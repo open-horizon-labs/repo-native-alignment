@@ -23,7 +23,7 @@ try {
   const tools = (await client.listTools()).tools ?? [];
   if (tools.length === 0) throw new Error("Smoke check failed: zero tools");
 
-  const mustHave = new Set(["oh_get_outcomes", "oh_get_guardrails", "outcome_progress"]);
+  const mustHave = new Set(["oh_get_context", "oh_record", "outcome_progress"]);
   const seen = new Set(tools.map((t) => t.name));
   for (const name of mustHave) {
     if (!seen.has(name)) throw new Error(`Smoke check failed: missing tool '${name}'`);

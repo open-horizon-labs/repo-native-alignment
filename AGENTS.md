@@ -27,17 +27,30 @@ This project IS the RNA MCP server. When working here, use its own tools.
 | Instead of... | Use this MCP tool |
 |---|---|
 | `Grep` for symbol names | `search_symbols(query, kind, language, file)` |
-| `Read` to trace function calls | `graph_neighbors(node_id, direction, edge_types)` |
-| `Grep` for "who calls X" | `graph_impact(node_id, max_hops)` |
+| `Read` to trace function calls | `graph_query(node_id, mode: "neighbors")` |
+| `Grep` for "who calls X" | `graph_query(node_id, mode: "impact")` |
 | `Read` to find .oh/ artifacts | `oh_search_context(query)` |
 | `Bash` with `grep -rn` | `search_symbols` or `oh_search_context` |
+| Recording learnings/signals | `oh_record(type, slug, ...)` |
+| Searching git history | `git_history(query)` or `git_history(file)` |
+
+**9 Tools (consolidated from 20+):**
+1. `oh_get_context` -- read all business context (outcomes, signals, guardrails, metis)
+2. `oh_search_context` -- semantic search (.oh/ artifacts, optionally code + markdown)
+3. `oh_record` -- write any business artifact (metis, signal, guardrail, outcome update)
+4. `oh_init` -- scaffold .oh/ directory
+5. `outcome_progress` -- structural join for outcome tracking
+6. `search_symbols` -- graph-aware code symbol search
+7. `graph_query` -- graph traversal (neighbors, impact, reachable)
+8. `git_history` -- commit search + file history
+9. `list_roots` -- workspace root management
 
 **Workflow:**
-- Before starting work: call `oh_get_outcomes` and `oh_get_guardrails` (auto-injected on first tool call)
-- Explore code: `search_symbols` → `graph_neighbors` → `graph_impact`
-- After completing work: call `oh_record_metis` with key learnings
+- Before starting work: call `oh_get_context` (business context auto-injected on first tool call)
+- Explore code: `search_symbols` -> `graph_query(mode: "neighbors")` -> `graph_query(mode: "impact")`
+- After completing work: call `oh_record(type: "metis", ...)` with key learnings
 - When checking progress: call `outcome_progress` with `agent-alignment`
-- When discovering constraints: call `oh_record_guardrail_candidate`
+- When discovering constraints: call `oh_record(type: "guardrail", ...)`
 - Tag commits with `[outcome:agent-alignment]`
 
 ---
@@ -48,7 +61,7 @@ This project IS the RNA MCP server. When working here, use its own tools.
 MCP server with a workspace-wide context engine. Incrementally scans repos, extracts a multi-language code graph (symbols, topology, schemas, PR history), and makes business outcomes, code structure, markdown, and git history queryable as one system. Agents stay aligned to declared intent because that intent lives in the repo as structured, queryable artifacts.
 
 ## Current Aims
-- **agent-alignment** (active): Agents scope work to declared outcomes without user re-prompting. Mechanism: 20 MCP tools + OH Skills integration + outcome_progress structural joins.
+- **agent-alignment** (active): Agents scope work to declared outcomes without user re-prompting. Mechanism: 9 intent-based MCP tools + OH Skills integration + outcome_progress structural joins.
 - **workspace-context-engine** (active): Agents see context across the full workspace. Mechanism: incremental scanner + pluggable extractors (tree-sitter, LSP, markdown, schema) + unified graph (LanceDB + petgraph).
 
 ## Key Constraints
@@ -61,8 +74,8 @@ MCP server with a workspace-wide context engine. Incrementally scans repos, extr
 
 ## Patterns to Follow
 - `[outcome:X]` in commit messages to link work to outcomes
-- Use MCP write tools (oh_record_metis, oh_record_signal, oh_record_guardrail_candidate) to close the feedback loop
-- Structural joins (outcome_progress) over keyword search (search_all) for the core use case
+- Use `oh_record(type, slug, ...)` to close the feedback loop (metis, signal, guardrail, outcome)
+- Structural joins (outcome_progress) over keyword search for the core use case
 - Pluggable extractors: implement `Extractor` trait for new file types (Phase 1: sync). `Enricher` trait for background enrichment (Phase 2: async, e.g., LSP)
 - Graph model: `Node` + `Edge` types with `ExtractionSource` provenance and `Confidence` levels
 - Source-capable records: wrap in `SourceEnvelope` at the outbox seam for future FEED publishing
@@ -86,7 +99,7 @@ Solo developer. PRs get /review and /dissent before merge. "Done" = tests pass, 
 - `src/scanner.rs` — incremental file scanner (mtime + git + configurable excludes)
 - `src/extract/` — pluggable extractors (Extractor trait + Enricher trait)
 - `src/extract/{rust,python,typescript,go,markdown}.rs` — language-specific extractors
-- `src/server.rs` — MCP server (20 tools)
+- `src/server.rs` — MCP server (9 intent-based tools)
 - `src/embed.rs` — semantic search (fastembed + LanceDB)
 - `src/query.rs` — outcome_progress structural joins
 

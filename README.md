@@ -41,7 +41,7 @@ Four systems collaborate. Each is independent; together they compound.
 
 **The join:** `outcome_progress` connects layers structurally — outcome → file patterns → tagged commits → code symbols → related markdown. Not keyword matching; structural links.
 
-**The graph:** `search_symbols` and `graph_neighbors` expose a multi-language code graph — symbols, imports, topology boundaries — built by incremental scanning with tree-sitter extraction across Rust, Python, TypeScript, and Go.
+**The graph:** `search_symbols` and `graph_query` expose a multi-language code graph — symbols, imports, topology boundaries — built by incremental scanning with tree-sitter extraction across Rust, Python, TypeScript, and Go.
 
 **The search:** `oh_search_context` lets agents describe what they need in natural language — "guardrails about API compatibility" — instead of listing all artifacts and filtering manually.
 
@@ -110,7 +110,7 @@ This does everything:
 
 ### 4. Start working
 
-The system compounds from here. Skills and agents use `oh_search_context` to discover relevant context. `search_symbols` and `graph_neighbors` expose the code graph. Write tools record what you learn. Next session starts richer.
+The system compounds from here. Skills and agents use `oh_search_context` to discover relevant context. `search_symbols` and `graph_query` expose the code graph. `oh_record` records what you learn. Next session starts richer.
 
 ---
 
@@ -146,11 +146,11 @@ The repo-local intelligence layer. Incrementally scans your repo, extracts a mul
 
 | Category | Tools |
 |----------|-------|
-| **Read .oh/** | `oh_get_outcomes`, `oh_get_signals`, `oh_get_guardrails`, `oh_get_metis`, `oh_get_context` |
-| **Write .oh/** | `oh_record_metis`, `oh_record_signal`, `oh_update_outcome`, `oh_record_guardrail_candidate`, `oh_init` |
-| **Search** | `search_markdown`, `search_code` (kind/file filters), `search_commits`, `file_history`, `search_all` |
+| **Read .oh/** | `oh_get_context` (all artifacts in one call) |
+| **Write .oh/** | `oh_record` (type: metis/signal/guardrail/outcome), `oh_init` |
+| **Search** | `oh_search_context` (semantic, optionally include code + markdown), `git_history` (commits + file history) |
 | **Semantic Search** | `oh_search_context` — natural language search over `.oh/` artifacts + git commits |
-| **Graph** | `search_symbols` (multi-lang), `graph_neighbors` (traversal), `graph_impact` (reverse BFS) |
+| **Graph** | `search_symbols` (multi-lang), `graph_query` (neighbors/impact/reachable) |
 | **Join** | `outcome_progress` — the structural intersection query |
 
 ### [OH MCP](https://github.com/cloud-atlas-ai/oh-mcp-server) — organizational context

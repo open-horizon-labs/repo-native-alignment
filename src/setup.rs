@@ -425,10 +425,12 @@ const MCP_GUIDANCE_BLOCK: &str = r#"
 | Instead of... | Use this MCP tool |
 |---|---|
 | `Grep` for symbol names | `search_symbols(query, kind, language, file)` |
-| `Read` to trace function calls | `graph_neighbors(node_id, direction, edge_types)` |
-| `Grep` for "who calls X" | `graph_impact(node_id, max_hops)` |
+| `Read` to trace function calls | `graph_query(node_id, mode: "neighbors")` |
+| `Grep` for "who calls X" | `graph_query(node_id, mode: "impact")` |
 | `Read` to find .oh/ artifacts | `oh_search_context(query)` |
 | `Bash` with `grep -rn` | `search_symbols` or `oh_search_context` |
+| Recording learnings/signals | `oh_record(type, slug, ...)` |
+| Searching git history | `git_history(query)` or `git_history(file)` |
 <!-- end RNA MCP tool guidance -->
 "#;
 
