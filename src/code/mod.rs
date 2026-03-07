@@ -8,11 +8,11 @@ use crate::types::{CodeSymbol, SymbolKind};
 /// parse each with tree-sitter, and return the collected symbols.
 pub fn extract_symbols(repo_root: &Path) -> Result<Vec<CodeSymbol>> {
     let mut symbols = Vec::new();
-    walk_dir(repo_root, repo_root, &mut symbols)?;
+    walk_dir(repo_root, &mut symbols)?;
     Ok(symbols)
 }
 
-fn walk_dir(dir: &Path, repo_root: &Path, symbols: &mut Vec<CodeSymbol>) -> Result<()> {
+fn walk_dir(dir: &Path, symbols: &mut Vec<CodeSymbol>) -> Result<()> {
     let entries = std::fs::read_dir(dir)?;
     for entry in entries {
         let entry = entry?;
@@ -25,7 +25,7 @@ fn walk_dir(dir: &Path, repo_root: &Path, symbols: &mut Vec<CodeSymbol>) -> Resu
             if name == ".git" || name == "target" {
                 continue;
             }
-            walk_dir(&path, repo_root, symbols)?;
+            walk_dir(&path, symbols)?;
         } else if path.extension().map_or(false, |ext| ext == "rs") {
             match parse_rust_file(&path) {
                 Ok(file_symbols) => symbols.extend(file_symbols),

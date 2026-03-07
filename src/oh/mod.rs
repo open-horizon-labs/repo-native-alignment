@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::types::{OhArtifact, OhArtifactKind};
 
@@ -58,8 +58,8 @@ pub fn parse_artifact(path: &Path, kind: OhArtifactKind) -> Result<OhArtifact> {
 
     let (frontmatter, body) = split_frontmatter(&raw);
 
-    let fm: HashMap<String, serde_yaml::Value> = if frontmatter.is_empty() {
-        HashMap::new()
+    let fm: BTreeMap<String, serde_yaml::Value> = if frontmatter.is_empty() {
+        BTreeMap::new()
     } else {
         serde_yaml::from_str(&frontmatter)
             .with_context(|| format!("parsing YAML frontmatter in {}", path.display()))?
@@ -80,14 +80,39 @@ pub fn parse_artifact(path: &Path, kind: OhArtifactKind) -> Result<OhArtifact> {
 pub fn write_metis(
     repo_root: &Path,
     slug: &str,
-    frontmatter: &HashMap<String, serde_yaml::Value>,
+    frontmatter: &BTreeMap<String, serde_yaml::Value>,
     body: &str,
 ) -> Result<PathBuf> {
+    // Reject slugs that could escape the target directory.
+    if slug.contains('/')
+        || slug.contains('\\')
+        || slug.contains("..")
+        || slug.is_empty()
+    {
+        bail!(
+            "invalid slug {:?}: must not be empty or contain '/', '\\', or '..'",
+            slug
+        );
+    }
+
     let metis_dir = repo_root.join(".oh").join("metis");
     fs::create_dir_all(&metis_dir)
         .with_context(|| format!("creating directory {}", metis_dir.display()))?;
 
     let file_path = metis_dir.join(format!("{}.md", slug));
+
+    // Canonicalize and verify the resolved path stays inside metis_dir.
+    let canonical_dir = metis_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", metis_dir.display()))?;
+    let canonical_file = canonical_dir.join(format!("{}.md", slug));
+    if !canonical_file.starts_with(&canonical_dir) {
+        bail!(
+            "path traversal detected: {:?} escapes {}",
+            slug,
+            canonical_dir.display()
+        );
+    }
 
     let yaml = serde_yaml::to_string(frontmatter)
         .context("serializing frontmatter to YAML")?;
@@ -194,7 +219,7 @@ mod tests {
     #[test]
     fn test_parse_frontmatter_yaml() {
         let yaml_str = "id: test-artifact\nstatus: active";
-        let fm: HashMap<String, serde_yaml::Value> = serde_yaml::from_str(yaml_str).unwrap();
+        let fm: BTreeMap<String, serde_yaml::Value> = serde_yaml::from_str(yaml_str).unwrap();
         assert_eq!(fm.get("id").unwrap().as_str().unwrap(), "test-artifact");
         assert_eq!(fm.get("status").unwrap().as_str().unwrap(), "active");
     }
@@ -211,7 +236,7 @@ mod tests {
             OhArtifact {
                 kind: OhArtifactKind::Outcome,
                 file_path: PathBuf::from("test.md"),
-                frontmatter: HashMap::from([
+                frontmatter: BTreeMap::from([
                     ("id".to_string(), serde_yaml::Value::String("o1".to_string())),
                 ]),
                 body: "Outcome body".to_string(),
@@ -219,7 +244,7 @@ mod tests {
             OhArtifact {
                 kind: OhArtifactKind::Guardrail,
                 file_path: PathBuf::from("g.md"),
-                frontmatter: HashMap::from([
+                frontmatter: BTreeMap::from([
                     ("id".to_string(), serde_yaml::Value::String("g1".to_string())),
                 ]),
                 body: "Guardrail body".to_string(),

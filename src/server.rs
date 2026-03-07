@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -190,7 +190,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
 
             "oh_record_metis" => {
                 let args: OhRecordMetis = parse_args(params.arguments)?;
-                let mut fm = HashMap::new();
+                let mut fm = BTreeMap::new();
                 fm.insert(
                     "id".to_string(),
                     serde_yaml::Value::String(args.slug.clone()),

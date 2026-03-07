@@ -13,25 +13,37 @@ use crate::types::{OhArtifact, QueryResult};
 /// substring matching.
 pub fn query_all(repo_root: &Path, query: &str) -> Result<QueryResult> {
     // Load and search .oh/ artifacts
-    let all_artifacts = oh::load_oh_artifacts(repo_root).unwrap_or_default();
+    let all_artifacts = oh::load_oh_artifacts(repo_root).unwrap_or_else(|e| {
+        tracing::warn!("Failed to load .oh/ artifacts: {}", e);
+        Vec::new()
+    });
     let outcomes = search_oh_artifacts(&all_artifacts, query);
 
     // Load and search markdown chunks
-    let all_chunks = markdown::extract_markdown_chunks(repo_root).unwrap_or_default();
+    let all_chunks = markdown::extract_markdown_chunks(repo_root).unwrap_or_else(|e| {
+        tracing::warn!("Failed to extract markdown chunks: {}", e);
+        Vec::new()
+    });
     let markdown_chunks = markdown::search_chunks(&all_chunks, query)
         .into_iter()
         .cloned()
         .collect();
 
     // Load and search code symbols
-    let all_symbols = code::extract_symbols(repo_root).unwrap_or_default();
+    let all_symbols = code::extract_symbols(repo_root).unwrap_or_else(|e| {
+        tracing::warn!("Failed to extract code symbols: {}", e);
+        Vec::new()
+    });
     let code_symbols = code::search_symbols(&all_symbols, query)
         .into_iter()
         .cloned()
         .collect();
 
     // Search git commits by message
-    let commits = git::search_commits(repo_root, query, 50).unwrap_or_default();
+    let commits = git::search_commits(repo_root, query, 50).unwrap_or_else(|e| {
+        tracing::warn!("Failed to search git commits: {}", e);
+        Vec::new()
+    });
 
     Ok(QueryResult {
         query: query.to_string(),
@@ -45,10 +57,22 @@ pub fn query_all(repo_root: &Path, query: &str) -> Result<QueryResult> {
 /// Returns the full, unfiltered context across all layers. Used by the
 /// `oh_get_context` tool to give agents a complete picture of the repo.
 pub fn get_full_context(repo_root: &Path) -> Result<QueryResult> {
-    let outcomes = oh::load_oh_artifacts(repo_root).unwrap_or_default();
-    let markdown_chunks = markdown::extract_markdown_chunks(repo_root).unwrap_or_default();
-    let code_symbols = code::extract_symbols(repo_root).unwrap_or_default();
-    let commits = git::load_commits(repo_root, 50).unwrap_or_default();
+    let outcomes = oh::load_oh_artifacts(repo_root).unwrap_or_else(|e| {
+        tracing::warn!("Failed to load .oh/ artifacts: {}", e);
+        Vec::new()
+    });
+    let markdown_chunks = markdown::extract_markdown_chunks(repo_root).unwrap_or_else(|e| {
+        tracing::warn!("Failed to extract markdown chunks: {}", e);
+        Vec::new()
+    });
+    let code_symbols = code::extract_symbols(repo_root).unwrap_or_else(|e| {
+        tracing::warn!("Failed to extract code symbols: {}", e);
+        Vec::new()
+    });
+    let commits = git::load_commits(repo_root, 50).unwrap_or_else(|e| {
+        tracing::warn!("Failed to load git commits: {}", e);
+        Vec::new()
+    });
 
     Ok(QueryResult {
         query: String::from("(full context)"),
@@ -102,7 +126,7 @@ fn yaml_value_contains(value: &serde_yaml::Value, query_lower: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use crate::types::{OhArtifact, OhArtifactKind};
@@ -111,7 +135,7 @@ mod tests {
         OhArtifact {
             kind: OhArtifactKind::Outcome,
             file_path: PathBuf::from(format!(".oh/outcomes/{}.md", id)),
-            frontmatter: HashMap::from([
+            frontmatter: BTreeMap::from([
                 (
                     "id".to_string(),
                     serde_yaml::Value::String(id.to_string()),

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Parsed .oh/ artifact (outcome, signal, guardrail, or metis)
@@ -7,7 +7,7 @@ use std::path::PathBuf;
 pub struct OhArtifact {
     pub kind: OhArtifactKind,
     pub file_path: PathBuf,
-    pub frontmatter: HashMap<String, serde_yaml::Value>,
+    pub frontmatter: BTreeMap<String, serde_yaml::Value>,
     pub body: String,
 }
 
