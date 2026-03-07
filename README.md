@@ -80,7 +80,7 @@ The repo-local intelligence layer. Parses code (tree-sitter), markdown (pulldown
 | **Read .oh/** | `oh_get_outcomes`, `oh_get_signals`, `oh_get_guardrails`, `oh_get_metis`, `oh_get_context` |
 | **Write .oh/** | `oh_record_metis`, `oh_record_signal`, `oh_update_outcome`, `oh_record_guardrail_candidate`, `oh_init` |
 | **Search** | `search_markdown`, `search_code` (kind/file filters), `search_commits`, `file_history`, `search_all` |
-| **Semantic Search** | `oh_search_context` — natural language search over `.oh/` artifacts + recent git commits |
+| **Semantic Search** | `oh_search_context` — natural language search over `.oh/` artifacts + git commits |
 | **Join** | `outcome_progress` — the structural intersection query |
 
 ### [OH MCP](https://github.com/cloud-atlas-ai/oh-mcp-server) — organizational context
@@ -135,7 +135,7 @@ Outcomes declare `files:` patterns linking to code. Commits tag `[outcome:X]` li
 
 ## How Semantic Search Works
 
-`oh_search_context` uses local embeddings to let agents find relevant `.oh/` artifacts and recent git commits by describing what they need, rather than listing and filtering. Filter by type: `outcome`, `signal`, `guardrail`, `metis`, or `commit`.
+`oh_search_context` uses local embeddings to let agents find relevant `.oh/` artifacts and git commits by describing what they need, rather than listing and filtering. Filter by type: `outcome`, `signal`, `guardrail`, `metis`, or `commit`.
 
 **How it works:**
 

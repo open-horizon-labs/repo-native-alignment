@@ -109,8 +109,8 @@ impl EmbeddingIndex {
             texts.push(text);
         }
 
-        // Also index recent git commits
-        if let Ok(commits) = git::load_commits(repo_root, 100) {
+        // Also index all git commits
+        if let Ok(commits) = git::load_commits(repo_root, usize::MAX) {
             for c in &commits {
                 let changed_files_str = c
                     .changed_files
