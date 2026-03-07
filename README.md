@@ -5,7 +5,9 @@ Agents stay aligned to declared business outcomes — not just code correctness 
 ## The Stack
 
 ```
-OH Skills (/aim, /salvage, /review, ...)    ← workflow: frame, build, reflect
+OH Skills + Agents                           ← workflow: frame, build, reflect
+  Skills: /aim, /review, /dissent, /salvage  ← run in main session (need conversation context)
+  Agents: oh-aim, oh-execute, oh-ship, ...   ← run isolated (own context + scoped tools)
     │
     ▼ calls
 RNA MCP Server (16 tools)                    ← structured read/write of .oh/ + code + git
@@ -36,10 +38,15 @@ cargo build --release
   }
 }
 
-# 3. Install OH Skills (optional but recommended)
+# 3. Install OH Skills + Agents (optional but recommended)
 npx skills add open-horizon-labs/skills -g -a claude-code -y
 
-# 4. Scaffold .oh/ for your project
+# 4. Install phase agents (run /teach-oh, or manually):
+mkdir -p .claude/agents
+# Copy agent files from skills repo agents-omp/ to .claude/agents/
+# Each agent gets its own isolated context and scoped tools
+
+# 5. Scaffold .oh/ for your project
 # In Claude Code, call the oh_init tool — it reads your project and creates
 # outcome, signal, and guardrail templates.
 ```
