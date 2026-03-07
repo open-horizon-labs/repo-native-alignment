@@ -95,3 +95,35 @@ Steps 1-3 are the minimum viable slice. Steps 4-5 close the loop.
 ## The Deeper Insight
 
 P4/P5 treated alignment as a *data problem* (get the right files in place). The real framing is an *information retrieval problem* (find relevant context given a task description). Skills encode *when* to look. RNA stores *what* to find. The missing piece is *how* to match intent to artifacts. That's semantic search.
+
+---
+
+## Problem Space
+**Updated:** 2026-03-07
+
+### Objective
+Each skill phase automatically discovers the right `.oh/` artifacts for its task without the user naming them.
+
+### The validate-before-building Tension
+The guardrail says "don't add infra before validating." P6 says "add embeddings." Resolution: the guardrail's override says "override when infra is the direct blocker." Semantic search IS the blocker — exact-match tools can't do discovery. The guardrail was right about LSP/multi-language. Wrong about retrieval.
+
+### The Simpler Path Question
+Do we need neural embeddings for 15 files? LanceDB supports full-text search (BM25) natively — no embedding model, still better than grep. For dozens of artifacts, BM25 may produce relevance as good as neural embeddings.
+
+**Proposed escalation:** Start with LanceDB full-text search (BM25). Add `fastembed-rs` vector embeddings only if BM25 relevance is insufficient.
+
+### Constraints
+| Constraint | Type | Reason |
+|------------|------|--------|
+| Repo-native: no cloud API for search | hard | Core guardrail |
+| Latency <2s | hard | Agent skips slow tools |
+| `.oh/` corpus is small (dozens) | hard (current) | BM25 may suffice |
+| LanceDB already a Cargo dep | soft | Just uncomment |
+
+### Assumptions
+1. BM25 full-text is sufficient for small `.oh/` corpus — if false: add embeddings
+2. Agents will use `oh_search_context` — strong belief: preambles already say to
+3. One search tool replaces "list all then filter" — if false: keep existing list tools
+
+### Ready for /solution-space?
+Yes. Two candidates: LanceDB BM25 (simpler) vs LanceDB + fastembed-rs (richer). Same tool surface either way.
