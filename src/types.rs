@@ -223,6 +223,10 @@ fn yaml_value_to_string(v: &serde_yaml::Value) -> String {
         serde_yaml::Value::String(s) => s.clone(),
         serde_yaml::Value::Bool(b) => b.to_string(),
         serde_yaml::Value::Number(n) => n.to_string(),
+        serde_yaml::Value::Sequence(seq) => {
+            let items: Vec<String> = seq.iter().map(yaml_value_to_string).collect();
+            items.join(", ")
+        }
         _ => format!("{:?}", v),
     }
 }

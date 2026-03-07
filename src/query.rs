@@ -147,15 +147,16 @@ pub fn outcome_progress(repo_root: &Path, outcome_id: &str) -> Result<QueryResul
         .collect();
 
     let all_symbols = code::extract_symbols(repo_root).unwrap_or_default();
-    let code_symbols = all_symbols
+    let code_symbols: Vec<_> = all_symbols
         .into_iter()
         .filter(|sym| {
             // Match if symbol's file is in the changed files set
-            // Need to compare relative paths
             let sym_rel = sym.file_path.strip_prefix(repo_root)
                 .unwrap_or(&sym.file_path);
             changed_files.contains(sym_rel)
         })
+        // Skip imports — they're noise in this context
+        .filter(|sym| sym.kind != crate::types::SymbolKind::Import)
         .collect();
 
     // 6. Find markdown mentioning this outcome
