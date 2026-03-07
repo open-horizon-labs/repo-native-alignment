@@ -73,17 +73,17 @@ pub fn parse_artifact(path: &Path, kind: OhArtifactKind) -> Result<OhArtifact> {
     })
 }
 
-/// Write a new metis artifact file at `.oh/metis/{slug}.md`.
+/// Write an artifact file at `.oh/{subdir}/{slug}.md`.
 ///
-/// Creates the `.oh/metis/` directory if it does not exist.
-/// Returns the path to the newly created file.
-pub fn write_metis(
+/// Creates the directory if it does not exist.
+/// Returns the path to the newly created/updated file.
+pub fn write_artifact(
     repo_root: &Path,
+    subdir: &str,
     slug: &str,
     frontmatter: &BTreeMap<String, serde_yaml::Value>,
     body: &str,
 ) -> Result<PathBuf> {
-    // Reject slugs that could escape the target directory.
     if slug.contains('/')
         || slug.contains('\\')
         || slug.contains("..")
@@ -95,16 +95,15 @@ pub fn write_metis(
         );
     }
 
-    let metis_dir = repo_root.join(".oh").join("metis");
-    fs::create_dir_all(&metis_dir)
-        .with_context(|| format!("creating directory {}", metis_dir.display()))?;
+    let dir = repo_root.join(".oh").join(subdir);
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("creating directory {}", dir.display()))?;
 
-    let file_path = metis_dir.join(format!("{}.md", slug));
+    let file_path = dir.join(format!("{}.md", slug));
 
-    // Canonicalize and verify the resolved path stays inside metis_dir.
-    let canonical_dir = metis_dir
+    let canonical_dir = dir
         .canonicalize()
-        .with_context(|| format!("canonicalizing {}", metis_dir.display()))?;
+        .with_context(|| format!("canonicalizing {}", dir.display()))?;
     let canonical_file = canonical_dir.join(format!("{}.md", slug));
     if !canonical_file.starts_with(&canonical_dir) {
         bail!(
@@ -116,8 +115,6 @@ pub fn write_metis(
 
     let yaml = serde_yaml::to_string(frontmatter)
         .context("serializing frontmatter to YAML")?;
-
-    // serde_yaml::to_string produces a trailing newline; strip it for clean output
     let yaml = yaml.trim_end();
 
     let content = format!("---\n{}\n---\n\n{}\n", yaml, body);
@@ -126,6 +123,50 @@ pub fn write_metis(
         .with_context(|| format!("writing {}", file_path.display()))?;
 
     Ok(file_path)
+}
+
+/// Convenience wrapper for backward compatibility.
+pub fn write_metis(
+    repo_root: &Path,
+    slug: &str,
+    frontmatter: &BTreeMap<String, serde_yaml::Value>,
+    body: &str,
+) -> Result<PathBuf> {
+    write_artifact(repo_root, "metis", slug, frontmatter, body)
+}
+
+/// Update an existing artifact's frontmatter fields while preserving the body.
+/// Only updates fields present in `updates`; other frontmatter fields are preserved.
+pub fn update_artifact(
+    repo_root: &Path,
+    subdir: &str,
+    slug: &str,
+    updates: &BTreeMap<String, serde_yaml::Value>,
+) -> Result<PathBuf> {
+    let dir = repo_root.join(".oh").join(subdir);
+    let file_path = dir.join(format!("{}.md", slug));
+
+    if !file_path.exists() {
+        bail!("{} not found at {}", slug, file_path.display());
+    }
+
+    let mut artifact = parse_artifact(&file_path, kind_for_subdir(subdir))?;
+
+    for (k, v) in updates {
+        artifact.frontmatter.insert(k.clone(), v.clone());
+    }
+
+    write_artifact(repo_root, subdir, slug, &artifact.frontmatter, &artifact.body)
+}
+
+fn kind_for_subdir(subdir: &str) -> OhArtifactKind {
+    match subdir {
+        "outcomes" => OhArtifactKind::Outcome,
+        "signals" => OhArtifactKind::Signal,
+        "guardrails" => OhArtifactKind::Guardrail,
+        "metis" => OhArtifactKind::Metis,
+        _ => OhArtifactKind::Metis,
+    }
 }
 
 /// Render a slice of artifacts as a single markdown document, grouped by kind.

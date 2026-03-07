@@ -69,6 +69,72 @@ pub struct OhRecordMetis {
 }
 
 #[macros::mcp_tool(
+    name = "oh_record_signal",
+    description = "Records a signal observation (SLO measurement, progress indicator) in .oh/signals/"
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct OhRecordSignal {
+    /// URL-safe slug used as the filename (e.g. 'p95-latency')
+    pub slug: String,
+    /// The outcome this signal measures
+    pub outcome: String,
+    /// Signal type: slo, metric, qualitative
+    #[serde(default = "default_signal_type")]
+    pub signal_type: String,
+    /// Threshold or definition (e.g. "p95 < 200ms")
+    pub threshold: String,
+    /// Markdown body with details, measurement method, current state
+    pub body: String,
+}
+
+fn default_signal_type() -> String {
+    "slo".to_string()
+}
+
+#[macros::mcp_tool(
+    name = "oh_update_outcome",
+    description = "Updates fields on an existing outcome in .oh/outcomes/. Merges provided fields with existing frontmatter; body is preserved."
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct OhUpdateOutcome {
+    /// The outcome slug/ID to update (e.g. 'agent-alignment')
+    pub slug: String,
+    /// Optional: new status (e.g. 'active', 'achieved', 'paused', 'abandoned')
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Optional: new or updated mechanism description
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mechanism: Option<String>,
+    /// Optional: updated file patterns (replaces existing)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<String>>,
+}
+
+#[macros::mcp_tool(
+    name = "oh_record_guardrail_candidate",
+    description = "Proposes a guardrail candidate from experience. Guardrails are born from regret, not theory. Human promotes to hard/soft guardrail."
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct OhRecordGuardrailCandidate {
+    /// URL-safe slug (e.g. 'no-breaking-api-changes')
+    pub slug: String,
+    /// The constraint statement
+    pub statement: String,
+    /// Severity: candidate (default), soft, hard
+    #[serde(default = "default_severity")]
+    pub severity: String,
+    /// What outcome this guardrail protects
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// Markdown body: rationale, what happened, override protocol
+    pub body: String,
+}
+
+fn default_severity() -> String {
+    "candidate".to_string()
+}
+
+#[macros::mcp_tool(
     name = "search_markdown",
     description = "Searches all markdown files in the repo by case-insensitive substring match against headings and content"
 )]
@@ -173,6 +239,9 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 OhGetMetis::tool(),
                 OhGetContext::tool(),
                 OhRecordMetis::tool(),
+                OhRecordSignal::tool(),
+                OhUpdateOutcome::tool(),
+                OhRecordGuardrailCandidate::tool(),
                 SearchMarkdown::tool(),
                 SearchCode::tool(),
                 SearchCommits::tool(),
@@ -243,6 +312,59 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         path.display()
                     ))),
                     Err(e) => Ok(text_result(format!("Error writing metis: {}", e))),
+                }
+            }
+
+            "oh_record_signal" => {
+                let args: OhRecordSignal = parse_args(params.arguments)?;
+                let mut fm = BTreeMap::new();
+                fm.insert("id".into(), serde_yaml::Value::String(args.slug.clone()));
+                fm.insert("outcome".into(), serde_yaml::Value::String(args.outcome));
+                fm.insert("type".into(), serde_yaml::Value::String(args.signal_type));
+                fm.insert("threshold".into(), serde_yaml::Value::String(args.threshold));
+
+                match oh::write_artifact(root, "signals", &args.slug, &fm, &args.body) {
+                    Ok(path) => Ok(text_result(format!("Recorded signal at `{}`", path.display()))),
+                    Err(e) => Ok(text_result(format!("Error: {}", e))),
+                }
+            }
+
+            "oh_update_outcome" => {
+                let args: OhUpdateOutcome = parse_args(params.arguments)?;
+                let mut updates = BTreeMap::new();
+                if let Some(status) = args.status {
+                    updates.insert("status".into(), serde_yaml::Value::String(status));
+                }
+                if let Some(mechanism) = args.mechanism {
+                    updates.insert("mechanism".into(), serde_yaml::Value::String(mechanism));
+                }
+                if let Some(files) = args.files {
+                    let seq: Vec<serde_yaml::Value> = files.into_iter().map(serde_yaml::Value::String).collect();
+                    updates.insert("files".into(), serde_yaml::Value::Sequence(seq));
+                }
+                if updates.is_empty() {
+                    return Ok(text_result("No fields to update.".into()));
+                }
+
+                match oh::update_artifact(root, "outcomes", &args.slug, &updates) {
+                    Ok(path) => Ok(text_result(format!("Updated outcome at `{}`", path.display()))),
+                    Err(e) => Ok(text_result(format!("Error: {}", e))),
+                }
+            }
+
+            "oh_record_guardrail_candidate" => {
+                let args: OhRecordGuardrailCandidate = parse_args(params.arguments)?;
+                let mut fm = BTreeMap::new();
+                fm.insert("id".into(), serde_yaml::Value::String(args.slug.clone()));
+                fm.insert("severity".into(), serde_yaml::Value::String(args.severity));
+                fm.insert("statement".into(), serde_yaml::Value::String(args.statement));
+                if let Some(ref outcome) = args.outcome {
+                    fm.insert("outcome".into(), serde_yaml::Value::String(outcome.clone()));
+                }
+
+                match oh::write_artifact(root, "guardrails", &args.slug, &fm, &args.body) {
+                    Ok(path) => Ok(text_result(format!("Recorded guardrail candidate at `{}`", path.display()))),
+                    Err(e) => Ok(text_result(format!("Error: {}", e))),
                 }
             }
 
