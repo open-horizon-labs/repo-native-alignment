@@ -20,16 +20,24 @@
 
 ## Repo-Native Alignment MCP
 
-This project IS the RNA MCP server. When working here, use its own tools:
+This project IS the RNA MCP server. When working here, use its own tools.
 
-- Before starting work: call `oh_get_outcomes` and `oh_get_guardrails`
-- Explore code structure: call `search_symbols` with kind/language/file filters
-- Traverse relationships: call `graph_neighbors` with a node ID from search_symbols
-- Impact analysis: call `graph_impact` to find what depends on a symbol
+**IMPORTANT: Use MCP tools for code exploration, NOT grep/Read/Bash.**
+
+| Instead of... | Use this MCP tool |
+|---|---|
+| `Grep` for symbol names | `search_symbols(query, kind, language, file)` |
+| `Read` to trace function calls | `graph_neighbors(node_id, direction, edge_types)` |
+| `Grep` for "who calls X" | `graph_impact(node_id, max_hops)` |
+| `Read` to find .oh/ artifacts | `oh_search_context(query)` |
+| `Bash` with `grep -rn` | `search_symbols` or `oh_search_context` |
+
+**Workflow:**
+- Before starting work: call `oh_get_outcomes` and `oh_get_guardrails` (auto-injected on first tool call)
+- Explore code: `search_symbols` → `graph_neighbors` → `graph_impact`
 - After completing work: call `oh_record_metis` with key learnings
 - When checking progress: call `outcome_progress` with `agent-alignment`
 - When discovering constraints: call `oh_record_guardrail_candidate`
-- When measuring progress: call `oh_record_signal`
 - Tag commits with `[outcome:agent-alignment]`
 
 ---

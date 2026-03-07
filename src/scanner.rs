@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 // ── Default excludes ────────────────────────────────────────────────
 
-const DEFAULT_EXCLUDES: &[&str] = &[
+pub const DEFAULT_EXCLUDES: &[&str] = &[
     "node_modules/",
     ".venv/",
     "target/",
@@ -176,6 +176,9 @@ pub struct Scanner {
     repo_root: PathBuf,
     excludes: Vec<String>,
     state: ScanState,
+    /// Override for state persistence path. When `None`, uses the default
+    /// `.oh/.cache/scan-state.json` under repo_root.
+    custom_state_path: Option<PathBuf>,
 }
 
 impl Scanner {
@@ -194,6 +197,23 @@ impl Scanner {
             repo_root,
             excludes,
             state,
+            custom_state_path: None,
+        })
+    }
+
+    /// Create a scanner with custom excludes and a custom state persistence path.
+    /// Used for multi-root workspace scanning where each root stores state separately.
+    pub fn with_excludes_and_state_path(
+        repo_root: PathBuf,
+        excludes: Vec<String>,
+        state_path_override: PathBuf,
+    ) -> Result<Self> {
+        let state = load_state_from_path(&state_path_override).unwrap_or_default();
+        Ok(Scanner {
+            repo_root,
+            excludes,
+            state,
+            custom_state_path: Some(state_path_override),
         })
     }
 
@@ -280,7 +300,11 @@ impl Scanner {
             self.state.last_commit_sha = Some(sha);
         }
 
-        save_state(&self.repo_root, &self.state)?;
+        if let Some(ref custom_path) = self.custom_state_path {
+            save_state_to_path(custom_path, &self.state)?;
+        } else {
+            save_state(&self.repo_root, &self.state)?;
+        }
 
         Ok(ScanResult {
             changed_files,
@@ -585,7 +609,11 @@ fn state_path(repo_root: &Path) -> PathBuf {
 
 fn load_state(repo_root: &Path) -> Result<ScanState> {
     let path = state_path(repo_root);
-    let data = fs::read_to_string(&path)
+    load_state_from_path(&path)
+}
+
+fn load_state_from_path(path: &Path) -> Result<ScanState> {
+    let data = fs::read_to_string(path)
         .with_context(|| format!("reading scan state from {}", path.display()))?;
     let state: ScanState = serde_json::from_str(&data).context("parsing scan-state.json")?;
     Ok(state)
@@ -593,11 +621,15 @@ fn load_state(repo_root: &Path) -> Result<ScanState> {
 
 fn save_state(repo_root: &Path, state: &ScanState) -> Result<()> {
     let path = state_path(repo_root);
+    save_state_to_path(&path, state)
+}
+
+fn save_state_to_path(path: &Path, state: &ScanState) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     let data = serde_json::to_string_pretty(state).context("serializing scan state")?;
-    fs::write(&path, data).with_context(|| format!("writing {}", path.display()))?;
+    fs::write(path, data).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 

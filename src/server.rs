@@ -15,6 +15,7 @@ use crate::embed::EmbeddingIndex;
 use crate::extract::{ExtractorRegistry, EnricherRegistry};
 use crate::graph::{self, EdgeKind, Node, Edge};
 use crate::graph::index::GraphIndex;
+use crate::roots::{WorkspaceConfig, cache_state_path};
 use crate::scanner::Scanner;
 use crate::types::OhArtifactKind;
 use crate::{code, git, markdown, oh, query};
@@ -241,6 +242,13 @@ pub struct OhInit {
 }
 
 #[macros::mcp_tool(
+    name = "list_roots",
+    description = "Lists configured workspace roots with their type, path, and scan status."
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ListRoots {}
+
+#[macros::mcp_tool(
     name = "search_symbols",
     description = "Searches code symbols across all languages (Rust, Python, TypeScript, Go) from the workspace graph. Returns functions, structs, traits, classes, interfaces with file location and edges. Replaces search_code with multi-language, graph-aware results."
 )]
@@ -257,6 +265,9 @@ pub struct SearchSymbols {
     /// Optional: filter by file path substring
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// Optional: filter to a specific workspace root (by slug, e.g. "zettelkasten")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
     /// Maximum results to return (default: 20)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
@@ -340,56 +351,83 @@ impl RnaHandler {
     async fn get_graph(&self) -> anyhow::Result<&GraphState> {
         self.graph_index
             .get_or_try_init(|| async {
-                // 1. Run scanner
-                let mut scanner = Scanner::new(self.repo_root.clone())?;
-                let scan_result = scanner.scan()?;
-                tracing::info!(
-                    "Scanned: {} new, {} changed, {} deleted in {:?}",
-                    scan_result.new_files.len(),
-                    scan_result.changed_files.len(),
-                    scan_result.deleted_files.len(),
-                    scan_result.scan_duration
-                );
+                // Load workspace config and merge with --repo as primary root
+                let workspace = WorkspaceConfig::load()
+                    .with_primary_root(self.repo_root.clone());
+                let resolved_roots = workspace.resolved_roots();
 
-                // 2. Run extractors on ALL known files (not just delta)
-                // The scan delta tells us what changed, but the graph needs
-                // the full picture on first init. On subsequent inits (server restart),
-                // the scan may return 0 changes but we still need the full graph.
                 let registry = ExtractorRegistry::with_builtins();
-                let all_files = scanner.all_known_files();
-                let full_scan = crate::scanner::ScanResult {
-                    changed_files: Vec::new(),
-                    new_files: all_files,
-                    deleted_files: Vec::new(),
-                    scan_duration: std::time::Duration::ZERO,
-                };
-                let extraction = registry.extract_scan_result(&self.repo_root, &full_scan);
-                tracing::info!(
-                    "Extracted: {} nodes, {} edges",
-                    extraction.nodes.len(),
-                    extraction.edges.len()
-                );
+                let mut all_nodes: Vec<Node> = Vec::new();
+                let mut all_edges: Vec<Edge> = Vec::new();
 
-                // 3. Extract PR merges from git history
-                let mut all_nodes = extraction.nodes;
-                let mut all_edges = extraction.edges;
+                // 3. Scan all roots (multi-root support)
+                for resolved_root in &resolved_roots {
+                    let root_slug = &resolved_root.slug;
+                    let root_path = &resolved_root.path;
+                    let excludes = resolved_root.config.effective_excludes();
 
+                    let is_primary = resolved_root.path == self.repo_root;
+                    let mut scanner = if is_primary {
+                        Scanner::with_excludes(root_path.clone(), excludes)?
+                    } else {
+                        let state_path = cache_state_path(root_slug);
+                        Scanner::with_excludes_and_state_path(
+                            root_path.clone(),
+                            excludes,
+                            state_path,
+                        )?
+                    };
+
+                    let scan_result = scanner.scan()?;
+                    tracing::info!(
+                        "Scanned root '{}' ({}): {} new, {} changed, {} deleted in {:?}",
+                        root_slug,
+                        resolved_root.config.root_type,
+                        scan_result.new_files.len(),
+                        scan_result.changed_files.len(),
+                        scan_result.deleted_files.len(),
+                        scan_result.scan_duration
+                    );
+
+                    let all_files = scanner.all_known_files();
+                    let full_scan = crate::scanner::ScanResult {
+                        changed_files: Vec::new(),
+                        new_files: all_files,
+                        deleted_files: Vec::new(),
+                        scan_duration: std::time::Duration::ZERO,
+                    };
+                    let mut extraction = registry.extract_scan_result(root_path, &full_scan);
+
+                    for node in &mut extraction.nodes {
+                        node.id.root = root_slug.clone();
+                    }
+                    for edge in &mut extraction.edges {
+                        edge.from.root = root_slug.clone();
+                        edge.to.root = root_slug.clone();
+                    }
+
+                    tracing::info!(
+                        "Extracted from '{}': {} nodes, {} edges",
+                        root_slug,
+                        extraction.nodes.len(),
+                        extraction.edges.len()
+                    );
+
+                    all_nodes.extend(extraction.nodes);
+                    all_edges.extend(extraction.edges);
+                }
+
+                // 4. Extract PR merges from git history
                 match git::pr_merges::extract_pr_merges(&self.repo_root, Some(100)) {
                     Ok((pr_nodes, pr_edges)) => {
-                        tracing::info!(
-                            "Extracted {} PR merge nodes, {} edges from git history",
-                            pr_nodes.len(),
-                            pr_edges.len()
-                        );
-
-                        // Link PR merges to symbols via Modified edges
                         let modified_edges =
                             git::pr_merges::link_pr_to_symbols(&pr_nodes, &all_nodes);
                         tracing::info!(
-                            "Created {} Modified edges linking PRs to symbols",
+                            "PR merges: {} nodes, {} edges, {} Modified links",
+                            pr_nodes.len(),
+                            pr_edges.len(),
                             modified_edges.len()
                         );
-
                         all_nodes.extend(pr_nodes);
                         all_edges.extend(pr_edges);
                         all_edges.extend(modified_edges);
@@ -399,21 +437,14 @@ impl RnaHandler {
                     }
                 }
 
-                // 4. Build petgraph index
+                // 5. Build petgraph index
                 let mut index = GraphIndex::new();
                 index.rebuild_from_edges(&all_edges);
-                // Also ensure all nodes are in the graph (some may have no edges)
                 for node in &all_nodes {
                     index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
                 }
 
-                // 4. Phase 2: Run enrichers (LSP) synchronously
-                // This adds cross-file reference edges and trait implementation edges.
-                // rust-analyzer typically takes 5-15 seconds; the graph is lazy-init
-                // (OnceCell) so this delay only happens once per session.
-                let mut all_edges = extraction.edges;
-                let mut all_nodes = extraction.nodes;
-
+                // 6. Phase 2: Run enrichers (LSP) synchronously
                 let languages: Vec<String> = all_nodes
                     .iter()
                     .map(|n| n.language.clone())
@@ -431,7 +462,6 @@ impl RnaHandler {
                         "Enrichment added {} edges",
                         enrichment.added_edges.len()
                     );
-                    // Add enrichment edges to the index
                     for edge in &enrichment.added_edges {
                         let from_id = edge.from.to_stable_id();
                         let to_id = edge.to.to_stable_id();
@@ -446,7 +476,6 @@ impl RnaHandler {
                     all_edges.extend(enrichment.added_edges);
                 }
 
-                // Apply node metadata patches from enrichment
                 for (node_id, patches) in &enrichment.updated_nodes {
                     if let Some(node) = all_nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
                         for (key, value) in patches {
@@ -454,6 +483,13 @@ impl RnaHandler {
                         }
                     }
                 }
+
+                tracing::info!(
+                    "Graph built: {} nodes, {} edges across {} root(s)",
+                    all_nodes.len(),
+                    all_edges.len(),
+                    resolved_roots.len()
+                );
 
                 Ok(GraphState {
                     nodes: all_nodes,
@@ -555,6 +591,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 SearchAll::tool(),
                 OutcomeProgress::tool(),
                 OhInit::tool(),
+                ListRoots::tool(),
                 SearchSymbols::tool(),
                 GraphNeighbors::tool(),
                 GraphImpact::tool(),
@@ -879,6 +916,38 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 }
             }
 
+            "list_roots" => {
+                let workspace = WorkspaceConfig::load()
+                    .with_primary_root(self.repo_root.clone());
+                let resolved = workspace.resolved_roots();
+
+                if resolved.is_empty() {
+                    Ok(text_result("No workspace roots configured.".to_string()))
+                } else {
+                    let md: String = resolved
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| {
+                            let primary = if i == 0 { " (primary)" } else { "" };
+                            format!(
+                                "- **{}**{}: `{}` (type: {}, git: {})",
+                                r.slug,
+                                primary,
+                                r.path.display(),
+                                r.config.root_type,
+                                r.config.git_aware,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    Ok(text_result(format!(
+                        "## Workspace Roots\n\n{} root(s)\n\n{}",
+                        resolved.len(),
+                        md
+                    )))
+                }
+            }
+
             "search_symbols" => {
                 let args: SearchSymbols = parse_args(params.arguments)?;
                 match self.get_graph().await {
@@ -908,6 +977,11 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                 if let Some(ref file_filter) = args.file {
                                     let path_str = n.id.file.to_string_lossy();
                                     if !path_str.contains(file_filter.as_str()) {
+                                        return false;
+                                    }
+                                }
+                                if let Some(ref root_filter) = args.root {
+                                    if n.id.root.to_lowercase() != root_filter.to_lowercase() {
                                         return false;
                                     }
                                 }
