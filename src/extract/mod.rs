@@ -9,8 +9,11 @@
 
 pub mod go;
 pub mod markdown;
+pub mod openapi;
+pub mod proto;
 pub mod python;
 pub mod rust;
+pub mod sql;
 pub mod typescript;
 
 use std::path::Path;
@@ -103,6 +106,9 @@ impl ExtractorRegistry {
         registry.register(Box::new(typescript::TypeScriptExtractor::new()));
         registry.register(Box::new(go::GoExtractor::new()));
         registry.register(Box::new(markdown::MarkdownExtractor::new()));
+        registry.register(Box::new(proto::ProtoExtractor::new()));
+        registry.register(Box::new(sql::SqlExtractor::new()));
+        registry.register(Box::new(openapi::OpenApiExtractor::new()));
         registry
     }
 
@@ -249,7 +255,7 @@ mod tests {
     #[test]
     fn test_registry_with_builtins_has_extractors() {
         let registry = ExtractorRegistry::with_builtins();
-        assert_eq!(registry.len(), 5); // rust, python, typescript, go, markdown
+        assert_eq!(registry.len(), 8); // rust, python, typescript, go, markdown, proto, sql, openapi
     }
 
     #[test]

@@ -41,6 +41,9 @@ fastembed = "5"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# SQL parsing (schema extraction from migrations)
+sqlparser = "0.59"
+
 # Serialization (YAML frontmatter + JSON for MCP responses)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
