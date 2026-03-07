@@ -1,17 +1,27 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rust_mcp_sdk::McpServer;
 use rust_mcp_sdk::schema::{Implementation, InitializeResult, ServerCapabilities};
 use rust_mcp_sdk::ToMcpServerHandler;
 
 use repo_native_alignment::server::RnaHandler;
+use repo_native_alignment::setup::{self, SetupArgs};
 
 #[derive(Parser, Debug)]
-#[command(name = "rna-server", about = "Repo-Native Alignment MCP Server")]
+#[command(
+    name = "repo-native-alignment",
+    about = "Repo-Native Alignment MCP Server",
+    long_about = None,
+)]
 struct Cli {
-    /// Repository root path (default: current directory)
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    // ── Server args (used when no subcommand is given) ───────────────────────
+
+    /// Repository root path (server mode only; default: current directory)
     #[arg(long, default_value = ".")]
     repo: PathBuf,
 
@@ -26,6 +36,12 @@ struct Cli {
     /// Port to bind to (http mode only)
     #[arg(long, default_value_t = 8382)]
     port: u16,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Bootstrap RNA + OH MCP setup for a project
+    Setup(SetupArgs),
 }
 
 fn server_details() -> InitializeResult {
@@ -56,6 +72,13 @@ fn server_details() -> InitializeResult {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // ── setup subcommand (sync, no tokio needed beyond the runtime) ──────────
+    if let Some(Commands::Setup(args)) = cli.command {
+        return setup::run(&args);
+    }
+
+    // ── server mode (default when no subcommand given) ───────────────────────
     let repo_root = cli.repo.canonicalize()?;
 
     let handler = RnaHandler {
@@ -74,7 +97,10 @@ async fn main() -> anyhow::Result<()> {
                 .with_writer(std::io::stderr)
                 .init();
 
-            tracing::info!("Starting RNA MCP server (stdio) for repo at {}", repo_root.display());
+            tracing::info!(
+                "Starting RNA MCP server (stdio) for repo at {}",
+                repo_root.display()
+            );
 
             let transport = rust_mcp_sdk::StdioTransport::new(Default::default())
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -102,7 +128,9 @@ async fn main() -> anyhow::Result<()> {
 
             tracing::info!(
                 "Starting RNA MCP server on {}:{} for repo at {}",
-                cli.host, cli.port, repo_root.display()
+                cli.host,
+                cli.port,
+                repo_root.display()
             );
 
             let server = rust_mcp_sdk::mcp_server::hyper_server::create_server(
