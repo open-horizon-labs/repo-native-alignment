@@ -27,6 +27,7 @@ const DEFAULT_EXCLUDES: &[&str] = &[
     "__pycache__/",
     ".git/",
     ".claude/",
+    ".omp/",
     "dist/",
     "vendor/",
     ".build/",
@@ -37,6 +38,57 @@ const DEFAULT_EXCLUDES: &[&str] = &[
     "*.dylib",
     ".DS_Store",
 ];
+
+/// Scanner configuration loaded from `.oh/config.toml`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScanConfig {
+    /// Additional exclude patterns (merged with defaults).
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Patterns to remove from default excludes (opt back in).
+    #[serde(default)]
+    pub include: Vec<String>,
+}
+
+impl ScanConfig {
+    /// Load from `.oh/config.toml` if it exists, otherwise return defaults.
+    pub fn load(repo_root: &Path) -> Self {
+        let config_path = repo_root.join(".oh").join("config.toml");
+        match std::fs::read_to_string(&config_path) {
+            Ok(content) => {
+                // Parse [scanner] section from TOML
+                match toml::from_str::<TomlConfig>(&content) {
+                    Ok(parsed) => parsed.scanner.unwrap_or_default(),
+                    Err(e) => {
+                        tracing::warn!("Failed to parse {}: {}", config_path.display(), e);
+                        Self::default()
+                    }
+                }
+            }
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Merge config with default excludes to produce final exclude list.
+    pub fn effective_excludes(&self) -> Vec<String> {
+        let mut excludes: Vec<String> = DEFAULT_EXCLUDES
+            .iter()
+            .filter(|d| !self.include.iter().any(|inc| inc == *d))
+            .map(|s| s.to_string())
+            .collect();
+        for extra in &self.exclude {
+            if !excludes.contains(extra) {
+                excludes.push(extra.clone());
+            }
+        }
+        excludes
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlConfig {
+    scanner: Option<ScanConfig>,
+}
 
 // ── Public types ────────────────────────────────────────────────────
 
@@ -127,12 +179,11 @@ pub struct Scanner {
 
 impl Scanner {
     /// Create a new scanner for the given root directory.
-    /// Loads persisted state from `.oh/.cache/scan-state.json` if it exists.
+    /// Loads exclude config from `.oh/config.toml` if it exists,
+    /// and persisted state from `.oh/.cache/scan-state.json`.
     pub fn new(repo_root: PathBuf) -> Result<Self> {
-        Self::with_excludes(
-            repo_root,
-            DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect(),
-        )
+        let config = ScanConfig::load(&repo_root);
+        Self::with_excludes(repo_root, config.effective_excludes())
     }
 
     /// Create a scanner with custom exclude patterns.
