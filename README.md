@@ -92,6 +92,10 @@ This does everything:
 
 The system compounds from here. Skills and agents use `oh_search_context` to discover relevant context. Write tools record what you learn. Next session starts richer.
 
+## Design Notes
+
+- [`docs/rna-source-compatibility.md`](docs/rna-source-compatibility.md) — steers the workspace-engine roadmap so RNA stays a strong local MCP runtime now and a clean future Context Assembler source later
+
 ## The Four Systems
 
 ### RNA MCP Server (this repo) — 17 tools
