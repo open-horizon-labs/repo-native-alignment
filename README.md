@@ -57,7 +57,7 @@ Four systems collaborate. Each is independent; together they compound.
 ```bash
 git clone https://github.com/open-horizon-labs/repo-native-alignment.git
 cd repo-native-alignment
-cargo install --path .
+cargo install --locked --path .
 ```
 
 ### 2. Bootstrap a project
@@ -70,8 +70,8 @@ repo-native-alignment setup --project /path/to/your/project
 
 This does, in order:
 
-1. Preflights `cargo`, `protoc`, and `npx` — fails fast with exact remediation if anything is missing.
-2. Installs/updates the RNA binary via `cargo install --path <rna repo root>`.
+1. Preflights required tools for the selected actions: checks `cargo` + `protoc` when RNA source is available for reinstall, and checks `npx` unless `--skip-skills` is set.
+2. Installs/updates the RNA binary via `cargo install --locked --path <rna repo root>` when source is available; otherwise reuses an already-installed binary.
 3. Installs OH skills globally: `npx skills add open-horizon-labs/skills -g -a claude-code -y`.
 4. Writes or merges `<project>/.mcp.json`, adding the `rna-server` entry and preserving any existing servers.
 5. Verifies the configured binary responds to `--help` and that `.mcp.json` contains `rna-server`.

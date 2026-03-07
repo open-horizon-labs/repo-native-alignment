@@ -130,12 +130,12 @@ repo-native-alignment setup --project <PATH>  # default: .
 ```
 
 **Execution flow (in order):**
-1. Preflight: checks `cargo`, `protoc`, `npx` are on `PATH`; emits exact remediation command per missing dep and aborts.
-2. RNA install: `cargo install --path <rna repo root>` — skipped on `--dry-run`.
+1. Preflight: checks only the tools required for selected actions (`cargo`/`protoc` when source reinstall is possible, `npx` unless `--skip-skills`); emits remediation and aborts on missing required deps.
+2. RNA install: runs `cargo install --locked --path <rna repo root>` when source path exists; if source is missing but an installed binary exists, setup continues using the existing binary.
 3. Skills install: `npx skills add open-horizon-labs/skills -g -a claude-code -y` — skipped on `--skip-skills` or `--dry-run`.
 4. MCP config merge: reads `<project>/.mcp.json` if present, sets `mcpServers.rna-server` to:
    - `type: "stdio"`
-   - `command: "$HOME/.cargo/bin/repo-native-alignment"`
+   - `command: "<CARGO_INSTALL_ROOT|CARGO_HOME|HOME cargo bin>/repo-native-alignment"`
    - `args: ["--repo", "<absolute project path>"]`
    - `timeout: 10000`
    Preserves all other top-level keys and server entries. Writes pretty JSON output.
@@ -150,6 +150,6 @@ repo-native-alignment setup --project <PATH>  # default: .
 ### Known Gaps
 
 - OH MCP server installation is **not** automated by `setup`; OH MCP requires a separate install or manual `.mcp.json` entry. The setup command configures RNA MCP only.
-- Cross-platform path handling: `$HOME/.cargo/bin` assumes Unix. Windows (`%USERPROFILE%\.cargo\bin`) is not yet handled in the config writer.
-- `cargo install --path` step inside `setup` requires the RNA repo to still be present on disk post-initial-install; users who deleted the clone after first build need to re-clone.
+- Windows binary naming/path edge cases remain (`repo-native-alignment.exe` and default `%USERPROFILE%\\.cargo\\bin` handling need explicit validation).
+- If both RNA source path and installed binary are unavailable, setup fails with remediation (re-clone or install a release binary first).
 - Smoke verification (`--skip-verify` bypass) uses binary `--help` rather than a real MCP tool call; true end-to-end verification would require a real MCP client path (noted in guardrails; deferred to P2).

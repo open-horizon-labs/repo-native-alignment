@@ -55,25 +55,69 @@ pub fn run(args: &SetupArgs) -> Result<()> {
         println!("[dry-run] Setup for project: {}", project_path.display());
         println!("[dry-run] No files will be written; no commands will be run.\n");
     } else {
-        println!("Setting up RNA + OH MCP for project: {}", project_path.display());
+        println!(
+            "Setting up RNA + OH MCP for project: {}",
+            project_path.display()
+        );
     }
 
     // ── Step 1: preflight ───────────────────────────────────────────────────
     println!("Checking dependencies...");
-    preflight()?;
+    let binary = installed_binary_path()?;
+    let source_available = Path::new(RNA_MANIFEST_DIR).exists();
+
+    if args.dry_run {
+        if source_available {
+            println!("[dry-run] Would check: cargo --version");
+            println!("[dry-run] Would check: protoc --version");
+        } else if binary.exists() {
+            println!(
+                "[dry-run] Would skip cargo/protoc checks (RNA source path missing; existing binary found at {})",
+                binary.display()
+            );
+        } else {
+            println!(
+                "[dry-run] Would fail without RNA source or existing binary at {}",
+                binary.display()
+            );
+        }
+
+        if args.skip_skills {
+            println!("[dry-run] Would skip: npx --version (--skip-skills)\n");
+        } else {
+            println!("[dry-run] Would check: npx --version\n");
+        }
+    } else {
+        preflight(source_available, !args.skip_skills)?;
+    }
 
     // ── Step 2: install RNA binary ─────────────────────────────────────────
     if args.dry_run {
-        println!("[dry-run] Would run: cargo install --path {RNA_MANIFEST_DIR}");
+        if source_available {
+            println!("[dry-run] Would run: cargo install --locked --path {RNA_MANIFEST_DIR}");
+        } else if binary.exists() {
+            println!(
+                "[dry-run] Would skip RNA install (source path missing); existing binary: {}",
+                binary.display()
+            );
+        } else {
+            println!(
+                "[dry-run] Would fail install: source path missing and binary not found at {}",
+                binary.display()
+            );
+        }
     } else {
-        install_rna_binary()?;
+        install_rna_binary(&binary)?;
     }
 
     // ── Step 3: install OH skills ──────────────────────────────────────────
-    let skills_cmd =
-        "npx skills add open-horizon-labs/skills -g -a claude-code -y";
+    let skills_cmd = "npx skills add open-horizon-labs/skills -g -a claude-code -y";
     if args.dry_run {
-        println!("[dry-run] Would run: {skills_cmd}");
+        if args.skip_skills {
+            println!("[dry-run] Would skip OH skills install (--skip-skills)");
+        } else {
+            println!("[dry-run] Would run: {skills_cmd}");
+        }
     } else if args.skip_skills {
         println!("[skip] OH skills install skipped (--skip-skills)");
     } else {
@@ -83,26 +127,23 @@ pub fn run(args: &SetupArgs) -> Result<()> {
     // ── Step 4: merge .mcp.json ────────────────────────────────────────────
     let mcp_path = project_path.join(".mcp.json");
     if args.dry_run {
-        let home = std::env::var("HOME")
-            .context("HOME is not set; cannot compute installed binary path")?;
-        let binary = PathBuf::from(&home).join(".cargo/bin/repo-native-alignment");
         println!("[dry-run] Would write/update: {}", mcp_path.display());
-        println!(
-            "  mcpServers.rna-server.command = {}",
-            binary.display()
-        );
+        println!("  mcpServers.rna-server.command = {}", binary.display());
         println!(
             "  mcpServers.rna-server.args    = [\"--repo\", \"{}\"]",
             project_path.display()
         );
     } else {
-        let binary = installed_binary_path()?;
         merge_mcp_json_with_binary(&mcp_path, &project_path, &binary)?;
     }
 
     // ── Step 5: verify ─────────────────────────────────────────────────────
     if args.dry_run {
-        println!("[dry-run] Would verify: binary --help, .mcp.json rna-server entry");
+        if args.skip_verify {
+            println!("[dry-run] Would skip verification (--skip-verify)");
+        } else {
+            println!("[dry-run] Would verify: binary --help, .mcp.json rna-server entry");
+        }
     } else if args.skip_verify {
         println!("[skip] Verification skipped (--skip-verify)");
     } else {
@@ -115,23 +156,29 @@ pub fn run(args: &SetupArgs) -> Result<()> {
 
 // ─── Preflight ───────────────────────────────────────────────────────────────
 
-fn preflight() -> Result<()> {
-    check_dep(
-        "cargo",
-        &["--version"],
-        "Install Rust: https://rustup.rs",
-    )?;
-    check_dep(
-        "protoc",
-        &["--version"],
-        "Install protobuf:\n  macOS:  brew install protobuf\n  Linux:  https://grpc.io/docs/protoc-installation/",
-    )?;
-    check_dep(
-        "npx",
-        &["--version"],
-        "Install Node.js (includes npx): https://nodejs.org",
-    )?;
-    println!("  All dependencies present.\n");
+fn preflight(require_rna_install: bool, require_skills_install: bool) -> Result<()> {
+    if require_rna_install {
+        check_dep("cargo", &["--version"], "Install Rust: https://rustup.rs")?;
+        check_dep(
+            "protoc",
+            &["--version"],
+            "Install protobuf:\n  macOS:  brew install protobuf\n  Linux:  https://grpc.io/docs/protoc-installation/",
+        )?;
+    }
+
+    if require_skills_install {
+        check_dep(
+            "npx",
+            &["--version"],
+            "Install Node.js (includes npx): https://nodejs.org",
+        )?;
+    }
+
+    if !require_rna_install && !require_skills_install {
+        println!("  No dependency checks required.\n");
+    } else {
+        println!("  All required dependencies present.\n");
+    }
     Ok(())
 }
 
@@ -150,22 +197,38 @@ fn check_dep(cmd: &str, args: &[&str], remediation: &str) -> Result<()> {
                 stderr.trim()
             )
         }
-        Err(_) => bail!(
-            "Preflight failed: `{cmd}` not found in PATH.\n  Fix: {remediation}"
-        ),
+        Err(_) => bail!("Preflight failed: `{cmd}` not found in PATH.\n  Fix: {remediation}"),
     }
 }
 
 // ─── Install steps ───────────────────────────────────────────────────────────
 
-fn install_rna_binary() -> Result<()> {
-    println!("Installing RNA binary (cargo install --path {RNA_MANIFEST_DIR}) ...");
+fn install_rna_binary(installed_binary: &Path) -> Result<()> {
+    let source_path = Path::new(RNA_MANIFEST_DIR);
+    if !source_path.exists() {
+        if installed_binary.exists() {
+            println!(
+                "RNA source path not found at {}; using existing binary: {}\n",
+                source_path.display(),
+                installed_binary.display()
+            );
+            return Ok(());
+        }
+
+        bail!(
+            "RNA source path not found at {} and existing binary not found at {}. Re-clone repo-native-alignment or install a release binary first.",
+            source_path.display(),
+            installed_binary.display()
+        );
+    }
+
+    println!("Installing RNA binary (cargo install --locked --path {RNA_MANIFEST_DIR}) ...");
     let status = Command::new("cargo")
-        .args(["install", "--path", RNA_MANIFEST_DIR])
+        .args(["install", "--locked", "--path", RNA_MANIFEST_DIR])
         .status()
         .context("Failed to launch `cargo install`")?;
     if !status.success() {
-        bail!("`cargo install --path {RNA_MANIFEST_DIR}` failed");
+        bail!("`cargo install --locked --path {RNA_MANIFEST_DIR}` failed");
     }
     println!("  RNA binary installed.\n");
     Ok(())
@@ -174,7 +237,15 @@ fn install_rna_binary() -> Result<()> {
 fn install_oh_skills() -> Result<()> {
     println!("Installing OH skills ...");
     let status = Command::new("npx")
-        .args(["skills", "add", "open-horizon-labs/skills", "-g", "-a", "claude-code", "-y"])
+        .args([
+            "skills",
+            "add",
+            "open-horizon-labs/skills",
+            "-g",
+            "-a",
+            "claude-code",
+            "-y",
+        ])
         .status()
         .context("Failed to launch `npx skills add`")?;
     if !status.success() {
@@ -187,8 +258,25 @@ fn install_oh_skills() -> Result<()> {
 // ─── .mcp.json merge ─────────────────────────────────────────────────────────
 
 fn installed_binary_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .context("HOME environment variable is not set; cannot determine installed binary path")?;
+    if let Ok(root) = std::env::var("CARGO_INSTALL_ROOT") {
+        if !root.is_empty() {
+            return Ok(PathBuf::from(root)
+                .join("bin")
+                .join("repo-native-alignment"));
+        }
+    }
+
+    if let Ok(home) = std::env::var("CARGO_HOME") {
+        if !home.is_empty() {
+            return Ok(PathBuf::from(home)
+                .join("bin")
+                .join("repo-native-alignment"));
+        }
+    }
+
+    let home = std::env::var("HOME").context(
+        "Cannot determine installed binary path; set CARGO_INSTALL_ROOT, CARGO_HOME, or HOME",
+    )?;
     Ok(PathBuf::from(home).join(".cargo/bin/repo-native-alignment"))
 }
 
@@ -231,11 +319,21 @@ pub fn merge_mcp_json_with_binary(
         ),
     }
 
+    let command_path = binary_path
+        .to_str()
+        .with_context(|| format!("Binary path is not valid UTF-8: {}", binary_path.display()))?;
+    let repo_path = project_path.to_str().with_context(|| {
+        format!(
+            "Project path is not valid UTF-8: {}",
+            project_path.display()
+        )
+    })?;
+
     // Insert / overwrite the `rna-server` entry.
     root["mcpServers"]["rna-server"] = json!({
         "type": "stdio",
-        "command": binary_path.to_string_lossy(),
-        "args": ["--repo", project_path.to_string_lossy()],
+        "command": command_path,
+        "args": ["--repo", repo_path],
         "timeout": 10000
     });
 
@@ -265,17 +363,11 @@ fn verify(mcp_path: &Path) -> Result<()> {
                 println!("  [PASS] Binary responds to --help: {}", binary.display());
             }
             Ok(out) => {
-                println!(
-                    "  [FAIL] Binary --help exited with: {}",
-                    out.status
-                );
+                println!("  [FAIL] Binary --help exited with: {}", out.status);
                 passed = false;
             }
             Err(e) => {
-                println!(
-                    "  [FAIL] Cannot run {}: {e}",
-                    binary.display()
-                );
+                println!("  [FAIL] Cannot run {}: {e}", binary.display());
                 passed = false;
             }
         },
@@ -385,10 +477,7 @@ mod tests {
         );
         // New server is present.
         assert_eq!(v["mcpServers"]["rna-server"]["type"], "stdio");
-        assert_eq!(
-            v["mcpServers"]["rna-server"]["args"][1],
-            "/proj"
-        );
+        assert_eq!(v["mcpServers"]["rna-server"]["args"][1], "/proj");
     }
 
     // ── rewrite stale rna-server entry ───────────────────────────────────────
@@ -417,7 +506,10 @@ mod tests {
         merge_mcp_json_with_binary(&mcp, Path::new("/new/project"), &new_binary).unwrap();
 
         let v = read_json(&mcp);
-        assert_eq!(v["mcpServers"]["rna-server"]["command"], "/new/bin/repo-native-alignment");
+        assert_eq!(
+            v["mcpServers"]["rna-server"]["command"],
+            "/new/bin/repo-native-alignment"
+        );
         assert_eq!(v["mcpServers"]["rna-server"]["args"][1], "/new/project");
         assert_eq!(v["mcpServers"]["rna-server"]["timeout"], 10000);
     }
