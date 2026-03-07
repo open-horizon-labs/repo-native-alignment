@@ -4,38 +4,20 @@ use anyhow::Result;
 
 use crate::types::{CodeSymbol, SymbolKind};
 
-/// Recursively find all `.rs` files under `repo_root`, excluding `.git/` and `target/`,
+/// Recursively find all `.rs` files under `repo_root`, respecting .gitignore rules,
 /// parse each with tree-sitter, and return the collected symbols.
 pub fn extract_symbols(repo_root: &Path) -> Result<Vec<CodeSymbol>> {
     let mut symbols = Vec::new();
-    walk_dir(repo_root, &mut symbols)?;
-    Ok(symbols)
-}
-
-fn walk_dir(dir: &Path, symbols: &mut Vec<CodeSymbol>) -> Result<()> {
-    let entries = std::fs::read_dir(dir)?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let file_name = entry.file_name();
-        let name = file_name.to_string_lossy();
-
-        // Skip .git/ and target/ directories
-        if path.is_dir() {
-            if name == ".git" || name == "target" {
-                continue;
-            }
-            walk_dir(&path, symbols)?;
-        } else if path.extension().map_or(false, |ext| ext == "rs") {
-            match parse_rust_file(&path) {
-                Ok(file_symbols) => symbols.extend(file_symbols),
-                Err(e) => {
-                    tracing::warn!("Failed to parse {}: {}", path.display(), e);
-                }
+    let rs_files = crate::walk::walk_repo_files(repo_root, &["rs"])?;
+    for path in rs_files {
+        match parse_rust_file(&path) {
+            Ok(file_symbols) => symbols.extend(file_symbols),
+            Err(e) => {
+                tracing::warn!("Failed to parse {}: {}", path.display(), e);
             }
         }
     }
-    Ok(())
+    Ok(symbols)
 }
 
 /// Parse a single Rust file with tree-sitter and extract code symbols.

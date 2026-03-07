@@ -124,6 +124,16 @@ pub struct SearchAll {
     pub query: String,
 }
 
+#[macros::mcp_tool(
+    name = "outcome_progress",
+    description = "The real intersection query: given an outcome ID, finds related commits (by [outcome:X] tags and file pattern matches), code symbols in changed files, and markdown mentioning the outcome. This joins layers structurally, not by keyword."
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct OutcomeProgress {
+    /// The outcome ID (e.g. 'agent-alignment') from .oh/outcomes/
+    pub outcome_id: String,
+}
+
 // ── ServerHandler ───────────────────────────────────────────────────
 
 pub struct RnaHandler {
@@ -162,6 +172,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 SearchCommits::tool(),
                 FileHistory::tool(),
                 SearchAll::tool(),
+                OutcomeProgress::tool(),
             ],
             meta: None,
             next_cursor: None,
@@ -348,6 +359,14 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             "search_all" => {
                 let args: SearchAll = parse_args(params.arguments)?;
                 match query::query_all(root, &args.query) {
+                    Ok(result) => Ok(text_result(result.to_markdown())),
+                    Err(e) => Ok(text_result(format!("Error: {}", e))),
+                }
+            }
+
+            "outcome_progress" => {
+                let args: OutcomeProgress = parse_args(params.arguments)?;
+                match query::outcome_progress(root, &args.outcome_id) {
                     Ok(result) => Ok(text_result(result.to_markdown())),
                     Err(e) => Ok(text_result(format!("Error: {}", e))),
                 }

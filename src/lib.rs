@@ -5,3 +5,4 @@ pub mod git;
 pub mod query;
 pub mod server;
 pub mod types;
+pub mod walk;

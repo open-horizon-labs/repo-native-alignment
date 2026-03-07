@@ -2,11 +2,14 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use std::collections::HashSet;
+use std::path::PathBuf;
+
 use crate::code;
 use crate::git;
 use crate::markdown;
 use crate::oh;
-use crate::types::{OhArtifact, QueryResult};
+use crate::types::{OhArtifact, OhArtifactKind, QueryResult};
 
 /// The main intersection query: searches across all layers (.oh/ artifacts,
 /// markdown chunks, code symbols, git commits) using case-insensitive
@@ -77,6 +80,94 @@ pub fn get_full_context(repo_root: &Path) -> Result<QueryResult> {
     Ok(QueryResult {
         query: String::from("(full context)"),
         outcomes,
+        markdown_chunks,
+        code_symbols,
+        commits,
+    })
+}
+
+/// The real intersection query: given an outcome ID, find related commits,
+/// code symbols, and markdown by following structural links — not keyword matching.
+///
+/// 1. Find the outcome by ID
+/// 2. Find commits tagged `[outcome:{id}]` in their message
+/// 3. Find commits touching files matching the outcome's `files:` patterns
+/// 4. Deduplicate commits
+/// 5. For changed files in those commits, find code symbols defined there
+/// 6. Find markdown sections mentioning the outcome ID
+pub fn outcome_progress(repo_root: &Path, outcome_id: &str) -> Result<QueryResult> {
+    // 1. Find the outcome
+    let all_artifacts = oh::load_oh_artifacts(repo_root)?;
+    let outcome = all_artifacts
+        .iter()
+        .find(|a| a.kind == OhArtifactKind::Outcome && a.id() == outcome_id);
+
+    let outcome = match outcome {
+        Some(o) => o.clone(),
+        None => anyhow::bail!("Outcome '{}' not found in .oh/outcomes/", outcome_id),
+    };
+
+    // Extract file patterns from frontmatter
+    let file_patterns: Vec<String> = outcome
+        .frontmatter
+        .get("files")
+        .and_then(|v| v.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 2. Find commits tagged with this outcome
+    let tagged_commits = git::search_by_outcome_tag(repo_root, outcome_id, 100)
+        .unwrap_or_default();
+
+    // 3. Find commits touching outcome's declared files
+    let pattern_commits = if file_patterns.is_empty() {
+        Vec::new()
+    } else {
+        git::commits_touching_patterns(repo_root, &file_patterns, 100)
+            .unwrap_or_default()
+    };
+
+    // 4. Deduplicate commits by hash, preserving order (tagged first)
+    let mut seen_hashes = HashSet::new();
+    let mut commits = Vec::new();
+    for c in tagged_commits.into_iter().chain(pattern_commits.into_iter()) {
+        if seen_hashes.insert(c.hash.clone()) {
+            commits.push(c);
+        }
+    }
+
+    // 5. Collect changed files from all commits, find symbols in those files
+    let changed_files: HashSet<PathBuf> = commits
+        .iter()
+        .flat_map(|c| c.changed_files.iter().cloned())
+        .collect();
+
+    let all_symbols = code::extract_symbols(repo_root).unwrap_or_default();
+    let code_symbols = all_symbols
+        .into_iter()
+        .filter(|sym| {
+            // Match if symbol's file is in the changed files set
+            // Need to compare relative paths
+            let sym_rel = sym.file_path.strip_prefix(repo_root)
+                .unwrap_or(&sym.file_path);
+            changed_files.contains(sym_rel)
+        })
+        .collect();
+
+    // 6. Find markdown mentioning this outcome
+    let all_chunks = markdown::extract_markdown_chunks(repo_root).unwrap_or_default();
+    let markdown_chunks = markdown::search_chunks(&all_chunks, outcome_id)
+        .into_iter()
+        .cloned()
+        .collect();
+
+    Ok(QueryResult {
+        query: format!("outcome_progress({})", outcome_id),
+        outcomes: vec![outcome],
         markdown_chunks,
         code_symbols,
         commits,

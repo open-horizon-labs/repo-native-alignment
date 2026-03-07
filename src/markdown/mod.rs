@@ -1,16 +1,18 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use anyhow::Result;
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 
 use crate::types::MarkdownChunk;
 
-/// Recursively find all `.md` files under `repo_root`, excluding `.git/` and `target/`,
+/// Recursively find all `.md` files under `repo_root`, respecting .gitignore rules,
 /// and parse each into heading-delimited chunks.
 pub fn extract_markdown_chunks(repo_root: &Path) -> Result<Vec<MarkdownChunk>> {
     let mut chunks = Vec::new();
-    let md_files = find_markdown_files(repo_root)?;
+    let md_files = crate::walk::walk_repo_files(repo_root, &["md"])?;
     for path in md_files {
         match parse_markdown_file(&path) {
             Ok(file_chunks) => chunks.extend(file_chunks),
@@ -151,38 +153,6 @@ pub fn search_chunks<'a>(chunks: &'a [MarkdownChunk], query: &str) -> Vec<&'a Ma
                 .any(|h| h.to_lowercase().contains(&query_lower))
         })
         .collect()
-}
-
-/// Recursively walk `dir` to find all `.md` files, skipping `.git/` and `target/`.
-fn find_markdown_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut results = Vec::new();
-    walk_dir(dir, &mut results)?;
-    results.sort();
-    Ok(results)
-}
-
-fn walk_dir(dir: &Path, results: &mut Vec<PathBuf>) -> Result<()> {
-    let entries = fs::read_dir(dir)?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let file_name = entry.file_name();
-        let name = file_name.to_string_lossy();
-
-        if path.is_dir() {
-            if name == ".git" || name == "target" {
-                continue;
-            }
-            walk_dir(&path, results)?;
-        } else if path.is_file() {
-            if let Some(ext) = path.extension() {
-                if ext.eq_ignore_ascii_case("md") {
-                    results.push(path);
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 fn heading_level_to_u32(level: HeadingLevel) -> u32 {

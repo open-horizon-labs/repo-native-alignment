@@ -141,6 +141,71 @@ pub fn changed_files_between(
     Ok(paths)
 }
 
+/// Returns commits whose messages contain `[outcome:{outcome_id}]` tag.
+pub fn search_by_outcome_tag(
+    repo_root: &Path,
+    outcome_id: &str,
+    max_count: usize,
+) -> Result<Vec<GitCommitInfo>> {
+    let tag = format!("[outcome:{}]", outcome_id);
+    search_commits(repo_root, &tag, max_count)
+}
+
+/// Returns commits that modified any file matching the given glob patterns.
+/// Patterns are matched against the relative file path (e.g. "src/oh/*").
+pub fn commits_touching_patterns(
+    repo_root: &Path,
+    patterns: &[String],
+    max_count: usize,
+) -> Result<Vec<GitCommitInfo>> {
+    let repo = Repository::open(repo_root).context("Failed to open git repository")?;
+
+    let mut revwalk = repo.revwalk().context("Failed to create revwalk")?;
+    revwalk.push_head().context("Failed to push HEAD to revwalk")?;
+    revwalk.set_sorting(git2::Sort::TIME)?;
+
+    let mut commits = Vec::new();
+
+    for oid_result in revwalk {
+        if commits.len() >= max_count {
+            break;
+        }
+        let oid = oid_result.context("Failed to get commit oid")?;
+        let commit = repo.find_commit(oid).context("Failed to find commit")?;
+        let changed = changed_files_for_commit(&repo, &commit)?;
+
+        let matches = changed.iter().any(|f| {
+            let f_str = f.to_string_lossy();
+            patterns.iter().any(|pat| glob_match(pat, &f_str))
+        });
+
+        if matches {
+            commits.push(build_commit_info(&commit, changed));
+        }
+    }
+
+    Ok(commits)
+}
+
+/// Simple glob matching: supports `*` (any segment chars) and `**` is not special yet.
+fn glob_match(pattern: &str, path: &str) -> bool {
+    // Simple implementation: convert glob to a check
+    // "src/oh/*" matches "src/oh/mod.rs"
+    // "src/server.rs" matches exactly
+    if !pattern.contains('*') {
+        return path == pattern;
+    }
+    // Replace * with regex-like matching
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 2 {
+        // Single wildcard: prefix*suffix
+        path.starts_with(parts[0]) && path.ends_with(parts[1])
+    } else {
+        // Fallback: just check prefix
+        path.starts_with(parts[0])
+    }
+}
+
 // ── internal helpers ────────────────────────────────────────────────
 
 /// Extracts changed files for a single commit by diffing against its first parent
