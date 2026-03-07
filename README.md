@@ -42,32 +42,55 @@ Four systems collaborate. Each is independent; together they compound.
 
 ## Quick Start
 
-```bash
-# 1. Build the RNA MCP server
-cargo build --release
+### 1. Install OH Skills (one-time, global)
 
-# 2. Configure Claude Code (.mcp.json in project root)
-cat > .mcp.json << 'EOF'
+```bash
+npx skills add open-horizon-labs/skills -g -a claude-code -y
+```
+
+### 2. Install the RNA MCP server (one-time)
+
+```bash
+# Clone and build
+git clone https://github.com/open-horizon-labs/repo-native-alignment.git
+cd repo-native-alignment
+cargo build --release
+```
+
+### 3. Add RNA MCP to your project
+
+In your project's root directory, add to `.mcp.json` (create if missing, merge if existing):
+
+```json
 {
   "mcpServers": {
     "rna-server": {
       "type": "stdio",
-      "command": "./target/release/repo-native-alignment",
+      "command": "/path/to/repo-native-alignment/target/release/repo-native-alignment",
       "args": ["--repo", "."]
     }
   }
 }
-EOF
-
-# 3. Install OH Skills (optional, recommended)
-npx skills add open-horizon-labs/skills -g -a claude-code -y
-
-# 4. Scaffold .oh/ — run in Claude Code:
-#    Call the oh_init tool, or run /teach-oh for full project setup
-#    /teach-oh also installs phase agents to .claude/agents/
-
-# 5. Start working — the system compounds from here
 ```
+
+### 4. Run `/teach-oh`
+
+Open a Claude Code session in your project and run:
+
+```
+/teach-oh
+```
+
+This does everything:
+- Explores your codebase (stack, patterns, conventions)
+- Asks about your aims and constraints
+- Writes `AGENTS.md` with project context
+- Scaffolds `.oh/` with outcomes, signals, guardrails
+- Installs phase agents to `.claude/agents/`
+
+### 5. Start working
+
+The system compounds from here. Skills and agents use `oh_search_context` to discover relevant context. Write tools record what you learn. Next session starts richer.
 
 ## The Four Systems
 
@@ -173,6 +196,16 @@ No cloud dependency. Everything is local, git-versioned, and disposable. The emb
 
 ## Status
 
-Working prototype. 17 MCP tools, 20 tests, stdio + HTTP transport. Skills integration PR open. Phase agents installed. Full read-write loop exercised on real work. Semantic search over `.oh/` artifacts via fastembed-rs and LanceDB.
+**Validated on 3 repos** — repo-native-alignment (self-referential), fspulse (Rust CLI), innovation-connector (enterprise Python+TS monorepo). Cold-started on all three, returned real context.
 
-**Next:** Grounded `oh_init` (scaffold from OH graph, not templates), then cross-references (markdown code spans -> symbol table). See `.oh/p4-solution-space.md`.
+- 17 MCP tools, 20 tests, stdio + HTTP transport
+- Semantic search via fastembed-rs + LanceDB (local ONNX, no API key)
+- Phase agents installed, skills integrated
+- Full read-write feedback loop exercised on real work
+- 7 metis entries, 6 guardrails, 2 signals — all recorded via MCP tools
+
+**Known gaps:**
+- Broad `files:` patterns make `outcome_progress` noisy — need sharper globs or commit tagging
+- `[outcome:X]` commit tagging convention not yet adopted on any repo besides this one
+- `oh_init` scaffolds templates — should pull from OH graph for grounded context (P6)
+- No `cargo install` yet — binary must be built from source
