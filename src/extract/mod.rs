@@ -8,6 +8,7 @@
 //! for fine-grained checks. Multiple extractors can handle the same file.
 
 pub mod go;
+pub mod markdown;
 pub mod python;
 pub mod rust;
 pub mod typescript;
@@ -101,6 +102,7 @@ impl ExtractorRegistry {
         registry.register(Box::new(python::PythonExtractor::new()));
         registry.register(Box::new(typescript::TypeScriptExtractor::new()));
         registry.register(Box::new(go::GoExtractor::new()));
+        registry.register(Box::new(markdown::MarkdownExtractor::new()));
         registry
     }
 
@@ -247,7 +249,7 @@ mod tests {
     #[test]
     fn test_registry_with_builtins_has_extractors() {
         let registry = ExtractorRegistry::with_builtins();
-        assert_eq!(registry.len(), 4); // rust, python, typescript, go
+        assert_eq!(registry.len(), 5); // rust, python, typescript, go, markdown
     }
 
     #[test]
