@@ -26,14 +26,14 @@ use tokio::sync::OnceCell;
 
 #[macros::mcp_tool(
     name = "oh_get_context",
-    description = "Returns the full business context bundle: outcomes, signals, guardrails, metis, plus recent commits, code symbols, and markdown sections. This is the single read tool for all .oh/ artifacts."
+    description = "Returns concise business context: outcomes, signals, guardrails, metis. Use this to understand project aims and constraints. For code exploration use search_symbols instead."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct OhGetContext {}
 
 #[macros::mcp_tool(
     name = "oh_search_context",
-    description = "Semantic search over .oh/ artifacts, git commits, and optionally code symbols and markdown. Finds outcomes, guardrails, metis, signals, and commits relevant to a natural language query. Set include_code=true to also search code symbols, include_markdown=true for markdown sections."
+    description = "Use this INSTEAD OF Grep for searching business context, commits, and optionally code/markdown. Describe what you need in natural language. Set include_code=true to also search code symbols, include_markdown=true for markdown sections."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct OhSearchContext {
@@ -119,7 +119,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search_symbols",
-    description = "Searches code symbols across all languages (Rust, Python, TypeScript, Go) from the workspace graph. Returns functions, structs, traits, classes, interfaces with file location and edges. Multi-language, graph-aware search."
+    description = "Use this INSTEAD OF Grep/Read for finding code symbols. Searches functions, structs, traits, classes, interfaces across Rust, Python, TypeScript, Go, Markdown. Returns file location, line numbers, signatures, and graph edges. Faster and richer than grep."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SearchSymbols {
@@ -144,7 +144,7 @@ pub struct SearchSymbols {
 
 #[macros::mcp_tool(
     name = "graph_query",
-    description = "Query the code graph: find neighbors (what calls/depends on a symbol), impact analysis (what depends on this), or reachable nodes within N hops. Use after search_symbols to explore relationships."
+    description = "Use this INSTEAD OF Read/Grep for tracing code relationships. Find neighbors (what calls/depends on a symbol), impact analysis (what depends on this), or reachable nodes within N hops. Use after search_symbols to get a node_id."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GraphQuery {
@@ -170,7 +170,7 @@ fn default_graph_mode() -> String {
 
 #[macros::mcp_tool(
     name = "git_history",
-    description = "Search git history: find commits by message query, or view the change history of a specific file. Provide 'query' to search commit messages, or 'file' to get file history."
+    description = "Use this INSTEAD OF Bash git commands. Search commits by message query, or view file change history. Provide 'query' to search commit messages, or 'file' to get file history."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GitHistory {
@@ -449,7 +449,10 @@ fn build_context_preamble(root: &Path) -> String {
         parts.push(section);
     }
 
-    format!("---\n# Business Context (auto-injected on first tool call)\n\n{}\n---\n\n", parts.join("\n"))
+    let mut out = format!("---\n# Business Context (auto-injected on first tool call)\n\n{}\n", parts.join("\n"));
+    out.push_str("**Code exploration:** use `search_symbols` (not Grep), `graph_query` (not Read), `oh_search_context` (not search_all)\n");
+    out.push_str("---\n\n");
+    out
 }
 
 #[async_trait]

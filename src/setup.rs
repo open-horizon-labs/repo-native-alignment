@@ -140,7 +140,7 @@ pub fn run(args: &SetupArgs) -> Result<()> {
         merge_mcp_json_with_binary(&mcp_path, &project_path, &binary)?;
     }
 
-    // ── Step 4.5: append MCP tool guidance to AGENTS.md ────────────────────
+    // ── Step 4.5: append MCP tool guidance to AGENTS.md + CLAUDE.md ────────
     let agents_md = project_path.join("AGENTS.md");
     if args.dry_run {
         if agents_md.exists() {
@@ -148,8 +148,18 @@ pub fn run(args: &SetupArgs) -> Result<()> {
         } else {
             println!("[dry-run] No AGENTS.md found; skipping tool guidance injection");
         }
-    } else if agents_md.exists() {
-        inject_mcp_guidance(&agents_md)?;
+        let claude_md = project_path.join("CLAUDE.md");
+        if claude_md.exists() {
+            println!("[dry-run] Would append MCP override to CLAUDE.md");
+        }
+    } else {
+        if agents_md.exists() {
+            inject_mcp_guidance(&agents_md)?;
+        }
+        let claude_md = project_path.join("CLAUDE.md");
+        if claude_md.exists() {
+            inject_claude_md_override(&claude_md)?;
+        }
     }
 
     // ── Step 5: initialize source boundary ──────────────────────────────────
@@ -680,6 +690,33 @@ fn inject_mcp_guidance(agents_md: &Path) -> Result<()> {
         .with_context(|| format!("Cannot write {}", agents_md.display()))?;
 
     println!("  Appended RNA MCP tool guidance to AGENTS.md");
+    Ok(())
+}
+
+// ─── CLAUDE.md MCP override injection ─────────────────────────────────────────
+
+const CLAUDE_MD_MARKER: &str = "<!-- RNA MCP override -->";
+
+const CLAUDE_MD_BLOCK: &str = r#"
+<!-- RNA MCP override -->
+When searching for code symbols, functions, types, or imports: ALWAYS use `search_symbols` MCP tool, NEVER use Grep or Read for symbol discovery. When tracing relationships: use `graph_query`. When searching business context: use `oh_search_context`. When recording learnings: use `oh_record`.
+<!-- end RNA MCP override -->
+"#;
+
+fn inject_claude_md_override(claude_md: &Path) -> Result<()> {
+    let content = std::fs::read_to_string(claude_md)
+        .with_context(|| format!("Cannot read {}", claude_md.display()))?;
+
+    if content.contains(CLAUDE_MD_MARKER) {
+        println!("  CLAUDE.md already has RNA MCP override; skipping.");
+        return Ok(());
+    }
+
+    let updated = format!("{}\n{}", content.trim_end(), CLAUDE_MD_BLOCK);
+    std::fs::write(claude_md, updated)
+        .with_context(|| format!("Cannot write {}", claude_md.display()))?;
+
+    println!("  Appended RNA MCP override to CLAUDE.md");
     Ok(())
 }
 
