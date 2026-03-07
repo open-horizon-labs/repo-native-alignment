@@ -254,9 +254,53 @@ impl EnricherRegistry {
     }
 
     /// Create a registry pre-loaded with all built-in enrichers.
+    ///
+    /// Registers LSP enrichers for all languages that have tree-sitter extractors:
+    /// Rust, Python, TypeScript/JavaScript, Go, and Markdown.
+    ///
+    /// Each enricher checks for its server binary at enrichment time (not startup),
+    /// so missing language servers are handled gracefully.
     pub fn with_builtins() -> Self {
         let mut registry = Self::new();
-        registry.register(Box::new(lsp::LspEnricher::new()));
+        registry.register(Box::new(lsp::LspEnricher::new(
+            "rust",
+            "rust-analyzer",
+            &[],
+            &["rs"],
+        )));
+        registry.register(Box::new(
+            lsp::LspEnricher::new(
+                "python",
+                "pyright-langserver",
+                &["--stdio"],
+                &["py"],
+            )
+            .with_settings(serde_json::json!({
+                "python": {
+                    "analysis": {
+                        "autoSearchPaths": true
+                    }
+                }
+            })),
+        ));
+        registry.register(Box::new(lsp::LspEnricher::new(
+            "typescript",
+            "typescript-language-server",
+            &["--stdio"],
+            &["ts", "tsx", "js", "jsx"],
+        )));
+        registry.register(Box::new(lsp::LspEnricher::new(
+            "go",
+            "gopls",
+            &["serve"],
+            &["go"],
+        )));
+        registry.register(Box::new(lsp::LspEnricher::new(
+            "markdown",
+            "marksman",
+            &["server"],
+            &["md"],
+        )));
         registry
     }
 

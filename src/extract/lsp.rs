@@ -1,13 +1,16 @@
-//! LSP-based enricher using rust-analyzer.
+//! LSP-based enricher for cross-file reference discovery.
 //!
-//! Phase 2 enrichment: spawns rust-analyzer as a child process, sends
+//! Phase 2 enrichment: spawns a language server as a child process, sends
 //! JSON-RPC messages over stdin/stdout, and uses `textDocument/references`
 //! and `textDocument/implementation` to discover cross-file edges.
 //!
+//! Supports multiple language servers (rust-analyzer, pyright, typescript-language-server,
+//! gopls, marksman) via the same generic `LspEnricher` struct.
+//!
 //! Design decisions:
-//! - Spawns rust-analyzer on first `enrich()` call, not at startup
+//! - Spawns the language server on first `enrich()` call, not at startup
 //! - Keeps the language server alive for the session duration
-//! - If rust-analyzer is not installed, logs a warning and skips gracefully
+//! - If the server binary is not installed, logs info and skips gracefully
 //! - 60-second timeout per LSP request
 
 use std::path::{Path, PathBuf};
@@ -75,7 +78,7 @@ struct LspTransport {
 
 impl LspTransport {
     /// Spawn a language server process and set up the transport.
-    async fn spawn(command: &str, args: &[&str], root_path: &Path) -> Result<Self> {
+    async fn spawn(command: &str, args: &[String], root_path: &Path) -> Result<Self> {
         let mut child = Command::new(command)
             .args(args)
             .stdin(std::process::Stdio::piped())
@@ -220,9 +223,24 @@ impl LspTransport {
 // LspEnricher
 // ---------------------------------------------------------------------------
 
-/// LSP enricher that uses rust-analyzer to discover cross-file references
-/// and trait implementations.
+/// LSP enricher that uses a language server to discover cross-file references
+/// and trait/interface implementations.
+///
+/// Generic over the language server binary — the same struct handles
+/// rust-analyzer, pyright, typescript-language-server, gopls, and marksman.
 pub struct LspEnricher {
+    /// Language identifier (e.g., "rust", "python").
+    language: String,
+    /// Command to spawn (e.g., "rust-analyzer", "pyright-langserver").
+    server_command: String,
+    /// Arguments to pass to the server (e.g., ["--stdio"]).
+    server_args: Vec<String>,
+    /// File extensions this enricher handles (e.g., ["rs"], ["py"]).
+    /// Stored for future use in file-level filtering.
+    #[allow(dead_code)]
+    extensions: Vec<String>,
+    /// Optional initialization settings (sent in initialize params).
+    init_settings: Option<serde_json::Value>,
     ready: AtomicBool,
     /// Protected by mutex because enrich takes &self but we need to mutate transport state.
     state: Mutex<LspState>,
@@ -232,13 +250,24 @@ struct LspState {
     transport: Option<LspTransport>,
     /// Cached root path from initialization.
     root_path: Option<PathBuf>,
-    /// Whether we already tried and failed to start rust-analyzer.
+    /// Whether we already tried and failed to start the language server.
     init_failed: bool,
 }
 
 impl LspEnricher {
-    pub fn new() -> Self {
+    /// Create a new LSP enricher for the given language server.
+    ///
+    /// - `language`: language identifier (e.g., "rust", "python")
+    /// - `command`: binary to spawn (e.g., "rust-analyzer", "pyright-langserver")
+    /// - `args`: command-line arguments (e.g., &["--stdio"])
+    /// - `extensions`: file extensions this enricher handles (e.g., &["rs"])
+    pub fn new(language: &str, command: &str, args: &[&str], extensions: &[&str]) -> Self {
         Self {
+            language: language.to_string(),
+            server_command: command.to_string(),
+            server_args: args.iter().map(|s| s.to_string()).collect(),
+            extensions: extensions.iter().map(|s| s.to_string()).collect(),
+            init_settings: None,
             ready: AtomicBool::new(false),
             state: Mutex::new(LspState {
                 transport: None,
@@ -248,7 +277,26 @@ impl LspEnricher {
         }
     }
 
-    /// Initialize rust-analyzer if not already running.
+    /// Create a new LSP enricher with custom initialization settings.
+    ///
+    /// Settings are sent as `initializationOptions` in the LSP initialize request.
+    pub fn with_settings(mut self, settings: serde_json::Value) -> Self {
+        self.init_settings = Some(settings);
+        self
+    }
+
+    /// Check if the server binary is available on PATH.
+    fn is_server_available(&self) -> bool {
+        std::process::Command::new("which")
+            .arg(&self.server_command)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Initialize the language server if not already running.
     async fn ensure_initialized(&self, repo_root: &Path) -> Result<()> {
         let mut state = self.state.lock().await;
 
@@ -257,22 +305,46 @@ impl LspEnricher {
         }
 
         if state.init_failed {
-            return Err(anyhow::anyhow!("rust-analyzer initialization previously failed"));
+            return Err(anyhow::anyhow!(
+                "{} initialization previously failed",
+                self.server_command
+            ));
         }
 
-        tracing::info!("Starting rust-analyzer for LSP enrichment...");
+        // Check if the server binary is available before trying to spawn
+        if !self.is_server_available() {
+            state.init_failed = true;
+            tracing::info!(
+                "LSP server '{}' not found, skipping enrichment for {}",
+                self.server_command,
+                self.language
+            );
+            return Err(anyhow::anyhow!(
+                "LSP server '{}' not found on PATH",
+                self.server_command
+            ));
+        }
 
-        let transport = match LspTransport::spawn("rust-analyzer", &[], repo_root).await {
-            Ok(t) => t,
-            Err(e) => {
-                state.init_failed = true;
-                tracing::warn!(
-                    "rust-analyzer not available, skipping LSP enrichment: {}",
-                    e
-                );
-                return Err(e);
-            }
-        };
+        tracing::info!(
+            "Starting {} for {} LSP enrichment...",
+            self.server_command,
+            self.language
+        );
+
+        let transport =
+            match LspTransport::spawn(&self.server_command, &self.server_args, repo_root).await {
+                Ok(t) => t,
+                Err(e) => {
+                    state.init_failed = true;
+                    tracing::warn!(
+                        "{} not available, skipping LSP enrichment for {}: {}",
+                        self.server_command,
+                        self.language,
+                        e
+                    );
+                    return Err(e);
+                }
+            };
 
         state.transport = Some(transport);
         state.root_path = Some(repo_root.to_path_buf());
@@ -281,11 +353,16 @@ impl LspEnricher {
         let root_uri = path_to_uri(repo_root)?;
 
         #[allow(deprecated)] // root_uri is deprecated in favor of workspace_folders
-        let init_params = InitializeParams {
+        let mut init_params = InitializeParams {
             root_uri: Some(root_uri),
             capabilities: ClientCapabilities::default(),
             ..Default::default()
         };
+
+        // Apply per-language initialization settings if provided
+        if let Some(ref settings) = self.init_settings {
+            init_params.initialization_options = Some(settings.clone());
+        }
 
         let transport = state.transport.as_mut().unwrap();
         let init_result = transport.request("initialize", &init_params).await?;
@@ -299,7 +376,7 @@ impl LspEnricher {
             .notify("initialized", serde_json::json!({}))
             .await?;
 
-        tracing::info!("rust-analyzer initialized successfully");
+        tracing::info!("{} initialized successfully for {}", self.server_command, self.language);
         self.ready.store(true, Ordering::SeqCst);
 
         Ok(())
@@ -338,7 +415,7 @@ impl LspEnricher {
         Ok(locations)
     }
 
-    /// Find implementations of a trait at the given position.
+    /// Find implementations of a trait/interface at the given position.
     async fn find_implementations(
         transport: &mut LspTransport,
         file_uri: &Uri,
@@ -388,7 +465,18 @@ impl LspEnricher {
 #[async_trait::async_trait]
 impl Enricher for LspEnricher {
     fn languages(&self) -> &[&str] {
-        &["rust"]
+        // Return a static slice for each language.
+        // We leak the string to get a &'static str — this is fine because
+        // enrichers live for the entire program lifetime.
+        // However, to avoid repeated leaks, we match known languages to statics.
+        match self.language.as_str() {
+            "rust" => &["rust"],
+            "python" => &["python"],
+            "typescript" => &["typescript"],
+            "go" => &["go"],
+            "markdown" => &["markdown"],
+            _ => &[],
+        }
     }
 
     fn is_ready(&self) -> bool {
@@ -396,16 +484,27 @@ impl Enricher for LspEnricher {
     }
 
     fn name(&self) -> &str {
-        "rust-analyzer-lsp"
+        // Return a static name for known servers to avoid lifetime issues.
+        match self.language.as_str() {
+            "rust" => "rust-analyzer-lsp",
+            "python" => "pyright-lsp",
+            "typescript" => "typescript-lsp",
+            "go" => "gopls-lsp",
+            "markdown" => "marksman-lsp",
+            _ => "unknown-lsp",
+        }
     }
 
     async fn enrich(&self, nodes: &[Node], _index: &GraphIndex) -> Result<EnrichmentResult> {
         let mut result = EnrichmentResult::default();
 
-        // Filter to Rust nodes only
-        let rust_nodes: Vec<&Node> = nodes.iter().filter(|n| n.language == "rust").collect();
+        // Filter to nodes matching this enricher's language
+        let matching_nodes: Vec<&Node> = nodes
+            .iter()
+            .filter(|n| n.language == self.language)
+            .collect();
 
-        if rust_nodes.is_empty() {
+        if matching_nodes.is_empty() {
             return Ok(result);
         }
 
@@ -413,9 +512,9 @@ impl Enricher for LspEnricher {
         // The nodes have relative paths; we need the repo root for absolute paths.
         let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        // Try to initialize rust-analyzer
+        // Try to initialize the language server
         if let Err(e) = self.ensure_initialized(&repo_root).await {
-            tracing::warn!("LSP enrichment skipped: {}", e);
+            tracing::debug!("LSP enrichment skipped for {}: {}", self.language, e);
             return Ok(result);
         }
 
@@ -429,8 +528,8 @@ impl Enricher for LspEnricher {
             None => return Ok(result),
         };
 
-        // Process functions and traits
-        for node in &rust_nodes {
+        // Process functions and traits/interfaces
+        for node in &matching_nodes {
             let abs_path = root.join(&node.id.file);
             let file_uri = match path_to_uri(&abs_path) {
                 Ok(u) => u,
@@ -475,7 +574,7 @@ impl Enricher for LspEnricher {
                     }
                 }
                 NodeKind::Trait => {
-                    // Find implementations for traits
+                    // Find implementations for traits/interfaces
                     match Self::find_implementations(transport, &file_uri, line, 0).await {
                         Ok(locations) => {
                             for loc in locations {
@@ -511,7 +610,8 @@ impl Enricher for LspEnricher {
         }
 
         tracing::info!(
-            "LSP enrichment complete: {} edges added",
+            "LSP enrichment complete for {}: {} edges added",
+            self.language,
             result.added_edges.len()
         );
 
@@ -568,22 +668,57 @@ mod tests {
         assert!(result.updated_nodes.is_empty());
     }
 
-    /// Verify the LspEnricher can be constructed and has correct properties.
+    /// Verify the LspEnricher can be constructed with correct properties for each language.
     #[test]
     fn test_lsp_enricher_creation() {
-        let enricher = LspEnricher::new();
+        let enricher = LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]);
         assert_eq!(enricher.languages(), &["rust"]);
-        assert!(!enricher.is_ready()); // Not ready until initialized
+        assert!(!enricher.is_ready());
         assert_eq!(enricher.name(), "rust-analyzer-lsp");
+        assert_eq!(enricher.server_command, "rust-analyzer");
+        assert!(enricher.server_args.is_empty());
+        assert_eq!(enricher.extensions, vec!["rs"]);
     }
 
-    /// Verify enrichment returns empty result when no Rust nodes are present.
+    /// Verify enrichers for each language have correct properties.
+    #[test]
+    fn test_lsp_enricher_all_languages() {
+        let rust = LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]);
+        assert_eq!(rust.languages(), &["rust"]);
+        assert_eq!(rust.name(), "rust-analyzer-lsp");
+
+        let python = LspEnricher::new("python", "pyright-langserver", &["--stdio"], &["py"]);
+        assert_eq!(python.languages(), &["python"]);
+        assert_eq!(python.name(), "pyright-lsp");
+        assert_eq!(python.server_args, vec!["--stdio"]);
+
+        let typescript = LspEnricher::new(
+            "typescript",
+            "typescript-language-server",
+            &["--stdio"],
+            &["ts", "tsx", "js", "jsx"],
+        );
+        assert_eq!(typescript.languages(), &["typescript"]);
+        assert_eq!(typescript.name(), "typescript-lsp");
+        assert_eq!(typescript.extensions, vec!["ts", "tsx", "js", "jsx"]);
+
+        let go = LspEnricher::new("go", "gopls", &["serve"], &["go"]);
+        assert_eq!(go.languages(), &["go"]);
+        assert_eq!(go.name(), "gopls-lsp");
+        assert_eq!(go.server_args, vec!["serve"]);
+
+        let markdown = LspEnricher::new("markdown", "marksman", &["server"], &["md"]);
+        assert_eq!(markdown.languages(), &["markdown"]);
+        assert_eq!(markdown.name(), "marksman-lsp");
+    }
+
+    /// Verify enrichment returns empty result when no matching nodes are present.
     #[tokio::test]
-    async fn test_lsp_enricher_no_rust_nodes() {
-        let enricher = LspEnricher::new();
+    async fn test_lsp_enricher_no_matching_nodes() {
+        let enricher = LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]);
         let index = GraphIndex::new();
 
-        // Pass nodes with a non-Rust language
+        // Pass nodes with a non-matching language
         let nodes = vec![Node {
             id: NodeId {
                 root: String::new(),
@@ -604,7 +739,7 @@ mod tests {
         assert!(result.added_edges.is_empty());
     }
 
-    /// Verify the EnricherRegistry works correctly.
+    /// Verify the EnricherRegistry works correctly with multiple enrichers.
     #[tokio::test]
     async fn test_enricher_registry() {
         use super::super::EnricherRegistry;
@@ -614,7 +749,56 @@ mod tests {
         assert_eq!(registry.len(), 0);
 
         let registry = EnricherRegistry::with_builtins();
-        assert_eq!(registry.len(), 1); // rust-analyzer
+        assert_eq!(registry.len(), 5); // rust, python, typescript, go, markdown
+    }
+
+    /// Verify multiple enrichers can be registered and coexist.
+    #[tokio::test]
+    async fn test_multiple_enrichers_registered() {
+        use super::super::EnricherRegistry;
+
+        let mut registry = EnricherRegistry::new();
+
+        registry.register(Box::new(LspEnricher::new(
+            "rust",
+            "rust-analyzer",
+            &[],
+            &["rs"],
+        )));
+        registry.register(Box::new(LspEnricher::new(
+            "python",
+            "pyright-langserver",
+            &["--stdio"],
+            &["py"],
+        )));
+        registry.register(Box::new(LspEnricher::new(
+            "typescript",
+            "typescript-language-server",
+            &["--stdio"],
+            &["ts", "tsx", "js", "jsx"],
+        )));
+
+        assert_eq!(registry.len(), 3);
+
+        // Enrich with no nodes should work fine for all enrichers
+        let index = GraphIndex::new();
+        let result = registry.enrich_all(&[], &index, &["rust".to_string(), "python".to_string()]).await;
+        assert!(result.added_edges.is_empty());
+    }
+
+    /// Verify the with_settings builder works.
+    #[test]
+    fn test_lsp_enricher_with_settings() {
+        let settings = serde_json::json!({
+            "python": {
+                "analysis": {
+                    "autoSearchPaths": true
+                }
+            }
+        });
+        let enricher = LspEnricher::new("python", "pyright-langserver", &["--stdio"], &["py"])
+            .with_settings(settings.clone());
+        assert_eq!(enricher.init_settings, Some(settings));
     }
 
     /// Verify URI helper functions work correctly.
@@ -643,7 +827,7 @@ mod tests {
         // This test validates the LspEnricher can start and respond,
         // but we don't have a full Cargo project to index against in tests.
         // The enricher should handle the initialization gracefully.
-        let enricher = LspEnricher::new();
+        let enricher = LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]);
         let index = GraphIndex::new();
 
         let nodes = vec![Node {
