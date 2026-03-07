@@ -11,8 +11,10 @@ use rust_mcp_sdk::schema::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::embed::EmbeddingIndex;
 use crate::types::OhArtifactKind;
 use crate::{code, git, markdown, oh, query};
+use tokio::sync::OnceCell;
 
 // ── Tool input structs ──────────────────────────────────────────────
 
@@ -135,6 +137,22 @@ fn default_severity() -> String {
 }
 
 #[macros::mcp_tool(
+    name = "oh_search_context",
+    description = "Semantic search over .oh/ artifacts. Finds outcomes, guardrails, metis, and signals relevant to a natural language query. Uses local embeddings — no API key needed."
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct OhSearchContext {
+    /// Natural language description of what you're looking for
+    pub query: String,
+    /// Optional: filter by artifact type (outcome, signal, guardrail, metis)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_types: Option<Vec<String>>,
+    /// Maximum results to return (default: 5)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+}
+
+#[macros::mcp_tool(
     name = "search_markdown",
     description = "Searches all markdown files in the repo by case-insensitive substring match against headings and content"
 )]
@@ -221,13 +239,28 @@ pub struct OhInit {
 
 pub struct RnaHandler {
     pub repo_root: PathBuf,
+    pub embed_index: OnceCell<EmbeddingIndex>,
 }
 
 impl Default for RnaHandler {
     fn default() -> Self {
         Self {
             repo_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            embed_index: OnceCell::new(),
         }
+    }
+}
+
+impl RnaHandler {
+    async fn get_index(&self) -> anyhow::Result<&EmbeddingIndex> {
+        self.embed_index
+            .get_or_try_init(|| async {
+                let index = EmbeddingIndex::new(&self.repo_root).await?;
+                let count = index.index_all(&self.repo_root).await?;
+                tracing::info!("Indexed {} .oh/ artifacts for semantic search", count);
+                Ok(index)
+            })
+            .await
     }
 }
 
@@ -250,6 +283,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 OhGetMetis::tool(),
                 OhGetContext::tool(),
                 OhRecordMetis::tool(),
+                OhSearchContext::tool(),
                 OhRecordSignal::tool(),
                 OhUpdateOutcome::tool(),
                 OhRecordGuardrailCandidate::tool(),
@@ -324,6 +358,39 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         path.display()
                     ))),
                     Err(e) => Ok(text_result(format!("Error writing metis: {}", e))),
+                }
+            }
+
+            "oh_search_context" => {
+                let args: OhSearchContext = parse_args(params.arguments)?;
+                let limit = args.limit.unwrap_or(5) as usize;
+                match self.get_index().await {
+                    Ok(index) => {
+                        match index.search(&args.query, args.artifact_types.as_deref(), limit).await {
+                            Ok(results) => {
+                                if results.is_empty() {
+                                    Ok(text_result(format!(
+                                        "No .oh/ artifacts found matching \"{}\".",
+                                        args.query
+                                    )))
+                                } else {
+                                    let md: String = results
+                                        .iter()
+                                        .map(|r| r.to_markdown())
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    Ok(text_result(format!(
+                                        "## Semantic search: \"{}\"\n\n{} result(s)\n\n{}",
+                                        args.query,
+                                        results.len(),
+                                        md
+                                    )))
+                                }
+                            }
+                            Err(e) => Ok(text_result(format!("Search error: {}", e))),
+                        }
+                    }
+                    Err(e) => Ok(text_result(format!("Index error: {}", e))),
                 }
             }
 
