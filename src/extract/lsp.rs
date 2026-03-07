@@ -52,6 +52,17 @@ fn path_to_uri(path: &Path) -> Result<Uri> {
 }
 
 /// Extract a relative file path from an LSP URI, relative to a given root.
+/// Find the narrowest enclosing function/impl/struct at a given file + line.
+/// Returns None if no symbol contains this location.
+fn find_enclosing_symbol(nodes: &[&Node], file: &Path, line: usize) -> Option<NodeId> {
+    nodes.iter()
+        .filter(|n| n.id.file == file)
+        .filter(|n| matches!(n.id.kind, NodeKind::Function | NodeKind::Impl | NodeKind::Struct))
+        .filter(|n| n.line_start <= line && n.line_end >= line)
+        .min_by_key(|n| n.line_end - n.line_start) // narrowest enclosing
+        .map(|n| n.id.clone())
+}
+
 fn uri_to_relative_path(uri: &Uri, root: &Path) -> PathBuf {
     let uri_str = uri.as_str();
     if let Some(file_path_str) = uri_str.strip_prefix("file://") {
@@ -652,7 +663,6 @@ impl Enricher for LspEnricher {
             match node.id.kind {
                 NodeKind::Function => {
                     attempted += 1;
-                    // Find references (call sites) for functions
                     match Self::find_references(transport, &file_uri, line, 0).await {
                         Ok(locations) => {
                             if !locations.is_empty() {
@@ -660,22 +670,26 @@ impl Enricher for LspEnricher {
                             }
                             for loc in locations {
                                 let ref_path = uri_to_relative_path(&loc.uri, &root);
+                                let ref_line = loc.range.start.line + 1; // 0-based → 1-based
 
-                                // Create a Calls edge from the reference location to this function
-                                let caller_id = NodeId {
-                                    root: String::new(),
-                                    file: ref_path,
-                                    name: format!("ref@L{}", loc.range.start.line + 1),
-                                    kind: NodeKind::Function,
-                                };
+                                // Find the enclosing function at the reference location
+                                let caller_id = find_enclosing_symbol(
+                                    &matching_nodes, &ref_path, ref_line as usize
+                                );
 
-                                result.added_edges.push(Edge {
-                                    from: caller_id,
-                                    to: node.id.clone(),
-                                    kind: EdgeKind::Calls,
-                                    source: ExtractionSource::Lsp,
-                                    confidence: Confidence::Confirmed,
-                                });
+                                if let Some(caller) = caller_id {
+                                    // Skip self-references
+                                    if caller == node.id {
+                                        continue;
+                                    }
+                                    result.added_edges.push(Edge {
+                                        from: caller,
+                                        to: node.id.clone(),
+                                        kind: EdgeKind::Calls,
+                                        source: ExtractionSource::Lsp,
+                                        confidence: Confidence::Confirmed,
+                                    });
+                                }
                             }
                         }
                         Err(e) => {
