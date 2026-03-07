@@ -39,7 +39,7 @@ fn server_details() -> InitializeResult {
                 .to_string(),
         ),
         meta: None,
-        protocol_version: "2025-03-26".to_string(),
+        protocol_version: "2025-11-25".to_string(),
         server_info: Implementation {
             name: "rna-server".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
