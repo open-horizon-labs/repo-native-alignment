@@ -5,3 +5,4 @@
 .fastembed_cache/
 .oh/.cache/
 .claude/worktrees/
+.mcp.json

@@ -241,7 +241,7 @@ No cloud dependency. Everything is local, git-versioned, and disposable. The emb
 
 ## Status
 
-**Validated on 3 repos** — repo-native-alignment (self-referential), fspulse (Rust CLI), innovation-connector (enterprise Python+TS monorepo). Cold-started on all three, returned real context.
+**Validated on 3 repos** — repo-native-alignment (self-referential), fspulse (Rust CLI), enterprise monorepo (enterprise Python+TS monorepo). Cold-started on all three, returned real context.
 
 - 20 MCP tools, 97 tests, stdio + HTTP transport
 - Multi-language extraction: Rust, Python, TypeScript/TSX, Go, Markdown
