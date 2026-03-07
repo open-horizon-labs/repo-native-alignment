@@ -37,8 +37,8 @@ pub fn parse_markdown_file(path: &Path) -> Result<Vec<MarkdownChunk>> {
     Ok(chunks)
 }
 
-/// Core parsing logic, separated for testability.
-fn parse_markdown_source(source: &str, path: &Path) -> Vec<MarkdownChunk> {
+/// Core parsing logic, separated for testability and reuse by the markdown extractor.
+pub fn parse_markdown_source(source: &str, path: &Path) -> Vec<MarkdownChunk> {
     let mut chunks = Vec::new();
 
     // State tracking

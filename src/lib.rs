@@ -1,5 +1,6 @@
 pub mod code;
 pub mod embed;
+pub mod extract;
 pub mod git;
 pub mod graph;
 pub mod markdown;
