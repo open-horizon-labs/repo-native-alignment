@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 
 use lsp_types::{
     ClientCapabilities, GotoDefinitionParams, GotoDefinitionResponse,
-    InitializeParams, InitializeResult, Location, Position, ReferenceContext, ReferenceParams,
+    InitializeParams, InitializeResult, Location, Position,
     TextDocumentIdentifier, TextDocumentPositionParams, Uri,
 };
 
@@ -259,6 +259,10 @@ impl LspTransport {
 pub struct LspEnricher {
     /// Language identifier (e.g., "rust", "python").
     language: String,
+    /// Static ref for Enricher::languages() return (leaked once per enricher).
+    language_static: &'static [&'static str],
+    /// Display name for logging (e.g., "rust-analyzer-lsp").
+    display_name: String,
     /// Command to spawn (e.g., "rust-analyzer", "pyright-langserver").
     server_command: String,
     /// Arguments to pass to the server (e.g., ["--stdio"]).
@@ -290,8 +294,14 @@ impl LspEnricher {
     /// - `args`: command-line arguments (e.g., &["--stdio"])
     /// - `extensions`: file extensions this enricher handles (e.g., &["rs"])
     pub fn new(language: &str, command: &str, args: &[&str], extensions: &[&str]) -> Self {
+        // Leak language string once — enrichers live for the entire program
+        let lang_static: &'static str = Box::leak(language.to_string().into_boxed_str());
+        let lang_slice: &'static [&'static str] = Box::leak(vec![lang_static].into_boxed_slice());
+
         Self {
             language: language.to_string(),
+            language_static: lang_slice,
+            display_name: format!("{}-lsp", command),
             server_command: command.to_string(),
             server_args: args.iter().map(|s| s.to_string()).collect(),
             extensions: extensions.iter().map(|s| s.to_string()).collect(),
@@ -505,39 +515,6 @@ impl LspEnricher {
         Ok(())
     }
 
-    /// Find all references to a symbol at the given position.
-    async fn find_references(
-        transport: &mut LspTransport,
-        file_uri: &Uri,
-        line: u32,
-        character: u32,
-    ) -> Result<Vec<Location>> {
-        let params = ReferenceParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: file_uri.clone(),
-                },
-                position: Position { line, character },
-            },
-            context: ReferenceContext {
-                include_declaration: false,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        };
-
-        let result: serde_json::Value =
-            transport.request("textDocument/references", &params).await?;
-
-        if result.is_null() {
-            return Ok(Vec::new());
-        }
-
-        let locations: Vec<Location> = serde_json::from_value(result).unwrap_or_default();
-
-        Ok(locations)
-    }
-
     /// Prepare call hierarchy at a position. Returns the CallHierarchyItem if found.
     async fn prepare_call_hierarchy(
         transport: &mut LspTransport,
@@ -636,18 +613,7 @@ impl LspEnricher {
 #[async_trait::async_trait]
 impl Enricher for LspEnricher {
     fn languages(&self) -> &[&str] {
-        // Return a static slice for each language.
-        // We leak the string to get a &'static str — this is fine because
-        // enrichers live for the entire program lifetime.
-        // However, to avoid repeated leaks, we match known languages to statics.
-        match self.language.as_str() {
-            "rust" => &["rust"],
-            "python" => &["python"],
-            "typescript" => &["typescript"],
-            "go" => &["go"],
-            "markdown" => &["markdown"],
-            _ => &[],
-        }
+        self.language_static
     }
 
     fn is_ready(&self) -> bool {
@@ -655,15 +621,7 @@ impl Enricher for LspEnricher {
     }
 
     fn name(&self) -> &str {
-        // Return a static name for known servers to avoid lifetime issues.
-        match self.language.as_str() {
-            "rust" => "rust-analyzer-lsp",
-            "python" => "pyright-lsp",
-            "typescript" => "typescript-lsp",
-            "go" => "gopls-lsp",
-            "markdown" => "marksman-lsp",
-            _ => "unknown-lsp",
-        }
+        &self.display_name
     }
 
     async fn enrich(&self, nodes: &[Node], _index: &GraphIndex) -> Result<EnrichmentResult> {
@@ -910,7 +868,7 @@ mod tests {
 
         let python = LspEnricher::new("python", "pyright-langserver", &["--stdio"], &["py"]);
         assert_eq!(python.languages(), &["python"]);
-        assert_eq!(python.name(), "pyright-lsp");
+        assert_eq!(python.name(), "pyright-langserver-lsp");
         assert_eq!(python.server_args, vec!["--stdio"]);
 
         let typescript = LspEnricher::new(
@@ -920,7 +878,7 @@ mod tests {
             &["ts", "tsx", "js", "jsx"],
         );
         assert_eq!(typescript.languages(), &["typescript"]);
-        assert_eq!(typescript.name(), "typescript-lsp");
+        assert_eq!(typescript.name(), "typescript-language-server-lsp");
         assert_eq!(typescript.extensions, vec!["ts", "tsx", "js", "jsx"]);
 
         let go = LspEnricher::new("go", "gopls", &["serve"], &["go"]);
@@ -970,7 +928,7 @@ mod tests {
         assert_eq!(registry.len(), 0);
 
         let registry = EnricherRegistry::with_builtins();
-        assert_eq!(registry.len(), 5); // rust, python, typescript, go, markdown
+        assert!(registry.len() >= 30, "should have 30+ auto-discovered LSP servers, got {}", registry.len());
     }
 
     /// Verify multiple enrichers can be registered and coexist.

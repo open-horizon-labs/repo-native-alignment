@@ -258,49 +258,70 @@ impl EnricherRegistry {
     /// Registers LSP enrichers for all languages that have tree-sitter extractors:
     /// Rust, Python, TypeScript/JavaScript, Go, and Markdown.
     ///
-    /// Each enricher checks for its server binary at enrichment time (not startup),
-    /// so missing language servers are handled gracefully.
+    /// Auto-discovers installed language servers and registers them.
+    /// Each server is checked on PATH at enrichment time — missing ones are skipped.
     pub fn with_builtins() -> Self {
         let mut registry = Self::new();
-        registry.register(Box::new(lsp::LspEnricher::new(
-            "rust",
-            "rust-analyzer",
-            &[],
-            &["rs"],
-        )));
-        registry.register(Box::new(
-            lsp::LspEnricher::new(
-                "python",
-                "pyright-langserver",
-                &["--stdio"],
-                &["py"],
-            )
-            .with_settings(serde_json::json!({
-                "python": {
-                    "analysis": {
-                        "autoSearchPaths": true
-                    }
-                }
-            })),
-        ));
-        registry.register(Box::new(lsp::LspEnricher::new(
-            "typescript",
-            "typescript-language-server",
-            &["--stdio"],
-            &["ts", "tsx", "js", "jsx"],
-        )));
-        registry.register(Box::new(lsp::LspEnricher::new(
-            "go",
-            "gopls",
-            &["serve"],
-            &["go"],
-        )));
-        registry.register(Box::new(lsp::LspEnricher::new(
-            "markdown",
-            "marksman",
-            &["server"],
-            &["md"],
-        )));
+
+        // Known LSP servers: (language, binary, args, extensions)
+        // Ordered by popularity. All are optional — only used if installed.
+        let servers: &[(&str, &str, &[&str], &[&str])] = &[
+            // Tier 1: most common
+            ("rust",         "rust-analyzer",              &[],         &["rs"]),
+            ("python",       "pyright-langserver",         &["--stdio"], &["py"]),
+            ("typescript",   "typescript-language-server",  &["--stdio"], &["ts", "tsx", "js", "jsx"]),
+            ("go",           "gopls",                      &["serve"],  &["go"]),
+            ("markdown",     "marksman",                   &["server"], &["md"]),
+            // Tier 2: widely used
+            ("c-cpp",        "clangd",                     &[],         &["c", "cc", "cpp", "cxx", "h", "hpp"]),
+            ("java",         "jdtls",                      &[],         &["java"]),
+            ("ruby",         "solargraph",                 &["stdio"],  &["rb"]),
+            ("csharp",       "omnisharp",                  &["-lsp"],   &["cs"]),
+            ("swift",        "sourcekit-lsp",              &[],         &["swift"]),
+            ("kotlin",       "kotlin-language-server",     &[],         &["kt", "kts"]),
+            ("lua",          "lua-language-server",        &[],         &["lua"]),
+            ("zig",          "zls",                        &[],         &["zig"]),
+            ("elixir",       "elixir-ls",                  &[],         &["ex", "exs"]),
+            ("haskell",      "haskell-language-server",    &["--lsp"],  &["hs"]),
+            ("ocaml",        "ocamllsp",                   &[],         &["ml", "mli"]),
+            ("scala",        "metals",                     &[],         &["scala", "sc"]),
+            // Tier 3: common in specific ecosystems
+            ("dart",         "dart",                       &["language-server"], &["dart"]),
+            ("r",            "R",                          &["--no-echo", "-e", "languageserver::run()"], &["r", "R"]),
+            ("julia",        "julia",                      &["--startup-file=no", "-e", "using LanguageServer; runserver()"], &["jl"]),
+            ("php",          "intelephense",               &["--stdio"], &["php"]),
+            ("css",          "vscode-css-languageserver",  &["--stdio"], &["css", "scss", "less"]),
+            ("html",         "vscode-html-languageserver", &["--stdio"], &["html", "htm"]),
+            ("yaml",         "yaml-language-server",       &["--stdio"], &["yaml", "yml"]),
+            ("json",         "vscode-json-languageserver", &["--stdio"], &["json"]),
+            ("toml",         "taplo",                      &["lsp", "stdio"], &["toml"]),
+            ("terraform",    "terraform-ls",               &["serve"],  &["tf", "tfvars"]),
+            ("nix",          "nil",                        &[],         &["nix"]),
+            ("vue",          "vue-language-server",        &["--stdio"], &["vue"]),
+            ("svelte",       "svelteserver",               &["--stdio"], &["svelte"]),
+            ("erlang",       "erlang_ls",                  &[],         &["erl", "hrl"]),
+            ("gleam",        "gleam",                      &["lsp"],    &["gleam"]),
+            ("nim",          "nimlsp",                     &[],         &["nim"]),
+            ("clojure",      "clojure-lsp",               &[],         &["clj", "cljs", "cljc"]),
+            ("deno",         "deno",                       &["lsp"],    &["ts", "tsx", "js", "jsx"]),
+            ("protobuf",     "buf",                        &["lsp"],    &["proto"]),
+            ("latex",        "texlab",                     &[],         &["tex", "bib"]),
+            ("typst",        "tinymist",                   &[],         &["typ"]),
+        ];
+
+        for &(lang, cmd, args, exts) in servers {
+            let enricher = lsp::LspEnricher::new(lang, cmd, args, exts);
+            // Add pyright-specific settings
+            let enricher = if lang == "python" {
+                enricher.with_settings(serde_json::json!({
+                    "python": { "analysis": { "autoSearchPaths": true } }
+                }))
+            } else {
+                enricher
+            };
+            registry.register(Box::new(enricher));
+        }
+
         registry
     }
 
@@ -320,6 +341,12 @@ impl EnricherRegistry {
     ) -> EnrichmentResult {
         let mut result = EnrichmentResult::default();
 
+        tracing::info!(
+            "LSP enrichment: {} language(s) detected in graph: [{}]",
+            languages.len(),
+            languages.join(", ")
+        );
+
         for enricher in &self.enrichers {
             // Check if this enricher supports any language in the graph
             let supported = enricher
@@ -327,8 +354,7 @@ impl EnricherRegistry {
                 .iter()
                 .any(|lang| languages.iter().any(|l| l == lang));
             if !supported {
-                tracing::debug!("Enricher {} skipped: no matching languages", enricher.name());
-                continue;
+                continue; // silently skip — too many servers to log each one
             }
 
             match enricher.enrich(nodes, index).await {
