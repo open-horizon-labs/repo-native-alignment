@@ -80,12 +80,18 @@ pub struct SearchMarkdown {
 
 #[macros::mcp_tool(
     name = "search_code",
-    description = "Searches code symbols (functions, structs, traits, enums, etc.) by case-insensitive substring match against name, signature, and body"
+    description = "Searches code symbols (functions, structs, traits, enums, etc.) by name and signature. Supports optional kind filter (function, struct, trait, impl, enum, const, module) and file glob filter."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SearchCode {
-    /// Search query string
+    /// Search query string (matched against symbol name and signature)
     pub query: String,
+    /// Optional: filter by symbol kind (function, struct, trait, impl, enum, const, module)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Optional: filter by file path glob (e.g. "src/server*", "src/oh/*")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 #[macros::mcp_tool(
@@ -272,7 +278,22 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 let args: SearchCode = parse_args(params.arguments)?;
                 match code::extract_symbols(root) {
                     Ok(symbols) => {
-                        let matches = code::search_symbols(&symbols, &args.query);
+                        let mut matches = code::search_symbols(&symbols, &args.query);
+
+                        // Apply kind filter
+                        if let Some(ref kind_filter) = args.kind {
+                            let k = kind_filter.to_lowercase();
+                            matches.retain(|s| s.kind.to_string().to_lowercase() == k);
+                        }
+
+                        // Apply file glob filter
+                        if let Some(ref file_filter) = args.file {
+                            matches.retain(|s| {
+                                let path_str = s.file_path.to_string_lossy();
+                                git::glob_match_public(file_filter, &path_str)
+                            });
+                        }
+
                         if matches.is_empty() {
                             Ok(text_result(format!(
                                 "No code symbol matches for \"{}\".",

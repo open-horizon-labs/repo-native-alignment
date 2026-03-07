@@ -176,7 +176,7 @@ pub fn commits_touching_patterns(
 
         let matches = changed.iter().any(|f| {
             let f_str = f.to_string_lossy();
-            patterns.iter().any(|pat| glob_match(pat, &f_str))
+            patterns.iter().any(|pat| glob_match_public(pat, &f_str))
         });
 
         if matches {
@@ -187,8 +187,8 @@ pub fn commits_touching_patterns(
     Ok(commits)
 }
 
-/// Simple glob matching: supports `*` (any segment chars) and `**` is not special yet.
-fn glob_match(pattern: &str, path: &str) -> bool {
+/// Simple glob matching: supports `*` (any segment chars).
+pub fn glob_match_public(pattern: &str, path: &str) -> bool {
     // Simple implementation: convert glob to a check
     // "src/oh/*" matches "src/oh/mod.rs"
     // "src/server.rs" matches exactly
