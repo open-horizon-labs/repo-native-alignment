@@ -126,4 +126,29 @@ Do we need neural embeddings for 15 files? LanceDB supports full-text search (BM
 3. One search tool replaces "list all then filter" — if false: keep existing list tools
 
 ### Ready for /solution-space?
-Yes. Two candidates: LanceDB BM25 (simpler) vs LanceDB + fastembed-rs (richer). Same tool surface either way.
+Yes.
+
+---
+
+## Solution Space
+**Updated:** 2026-03-07
+
+**Selected:** `fastembed-rs` + LanceDB vector search
+**Level:** Local Optimum (right tool, not over-engineered)
+
+One new tool: `oh_search_context(query, artifact_types, limit)`. Agent describes what it needs in natural language, gets back the top-k relevant `.oh/` artifacts ranked by semantic similarity. `BAAI/bge-small-en-v1.5` model (~30MB, local ONNX, no API key).
+
+### Implementation
+1. Uncomment `lancedb`, add `fastembed` to Cargo.toml
+2. `src/embed.rs`: EmbeddingIndex wrapping LanceDB + fastembed
+3. Index `.oh/` artifacts on server startup
+4. `oh_search_context` tool in server.rs
+5. Auto-embed on write (record_metis, update_outcome, etc.)
+6. Update skill preambles: "call oh_search_context with task description"
+
+### What stays
+- Existing list tools (`oh_get_outcomes`, `oh_get_guardrails`) for exhaustive queries
+- `outcome_progress` for structural joins
+- `search_all` for grep-style search
+
+`oh_search_context` is additive — discovery layer on top of the existing exact-match tools.
