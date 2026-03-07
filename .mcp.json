@@ -1,8 +1,6 @@
 {
   "mcpServers": {
     "rna-server": {
-      "command": "cargo",
-      "args": ["run", "--", "--repo", "."],
       "type": "http",
       "url": "http://127.0.0.1:8382/mcp"
     }
