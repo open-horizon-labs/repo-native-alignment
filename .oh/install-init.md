@@ -147,12 +147,25 @@ repo-native-alignment setup --project <PATH>  # default: .
 - Dry-run usage documented.
 - Manual/fallback path retained under a brief `---` separator.
 
+### What Gets Installed (as of 2026-03-07)
+
+The installed binary provides 20 MCP tools:
+
+- **Business context:** 5 read + 4 write + 1 init + 1 semantic search + 1 structural join
+- **Code search:** search_code, search_markdown, search_commits, file_history, search_all
+- **Workspace graph (new):** search_symbols (multi-lang: Rust, Python, TS, Go, Markdown), graph_neighbors (traversal), graph_impact (reverse BFS)
+
+The graph is built on first query by an incremental scanner (mtime + git optimization) + pluggable tree-sitter extractors. Scanner excludes are configurable via `.oh/config.toml`.
+
+Setup configures the `timeout` to 30000ms (increased from 10000) to allow for first-run graph population.
+
 ### Known Gaps
 
 - OH MCP server installation is **not** automated by `setup`; OH MCP requires a separate install or manual `.mcp.json` entry. The setup command configures RNA MCP only.
 - Windows binary naming/path edge cases remain (`repo-native-alignment.exe` and default `%USERPROFILE%\\.cargo\\bin` handling need explicit validation).
 - If both RNA source path and installed binary are unavailable, setup fails with remediation (re-clone or install a release binary first).
 - Smoke verification (`--skip-verify` bypass) uses binary `--help` rather than a real MCP tool call; true end-to-end verification would require a real MCP client path (noted in guardrails; deferred to P2).
+- `/mcp` reconnect fails on long Claude Code sessions — users should restart Claude Code rather than reconnect mid-session after binary updates.
 
 
 ## Ship
