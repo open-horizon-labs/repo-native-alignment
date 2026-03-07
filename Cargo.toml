@@ -22,7 +22,10 @@ pulldown-cmark = "0.12"
 git2 = "0.20"
 
 # Code parsing (symbol extraction)
-# tree-sitter = "0.25"  # Phase 2 — uncomment when ready
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
 
 # Vector + columnar store (Phase 1+)
 # lancedb = "0.15"  # uncomment when ready
@@ -44,3 +47,6 @@ anyhow = "1"
 # Logging (stderr only — stdout reserved for MCP stdio transport)
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.26.0"
