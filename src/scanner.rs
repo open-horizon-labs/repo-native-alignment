@@ -26,6 +26,7 @@ const DEFAULT_EXCLUDES: &[&str] = &[
     "build/",
     "__pycache__/",
     ".git/",
+    ".claude/",
     "dist/",
     "vendor/",
     ".build/",
