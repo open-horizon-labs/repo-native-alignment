@@ -563,6 +563,26 @@ impl LspEnricher {
         Ok(result.as_array().cloned().unwrap_or_default())
     }
 
+    /// Get document links (cross-references, wiki-links) for a file.
+    async fn document_links(
+        transport: &mut LspTransport,
+        file_uri: &Uri,
+    ) -> Result<Vec<serde_json::Value>> {
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri.as_str() }
+        });
+
+        let result: serde_json::Value = transport
+            .request("textDocument/documentLink", &params)
+            .await?;
+
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+
+        Ok(result.as_array().cloned().unwrap_or_default())
+    }
+
     /// Find implementations of a trait/interface at the given position.
     async fn find_implementations(
         transport: &mut LspTransport,
@@ -782,7 +802,49 @@ impl Enricher for LspEnricher {
                         }
                     }
                 }
-                _ => {}
+                _ => {
+                    // For non-code nodes (markdown sections, etc.), try documentLink
+                    // to find cross-document references and links.
+                    if matches!(node.id.kind, NodeKind::Other(_)) {
+                        match Self::document_links(transport, &file_uri).await {
+                            Ok(links) => {
+                                for link in &links {
+                                    if let Some(target) = link.get("target").and_then(|t| t.as_str()) {
+                                        if let Some(target_path) = target.strip_prefix("file://") {
+                                            let rel_target = PathBuf::from(target_path);
+                                            let rel_target = rel_target.strip_prefix(&root).unwrap_or(&rel_target).to_path_buf();
+
+                                            // Skip external links
+                                            if rel_target.to_string_lossy().starts_with("http") {
+                                                continue;
+                                            }
+
+                                            // Create a DependsOn edge from this section to the linked document
+                                            let target_id = NodeId {
+                                                root: node.id.root.clone(),
+                                                file: rel_target.clone(),
+                                                name: rel_target.file_name()
+                                                    .and_then(|n| n.to_str())
+                                                    .unwrap_or("unknown")
+                                                    .to_string(),
+                                                kind: NodeKind::Module,
+                                            };
+
+                                            result.added_edges.push(Edge {
+                                                from: node.id.clone(),
+                                                to: target_id,
+                                                kind: EdgeKind::DependsOn,
+                                                source: ExtractionSource::Lsp,
+                                                confidence: Confidence::Confirmed,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_) => {} // documentLink not supported — fine
+                        }
+                    }
+                }
             }
         }
 
