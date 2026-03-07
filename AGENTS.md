@@ -1,6 +1,6 @@
 # Open Horizons Framework
 
-**The shift:** Action is cheap. Knowing what to do is scarce.
+**The shift:** Action is cheap. Knowing what to do is scarce. We don't build features, we build capabilities.
 
 **The sequence:** aim → problem-space → problem-statement → solution-space → execute → ship
 
@@ -23,6 +23,9 @@
 This project IS the RNA MCP server. When working here, use its own tools:
 
 - Before starting work: call `oh_get_outcomes` and `oh_get_guardrails`
+- Explore code structure: call `search_symbols` with kind/language/file filters
+- Traverse relationships: call `graph_neighbors` with a node ID from search_symbols
+- Impact analysis: call `graph_impact` to find what depends on a symbol
 - After completing work: call `oh_record_metis` with key learnings
 - When checking progress: call `outcome_progress` with `agent-alignment`
 - When discovering constraints: call `oh_record_guardrail_candidate`
@@ -34,36 +37,53 @@ This project IS the RNA MCP server. When working here, use its own tools:
 # Project Context
 
 ## Purpose
-MCP server that makes business outcomes, code structure, markdown, and git history queryable as one system. Agents stay aligned to declared intent because that intent lives in the repo as structured, queryable artifacts.
+MCP server with a workspace-wide context engine. Incrementally scans repos, extracts a multi-language code graph (symbols, topology, schemas, PR history), and makes business outcomes, code structure, markdown, and git history queryable as one system. Agents stay aligned to declared intent because that intent lives in the repo as structured, queryable artifacts.
 
 ## Current Aims
-- **agent-alignment** (active): Agents scope work to declared outcomes without user re-prompting. Mechanism: 16 MCP tools + OH Skills integration + outcome_progress structural joins.
+- **agent-alignment** (active): Agents scope work to declared outcomes without user re-prompting. Mechanism: 20 MCP tools + OH Skills integration + outcome_progress structural joins.
+- **workspace-context-engine** (active): Agents see context across the full workspace. Mechanism: incremental scanner + pluggable extractors (tree-sitter, LSP, markdown, schema) + unified graph (LanceDB + petgraph).
 
 ## Key Constraints
 - **repo-native** (hard): No external store. `.oh/` in the repo, git-versioned. `rm -rf .oh/` loses context but breaks nothing.
 - **lightweight** (hard): Adding an outcome = writing a markdown file. If heavier than a CLAUDE.md section, adoption fails.
+- **git-is-optimization-not-requirement** (hard): Scanner works on any directory. Git adds precision when `.git` present.
+- **extractors-are-pluggable** (soft): Don't hardcode extraction strategy per file type. tree-sitter, LSP, schema, markdown are all pluggable extractors behind the same trait.
 - **name-tools-honestly** (soft): Tool names describe current behavior, not aspirations.
 - **test-with-real-mcp-client** (candidate): Test MCP changes with TypeScript SDK or Claude Code, not curl.
-- **validate-before-building** (soft): Don't add infrastructure before validating the hypothesis. Behavior change is the metric.
 
 ## Patterns to Follow
 - `[outcome:X]` in commit messages to link work to outcomes
 - Use MCP write tools (oh_record_metis, oh_record_signal, oh_record_guardrail_candidate) to close the feedback loop
 - Structural joins (outcome_progress) over keyword search (search_all) for the core use case
+- Pluggable extractors: implement `Extractor` trait for new file types (Phase 1: sync). `Enricher` trait for background enrichment (Phase 2: async, e.g., LSP)
+- Graph model: `Node` + `Edge` types with `ExtractionSource` provenance and `Confidence` levels
+- Source-capable records: wrap in `SourceEnvelope` at the outbox seam for future FEED publishing
 - BTreeMap for frontmatter (deterministic output)
 - YAML frontmatter + markdown body for all `.oh/` artifacts
-- `cargo build --release` before `/mcp` reconnect
+- Scanner excludes configurable via `.oh/config.toml`
+- Use compiler-driven refactoring (add field, let `cargo check` find every construction site)
+- `cargo install --path .` before `/mcp` reconnect (or restart Claude Code)
 
 ## Anti-Patterns to Avoid
 - Don't search function bodies in code search (noise) — match name + signature only
-- Don't add embeddings/LSP/multi-language before validating agent behavior change
 - Don't call a union of four greps an "intersection query"
 - Don't test MCP with curl alone — protocol negotiation differs from real clients
+- Don't port fsPulse's 4-phase scanner wholesale — RNA needs simpler: detect changed → extract → index
 
 ## Decision Context
 Solo developer. PRs get /review and /dissent before merge. "Done" = tests pass, MCP client connects, tools exercised through real usage. Session learnings recorded as metis via MCP tools.
 
-## Unvalidated Hypotheses
-- agent-scoping-accuracy SLO has zero observations
-- Compound metis effect untested (3 entries, needs 5-10 sessions)
-- Not tested on a second non-trivial repo
+## Key Modules
+- `src/graph/` — unified graph model (types, LanceDB schemas, petgraph index)
+- `src/scanner.rs` — incremental file scanner (mtime + git + configurable excludes)
+- `src/extract/` — pluggable extractors (Extractor trait + Enricher trait)
+- `src/extract/{rust,python,typescript,go,markdown}.rs` — language-specific extractors
+- `src/server.rs` — MCP server (20 tools)
+- `src/embed.rs` — semantic search (fastembed + LanceDB)
+- `src/query.rs` — outcome_progress structural joins
+
+## Next Up
+- LSP enricher (#9): cross-file references, type resolution → `Calls`/`Implements` edges
+- Schema extractors (#10): .proto, SQL migrations, OpenAPI
+- Multi-root workspace (#12): scan ~/src/zettelkasten, ~/Downloads, multiple project repos
+- PR merge extraction: walk git merge history → pr_merge graph nodes
