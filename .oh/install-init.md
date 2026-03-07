@@ -153,3 +153,14 @@ repo-native-alignment setup --project <PATH>  # default: .
 - Windows binary naming/path edge cases remain (`repo-native-alignment.exe` and default `%USERPROFILE%\\.cargo\\bin` handling need explicit validation).
 - If both RNA source path and installed binary are unavailable, setup fails with remediation (re-clone or install a release binary first).
 - Smoke verification (`--skip-verify` bypass) uses binary `--help` rather than a real MCP tool call; true end-to-end verification would require a real MCP client path (noted in guardrails; deferred to P2).
+
+
+## Ship
+**Updated:** 2026-03-07
+**Status:** verified
+
+- PR #6 merged to `main` via squash: https://github.com/open-horizon-labs/repo-native-alignment/pull/6
+- Delivery path completed: branch -> PR review/dissent -> merge-conflict resolution -> merge -> main
+- Added GitHub workflow `.github/workflows/rust-main-merge.yml` to run `cargo test setup::tests` and `cargo build --release` on PRs to `main` and pushes to `main`.
+- Post-merge verification: main head contains setup command, docs updates, and workflow file.
+- Delivery-path tax observed: one merge conflict in `README.md` added manual integration time.
