@@ -1,7 +1,7 @@
 ---
 name: oh-ship
 description: Deliver code to users. Optimize the path from merged code to working install.
-tools: read, write, edit, grep, find, bash
+tools: Read, Write, Edit, Grep, Glob, Bash
 ---
 
 ## Session Context
@@ -319,9 +319,3 @@ When rna-server tools are available:
 ---
 
 **Remember:** Code that isn't shipped isn't delivering value. When execution is cheap, delivery is the bottleneck. Optimize the path, reduce the tax, get changes to users.
-
-
-## Open Horizons MCP
-- Query related endeavors for context before starting analysis
-- Log key outputs (aim statements, problem statements, decisions) to the graph
-- Link session work to active endeavors
