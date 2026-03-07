@@ -53,3 +53,42 @@ Level 2 is what we're enhancing. The skills already know about `.oh/`. They just
 - `npx skills add open-horizon-labs/repo-native-alignment -g` installs both
 - Skills and MCP tools version-locked
 - Trade-off: this repo does two things (server + skills)
+
+### Option D: Integration via context, not code
+- Skills don't change at all
+- `oh_init` writes a CLAUDE.md section mapping skills → MCP tools
+- Agent reads CLAUDE.md and follows the integration instructions
+- Trade-off: depends on agent reading instructions (which it already does)
+
+---
+
+## Solution Space
+**Updated:** 2026-03-07
+
+**Selected:** Option D — Integration via context, not code
+**Level:** Redesign
+
+**Rationale:** Skills are prompts. They influence the agent through instructions. The cleanest integration is *more instructions* — not forking code. `oh_init` adds a CLAUDE.md section:
+
+```markdown
+## Workflow Integration (OH Skills + RNA MCP)
+When using OH skills alongside rna-server MCP tools:
+- Before /aim: call oh_get_outcomes to see existing outcomes
+- After /aim: call oh_update_outcome or oh_init to persist the aim
+- After /salvage: call oh_record_metis with key learnings
+- After /review or /dissent: call oh_record_guardrail_candidate if constraints discovered
+- After /execute: tag commit with [outcome:X]
+- After /solution-space: update the .oh/ session file via write
+```
+
+Zero changes to the skills repo. Zero fork divergence. Works with any version of skills.
+
+**Accepted trade-offs:**
+- Integration depends on agent reading CLAUDE.md (which it does)
+- Less "guaranteed" than hardcoded tool calls — but more resilient to change
+
+### Implementation Checklist
+- [ ] Modify `oh_init` to detect existing CLAUDE.md and append workflow integration section
+- [ ] Write the skill→MCP mapping as a CLAUDE.md section template
+- [ ] Test: run /salvage with integration section present — does agent call oh_record_metis?
+- [ ] Test: run /aim with integration section — does agent call oh_get_outcomes first?
