@@ -1,0 +1,479 @@
+//! In-memory petgraph index for structural graph traversal.
+//!
+//! The `GraphIndex` is a derived index rebuilt from LanceDB edge data.
+//! It provides fast BFS/DFS traversal, neighbor queries, and impact
+//! analysis that would be expensive as columnar joins.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::visit::EdgeRef as PetgraphEdgeRef;
+use petgraph::Direction;
+
+use super::{Edge, EdgeKind};
+
+// ---------------------------------------------------------------------------
+// Lightweight references stored in petgraph (not full Node/Edge structs)
+// ---------------------------------------------------------------------------
+
+/// Lightweight node reference stored in petgraph. Contains just enough
+/// to identify the node and look it up in LanceDB.
+#[derive(Debug, Clone)]
+pub struct NodeRef {
+    /// The deterministic string ID (matches LanceDB `id` column).
+    pub id: String,
+    /// Node type string (e.g., "function", "struct", "proto_message").
+    pub node_type: String,
+}
+
+/// Lightweight edge reference stored in petgraph.
+#[derive(Debug, Clone)]
+pub struct EdgeRef {
+    pub edge_type: EdgeKind,
+}
+
+// ---------------------------------------------------------------------------
+// GraphIndex
+// ---------------------------------------------------------------------------
+
+/// In-memory directed graph index backed by petgraph.
+///
+/// This is a derived cache rebuilt from LanceDB edge data. If it drifts,
+/// rebuild it. The design intentionally keeps petgraph as a throwaway index
+/// rather than a source of truth.
+pub struct GraphIndex {
+    graph: DiGraph<NodeRef, EdgeRef>,
+    node_lookup: HashMap<String, NodeIndex>,
+}
+
+impl GraphIndex {
+    /// Create an empty graph index.
+    pub fn new() -> Self {
+        Self {
+            graph: DiGraph::new(),
+            node_lookup: HashMap::new(),
+        }
+    }
+
+    /// Number of nodes in the graph.
+    pub fn node_count(&self) -> usize {
+        self.graph.node_count()
+    }
+
+    /// Number of edges in the graph.
+    pub fn edge_count(&self) -> usize {
+        self.graph.edge_count()
+    }
+
+    /// Ensure a node exists in the graph. Returns its index.
+    /// If the node already exists, returns the existing index.
+    pub fn ensure_node(&mut self, id: &str, node_type: &str) -> NodeIndex {
+        if let Some(&idx) = self.node_lookup.get(id) {
+            return idx;
+        }
+        let idx = self.graph.add_node(NodeRef {
+            id: id.to_string(),
+            node_type: node_type.to_string(),
+        });
+        self.node_lookup.insert(id.to_string(), idx);
+        idx
+    }
+
+    /// Add a directed edge between two nodes. Creates nodes if they don't exist.
+    pub fn add_edge(
+        &mut self,
+        from_id: &str,
+        from_type: &str,
+        to_id: &str,
+        to_type: &str,
+        edge_type: EdgeKind,
+    ) {
+        let from_idx = self.ensure_node(from_id, from_type);
+        let to_idx = self.ensure_node(to_id, to_type);
+        self.graph.add_edge(from_idx, to_idx, EdgeRef { edge_type });
+    }
+
+    /// Rebuild the graph from a slice of `Edge` structs (e.g., loaded from LanceDB).
+    /// Clears the existing graph first.
+    pub fn rebuild_from_edges(&mut self, edges: &[Edge]) {
+        self.graph.clear();
+        self.node_lookup.clear();
+
+        for edge in edges {
+            let from_id = edge.from.to_stable_id();
+            let to_id = edge.to.to_stable_id();
+            self.add_edge(
+                &from_id,
+                &edge.from.kind.to_string(),
+                &to_id,
+                &edge.to.kind.to_string(),
+                edge.kind.clone(),
+            );
+        }
+    }
+
+    /// Get the NodeRef for a given node ID, if it exists.
+    pub fn get_node(&self, id: &str) -> Option<&NodeRef> {
+        self.node_lookup
+            .get(id)
+            .map(|&idx| &self.graph[idx])
+    }
+
+    /// 1-hop filtered neighbors of a node.
+    ///
+    /// - `edge_types`: if `Some`, only follow edges of these types. If `None`, follow all.
+    /// - `direction`: `Outgoing` for callees, `Incoming` for callers, etc.
+    ///
+    /// Returns the IDs of neighboring nodes.
+    pub fn neighbors(
+        &self,
+        node_id: &str,
+        edge_types: Option<&[EdgeKind]>,
+        direction: Direction,
+    ) -> Vec<String> {
+        let Some(&idx) = self.node_lookup.get(node_id) else {
+            return Vec::new();
+        };
+
+        let mut result = Vec::new();
+        let edges = self.graph.edges_directed(idx, direction);
+
+        for edge_ref in edges {
+            // Filter by edge type if specified
+            if let Some(types) = edge_types {
+                if !types.contains(&edge_ref.weight().edge_type) {
+                    continue;
+                }
+            }
+
+            let neighbor_idx = match direction {
+                Direction::Outgoing => edge_ref.target(),
+                Direction::Incoming => edge_ref.source(),
+            };
+            result.push(self.graph[neighbor_idx].id.clone());
+        }
+
+        result
+    }
+
+    /// BFS reachability within N hops, optionally filtered by edge types.
+    ///
+    /// Returns all node IDs reachable from `node_id` within `max_hops` edges,
+    /// following only `Outgoing` edges. Does not include the start node.
+    pub fn reachable(
+        &self,
+        node_id: &str,
+        max_hops: usize,
+        edge_types: Option<&[EdgeKind]>,
+    ) -> Vec<String> {
+        let Some(&start_idx) = self.node_lookup.get(node_id) else {
+            return Vec::new();
+        };
+
+        let mut visited = HashSet::new();
+        visited.insert(start_idx);
+
+        let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::new();
+        queue.push_back((start_idx, 0));
+
+        let mut result = Vec::new();
+
+        while let Some((current, depth)) = queue.pop_front() {
+            if depth >= max_hops {
+                continue;
+            }
+
+            for edge_ref in self.graph.edges_directed(current, Direction::Outgoing) {
+                if let Some(types) = edge_types {
+                    if !types.contains(&edge_ref.weight().edge_type) {
+                        continue;
+                    }
+                }
+
+                let neighbor = edge_ref.target();
+                if visited.insert(neighbor) {
+                    result.push(self.graph[neighbor].id.clone());
+                    queue.push_back((neighbor, depth + 1));
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Reverse BFS: "what depends on this node?"
+    ///
+    /// Follows `Incoming` edges to find all nodes that transitively depend
+    /// on the given node, within `max_hops`. Does not include the start node.
+    pub fn impact(
+        &self,
+        node_id: &str,
+        max_hops: usize,
+    ) -> Vec<String> {
+        let Some(&start_idx) = self.node_lookup.get(node_id) else {
+            return Vec::new();
+        };
+
+        let mut visited = HashSet::new();
+        visited.insert(start_idx);
+
+        let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::new();
+        queue.push_back((start_idx, 0));
+
+        let mut result = Vec::new();
+
+        while let Some((current, depth)) = queue.pop_front() {
+            if depth >= max_hops {
+                continue;
+            }
+
+            for edge_ref in self.graph.edges_directed(current, Direction::Incoming) {
+                let neighbor = edge_ref.source();
+                if visited.insert(neighbor) {
+                    result.push(self.graph[neighbor].id.clone());
+                    queue.push_back((neighbor, depth + 1));
+                }
+            }
+        }
+
+        result
+    }
+}
+
+impl Default for GraphIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::{Confidence, ExtractionSource, NodeId, NodeKind};
+    use std::path::PathBuf;
+
+    fn make_node_id(name: &str) -> NodeId {
+        NodeId {
+            root: "test".to_string(),
+            file: PathBuf::from("src/lib.rs"),
+            name: name.to_string(),
+            kind: NodeKind::Function,
+        }
+    }
+
+    fn make_edge(from: &str, to: &str, kind: EdgeKind) -> Edge {
+        Edge {
+            from: make_node_id(from),
+            to: make_node_id(to),
+            kind,
+            source: ExtractionSource::TreeSitter,
+            confidence: Confidence::Detected,
+        }
+    }
+
+    #[test]
+    fn test_add_node_and_edge() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "function", "b", "function", EdgeKind::Calls);
+
+        assert_eq!(index.node_count(), 2);
+        assert_eq!(index.edge_count(), 1);
+    }
+
+    #[test]
+    fn test_ensure_node_idempotent() {
+        let mut index = GraphIndex::new();
+        let idx1 = index.ensure_node("a", "function");
+        let idx2 = index.ensure_node("a", "function");
+        assert_eq!(idx1, idx2);
+        assert_eq!(index.node_count(), 1);
+    }
+
+    #[test]
+    fn test_neighbors_outgoing() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "function", "b", "function", EdgeKind::Calls);
+        index.add_edge("a", "function", "c", "struct", EdgeKind::DependsOn);
+        index.add_edge("d", "function", "a", "function", EdgeKind::Calls);
+
+        let out = index.neighbors("a", None, Direction::Outgoing);
+        assert_eq!(out.len(), 2);
+        assert!(out.contains(&"b".to_string()));
+        assert!(out.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn test_neighbors_incoming() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "function", "b", "function", EdgeKind::Calls);
+        index.add_edge("c", "function", "b", "function", EdgeKind::Calls);
+
+        let inc = index.neighbors("b", None, Direction::Incoming);
+        assert_eq!(inc.len(), 2);
+        assert!(inc.contains(&"a".to_string()));
+        assert!(inc.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn test_neighbors_filtered_by_edge_type() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "function", "b", "function", EdgeKind::Calls);
+        index.add_edge("a", "function", "c", "struct", EdgeKind::DependsOn);
+
+        let calls_only = index.neighbors("a", Some(&[EdgeKind::Calls]), Direction::Outgoing);
+        assert_eq!(calls_only.len(), 1);
+        assert_eq!(calls_only[0], "b");
+
+        let deps_only = index.neighbors("a", Some(&[EdgeKind::DependsOn]), Direction::Outgoing);
+        assert_eq!(deps_only.len(), 1);
+        assert_eq!(deps_only[0], "c");
+    }
+
+    #[test]
+    fn test_neighbors_nonexistent_node() {
+        let index = GraphIndex::new();
+        let result = index.neighbors("nonexistent", None, Direction::Outgoing);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_reachable_within_hops() {
+        // a -> b -> c -> d
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "d", "fn", EdgeKind::Calls);
+
+        let reach_1 = index.reachable("a", 1, None);
+        assert_eq!(reach_1, vec!["b".to_string()]);
+
+        let reach_2 = index.reachable("a", 2, None);
+        assert_eq!(reach_2.len(), 2);
+        assert!(reach_2.contains(&"b".to_string()));
+        assert!(reach_2.contains(&"c".to_string()));
+
+        let reach_3 = index.reachable("a", 3, None);
+        assert_eq!(reach_3.len(), 3);
+    }
+
+    #[test]
+    fn test_reachable_with_edge_filter() {
+        // a -calls-> b -depends_on-> c -calls-> d
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::DependsOn);
+        index.add_edge("c", "fn", "d", "fn", EdgeKind::Calls);
+
+        // Only following Calls edges: a -> b, then b has no Calls outgoing
+        let calls_only = index.reachable("a", 3, Some(&[EdgeKind::Calls]));
+        assert_eq!(calls_only, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn test_reachable_handles_cycles() {
+        // a -> b -> c -> a (cycle)
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "a", "fn", EdgeKind::Calls);
+
+        let reach = index.reachable("a", 10, None);
+        // Should visit b and c but not loop forever
+        assert_eq!(reach.len(), 2);
+        assert!(reach.contains(&"b".to_string()));
+        assert!(reach.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn test_impact_reverse_bfs() {
+        // a -> b -> c
+        // d -> b
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("d", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+
+        // Impact of c: who depends on c? b (directly), then a and d (transitively)
+        let impact = index.impact("c", 10);
+        assert_eq!(impact.len(), 3);
+        assert!(impact.contains(&"b".to_string()));
+        assert!(impact.contains(&"a".to_string()));
+        assert!(impact.contains(&"d".to_string()));
+    }
+
+    #[test]
+    fn test_impact_limited_hops() {
+        // a -> b -> c -> d
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "d", "fn", EdgeKind::Calls);
+
+        // Impact of d within 1 hop: only c
+        let impact_1 = index.impact("d", 1);
+        assert_eq!(impact_1, vec!["c".to_string()]);
+
+        // Impact of d within 2 hops: c and b
+        let impact_2 = index.impact("d", 2);
+        assert_eq!(impact_2.len(), 2);
+    }
+
+    #[test]
+    fn test_rebuild_from_edges() {
+        let edges = vec![
+            make_edge("foo", "bar", EdgeKind::Calls),
+            make_edge("bar", "baz", EdgeKind::DependsOn),
+        ];
+
+        let mut index = GraphIndex::new();
+        index.rebuild_from_edges(&edges);
+
+        assert_eq!(index.node_count(), 3);
+        assert_eq!(index.edge_count(), 2);
+
+        // Verify the edges exist with correct types
+        let foo_id = make_node_id("foo").to_stable_id();
+        let bar_id = make_node_id("bar").to_stable_id();
+        let baz_id = make_node_id("baz").to_stable_id();
+
+        let foo_neighbors = index.neighbors(&foo_id, None, Direction::Outgoing);
+        assert_eq!(foo_neighbors.len(), 1);
+        assert_eq!(foo_neighbors[0], bar_id);
+
+        let bar_neighbors = index.neighbors(&bar_id, None, Direction::Outgoing);
+        assert_eq!(bar_neighbors.len(), 1);
+        assert_eq!(bar_neighbors[0], baz_id);
+    }
+
+    #[test]
+    fn test_rebuild_clears_previous() {
+        let mut index = GraphIndex::new();
+        index.add_edge("old_a", "fn", "old_b", "fn", EdgeKind::Calls);
+        assert_eq!(index.node_count(), 2);
+
+        // Rebuild with different edges
+        let edges = vec![make_edge("new_x", "new_y", EdgeKind::Calls)];
+        index.rebuild_from_edges(&edges);
+
+        assert_eq!(index.node_count(), 2); // new_x and new_y
+        assert!(index.get_node("old_a").is_none());
+        assert!(index.get_node("old_b").is_none());
+    }
+
+    #[test]
+    fn test_get_node() {
+        let mut index = GraphIndex::new();
+        index.ensure_node("my_func", "function");
+
+        let node = index.get_node("my_func");
+        assert!(node.is_some());
+        assert_eq!(node.unwrap().id, "my_func");
+        assert_eq!(node.unwrap().node_type, "function");
+
+        assert!(index.get_node("nonexistent").is_none());
+    }
+}

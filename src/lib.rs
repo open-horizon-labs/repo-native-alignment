@@ -1,6 +1,7 @@
 pub mod code;
 pub mod embed;
 pub mod git;
+pub mod graph;
 pub mod markdown;
 pub mod oh;
 pub mod query;
