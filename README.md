@@ -6,8 +6,6 @@ We don't build features, we build capabilities.
 
 ## How It Works
 
-Four systems collaborate. Each is independent; together they compound.
-
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  OH MCP (organizational)        RNA MCP (repo-local)        │
@@ -37,19 +35,17 @@ Four systems collaborate. Each is independent; together they compound.
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**The loop:** Skills/agents guide the workflow → MCP tools read/write structured context → `.oh/` accumulates learnings → git versions everything → next session starts richer.
+**The loop:** Skills guide work → MCP tools read/write context → `.oh/` accumulates learnings → git versions everything → next session starts richer.
 
-**The join:** `outcome_progress` connects layers structurally — outcome → file patterns → tagged commits → code symbols → related markdown. Not keyword matching; structural links.
+**The graph:** `search_symbols` and `graph_query` expose a multi-language code graph — symbols, imports, topology boundaries — built by incremental scanning with tree-sitter across Rust, Python, TypeScript, and Go.
 
-**The graph:** `search_symbols` and `graph_query` expose a multi-language code graph — symbols, imports, topology boundaries — built by incremental scanning with tree-sitter extraction across Rust, Python, TypeScript, and Go.
+**The join:** `outcome_progress` connects layers structurally — outcome → file patterns → tagged commits → code symbols → PR merges. Structural links, not keyword matching.
 
-**The search:** `oh_search_context` lets agents describe what they need in natural language — "guardrails about API compatibility" — instead of listing all artifacts and filtering manually.
+**The search:** `oh_search_context` finds relevant context by natural language — "guardrails about API compatibility" — instead of listing all artifacts and filtering manually.
 
 ## Quick Start
 
 ### Prerequisites
-
-`repo-native-alignment setup` checks for these before doing anything:
 
 | Dependency | Install |
 |------------|---------|
@@ -57,7 +53,7 @@ Four systems collaborate. Each is independent; together they compound.
 | `protoc` | `brew install protobuf` / `apt install protobuf-compiler` |
 | `npx` | ships with Node.js — [nodejs.org](https://nodejs.org) |
 
-### 1. Install the RNA binary (one-time)
+### 1. Install
 
 ```bash
 git clone https://github.com/open-horizon-labs/repo-native-alignment.git
@@ -65,130 +61,89 @@ cd repo-native-alignment
 cargo install --locked --path .
 ```
 
-### 2. Bootstrap a project
-
-Run once per project (idempotent — safe to re-run on updates):
+### 2. Set up a project
 
 ```bash
 repo-native-alignment setup --project /path/to/your/project
 ```
 
-This does, in order:
+This checks dependencies, installs the binary, configures `.mcp.json`, and verifies everything works. Safe to re-run on updates.
 
-1. Preflights required tools for the selected actions: checks `cargo` + `protoc` when RNA source is available for reinstall, and checks `npx` unless `--skip-skills` is set.
-2. Installs/updates the RNA binary via `cargo install --locked --path <rna repo root>` when source is available; otherwise reuses an already-installed binary.
-3. Installs OH skills globally: `npx skills add open-horizon-labs/skills -g -a claude-code -y`.
-4. Writes or merges `<project>/.mcp.json`, adding the `rna-server` entry and preserving any existing servers.
-5. Initializes source-boundary artifacts under `.oh/` (`code.workspace:v1` declaration, outbox, replay-smoke projection).
-6. Verifies binary/help, MCP config, and source health (declaration valid, outbox writable, replay smoke passes).
+Preview first: `repo-native-alignment setup --project . --dry-run`
 
-**Preview without making changes:**
+### 3. Teach your agents
 
-```bash
-repo-native-alignment setup --project . --dry-run
-```
-
-**Skip OH skills install** (if already installed or managing separately):
-
-```bash
-repo-native-alignment setup --project . --skip-skills
-```
-
-### 3. Run `/teach-oh`
-
-Open a Claude Code session in your project and run:
+Open a Claude Code session in your project:
 
 ```
 /teach-oh
 ```
 
-This does everything:
-- Explores your codebase (stack, patterns, conventions)
-- Asks about your aims and constraints
-- Writes `AGENTS.md` with project context
-- Scaffolds `.oh/` with outcomes, signals, guardrails
-- Installs phase agents to `.claude/agents/`
+This explores your codebase, asks about your aims, writes `AGENTS.md`, scaffolds `.oh/` with outcomes and constraints, and installs phase agents.
 
 ### 4. Start working
 
-The system compounds from here. Skills and agents use `oh_search_context` to discover relevant context. `search_symbols` and `graph_query` expose the code graph. `oh_record` records what you learn. Next session starts richer.
+The system compounds from here. Agents use `oh_search_context` to discover relevant context, `search_symbols` to explore code, and `oh_record` to capture learnings. Each session starts richer than the last.
 
 ---
 
-**Manual path (fallback):** If you prefer full control, build from source (`cargo build --release`), then hand-edit your project's `.mcp.json` to add `rna-server` pointing at the compiled binary with `--repo <project path>`. The setup command exists to make this deterministic and verifiable, not to replace understanding of what it configures.
+**Manual path:** Build from source (`cargo build --release`), add `rna-server` to your `.mcp.json` pointing at the binary with `--repo <project path>`. The setup command automates this.
 
-## Design Notes
+## RNA MCP Server — 9 tools
 
-- [`docs/rna-source-compatibility.md`](docs/rna-source-compatibility.md) — steers the workspace-engine roadmap so RNA stays a strong local MCP runtime now and a clean future Context Assembler source later
-
-## The Four Systems
-
-### RNA MCP Server (this repo) — 20 tools + workspace graph
-
-The repo-local intelligence layer. Incrementally scans your repo, extracts a multi-language code graph, and serves it via MCP.
-
-**Extraction stack (pluggable, multi-language):**
-- **tree-sitter** — Rust, Python, TypeScript/TSX, Go symbol extraction (functions, structs, traits, classes, interfaces, imports)
-- **Markdown** — heading-aware sections with YAML frontmatter as graph nodes
-- **Topology detection** — `Command::new`, `TcpListener::bind`, `tokio::spawn` patterns → runtime architecture edges
-- **Embeddings** — fastembed-rs (BAAI/bge-small-en-v1.5) for semantic search over `.oh/` artifacts
-
-**Graph model (LanceDB + petgraph):**
-- **Nodes:** symbols, components, schemas, artifacts, PR merges
-- **Edges:** calls, implements, depends-on, connects-to, modified, serves (with provenance + confidence)
-- **Traversal:** in-memory petgraph for BFS, impact analysis, reachability (microseconds)
-- **Source-capable:** `SourceEnvelope` with scope, idempotency keys, provenance for future Context Assembler integration
-
-**Scanner (incremental, mtime + git):**
-- mtime-based subtree skipping — unchanged directories skipped entirely
-- git diff as precision layer when `.git` present
-- Configurable excludes via `.oh/config.toml` (default: `node_modules/`, `.venv/`, `target/`, `.git/`, `.claude/`, `.omp/`)
-- State persisted to `.oh/.cache/scan-state.json` — subsequent scans in <1s
+The repo-local intelligence layer. Scans your repo, extracts a multi-language code graph, and serves everything via MCP.
 
 | Category | Tools |
 |----------|-------|
-| **Read .oh/** | `oh_get_context` (all artifacts in one call) |
-| **Write .oh/** | `oh_record` (type: metis/signal/guardrail/outcome), `oh_init` |
-| **Search** | `oh_search_context` (semantic, optionally include code + markdown), `git_history` (commits + file history) |
-| **Semantic Search** | `oh_search_context` — natural language search over `.oh/` artifacts + git commits |
-| **Graph** | `search_symbols` (multi-lang), `graph_query` (neighbors/impact/reachable) |
-| **Join** | `outcome_progress` — the structural intersection query |
+| **Context** | `oh_get_context` — all business artifacts in one call |
+| **Search** | `oh_search_context` — semantic search over .oh/ + commits (optionally code + markdown) |
+| **Write** | `oh_record` — record metis, signals, guardrails, or update outcomes |
+| **Scaffold** | `oh_init` — initialize .oh/ directory from project context |
+| **Code** | `search_symbols` — multi-language symbol search with graph edges |
+| **Graph** | `graph_query` — traverse neighbors, impact analysis, reachability |
+| **History** | `git_history` — search commits or view file change history |
+| **Join** | `outcome_progress` — structural join: outcome → commits → symbols → PRs |
+| **Workspace** | `list_roots` — show configured workspace roots |
+
+**Extraction (pluggable, multi-language):**
+- **tree-sitter** — Rust, Python, TypeScript/TSX, Go (functions, structs, traits, classes, imports)
+- **Markdown** — heading-aware sections with YAML frontmatter
+- **Schema** — .proto messages, SQL tables, OpenAPI endpoints
+- **Topology** — `Command::new`, `TcpListener`, `tokio::spawn` → architecture edges
+- **LSP** — rust-analyzer, pyright, tsserver, gopls, marksman for cross-file references
+- **Embeddings** — fastembed-rs (BAAI/bge-small-en-v1.5, local ONNX, no API key)
+
+**Graph (LanceDB + petgraph):**
+- Nodes: symbols, schemas, artifacts, PR merges
+- Edges: calls, implements, depends-on, modified, serves (with provenance + confidence)
+- In-memory traversal via petgraph (microseconds)
+
+**Scanner (incremental):**
+- mtime-based subtree skipping — unchanged directories skipped entirely
+- git diff as precision layer when `.git` present
+- Configurable excludes via `.oh/config.toml`
+- Rescans in <1s after initial scan
+
+## Companion Systems
 
 ### [OH MCP](https://github.com/cloud-atlas-ai/oh-mcp-server) — organizational context
 
-The organizational memory layer. Missions, aims, endeavors, decision logs, cross-project context. RNA's `.oh/` is the repo-local projection of the OH graph.
+Missions, aims, endeavors, decision logs, cross-project context. RNA's `.oh/` is the repo-local projection of the OH graph.
 
-| What OH provides | How RNA uses it |
-|-----------------|-----------------|
-| Aims and endeavors | `oh_init` seeds `.oh/outcomes/` from the OH graph |
-| Decision logs | Agents log decisions via `oh_log_decision` |
-| Cross-project context | Agents see which other projects share this aim |
+### [OH Skills](https://github.com/open-horizon-labs/skills) — workflow skills
 
-### [OH Skills](https://github.com/open-horizon-labs/skills) — cross-cutting workflow
-
-Prompt-based skills that run in the main conversation. They need full conversation context to detect drift, challenge decisions, and extract learning.
-
-| Skill | What it does | RNA MCP integration |
-|-------|-------------|-------------------|
-| `/aim` | Frame the outcome | Calls `oh_search_context("outcomes related to [task]")` to find relevant outcomes |
-| `/review` | Check alignment before committing | Calls `oh_search_context("guardrails for [area]", types: ["guardrail"])`, `outcome_progress` |
-| `/dissent` | Devil's advocate before one-way doors | Calls `oh_search_context("constraints and risks for [decision]")` to ground dissent |
-| `/salvage` | Extract learning before restarting | Records metis and guardrail candidates via write tools |
-| `/solution-space` | Evaluate approaches | Calls `oh_search_context("past approaches to [problem]", types: ["metis"])` for prior art |
-| `/execute` | Build the change | Pre-flight via `oh_search_context("guardrails for [scope]", types: ["guardrail"])`, tags commits |
+| Skill | What it does |
+|-------|-------------|
+| `/aim` | Frame the outcome you want |
+| `/review` | Check alignment before committing |
+| `/dissent` | Seek contrary evidence before one-way doors |
+| `/salvage` | Extract learning before restarting |
+| `/solution-space` | Evaluate approaches before committing |
+| `/execute` | Build with pre-flight checks and drift detection |
 
 ### OH Phase Agents — isolated execution
 
-Agent wrappers that run each workflow phase in its own context window with scoped tools. Installed to `.claude/agents/` for Claude Code.
-
-| Agent | Phase | RNA MCP integration |
-|-------|-------|-------------------|
-| `oh-aim` | Frame the outcome | Reads outcomes first, updates after |
-| `oh-problem-space` | Map constraints | Loads full context via `oh_get_context` |
-| `oh-problem-statement` | Define the framing | Reads outcomes + guardrails |
-| `oh-solution-space` | Evaluate approaches | Validates against guardrails, records decision as metis |
-| `oh-execute` | Build | Pre-flight guardrail check, tags commits `[outcome:X]` |
-| `oh-ship` | Deliver | Records signal observations, updates outcome status |
+Agent wrappers for each workflow phase (`oh-aim`, `oh-execute`, `oh-ship`, etc.). Each runs in its own context window with scoped tools. Installed to `.claude/agents/`.
 
 ## The `.oh/` Directory
 
@@ -204,58 +159,54 @@ Agent wrappers that run each workflow phase in its own context window with scope
 
 Outcomes declare `files:` patterns linking to code. Commits tag `[outcome:X]` linking to outcomes. These structural links power `outcome_progress`.
 
-`.oh/` is a **cache**, not source of truth. Outcomes originate in external systems (OH graph, Jira, Linear). `.oh/` is the repo-local, git-versioned projection. `rm -rf .oh/` loses context but breaks nothing.
+`.oh/` is a **cache**, not source of truth. `rm -rf .oh/` loses context but breaks nothing.
 
 ### Scanner Configuration
 
-Add `.oh/config.toml` to customize what gets scanned:
-
 ```toml
+# .oh/config.toml
 [scanner]
 exclude = [".omp/", "data/", "*.log"]   # added to defaults
 include = ["vendor/"]                     # opt back into something excluded by default
 ```
 
-Default excludes: `node_modules/`, `.venv/`, `target/`, `build/`, `__pycache__/`, `.git/`, `.claude/`, `.omp/`, `dist/`, `vendor/`, `.build/`, `.cache/`, `*.pyc`, `*.o`, `*.so`, `*.dylib`, `.DS_Store`
+Default excludes: `node_modules/`, `.venv/`, `target/`, `build/`, `__pycache__/`, `.git/`, `.claude/`, `.omp/`, `dist/`, `vendor/`, `.build/`, `.cache/`
 
 ## Architecture
 
 ```
 Scanner (mtime + git)     <- incremental file change detection
   ├── tree-sitter         <- Rust, Python, TS, Go → symbols + import graph
-  ├── topology detector   <- Command::new, TcpListener, tokio::spawn → architecture edges
+  ├── schema extractors   <- .proto, SQL, OpenAPI → schema nodes + edges
+  ├── topology detector   <- subprocess/network/async boundaries → architecture edges
   ├── markdown extractor  <- heading sections + YAML frontmatter → graph nodes
+  ├── LSP enricher        <- rust-analyzer, pyright, tsserver, gopls → cross-file edges
   └── fastembed-rs        <- local ONNX embeddings (BAAI/bge-small-en-v1.5)
          │
          ▼
 Graph (LanceDB + petgraph)
-  ├── LanceDB             <- columnar + vector store (symbols, edges, pr_merges, file_index)
+  ├── LanceDB             <- columnar + vector store
   ├── petgraph            <- in-memory traversal (BFS, impact, reachability)
   └── SourceEnvelope      <- canonical records with scope + provenance
          │
          ▼
-MCP Server (rust-mcp-sdk) <- stdio + HTTP transport, 20 tools
+MCP Server (rust-mcp-sdk) <- stdio + HTTP transport, 9 tools
 ```
 
-No cloud dependency. Everything is local, git-versioned, and disposable. The embedding model downloads once on first use and runs on CPU.
+No cloud dependency. Everything local, git-versioned, disposable.
 
 ## Status
 
-**Validated on 3 repos** — repo-native-alignment (self-referential), fspulse (Rust CLI), enterprise monorepo (enterprise Python+TS monorepo). Cold-started on all three, returned real context.
-
-- 20 MCP tools, 97 tests, stdio + HTTP transport
-- Multi-language extraction: Rust, Python, TypeScript/TSX, Go, Markdown
+- 9 intent-based MCP tools, 153 tests
+- 8 extractors: Rust, Python, TypeScript, Go, Markdown, Proto, SQL, OpenAPI
+- Multi-language LSP enrichment (rust-analyzer, pyright, tsserver, gopls, marksman)
 - Incremental scanner with mtime skip + git optimization + configurable excludes
-- Unified graph model: code symbols + topology + schemas + business context + PR merges
-- In-memory petgraph traversal: neighbors, reachability, impact analysis
-- Semantic search via fastembed-rs + LanceDB (local ONNX, no API key)
-- Source-capable: SourceEnvelope with scope, provenance, idempotency keys (#17)
-- Full read-write feedback loop exercised on real work
-- 10 metis entries, 8 guardrails, 2 signals — all recorded via MCP tools
+- Unified graph: code symbols + topology + schemas + PR merges + business context
+- Multi-root workspace scanning via `~/.config/rna/roots.toml`
+- Semantic search via local embeddings (no API key)
+- Context auto-injected on first MCP tool call — agents always see business context
+- Validated on 3 repos with different shapes (Rust, Python+TS monorepo)
 
-**Known gaps:**
-- LSP enricher trait defined but not implemented (tree-sitter only — `Calls`/`Implements` edges need LSP)
-- Schema extractors (.proto, SQL, OpenAPI) not yet implemented
-- Multi-root workspace scanning designed (#12) but single-repo only today
-- PR merge extraction designed (graph types exist) but not wired to git history walking
-- `setup` command configures RNA MCP only — OH MCP server install requires a separate step
+## Design Notes
+
+- [`docs/rna-source-compatibility.md`](docs/rna-source-compatibility.md) — source-capability design for future Context Assembler integration
