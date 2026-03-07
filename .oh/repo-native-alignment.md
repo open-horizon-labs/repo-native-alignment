@@ -40,6 +40,85 @@
 
 ---
 
+## Problem Statement
+**Updated:** 2026-03-06
+
+**Current framing:** Agents lose alignment with business intent every session because intent lives in unstructured prose they can't reason over.
+
+**Reframed as:** Agents can't answer "what have we done towards this outcome?" because there's no system that connects business context (aims, signals, guardrails, metis), code structure, and git history into a single queryable interface. The three exist in isolation — `.oh/` files, source code, and git log — and the agent has no way to intersect them.
+
+**The shift:** From "prove the value of structured context" to "build the system that makes business context, code, and history queryable as one thing." The prototype isn't done until an agent can ask: *"What have we done to make alignment available via MCP?"* — and get back a grounded answer spanning aims, commits, and code.
+
+### Markdown is the Lingua Franca
+
+Markdown is both **input and output** for agents — this is a first-class architectural concern, not a formatting choice.
+
+**As input (operational content — all markdown, not just `.oh/`):**
+- CLAUDE.md, AGENTS.md, `.oh/` session files — **agent behavior configuration**
+- README, ADRs, runbooks, changelogs — **project intent and conventions**
+- These are not "docs" — they are **semantic context** that agents need to understand constraints, patterns, and decisions
+- All markdown needs first-class parsing (pulldown-cmark) and embedding, not just `.oh/` files
+
+**As output (query results):**
+- MCP tool responses should be **markdown-native** — tables, `file:line` links, diff blocks
+- The store is structured objects internally; markdown is the *view layer* for agent consumption
+
+**Cross-references between markdown and code:**
+- When CLAUDE.md says "always use `params![]` positional," that code span should link to actual code symbols in the index
+- pulldown-cmark extracts code spans from markdown; the index matches them against the code symbol table
+- This intersection is a differentiator — no existing tool (Codemogger, Srclight, code-memory) does this
+
+### The Hybrid Index Model
+
+Resolves the tension between Anthropic's "just-in-time context" and the VisualAge "persistent object model":
+
+```
+Lightweight persistent index  +  On-demand deep reads
+= "know WHERE everything is"  +  "read WHAT you need when you need it"
+```
+
+- **Always indexed:** symbol names, file locations, dependency edges, heading hierarchy, change timestamps — small, fast, always current
+- **On-demand:** full AST, embeddings, file contents, detailed type info — loaded through MCP tools when the agent needs them
+- **This IS just-in-time context** — the index is the mechanism that makes just-in-time *possible*. Without it, "just-in-time" means "grep and hope."
+
+### The Extractor Architecture
+
+Pluggable extractors produce `{ metadata, chunks }` from files. Same pipeline handles code and markdown:
+
+- **MarkdownExtractor** (pulldown-cmark): heading-delimited sections become chunks, code spans become cross-references, YAML frontmatter becomes structured metadata
+- **TreeSitterExtractor**: functions/structs/traits/imports become symbols with metadata (file, line range, kind, parent scope), function bodies become embeddable chunks
+- **Future extractors**: Terraform, YAML config, Dockerfile — anything with parseable structure
+- The registry matches extractors to files by path/extension. Only changed files get re-extracted (git diff drives the delta).
+
+### Constraints
+- **Hard:**
+  - **Repo-native** — `.oh/` in the repo, git-versioned, no external store
+  - **Lightweight** — markdown files with frontmatter, complexity in tooling not content
+  - **MCP interface** — agents query via MCP tools, not direct file reads
+  - **Must connect all three layers** — aims + code + git history, and their intersections
+  - **All markdown is first-class** — CLAUDE.md, README, session files parsed and indexed alongside `.oh/` and code
+
+- **Soft:**
+  - Rust + rust-mcp-sdk (matched to UHC patterns, but implementation choice)
+  - YAML frontmatter (one serialization among several)
+  - LanceDB for storage (could start simpler, but this is the target)
+  - pulldown-cmark for markdown, tree-sitter for code (best current choices, not permanent commitments)
+
+### What this framing enables
+1. Building the prototype end-to-end — MCP server that reads `.oh/`, parses code and markdown, reads git history
+2. The intersection query as the acceptance test: "what work relates to outcome X?"
+3. Cross-references between prose and code: CLAUDE.md rules linked to the symbols they reference
+4. Incremental delivery — can ship MCP tools as each layer comes online (files first, then git, then code parsing)
+5. Semantic search across all content types: "find everything about error handling" spans code, markdown, and `.oh/` files
+
+### What this framing excludes
+- OH graph sync (Phase 5) — organizational memory is out of scope for the prototype
+- DuckDB analytics overlay — optional, not required for the proof
+- Real-time incremental indexing — full rebuild is fine for prototype scale
+- LSP enrichment (type info, hover) — tree-sitter is sufficient for symbol extraction; LSP can layer on later
+
+---
+
 ## Convergence with CodeState
 
 CodeState and this aim are the same system viewed from two angles:
