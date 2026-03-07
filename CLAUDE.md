@@ -13,10 +13,6 @@ repo-native-alignment: an agentic harness for business outcome alignment in code
 - pulldown-cmark (markdown parsing)
 - MCP protocol (agent interface)
 
-## MCP Tools (use these, not grep/Read)
-
-When searching for code symbols, functions, types, or imports: ALWAYS use `search_symbols` MCP tool, NEVER use Grep or Read for symbol discovery. When tracing relationships: use `graph_query`. When searching business context: use `oh_search_context`. When recording learnings: use `oh_record`.
-
 ## Conventions
 
 - Session context lives in `.oh/`
