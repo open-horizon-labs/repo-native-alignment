@@ -131,3 +131,36 @@ The repo-native `.oh/` structure is the *local projection* of the OH graph into 
 - `.oh/metis/` <-> OH Metis entries for this endeavor
 
 The repo is the working copy. OH is the organizational memory. Git push/pull semantics for sync (not real-time).
+
+---
+
+## Problem Space: MCP Bootstrap
+**Updated:** 2026-03-06
+
+### Objective
+Time-to-self-reference: the MCP server becomes available to the coding agent ASAP, so the agent building it can use it while building it.
+
+### Key Decisions
+- **rust-mcp-sdk v0.8** — same as UHC, proven pattern with `#[mcp_tool]` macros + `ServerHandler` trait
+- **HTTP transport** (like UHC) vs **stdio** — UHC uses HTTP via Axum; stdio is simpler for standalone CLI. Decision: start with HTTP to reuse UHC pattern verbatim.
+- **No LanceDB/git2 for bootstrap** — just read `.oh/` files from disk. Embeddings and change detection come later.
+- **YAML frontmatter + markdown body** — parsed with `serde_yaml` + `pulldown-cmark`
+
+### Bootstrap Tool Surface
+| Tool | Description | Read-only? |
+|------|-------------|------------|
+| `oh_get_outcomes` | List all outcomes with frontmatter + body | Yes |
+| `oh_get_signals` | List all signals with SLO definitions | Yes |
+| `oh_get_guardrails` | List all guardrails with severity | Yes |
+| `oh_get_metis` | List all metis entries | Yes |
+| `oh_get_context` | Return everything as one bundle | Yes |
+| `oh_record_metis` | Write a new metis entry to `.oh/metis/` | No |
+
+### Reference Implementation
+UHC MCP server: `open-horizon-labs/unified-hifi-control/src/mcp/mod.rs` — exact same SDK, same macros, same patterns.
+
+### Constraints
+- Must use UHC's `rust-mcp-sdk` pattern (proven, same org)
+- `.oh/` files are source of truth (repo-native guardrail)
+- Must work with Claude Code's `.mcp.json` config
+- No external dependencies for core function (no DB, no cloud)
