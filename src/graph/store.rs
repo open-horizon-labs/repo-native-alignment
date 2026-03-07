@@ -72,6 +72,28 @@ pub fn edges_schema() -> Schema {
     ])
 }
 
+/// Arrow schema for the `pr_merges` table.
+///
+/// Stores PR-level change summaries extracted from merge commits on the base
+/// branch. PRs are the natural unit of meaningful change — they have semantic
+/// intent (title/description), bounded scope, and map to graph edges via the
+/// files they modify.
+pub fn pr_merges_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),           // root:merge_commit_sha
+        Field::new("root_id", DataType::Utf8, false),
+        Field::new("merge_sha", DataType::Utf8, false),     // the merge commit
+        Field::new("branch_name", DataType::Utf8, true),    // from commit message
+        Field::new("title", DataType::Utf8, false),         // first line of merge commit message
+        Field::new("description", DataType::Utf8, true),    // rest of merge commit message
+        Field::new("author", DataType::Utf8, false),
+        Field::new("merged_at", DataType::Int64, false),    // unix timestamp
+        Field::new("commit_count", DataType::UInt32, false), // commits in the PR
+        Field::new("files_changed", DataType::Utf8, false),  // JSON array of file paths
+        Field::new("updated_at", DataType::Int64, false),
+    ])
+}
+
 /// Arrow schema for the `file_index` table.
 ///
 /// Tracks which files have been indexed and by which extractors,
@@ -130,6 +152,22 @@ mod tests {
         assert!(schema.field_with_name("edge_type").is_ok());
         assert!(schema.field_with_name("properties_json").is_ok());
         assert!(schema.field_with_name("root_id").is_ok());
+        assert!(schema.field_with_name("updated_at").is_ok());
+    }
+
+    #[test]
+    fn test_pr_merges_schema_fields() {
+        let schema = pr_merges_schema();
+        assert!(schema.field_with_name("id").is_ok());
+        assert!(schema.field_with_name("root_id").is_ok());
+        assert!(schema.field_with_name("merge_sha").is_ok());
+        assert!(schema.field_with_name("branch_name").is_ok());
+        assert!(schema.field_with_name("title").is_ok());
+        assert!(schema.field_with_name("description").is_ok());
+        assert!(schema.field_with_name("author").is_ok());
+        assert!(schema.field_with_name("merged_at").is_ok());
+        assert!(schema.field_with_name("commit_count").is_ok());
+        assert!(schema.field_with_name("files_changed").is_ok());
         assert!(schema.field_with_name("updated_at").is_ok());
     }
 

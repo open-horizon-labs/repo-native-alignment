@@ -69,6 +69,8 @@ pub enum NodeKind {
     ProtoMessage,
     SqlTable,
     ApiEndpoint,
+    /// A merged PR (branch merge to base branch). The natural unit of meaningful change.
+    PrMerge,
     Other(String),
 }
 
@@ -86,6 +88,7 @@ impl fmt::Display for NodeKind {
             NodeKind::ProtoMessage => write!(f, "proto_message"),
             NodeKind::SqlTable => write!(f, "sql_table"),
             NodeKind::ApiEndpoint => write!(f, "api_endpoint"),
+            NodeKind::PrMerge => write!(f, "pr_merge"),
             NodeKind::Other(s) => write!(f, "{}", s),
         }
     }
@@ -108,6 +111,12 @@ pub enum EdgeKind {
     Evolves,
     ReferencedBy,
     TopologyBoundary,
+    /// PR modified this symbol/schema/component.
+    Modified,
+    /// PR affected this topology component.
+    Affected,
+    /// PR serves this outcome (from commit tags or file patterns).
+    Serves,
 }
 
 impl fmt::Display for EdgeKind {
@@ -122,6 +131,9 @@ impl fmt::Display for EdgeKind {
             EdgeKind::Evolves => write!(f, "evolves"),
             EdgeKind::ReferencedBy => write!(f, "referenced_by"),
             EdgeKind::TopologyBoundary => write!(f, "topology_boundary"),
+            EdgeKind::Modified => write!(f, "modified"),
+            EdgeKind::Affected => write!(f, "affected"),
+            EdgeKind::Serves => write!(f, "serves"),
         }
     }
 }
@@ -137,6 +149,8 @@ pub enum ExtractionSource {
     TreeSitter,
     Lsp,
     Schema,
+    /// Extracted from git history (merge commits, diff analysis).
+    Git,
 }
 
 impl fmt::Display for ExtractionSource {
@@ -145,6 +159,7 @@ impl fmt::Display for ExtractionSource {
             ExtractionSource::TreeSitter => write!(f, "tree_sitter"),
             ExtractionSource::Lsp => write!(f, "lsp"),
             ExtractionSource::Schema => write!(f, "schema"),
+            ExtractionSource::Git => write!(f, "git"),
         }
     }
 }
