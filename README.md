@@ -111,6 +111,10 @@ The system compounds from here. Skills and agents use `oh_search_context` to dis
 
 **Manual path (fallback):** If you prefer full control, build from source (`cargo build --release`), then hand-edit your project's `.mcp.json` to add `rna-server` pointing at the compiled binary with `--repo <project path>`. The setup command exists to make this deterministic and verifiable, not to replace understanding of what it configures.
 
+## Design Notes
+
+- [`docs/rna-source-compatibility.md`](docs/rna-source-compatibility.md) — steers the workspace-engine roadmap so RNA stays a strong local MCP runtime now and a clean future Context Assembler source later
+
 ## The Four Systems
 
 ### RNA MCP Server (this repo) — 17 tools
