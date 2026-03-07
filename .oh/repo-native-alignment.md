@@ -164,3 +164,63 @@ UHC MCP server: `open-horizon-labs/unified-hifi-control/src/mcp/mod.rs` — exac
 - `.oh/` files are source of truth (repo-native guardrail)
 - Must work with Claude Code's `.mcp.json` config
 - No external dependencies for core function (no DB, no cloud)
+
+---
+
+## Full System Phases
+
+### Phase 0: MCP Bootstrap (just read files)
+- Read `.oh/` artifacts from disk, parse frontmatter, return via MCP tools
+- 6 tools: get_outcomes, get_signals, get_guardrails, get_metis, get_context, record_metis
+- No indexing, no embeddings — just structured file reads
+- **Goal:** agent can query its own outcomes/constraints while building the rest
+
+### Phase 1: Markdown Scanner + Embeddings
+- pulldown-cmark parses all `.md` files (not just `.oh/`) into heading-delimited sections
+- Each section becomes a chunk with metadata (file, heading hierarchy, byte range)
+- LanceDB stores chunks with embeddings for semantic search
+- **Goal:** "find markdown about error handling" or "what have we done towards alignment?"
+- Cross-reference extraction: code spans in markdown link to code symbols
+
+### Phase 2: Code Scanner (tree-sitter)
+- tree-sitter parses code files (.rs, .ts, .py, etc.) into symbols (functions, structs, traits, imports)
+- Symbols stored in LanceDB with metadata (file, line range, kind, parent scope)
+- Embeddings on function/struct bodies for semantic code search
+- **Goal:** "find functions related to authentication" or "what calls Database::get_connection?"
+
+### Phase 3: Git Awareness
+- git2 integration for change detection (replaces filesystem scanning)
+- `git diff` drives incremental re-indexing (only re-parse/re-embed changed files)
+- Commit history mapped to symbols: "when did this function last change? who changed it?"
+- Blame integration: per-symbol authorship
+- **Goal:** "what changed in the last 3 commits?" or "who last touched the auth module?"
+
+### Phase 4: Query Engine
+- Hybrid queries: structured filters + vector similarity in one call
+- DuckDB as optional analytics overlay via lance-duckdb extension
+- Natural language queries: "what have we done to make alignment available via MCP?"
+  - Decomposes to: search metis + git history + code changes matching "alignment" + "MCP"
+  - Returns: timeline of relevant commits, metis entries, code changes, outcome progress
+- **Goal:** agents can ask open-ended questions about project state and get grounded answers
+
+### Phase 5: OH Sync
+- Bidirectional sync between `.oh/` repo artifacts and OH graph
+- `.oh/outcomes/` <-> OH Aims, `.oh/signals/` <-> OH Signals, etc.
+- Git push/pull semantics (not real-time)
+- **Goal:** organizational memory and repo-local context stay in sync
+
+---
+
+## The Query That Proves It Works
+
+> "What have we done to make alignment available via MCP?"
+
+This query exercises the full stack:
+1. **Outcome lookup** — finds the "agent-alignment" outcome in `.oh/outcomes/`
+2. **Metis search** — finds learnings tagged to that outcome
+3. **Git history** — finds commits whose messages or changed files relate to "alignment" + "MCP"
+4. **Code search** — finds MCP tool definitions, handler implementations
+5. **Markdown search** — finds session file sections discussing MCP bootstrap
+6. **Synthesis** — assembles a timeline of progress towards the outcome
+
+When this query returns a useful answer, the system works.
