@@ -497,23 +497,29 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
         };
 
         let mut result = match params.name.as_str() {
-            "oh_get_context" => match query::get_full_context(root) {
-                Ok(mut result) => {
-                    let sym_total = result.code_symbols.len();
-                    let chunk_total = result.markdown_chunks.len();
-                    result.code_symbols.truncate(50);
-                    result.markdown_chunks.truncate(50);
-                    let mut md = result.to_markdown();
-                    if sym_total > 50 || chunk_total > 50 {
-                        md.push_str(&format!(
-                            "\n_Showing {} of {} symbols, {} of {} markdown sections._\n",
-                            result.code_symbols.len(), sym_total,
-                            result.markdown_chunks.len(), chunk_total,
-                        ));
+            "oh_get_context" => {
+                // Return concise business context — not the entire repo.
+                // Use oh_search_context for discovery, search_symbols for code.
+                let artifacts = oh::load_oh_artifacts(root).unwrap_or_default();
+                let mut md = String::from("# Business Context (.oh/)\n\n");
+
+                for kind in &[OhArtifactKind::Outcome, OhArtifactKind::Signal, OhArtifactKind::Guardrail, OhArtifactKind::Metis] {
+                    let filtered: Vec<_> = artifacts.iter().filter(|a| &a.kind == kind).collect();
+                    if filtered.is_empty() { continue; }
+                    md.push_str(&format!("## {}s\n\n", kind));
+                    for a in &filtered {
+                        md.push_str(&a.to_markdown());
+                        md.push_str("\n---\n\n");
                     }
-                    Ok(text_result(md))
                 }
-                Err(e) => Ok(text_result(format!("Error: {}", e))),
+
+                let commit_count = git::load_commits(root, 10)
+                    .map(|c| c.len())
+                    .unwrap_or(0);
+                md.push_str(&format!("_Recent commits: {}. Use `git_history` for details._\n", commit_count));
+                md.push_str("_Use `search_symbols` for code, `oh_search_context` for semantic search._\n");
+
+                Ok(text_result(md))
             },
 
             "oh_search_context" => {
