@@ -706,7 +706,38 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             "outcome_progress" => {
                 let args: OutcomeProgress = parse_args(params.arguments)?;
                 match query::outcome_progress(root, &args.outcome_id) {
-                    Ok(result) => Ok(text_result(result.to_markdown())),
+                    Ok(result) => {
+                        let mut md = result.to_markdown();
+
+                        // Append PR merge section from the graph
+                        if let Ok(graph_state) = self.get_graph().await {
+                            let file_patterns: Vec<String> = result
+                                .outcomes
+                                .first()
+                                .and_then(|o| o.frontmatter.get("files"))
+                                .and_then(|v| v.as_sequence())
+                                .map(|seq| {
+                                    seq.iter()
+                                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+
+                            let pr_nodes = query::find_pr_merges_for_outcome(
+                                &graph_state.nodes,
+                                &graph_state.edges,
+                                &args.outcome_id,
+                                &file_patterns,
+                            );
+                            let pr_md = query::format_pr_merges_markdown(&pr_nodes);
+                            if !pr_md.is_empty() {
+                                md.push('\n');
+                                md.push_str(&pr_md);
+                            }
+                        }
+
+                        Ok(text_result(md))
+                    }
                     Err(e) => Ok(text_result(format!("Error: {}", e))),
                 }
             }

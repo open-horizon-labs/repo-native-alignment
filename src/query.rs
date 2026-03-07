@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use crate::code;
 use crate::git;
+use crate::graph::{Edge, EdgeKind, Node, NodeKind};
 use crate::markdown;
 use crate::oh;
 use crate::types::{OhArtifact, OhArtifactKind, QueryResult};
@@ -173,6 +174,100 @@ pub fn outcome_progress(repo_root: &Path, outcome_id: &str) -> Result<QueryResul
         code_symbols,
         commits,
     })
+}
+
+/// Find PR merge nodes relevant to an outcome.
+///
+/// Two sources of relevance:
+/// 1. Serves edges: PR merge nodes with `EdgeKind::Serves` edges pointing to
+///    an outcome node whose name matches `outcome_id`.
+/// 2. File pattern matching: PR merge nodes whose `files_changed` metadata
+///    overlaps with the outcome's declared `file_patterns`.
+///
+/// Results are deduplicated by node stable ID.
+pub fn find_pr_merges_for_outcome<'a>(
+    nodes: &'a [Node],
+    edges: &[Edge],
+    outcome_id: &str,
+    file_patterns: &[String],
+) -> Vec<&'a Node> {
+    let mut matched_stable_ids = HashSet::new();
+
+    // 1. Find PR merge nodes with Serves edges to this outcome
+    for edge in edges {
+        if edge.kind == EdgeKind::Serves
+            && edge.to.name == outcome_id
+            && edge.from.kind == NodeKind::PrMerge
+        {
+            matched_stable_ids.insert(edge.from.to_stable_id());
+        }
+    }
+
+    // 2. Find PR merge nodes whose files_changed match the outcome's file patterns
+    if !file_patterns.is_empty() {
+        for node in nodes {
+            if node.id.kind != NodeKind::PrMerge {
+                continue;
+            }
+            let stable_id = node.stable_id();
+            if matched_stable_ids.contains(&stable_id) {
+                continue;
+            }
+            if let Some(files_json) = node.metadata.get("files_changed") {
+                if let Ok(files) = serde_json::from_str::<Vec<String>>(files_json) {
+                    let matches = files.iter().any(|f| {
+                        file_patterns
+                            .iter()
+                            .any(|pat| git::glob_match_public(pat, f))
+                    });
+                    if matches {
+                        matched_stable_ids.insert(stable_id);
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect the actual Node references, preserving the order from the nodes slice
+    nodes
+        .iter()
+        .filter(|n| n.id.kind == NodeKind::PrMerge && matched_stable_ids.contains(&n.stable_id()))
+        .collect()
+}
+
+/// Format PR merge nodes as a markdown section for outcome_progress output.
+pub fn format_pr_merges_markdown(pr_nodes: &[&Node]) -> String {
+    if pr_nodes.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("## PR Merges serving this outcome\n\n");
+
+    for node in pr_nodes {
+        let title = &node.signature;
+        let author = node.metadata.get("author").map(|s| s.as_str()).unwrap_or("unknown");
+        let branch = node.metadata.get("branch_name").map(|s| s.as_str()).unwrap_or("unknown");
+        let commit_count = node.metadata.get("commit_count").map(|s| s.as_str()).unwrap_or("?");
+        let merged_at = node
+            .metadata
+            .get("merged_at")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let files_str = node
+            .metadata
+            .get("files_changed")
+            .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
+            .map(|files| files.join(", "))
+            .unwrap_or_default();
+
+        out.push_str(&format!(
+            "- **{}** (merged {} by {})\n  Branch: {} | {} commit(s) | Modified: {}\n\n",
+            title, merged_at, author, branch, commit_count, files_str,
+        ));
+    }
+
+    out
 }
 
 /// Filter `.oh/` artifacts by case-insensitive substring match against the
