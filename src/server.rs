@@ -12,8 +12,13 @@ use rust_mcp_sdk::schema::{
 use serde::{Deserialize, Serialize};
 
 use crate::embed::EmbeddingIndex;
+use crate::extract::ExtractorRegistry;
+use crate::graph::{self, EdgeKind, Node, Edge};
+use crate::graph::index::GraphIndex;
+use crate::scanner::Scanner;
 use crate::types::OhArtifactKind;
 use crate::{code, git, markdown, oh, query};
+use petgraph::Direction;
 use tokio::sync::OnceCell;
 
 // ── Tool input structs ──────────────────────────────────────────────
@@ -235,11 +240,76 @@ pub struct OhInit {
     pub outcome_name: Option<String>,
 }
 
+#[macros::mcp_tool(
+    name = "search_symbols",
+    description = "Searches code symbols across all languages (Rust, Python, TypeScript, Go) from the workspace graph. Returns functions, structs, traits, classes, interfaces with file location and edges. Replaces search_code with multi-language, graph-aware results."
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct SearchSymbols {
+    /// Search query string (matched against symbol name and signature)
+    pub query: String,
+    /// Optional: filter by symbol kind (function, struct, trait, enum, module, import, etc.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Optional: filter by language (rust, python, typescript, go, markdown)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Optional: filter by file path substring
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Maximum results to return (default: 20)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[macros::mcp_tool(
+    name = "graph_neighbors",
+    description = "Traverses the code graph from a symbol. Returns what calls it, what it calls, what it depends on, what implements it. Use after search_symbols to explore relationships."
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GraphNeighbors {
+    /// Stable ID from search_symbols results
+    pub node_id: String,
+    /// Direction: "outgoing" (default), "incoming", "both"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    /// Filter edge types: calls, depends_on, implements, defines, etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_types: Option<Vec<String>>,
+    /// Maximum hops to traverse (default: 1)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_hops: Option<u32>,
+}
+
+#[macros::mcp_tool(
+    name = "graph_impact",
+    description = "Impact analysis: what depends on this symbol? Reverse-traverses the graph to find all callers, implementors, and dependents within N hops."
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GraphImpact {
+    /// Stable ID from search_symbols results
+    pub node_id: String,
+    /// Maximum hops to traverse (default: 3)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_hops: Option<u32>,
+}
+
+// ── Graph state ─────────────────────────────────────────────────────
+
+/// In-memory graph state: extraction results + petgraph index.
+/// Lazily initialized on first graph-aware tool call.
+pub struct GraphState {
+    pub nodes: Vec<Node>,
+    pub edges: Vec<Edge>,
+    pub index: GraphIndex,
+}
+
 // ── ServerHandler ───────────────────────────────────────────────────
 
 pub struct RnaHandler {
     pub repo_root: PathBuf,
     pub embed_index: OnceCell<EmbeddingIndex>,
+    pub graph_index: OnceCell<GraphState>,
 }
 
 impl Default for RnaHandler {
@@ -247,6 +317,7 @@ impl Default for RnaHandler {
         Self {
             repo_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             embed_index: OnceCell::new(),
+            graph_index: OnceCell::new(),
         }
     }
 }
@@ -259,6 +330,46 @@ impl RnaHandler {
                 let count = index.index_all(&self.repo_root).await?;
                 tracing::info!("Indexed {} .oh/ artifacts for semantic search", count);
                 Ok(index)
+            })
+            .await
+    }
+
+    async fn get_graph(&self) -> anyhow::Result<&GraphState> {
+        self.graph_index
+            .get_or_try_init(|| async {
+                // 1. Run scanner
+                let mut scanner = Scanner::new(self.repo_root.clone())?;
+                let scan_result = scanner.scan()?;
+                tracing::info!(
+                    "Scanned: {} new, {} changed, {} deleted in {:?}",
+                    scan_result.new_files.len(),
+                    scan_result.changed_files.len(),
+                    scan_result.deleted_files.len(),
+                    scan_result.scan_duration
+                );
+
+                // 2. Run extractors
+                let registry = ExtractorRegistry::with_builtins();
+                let extraction = registry.extract_scan_result(&self.repo_root, &scan_result);
+                tracing::info!(
+                    "Extracted: {} nodes, {} edges",
+                    extraction.nodes.len(),
+                    extraction.edges.len()
+                );
+
+                // 3. Build petgraph index
+                let mut index = GraphIndex::new();
+                index.rebuild_from_edges(&extraction.edges);
+                // Also ensure all nodes are in the graph (some may have no edges)
+                for node in &extraction.nodes {
+                    index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+                }
+
+                Ok(GraphState {
+                    nodes: extraction.nodes,
+                    edges: extraction.edges,
+                    index,
+                })
             })
             .await
     }
@@ -294,6 +405,9 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 SearchAll::tool(),
                 OutcomeProgress::tool(),
                 OhInit::tool(),
+                SearchSymbols::tool(),
+                GraphNeighbors::tool(),
+                GraphImpact::tool(),
             ],
             meta: None,
             next_cursor: None,
@@ -602,6 +716,225 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 }
             }
 
+            "search_symbols" => {
+                let args: SearchSymbols = parse_args(params.arguments)?;
+                match self.get_graph().await {
+                    Ok(graph_state) => {
+                        let limit = args.limit.unwrap_or(20) as usize;
+                        let query_lower = args.query.to_lowercase();
+
+                        let mut matches: Vec<&Node> = graph_state
+                            .nodes
+                            .iter()
+                            .filter(|n| {
+                                let name_match = n.id.name.to_lowercase().contains(&query_lower)
+                                    || n.signature.to_lowercase().contains(&query_lower);
+                                if !name_match {
+                                    return false;
+                                }
+                                if let Some(ref kind_filter) = args.kind {
+                                    if n.id.kind.to_string().to_lowercase() != kind_filter.to_lowercase() {
+                                        return false;
+                                    }
+                                }
+                                if let Some(ref lang_filter) = args.language {
+                                    if n.language.to_lowercase() != lang_filter.to_lowercase() {
+                                        return false;
+                                    }
+                                }
+                                if let Some(ref file_filter) = args.file {
+                                    let path_str = n.id.file.to_string_lossy();
+                                    if !path_str.contains(file_filter.as_str()) {
+                                        return false;
+                                    }
+                                }
+                                true
+                            })
+                            .collect();
+
+                        matches.truncate(limit);
+
+                        if matches.is_empty() {
+                            Ok(text_result(format!(
+                                "No symbols matching \"{}\".",
+                                args.query
+                            )))
+                        } else {
+                            let md: String = matches
+                                .iter()
+                                .map(|n| {
+                                    let stable_id = n.stable_id();
+                                    // Find edges involving this node
+                                    let outgoing = graph_state.index.neighbors(
+                                        &stable_id,
+                                        None,
+                                        Direction::Outgoing,
+                                    );
+                                    let incoming = graph_state.index.neighbors(
+                                        &stable_id,
+                                        None,
+                                        Direction::Incoming,
+                                    );
+                                    let mut entry = format!(
+                                        "- **{}** `{}` ({}) `{}`:{}-{}\n  ID: `{}`",
+                                        n.id.kind, n.id.name, n.language,
+                                        n.id.file.display(),
+                                        n.line_start, n.line_end,
+                                        stable_id,
+                                    );
+                                    if !n.signature.is_empty() {
+                                        entry.push_str(&format!("\n  Sig: `{}`", n.signature));
+                                    }
+                                    if !outgoing.is_empty() {
+                                        entry.push_str(&format!("\n  Out: {} edge(s)", outgoing.len()));
+                                    }
+                                    if !incoming.is_empty() {
+                                        entry.push_str(&format!("\n  In: {} edge(s)", incoming.len()));
+                                    }
+                                    entry
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n\n");
+                            Ok(text_result(format!(
+                                "## Symbol search: \"{}\"\n\n{} result(s)\n\n{}",
+                                args.query,
+                                matches.len(),
+                                md
+                            )))
+                        }
+                    }
+                    Err(e) => Ok(text_result(format!("Graph error: {}", e))),
+                }
+            }
+
+            "graph_neighbors" => {
+                let args: GraphNeighbors = parse_args(params.arguments)?;
+                match self.get_graph().await {
+                    Ok(graph_state) => {
+                        let max_hops = args.max_hops.unwrap_or(1) as usize;
+                        let edge_filter = args.edge_types.as_ref().map(|types| {
+                            types
+                                .iter()
+                                .filter_map(|t| parse_edge_kind(t))
+                                .collect::<Vec<_>>()
+                        });
+                        let edge_filter_slice = edge_filter.as_deref();
+
+                        let direction = args.direction.as_deref().unwrap_or("outgoing");
+
+                        let mut all_ids: Vec<String> = Vec::new();
+
+                        match direction {
+                            "outgoing" => {
+                                if max_hops == 1 {
+                                    all_ids = graph_state.index.neighbors(
+                                        &args.node_id,
+                                        edge_filter_slice,
+                                        Direction::Outgoing,
+                                    );
+                                } else {
+                                    all_ids = graph_state.index.reachable(
+                                        &args.node_id,
+                                        max_hops,
+                                        edge_filter_slice,
+                                    );
+                                }
+                            }
+                            "incoming" => {
+                                if max_hops == 1 {
+                                    all_ids = graph_state.index.neighbors(
+                                        &args.node_id,
+                                        edge_filter_slice,
+                                        Direction::Incoming,
+                                    );
+                                } else {
+                                    // For multi-hop incoming, use impact (no edge filter)
+                                    all_ids = graph_state.index.impact(&args.node_id, max_hops);
+                                }
+                            }
+                            "both" => {
+                                let out = if max_hops == 1 {
+                                    graph_state.index.neighbors(
+                                        &args.node_id,
+                                        edge_filter_slice,
+                                        Direction::Outgoing,
+                                    )
+                                } else {
+                                    graph_state.index.reachable(
+                                        &args.node_id,
+                                        max_hops,
+                                        edge_filter_slice,
+                                    )
+                                };
+                                let inc = if max_hops == 1 {
+                                    graph_state.index.neighbors(
+                                        &args.node_id,
+                                        edge_filter_slice,
+                                        Direction::Incoming,
+                                    )
+                                } else {
+                                    graph_state.index.impact(&args.node_id, max_hops)
+                                };
+                                all_ids.extend(out);
+                                all_ids.extend(inc);
+                                all_ids.sort();
+                                all_ids.dedup();
+                            }
+                            _ => {
+                                return Ok(text_result(format!(
+                                    "Invalid direction: \"{}\". Use \"outgoing\", \"incoming\", or \"both\".",
+                                    direction
+                                )));
+                            }
+                        }
+
+                        if all_ids.is_empty() {
+                            Ok(text_result(format!(
+                                "No {} neighbors for `{}`.",
+                                direction, args.node_id
+                            )))
+                        } else {
+                            let md = format_neighbor_nodes(&graph_state.nodes, &all_ids);
+                            Ok(text_result(format!(
+                                "## Graph neighbors ({}) of `{}`\n\n{} result(s)\n\n{}",
+                                direction,
+                                args.node_id,
+                                all_ids.len(),
+                                md
+                            )))
+                        }
+                    }
+                    Err(e) => Ok(text_result(format!("Graph error: {}", e))),
+                }
+            }
+
+            "graph_impact" => {
+                let args: GraphImpact = parse_args(params.arguments)?;
+                match self.get_graph().await {
+                    Ok(graph_state) => {
+                        let max_hops = args.max_hops.unwrap_or(3) as usize;
+                        let impacted = graph_state.index.impact(&args.node_id, max_hops);
+
+                        if impacted.is_empty() {
+                            Ok(text_result(format!(
+                                "No dependents found for `{}` within {} hops.",
+                                args.node_id, max_hops
+                            )))
+                        } else {
+                            let md = format_neighbor_nodes(&graph_state.nodes, &impacted);
+                            Ok(text_result(format!(
+                                "## Impact analysis for `{}`\n\n{} dependent(s) within {} hop(s)\n\n{}",
+                                args.node_id,
+                                impacted.len(),
+                                max_hops,
+                                md
+                            )))
+                        }
+                    }
+                    Err(e) => Ok(text_result(format!("Graph error: {}", e))),
+                }
+            }
+
             _ => Err(CallToolError::unknown_tool(&params.name)),
         }
     }
@@ -783,4 +1116,45 @@ fn ok_markdown(result: Result<String, anyhow::Error>) -> Result<CallToolResult, 
         Ok(md) => Ok(text_result(md)),
         Err(e) => Ok(text_result(format!("Error: {}", e))),
     }
+}
+
+/// Parse an edge kind string into an EdgeKind enum variant.
+fn parse_edge_kind(s: &str) -> Option<EdgeKind> {
+    match s.to_lowercase().as_str() {
+        "calls" => Some(EdgeKind::Calls),
+        "implements" => Some(EdgeKind::Implements),
+        "depends_on" => Some(EdgeKind::DependsOn),
+        "connects_to" => Some(EdgeKind::ConnectsTo),
+        "defines" => Some(EdgeKind::Defines),
+        "has_field" => Some(EdgeKind::HasField),
+        "evolves" => Some(EdgeKind::Evolves),
+        "referenced_by" => Some(EdgeKind::ReferencedBy),
+        "topology_boundary" => Some(EdgeKind::TopologyBoundary),
+        "modified" => Some(EdgeKind::Modified),
+        "affected" => Some(EdgeKind::Affected),
+        "serves" => Some(EdgeKind::Serves),
+        _ => None,
+    }
+}
+
+/// Format a list of node IDs into markdown, enriched with node details if available.
+fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String]) -> String {
+    ids.iter()
+        .map(|id| {
+            if let Some(node) = nodes.iter().find(|n| n.stable_id() == *id) {
+                format!(
+                    "- **{}** `{}` ({}) `{}`:{}-{}",
+                    node.id.kind,
+                    node.id.name,
+                    node.language,
+                    node.id.file.display(),
+                    node.line_start,
+                    node.line_end,
+                )
+            } else {
+                format!("- `{}`", id)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
