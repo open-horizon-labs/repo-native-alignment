@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context;
+use arrow_array::{RecordBatch, RecordBatchIterator, StringArray, UInt32Array, Int64Array};
 use async_trait::async_trait;
 use rust_mcp_sdk::macros::{self, JsonSchema};
 use rust_mcp_sdk::McpServer;
@@ -13,8 +15,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::embed::EmbeddingIndex;
 use crate::extract::{ExtractorRegistry, EnricherRegistry};
-use crate::graph::{self, EdgeKind, Node, Edge};
+use crate::graph::{self, EdgeKind, Node, Edge, Confidence, ExtractionSource, NodeId, NodeKind};
 use crate::graph::index::GraphIndex;
+use crate::graph::store::{symbols_schema, edges_schema};
 use crate::roots::{WorkspaceConfig, cache_state_path};
 use crate::scanner::Scanner;
 use crate::types::OhArtifactKind;
@@ -192,6 +195,380 @@ pub struct GitHistory {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ListRoots {}
 
+// ── Graph persistence (LanceDB) ─────────────────────────────────────
+
+/// LanceDB path for graph persistence.
+fn graph_lance_path(repo_root: &Path) -> PathBuf {
+    repo_root.join(".oh").join(".cache").join("lance")
+}
+
+/// Parse a NodeKind from its string representation.
+fn parse_node_kind(s: &str) -> NodeKind {
+    match s {
+        "function" => NodeKind::Function,
+        "struct" => NodeKind::Struct,
+        "trait" => NodeKind::Trait,
+        "enum" => NodeKind::Enum,
+        "module" => NodeKind::Module,
+        "import" => NodeKind::Import,
+        "const" => NodeKind::Const,
+        "impl" => NodeKind::Impl,
+        "proto_message" => NodeKind::ProtoMessage,
+        "sql_table" => NodeKind::SqlTable,
+        "api_endpoint" => NodeKind::ApiEndpoint,
+        "pr_merge" => NodeKind::PrMerge,
+        other => NodeKind::Other(other.to_string()),
+    }
+}
+
+/// Parse an EdgeKind from its string representation.
+fn parse_edge_kind(s: &str) -> Option<EdgeKind> {
+    Some(match s {
+        "calls" => EdgeKind::Calls,
+        "implements" => EdgeKind::Implements,
+        "depends_on" => EdgeKind::DependsOn,
+        "connects_to" => EdgeKind::ConnectsTo,
+        "defines" => EdgeKind::Defines,
+        "has_field" => EdgeKind::HasField,
+        "evolves" => EdgeKind::Evolves,
+        "referenced_by" => EdgeKind::ReferencedBy,
+        "topology_boundary" => EdgeKind::TopologyBoundary,
+        "modified" => EdgeKind::Modified,
+        "affected" => EdgeKind::Affected,
+        "serves" => EdgeKind::Serves,
+        _ => return None,
+    })
+}
+
+/// Parse an ExtractionSource from its string representation.
+fn parse_extraction_source(s: &str) -> ExtractionSource {
+    match s {
+        "tree_sitter" => ExtractionSource::TreeSitter,
+        "lsp" => ExtractionSource::Lsp,
+        "schema" => ExtractionSource::Schema,
+        "git" => ExtractionSource::Git,
+        "markdown" => ExtractionSource::Markdown,
+        _ => ExtractionSource::TreeSitter,
+    }
+}
+
+/// Parse a Confidence from its string representation.
+fn parse_confidence(s: &str) -> Confidence {
+    match s {
+        "confirmed" => Confidence::Confirmed,
+        _ => Confidence::Detected,
+    }
+}
+
+/// Persist graph nodes and edges to LanceDB tables.
+async fn persist_graph_to_lance(
+    repo_root: &Path,
+    nodes: &[Node],
+    edges: &[Edge],
+) -> anyhow::Result<()> {
+    let db_path = graph_lance_path(repo_root);
+    std::fs::create_dir_all(&db_path)?;
+
+    let db = lancedb::connect(db_path.to_str().unwrap())
+        .execute()
+        .await
+        .context("Failed to connect to LanceDB for graph persistence")?;
+
+    // ── Write symbols (nodes) table ──
+    {
+        let schema = Arc::new(symbols_schema());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
+        let root_ids: Vec<String> = nodes.iter().map(|n| n.id.root.clone()).collect();
+        let file_paths: Vec<String> = nodes.iter().map(|n| n.id.file.display().to_string()).collect();
+        let names: Vec<String> = nodes.iter().map(|n| n.id.name.clone()).collect();
+        let kinds: Vec<String> = nodes.iter().map(|n| n.id.kind.to_string()).collect();
+        let line_starts: Vec<u32> = nodes.iter().map(|n| n.line_start as u32).collect();
+        let line_ends: Vec<u32> = nodes.iter().map(|n| n.line_end as u32).collect();
+        let signatures: Vec<String> = nodes.iter().map(|n| n.signature.clone()).collect();
+        let bodies: Vec<String> = nodes.iter().map(|n| n.body.clone()).collect();
+        let updated_ats: Vec<i64> = vec![now; nodes.len()];
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(root_ids)),
+                Arc::new(StringArray::from(file_paths)),
+                Arc::new(StringArray::from(names)),
+                Arc::new(StringArray::from(kinds)),
+                Arc::new(UInt32Array::from(line_starts)),
+                Arc::new(UInt32Array::from(line_ends)),
+                Arc::new(StringArray::from(signatures)),
+                Arc::new(StringArray::from(bodies)),
+                Arc::new(Int64Array::from(updated_ats)),
+            ],
+        )?;
+
+        let _ = db.drop_table("symbols", &[]).await;
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        db.create_table("symbols", Box::new(batches))
+            .execute()
+            .await
+            .context("Failed to create symbols table")?;
+    }
+
+    // ── Write edges table ──
+    {
+        let schema = Arc::new(edges_schema());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let ids: Vec<String> = edges.iter().map(|e| e.stable_id()).collect();
+        let source_ids: Vec<String> = edges.iter().map(|e| e.from.to_stable_id()).collect();
+        let source_types: Vec<String> = edges.iter().map(|e| e.from.kind.to_string()).collect();
+        let target_ids: Vec<String> = edges.iter().map(|e| e.to.to_stable_id()).collect();
+        let target_types: Vec<String> = edges.iter().map(|e| e.to.kind.to_string()).collect();
+        let edge_types: Vec<String> = edges.iter().map(|e| e.kind.to_string()).collect();
+        // Store source and confidence in properties_json
+        let properties: Vec<String> = edges
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "source": e.source.to_string(),
+                    "confidence": e.confidence.to_string(),
+                })
+                .to_string()
+            })
+            .collect();
+        let root_ids: Vec<String> = edges.iter().map(|e| e.from.root.clone()).collect();
+        let updated_ats: Vec<i64> = vec![now; edges.len()];
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(source_ids)),
+                Arc::new(StringArray::from(source_types)),
+                Arc::new(StringArray::from(target_ids)),
+                Arc::new(StringArray::from(target_types)),
+                Arc::new(StringArray::from(edge_types)),
+                Arc::new(StringArray::from(properties)),
+                Arc::new(StringArray::from(root_ids)),
+                Arc::new(Int64Array::from(updated_ats)),
+            ],
+        )?;
+
+        let _ = db.drop_table("edges", &[]).await;
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        db.create_table("edges", Box::new(batches))
+            .execute()
+            .await
+            .context("Failed to create edges table")?;
+    }
+
+    tracing::info!(
+        "Persisted graph to LanceDB: {} nodes, {} edges",
+        nodes.len(),
+        edges.len()
+    );
+    Ok(())
+}
+
+/// Load graph nodes and edges from LanceDB tables.
+async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphState> {
+    use futures::TryStreamExt;
+    use lancedb::query::ExecutableQuery;
+
+    let db_path = graph_lance_path(repo_root);
+    if !db_path.exists() {
+        anyhow::bail!("No persisted graph at {}", db_path.display());
+    }
+
+    let db = lancedb::connect(db_path.to_str().unwrap())
+        .execute()
+        .await
+        .context("Failed to connect to LanceDB for graph loading")?;
+
+    // ── Read symbols (nodes) ──
+    let nodes = {
+        let table = db
+            .open_table("symbols")
+            .execute()
+            .await
+            .context("No symbols table found")?;
+        let stream = table.query().execute().await.context("Failed to query symbols")?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+        let mut nodes = Vec::new();
+        for batch in &batches {
+            let ids = batch.column_by_name("id").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let root_ids = batch.column_by_name("root_id").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let file_paths = batch.column_by_name("file_path").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let names = batch.column_by_name("name").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let kinds = batch.column_by_name("kind").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let line_starts = batch.column_by_name("line_start").unwrap().as_any().downcast_ref::<UInt32Array>().unwrap();
+            let line_ends = batch.column_by_name("line_end").unwrap().as_any().downcast_ref::<UInt32Array>().unwrap();
+            let signatures = batch.column_by_name("signature").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let bodies = batch.column_by_name("body").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            // We don't store language or source in the symbols schema, so we infer from file extension
+            let _ = ids; // ids column exists but we reconstruct from components
+
+            for i in 0..batch.num_rows() {
+                let file_path = PathBuf::from(file_paths.value(i));
+                let language = infer_language_from_path(&file_path);
+                nodes.push(Node {
+                    id: NodeId {
+                        root: root_ids.value(i).to_string(),
+                        file: file_path,
+                        name: names.value(i).to_string(),
+                        kind: parse_node_kind(kinds.value(i)),
+                    },
+                    language,
+                    line_start: line_starts.value(i) as usize,
+                    line_end: line_ends.value(i) as usize,
+                    signature: signatures.value(i).to_string(),
+                    body: bodies.value(i).to_string(),
+                    metadata: BTreeMap::new(),
+                    source: ExtractionSource::TreeSitter, // default; not stored in schema
+                });
+            }
+        }
+        nodes
+    };
+
+    // ── Read edges ──
+    let edges = {
+        let table = db
+            .open_table("edges")
+            .execute()
+            .await
+            .context("No edges table found")?;
+        let stream = table.query().execute().await.context("Failed to query edges")?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+        let mut edges = Vec::new();
+        for batch in &batches {
+            let source_ids = batch.column_by_name("source_id").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let source_types = batch.column_by_name("source_type").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let target_ids = batch.column_by_name("target_id").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let target_types = batch.column_by_name("target_type").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let edge_types = batch.column_by_name("edge_type").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let properties = batch.column_by_name("properties_json").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let root_ids = batch.column_by_name("root_id").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+
+            for i in 0..batch.num_rows() {
+                let edge_kind = match parse_edge_kind(edge_types.value(i)) {
+                    Some(k) => k,
+                    None => continue,
+                };
+
+                // Parse source and confidence from properties_json
+                let props: serde_json::Value = serde_json::from_str(properties.value(i)).unwrap_or_default();
+                let extraction_source = props.get("source")
+                    .and_then(|v| v.as_str())
+                    .map(parse_extraction_source)
+                    .unwrap_or(ExtractionSource::TreeSitter);
+                let confidence = props.get("confidence")
+                    .and_then(|v| v.as_str())
+                    .map(parse_confidence)
+                    .unwrap_or(Confidence::Detected);
+
+                // Parse NodeId from stable_id format: "root:file:name:kind"
+                let from = parse_node_id_from_stable(source_ids.value(i), source_types.value(i), root_ids.value(i));
+                let to = parse_node_id_from_stable(target_ids.value(i), target_types.value(i), root_ids.value(i));
+
+                edges.push(Edge {
+                    from,
+                    to,
+                    kind: edge_kind,
+                    source: extraction_source,
+                    confidence,
+                });
+            }
+        }
+        edges
+    };
+
+    // ── Build index ──
+    let mut index = GraphIndex::new();
+    index.rebuild_from_edges(&edges);
+    for node in &nodes {
+        index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+    }
+
+    Ok(GraphState { nodes, edges, index })
+}
+
+/// Parse a NodeId from its stable_id string (format: "root:file:name:kind").
+/// Falls back to using the type hint and root if parsing is ambiguous.
+fn parse_node_id_from_stable(stable_id: &str, kind_hint: &str, root_hint: &str) -> NodeId {
+    // stable_id format: "root:file:name:kind"
+    // We need to handle the case where file or name might contain ':'
+    // Strategy: split from the end to get kind, then from the start to get root,
+    // the middle is file:name which we split on the last ':'
+    let parts: Vec<&str> = stable_id.splitn(2, ':').collect();
+    if parts.len() < 2 {
+        return NodeId {
+            root: root_hint.to_string(),
+            file: PathBuf::from(stable_id),
+            name: String::new(),
+            kind: parse_node_kind(kind_hint),
+        };
+    }
+
+    let root = parts[0].to_string();
+    let rest = parts[1]; // "file:name:kind"
+
+    // Split from the end to get kind
+    if let Some(last_colon) = rest.rfind(':') {
+        let before_kind = &rest[..last_colon]; // "file:name"
+        // Split file:name on the last colon
+        if let Some(name_colon) = before_kind.rfind(':') {
+            let file = &before_kind[..name_colon];
+            let name = &before_kind[name_colon + 1..];
+            return NodeId {
+                root,
+                file: PathBuf::from(file),
+                name: name.to_string(),
+                kind: parse_node_kind(kind_hint),
+            };
+        }
+        // Only one segment — treat as file with empty name
+        return NodeId {
+            root,
+            file: PathBuf::from(before_kind),
+            name: String::new(),
+            kind: parse_node_kind(kind_hint),
+        };
+    }
+
+    NodeId {
+        root: root_hint.to_string(),
+        file: PathBuf::from(rest),
+        name: String::new(),
+        kind: parse_node_kind(kind_hint),
+    }
+}
+
+/// Infer programming language from file extension.
+fn infer_language_from_path(path: &Path) -> String {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("rs") => "rust".to_string(),
+        Some("py") => "python".to_string(),
+        Some("ts") | Some("tsx") => "typescript".to_string(),
+        Some("js") | Some("jsx") => "javascript".to_string(),
+        Some("go") => "go".to_string(),
+        Some("proto") => "protobuf".to_string(),
+        Some("sql") => "sql".to_string(),
+        Some("md") => "markdown".to_string(),
+        Some("toml") => "toml".to_string(),
+        Some("yaml") | Some("yml") => "yaml".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
 // ── Graph state ─────────────────────────────────────────────────────
 
 /// In-memory graph state: extraction results + petgraph index.
@@ -243,11 +620,10 @@ impl RnaHandler {
                     .with_primary_root(self.repo_root.clone());
                 let resolved_roots = workspace.resolved_roots();
 
-                let registry = ExtractorRegistry::with_builtins();
-                let mut all_nodes: Vec<Node> = Vec::new();
-                let mut all_edges: Vec<Edge> = Vec::new();
+                // 1. Scan all roots to detect changes
+                let mut has_changes = false;
+                let mut scanners: Vec<(String, Scanner, crate::scanner::ScanResult, PathBuf)> = Vec::new();
 
-                // 3. Scan all roots (multi-root support)
                 for resolved_root in &resolved_roots {
                     let root_slug = &resolved_root.slug;
                     let root_path = &resolved_root.path;
@@ -276,6 +652,39 @@ impl RnaHandler {
                         scan_result.scan_duration
                     );
 
+                    if !scan_result.new_files.is_empty()
+                        || !scan_result.changed_files.is_empty()
+                        || !scan_result.deleted_files.is_empty()
+                    {
+                        has_changes = true;
+                    }
+
+                    scanners.push((root_slug.clone(), scanner, scan_result, root_path.clone()));
+                }
+
+                // 2. If no changes, try loading from LanceDB
+                if !has_changes {
+                    match load_graph_from_lance(&self.repo_root).await {
+                        Ok(state) => {
+                            tracing::info!(
+                                "Loaded graph from LanceDB: {} nodes, {} edges",
+                                state.nodes.len(),
+                                state.edges.len()
+                            );
+                            return Ok(state);
+                        }
+                        Err(e) => {
+                            tracing::debug!("Could not load persisted graph: {}", e);
+                        }
+                    }
+                }
+
+                // 3. Full rebuild
+                let registry = ExtractorRegistry::with_builtins();
+                let mut all_nodes: Vec<Node> = Vec::new();
+                let mut all_edges: Vec<Edge> = Vec::new();
+
+                for (root_slug, scanner, _scan_result, root_path) in &scanners {
                     let all_files = scanner.all_known_files();
                     let full_scan = crate::scanner::ScanResult {
                         changed_files: Vec::new(),
@@ -377,6 +786,12 @@ impl RnaHandler {
                     all_edges.len(),
                     resolved_roots.len()
                 );
+
+                // 7. Persist to LanceDB for next startup
+                if let Err(e) = persist_graph_to_lance(&self.repo_root, &all_nodes, &all_edges).await {
+                    tracing::warn!("Failed to persist graph to LanceDB: {}", e);
+                    // Non-fatal — graph still works in-memory
+                }
 
                 Ok(GraphState {
                     nodes: all_nodes,
@@ -1271,25 +1686,6 @@ fn detect_project_name(repo_root: &Path) -> Option<String> {
         .file_name()
         .and_then(|n| n.to_str())
         .map(|s| s.to_string())
-}
-
-/// Parse an edge kind string into an EdgeKind enum variant.
-fn parse_edge_kind(s: &str) -> Option<EdgeKind> {
-    match s.to_lowercase().as_str() {
-        "calls" => Some(EdgeKind::Calls),
-        "implements" => Some(EdgeKind::Implements),
-        "depends_on" => Some(EdgeKind::DependsOn),
-        "connects_to" => Some(EdgeKind::ConnectsTo),
-        "defines" => Some(EdgeKind::Defines),
-        "has_field" => Some(EdgeKind::HasField),
-        "evolves" => Some(EdgeKind::Evolves),
-        "referenced_by" => Some(EdgeKind::ReferencedBy),
-        "topology_boundary" => Some(EdgeKind::TopologyBoundary),
-        "modified" => Some(EdgeKind::Modified),
-        "affected" => Some(EdgeKind::Affected),
-        "serves" => Some(EdgeKind::Serves),
-        _ => None,
-    }
 }
 
 /// Format a list of node IDs into markdown, enriched with node details if available.
