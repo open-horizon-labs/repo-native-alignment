@@ -310,6 +310,8 @@ pub struct RnaHandler {
     pub repo_root: PathBuf,
     pub embed_index: OnceCell<EmbeddingIndex>,
     pub graph_index: OnceCell<GraphState>,
+    /// Whether business context has been injected into a tool response.
+    pub context_injected: std::sync::atomic::AtomicBool,
 }
 
 impl Default for RnaHandler {
@@ -318,6 +320,7 @@ impl Default for RnaHandler {
             repo_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             embed_index: OnceCell::new(),
             graph_index: OnceCell::new(),
+            context_injected: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -389,6 +392,66 @@ fn text_result(s: String) -> CallToolResult {
     CallToolResult::text_content(vec![TextContent::new(s, None, None)])
 }
 
+/// Build a concise business context preamble from .oh/ artifacts.
+fn build_context_preamble(root: &Path) -> String {
+    let artifacts = match oh::load_oh_artifacts(root) {
+        Ok(a) => a,
+        Err(_) => return String::new(),
+    };
+
+    if artifacts.is_empty() {
+        return String::new();
+    }
+
+    let mut parts = Vec::new();
+
+    // Active outcomes (just names + status)
+    let outcomes: Vec<_> = artifacts.iter().filter(|a| a.kind == OhArtifactKind::Outcome).collect();
+    if !outcomes.is_empty() {
+        let mut section = String::from("**Active outcomes:**\n");
+        for o in &outcomes {
+            let status = o.frontmatter.get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            section.push_str(&format!("- {} ({})\n", o.id(), status));
+        }
+        parts.push(section);
+    }
+
+    // Hard/soft guardrails (just statements, no full body)
+    let guardrails: Vec<_> = artifacts.iter().filter(|a| a.kind == OhArtifactKind::Guardrail).collect();
+    if !guardrails.is_empty() {
+        let mut section = String::from("**Guardrails:**\n");
+        for g in &guardrails {
+            let severity = g.frontmatter.get("severity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("candidate");
+            let id = g.id();
+            let statement = g.frontmatter.get("statement")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&id);
+            section.push_str(&format!("- [{}] {}\n", severity, statement));
+        }
+        parts.push(section);
+    }
+
+    // Recent metis (last 3 titles only)
+    let metis: Vec<_> = artifacts.iter().filter(|a| a.kind == OhArtifactKind::Metis).collect();
+    if !metis.is_empty() {
+        let mut section = String::from("**Recent learnings:**\n");
+        for m in metis.iter().rev().take(3) {
+            let id = m.id();
+            let title = m.frontmatter.get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&id);
+            section.push_str(&format!("- {}\n", title));
+        }
+        parts.push(section);
+    }
+
+    format!("---\n# Business Context (auto-injected on first tool call)\n\n{}\n---\n\n", parts.join("\n"))
+}
+
 #[async_trait]
 impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
     async fn handle_list_tools_request(
@@ -431,7 +494,20 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
     ) -> Result<CallToolResult, CallToolError> {
         let root = &self.repo_root;
 
-        match params.name.as_str() {
+        // Inject business context preamble on first tool call
+        let preamble = if !self.context_injected.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let ctx = build_context_preamble(root);
+            if !ctx.is_empty() {
+                tracing::info!("Injecting business context preamble on first tool call");
+                Some(ctx)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut result = match params.name.as_str() {
             "oh_get_outcomes" => ok_markdown(get_artifacts_by_kind(root, OhArtifactKind::Outcome)),
             "oh_get_signals" => ok_markdown(get_artifacts_by_kind(root, OhArtifactKind::Signal)),
             "oh_get_guardrails" => {
@@ -946,7 +1022,17 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             }
 
             _ => Err(CallToolError::unknown_tool(&params.name)),
+        };
+
+        // Prepend business context preamble to first successful tool result
+        if let (Some(preamble), Ok(tool_result)) = (preamble, &mut result) {
+            tool_result.content.insert(
+                0,
+                TextContent::new(preamble, None, None).into(),
+            );
         }
+
+        result
     }
 }
 
