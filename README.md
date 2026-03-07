@@ -120,6 +120,20 @@ The repo-local intelligence layer. Scans your repo, extracts a multi-language co
 - Edges: calls, implements, depends-on, modified, serves (with provenance + confidence)
 - In-memory traversal via petgraph (microseconds)
 
+**LSP enrichment (auto-discovered):**
+
+RNA auto-detects installed language servers and uses them for cross-file `Calls` and `Implements` edges. No configuration needed — if the binary is on PATH, it's used.
+
+| Language | Server | Install |
+|---|---|---|
+| Rust | rust-analyzer | `rustup component add rust-analyzer` |
+| Python | pyright | `npm install -g pyright` |
+| TypeScript/JS | typescript-language-server | `npm install -g typescript-language-server typescript` |
+| Go | gopls | `go install golang.org/x/tools/gopls@latest` |
+| Markdown | marksman | `brew install marksman` |
+
+Missing servers are skipped gracefully — the graph still has tree-sitter data. LSP adds richer edges.
+
 **Scanner (incremental):**
 - mtime-based subtree skipping — unchanged directories skipped entirely
 - git diff as precision layer when `.git` present
