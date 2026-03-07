@@ -90,13 +90,29 @@ Pluggable extractors produce `{ metadata, chunks }` from files. Same pipeline ha
 - **Future extractors**: Terraform, YAML config, Dockerfile — anything with parseable structure
 - The registry matches extractors to files by path/extension. Only changed files get re-extracted (git diff drives the delta).
 
+### `.oh/` is a Cache, Not the Source of Truth
+
+Outcomes live wherever they live: OH graph, Jira, Linear, Notion, Slack, product tickets, external docs, conversations. The `.oh/` directory is the **local, repo-embedded cache** of outcomes discovered from any source. The system should:
+
+1. **Extract** aims from any MCP-accessible source as they're encountered
+2. **Capture** them into the vector store when accessed
+3. **Cache** them to `.oh/` for repo-local, offline, git-versioned access
+4. **Update** the cache conversationally — user + LLM refine together
+
+The `.oh/` reader is just one ingest adapter. The vector store (once added) is the real index. Any MCP tool result containing outcome-like content gets captured. `.oh/` is the local projection you can `git commit`.
+
+### Code Intelligence: LSP-First, Tree-Sitter Fallback
+
+When an LSP is available and running, it has richer type info than tree-sitter (hover, go-to-definition, type inference). The code extractor should try LSP first, fall back to tree-sitter for repos without LSP support.
+
 ### Constraints
 - **Hard:**
-  - **Repo-native** — `.oh/` in the repo, git-versioned, no external store
+  - **Repo-native** — `.oh/` in the repo, git-versioned, no external store for core function
   - **Lightweight** — markdown files with frontmatter, complexity in tooling not content
   - **MCP interface** — agents query via MCP tools, not direct file reads
   - **Must connect all three layers** — aims + code + git history, and their intersections
   - **All markdown is first-class** — CLAUDE.md, README, session files parsed and indexed alongside `.oh/` and code
+  - **`.oh/` is a cache** — outcomes originate in external systems; `.oh/` is the repo-local projection
 
 - **Soft:**
   - Rust + rust-mcp-sdk (matched to UHC patterns, but implementation choice)
@@ -116,6 +132,76 @@ Pluggable extractors produce `{ metadata, chunks }` from files. Same pipeline ha
 - DuckDB analytics overlay — optional, not required for the proof
 - Real-time incremental indexing — full rebuild is fine for prototype scale
 - LSP enrichment (type info, hover) — tree-sitter is sufficient for symbol extraction; LSP can layer on later
+
+---
+
+## Solution Space
+**Updated:** 2026-03-06
+
+**Selected approach:** Vertical Slice — build all layers thin, wired together from day one. The acceptance test is the target from commit 1.
+
+**Why:** The whole point is the *intersection* of business context + code + git history. Building layers in isolation delays the moment you discover whether connecting them works. A vertical slice forces integration design from the start — which is where the novel value lives.
+
+**Accepted trade-offs:**
+- Each layer is thin initially (no embeddings, basic tree-sitter, simple git queries)
+- Will rework internals as layers deepen
+- LanceDB may be overkill for the thin slice — start with in-memory structs, graduate to LanceDB
+
+### Implementation Checklist
+
+#### 1. Project Scaffold
+- [ ] Cargo workspace with `rna-server` binary crate
+- [ ] rust-mcp-sdk dependency + Axum HTTP transport
+- [ ] `.mcp.json` config for Claude Code integration
+- [ ] Server boots, registers tools, responds to `list_tools`
+
+#### 2. `.oh/` File Reader (Business Context Layer)
+- [ ] Parse YAML frontmatter + markdown body from `.oh/` files
+- [ ] `oh_get_outcomes` — list outcomes with metadata
+- [ ] `oh_get_signals` — list signals with SLO definitions
+- [ ] `oh_get_guardrails` — list guardrails with severity
+- [ ] `oh_get_metis` — list metis entries
+- [ ] `oh_get_context` — return full `.oh/` bundle
+- [ ] `oh_record_metis` — write new metis entry to `.oh/metis/`
+- [ ] Output as markdown (tables, structured sections)
+
+#### 3. Markdown Extractor (All Markdown First-Class)
+- [ ] pulldown-cmark parses all `.md` files in repo (not just `.oh/`)
+- [ ] Heading-delimited chunking: each section = chunk with metadata (file, heading hierarchy, byte range)
+- [ ] YAML frontmatter extraction as structured metadata
+- [ ] Code span extraction from markdown (`` `params![]` `` → potential cross-reference)
+- [ ] MCP tool: `search_markdown` — find sections matching a query across all `.md` files
+
+#### 4. Code Extractor (tree-sitter)
+- [ ] tree-sitter parses `.rs` files → symbols (functions, structs, traits, imports)
+- [ ] Symbol metadata: file, line range, kind, parent scope, signature
+- [ ] MCP tool: `search_code` — find symbols by name or kind
+- [ ] Cross-reference: code spans found in markdown matched against symbol table
+
+#### 5. Git History Layer
+- [ ] git2 reads commit history (messages, changed files, timestamps, authors)
+- [ ] MCP tool: `search_commits` — find commits matching a query string
+- [ ] Map commits to files → connect to symbols and markdown sections
+- [ ] MCP tool: `file_history` — what changed in a file across commits
+
+#### 6. The Intersection Query
+- [ ] MCP tool: `query` — the compound query that crosses all layers
+- [ ] Given a natural language query, search across: `.oh/` entries, markdown sections, code symbols, git commits
+- [ ] Return results as markdown: timeline of commits, relevant code, matching `.oh/` entries, related markdown sections
+- [ ] **Acceptance test:** "What have we done to make alignment available via MCP?" returns a grounded, multi-layer answer
+
+#### 7. Markdown-Native Output
+- [ ] All MCP tool responses rendered as markdown
+- [ ] `file:line` links for code references
+- [ ] Tables for structured data (outcomes, signals, symbols)
+- [ ] Diff blocks for git changes
+
+#### 8. Hybrid Index (Lightweight Persistent + On-Demand)
+- [ ] Persistent index: symbol names, file locations, heading hierarchy, change timestamps
+- [ ] On-demand: full file contents, detailed AST, embeddings loaded when queried
+- [ ] LanceDB as the store (or in-memory structs for initial thin slice, graduate to LanceDB)
+- [ ] Extractor registry: match files to extractors by path/extension
+- [ ] Re-extract only changed files (git diff drives delta)
 
 ---
 

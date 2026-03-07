@@ -6,13 +6,9 @@ description = "Agentic harness: business outcomes, SLO signals, constraints, and
 
 [dependencies]
 # MCP server (same SDK as UHC — proven pattern)
-rust-mcp-sdk = { version = "0.8", default-features = false, features = ["server", "macros", "hyper-server", "sse"] }
+rust-mcp-sdk = { version = "0.8", default-features = false, features = ["server", "macros", "hyper-server", "sse", "stdio"] }
 async-trait = "0.1"
 
-# Web framework (for HTTP MCP transport, matching UHC pattern)
-axum = "0.8"
-tower = "0.5"
-tower-http = { version = "0.6", features = ["cors"] }
 tokio = { version = "1", features = ["full"] }
 
 # Markdown parsing (heading-aware chunking for embeddings)
@@ -22,7 +18,8 @@ pulldown-cmark = "0.12"
 git2 = "0.20"
 
 # Code parsing (symbol extraction)
-# tree-sitter = "0.25"  # Phase 2 — uncomment when ready
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
 
 # Vector + columnar store (Phase 1+)
 # lancedb = "0.15"  # uncomment when ready
@@ -35,12 +32,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 
-# Schema generation for MCP tool parameters
-schemars = "0.8"
-
 # Error handling
 anyhow = "1"
 
 # Logging (stderr only — stdout reserved for MCP stdio transport)
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.26.0"

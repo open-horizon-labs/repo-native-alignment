@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "rna-server": {
+      "type": "stdio",
+      "command": "/Users/muness/src/open-horizon-labs/repo-native-alignment/target/release/repo-native-alignment",
+      "args": ["--repo", "/Users/muness/src/open-horizon-labs/repo-native-alignment"],
+      "timeout": 10000
+    }
+  }
+}
