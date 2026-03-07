@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "rna-server": {
-      "type": "http",
-      "url": "http://127.0.0.1:8382/mcp"
+      "command": "./target/release/repo-native-alignment",
+      "args": ["--repo", "."]
     }
   }
 }
