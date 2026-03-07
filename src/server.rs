@@ -602,11 +602,13 @@ impl Default for RnaHandler {
 
 impl RnaHandler {
     async fn get_index(&self) -> anyhow::Result<&EmbeddingIndex> {
+        // Ensure graph is built first so symbols are available for embedding
+        let _ = self.get_graph().await;
+
         self.embed_index
             .get_or_try_init(|| async {
                 let index = EmbeddingIndex::new(&self.repo_root).await?;
 
-                // If graph is already built, include symbols in the embedding index
                 let symbols = if let Some(graph) = self.graph_index.get() {
                     &graph.nodes[..]
                 } else {
@@ -614,7 +616,7 @@ impl RnaHandler {
                 };
 
                 let count = index.index_all_with_symbols(&self.repo_root, symbols).await?;
-                tracing::info!("Indexed {} items for semantic search (artifacts + commits + symbols)", count);
+                tracing::info!("Indexed {} items for semantic search (artifacts + commits + {} symbols)", count, symbols.len());
                 Ok(index)
             })
             .await
@@ -798,20 +800,6 @@ impl RnaHandler {
                 // 7. Persist to LanceDB for next startup
                 if let Err(e) = persist_graph_to_lance(&self.repo_root, &all_nodes, &all_edges).await {
                     tracing::warn!("Failed to persist graph to LanceDB: {}", e);
-                }
-
-                // 8. Rebuild embedding index with symbols for semantic code search
-                match EmbeddingIndex::new(&self.repo_root).await {
-                    Ok(embed_index) => {
-                        match embed_index.index_all_with_symbols(&self.repo_root, &all_nodes).await {
-                            Ok(count) => {
-                                tracing::info!("Embedded {} items (artifacts + commits + symbols)", count);
-                                let _ = self.embed_index.set(embed_index);
-                            }
-                            Err(e) => tracing::warn!("Failed to build embedding index: {}", e),
-                        }
-                    }
-                    Err(e) => tracing::warn!("Failed to create embedding index: {}", e),
                 }
 
                 Ok(GraphState {
