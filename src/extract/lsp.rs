@@ -355,7 +355,13 @@ impl LspEnricher {
         #[allow(deprecated)] // root_uri is deprecated in favor of workspace_folders
         let mut init_params = InitializeParams {
             root_uri: Some(root_uri),
-            capabilities: ClientCapabilities::default(),
+            capabilities: ClientCapabilities {
+                window: Some(lsp_types::WindowClientCapabilities {
+                    work_done_progress: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -367,16 +373,105 @@ impl LspEnricher {
         let transport = state.transport.as_mut().unwrap();
         let init_result = transport.request("initialize", &init_params).await?;
 
-        // Parse to verify it's valid
-        let _result: InitializeResult = serde_json::from_value(init_result)
+        // Parse and check server capabilities
+        let init_result_parsed: InitializeResult = serde_json::from_value(init_result)
             .context("Failed to parse initialize result")?;
+
+        let has_references = init_result_parsed.capabilities.references_provider.is_some();
+        let has_implementation = init_result_parsed.capabilities.implementation_provider.is_some();
+        tracing::info!(
+            "{} capabilities: references={}, implementation={}",
+            self.server_command, has_references, has_implementation
+        );
 
         // Send initialized notification
         transport
             .notify("initialized", serde_json::json!({}))
             .await?;
 
-        tracing::info!("{} initialized successfully for {}", self.server_command, self.language);
+        tracing::info!("{} initialized, waiting for indexing...", self.server_command);
+
+        // Wait for the language server to finish indexing the workspace.
+        // rust-analyzer (and most LSP servers) need time after `initialized`
+        // to build their project index. Without this wait, all reference
+        // lookups return "file not found."
+        //
+        // We drain notifications looking for progress/done signals.
+        // Timeout after 60 seconds to avoid hanging on broken servers.
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+        let transport = state.transport.as_mut().unwrap();
+        // Wait for the server to be ready.
+        //
+        // rust-analyzer uses `experimental/serverStatus` with:
+        //   health: "ok" | "warning" | "error"
+        //   quiescent: bool (false = no pending background work)
+        //
+        // Other LSP servers may not send this — for those, we fall back
+        // to a timeout after `$/progress` tokens complete.
+        let mut server_ready = false;
+
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                tokio::time::Duration::from_secs(5),
+                transport.read_message(),
+            )
+            .await
+            {
+                Ok(Ok(msg)) => {
+                    if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+                        match method {
+                            // rust-analyzer's readiness signal
+                            "experimental/serverStatus" => {
+                                let health = msg.pointer("/params/health").and_then(|h| h.as_str()).unwrap_or("");
+                                let quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(true);
+                                tracing::info!("{} serverStatus: health={}, quiescent={}", self.server_command, health, quiescent);
+
+                                if health == "ok" && !quiescent {
+                                    tracing::info!("{} ready (serverStatus: ok, not quiescent)", self.server_command);
+                                    server_ready = true;
+                                    break;
+                                }
+                            }
+                            // Respond to progress create requests (required by protocol)
+                            "window/workDoneProgress/create" => {
+                                if let Some(id) = msg.get("id") {
+                                    let response = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "result": null
+                                    });
+                                    let _ = transport.send_message(&response).await;
+                                }
+                            }
+                            "$/progress" => {
+                                // Log progress for debugging but don't use it for readiness
+                                let kind = msg.pointer("/params/value/kind").and_then(|k| k.as_str()).unwrap_or("");
+                                let title = msg.pointer("/params/value/title").and_then(|t| t.as_str()).unwrap_or("");
+                                if kind == "begin" || kind == "end" {
+                                    tracing::debug!("{} progress {}: {}", self.server_command, kind, title);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!("Error reading LSP message during init: {}", e);
+                    break;
+                }
+                Err(_) => {
+                    // 5s timeout with no messages — server may not support serverStatus
+                    tracing::info!("{} no serverStatus after 5s, assuming ready", self.server_command);
+                    break;
+                }
+            }
+        }
+
+        if !server_ready {
+            tracing::info!("{} readiness timeout reached, proceeding anyway", self.server_command);
+        }
+
+        tracing::info!("{} ready for {}", self.server_command, self.language);
         self.ready.store(true, Ordering::SeqCst);
 
         Ok(())
@@ -504,13 +599,26 @@ impl Enricher for LspEnricher {
             .filter(|n| n.language == self.language)
             .collect();
 
+        let fn_count = matching_nodes.iter().filter(|n| n.id.kind == NodeKind::Function).count();
+        let trait_count = matching_nodes.iter().filter(|n| n.id.kind == NodeKind::Trait).count();
+        tracing::info!(
+            "LSP enriching {} nodes ({} functions, {} traits) for {}",
+            matching_nodes.len(), fn_count, trait_count, self.language
+        );
+
         if matching_nodes.is_empty() {
             return Ok(result);
         }
 
-        // Determine repo root from the first node's file path context.
-        // The nodes have relative paths; we need the repo root for absolute paths.
-        let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // Use the repo root from the --repo arg, not cwd
+        let repo_root = matching_nodes.first()
+            .map(|n| {
+                // Nodes have root_id set by multi-root scanning.
+                // For the primary root, the path in the graph state is relative to repo_root.
+                // We need the actual repo root path from the server.
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            })
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
         // Try to initialize the language server
         if let Err(e) = self.ensure_initialized(&repo_root).await {
@@ -529,6 +637,8 @@ impl Enricher for LspEnricher {
         };
 
         // Process functions and traits/interfaces
+        let mut attempted = 0u32;
+        let mut errors = 0u32;
         for node in &matching_nodes {
             let abs_path = root.join(&node.id.file);
             let file_uri = match path_to_uri(&abs_path) {
@@ -541,9 +651,13 @@ impl Enricher for LspEnricher {
 
             match node.id.kind {
                 NodeKind::Function => {
+                    attempted += 1;
                     // Find references (call sites) for functions
                     match Self::find_references(transport, &file_uri, line, 0).await {
                         Ok(locations) => {
+                            if !locations.is_empty() {
+                                tracing::debug!("Found {} references for {}", locations.len(), node.id.name);
+                            }
                             for loc in locations {
                                 let ref_path = uri_to_relative_path(&loc.uri, &root);
 
@@ -565,6 +679,7 @@ impl Enricher for LspEnricher {
                             }
                         }
                         Err(e) => {
+                            errors += 1;
                             tracing::debug!(
                                 "References lookup failed for {}: {}",
                                 node.id.name,
@@ -610,9 +725,11 @@ impl Enricher for LspEnricher {
         }
 
         tracing::info!(
-            "LSP enrichment complete for {}: {} edges added",
+            "LSP enrichment complete for {}: {} edges added ({} attempted, {} errors)",
             self.language,
-            result.added_edges.len()
+            result.added_edges.len(),
+            attempted,
+            errors,
         );
 
         Ok(result)
