@@ -1,6 +1,6 @@
 # Repo-Native Alignment
 
-Agents stay aligned to declared business outcomes — not just code correctness — because outcomes, constraints, signals, and learnings live *in the repo* as queryable, evolving artifacts.
+Aim-conditioned decision infrastructure for coding agents. Agents don't just execute — they plan and adapt conditioned on declared aims, treating repo artifacts as evidence that updates confidence in whether the current aim framing is still correct.
 
 We don't build features, we build capabilities.
 
@@ -40,6 +40,8 @@ We don't build features, we build capabilities.
 **The graph:** `search_symbols` and `graph_query` expose a multi-language code graph — symbols, imports, topology boundaries — built by incremental scanning with tree-sitter across Rust, Python, TypeScript, and Go.
 
 **The join:** `outcome_progress` connects layers structurally — outcome → file patterns → tagged commits → code symbols → PR merges. Structural links, not keyword matching.
+
+**Aim feedback:** Repo artifacts are evidence against declared aims. Commits, symbols, PR merges, and metis/guardrails don't just show activity — they update confidence in whether the current aim framing is still correct. When evidence diverges from the aim, that's a signal to reframe, not just push harder.
 
 **The search:** `oh_search_context` finds relevant context by natural language — "guardrails about API compatibility" — instead of listing all artifacts and filtering manually.
 
@@ -158,6 +160,8 @@ Agent wrappers for each workflow phase (`oh-aim`, `oh-execute`, `oh-ship`, etc.)
 ```
 
 Outcomes declare `files:` patterns linking to code. Commits tag `[outcome:X]` linking to outcomes. These structural links power `outcome_progress`.
+
+**Aims-aware context assembly:** On first tool call, agents receive aims + relevant artifact evidence + recent metis/guardrails, so planning is conditioned on current strategic intent, not just local code state.
 
 `.oh/` is a **cache**, not source of truth. `rm -rf .oh/` loses context but breaks nothing.
 
