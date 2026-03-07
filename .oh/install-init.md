@@ -177,3 +177,17 @@ Setup configures the `timeout` to 30000ms (increased from 10000) to allow for fi
 - Added GitHub workflow `.github/workflows/rust-main-merge.yml` to run `cargo test setup::tests` and `cargo build --release` on PRs to `main` and pushes to `main`.
 - Post-merge verification: main head contains setup command, docs updates, and workflow file.
 - Delivery-path tax observed: one merge conflict in `README.md` added manual integration time.
+
+## Solution Space (Issue #21)
+**Updated:** 2026-03-07
+
+**Problem:** Setup verifies install/runtime wiring but not source-boundary readiness requested in #21.
+**Key Constraint:** Keep bootstrap lightweight/repo-native while adding declaration/outbox/replay health checks without external dependencies.
+
+**Selected:** Option C — extend `setup` to initialize source declaration + outbox + tiny replay smoke and report source health during verify.
+
+**Implementation notes:**
+- create/validate `.oh/sources/code.workspace.v1.json`
+- initialize writable `.oh/outbox/code.workspace.v1.ndjson`
+- run replay smoke to `.oh/projections/code.workspace.v1.smoke.json`
+- surface verify status for declaration validity, outbox writability, replay pass
