@@ -1,0 +1,26 @@
+[package]
+name = "repo-native-alignment"
+version = "0.1.0"
+edition = "2024"
+description = "Agentic harness: business outcomes, SLO signals, constraints, and learnings as queryable repo artifacts"
+
+[dependencies]
+# Markdown parsing (heading-aware chunking for embeddings)
+pulldown-cmark = "0.12"
+
+# Git integration (change detection, history)
+git2 = "0.20"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization (YAML frontmatter parsing)
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+# Error handling
+anyhow = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
