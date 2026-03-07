@@ -138,13 +138,13 @@ fn default_severity() -> String {
 
 #[macros::mcp_tool(
     name = "oh_search_context",
-    description = "Semantic search over .oh/ artifacts. Finds outcomes, guardrails, metis, and signals relevant to a natural language query. Uses local embeddings — no API key needed."
+    description = "Semantic search over .oh/ artifacts and recent git commits. Finds outcomes, guardrails, metis, signals, and commits relevant to a natural language query. Uses local embeddings — no API key needed."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct OhSearchContext {
     /// Natural language description of what you're looking for
     pub query: String,
-    /// Optional: filter by artifact type (outcome, signal, guardrail, metis)
+    /// Optional: filter by artifact type (outcome, signal, guardrail, metis, commit)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_types: Option<Vec<String>>,
     /// Maximum results to return (default: 5)
