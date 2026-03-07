@@ -70,8 +70,22 @@ impl EmbeddingIndex {
         })
     }
 
+    /// Index all .oh/ artifacts, git commits, and optionally code symbols.
+    /// Call with symbols from the graph to enable semantic code search.
+    pub async fn index_all_with_symbols(
+        &self,
+        repo_root: &Path,
+        symbols: &[crate::graph::Node],
+    ) -> Result<usize> {
+        self.index_all_inner(repo_root, symbols).await
+    }
+
     /// Index all .oh/ artifacts and recent git commits. Rebuilds the table from scratch.
     pub async fn index_all(&self, repo_root: &Path) -> Result<usize> {
+        self.index_all_inner(repo_root, &[]).await
+    }
+
+    async fn index_all_inner(&self, repo_root: &Path, symbols: &[crate::graph::Node]) -> Result<usize> {
         let artifacts = oh::load_oh_artifacts(repo_root)?;
 
         // Collect ids, kinds, titles, bodies, and embedding texts from artifacts
@@ -127,6 +141,43 @@ impl EmbeddingIndex {
                 bodies.push(body.clone());
                 texts.push(body);
             }
+        }
+
+        // Also index code symbols and markdown sections from the graph
+        for node in symbols {
+            let kind_str = match &node.id.kind {
+                crate::graph::NodeKind::Other(s) => s.clone(),
+                k => format!("{}", k),
+            };
+
+            // Build searchable text from signature + body + metadata
+            let mut text = String::new();
+            text.push_str(&node.id.name);
+            text.push(' ');
+            text.push_str(&node.signature);
+            text.push(' ');
+            // Include doc comments / body for semantic matching
+            // Truncate body to avoid huge embeddings
+            let body_snippet = if node.body.len() > 500 {
+                &node.body[..500]
+            } else {
+                &node.body
+            };
+            text.push_str(body_snippet);
+
+            let title = format!("{} {} ({})", kind_str, node.id.name, node.language);
+            let body_display = format!(
+                "{}\n\n{}:{}",
+                node.signature,
+                node.id.file.display(),
+                node.line_start
+            );
+
+            ids.push(node.stable_id());
+            kinds.push(format!("code:{}", kind_str));
+            titles.push(title);
+            bodies.push(body_display);
+            texts.push(text);
         }
 
         if texts.is_empty() {
