@@ -55,11 +55,28 @@ fn path_to_uri(path: &Path) -> Result<Uri> {
 /// Find the narrowest enclosing function/impl/struct at a given file + line.
 /// Returns None if no symbol contains this location.
 fn find_enclosing_symbol(nodes: &[&Node], file: &Path, line: usize) -> Option<NodeId> {
-    nodes.iter()
+    let file_matches: Vec<_> = nodes.iter()
         .filter(|n| n.id.file == file)
+        .collect();
+
+    if file_matches.is_empty() {
+        // Try matching just the filename if full path doesn't match
+        let file_str = file.to_string_lossy();
+        tracing::debug!(
+            "No nodes match path '{}', trying {} node paths",
+            file_str,
+            nodes.iter().map(|n| n.id.file.display().to_string()).collect::<std::collections::HashSet<_>>().len()
+        );
+        // Log first few node paths for comparison
+        for n in nodes.iter().take(3) {
+            tracing::debug!("  node path sample: '{}'", n.id.file.display());
+        }
+    }
+
+    file_matches.iter()
         .filter(|n| matches!(n.id.kind, NodeKind::Function | NodeKind::Impl | NodeKind::Struct))
         .filter(|n| n.line_start <= line && n.line_end >= line)
-        .min_by_key(|n| n.line_end - n.line_start) // narrowest enclosing
+        .min_by_key(|n| n.line_end - n.line_start)
         .map(|n| n.id.clone())
 }
 
@@ -673,15 +690,25 @@ impl Enricher for LspEnricher {
                                 let ref_line = loc.range.start.line + 1; // 0-based → 1-based
 
                                 // Find the enclosing function at the reference location
+                                // Skip references within the function's own body
+                                if ref_path == node.id.file
+                                    && ref_line as usize >= node.line_start
+                                    && ref_line as usize <= node.line_end
+                                {
+                                    continue;
+                                }
+
+                                // Skip external crate references
+                                if ref_path.to_string_lossy().contains(".cargo") {
+                                    continue;
+                                }
+
                                 let caller_id = find_enclosing_symbol(
                                     &matching_nodes, &ref_path, ref_line as usize
                                 );
 
                                 if let Some(caller) = caller_id {
-                                    // Skip self-references
-                                    if caller == node.id {
-                                        continue;
-                                    }
+                                    tracing::debug!("Calls edge: {} -> {}", caller.name, node.id.name);
                                     result.added_edges.push(Edge {
                                         from: caller,
                                         to: node.id.clone(),
