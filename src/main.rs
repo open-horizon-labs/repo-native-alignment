@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
 
     let handler = RnaHandler {
         repo_root: repo_root.clone(),
+        embed_index: tokio::sync::OnceCell::new(),
     };
 
     match cli.transport.as_str() {
