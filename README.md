@@ -42,38 +42,53 @@ Four systems collaborate. Each is independent; together they compound.
 
 ## Quick Start
 
-### 1. Install OH Skills (one-time, global)
+### Prerequisites
+
+`repo-native-alignment setup` checks for these before doing anything:
+
+| Dependency | Install |
+|------------|---------|
+| `cargo` | [rustup.rs](https://rustup.rs) |
+| `protoc` | `brew install protobuf` / `apt install protobuf-compiler` |
+| `npx` | ships with Node.js — [nodejs.org](https://nodejs.org) |
+
+### 1. Install the RNA binary (one-time)
 
 ```bash
-npx skills add open-horizon-labs/skills -g -a claude-code -y
-```
-
-### 2. Install the RNA MCP server (one-time)
-
-```bash
-# Clone and build
 git clone https://github.com/open-horizon-labs/repo-native-alignment.git
 cd repo-native-alignment
-cargo build --release
+cargo install --path .
 ```
 
-### 3. Add RNA MCP to your project
+### 2. Bootstrap a project
 
-In your project's root directory, add to `.mcp.json` (create if missing, merge if existing):
+Run once per project (idempotent — safe to re-run on updates):
 
-```json
-{
-  "mcpServers": {
-    "rna-server": {
-      "type": "stdio",
-      "command": "/path/to/repo-native-alignment/target/release/repo-native-alignment",
-      "args": ["--repo", "."]
-    }
-  }
-}
+```bash
+repo-native-alignment setup --project /path/to/your/project
 ```
 
-### 4. Run `/teach-oh`
+This does, in order:
+
+1. Preflights `cargo`, `protoc`, and `npx` — fails fast with exact remediation if anything is missing.
+2. Installs/updates the RNA binary via `cargo install --path <rna repo root>`.
+3. Installs OH skills globally: `npx skills add open-horizon-labs/skills -g -a claude-code -y`.
+4. Writes or merges `<project>/.mcp.json`, adding the `rna-server` entry and preserving any existing servers.
+5. Verifies the configured binary responds to `--help` and that `.mcp.json` contains `rna-server`.
+
+**Preview without making changes:**
+
+```bash
+repo-native-alignment setup --project . --dry-run
+```
+
+**Skip OH skills install** (if already installed or managing separately):
+
+```bash
+repo-native-alignment setup --project . --skip-skills
+```
+
+### 3. Run `/teach-oh`
 
 Open a Claude Code session in your project and run:
 
@@ -88,9 +103,13 @@ This does everything:
 - Scaffolds `.oh/` with outcomes, signals, guardrails
 - Installs phase agents to `.claude/agents/`
 
-### 5. Start working
+### 4. Start working
 
 The system compounds from here. Skills and agents use `oh_search_context` to discover relevant context. Write tools record what you learn. Next session starts richer.
+
+---
+
+**Manual path (fallback):** If you prefer full control, build from source (`cargo build --release`), then hand-edit your project's `.mcp.json` to add `rna-server` pointing at the compiled binary with `--repo <project path>`. The setup command exists to make this deterministic and verifiable, not to replace understanding of what it configures.
 
 ## The Four Systems
 
@@ -208,4 +227,4 @@ No cloud dependency. Everything is local, git-versioned, and disposable. The emb
 - Broad `files:` patterns make `outcome_progress` noisy — need sharper globs or commit tagging
 - `[outcome:X]` commit tagging convention not yet adopted on any repo besides this one
 - `oh_init` scaffolds templates — should pull from OH graph for grounded context (P6)
-- No `cargo install` yet — binary must be built from source
+- `setup` command configures RNA MCP only — OH MCP server install requires a separate step
