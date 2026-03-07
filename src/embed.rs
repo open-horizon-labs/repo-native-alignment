@@ -46,10 +46,17 @@ impl SearchResult {
         } else {
             self.body.clone()
         };
-        format!(
-            "- **{}** ({}) — relevance: {:.2}\n  {}\n",
-            self.title, self.kind, self.score, snippet
-        )
+        if self.kind.starts_with("code:") {
+            format!(
+                "- **{}** ({}) — relevance: {:.2}\n  {}\n  ID: `{}`\n",
+                self.title, self.kind, self.score, snippet, self.id
+            )
+        } else {
+            format!(
+                "- **{}** ({}) — relevance: {:.2}\n  {}\n",
+                self.title, self.kind, self.score, snippet
+            )
+        }
     }
 }
 
