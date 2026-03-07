@@ -15,7 +15,7 @@ files:
 - .oh/guardrails/*
 - .oh/metis/*
 id: agent-alignment
-mechanism: 'Agents read structured outcome/signal/constraint artifacts from repo at session start via 16 MCP tools. outcome_progress joins layers structurally (outcome → file patterns → commits → symbols). OH Skills (/aim, /salvage, /review, etc.) guide the workflow and use RNA MCP tools to read/write .oh/ context. The feedback loop compounds: work → record metis → next session reads metis → agent scopes better.'
+mechanism: 'Agents read structured outcome/signal/constraint artifacts from repo at session start via 16 MCP tools. outcome_progress joins layers structurally. OH Skills guide the workflow. The feedback loop compounds: work → record metis → next session reads metis → agent scopes better. Validated by use: session 1 exercised the full read-write loop on real work.'
 status: active
 ---
 
@@ -29,4 +29,5 @@ Agents working in this codebase stay aligned to declared business outcomes becau
 ## Constraints
 - repo-native (see guardrails/)
 - lightweight (see guardrails/)
+
 
