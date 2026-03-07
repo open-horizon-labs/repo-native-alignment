@@ -62,33 +62,58 @@ Level 2 is what we're enhancing. The skills already know about `.oh/`. They just
 
 ---
 
-## Solution Space
+## New Finding: skills PR #8
+
+PR #8 (`teach-oh-phase-agents`) already has the adaptive MCP integration pattern:
+- Lines 361-373: checks if OH MCP tools are available, appends an MCP preamble to agent files
+- Detection: looks for `oh_get_endeavors` in available tools, or `.oh/mcp.json`
+- Pattern: conditional append, not fork — exactly the approach we need
+
+This means Option B is already half-built in upstream. We don't need Option D (CLAUDE.md hack). We need to extend PR #8's pattern to detect RNA MCP tools alongside OH MCP tools.
+
+## Solution Space (Revised)
 **Updated:** 2026-03-07
 
-**Selected:** Option D — Integration via context, not code
-**Level:** Redesign
+**Selected:** Option B — extend PR #8's MCP preamble pattern for RNA tools
+**Level:** Local Optimum (the pattern already exists, we're extending it)
 
-**Rationale:** Skills are prompts. They influence the agent through instructions. The cleanest integration is *more instructions* — not forking code. `oh_init` adds a CLAUDE.md section:
+**How it works:**
+1. PR #8 already appends an "Open Horizons MCP" preamble to agent files when OH MCP is detected
+2. Add a parallel "RNA MCP" preamble that gets appended when rna-server tools are detected
+3. Detection: check for `oh_get_outcomes` (rna-server tool) or `.mcp.json` with rna-server
+4. The RNA preamble tells agents: "use oh_get_outcomes before framing, use oh_record_metis after salvage, use outcome_progress to check alignment"
+
+**The RNA MCP preamble for each agent:**
 
 ```markdown
-## Workflow Integration (OH Skills + RNA MCP)
-When using OH skills alongside rna-server MCP tools:
-- Before /aim: call oh_get_outcomes to see existing outcomes
-- After /aim: call oh_update_outcome or oh_init to persist the aim
-- After /salvage: call oh_record_metis with key learnings
-- After /review or /dissent: call oh_record_guardrail_candidate if constraints discovered
-- After /execute: tag commit with [outcome:X]
-- After /solution-space: update the .oh/ session file via write
+## Repo-Native Alignment MCP
+When rna-server MCP tools are available:
+- Before framing: call `oh_get_outcomes` and `oh_get_guardrails` to load business context
+- After producing output: call `oh_record_metis` to capture key learnings
+- When checking progress: call `outcome_progress` with the relevant outcome ID
+- When discovering constraints: call `oh_record_guardrail_candidate`
+- When measuring progress: call `oh_record_signal`
 ```
 
-Zero changes to the skills repo. Zero fork divergence. Works with any version of skills.
+**Per-agent specifics:**
+- `oh-aim`: call `oh_get_outcomes` first, call `oh_update_outcome` after
+- `oh-execute`: call `outcome_progress` for context, tag commits with `[outcome:X]`
+- `oh-solution-space`: call `oh_get_guardrails` for constraints
+- `oh-problem-space`: call `oh_get_context` for full picture
+
+**Why this beats Option D:**
+- Integrates at the agent/skill level, not CLAUDE.md
+- Uses the same pattern PR #8 already established
+- Skills repo owns the integration, no fork needed
+- Works for both skill and agent variants
 
 **Accepted trade-offs:**
-- Integration depends on agent reading CLAUDE.md (which it does)
-- Less "guaranteed" than hardcoded tool calls — but more resilient to change
+- Requires a PR to the skills repo (but it extends an existing PR, not a new pattern)
+- RNA MCP detection is heuristic (tool name check)
 
 ### Implementation Checklist
-- [ ] Modify `oh_init` to detect existing CLAUDE.md and append workflow integration section
-- [ ] Write the skill→MCP mapping as a CLAUDE.md section template
-- [ ] Test: run /salvage with integration section present — does agent call oh_record_metis?
-- [ ] Test: run /aim with integration section — does agent call oh_get_outcomes first?
+- [ ] PR to skills repo: add RNA MCP preamble alongside OH MCP preamble in teach-oh Step 5
+- [ ] Define the per-agent RNA MCP instructions
+- [ ] Update detection logic: check for `oh_get_outcomes` (RNA) alongside `oh_get_endeavors` (OH)
+- [ ] Test: install skills + RNA MCP on a project, run /teach-oh, verify preamble appended
+- [ ] Optionally: `oh_init` in this repo can also write the integration instructions to CLAUDE.md as a fallback for non-OMP users
