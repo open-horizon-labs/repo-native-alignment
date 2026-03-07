@@ -498,7 +498,27 @@ async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphState> {
         index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
     }
 
-    Ok(GraphState { nodes, edges, index })
+    // Build embedding index for the cached graph
+    let embed_index = match EmbeddingIndex::new(repo_root).await {
+        Ok(idx) => {
+            match idx.index_all_with_symbols(repo_root, &nodes).await {
+                Ok(count) => {
+                    tracing::info!("Embedded {} items from cached graph ({} symbols)", count, nodes.len());
+                    Some(idx)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to embed cached graph: {}", e);
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to create embed index: {}", e);
+            None
+        }
+    };
+
+    Ok(GraphState { nodes, edges, index, embed_index })
 }
 
 /// Parse a NodeId from its stable_id string (format: "root:file:name:kind").
@@ -571,19 +591,20 @@ fn infer_language_from_path(path: &Path) -> String {
 
 // ── Graph state ─────────────────────────────────────────────────────
 
-/// In-memory graph state: extraction results + petgraph index.
-/// Lazily initialized on first graph-aware tool call.
+/// In-memory graph state: extraction results + petgraph index + embedding index.
+/// Lazily initialized on first tool call. Embeddings are built as part of the
+/// graph pipeline — not as a separate lazy init that races with graph building.
 pub struct GraphState {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub index: GraphIndex,
+    pub embed_index: Option<EmbeddingIndex>,
 }
 
 // ── ServerHandler ───────────────────────────────────────────────────
 
 pub struct RnaHandler {
     pub repo_root: PathBuf,
-    pub embed_index: OnceCell<EmbeddingIndex>,
     pub graph_index: OnceCell<GraphState>,
     /// Whether business context has been injected into a tool response.
     pub context_injected: std::sync::atomic::AtomicBool,
@@ -593,7 +614,6 @@ impl Default for RnaHandler {
     fn default() -> Self {
         Self {
             repo_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            embed_index: OnceCell::new(),
             graph_index: OnceCell::new(),
             context_injected: std::sync::atomic::AtomicBool::new(false),
         }
@@ -601,25 +621,12 @@ impl Default for RnaHandler {
 }
 
 impl RnaHandler {
+    /// Get the embedding index from the graph state.
+    /// The graph pipeline builds embeddings as part of graph construction.
     async fn get_index(&self) -> anyhow::Result<&EmbeddingIndex> {
-        // The graph pipeline (get_graph) embeds symbols as part of its build.
-        // If embed_index is already set (from graph build), use it.
-        // If not (graph loaded from LanceDB cache), build with cached symbols.
-        self.embed_index
-            .get_or_try_init(|| async {
-                let index = EmbeddingIndex::new(&self.repo_root).await?;
-
-                let symbols = if let Some(graph) = self.graph_index.get() {
-                    &graph.nodes[..]
-                } else {
-                    &[]
-                };
-
-                let count = index.index_all_with_symbols(&self.repo_root, symbols).await?;
-                tracing::info!("Embedded {} items (fallback path, {} symbols)", count, symbols.len());
-                Ok(index)
-            })
-            .await
+        let graph = self.get_graph().await?;
+        graph.embed_index.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Embedding index not available"))
     }
 
     async fn get_graph(&self) -> anyhow::Result<&GraphState> {
@@ -802,26 +809,31 @@ impl RnaHandler {
                     tracing::warn!("Failed to persist graph to LanceDB: {}", e);
                 }
 
-                // 8. Embed all nodes (symbols + markdown sections) for semantic search
-                // This is part of the graph pipeline — embed where nodes are created,
-                // not as a separate lazy step that might miss them.
-                match EmbeddingIndex::new(&self.repo_root).await {
-                    Ok(embed_index) => {
-                        match embed_index.index_all_with_symbols(&self.repo_root, &all_nodes).await {
+                // 8. Embed all nodes as part of the graph pipeline
+                let embed_index = match EmbeddingIndex::new(&self.repo_root).await {
+                    Ok(idx) => {
+                        match idx.index_all_with_symbols(&self.repo_root, &all_nodes).await {
                             Ok(count) => {
-                                tracing::info!("Embedded {} items (artifacts + commits + {} symbols)", count, all_nodes.len());
-                                let _ = self.embed_index.set(embed_index);
+                                tracing::info!("Embedded {} items ({} symbols)", count, all_nodes.len());
+                                Some(idx)
                             }
-                            Err(e) => tracing::warn!("Failed to embed: {}", e),
+                            Err(e) => {
+                                tracing::warn!("Failed to embed: {}", e);
+                                None
+                            }
                         }
                     }
-                    Err(e) => tracing::warn!("Failed to create embed index: {}", e),
-                }
+                    Err(e) => {
+                        tracing::warn!("Failed to create embed index: {}", e);
+                        None
+                    }
+                };
 
                 Ok(GraphState {
                     nodes: all_nodes,
                     edges: all_edges,
                     index,
+                    embed_index,
                 })
             })
             .await
