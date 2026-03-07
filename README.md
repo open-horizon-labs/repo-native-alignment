@@ -1,33 +1,50 @@
 # Repo-Native Alignment
 
-Agents stay aligned to declared business outcomes — not just code correctness — because outcomes, constraints, signals, and learnings live *in the repo* as queryable artifacts.
+Agents stay aligned to declared business outcomes — not just code correctness — because outcomes, constraints, signals, and learnings live *in the repo* as queryable, evolving artifacts.
 
-## The Stack
+## How It Works
+
+Four systems collaborate. Each is independent; together they compound.
 
 ```
-OH Skills + Agents                           ← workflow: frame, build, reflect
-  Skills: /aim, /review, /dissent, /salvage  ← run in main session (need conversation context)
-  Agents: oh-aim, oh-execute, oh-ship, ...   ← run isolated (own context + scoped tools)
-    │
-    ▼ calls
-RNA MCP Server (16 tools)                    ← structured read/write of .oh/ + code + git
-    │
-    ▼ reads/writes
-.oh/ directory                               ← outcomes, signals, guardrails, metis
-    │
-    ▼ versioned by
-git                                          ← history of everything, including intent
+┌─────────────────────────────────────────────────────────────┐
+│  OH MCP (organizational)        RNA MCP (repo-local)        │
+│  ─ aims, missions, endeavors    ─ outcomes, signals, code   │
+│  ─ cross-project context        ─ structural joins (git+ts) │
+│  ─ decision logs                ─ .oh/ read/write           │
+└──────────┬──────────────────────────────┬───────────────────┘
+           │                              │
+           ▼                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  OH Skills (cross-cutting)      OH Agents (phase-isolated)  │
+│  /review  /dissent  /salvage    oh-aim  oh-execute  oh-ship │
+│  ─ run in main session          ─ own context + scoped tools│
+│  ─ need conversation context    ─ read/write .oh/ sessions  │
+│  ─ use RNA+OH MCP when avail    ─ use RNA+OH MCP when avail │
+└─────────────────────────────────────────────────────────────┘
+           │                              │
+           ▼                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  .oh/ directory (repo-local cache, git-versioned)           │
+│  outcomes/ ─ what we're optimizing for                      │
+│  signals/  ─ how we measure progress                        │
+│  guardrails/ ─ constraints that shape behavior              │
+│  metis/    ─ learnings that compound across sessions        │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-**The loop:** Skills guide the workflow. MCP tools read and write structured context. `.oh/` accumulates learnings. Git versions everything. Next session starts richer than the last.
+**The loop:** Skills/agents guide the workflow → MCP tools read/write structured context → `.oh/` accumulates learnings → git versions everything → next session starts richer.
+
+**The join:** `outcome_progress` connects layers structurally — outcome → file patterns → tagged commits → code symbols → related markdown. Not keyword matching; structural links.
 
 ## Quick Start
 
 ```bash
-# 1. Build the MCP server
+# 1. Build the RNA MCP server
 cargo build --release
 
-# 2. Configure Claude Code (add to .mcp.json)
+# 2. Configure Claude Code (.mcp.json in project root)
+cat > .mcp.json << 'EOF'
 {
   "mcpServers": {
     "rna-server": {
@@ -37,118 +54,99 @@ cargo build --release
     }
   }
 }
+EOF
 
-# 3. Install OH Skills + Agents (optional but recommended)
+# 3. Install OH Skills (optional, recommended)
 npx skills add open-horizon-labs/skills -g -a claude-code -y
 
-# 4. Install phase agents (run /teach-oh, or manually):
-mkdir -p .claude/agents
-# Copy agent files from skills repo agents-omp/ to .claude/agents/
-# Each agent gets its own isolated context and scoped tools
+# 4. Scaffold .oh/ — run in Claude Code:
+#    Call the oh_init tool, or run /teach-oh for full project setup
+#    /teach-oh also installs phase agents to .claude/agents/
 
-# 5. Scaffold .oh/ for your project
-# In Claude Code, call the oh_init tool — it reads your project and creates
-# outcome, signal, and guardrail templates.
+# 5. Start working — the system compounds from here
 ```
 
-## MCP Tools (16)
+## The Four Systems
 
-### Business Context (read)
-| Tool | Description |
-|------|-------------|
-| `oh_get_outcomes` | List outcomes from `.oh/outcomes/` |
-| `oh_get_signals` | List SLO signals from `.oh/signals/` |
-| `oh_get_guardrails` | List guardrails from `.oh/guardrails/` |
-| `oh_get_metis` | List learnings from `.oh/metis/` |
-| `oh_get_context` | Full context bundle (capped at 50 symbols/chunks) |
+### RNA MCP Server (this repo) — 16 tools
 
-### Business Context (write)
-| Tool | Description |
-|------|-------------|
-| `oh_record_metis` | Record a learning or decision |
-| `oh_record_signal` | Record a signal observation (SLO measurement) |
-| `oh_update_outcome` | Update outcome status/mechanism/files |
-| `oh_record_guardrail_candidate` | Propose a guardrail from experience |
-| `oh_init` | Scaffold `.oh/` from existing project context |
+The repo-local intelligence layer. Parses code (tree-sitter), markdown (pulldown-cmark), and git history (git2). Exposes everything via MCP.
 
-### Search
-| Tool | Description |
-|------|-------------|
-| `search_markdown` | Search all `.md` files by content/headings |
-| `search_code` | Search code symbols with optional `kind` and `file` filters |
-| `search_commits` | Search git commit messages |
-| `file_history` | Git history for a specific file |
-| `search_all` | Multi-source substring search (honest name: it's grep across layers) |
+| Category | Tools |
+|----------|-------|
+| **Read .oh/** | `oh_get_outcomes`, `oh_get_signals`, `oh_get_guardrails`, `oh_get_metis`, `oh_get_context` |
+| **Write .oh/** | `oh_record_metis`, `oh_record_signal`, `oh_update_outcome`, `oh_record_guardrail_candidate`, `oh_init` |
+| **Search** | `search_markdown`, `search_code` (kind/file filters), `search_commits`, `file_history`, `search_all` |
+| **Join** | `outcome_progress` — the structural intersection query |
 
-### Intersection Query
-| Tool | Description |
-|------|-------------|
-| `outcome_progress` | **The real join:** outcome → tagged commits + file pattern matches → code symbols → related markdown |
+### [OH MCP](https://github.com/cloud-atlas-ai/oh-mcp-server) — organizational context
 
-## How `outcome_progress` Works
+The organizational memory layer. Missions, aims, endeavors, decision logs, cross-project context. RNA's `.oh/` is the repo-local projection of the OH graph.
 
-This is the tool that connects layers structurally, not by keyword:
+| What OH provides | How RNA uses it |
+|-----------------|-----------------|
+| Aims and endeavors | `oh_init` seeds `.oh/outcomes/` from the OH graph |
+| Decision logs | Agents log decisions via `oh_log_decision` |
+| Cross-project context | Agents see which other projects share this aim |
 
-1. Finds the outcome by ID from `.oh/outcomes/`
-2. Finds commits tagged `[outcome:{id}]` in their message
-3. Finds commits touching files matching the outcome's `files:` patterns
-4. Deduplicates, finds code symbols in changed files
-5. Finds markdown sections mentioning the outcome
-6. Returns a connected answer: outcome → commits → code → docs
+### [OH Skills](https://github.com/open-horizon-labs/skills) — cross-cutting workflow
+
+Prompt-based skills that run in the main conversation. They need full conversation context to detect drift, challenge decisions, and extract learning.
+
+| Skill | What it does | RNA MCP integration |
+|-------|-------------|-------------------|
+| `/review` | Check alignment before committing | Calls `outcome_progress`, `oh_get_guardrails` |
+| `/dissent` | Devil's advocate before one-way doors | Grounds dissent in declared constraints |
+| `/salvage` | Extract learning before restarting | Records metis and guardrail candidates |
+
+### OH Phase Agents — isolated execution
+
+Agent wrappers that run each workflow phase in its own context window with scoped tools. Installed to `.claude/agents/` for Claude Code.
+
+| Agent | Phase | RNA MCP integration |
+|-------|-------|-------------------|
+| `oh-aim` | Frame the outcome | Reads outcomes first, updates after |
+| `oh-problem-space` | Map constraints | Loads full context via `oh_get_context` |
+| `oh-problem-statement` | Define the framing | Reads outcomes + guardrails |
+| `oh-solution-space` | Evaluate approaches | Validates against guardrails, records decision as metis |
+| `oh-execute` | Build | Pre-flight guardrail check, tags commits `[outcome:X]` |
+| `oh-ship` | Deliver | Records signal observations, updates outcome status |
 
 ## The `.oh/` Directory
 
 ```
 .oh/
-├── outcomes/           ← what we're optimizing for
-│   └── agent-alignment.md
-├── signals/            ← how we measure progress
-│   └── agent-scoping-accuracy.md
-├── guardrails/         ← constraints that shape behavior
-│   ├── repo-native.md
-│   └── lightweight.md
-└── metis/              ← learnings that compound
-    ├── session-1-salvage.md
-    └── commit-tagging-convention.md
+├── outcomes/        ← what we're optimizing for (YAML frontmatter + markdown)
+├── signals/         ← how we measure progress (SLO definitions + observations)
+├── guardrails/      ← constraints that shape behavior (hard/soft/candidate)
+└── metis/           ← learnings that compound (the institutional memory)
 ```
 
-Each file is structured markdown with YAML frontmatter. Outcomes can declare `files:` patterns to link to code. Commits can tag `[outcome:X]` to link to outcomes. These links power `outcome_progress`.
+Outcomes declare `files:` patterns linking to code. Commits tag `[outcome:X]` linking to outcomes. These structural links power `outcome_progress`.
 
-## With OH Skills
+`.oh/` is a **cache**, not source of truth. Outcomes originate in external systems (OH graph, Jira, Linear). `.oh/` is the repo-local, git-versioned projection. `rm -rf .oh/` loses context but breaks nothing.
 
-When [OH Skills](https://github.com/open-horizon-labs/skills) are installed, each skill in the workflow knows how to use RNA MCP tools:
+## Design Decisions
 
-| Skill | RNA MCP Integration |
-|-------|-------------------|
-| `/aim` | Reads existing outcomes before framing, updates outcome after |
-| `/problem-space` | Loads full context, checks outcome progress |
-| `/solution-space` | Validates against guardrails, records decision rationale as metis |
-| `/execute` | Pre-flight guardrail check, tags commits with `[outcome:X]` |
-| `/ship` | Records signal observations, updates outcome status |
-| `/review` | Checks work against declared outcome, surfaces missing guardrails |
-| `/dissent` | Grounds dissent in declared constraints, records findings as metis |
-| `/salvage` | Records learnings as metis, captures guardrail candidates |
-
-The skills guide the workflow. The MCP tools make it persistent.
+- **Structural joins > semantic search** — `outcome_progress` follows links, not keywords. Embeddings are future work for the discovery path.
+- **Write tools close the feedback loop** — without `oh_record_metis` and `oh_record_signal`, the system is read-only and can't compound.
+- **Honest tool names** — `search_all` is multi-source grep. `outcome_progress` is the real join.
+- **Alignment is the constraint** — not a hypothesis to measure. Session 1 exercised the full read-write loop on real work. The system compounds by design.
+- **Skills integrate via context, not code** — agents read preamble sections telling them which MCP tools to call. No fork needed.
 
 ## Architecture
 
 ```
-tree-sitter       ← parse Rust code → symbols (functions, structs, traits)
-pulldown-cmark    ← parse all markdown → heading-delimited chunks + code spans
-git2              ← commit history, file changes, blame
-rust-mcp-sdk      ← MCP server (stdio + HTTP transport)
+tree-sitter       ← Rust code → symbols (functions, structs, traits, impls)
+pulldown-cmark    ← all markdown → heading-delimited chunks + code spans
+git2              ← commit history, file changes, outcome tagging
+rust-mcp-sdk      ← MCP server (stdio default, HTTP optional)
 ```
 
-No external database. No cloud dependency. Everything is local, git-versioned, and disposable — `rm -rf .oh/` loses context but breaks nothing.
-
-## Design Decisions
-
-- **`.oh/` is a cache, not source of truth** — outcomes originate in external systems (OH graph, Jira, Linear, Notion). `.oh/` is the repo-local projection.
-- **Structural joins over semantic search** — `outcome_progress` follows links (file patterns, commit tags), not keyword matches. Embeddings are future work for the discovery path.
-- **Honest tool names** — `search_all` is multi-source grep, not an intersection query. `outcome_progress` is the real join.
-- **Write tools close the feedback loop** — without `oh_record_metis` and `oh_record_signal`, the system is read-only and can't compound.
+No external database. No cloud dependency. Everything is local, git-versioned, and disposable.
 
 ## Status
 
-Working prototype. 16 MCP tools, 20 tests, stdio + HTTP transport. See `.oh/repo-native-alignment.md` for the full session history.
+Working prototype. 16 MCP tools, 20 tests, stdio + HTTP transport. Skills integration PR open. Phase agents installed. Full read-write loop exercised on real work.
+
+**Next:** Grounded `oh_init` (scaffold from OH graph, not templates), then cross-references (markdown code spans → symbol table). See `.oh/p4-solution-space.md`.
