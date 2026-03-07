@@ -120,9 +120,17 @@ The repo-local intelligence layer. Scans your repo, extracts a multi-language co
 - Edges: calls, implements, depends-on, modified, serves (with provenance + confidence)
 - In-memory traversal via petgraph (microseconds)
 
-**LSP enrichment (auto-discovered):**
+**LSP enrichment (37 servers auto-detected from PATH):**
 
-RNA auto-detects installed language servers and uses them for cross-file `Calls` and `Implements` edges. No configuration needed — if the binary is on PATH, it's used.
+RNA auto-discovers installed language servers and enriches the graph with cross-file edges. No configuration — if the binary is on PATH, it's used. Missing servers skipped gracefully.
+
+What LSP adds beyond tree-sitter:
+- `callHierarchy/incomingCalls` → who calls this function (`Calls` edges)
+- `callHierarchy/outgoingCalls` → what does this function call (`Calls` edges)
+- `textDocument/implementation` → who implements this trait (`Implements` edges)
+- `textDocument/documentLink` → cross-document references for markdown/docs (`DependsOn` edges)
+
+Common servers (install for richer graphs):
 
 | Language | Server | Install |
 |---|---|---|
@@ -130,9 +138,10 @@ RNA auto-detects installed language servers and uses them for cross-file `Calls`
 | Python | pyright | `npm install -g pyright` |
 | TypeScript/JS | typescript-language-server | `npm install -g typescript-language-server typescript` |
 | Go | gopls | `go install golang.org/x/tools/gopls@latest` |
+| C/C++ | clangd | ships with LLVM / `brew install llvm` |
 | Markdown | marksman | `brew install marksman` |
 
-Missing servers are skipped gracefully — the graph still has tree-sitter data. LSP adds richer edges.
+Plus 31 more: Ruby (solargraph), Java (jdtls), Kotlin, Lua, Zig, Elixir, Haskell, OCaml, Scala, Dart, PHP, Swift, Nix, Terraform, TOML, YAML, and others. Full list in `src/extract/mod.rs`.
 
 **Scanner (incremental):**
 - mtime-based subtree skipping — unchanged directories skipped entirely
@@ -198,7 +207,7 @@ Scanner (mtime + git)     <- incremental file change detection
   ├── schema extractors   <- .proto, SQL, OpenAPI → schema nodes + edges
   ├── topology detector   <- subprocess/network/async boundaries → architecture edges
   ├── markdown extractor  <- heading sections + YAML frontmatter → graph nodes
-  ├── LSP enricher        <- rust-analyzer, pyright, tsserver, gopls → cross-file edges
+  ├── LSP enricher        <- 37 servers auto-detected → calls, implements, doc links
   └── fastembed-rs        <- local ONNX embeddings (BAAI/bge-small-en-v1.5)
          │
          ▼
