@@ -612,7 +612,7 @@ impl Enricher for LspEnricher {
 
         // Use the repo root from the --repo arg, not cwd
         let repo_root = matching_nodes.first()
-            .map(|n| {
+            .map(|_n| {
                 // Nodes have root_id set by multi-root scanning.
                 // For the primary root, the path in the graph state is relative to repo_root.
                 // We need the actual repo root path from the server.
