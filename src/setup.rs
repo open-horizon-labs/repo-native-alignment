@@ -7,6 +7,9 @@ use serde_json::{Value, json};
 
 /// Compile-time path to the RNA source tree (used for `cargo install --path`).
 const RNA_MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
+const SOURCE_DECLARATION_VERSION: &str = "0.1.0";
+const SOURCE_DECLARATION_KIND: &str = "code.workspace:v1";
+const SOURCE_FACT_TYPE: &str = "code.workspace.bootstrap.health";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -137,17 +140,37 @@ pub fn run(args: &SetupArgs) -> Result<()> {
         merge_mcp_json_with_binary(&mcp_path, &project_path, &binary)?;
     }
 
-    // ── Step 5: verify ─────────────────────────────────────────────────────
+    // ── Step 5: initialize source boundary ──────────────────────────────────
+    if args.dry_run {
+        println!(
+            "[dry-run] Would initialize source declaration: {}",
+            source_declaration_path(&project_path).display()
+        );
+        println!(
+            "[dry-run] Would initialize source outbox: {}",
+            source_outbox_path(&project_path).display()
+        );
+        println!(
+            "[dry-run] Would run replay smoke -> {}",
+            source_projection_path(&project_path).display()
+        );
+    } else {
+        initialize_source_boundary(&project_path)?;
+    }
+
+    // ── Step 6: verify ─────────────────────────────────────────────────────
     if args.dry_run {
         if args.skip_verify {
             println!("[dry-run] Would skip verification (--skip-verify)");
         } else {
-            println!("[dry-run] Would verify: binary --help, .mcp.json rna-server entry");
+            println!(
+                "[dry-run] Would verify: binary --help, .mcp.json rna-server entry, source declaration valid, outbox writable, replay smoke passes"
+            );
         }
     } else if args.skip_verify {
         println!("[skip] Verification skipped (--skip-verify)");
     } else {
-        verify(&mcp_path)?;
+        verify(&mcp_path, &project_path)?;
     }
 
     println!("\nSetup complete.");
@@ -346,9 +369,183 @@ pub fn merge_mcp_json_with_binary(
     Ok(())
 }
 
+// ─── Source boundary initialization ─────────────────────────────────────────
+
+fn source_declaration_path(project_path: &Path) -> PathBuf {
+    project_path
+        .join(".oh")
+        .join("sources")
+        .join("code.workspace.v1.json")
+}
+
+fn source_outbox_path(project_path: &Path) -> PathBuf {
+    project_path
+        .join(".oh")
+        .join("outbox")
+        .join("code.workspace.v1.ndjson")
+}
+
+fn source_projection_path(project_path: &Path) -> PathBuf {
+    project_path
+        .join(".oh")
+        .join("projections")
+        .join("code.workspace.v1.smoke.json")
+}
+
+fn initialize_source_boundary(project_path: &Path) -> Result<()> {
+    let declaration_path = source_declaration_path(project_path);
+    let outbox_path = source_outbox_path(project_path);
+    let projection_path = source_projection_path(project_path);
+
+    ensure_source_declaration(project_path, &declaration_path)?;
+    ensure_outbox_initialized(&outbox_path)?;
+    run_replay_smoke(project_path, &outbox_path, &projection_path)?;
+
+    println!(
+        "  Source declaration initialized: {}",
+        declaration_path.display()
+    );
+    println!("  Source outbox initialized: {}", outbox_path.display());
+    println!(
+        "  Replay smoke projection updated: {}",
+        projection_path.display()
+    );
+    Ok(())
+}
+
+fn ensure_source_declaration(project_path: &Path, declaration_path: &Path) -> Result<()> {
+    if let Some(parent) = declaration_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Cannot create {}", parent.display()))?;
+    }
+
+    let canonical_root = project_path
+        .canonicalize()
+        .with_context(|| format!("Cannot canonicalize {}", project_path.display()))?;
+
+    let expected = json!({
+        "source": SOURCE_DECLARATION_KIND,
+        "version": SOURCE_DECLARATION_VERSION,
+        "repo_root": canonical_root.to_string_lossy(),
+    });
+
+    if !declaration_path.exists() {
+        std::fs::write(
+            declaration_path,
+            serde_json::to_string_pretty(&expected)? + "\n",
+        )
+        .with_context(|| format!("Cannot write {}", declaration_path.display()))?;
+        return Ok(());
+    }
+
+    let raw = std::fs::read_to_string(declaration_path)
+        .with_context(|| format!("Cannot read {}", declaration_path.display()))?;
+    let existing: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("{} is not valid JSON", declaration_path.display()))?;
+
+    if existing.get("source") != Some(&Value::String(SOURCE_DECLARATION_KIND.to_string())) {
+        bail!(
+            "{}: expected source '{}'",
+            declaration_path.display(),
+            SOURCE_DECLARATION_KIND
+        );
+    }
+
+    if existing.get("version") != Some(&Value::String(SOURCE_DECLARATION_VERSION.to_string())) {
+        bail!(
+            "{}: expected version '{}'",
+            declaration_path.display(),
+            SOURCE_DECLARATION_VERSION
+        );
+    }
+
+    Ok(())
+}
+
+fn ensure_outbox_initialized(outbox_path: &Path) -> Result<()> {
+    if let Some(parent) = outbox_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Cannot create {}", parent.display()))?;
+    }
+
+    if !outbox_path.exists() {
+        std::fs::File::create(outbox_path)
+            .with_context(|| format!("Cannot create {}", outbox_path.display()))?;
+    }
+
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(outbox_path)
+        .with_context(|| format!("Cannot open {} for append", outbox_path.display()))?;
+    Ok(())
+}
+
+fn run_replay_smoke(project_path: &Path, outbox_path: &Path, projection_path: &Path) -> Result<()> {
+    let canonical_root = project_path
+        .canonicalize()
+        .with_context(|| format!("Cannot canonicalize {}", project_path.display()))?;
+
+    let event_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("System clock before UNIX_EPOCH")?
+        .as_secs();
+
+    let canonical_record = json!({
+        "source": SOURCE_DECLARATION_KIND,
+        "version": SOURCE_DECLARATION_VERSION,
+        "fact_type": SOURCE_FACT_TYPE,
+        "repo_root": canonical_root.to_string_lossy(),
+        "event_time": event_time
+    });
+
+    std::fs::write(
+        outbox_path,
+        serde_json::to_string(&canonical_record)? + "\n",
+    )
+    .with_context(|| format!("Cannot write {}", outbox_path.display()))?;
+
+    let mut replayed = 0usize;
+    let mut last_record: Option<Value> = None;
+    let raw = std::fs::read_to_string(outbox_path)
+        .with_context(|| format!("Cannot read {}", outbox_path.display()))?;
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let parsed: Value = serde_json::from_str(line).with_context(|| {
+            format!("Invalid canonical record line in {}", outbox_path.display())
+        })?;
+        replayed += 1;
+        last_record = Some(parsed);
+    }
+
+    if replayed == 0 {
+        bail!("Replay smoke failed: no canonical records to replay");
+    }
+
+    let projection = json!({
+        "source": SOURCE_DECLARATION_KIND,
+        "replayed_count": replayed,
+        "last_fact_type": last_record
+            .as_ref()
+            .and_then(|value| value.get("fact_type"))
+            .and_then(Value::as_str),
+        "status": "ok"
+    });
+
+    if let Some(parent) = projection_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Cannot create {}", parent.display()))?;
+    }
+
+    std::fs::write(
+        projection_path,
+        serde_json::to_string_pretty(&projection)? + "\n",
+    )
+    .with_context(|| format!("Cannot write {}", projection_path.display()))?;
+    Ok(())
+}
+
 // ─── Verification ────────────────────────────────────────────────────────────
 
-fn verify(mcp_path: &Path) -> Result<()> {
+fn verify(mcp_path: &Path, project_path: &Path) -> Result<()> {
     println!("\nVerifying setup...");
     let mut passed = true;
 
@@ -392,6 +589,41 @@ fn verify(mcp_path: &Path) -> Result<()> {
                 passed = false;
             }
         },
+    }
+
+    println!("  Source health:");
+
+    let declaration_path = source_declaration_path(project_path);
+    match ensure_source_declaration(project_path, &declaration_path) {
+        Ok(_) => println!(
+            "    [PASS] declaration valid ({})",
+            declaration_path.display()
+        ),
+        Err(e) => {
+            println!("    [FAIL] declaration invalid: {e}");
+            passed = false;
+        }
+    }
+
+    let outbox_path = source_outbox_path(project_path);
+    match ensure_outbox_initialized(&outbox_path) {
+        Ok(_) => println!("    [PASS] outbox writable ({})", outbox_path.display()),
+        Err(e) => {
+            println!("    [FAIL] outbox not writable: {e}");
+            passed = false;
+        }
+    }
+
+    let projection_path = source_projection_path(project_path);
+    match run_replay_smoke(project_path, &outbox_path, &projection_path) {
+        Ok(_) => println!(
+            "    [PASS] replay smoke passed ({})",
+            projection_path.display()
+        ),
+        Err(e) => {
+            println!("    [FAIL] replay smoke failed: {e}");
+            passed = false;
+        }
     }
 
     if passed {
@@ -562,5 +794,41 @@ mod tests {
             err.contains("`mcpServers` must be a JSON object"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_initialize_source_boundary_creates_artifacts() {
+        let (_dir, proj) = tmp();
+
+        initialize_source_boundary(&proj).unwrap();
+
+        let declaration = source_declaration_path(&proj);
+        let outbox = source_outbox_path(&proj);
+        let projection = source_projection_path(&proj);
+
+        assert!(declaration.exists(), "source declaration must exist");
+        assert!(outbox.exists(), "outbox file must exist");
+        assert!(projection.exists(), "projection file must exist");
+
+        let declaration_json = read_json(&declaration);
+        assert_eq!(declaration_json["source"], SOURCE_DECLARATION_KIND);
+        assert_eq!(declaration_json["version"], SOURCE_DECLARATION_VERSION);
+
+        let projection_json = read_json(&projection);
+        assert_eq!(projection_json["status"], "ok");
+        assert_eq!(projection_json["source"], SOURCE_DECLARATION_KIND);
+    }
+
+    #[test]
+    fn test_source_declaration_validation_fails_on_wrong_source() {
+        let (_dir, proj) = tmp();
+        let declaration = source_declaration_path(&proj);
+        std::fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+        std::fs::write(&declaration, r#"{"source":"wrong","version":"0.1.0"}"#).unwrap();
+
+        let err = ensure_source_declaration(&proj, &declaration)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected source"), "unexpected error: {err}");
     }
 }

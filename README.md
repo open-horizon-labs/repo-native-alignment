@@ -79,7 +79,8 @@ This does, in order:
 2. Installs/updates the RNA binary via `cargo install --locked --path <rna repo root>` when source is available; otherwise reuses an already-installed binary.
 3. Installs OH skills globally: `npx skills add open-horizon-labs/skills -g -a claude-code -y`.
 4. Writes or merges `<project>/.mcp.json`, adding the `rna-server` entry and preserving any existing servers.
-5. Verifies the configured binary responds to `--help` and that `.mcp.json` contains `rna-server`.
+5. Initializes source-boundary artifacts under `.oh/` (`code.workspace:v1` declaration, outbox, replay-smoke projection).
+6. Verifies binary/help, MCP config, and source health (declaration valid, outbox writable, replay smoke passes).
 
 **Preview without making changes:**
 
