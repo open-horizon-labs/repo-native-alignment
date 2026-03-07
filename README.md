@@ -203,9 +203,10 @@ No cloud dependency. Everything local, git-versioned, disposable.
 
 - 9 intent-based MCP tools, 153 tests
 - 8 extractors: Rust, Python, TypeScript, Go, Markdown, Proto, SQL, OpenAPI
-- Multi-language LSP enrichment (rust-analyzer, pyright, tsserver, gopls, marksman)
+- LSP enrichment: 252 `Calls` edges via rust-analyzer `callHierarchy/incomingCalls` (pyright, tsserver, gopls, marksman registered)
+- `graph_query(mode: "impact")` finds real callers across the codebase
+- Graph persisted to LanceDB (`.oh/.cache/lance/`) — loads in <1s on restart
 - Incremental scanner with mtime skip + git optimization + configurable excludes
-- Unified graph: code symbols + topology + schemas + PR merges + business context
 - Multi-root workspace scanning via `~/.config/rna/roots.toml`
 - Semantic search via local embeddings (no API key)
 - Context auto-injected on first MCP tool call — agents always see business context

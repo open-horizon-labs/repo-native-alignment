@@ -103,8 +103,10 @@ Solo developer. PRs get /review and /dissent before merge. "Done" = tests pass, 
 - `src/embed.rs` — semantic search (fastembed + LanceDB)
 - `src/query.rs` — outcome_progress structural joins
 
-## Next Up
-- LSP enricher (#9): cross-file references, type resolution → `Calls`/`Implements` edges
-- Schema extractors (#10): .proto, SQL migrations, OpenAPI
-- Multi-root workspace (#12): scan ~/src/zettelkasten, ~/Downloads, multiple project repos
-- PR merge extraction: walk git merge history → pr_merge graph nodes
+## Shipped Capabilities
+- LSP enrichment: 252 `Calls` edges via rust-analyzer callHierarchy (pyright, tsserver, gopls, marksman registered)
+- Schema extractors: .proto, SQL, OpenAPI
+- Multi-root workspace: `~/.config/rna/roots.toml` + per-root scanning
+- PR merge extraction: git merge history → graph nodes + outcome_progress integration
+- Graph persistence: LanceDB cache at `.oh/.cache/lance/`, loads in <1s on restart
+- Context injection: business context auto-delivered on first tool call
