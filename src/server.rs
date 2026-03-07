@@ -12,7 +12,7 @@ use rust_mcp_sdk::schema::{
 use serde::{Deserialize, Serialize};
 
 use crate::embed::EmbeddingIndex;
-use crate::extract::ExtractorRegistry;
+use crate::extract::{ExtractorRegistry, EnricherRegistry};
 use crate::graph::{self, EdgeKind, Node, Edge};
 use crate::graph::index::GraphIndex;
 use crate::scanner::Scanner;
@@ -378,9 +378,57 @@ impl RnaHandler {
                     index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
                 }
 
+                // 4. Phase 2: Run enrichers (LSP) synchronously
+                // This adds cross-file reference edges and trait implementation edges.
+                // rust-analyzer typically takes 5-15 seconds; the graph is lazy-init
+                // (OnceCell) so this delay only happens once per session.
+                let mut all_edges = extraction.edges;
+                let mut all_nodes = extraction.nodes;
+
+                let languages: Vec<String> = all_nodes
+                    .iter()
+                    .map(|n| n.language.clone())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+
+                let enricher_registry = EnricherRegistry::with_builtins();
+                let enrichment = enricher_registry
+                    .enrich_all(&all_nodes, &index, &languages)
+                    .await;
+
+                if !enrichment.added_edges.is_empty() {
+                    tracing::info!(
+                        "Enrichment added {} edges",
+                        enrichment.added_edges.len()
+                    );
+                    // Add enrichment edges to the index
+                    for edge in &enrichment.added_edges {
+                        let from_id = edge.from.to_stable_id();
+                        let to_id = edge.to.to_stable_id();
+                        index.add_edge(
+                            &from_id,
+                            &edge.from.kind.to_string(),
+                            &to_id,
+                            &edge.to.kind.to_string(),
+                            edge.kind.clone(),
+                        );
+                    }
+                    all_edges.extend(enrichment.added_edges);
+                }
+
+                // Apply node metadata patches from enrichment
+                for (node_id, patches) in &enrichment.updated_nodes {
+                    if let Some(node) = all_nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
+                        for (key, value) in patches {
+                            node.metadata.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+
                 Ok(GraphState {
-                    nodes: extraction.nodes,
-                    edges: extraction.edges,
+                    nodes: all_nodes,
+                    edges: all_edges,
                     index,
                 })
             })

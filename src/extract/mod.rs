@@ -8,6 +8,7 @@
 //! for fine-grained checks. Multiple extractors can handle the same file.
 
 pub mod go;
+pub mod lsp;
 pub mod markdown;
 pub mod openapi;
 pub mod proto;
@@ -16,11 +17,13 @@ pub mod rust;
 pub mod sql;
 pub mod typescript;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
 
 use crate::graph::{Edge, Node};
+use crate::graph::index::GraphIndex;
 use crate::scanner::ScanResult;
 
 // ---------------------------------------------------------------------------
@@ -73,12 +76,42 @@ pub trait Extractor: Send + Sync {
 // Enricher trait (Phase 2: async, not yet implemented)
 // ---------------------------------------------------------------------------
 
-// #[async_trait::async_trait]
-// pub trait Enricher: Send + Sync {
-//     fn languages(&self) -> &[&str];
-//     fn is_ready(&self) -> bool;
-//     async fn enrich(&self, graph: &GraphIndex) -> Result<EnrichmentResult>;
-// }
+/// The output of running an enricher on existing graph data.
+/// Enrichers add edges and patch node metadata — they don't create new nodes.
+#[derive(Debug, Clone, Default)]
+pub struct EnrichmentResult {
+    /// New edges discovered by the enricher (e.g., Calls, Implements).
+    pub added_edges: Vec<Edge>,
+    /// Metadata patches for existing nodes: (node_stable_id, key-value patches).
+    pub updated_nodes: Vec<(String, BTreeMap<String, String>)>,
+}
+
+/// Phase 2: Asynchronous enrichment after initial extraction.
+///
+/// Enrichers run after all Phase 1 extractors have built the initial graph.
+/// They add edges (cross-file references, trait implementations) and patch
+/// node metadata using a higher-confidence source (e.g., LSP).
+///
+/// Enrichers must not block MCP server startup — they run inside the
+/// lazy `get_graph()` initialization, after tree-sitter extraction.
+#[async_trait::async_trait]
+pub trait Enricher: Send + Sync {
+    /// Languages this enricher supports (e.g., &["rust"]).
+    fn languages(&self) -> &[&str];
+
+    /// Whether the enricher is ready to run.
+    /// For LSP enrichers, this indicates the language server has finished indexing.
+    fn is_ready(&self) -> bool;
+
+    /// Enrich the graph with additional edges and metadata.
+    ///
+    /// Receives the current nodes and the graph index for lookup.
+    /// Returns new edges and node metadata patches.
+    async fn enrich(&self, nodes: &[Node], index: &GraphIndex) -> Result<EnrichmentResult>;
+
+    /// Human-readable name for this enricher (for diagnostics).
+    fn name(&self) -> &str;
+}
 
 // ---------------------------------------------------------------------------
 // ExtractorRegistry
@@ -198,6 +231,94 @@ impl ExtractorRegistry {
 }
 
 impl Default for ExtractorRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EnricherRegistry
+// ---------------------------------------------------------------------------
+
+/// Registry of enrichers. Runs all matching enrichers after Phase 1 extraction.
+pub struct EnricherRegistry {
+    enrichers: Vec<Box<dyn Enricher>>,
+}
+
+impl EnricherRegistry {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self {
+            enrichers: Vec::new(),
+        }
+    }
+
+    /// Create a registry pre-loaded with all built-in enrichers.
+    pub fn with_builtins() -> Self {
+        let mut registry = Self::new();
+        registry.register(Box::new(lsp::LspEnricher::new()));
+        registry
+    }
+
+    /// Register an enricher.
+    pub fn register(&mut self, enricher: Box<dyn Enricher>) {
+        self.enrichers.push(enricher);
+    }
+
+    /// Run all enrichers that support the given languages present in the graph.
+    ///
+    /// Returns a merged `EnrichmentResult` from all enrichers.
+    pub async fn enrich_all(
+        &self,
+        nodes: &[Node],
+        index: &GraphIndex,
+        languages: &[String],
+    ) -> EnrichmentResult {
+        let mut result = EnrichmentResult::default();
+
+        for enricher in &self.enrichers {
+            // Check if this enricher supports any language in the graph
+            let supported = enricher
+                .languages()
+                .iter()
+                .any(|lang| languages.iter().any(|l| l == lang));
+            if !supported {
+                tracing::debug!("Enricher {} skipped: no matching languages", enricher.name());
+                continue;
+            }
+
+            match enricher.enrich(nodes, index).await {
+                Ok(enrichment) => {
+                    tracing::info!(
+                        "Enricher {}: {} edges, {} node patches",
+                        enricher.name(),
+                        enrichment.added_edges.len(),
+                        enrichment.updated_nodes.len(),
+                    );
+                    result.added_edges.extend(enrichment.added_edges);
+                    result.updated_nodes.extend(enrichment.updated_nodes);
+                }
+                Err(e) => {
+                    tracing::warn!("Enricher {} failed: {}", enricher.name(), e);
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Number of registered enrichers.
+    pub fn len(&self) -> usize {
+        self.enrichers.len()
+    }
+
+    /// Whether the registry has no enrichers.
+    pub fn is_empty(&self) -> bool {
+        self.enrichers.is_empty()
+    }
+}
+
+impl Default for EnricherRegistry {
     fn default() -> Self {
         Self::new()
     }
