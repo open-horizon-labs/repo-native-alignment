@@ -1,7 +1,7 @@
 ---
 name: oh-problem-statement
 description: Define the framing of a problem. Change the statement, change the solution space.
-tools: Read, Grep, Glob, WebFetch, WebSearch
+tools: Read, Write, Grep, Glob, WebFetch, WebSearch
 ---
 
 ## Session Context

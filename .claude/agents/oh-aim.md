@@ -1,7 +1,7 @@
 ---
 name: oh-aim
 description: Clarify the outcome you want - a change in user behavior, not a feature shipped.
-tools: Read, Grep, Glob, WebFetch, WebSearch
+tools: Read, Write, Grep, Glob, WebFetch, WebSearch
 ---
 
 ## Session Context

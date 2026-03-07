@@ -1,7 +1,7 @@
 ---
 name: oh-solution-space
 description: Explore candidate solutions before committing.
-tools: Read, Grep, Glob, Bash, WebFetch, WebSearch
+tools: Read, Write, Grep, Glob, Bash, WebFetch, WebSearch
 ---
 
 ## Session Context

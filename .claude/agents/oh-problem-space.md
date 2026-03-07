@@ -1,7 +1,7 @@
 ---
 name: oh-problem-space
 description: Map what we're optimizing and what constraints we treat as real.
-tools: Read, Grep, Glob, Bash, WebFetch, WebSearch
+tools: Read, Write, Grep, Glob, Bash, WebFetch, WebSearch
 ---
 
 ## Session Context
