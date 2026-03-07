@@ -164,6 +164,7 @@ pub fn artifacts_to_markdown(artifacts: &[OhArtifact]) -> String {
 /// If the file does not start with `---`, returns empty frontmatter and the
 /// entire content as the body.
 fn split_frontmatter(content: &str) -> (String, String) {
+    let content = content.replace("\r\n", "\n").replace('\r', "\n");
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
         return (String::new(), content.to_string());
@@ -255,5 +256,23 @@ mod tests {
         assert!(md.contains("## Guardrails"));
         assert!(!md.contains("## Signals"));
         assert!(!md.contains("## Metis"));
+    }
+
+    #[test]
+    fn test_write_metis_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let mut fm = BTreeMap::new();
+        fm.insert("id".to_string(), serde_yaml::Value::String("test-entry".to_string()));
+        fm.insert("outcome".to_string(), serde_yaml::Value::String("agent-alignment".to_string()));
+
+        let path = write_metis(root, "test-entry", &fm, "We learned something important.").unwrap();
+        assert!(path.exists());
+
+        let artifact = parse_artifact(&path, OhArtifactKind::Metis).unwrap();
+        assert_eq!(artifact.id(), "test-entry");
+        assert_eq!(artifact.frontmatter.get("outcome").unwrap().as_str().unwrap(), "agent-alignment");
+        assert!(artifact.body.contains("We learned something important."));
     }
 }

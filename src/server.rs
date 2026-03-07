@@ -115,11 +115,11 @@ pub struct FileHistory {
 }
 
 #[macros::mcp_tool(
-    name = "query",
-    description = "The intersection query: searches across all layers (.oh/ artifacts, markdown, code symbols, git commits) and returns a unified result"
+    name = "search_all",
+    description = "Multi-source substring search across all layers (.oh/ artifacts, markdown, code symbols, git commits). Note: this is a keyword union, not a relational intersection."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct Query {
+pub struct SearchAll {
     /// Search query string to match across all layers
     pub query: String,
 }
@@ -161,7 +161,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 SearchCode::tool(),
                 SearchCommits::tool(),
                 FileHistory::tool(),
-                Query::tool(),
+                SearchAll::tool(),
             ],
             meta: None,
             next_cursor: None,
@@ -184,7 +184,21 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             "oh_get_metis" => ok_markdown(get_artifacts_by_kind(root, OhArtifactKind::Metis)),
 
             "oh_get_context" => match query::get_full_context(root) {
-                Ok(result) => Ok(text_result(result.to_markdown())),
+                Ok(mut result) => {
+                    let sym_total = result.code_symbols.len();
+                    let chunk_total = result.markdown_chunks.len();
+                    result.code_symbols.truncate(50);
+                    result.markdown_chunks.truncate(50);
+                    let mut md = result.to_markdown();
+                    if sym_total > 50 || chunk_total > 50 {
+                        md.push_str(&format!(
+                            "\n_Showing {} of {} symbols, {} of {} markdown sections._\n",
+                            result.code_symbols.len(), sym_total,
+                            result.markdown_chunks.len(), chunk_total,
+                        ));
+                    }
+                    Ok(text_result(md))
+                }
                 Err(e) => Ok(text_result(format!("Error: {}", e))),
             },
 
@@ -303,6 +317,9 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 let args: FileHistory = parse_args(params.arguments)?;
                 let max = args.max_count.unwrap_or(20) as usize;
                 let file_path = Path::new(&args.path);
+                if file_path.is_absolute() || args.path.contains("..") {
+                    return Ok(text_result("Error: path must be relative and cannot contain '..'".to_string()));
+                }
                 match git::file_history(root, file_path, max) {
                     Ok(commits) => {
                         if commits.is_empty() {
@@ -328,8 +345,8 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 }
             }
 
-            "query" => {
-                let args: Query = parse_args(params.arguments)?;
+            "search_all" => {
+                let args: SearchAll = parse_args(params.arguments)?;
                 match query::query_all(root, &args.query) {
                     Ok(result) => Ok(text_result(result.to_markdown())),
                     Err(e) => Ok(text_result(format!("Error: {}", e))),

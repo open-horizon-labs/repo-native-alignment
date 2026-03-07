@@ -117,31 +117,16 @@ fn collect_symbols(
 fn extract_name(node: &tree_sitter::Node, kind: &SymbolKind, source: &[u8]) -> String {
     match kind {
         SymbolKind::Impl => {
-            // For impl blocks, the type being implemented is in the "type" field
-            if let Some(type_node) = node.child_by_field_name("type") {
-                type_node
-                    .utf8_text(source)
-                    .unwrap_or("unknown")
-                    .to_string()
-            } else {
-                // Fallback: try to find the type from the "trait" field (for trait impls)
-                if let Some(trait_node) = node.child_by_field_name("trait") {
-                    let trait_name = trait_node
-                        .utf8_text(source)
-                        .unwrap_or("")
-                        .to_string();
-                    if let Some(type_node) = node.child_by_field_name("type") {
-                        format!(
-                            "{} for {}",
-                            trait_name,
-                            type_node.utf8_text(source).unwrap_or("unknown")
-                        )
-                    } else {
-                        trait_name
-                    }
-                } else {
-                    "unknown".to_string()
-                }
+            let trait_name = node.child_by_field_name("trait")
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(|s| s.to_string());
+            let type_name = node.child_by_field_name("type")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("unknown")
+                .to_string();
+            match trait_name {
+                Some(t) => format!("{} for {}", t, type_name),
+                None => type_name,
             }
         }
         SymbolKind::Import => {
@@ -183,7 +168,7 @@ fn extract_signature(body: &str) -> String {
         .to_string()
 }
 
-/// Case-insensitive substring search across symbol name, signature, and body.
+/// Case-insensitive substring search across symbol name and signature.
 pub fn search_symbols<'a>(symbols: &'a [CodeSymbol], query: &str) -> Vec<&'a CodeSymbol> {
     let query_lower = query.to_lowercase();
     symbols
@@ -191,7 +176,6 @@ pub fn search_symbols<'a>(symbols: &'a [CodeSymbol], query: &str) -> Vec<&'a Cod
         .filter(|sym| {
             sym.name.to_lowercase().contains(&query_lower)
                 || sym.signature.to_lowercase().contains(&query_lower)
-                || sym.body.to_lowercase().contains(&query_lower)
         })
         .collect()
 }
