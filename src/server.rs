@@ -971,9 +971,13 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 let include_code = args.include_code.unwrap_or(false);
                 let include_markdown = args.include_markdown.unwrap_or(false);
 
+                // Ensure graph is built first so symbols are embedded
+                // (get_graph builds the graph + embeds symbols in the pipeline)
+                let _ = self.get_graph().await;
+
                 let mut sections: Vec<String> = Vec::new();
 
-                // Always search .oh/ artifacts via embedding index
+                // Search .oh/ artifacts + symbols via embedding index
                 match self.get_index().await {
                     Ok(index) => {
                         match index.search(&args.query, args.artifact_types.as_deref(), limit).await {
