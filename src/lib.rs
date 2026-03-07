@@ -7,3 +7,4 @@ pub mod server;
 pub mod types;
 pub mod walk;
 pub mod embed;
+pub mod scanner;
