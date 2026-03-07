@@ -543,6 +543,26 @@ impl LspEnricher {
         }
     }
 
+    /// Find outgoing calls (callees) for a CallHierarchyItem.
+    async fn outgoing_calls(
+        transport: &mut LspTransport,
+        item: &serde_json::Value,
+    ) -> Result<Vec<serde_json::Value>> {
+        let params = serde_json::json!({
+            "item": item
+        });
+
+        let result: serde_json::Value = transport
+            .request("callHierarchy/outgoingCalls", &params)
+            .await?;
+
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+
+        Ok(result.as_array().cloned().unwrap_or_default())
+    }
+
     /// Find incoming calls (callers) for a CallHierarchyItem.
     async fn incoming_calls(
         transport: &mut LspTransport,
@@ -762,6 +782,53 @@ impl Enricher for LspEnricher {
                                     tracing::debug!("incomingCalls failed for {}: {}", node.id.name, e);
                                 }
                             }
+
+                            // Outgoing calls: what does this function call?
+                            match Self::outgoing_calls(transport, &item).await {
+                                Ok(calls) => {
+                                    for call in &calls {
+                                        let callee_uri = &call["to"]["uri"];
+                                        let callee_name = call["to"]["name"].as_str().unwrap_or("");
+                                        let callee_line = call["to"]["range"]["start"]["line"].as_u64().unwrap_or(0) as usize + 1;
+
+                                        if let Some(uri_str) = callee_uri.as_str() {
+                                            let callee_path = if let Some(p) = uri_str.strip_prefix("file://") {
+                                                let abs = PathBuf::from(p);
+                                                abs.strip_prefix(&root).unwrap_or(&abs).to_path_buf()
+                                            } else {
+                                                continue;
+                                            };
+
+                                            if callee_path.to_string_lossy().contains(".cargo") {
+                                                continue;
+                                            }
+
+                                            let callee_id = matching_nodes.iter()
+                                                .filter(|n| n.id.file == callee_path)
+                                                .filter(|n| n.id.name == callee_name)
+                                                .next()
+                                                .map(|n| n.id.clone())
+                                                .or_else(|| find_enclosing_symbol(&matching_nodes, &callee_path, callee_line));
+
+                                            if let Some(callee) = callee_id {
+                                                if callee.name == node.id.name && callee.file == node.id.file {
+                                                    continue;
+                                                }
+                                                result.added_edges.push(Edge {
+                                                    from: node.id.clone(),
+                                                    to: callee,
+                                                    kind: EdgeKind::Calls,
+                                                    source: ExtractionSource::Lsp,
+                                                    confidence: Confidence::Confirmed,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!("outgoingCalls failed for {}: {}", node.id.name, e);
+                                }
+                            }
                         }
                         Ok(None) => {} // No call hierarchy item — function not recognized
                         Err(e) => {
@@ -772,25 +839,33 @@ impl Enricher for LspEnricher {
                 }
                 NodeKind::Trait => {
                     // Find implementations for traits/interfaces
-                    match Self::find_implementations(transport, &file_uri, line, 0).await {
+                    match Self::find_implementations(transport, &file_uri, line, col).await {
                         Ok(locations) => {
                             for loc in locations {
                                 let impl_path = uri_to_relative_path(&loc.uri, &root);
+                                let impl_line = loc.range.start.line as usize + 1;
 
-                                let impl_id = NodeId {
-                                    root: String::new(),
-                                    file: impl_path,
-                                    name: format!("impl@L{}", loc.range.start.line + 1),
-                                    kind: NodeKind::Impl,
-                                };
+                                if impl_path.to_string_lossy().contains(".cargo") {
+                                    continue;
+                                }
 
-                                result.added_edges.push(Edge {
-                                    from: impl_id,
-                                    to: node.id.clone(),
-                                    kind: EdgeKind::Implements,
-                                    source: ExtractionSource::Lsp,
-                                    confidence: Confidence::Confirmed,
-                                });
+                                // Resolve to actual enclosing symbol
+                                let impl_id = matching_nodes.iter()
+                                    .filter(|n| n.id.file == impl_path)
+                                    .filter(|n| matches!(n.id.kind, NodeKind::Impl | NodeKind::Struct))
+                                    .filter(|n| n.line_start <= impl_line && n.line_end >= impl_line)
+                                    .min_by_key(|n| n.line_end - n.line_start)
+                                    .map(|n| n.id.clone());
+
+                                if let Some(implementor) = impl_id {
+                                    result.added_edges.push(Edge {
+                                        from: implementor,
+                                        to: node.id.clone(),
+                                        kind: EdgeKind::Implements,
+                                        source: ExtractionSource::Lsp,
+                                        confidence: Confidence::Confirmed,
+                                    });
+                                }
                             }
                         }
                         Err(e) => {
