@@ -113,6 +113,7 @@ fn collect_nodes(
             signature,
             body,
             metadata,
+            source: ExtractionSource::TreeSitter,
         };
 
         // For import nodes, produce a DependsOn edge

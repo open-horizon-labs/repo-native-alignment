@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::SystemTime;
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Node identity
@@ -151,6 +153,8 @@ pub enum ExtractionSource {
     Schema,
     /// Extracted from git history (merge commits, diff analysis).
     Git,
+    /// Extracted from markdown parsing (pulldown-cmark).
+    Markdown,
 }
 
 impl fmt::Display for ExtractionSource {
@@ -160,6 +164,7 @@ impl fmt::Display for ExtractionSource {
             ExtractionSource::Lsp => write!(f, "lsp"),
             ExtractionSource::Schema => write!(f, "schema"),
             ExtractionSource::Git => write!(f, "git"),
+            ExtractionSource::Markdown => write!(f, "markdown"),
         }
     }
 }
@@ -184,10 +189,74 @@ impl fmt::Display for Confidence {
 }
 
 // ---------------------------------------------------------------------------
+// Scope — workspace/root/repo identity for source registration
+// ---------------------------------------------------------------------------
+
+/// Identifies the scope a fact belongs to. Supports future Context Assembler
+/// source registration without rewriting extractors.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Scope {
+    /// Workspace identifier (user-level, spans roots).
+    pub workspace_id: Option<String>,
+    /// Root identifier (e.g., "zettelkasten", "project-x").
+    pub root_id: String,
+    /// Git repo identifier (remote URL or local path hash), if git-aware.
+    pub repo_id: Option<String>,
+    /// Branch name, if relevant.
+    pub branch: Option<String>,
+    /// Commit SHA at extraction time, if git-aware.
+    pub commit_sha: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Source envelope — canonical record wrapper for replay/outbox
+// ---------------------------------------------------------------------------
+
+/// Canonical source envelope wrapping every extracted fact (node or edge).
+/// Designed for deterministic replay and future FEED publishing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceEnvelope<T> {
+    /// Unique event ID (UUID v4).
+    pub event_id: String,
+    /// Deterministic idempotency key derived from content.
+    /// Same input → same key → safe to replay.
+    pub idempotency_key: String,
+    /// Source identifier: "code.workspace:v1"
+    pub source: String,
+    /// Schema version for the payload.
+    pub source_schema_version: String,
+    /// Fact type: "code.symbol", "code.edge", "code.pr_merge", etc.
+    pub fact_type: String,
+    /// When this fact was extracted.
+    pub event_time: SystemTime,
+    /// Scope context.
+    pub scope: Scope,
+    /// The actual payload.
+    pub payload: T,
+}
+
+impl<T> SourceEnvelope<T> {
+    /// Wrap a payload in a source envelope with standard defaults.
+    pub fn wrap(payload: T, fact_type: &str, idempotency_key: String, scope: Scope) -> Self {
+        Self {
+            event_id: Uuid::new_v4().to_string(),
+            idempotency_key,
+            source: "code.workspace:v1".to_string(),
+            source_schema_version: "0.1.0".to_string(),
+            fact_type: fact_type.to_string(),
+            event_time: SystemTime::now(),
+            scope,
+            payload,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Core structs
 // ---------------------------------------------------------------------------
 
 /// A node in the code graph: a symbol, schema element, component, or artifact.
+/// This is the canonical source record — independent of LanceDB layout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     pub id: NodeId,
@@ -201,6 +270,8 @@ pub struct Node {
     pub body: String,
     /// Arbitrary key-value metadata for extractor-specific data.
     pub metadata: BTreeMap<String, String>,
+    /// Which extractor produced this node.
+    pub source: ExtractionSource,
 }
 
 impl Node {

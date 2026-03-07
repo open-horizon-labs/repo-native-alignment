@@ -79,6 +79,7 @@ fn collect_nodes(
                     signature,
                     body,
                     metadata: BTreeMap::new(),
+                    source: ExtractionSource::TreeSitter,
                 });
             }
         }
@@ -101,6 +102,7 @@ fn collect_nodes(
                     signature,
                     body,
                     metadata: BTreeMap::new(),
+                    source: ExtractionSource::TreeSitter,
                 });
             }
         }
@@ -123,6 +125,7 @@ fn collect_nodes(
                     signature,
                     body,
                     metadata: BTreeMap::new(),
+                    source: ExtractionSource::TreeSitter,
                 });
             }
         }
@@ -144,6 +147,7 @@ fn collect_nodes(
                     signature: body.clone(),
                     body,
                     metadata: BTreeMap::new(),
+                    source: ExtractionSource::TreeSitter,
                 });
             }
         }
@@ -164,6 +168,7 @@ fn collect_nodes(
                 signature: text,
                 body: String::new(),
                 metadata: BTreeMap::new(),
+                source: ExtractionSource::TreeSitter,
             };
 
             if !target.is_empty() {

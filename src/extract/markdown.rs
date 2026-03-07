@@ -8,7 +8,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::graph::{Node, NodeId, NodeKind};
+use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
 
 use super::{ExtractionResult, Extractor};
 
@@ -99,6 +99,7 @@ impl Extractor for MarkdownExtractor {
                 signature: chunk.heading_hierarchy.join(" > "),
                 body: chunk.content.clone(),
                 metadata,
+                source: ExtractionSource::Markdown,
             };
             nodes.push(node);
         }

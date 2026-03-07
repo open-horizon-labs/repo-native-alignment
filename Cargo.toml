@@ -27,6 +27,9 @@ tree-sitter-go = "0.23"
 # In-memory graph index (traversal, path queries, impact analysis)
 petgraph = "0.7"
 
+# Deterministic UUIDs for source envelope event IDs
+uuid = { version = "1", features = ["v4"] }
+
 # Vector + columnar store
 lancedb = "0.26"
 arrow-array = "57"

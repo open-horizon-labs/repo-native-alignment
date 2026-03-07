@@ -78,6 +78,7 @@ fn collect_nodes(
                     signature,
                     body,
                     metadata: BTreeMap::new(),
+                    source: ExtractionSource::TreeSitter,
                 });
             }
         }
@@ -107,6 +108,7 @@ fn collect_nodes(
                     signature,
                     body,
                     metadata,
+                    source: ExtractionSource::TreeSitter,
                 });
             }
         }
@@ -159,6 +161,7 @@ fn collect_nodes(
                     signature: text,
                     body: String::new(),
                     metadata: BTreeMap::new(),
+                    source: ExtractionSource::TreeSitter,
                 });
             }
         }
@@ -212,6 +215,7 @@ fn extract_type_spec(
             signature,
             body,
             metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
         });
     }
 }
@@ -251,6 +255,7 @@ fn extract_import_spec(
             signature: text,
             body: String::new(),
             metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
         };
 
         edges.push(Edge {

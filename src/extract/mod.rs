@@ -269,6 +269,7 @@ mod tests {
                 signature: "fn foo()".into(),
                 body: "fn foo() {}".into(),
                 metadata: Default::default(),
+                source: crate::graph::ExtractionSource::TreeSitter,
             }],
             edges: vec![],
         };
