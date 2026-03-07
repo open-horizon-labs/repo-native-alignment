@@ -12,6 +12,7 @@ Four systems collaborate. Each is independent; together they compound.
 │  ─ aims, missions, endeavors    ─ outcomes, signals, code   │
 │  ─ cross-project context        ─ structural joins (git+ts) │
 │  ─ decision logs                ─ .oh/ read/write           │
+│                                 ─ semantic search over .oh/  │
 └──────────┬──────────────────────────────┬───────────────────┘
            │                              │
            ▼                              ▼
@@ -36,6 +37,8 @@ Four systems collaborate. Each is independent; together they compound.
 **The loop:** Skills/agents guide the workflow → MCP tools read/write structured context → `.oh/` accumulates learnings → git versions everything → next session starts richer.
 
 **The join:** `outcome_progress` connects layers structurally — outcome → file patterns → tagged commits → code symbols → related markdown. Not keyword matching; structural links.
+
+**The search:** `oh_search_context` lets agents describe what they need in natural language — "guardrails about API compatibility" — instead of listing all artifacts and filtering manually.
 
 ## Quick Start
 
@@ -68,15 +71,16 @@ npx skills add open-horizon-labs/skills -g -a claude-code -y
 
 ## The Four Systems
 
-### RNA MCP Server (this repo) — 16 tools
+### RNA MCP Server (this repo) — 17 tools
 
-The repo-local intelligence layer. Parses code (tree-sitter), markdown (pulldown-cmark), and git history (git2). Exposes everything via MCP.
+The repo-local intelligence layer. Parses code (tree-sitter), markdown (pulldown-cmark), and git history (git2). Embeds `.oh/` artifacts for semantic search (fastembed-rs + LanceDB). Exposes everything via MCP.
 
 | Category | Tools |
 |----------|-------|
 | **Read .oh/** | `oh_get_outcomes`, `oh_get_signals`, `oh_get_guardrails`, `oh_get_metis`, `oh_get_context` |
 | **Write .oh/** | `oh_record_metis`, `oh_record_signal`, `oh_update_outcome`, `oh_record_guardrail_candidate`, `oh_init` |
 | **Search** | `search_markdown`, `search_code` (kind/file filters), `search_commits`, `file_history`, `search_all` |
+| **Semantic Search** | `oh_search_context` — natural language search over `.oh/` artifacts + git commits |
 | **Join** | `outcome_progress` — the structural intersection query |
 
 ### [OH MCP](https://github.com/cloud-atlas-ai/oh-mcp-server) — organizational context
@@ -95,9 +99,12 @@ Prompt-based skills that run in the main conversation. They need full conversati
 
 | Skill | What it does | RNA MCP integration |
 |-------|-------------|-------------------|
-| `/review` | Check alignment before committing | Calls `outcome_progress`, `oh_get_guardrails` |
-| `/dissent` | Devil's advocate before one-way doors | Grounds dissent in declared constraints |
-| `/salvage` | Extract learning before restarting | Records metis and guardrail candidates |
+| `/aim` | Frame the outcome | Calls `oh_search_context("outcomes related to [task]")` to find relevant outcomes |
+| `/review` | Check alignment before committing | Calls `oh_search_context("guardrails for [area]", types: ["guardrail"])`, `outcome_progress` |
+| `/dissent` | Devil's advocate before one-way doors | Calls `oh_search_context("constraints and risks for [decision]")` to ground dissent |
+| `/salvage` | Extract learning before restarting | Records metis and guardrail candidates via write tools |
+| `/solution-space` | Evaluate approaches | Calls `oh_search_context("past approaches to [problem]", types: ["metis"])` for prior art |
+| `/execute` | Build the change | Pre-flight via `oh_search_context("guardrails for [scope]", types: ["guardrail"])`, tags commits |
 
 ### OH Phase Agents — isolated execution
 
@@ -116,37 +123,56 @@ Agent wrappers that run each workflow phase in its own context window with scope
 
 ```
 .oh/
-├── outcomes/        ← what we're optimizing for (YAML frontmatter + markdown)
-├── signals/         ← how we measure progress (SLO definitions + observations)
-├── guardrails/      ← constraints that shape behavior (hard/soft/candidate)
-└── metis/           ← learnings that compound (the institutional memory)
+├── outcomes/        <- what we're optimizing for (YAML frontmatter + markdown)
+├── signals/         <- how we measure progress (SLO definitions + observations)
+├── guardrails/      <- constraints that shape behavior (hard/soft/candidate)
+└── metis/           <- learnings that compound (the institutional memory)
 ```
 
 Outcomes declare `files:` patterns linking to code. Commits tag `[outcome:X]` linking to outcomes. These structural links power `outcome_progress`.
 
 `.oh/` is a **cache**, not source of truth. Outcomes originate in external systems (OH graph, Jira, Linear). `.oh/` is the repo-local, git-versioned projection. `rm -rf .oh/` loses context but breaks nothing.
 
+## How Semantic Search Works
+
+`oh_search_context` uses local embeddings to let agents find relevant `.oh/` artifacts and git commits by describing what they need, rather than listing and filtering. Filter by type: `outcome`, `signal`, `guardrail`, `metis`, or `commit`.
+
+**How it works:**
+
+1. On first search call, `.oh/` artifacts (outcomes, signals, guardrails, metis) are chunked by heading and embedded using BAAI/bge-small-en-v1.5 via fastembed-rs.
+2. The agent describes what it needs in natural language — e.g., "guardrails about backward compatibility" or "learnings from previous auth refactors".
+3. LanceDB performs vector similarity search and returns ranked results.
+4. Results include the artifact type, file path, matched section, and similarity score.
+
+**Why this matters:** Without semantic search, agents must call `oh_get_guardrails` and read every artifact to find the relevant ones. With `oh_search_context`, they describe the intent and get back only what matches. This replaces "list all, then filter" with "describe what you need."
+
+**Filtering by type:** Pass `types: ["guardrail", "metis"]` to restrict search to specific artifact categories. Omit to search everything.
+
+**Locality:** Everything runs locally. The embedding model (ONNX, ~33MB) downloads once and runs on CPU via fastembed-rs. No API calls, no cloud dependency.
+
 ## Design Decisions
 
-- **Structural joins > semantic search** — `outcome_progress` follows links, not keywords. Embeddings are future work for the discovery path.
+- **Structural joins > semantic search for the core path** — `outcome_progress` follows links, not keywords. Semantic search via `oh_search_context` complements this for the discovery path: finding relevant context when you don't know the exact artifact name.
 - **Write tools close the feedback loop** — without `oh_record_metis` and `oh_record_signal`, the system is read-only and can't compound.
-- **Honest tool names** — `search_all` is multi-source grep. `outcome_progress` is the real join.
+- **Honest tool names** — `search_all` is multi-source grep. `outcome_progress` is the real join. `oh_search_context` is vector similarity over `.oh/`.
 - **Alignment is the constraint** — not a hypothesis to measure. Session 1 exercised the full read-write loop on real work. The system compounds by design.
 - **Skills integrate via context, not code** — agents read preamble sections telling them which MCP tools to call. No fork needed.
 
 ## Architecture
 
 ```
-tree-sitter       ← Rust code → symbols (functions, structs, traits, impls)
-pulldown-cmark    ← all markdown → heading-delimited chunks + code spans
-git2              ← commit history, file changes, outcome tagging
-rust-mcp-sdk      ← MCP server (stdio default, HTTP optional)
+fastembed-rs      <- local ONNX embeddings (BAAI/bge-small-en-v1.5)
+LanceDB           <- vector store for semantic search over .oh/ artifacts
+tree-sitter       <- Rust code -> symbols (functions, structs, traits, impls)
+pulldown-cmark    <- markdown -> heading-delimited chunks + code spans
+git2              <- commit history, file changes, outcome tagging
+rust-mcp-sdk      <- MCP server (stdio default, HTTP optional)
 ```
 
-No external database. No cloud dependency. Everything is local, git-versioned, and disposable.
+No cloud dependency. Everything is local, git-versioned, and disposable. The embedding model downloads once on first use and runs on CPU.
 
 ## Status
 
-Working prototype. 16 MCP tools, 20 tests, stdio + HTTP transport. Skills integration PR open. Phase agents installed. Full read-write loop exercised on real work.
+Working prototype. 17 MCP tools, 20 tests, stdio + HTTP transport. Skills integration PR open. Phase agents installed. Full read-write loop exercised on real work. Semantic search over `.oh/` artifacts via fastembed-rs and LanceDB.
 
-**Next:** Grounded `oh_init` (scaffold from OH graph, not templates), then cross-references (markdown code spans → symbol table). See `.oh/p4-solution-space.md`.
+**Next:** Grounded `oh_init` (scaffold from OH graph, not templates), then cross-references (markdown code spans -> symbol table). See `.oh/p4-solution-space.md`.

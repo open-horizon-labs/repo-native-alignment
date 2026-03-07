@@ -7,6 +7,7 @@ use arrow_schema::{DataType, Field, Schema};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use lancedb::query::{ExecutableQuery, QueryBase};
 
+use crate::git;
 use crate::oh;
 
 fn new_model() -> Result<TextEmbedding> {
@@ -69,32 +70,68 @@ impl EmbeddingIndex {
         })
     }
 
-    /// Index all .oh/ artifacts. Rebuilds the table from scratch.
+    /// Index all .oh/ artifacts and recent git commits. Rebuilds the table from scratch.
     pub async fn index_all(&self, repo_root: &Path) -> Result<usize> {
         let artifacts = oh::load_oh_artifacts(repo_root)?;
-        if artifacts.is_empty() {
-            return Ok(0);
+
+        // Collect ids, kinds, titles, bodies, and embedding texts from artifacts
+        let mut ids: Vec<String> = Vec::new();
+        let mut kinds: Vec<String> = Vec::new();
+        let mut titles: Vec<String> = Vec::new();
+        let mut bodies: Vec<String> = Vec::new();
+        let mut texts: Vec<String> = Vec::new();
+
+        for a in &artifacts {
+            ids.push(a.id());
+            kinds.push(a.kind.to_string());
+            titles.push(
+                a.frontmatter
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| a.frontmatter.get("statement").and_then(|v| v.as_str()))
+                    .unwrap_or(&a.id())
+                    .to_string(),
+            );
+            bodies.push(a.body.clone());
+
+            let mut text = String::new();
+            text.push_str(&a.id());
+            text.push(' ');
+            for (k, v) in &a.frontmatter {
+                if let Some(s) = v.as_str() {
+                    text.push_str(k);
+                    text.push_str(": ");
+                    text.push_str(s);
+                    text.push(' ');
+                }
+            }
+            text.push_str(&a.body);
+            texts.push(text);
         }
 
-        // Prepare texts for embedding: combine frontmatter + body
-        let texts: Vec<String> = artifacts
-            .iter()
-            .map(|a| {
-                let mut text = String::new();
-                text.push_str(&a.id());
-                text.push(' ');
-                for (k, v) in &a.frontmatter {
-                    if let Some(s) = v.as_str() {
-                        text.push_str(k);
-                        text.push_str(": ");
-                        text.push_str(s);
-                        text.push(' ');
-                    }
-                }
-                text.push_str(&a.body);
-                text
-            })
-            .collect();
+        // Also index all git commits
+        if let Ok(commits) = git::load_commits(repo_root, usize::MAX) {
+            for c in &commits {
+                let changed_files_str = c
+                    .changed_files
+                    .iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let body = format!("{}\n\nFiles: {}", c.message, changed_files_str);
+                let title = c.message.lines().next().unwrap_or(&c.message).to_string();
+
+                ids.push(c.short_hash.clone());
+                kinds.push("commit".to_string());
+                titles.push(title);
+                bodies.push(body.clone());
+                texts.push(body);
+            }
+        }
+
+        if texts.is_empty() {
+            return Ok(0);
+        }
 
         let count = texts.len();
 
@@ -103,19 +140,6 @@ impl EmbeddingIndex {
 
         let embeddings = embed_texts(&mut model, texts)?;
         let dim = embeddings[0].len();
-
-        // Build arrow arrays
-        let ids: Vec<String> = artifacts.iter().map(|a| a.id()).collect();
-        let kinds: Vec<String> = artifacts.iter().map(|a| a.kind.to_string()).collect();
-        let titles: Vec<String> = artifacts.iter().map(|a| {
-            a.frontmatter
-                .get("title")
-                .and_then(|v| v.as_str())
-                .or_else(|| a.frontmatter.get("statement").and_then(|v| v.as_str()))
-                .unwrap_or(&a.id())
-                .to_string()
-        }).collect();
-        let bodies: Vec<String> = artifacts.iter().map(|a| a.body.clone()).collect();
 
         let flat_embeddings: Vec<f32> = embeddings.into_iter().flatten().collect();
 
