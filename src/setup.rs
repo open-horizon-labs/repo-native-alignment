@@ -137,6 +137,18 @@ pub fn run(args: &SetupArgs) -> Result<()> {
         merge_mcp_json_with_binary(&mcp_path, &project_path, &binary)?;
     }
 
+    // ── Step 4.5: append MCP tool guidance to AGENTS.md ────────────────────
+    let agents_md = project_path.join("AGENTS.md");
+    if args.dry_run {
+        if agents_md.exists() {
+            println!("[dry-run] Would append RNA MCP tool guidance to AGENTS.md");
+        } else {
+            println!("[dry-run] No AGENTS.md found; skipping tool guidance injection");
+        }
+    } else if agents_md.exists() {
+        inject_mcp_guidance(&agents_md)?;
+    }
+
     // ── Step 5: verify ─────────────────────────────────────────────────────
     if args.dry_run {
         if args.skip_verify {
@@ -400,6 +412,41 @@ fn verify(mcp_path: &Path) -> Result<()> {
     } else {
         bail!("One or more verification checks failed (see above).");
     }
+}
+
+// ─── AGENTS.md MCP guidance injection ─────────────────────────────────────────
+
+const MCP_GUIDANCE_MARKER: &str = "<!-- RNA MCP tool guidance -->";
+
+const MCP_GUIDANCE_BLOCK: &str = r#"
+<!-- RNA MCP tool guidance -->
+## Code Exploration (use RNA MCP tools, not grep/Read)
+
+| Instead of... | Use this MCP tool |
+|---|---|
+| `Grep` for symbol names | `search_symbols(query, kind, language, file)` |
+| `Read` to trace function calls | `graph_neighbors(node_id, direction, edge_types)` |
+| `Grep` for "who calls X" | `graph_impact(node_id, max_hops)` |
+| `Read` to find .oh/ artifacts | `oh_search_context(query)` |
+| `Bash` with `grep -rn` | `search_symbols` or `oh_search_context` |
+<!-- end RNA MCP tool guidance -->
+"#;
+
+fn inject_mcp_guidance(agents_md: &Path) -> Result<()> {
+    let content = std::fs::read_to_string(agents_md)
+        .with_context(|| format!("Cannot read {}", agents_md.display()))?;
+
+    if content.contains(MCP_GUIDANCE_MARKER) {
+        println!("  AGENTS.md already has RNA MCP tool guidance; skipping.");
+        return Ok(());
+    }
+
+    let updated = format!("{}\n{}", content.trim_end(), MCP_GUIDANCE_BLOCK);
+    std::fs::write(agents_md, updated)
+        .with_context(|| format!("Cannot write {}", agents_md.display()))?;
+
+    println!("  Appended RNA MCP tool guidance to AGENTS.md");
+    Ok(())
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
