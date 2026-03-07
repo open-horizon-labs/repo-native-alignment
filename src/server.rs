@@ -348,9 +348,19 @@ impl RnaHandler {
                     scan_result.scan_duration
                 );
 
-                // 2. Run extractors
+                // 2. Run extractors on ALL known files (not just delta)
+                // The scan delta tells us what changed, but the graph needs
+                // the full picture on first init. On subsequent inits (server restart),
+                // the scan may return 0 changes but we still need the full graph.
                 let registry = ExtractorRegistry::with_builtins();
-                let extraction = registry.extract_scan_result(&self.repo_root, &scan_result);
+                let all_files = scanner.all_known_files();
+                let full_scan = crate::scanner::ScanResult {
+                    changed_files: Vec::new(),
+                    new_files: all_files,
+                    deleted_files: Vec::new(),
+                    scan_duration: std::time::Duration::ZERO,
+                };
+                let extraction = registry.extract_scan_result(&self.repo_root, &full_scan);
                 tracing::info!(
                     "Extracted: {} nodes, {} edges",
                     extraction.nodes.len(),

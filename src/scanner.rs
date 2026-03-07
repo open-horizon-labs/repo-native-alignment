@@ -170,6 +170,7 @@ impl ScanResult {
     }
 }
 
+
 /// The scanner: detects file changes incrementally.
 pub struct Scanner {
     repo_root: PathBuf,
@@ -194,6 +195,13 @@ impl Scanner {
             excludes,
             state,
         })
+    }
+
+    /// All files known to the scanner (from persisted state after scan).
+    /// Use this to populate the graph on startup — the scan delta
+    /// only returns changed files, but the graph needs everything.
+    pub fn all_known_files(&self) -> Vec<PathBuf> {
+        self.state.file_mtimes.keys().cloned().collect()
     }
 
     /// Perform an incremental scan. Returns changed/new/deleted file lists.
