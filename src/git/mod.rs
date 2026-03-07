@@ -1,3 +1,5 @@
+pub mod pr_merges;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};

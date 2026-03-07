@@ -370,11 +370,40 @@ impl RnaHandler {
                     extraction.edges.len()
                 );
 
-                // 3. Build petgraph index
+                // 3. Extract PR merges from git history
+                let mut all_nodes = extraction.nodes;
+                let mut all_edges = extraction.edges;
+
+                match git::pr_merges::extract_pr_merges(&self.repo_root, Some(100)) {
+                    Ok((pr_nodes, pr_edges)) => {
+                        tracing::info!(
+                            "Extracted {} PR merge nodes, {} edges from git history",
+                            pr_nodes.len(),
+                            pr_edges.len()
+                        );
+
+                        // Link PR merges to symbols via Modified edges
+                        let modified_edges =
+                            git::pr_merges::link_pr_to_symbols(&pr_nodes, &all_nodes);
+                        tracing::info!(
+                            "Created {} Modified edges linking PRs to symbols",
+                            modified_edges.len()
+                        );
+
+                        all_nodes.extend(pr_nodes);
+                        all_edges.extend(pr_edges);
+                        all_edges.extend(modified_edges);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to extract PR merges: {}", e);
+                    }
+                }
+
+                // 4. Build petgraph index
                 let mut index = GraphIndex::new();
-                index.rebuild_from_edges(&extraction.edges);
+                index.rebuild_from_edges(&all_edges);
                 // Also ensure all nodes are in the graph (some may have no edges)
-                for node in &extraction.nodes {
+                for node in &all_nodes {
                     index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
                 }
 
