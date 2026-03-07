@@ -602,9 +602,9 @@ impl Default for RnaHandler {
 
 impl RnaHandler {
     async fn get_index(&self) -> anyhow::Result<&EmbeddingIndex> {
-        // Ensure graph is built first so symbols are available for embedding
-        let _ = self.get_graph().await;
-
+        // The graph pipeline (get_graph) embeds symbols as part of its build.
+        // If embed_index is already set (from graph build), use it.
+        // If not (graph loaded from LanceDB cache), build with cached symbols.
         self.embed_index
             .get_or_try_init(|| async {
                 let index = EmbeddingIndex::new(&self.repo_root).await?;
@@ -616,7 +616,7 @@ impl RnaHandler {
                 };
 
                 let count = index.index_all_with_symbols(&self.repo_root, symbols).await?;
-                tracing::info!("Indexed {} items for semantic search (artifacts + commits + {} symbols)", count, symbols.len());
+                tracing::info!("Embedded {} items (fallback path, {} symbols)", count, symbols.len());
                 Ok(index)
             })
             .await
@@ -797,9 +797,25 @@ impl RnaHandler {
                     resolved_roots.len()
                 );
 
-                // 7. Persist to LanceDB for next startup
+                // 7. Persist graph to LanceDB
                 if let Err(e) = persist_graph_to_lance(&self.repo_root, &all_nodes, &all_edges).await {
                     tracing::warn!("Failed to persist graph to LanceDB: {}", e);
+                }
+
+                // 8. Embed all nodes (symbols + markdown sections) for semantic search
+                // This is part of the graph pipeline — embed where nodes are created,
+                // not as a separate lazy step that might miss them.
+                match EmbeddingIndex::new(&self.repo_root).await {
+                    Ok(embed_index) => {
+                        match embed_index.index_all_with_symbols(&self.repo_root, &all_nodes).await {
+                            Ok(count) => {
+                                tracing::info!("Embedded {} items (artifacts + commits + {} symbols)", count, all_nodes.len());
+                                let _ = self.embed_index.set(embed_index);
+                            }
+                            Err(e) => tracing::warn!("Failed to embed: {}", e),
+                        }
+                    }
+                    Err(e) => tracing::warn!("Failed to create embed index: {}", e),
                 }
 
                 Ok(GraphState {
