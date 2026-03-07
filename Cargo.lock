@@ -1766,7 +1766,7 @@ dependencies = [
  "itertools 0.14.0",
  "parking_lot",
  "paste",
- "petgraph",
+ "petgraph 0.8.3",
 ]
 
 [[package]]
@@ -4817,6 +4817,16 @@ checksum = "df202b0b0f5b8e389955afd5f27b007b00fb948162953f1db9c70d2c7e3157d7"
 
 [[package]]
 name = "petgraph"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3672b37090dbd86368a4145bc067582552b29c27377cad4e0a306c97f9bd7772"
+dependencies = [
+ "fixedbitset",
+ "indexmap 2.13.0",
+]
+
+[[package]]
+name = "petgraph"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8701b58ea97060d5e5b155d383a69952a60943f0e6dfe30b04c287beb0b27455"
@@ -5002,7 +5012,7 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "multimap",
- "petgraph",
+ "petgraph 0.8.3",
  "prettyplease",
  "prost",
  "prost-types",
@@ -5453,6 +5463,7 @@ dependencies = [
  "futures",
  "git2",
  "lancedb",
+ "petgraph 0.7.1",
  "pulldown-cmark",
  "rust-mcp-sdk",
  "serde",
@@ -5699,7 +5710,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
