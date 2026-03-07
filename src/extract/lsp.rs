@@ -538,6 +538,54 @@ impl LspEnricher {
         Ok(locations)
     }
 
+    /// Prepare call hierarchy at a position. Returns the CallHierarchyItem if found.
+    async fn prepare_call_hierarchy(
+        transport: &mut LspTransport,
+        file_uri: &Uri,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<serde_json::Value>> {
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri.as_str() },
+            "position": { "line": line, "character": character }
+        });
+
+        let result: serde_json::Value = transport
+            .request("textDocument/prepareCallHierarchy", &params)
+            .await?;
+
+        if result.is_null() {
+            return Ok(None);
+        }
+
+        // Returns an array of CallHierarchyItem — take the first
+        if let Some(items) = result.as_array() {
+            Ok(items.first().cloned())
+        } else {
+            Ok(Some(result))
+        }
+    }
+
+    /// Find incoming calls (callers) for a CallHierarchyItem.
+    async fn incoming_calls(
+        transport: &mut LspTransport,
+        item: &serde_json::Value,
+    ) -> Result<Vec<serde_json::Value>> {
+        let params = serde_json::json!({
+            "item": item
+        });
+
+        let result: serde_json::Value = transport
+            .request("callHierarchy/incomingCalls", &params)
+            .await?;
+
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+
+        Ok(result.as_array().cloned().unwrap_or_default())
+    }
+
     /// Find implementations of a trait/interface at the given position.
     async fn find_implementations(
         transport: &mut LspTransport,
@@ -676,56 +724,71 @@ impl Enricher for LspEnricher {
 
             // line_start is 1-based, LSP positions are 0-based
             let line = (node.line_start.saturating_sub(1)) as u32;
+            // Find column of function name in signature for accurate cursor positioning
+            let col = node.signature.find(&node.id.name)
+                .map(|i| i as u32)
+                .unwrap_or(4); // fallback: typical "fn " or "pub fn " offset
 
             match node.id.kind {
                 NodeKind::Function => {
                     attempted += 1;
-                    match Self::find_references(transport, &file_uri, line, 0).await {
-                        Ok(locations) => {
-                            if !locations.is_empty() {
-                                tracing::debug!("Found {} references for {}", locations.len(), node.id.name);
-                            }
-                            for loc in locations {
-                                let ref_path = uri_to_relative_path(&loc.uri, &root);
-                                let ref_line = loc.range.start.line + 1; // 0-based → 1-based
+                    // Use callHierarchy to find callers
+                    match Self::prepare_call_hierarchy(transport, &file_uri, line, col).await {
+                        Ok(Some(item)) => {
+                            match Self::incoming_calls(transport, &item).await {
+                                Ok(calls) => {
+                                    for call in &calls {
+                                        let caller_uri = &call["from"]["uri"];
+                                        let caller_name = call["from"]["name"].as_str().unwrap_or("");
+                                        let caller_line = call["from"]["range"]["start"]["line"].as_u64().unwrap_or(0) as usize + 1;
 
-                                // Find the enclosing function at the reference location
-                                // Skip references within the function's own body
-                                if ref_path == node.id.file
-                                    && ref_line as usize >= node.line_start
-                                    && ref_line as usize <= node.line_end
-                                {
-                                    continue;
+                                        if let Some(uri_str) = caller_uri.as_str() {
+                                            let caller_path = if let Some(p) = uri_str.strip_prefix("file://") {
+                                                let abs = PathBuf::from(p);
+                                                abs.strip_prefix(&root).unwrap_or(&abs).to_path_buf()
+                                            } else {
+                                                continue;
+                                            };
+
+                                            // Skip external crate callers
+                                            if caller_path.to_string_lossy().contains(".cargo") {
+                                                continue;
+                                            }
+
+                                            // Find the caller in our graph nodes
+                                            let caller_id = matching_nodes.iter()
+                                                .filter(|n| n.id.file == caller_path)
+                                                .filter(|n| n.id.name == caller_name)
+                                                .next()
+                                                .map(|n| n.id.clone())
+                                                .or_else(|| find_enclosing_symbol(&matching_nodes, &caller_path, caller_line));
+
+                                            if let Some(caller) = caller_id {
+                                                // Skip self-calls
+                                                if caller.name == node.id.name && caller.file == node.id.file {
+                                                    continue;
+                                                }
+                                                tracing::debug!("Calls edge: {} -> {}", caller.name, node.id.name);
+                                                result.added_edges.push(Edge {
+                                                    from: caller,
+                                                    to: node.id.clone(),
+                                                    kind: EdgeKind::Calls,
+                                                    source: ExtractionSource::Lsp,
+                                                    confidence: Confidence::Confirmed,
+                                                });
+                                            }
+                                        }
+                                    }
                                 }
-
-                                // Skip external crate references
-                                if ref_path.to_string_lossy().contains(".cargo") {
-                                    continue;
-                                }
-
-                                let caller_id = find_enclosing_symbol(
-                                    &matching_nodes, &ref_path, ref_line as usize
-                                );
-
-                                if let Some(caller) = caller_id {
-                                    tracing::debug!("Calls edge: {} -> {}", caller.name, node.id.name);
-                                    result.added_edges.push(Edge {
-                                        from: caller,
-                                        to: node.id.clone(),
-                                        kind: EdgeKind::Calls,
-                                        source: ExtractionSource::Lsp,
-                                        confidence: Confidence::Confirmed,
-                                    });
+                                Err(e) => {
+                                    tracing::debug!("incomingCalls failed for {}: {}", node.id.name, e);
                                 }
                             }
                         }
+                        Ok(None) => {} // No call hierarchy item — function not recognized
                         Err(e) => {
                             errors += 1;
-                            tracing::debug!(
-                                "References lookup failed for {}: {}",
-                                node.id.name,
-                                e
-                            );
+                            tracing::debug!("prepareCallHierarchy failed for {}: {}", node.id.name, e);
                         }
                     }
                 }
