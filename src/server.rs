@@ -206,6 +206,17 @@ pub struct OutcomeProgress {
     pub outcome_id: String,
 }
 
+#[macros::mcp_tool(
+    name = "oh_init",
+    description = "Scaffolds .oh/ directory structure for a repo. Reads CLAUDE.md, README.md, and recent git history to propose an initial outcome, signal, and guardrails. Idempotent — won't overwrite existing files."
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct OhInit {
+    /// Optional: name for the primary outcome (auto-detected from README/CLAUDE.md if omitted)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_name: Option<String>,
+}
+
 // ── ServerHandler ───────────────────────────────────────────────────
 
 pub struct RnaHandler {
@@ -248,6 +259,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 FileHistory::tool(),
                 SearchAll::tool(),
                 OutcomeProgress::tool(),
+                OhInit::tool(),
             ],
             meta: None,
             next_cursor: None,
@@ -515,6 +527,14 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 }
             }
 
+            "oh_init" => {
+                let args: OhInit = parse_args(params.arguments)?;
+                match oh_init_impl(root, args.outcome_name.as_deref()) {
+                    Ok(msg) => Ok(text_result(msg)),
+                    Err(e) => Ok(text_result(format!("Error: {}", e))),
+                }
+            }
+
             _ => Err(CallToolError::unknown_tool(&params.name)),
         }
     }
@@ -539,6 +559,156 @@ fn get_artifacts_by_kind(
     let all = oh::load_oh_artifacts(repo_root)?;
     let filtered: Vec<_> = all.into_iter().filter(|a| a.kind == kind).collect();
     Ok(oh::artifacts_to_markdown(&filtered))
+}
+
+fn oh_init_impl(repo_root: &Path, outcome_name: Option<&str>) -> anyhow::Result<String> {
+    use std::fs;
+
+    let oh_dir = repo_root.join(".oh");
+    let mut created = Vec::new();
+    let mut skipped = Vec::new();
+
+    // Create directory structure
+    for subdir in &["outcomes", "signals", "guardrails", "metis"] {
+        let dir = oh_dir.join(subdir);
+        if !dir.exists() {
+            fs::create_dir_all(&dir)?;
+            created.push(format!(".oh/{}/", subdir));
+        }
+    }
+
+    // Try to detect project name from README or CLAUDE.md
+    let project_name = outcome_name
+        .map(|s| s.to_string())
+        .or_else(|| detect_project_name(repo_root))
+        .unwrap_or_else(|| "project-goal".to_string());
+
+    let slug = project_name
+        .to_lowercase()
+        .replace(|c: char| !c.is_alphanumeric() && c != '-', "-")
+        .trim_matches('-')
+        .to_string();
+
+    // Scaffold outcome
+    let outcome_path = oh_dir.join("outcomes").join(format!("{}.md", slug));
+    if outcome_path.exists() {
+        skipped.push(format!(".oh/outcomes/{}.md (exists)", slug));
+    } else {
+        let mut fm = BTreeMap::new();
+        fm.insert("id".into(), serde_yaml::Value::String(slug.clone()));
+        fm.insert("status".into(), serde_yaml::Value::String("active".into()));
+        fm.insert(
+            "mechanism".into(),
+            serde_yaml::Value::String("(describe how this outcome is achieved)".into()),
+        );
+        fm.insert(
+            "files".into(),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("src/*".into())]),
+        );
+        oh::write_artifact(
+            repo_root,
+            "outcomes",
+            &slug,
+            &fm,
+            &format!("# {}\n\n(Describe the desired outcome here.)\n\n## Signals\n- (what signals indicate progress?)\n\n## Constraints\n- (what guardrails apply?)", project_name),
+        )?;
+        created.push(format!(".oh/outcomes/{}.md", slug));
+    }
+
+    // Scaffold signal
+    let signal_slug = format!("{}-progress", slug);
+    let signal_path = oh_dir.join("signals").join(format!("{}.md", signal_slug));
+    if signal_path.exists() {
+        skipped.push(format!(".oh/signals/{}.md (exists)", signal_slug));
+    } else {
+        let mut fm = BTreeMap::new();
+        fm.insert("id".into(), serde_yaml::Value::String(signal_slug.clone()));
+        fm.insert("outcome".into(), serde_yaml::Value::String(slug.clone()));
+        fm.insert("type".into(), serde_yaml::Value::String("slo".into()));
+        fm.insert(
+            "threshold".into(),
+            serde_yaml::Value::String("(define measurable threshold)".into()),
+        );
+        oh::write_artifact(
+            repo_root,
+            "signals",
+            &signal_slug,
+            &fm,
+            &format!("# {} Progress\n\n(How do you measure progress toward this outcome?)", project_name),
+        )?;
+        created.push(format!(".oh/signals/{}.md", signal_slug));
+    }
+
+    // Scaffold lightweight guardrail
+    let gr_path = oh_dir.join("guardrails").join("lightweight.md");
+    if gr_path.exists() {
+        skipped.push(".oh/guardrails/lightweight.md (exists)".into());
+    } else {
+        let mut fm = BTreeMap::new();
+        fm.insert("id".into(), serde_yaml::Value::String("lightweight".into()));
+        fm.insert("severity".into(), serde_yaml::Value::String("hard".into()));
+        oh::write_artifact(
+            repo_root,
+            "guardrails",
+            "lightweight",
+            &fm,
+            "# Lightweight Adoption\n\nAdding an outcome is writing a markdown file, not configuring a system. If this harness is heavier than adding a section to CLAUDE.md, adoption will fail.",
+        )?;
+        created.push(".oh/guardrails/lightweight.md".into());
+    }
+
+    // Build result message
+    let mut msg = String::from("## .oh/ initialized\n\n");
+    if !created.is_empty() {
+        msg.push_str("### Created\n");
+        for f in &created {
+            msg.push_str(&format!("- `{}`\n", f));
+        }
+    }
+    if !skipped.is_empty() {
+        msg.push_str("\n### Skipped\n");
+        for f in &skipped {
+            msg.push_str(&format!("- `{}`\n", f));
+        }
+    }
+    msg.push_str(&format!(
+        "\n### Next steps\n1. Edit `.oh/outcomes/{}.md` — describe your outcome\n2. Edit `.oh/signals/{}.md` — define how to measure progress\n3. Add `files:` patterns to the outcome frontmatter\n4. Start tagging commits with `[outcome:{}]`\n",
+        slug, signal_slug, slug
+    ));
+    Ok(msg)
+}
+
+fn detect_project_name(repo_root: &Path) -> Option<String> {
+    // Try Cargo.toml name field
+    let cargo_path = repo_root.join("Cargo.toml");
+    if cargo_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&cargo_path) {
+            for line in content.lines() {
+                if let Some(name) = line.strip_prefix("name") {
+                    let name = name.trim().trim_start_matches('=').trim().trim_matches('"');
+                    if !name.is_empty() {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    // Try package.json name field
+    let pkg_path = repo_root.join("package.json");
+    if pkg_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&pkg_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    // Try directory name
+    repo_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
 }
 
 fn ok_markdown(result: Result<String, anyhow::Error>) -> Result<CallToolResult, CallToolError> {
