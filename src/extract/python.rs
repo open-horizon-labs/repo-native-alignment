@@ -11,6 +11,7 @@ use crate::graph::{
     Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
 };
 
+use super::string_literals::harvest_string_literals;
 use super::{ExtractionResult, Extractor};
 
 /// Python tree-sitter extractor.
@@ -43,6 +44,18 @@ impl Extractor for PythonExtractor {
         let source = content.as_bytes();
 
         collect_nodes(tree.root_node(), path, source, &mut nodes, &mut edges);
+
+        // Harvest string literals as synthetic Const nodes
+        // Python: "string" node, strip quotes from raw text
+        harvest_string_literals(
+            tree.root_node(),
+            path,
+            source,
+            "python",
+            "string",
+            None,
+            &mut nodes,
+        );
 
         Ok(ExtractionResult { nodes, edges })
     }
@@ -330,11 +343,13 @@ CamelCase = "also not a constant"
 "#;
         let result = extractor.extract(Path::new("config.py"), code).unwrap();
         let consts: Vec<_> = result.nodes.iter().filter(|n| n.id.kind == NodeKind::Const).collect();
-        assert_eq!(consts.len(), 2, "Should find 2 ALL_CAPS constants");
-        let names: Vec<&str> = consts.iter().map(|n| n.id.name.as_str()).collect();
+        // 2 declared ALL_CAPS consts + synthetic string literals from string values in the code
+        let declared: Vec<_> = consts.iter().filter(|n| n.metadata.get("synthetic").map(|s| s.as_str()) == Some("false")).collect();
+        assert_eq!(declared.len(), 2, "Should find 2 declared ALL_CAPS constants");
+        let names: Vec<&str> = declared.iter().map(|n| n.id.name.as_str()).collect();
         assert!(names.contains(&"MAX_RETRIES"), "Should find MAX_RETRIES");
         assert!(names.contains(&"API_URL"), "Should find API_URL");
-        let max_retries = consts.iter().find(|n| n.id.name == "MAX_RETRIES").unwrap();
+        let max_retries = declared.iter().find(|n| n.id.name == "MAX_RETRIES").unwrap();
         assert_eq!(max_retries.metadata.get("value").map(|s| s.as_str()), Some("5"));
         assert_eq!(max_retries.metadata.get("synthetic").map(|s| s.as_str()), Some("false"));
     }

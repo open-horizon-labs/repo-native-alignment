@@ -9,6 +9,7 @@ use anyhow::Result;
 
 use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
 
+use super::string_literals::harvest_string_literals;
 use super::{ExtractionResult, Extractor};
 
 pub struct ZigExtractor;
@@ -39,6 +40,17 @@ impl Extractor for ZigExtractor {
         let source = content.as_bytes();
 
         collect_nodes(tree.root_node(), path, source, &mut nodes);
+
+        // Harvest string literals as synthetic Const nodes
+        harvest_string_literals(
+            tree.root_node(),
+            path,
+            source,
+            "zig",
+            "string_literal",
+            None,
+            &mut nodes,
+        );
 
         Ok(ExtractionResult { nodes, edges: Vec::new() })
     }

@@ -13,6 +13,7 @@ use crate::graph::{
     Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
 };
 
+use super::string_literals::harvest_string_literals;
 use super::{ExtractionResult, Extractor};
 
 /// Rust tree-sitter extractor with topology pattern detection.
@@ -57,6 +58,18 @@ impl Extractor for RustExtractor {
 
         // Topology pattern detection
         detect_topology_patterns(tree.root_node(), path, source, &mut edges);
+
+        // Harvest string literals as synthetic Const nodes
+        // Rust: string_literal node, value lives in string_content child
+        harvest_string_literals(
+            tree.root_node(),
+            path,
+            source,
+            "rust",
+            "string_literal",
+            Some("string_content"),
+            &mut nodes,
+        );
 
         Ok(ExtractionResult { nodes, edges })
     }
@@ -391,14 +404,23 @@ pub const CONTENT_TYPE: &str = "application/json";
 "#;
         let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
         let consts: Vec<_> = result.nodes.iter().filter(|n| n.id.kind == NodeKind::Const).collect();
-        assert_eq!(consts.len(), 2, "Should find 2 const nodes");
+        // 2 declared consts + 1 synthetic string literal ("application/json" len > 3)
+        assert!(consts.len() >= 2, "Should find at least 2 const nodes");
 
-        let max_retries = consts.iter().find(|n| n.id.name == "MAX_RETRIES").expect("Should find MAX_RETRIES");
+        let declared: Vec<_> = consts.iter().filter(|n| n.metadata.get("synthetic").map(|s| s.as_str()) == Some("false")).collect();
+        assert_eq!(declared.len(), 2, "Should find exactly 2 declared (non-synthetic) const nodes");
+
+        let max_retries = declared.iter().find(|n| n.id.name == "MAX_RETRIES").expect("Should find MAX_RETRIES");
         assert_eq!(max_retries.metadata.get("value").map(|s| s.as_str()), Some("5"), "Should extract value 5");
         assert_eq!(max_retries.metadata.get("synthetic").map(|s| s.as_str()), Some("false"));
 
-        let content_type = consts.iter().find(|n| n.id.name == "CONTENT_TYPE").expect("Should find CONTENT_TYPE");
+        let content_type = declared.iter().find(|n| n.id.name == "CONTENT_TYPE").expect("Should find CONTENT_TYPE");
         assert!(content_type.metadata.get("value").is_some(), "Should extract string value");
+
+        // The string literal value should also be captured as a synthetic Const
+        let synthetic: Vec<_> = consts.iter().filter(|n| n.metadata.get("synthetic").map(|s| s.as_str()) == Some("true")).collect();
+        assert!(!synthetic.is_empty(), "Should capture at least 1 synthetic string literal");
+        assert!(synthetic.iter().any(|n| n.id.name == "application/json"), "Should capture 'application/json'");
     }
 
     #[test]

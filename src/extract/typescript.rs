@@ -12,6 +12,7 @@ use crate::graph::{
     Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
 };
 
+use super::string_literals::harvest_string_literals;
 use super::{ExtractionResult, Extractor};
 
 /// TypeScript tree-sitter extractor (handles .ts and .tsx files).
@@ -45,6 +46,17 @@ impl Extractor for TypeScriptExtractor {
         let source = content.as_bytes();
 
         collect_nodes(tree.root_node(), path, source, &mut nodes, &mut edges);
+
+        // Harvest string literals as synthetic Const nodes
+        harvest_string_literals(
+            tree.root_node(),
+            path,
+            source,
+            "typescript",
+            "string",
+            Some("string_fragment"),
+            &mut nodes,
+        );
 
         Ok(ExtractionResult { nodes, edges })
     }

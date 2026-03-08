@@ -9,6 +9,7 @@ use anyhow::Result;
 
 use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
 
+use super::string_literals::harvest_string_literals;
 use super::{ExtractionResult, Extractor};
 
 pub struct RubyExtractor;
@@ -39,6 +40,20 @@ impl Extractor for RubyExtractor {
         let source = content.as_bytes();
 
         collect_nodes(tree.root_node(), path, source, None, &mut nodes);
+
+        // Harvest string literals as synthetic Const nodes.
+        // Use "string" as the outer node kind and "string_content" as the content child
+        // so that harvest_rec's non-recursion guard fires on the outer "string" node,
+        // consistent with Kotlin/Rust/C++ patterns.
+        harvest_string_literals(
+            tree.root_node(),
+            path,
+            source,
+            "ruby",
+            "string",
+            Some("string_content"),
+            &mut nodes,
+        );
 
         Ok(ExtractionResult { nodes, edges: Vec::new() })
     }

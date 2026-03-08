@@ -11,6 +11,7 @@ use crate::graph::{
     Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
 };
 
+use super::string_literals::harvest_string_literals;
 use super::{ExtractionResult, Extractor};
 
 pub struct JavaScriptExtractor;
@@ -42,6 +43,17 @@ impl Extractor for JavaScriptExtractor {
         let source = content.as_bytes();
 
         collect_nodes(tree.root_node(), path, source, None, &mut nodes, &mut edges);
+
+        // Harvest string literals as synthetic Const nodes
+        harvest_string_literals(
+            tree.root_node(),
+            path,
+            source,
+            "javascript",
+            "string",
+            Some("string_fragment"),
+            &mut nodes,
+        );
 
         Ok(ExtractionResult { nodes, edges })
     }
