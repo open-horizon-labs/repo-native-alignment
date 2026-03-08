@@ -103,7 +103,7 @@ The repo-local intelligence layer. Scans your repo, extracts a multi-language co
 | **Scaffold** | `oh_init` — initialize .oh/ directory from project context |
 | **Code** | `search_symbols` — multi-language symbol search with graph edges |
 | **Graph** | `graph_query` — traverse neighbors, impact analysis, reachability |
-| **History** | `git_history` — search commits or view file change history |
+| **History** | `oh_search_context` returns commit hash — use `git show <hash>` via Bash for diffs |
 | **Join** | `outcome_progress` — structural join: outcome → commits → symbols → PRs |
 | **Workspace** | `list_roots` — show configured workspace roots |
 

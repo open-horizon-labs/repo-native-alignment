@@ -662,7 +662,7 @@ const MCP_GUIDANCE_BLOCK: &str = r#"
 | `Read` to find .oh/ artifacts | `oh_search_context(query)` |
 | `Bash` with `grep -rn` | `search_symbols` or `oh_search_context` |
 | Recording learnings/signals | `oh_record(type, slug, ...)` |
-| Searching git history | `git_history(query)` or `git_history(file)` |
+| Searching git history | `oh_search_context(query)` — returns hash; use `git show <hash>` via Bash for diffs |
 <!-- end RNA MCP tool guidance -->
 "#;
 

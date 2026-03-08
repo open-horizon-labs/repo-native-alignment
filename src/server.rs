@@ -172,23 +172,6 @@ fn default_graph_mode() -> String {
 }
 
 #[macros::mcp_tool(
-    name = "git_history",
-    description = "Use this INSTEAD OF Bash git commands. Search commits by message query, or view file change history. Provide 'query' to search commit messages, or 'file' to get file history."
-)]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct GitHistory {
-    /// Search query (matched against commit messages)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub query: Option<String>,
-    /// File path to get history for (alternative to query search)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file: Option<String>,
-    /// Maximum number of results to return (default: 20 for file, 50 for query)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u64>,
-}
-
-#[macros::mcp_tool(
     name = "list_roots",
     description = "Lists configured workspace roots with their type, path, and scan status."
 )]
@@ -921,16 +904,26 @@ impl RnaHandler {
         }
 
         // 8. Embed all nodes as part of the graph pipeline
+        // Probe first — if a persisted table already exists, reuse it (fast path).
+        // The background scanner handles incremental updates.
         let embed_index = match EmbeddingIndex::new(&self.repo_root).await {
             Ok(idx) => {
-                match idx.index_all_with_symbols(&self.repo_root, &all_nodes).await {
-                    Ok(count) => {
-                        tracing::info!("Embedded {} items ({} symbols)", count, all_nodes.len());
+                match idx.search("_probe_", None, 1).await {
+                    Ok(_) => {
+                        tracing::info!("Reusing persisted embedding index (skipping rebuild)");
                         Some(idx)
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to embed: {}", e);
-                        None
+                    Err(_) => {
+                        match idx.index_all_with_symbols(&self.repo_root, &all_nodes).await {
+                            Ok(count) => {
+                                tracing::info!("Embedded {} items ({} symbols)", count, all_nodes.len());
+                                Some(idx)
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to embed: {}", e);
+                                None
+                            }
+                        }
                     }
                 }
             }
@@ -1108,7 +1101,6 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 OutcomeProgress::tool(),
                 SearchSymbols::tool(),
                 GraphQuery::tool(),
-                GitHistory::tool(),
                 ListRoots::tool(),
             ],
             meta: None,
@@ -1156,7 +1148,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 let commit_count = git::load_commits(root, 10)
                     .map(|c| c.len())
                     .unwrap_or(0);
-                md.push_str(&format!("_Recent commits: {}. Use `git_history` for details._\n", commit_count));
+                md.push_str(&format!("_Recent commits: {}. Use `oh_search_context` for semantic search; `git show <hash>` via Bash for diffs._\n", commit_count));
                 md.push_str("_Use `search_symbols` for code, `oh_search_context` for semantic search._\n");
 
                 Ok(text_result(md))
@@ -1645,69 +1637,6 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         }
                     }
                     Err(e) => Ok(text_result(format!("Graph error: {}", e))),
-                }
-            }
-
-            "git_history" => {
-                let args: GitHistory = parse_args(params.arguments)?;
-                if let Some(ref file_path_str) = args.file {
-                    // File history mode
-                    let max = args.limit.unwrap_or(20) as usize;
-                    let file_path = Path::new(file_path_str);
-                    if file_path.is_absolute() || file_path_str.contains("..") {
-                        return Ok(text_result("Error: path must be relative and cannot contain '..'".to_string()));
-                    }
-                    match git::file_history(root, file_path, max) {
-                        Ok(commits) => {
-                            if commits.is_empty() {
-                                Ok(text_result(format!(
-                                    "No commits found for `{}`.",
-                                    file_path_str
-                                )))
-                            } else {
-                                let md = commits
-                                    .iter()
-                                    .map(|c| c.to_markdown())
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                Ok(text_result(format!(
-                                    "## File history: `{}`\n\n{} commit(s)\n\n{}",
-                                    file_path_str,
-                                    commits.len(),
-                                    md
-                                )))
-                            }
-                        }
-                        Err(e) => Ok(text_result(format!("Error: {}", e))),
-                    }
-                } else if let Some(ref query) = args.query {
-                    // Commit search mode
-                    let max = args.limit.unwrap_or(50) as usize;
-                    match git::search_commits(root, query, max) {
-                        Ok(commits) => {
-                            if commits.is_empty() {
-                                Ok(text_result(format!(
-                                    "No commits matching \"{}\".",
-                                    query
-                                )))
-                            } else {
-                                let md = commits
-                                    .iter()
-                                    .map(|c| c.to_markdown())
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                Ok(text_result(format!(
-                                    "## Commit search: \"{}\"\n\n{} result(s)\n\n{}",
-                                    query,
-                                    commits.len(),
-                                    md
-                                )))
-                            }
-                        }
-                        Err(e) => Ok(text_result(format!("Error: {}", e))),
-                    }
-                } else {
-                    Ok(text_result("Provide either 'query' (to search commit messages) or 'file' (to view file history).".to_string()))
                 }
             }
 
