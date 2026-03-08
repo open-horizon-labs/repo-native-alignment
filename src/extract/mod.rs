@@ -8,21 +8,28 @@
 //! for fine-grained checks. Multiple extractors can handle the same file.
 
 pub mod bash;
+pub mod cpp;
+pub mod csharp;
 pub mod go;
 pub mod hcl;
 pub mod java;
 pub mod javascript;
 pub mod json_extractor;
+pub mod kotlin;
 pub mod lsp;
+pub mod lua;
 pub mod markdown;
 pub mod openapi;
 pub mod proto;
 pub mod python;
+pub mod ruby;
 pub mod rust;
 pub mod sql;
+pub mod swift;
 pub mod toml_extractor;
 pub mod typescript;
 pub mod yaml_extractor;
+pub mod zig;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -149,6 +156,13 @@ impl ExtractorRegistry {
         registry.register(Box::new(go::GoExtractor::new()));
         registry.register(Box::new(java::JavaExtractor::new()));
         registry.register(Box::new(bash::BashExtractor::new()));
+        registry.register(Box::new(ruby::RubyExtractor::new()));
+        registry.register(Box::new(cpp::CppExtractor::new()));
+        registry.register(Box::new(csharp::CSharpExtractor::new()));
+        registry.register(Box::new(kotlin::KotlinExtractor::new()));
+        registry.register(Box::new(zig::ZigExtractor::new()));
+        registry.register(Box::new(lua::LuaExtractor::new()));
+        registry.register(Box::new(swift::SwiftExtractor::new()));
         // Infrastructure / config
         registry.register(Box::new(hcl::HclExtractor::new()));
         registry.register(Box::new(json_extractor::JsonExtractor::new()));
@@ -463,7 +477,7 @@ mod tests {
     #[test]
     fn test_registry_with_builtins_has_extractors() {
         let registry = ExtractorRegistry::with_builtins();
-        assert_eq!(registry.len(), 8); // rust, python, typescript, go, markdown, proto, sql, openapi
+        assert_eq!(registry.len(), 22); // rust, python, typescript, javascript, go, java, bash, ruby, cpp, csharp, kotlin, zig, lua, swift, hcl, json, toml, yaml, markdown, proto, sql, openapi
     }
 
     #[test]
