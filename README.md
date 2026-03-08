@@ -133,11 +133,11 @@ All 22 extractors index constants and literal values. `search_symbols` returns t
 - const MAX_RETRIES (go) config.go:8         Value: `5`
 ```
 
-Named constants (`synthetic: false`) are declared identifiers — `const MAX_RETRIES = 5`, static final fields, ALL_CAPS module-level assignments, etc.
+Named constants are declared identifiers — `const MAX_RETRIES = 5`, static final fields, ALL_CAPS module-level assignments, etc.
 
-Synthetic constants (`synthetic: true`) are inferred from structure — YAML/TOML/JSON top-level scalar values, OpenAPI enum values, and single-token string literals (e.g. `"application/json"`, `"GET"`) found in function bodies. They appear with a `*(literal)*` badge.
+Synthetic constants are inferred from structure — YAML/TOML/JSON top-level scalar values, OpenAPI enum values, and single-token string literals (e.g. `"application/json"`, `"GET"`) found in function bodies. They appear with a `*(literal)*` badge.
 
-Filter by kind in `search_symbols`: pass `synthetic: false` to see only declared constants, `synthetic: true` for inferred literals, or omit for both.
+`search_symbols` accepts a `synthetic` filter to narrow results to declared constants, inferred literals, or both.
 
 Language mapping:
 - **Rust** — `const_item` with extracted value
@@ -190,7 +190,7 @@ Plus 31 more: Ruby (solargraph), Java (jdtls), Kotlin, Lua, Zig, Elixir, Haskell
 - Rescans in <1s — only changed files re-extracted and upserted (O(changed files) end-to-end, including LanceDB)
 - Event-driven reindex — triggers immediately on `git pull`, `git merge`, or branch checkout; 15-minute heartbeat is the fallback, not the trigger
 - Git worktrees indexed automatically — agents running parallel branches see their own in-progress symbols, not the stale main-branch index
-- Schema versioning — `SCHEMA_VERSION` constant in `store.rs`; bump it when schemas change and the cache auto-drops and rebuilds on next startup
+- Self-healing cache — schema changes trigger automatic rebuild; no manual cache deletion needed
 - Configurable excludes via `.oh/config.toml`
 
 ## Companion Systems
@@ -273,8 +273,7 @@ No cloud dependency. Everything local, git-versioned, disposable.
 - `outcome_progress` joins outcomes → commits → symbols → PRs structurally
 - `graph_query(mode: "impact")` traces blast radius across your codebase and into external packages
 - `search_symbols` returns results from active git worktrees — parallel agents see their own changes
-- `search_symbols(synthetic: false)` for declared constants; `synthetic: true` for inferred literals
-- Cross-language constant + literal search — find `MAX_RETRIES = 5` in Rust, Python, Go, YAML in one query
+- Cross-language constant + literal search — find `MAX_RETRIES = 5` in Rust, Python, Go, YAML in one query; filter by declared vs inferred
 - Semantic search over code, docs, and business artifacts — no API key, runs locally
 - `rna test --repo .` verifies the full pipeline (22+ checks) in one command
 - Index persists between sessions — restarts in <1s, auto-rebuilds on schema change
