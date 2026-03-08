@@ -499,12 +499,74 @@ pub(crate) async fn persist_graph_to_lance(
             .context("Failed to create edges table")?;
     }
 
+    // Create FTS index on symbols table for keyword search over all nodes
+    // (fields, imports, keys, consts that don't get vector embeddings)
+    if let Ok(symbols_table) = db.open_table("symbols").execute().await {
+        match symbols_table
+            .create_index(&["name", "signature"], lancedb::index::Index::FTS(Default::default()))
+            .execute()
+            .await
+        {
+            Ok(_) => tracing::info!("Created FTS index on symbols table"),
+            Err(e) => tracing::warn!("Failed to create FTS index: {}", e),
+        }
+    }
+
     tracing::info!(
         "Persisted graph to LanceDB: {} nodes, {} edges",
         nodes.len(),
         edges.len()
     );
     Ok(())
+}
+
+/// Full-text search over the symbols table in LanceDB.
+/// Complements vector search by covering nodes that don't have embeddings
+/// (fields, imports, consts, json/yaml keys).
+pub async fn fts_search_symbols(
+    repo_root: &Path,
+    query: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<(String, String, String, String)>> {
+    let db_path = graph_lance_path(repo_root);
+    let db = lancedb::connect(db_path.to_str().unwrap())
+        .execute()
+        .await?;
+    let table = db.open_table("symbols").execute().await?;
+
+    use lancedb::index::scalar::FullTextSearchQuery;
+    use lancedb::query::{ExecutableQuery, QueryBase};
+    let fts_query = FullTextSearchQuery::new(query.to_string());
+    let results = table
+        .query()
+        .full_text_search(fts_query)
+        .select(lancedb::query::Select::columns(&["id", "name", "kind", "signature", "file_path"]))
+        .limit(limit)
+        .execute()
+        .await?;
+
+    use futures::TryStreamExt;
+    let batches: Vec<RecordBatch> = results.try_collect().await?;
+
+    let mut hits = Vec::new();
+    for batch in &batches {
+        let ids = batch.column_by_name("id").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        let names = batch.column_by_name("name").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        let kinds = batch.column_by_name("kind").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        let sigs = batch.column_by_name("signature").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        for i in 0..batch.num_rows() {
+            hits.push((
+                ids.value(i).to_string(),
+                names.value(i).to_string(),
+                kinds.value(i).to_string(),
+                sigs.value(i).to_string(),
+            ));
+            if hits.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(hits)
 }
 
 /// Persist graph changes incrementally using LanceDB merge_insert (upsert) and targeted delete.
@@ -2006,6 +2068,26 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         }
                     }
                     Err(e) => sections.push(format!("Index error: {}", e)),
+                }
+
+                // FTS search on symbols table (covers fields, imports, keys — nodes without vectors)
+                match fts_search_symbols(root, &args.query, limit).await {
+                    Ok(fts_hits) if !fts_hits.is_empty() => {
+                        let md: String = fts_hits
+                            .iter()
+                            .map(|(id, name, kind, sig)| {
+                                format!("- **{}** ({}) — `{}`\n  ID: `{}`\n", name, kind, sig, id)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        sections.push(format!(
+                            "### Full-text matches ({} result(s))\n\n{}",
+                            fts_hits.len(),
+                            md
+                        ));
+                    }
+                    Ok(_) => {} // no FTS hits
+                    Err(e) => tracing::debug!("FTS search unavailable: {}", e),
                 }
 
                 // Optionally search code symbols

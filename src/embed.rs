@@ -12,9 +12,9 @@ use crate::git;
 use crate::oh;
 
 /// Number of recent commits to embed for temporal context.
-const RECENT_COMMIT_LIMIT: usize = 500;
+const RECENT_COMMIT_LIMIT: usize = 100;
 /// Number of PR merge commits to embed for structural context.
-const PR_MERGE_LIMIT: usize = 250;
+const PR_MERGE_LIMIT: usize = 50;
 
 /// Truncate `s` to at most `max_chars` Unicode scalar values, returning a
 /// valid UTF-8 slice. Safe even when a multibyte character straddles the
@@ -345,6 +345,24 @@ fn build_batch(
     Ok((batch, schema))
 }
 
+/// Should this node get a vector embedding? Semantic-tier nodes get vectors;
+/// navigational nodes (fields, imports, keys, consts) are covered by FTS on the
+/// symbols table instead.
+fn should_embed(node: &crate::graph::Node) -> bool {
+    use crate::graph::NodeKind;
+    match &node.id.kind {
+        NodeKind::Function | NodeKind::Struct | NodeKind::Trait |
+        NodeKind::Enum | NodeKind::Module => true,
+        NodeKind::Other(s) => matches!(s.as_str(),
+            "markdown_section" | "PrMerge" |
+            "k8s_deployment" | "k8s_service" | "k8s_configmap" |
+            "sql_table" | "api_endpoint" | "proto_message"
+        ),
+        // Field, Import, Const, Impl — searchable via FTS, not worth a vector
+        _ => false,
+    }
+}
+
 /// Dedup synthetic string literal nodes by value for embedding.
 /// Returns deduped nodes with locations metadata. Graph keeps per-file nodes.
 fn dedup_synthetic_consts(symbols: &[crate::graph::Node]) -> (Vec<crate::graph::Node>, Vec<crate::graph::Node>) {
@@ -667,8 +685,15 @@ impl EmbeddingIndex {
             }
         }
 
+        // Filter to semantic-tier nodes only; navigational nodes use FTS on symbols table
+        let embeddable: Vec<_> = symbols.iter()
+            .filter(|n| should_embed(n))
+            .cloned()
+            .collect();
+        let skipped_count = symbols.len() - embeddable.len();
+
         // Dedup synthetic string literal nodes by value before embedding
-        let (real_symbols, deduped_strings) = dedup_synthetic_consts(symbols);
+        let (real_symbols, deduped_strings) = dedup_synthetic_consts(&embeddable);
 
         // Index real code symbols and markdown sections
         for node in real_symbols.iter().chain(deduped_strings.iter()) {
@@ -719,13 +744,14 @@ impl EmbeddingIndex {
         let deduped_string_count = deduped_strings.len();
 
         tracing::info!(
-            "Embedding pipeline: {} items ({} artifacts, {} commits, {} merges, {} symbols, {} deduped strings)",
+            "Embedding pipeline: {} items ({} artifacts, {} commits, {} merges, {} symbols, {} deduped strings; {} skipped → FTS)",
             count,
             artifacts.len(),
             std::cmp::min(RECENT_COMMIT_LIMIT, count),
             seen_merge_shas.len(),
             real_symbols.len(),
             deduped_string_count,
+            skipped_count,
         );
 
         // Compute embeddings via cache
