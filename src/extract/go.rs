@@ -56,6 +56,16 @@ impl Extractor for GoExtractor {
             None,
             &mut nodes,
         );
+        // Also harvest Go backtick raw string literals
+        harvest_string_literals(
+            tree.root_node(),
+            path,
+            source,
+            "go",
+            "raw_string_literal",
+            None,
+            &mut nodes,
+        );
 
         Ok(ExtractionResult { nodes, edges })
     }

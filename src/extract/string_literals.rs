@@ -21,8 +21,9 @@ use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
 /// - Stripped value length must be > 3 (avoids short noise like "ok", "no").
 /// - Whitespace-only values are skipped.
 ///
-/// Deduplication: same `(value, line_start)` pair within a single file is deduplicated
-/// (exact duplicate at same site). Cross-file duplicates are intentional signal.
+/// Deduplication: same `value` within a single file is deduplicated (at most one node per
+/// unique string value per file, using the first occurrence's line number).
+/// Cross-file duplicates are intentional signal.
 ///
 /// # Arguments
 /// * `root` — root node of the parsed AST
@@ -42,7 +43,7 @@ pub fn harvest_string_literals(
     content_child: Option<&str>,
     nodes: &mut Vec<Node>,
 ) {
-    let mut seen: HashSet<(String, usize)> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
     harvest_rec(
         root,
         path,
@@ -63,7 +64,7 @@ fn harvest_rec(
     string_node_kind: &str,
     content_child: Option<&str>,
     nodes: &mut Vec<Node>,
-    seen: &mut HashSet<(String, usize)>,
+    seen: &mut HashSet<String>,
 ) {
     if node.kind() == string_node_kind {
         let raw = node.utf8_text(source).unwrap_or("").trim().to_string();
@@ -92,9 +93,8 @@ fn harvest_rec(
         // Filter: len > 3 and not whitespace-only
         if value.len() > 3 && !value.trim().is_empty() {
             let line_start = node.start_position().row + 1;
-            let key = (value.clone(), line_start);
-            if !seen.contains(&key) {
-                seen.insert(key);
+            if !seen.contains(&value) {
+                seen.insert(value.clone());
                 let mut metadata = BTreeMap::new();
                 metadata.insert("value".to_string(), value.clone());
                 metadata.insert("synthetic".to_string(), "true".to_string());
@@ -137,12 +137,19 @@ fn harvest_rec(
 }
 
 /// Strip surrounding quote characters from a raw string literal text.
-/// Handles: `"..."`, `'...'`, `` `...` ``, and Lua long-bracket `[[...]]`.
+/// Handles: triple-quoted `"""..."""`, `'''...'''`, ` ```...``` `, `"..."`, `'...'`,
+/// `` `...` ``, and Lua long-bracket `[[...]]`.
 pub fn strip_string_quotes(raw: &str) -> String {
     let s = raw.trim();
     // Lua long-bracket strings: [[...]]
     if s.starts_with("[[") && s.ends_with("]]") {
         return s[2..s.len() - 2].to_string();
+    }
+    // Triple-quoted strings: check before single-character variants
+    for triple in &[r#"""""#, "'''", "```"] {
+        if s.starts_with(triple) && s.ends_with(triple) && s.len() > triple.len() * 2 {
+            return s[triple.len()..s.len() - triple.len()].to_string();
+        }
     }
     if s.len() >= 2 {
         let first = s.chars().next().unwrap();
@@ -183,5 +190,26 @@ mod tests {
     #[test]
     fn test_strip_string_quotes_no_quotes() {
         assert_eq!(strip_string_quotes("hello"), "hello");
+    }
+
+    #[test]
+    fn test_strip_string_quotes_triple_double() {
+        assert_eq!(strip_string_quotes(r#""""hello world""""#), "hello world");
+    }
+
+    #[test]
+    fn test_strip_string_quotes_triple_single() {
+        assert_eq!(strip_string_quotes("'''hello world'''"), "hello world");
+    }
+
+    #[test]
+    fn test_strip_string_quotes_triple_backtick() {
+        assert_eq!(strip_string_quotes("```hello world```"), "hello world");
+    }
+
+    #[test]
+    fn test_strip_string_quotes_triple_does_not_mangle_double() {
+        // A plain "x" should not be affected by triple logic
+        assert_eq!(strip_string_quotes(r#""hello""#), "hello");
     }
 }

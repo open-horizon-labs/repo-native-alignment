@@ -41,7 +41,9 @@ impl Extractor for BashExtractor {
 
         collect_nodes(tree.root_node(), path, source, &mut nodes);
 
-        // Harvest string literals as synthetic Const nodes
+        // Harvest string literals as synthetic Const nodes.
+        // Collect into a temporary vec so we can filter out interpolated strings.
+        let mut string_nodes = Vec::new();
         harvest_string_literals(
             tree.root_node(),
             path,
@@ -49,8 +51,15 @@ impl Extractor for BashExtractor {
             "bash",
             "string",
             None,
-            &mut nodes,
+            &mut string_nodes,
         );
+        // Filter: skip interpolated strings (stripped value contains `$`)
+        for n in string_nodes {
+            if n.id.name.contains('$') {
+                continue;
+            }
+            nodes.push(n);
+        }
 
         Ok(ExtractionResult { nodes, edges: Vec::new() })
     }

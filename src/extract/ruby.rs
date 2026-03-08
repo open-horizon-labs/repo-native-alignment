@@ -41,14 +41,17 @@ impl Extractor for RubyExtractor {
 
         collect_nodes(tree.root_node(), path, source, None, &mut nodes);
 
-        // Harvest string literals as synthetic Const nodes
+        // Harvest string literals as synthetic Const nodes.
+        // Use "string" as the outer node kind and "string_content" as the content child
+        // so that harvest_rec's non-recursion guard fires on the outer "string" node,
+        // consistent with Kotlin/Rust/C++ patterns.
         harvest_string_literals(
             tree.root_node(),
             path,
             source,
             "ruby",
-            "string_content",
-            None,
+            "string",
+            Some("string_content"),
             &mut nodes,
         );
 
