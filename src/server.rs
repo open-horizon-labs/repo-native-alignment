@@ -1535,6 +1535,10 @@ impl RnaHandler {
             tracing::warn!("Failed to persist graph to LanceDB: {}", e);
         }
 
+        // Mark symbols-ready here — before embeddings. Agents can query search_symbols
+        // immediately. Embeddings are background infrastructure; freshness reflects symbols.
+        let symbols_ready_at = std::time::Instant::now();
+
         // 8. Embed all nodes as part of the graph pipeline.
         // Virtual external nodes (root == "external") have no body and must NOT be embedded.
         // Probe first — if a persisted table already exists, reuse it (fast path).
@@ -1575,7 +1579,7 @@ impl RnaHandler {
             edges: all_edges,
             index,
             embed_index,
-            last_scan_completed_at: Some(std::time::Instant::now()),
+            last_scan_completed_at: Some(symbols_ready_at),
         })
     }
 

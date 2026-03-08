@@ -9,6 +9,7 @@
 
 pub mod bash;
 pub mod cpp;
+pub mod generic;
 pub mod csharp;
 pub mod string_literals;
 pub mod go;

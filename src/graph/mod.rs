@@ -71,6 +71,8 @@ pub enum NodeKind {
     ProtoMessage,
     SqlTable,
     ApiEndpoint,
+    /// A struct/class/enum field or record member.
+    Field,
     /// A merged PR (branch merge to base branch). The natural unit of meaningful change.
     PrMerge,
     Other(String),
@@ -90,6 +92,7 @@ impl fmt::Display for NodeKind {
             NodeKind::ProtoMessage => write!(f, "proto_message"),
             NodeKind::SqlTable => write!(f, "sql_table"),
             NodeKind::ApiEndpoint => write!(f, "api_endpoint"),
+            NodeKind::Field => write!(f, "field"),
             NodeKind::PrMerge => write!(f, "pr_merge"),
             NodeKind::Other(s) => write!(f, "{}", s),
         }
