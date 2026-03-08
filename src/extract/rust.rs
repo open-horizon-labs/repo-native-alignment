@@ -86,6 +86,7 @@ fn ts_kind_to_node_kind(kind_str: &str) -> Option<NodeKind> {
         "const_item" => Some(NodeKind::Const),
         "mod_item" => Some(NodeKind::Module),
         "use_declaration" => Some(NodeKind::Import),
+        "field_declaration" => Some(NodeKind::Field),
         _ => None,
     }
 }
@@ -171,8 +172,9 @@ fn collect_nodes(
 
         nodes.push(graph_node);
 
-        // For impl blocks, recurse with the impl target as parent scope
-        if node_kind == NodeKind::Impl {
+        // Recurse into impl/struct/enum bodies with the type name as parent scope
+        // so fields and methods know which type they belong to.
+        if matches!(node_kind, NodeKind::Impl | NodeKind::Struct | NodeKind::Enum) {
             let scope = Some(name);
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i as u32) {
