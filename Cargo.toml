@@ -70,6 +70,9 @@ futures = "0.3"
 # LSP protocol types (for Phase 2 enrichment via language servers)
 lsp-types = "0.97"
 
+# Content-addressable embedding cache
+blake3 = "1"
+
 # Error handling
 anyhow = "1"
 
