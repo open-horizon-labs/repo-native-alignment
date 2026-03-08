@@ -34,7 +34,8 @@ jobs:
         run: cargo build --release
 
       - name: RNA pipeline smoke test (rna test)
-        run: cargo run --release -- test --repo .
+        run: ./target/release/repo-native-alignment test --repo .
+        timeout-minutes: 5
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
