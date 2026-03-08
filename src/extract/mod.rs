@@ -84,13 +84,17 @@ pub trait Extractor: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// The output of running an enricher on existing graph data.
-/// Enrichers add edges and patch node metadata — they don't create new nodes.
+/// Enrichers add edges, patch node metadata, and may synthesize virtual nodes
+/// for external (out-of-repo) symbols discovered via LSP.
 #[derive(Debug, Clone, Default)]
 pub struct EnrichmentResult {
     /// New edges discovered by the enricher (e.g., Calls, Implements).
     pub added_edges: Vec<Edge>,
     /// Metadata patches for existing nodes: (node_stable_id, key-value patches).
     pub updated_nodes: Vec<(String, BTreeMap<String, String>)>,
+    /// Virtual nodes synthesized for external symbols (e.g., tokio::spawn).
+    /// These have `root = "external"` and no body — they must NOT be embedded.
+    pub new_nodes: Vec<Node>,
 }
 
 /// Phase 2: Asynchronous enrichment after initial extraction.
@@ -380,13 +384,15 @@ impl EnricherRegistry {
             match enricher.enrich(nodes, index, repo_root).await {
                 Ok(enrichment) => {
                     tracing::info!(
-                        "Enricher {}: {} edges, {} node patches",
+                        "Enricher {}: {} edges, {} node patches, {} virtual nodes",
                         enricher.name(),
                         enrichment.added_edges.len(),
                         enrichment.updated_nodes.len(),
+                        enrichment.new_nodes.len(),
                     );
                     result.added_edges.extend(enrichment.added_edges);
                     result.updated_nodes.extend(enrichment.updated_nodes);
+                    result.new_nodes.extend(enrichment.new_nodes);
                 }
                 Err(e) => {
                     tracing::warn!("Enricher {} failed: {}", enricher.name(), e);

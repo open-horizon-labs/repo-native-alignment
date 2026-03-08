@@ -1010,6 +1010,19 @@ impl RnaHandler {
             .enrich_all(&all_nodes, &index, &languages, &self.repo_root)
             .await;
 
+        // Add virtual nodes synthesized for external symbols (e.g., tokio::spawn).
+        // These must be persisted in the symbols table but must NOT be embedded.
+        if !enrichment.new_nodes.is_empty() {
+            tracing::info!(
+                "Enrichment synthesized {} virtual external nodes",
+                enrichment.new_nodes.len()
+            );
+            for vnode in &enrichment.new_nodes {
+                index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
+            }
+            all_nodes.extend(enrichment.new_nodes);
+        }
+
         if !enrichment.added_edges.is_empty() {
             tracing::info!(
                 "Enrichment added {} edges",
@@ -1049,9 +1062,14 @@ impl RnaHandler {
             tracing::warn!("Failed to persist graph to LanceDB: {}", e);
         }
 
-        // 8. Embed all nodes as part of the graph pipeline
+        // 8. Embed all nodes as part of the graph pipeline.
+        // Virtual external nodes (root == "external") have no body and must NOT be embedded.
         // Probe first — if a persisted table already exists, reuse it (fast path).
         // The background scanner handles incremental updates.
+        let embeddable_nodes: Vec<Node> = all_nodes.iter()
+            .filter(|n| n.id.root != "external")
+            .cloned()
+            .collect();
         let embed_index = match EmbeddingIndex::new(&self.repo_root).await {
             Ok(idx) => {
                 match idx.search("_probe_", None, 1).await {
@@ -1060,7 +1078,7 @@ impl RnaHandler {
                         Some(idx)
                     }
                     Err(_) => {
-                        match idx.index_all_with_symbols(&self.repo_root, &all_nodes).await {
+                        match idx.index_all_with_symbols(&self.repo_root, &embeddable_nodes).await {
                             Ok(count) => {
                                 tracing::info!("Embedded {} items ({} symbols)", count, all_nodes.len());
                                 Some(idx)
@@ -1164,6 +1182,19 @@ impl RnaHandler {
             let enrichment = enricher_registry
                 .enrich_all(&changed_nodes, &graph.index, &languages, &self.repo_root)
                 .await;
+
+            // Add virtual nodes synthesized for external symbols.
+            // These must NOT be re-embedded (no body).
+            if !enrichment.new_nodes.is_empty() {
+                tracing::info!(
+                    "Incremental LSP enrichment synthesized {} virtual external nodes",
+                    enrichment.new_nodes.len()
+                );
+                for vnode in &enrichment.new_nodes {
+                    graph.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
+                }
+                graph.nodes.extend(enrichment.new_nodes);
+            }
 
             if !enrichment.added_edges.is_empty() {
                 tracing::info!(

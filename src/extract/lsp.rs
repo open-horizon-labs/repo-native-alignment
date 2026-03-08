@@ -790,6 +790,57 @@ impl Enricher for LspEnricher {
                                             };
 
                                             if callee_path.to_string_lossy().contains(".cargo") {
+                                                // External crate symbol — synthesize a virtual node.
+                                                // rust-analyzer populates call["to"]["detail"] with the
+                                                // fully-qualified path (e.g. "tokio::runtime::Runtime::new").
+                                                // Fall back to the bare name if detail is absent.
+                                                let fqn = call["to"]["detail"]
+                                                    .as_str()
+                                                    .filter(|s| !s.is_empty())
+                                                    .unwrap_or(callee_name);
+
+                                                if fqn.is_empty() {
+                                                    continue;
+                                                }
+
+                                                // Derive package from the first path segment of the FQN.
+                                                let package = fqn.split("::").next().unwrap_or(fqn).to_string();
+
+                                                let virtual_id = NodeId {
+                                                    root: "external".to_string(),
+                                                    file: PathBuf::new(),
+                                                    name: fqn.to_string(),
+                                                    kind: NodeKind::Function,
+                                                };
+
+                                                // Deduplicate: only add if not already synthesized this run.
+                                                if !result.new_nodes.iter().any(|n| n.id == virtual_id) {
+                                                    let mut meta = std::collections::BTreeMap::new();
+                                                    meta.insert("package".to_string(), package.clone());
+                                                    meta.insert("virtual".to_string(), "true".to_string());
+                                                    result.new_nodes.push(Node {
+                                                        id: virtual_id.clone(),
+                                                        language: self.language.clone(),
+                                                        line_start: 0,
+                                                        line_end: 0,
+                                                        signature: fqn.to_string(),
+                                                        body: String::new(), // no body — must not be embedded
+                                                        metadata: meta,
+                                                        source: ExtractionSource::Lsp,
+                                                    });
+                                                    tracing::debug!(
+                                                        "Synthesized virtual node: {} (package: {})",
+                                                        fqn, package
+                                                    );
+                                                }
+
+                                                result.added_edges.push(Edge {
+                                                    from: node.id.clone(),
+                                                    to: virtual_id,
+                                                    kind: EdgeKind::Calls,
+                                                    source: ExtractionSource::Lsp,
+                                                    confidence: Confidence::Detected,
+                                                });
                                                 continue;
                                             }
 
