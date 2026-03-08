@@ -231,7 +231,10 @@ fn parse_extraction_source(s: &str) -> ExtractionSource {
         "schema" => ExtractionSource::Schema,
         "git" => ExtractionSource::Git,
         "markdown" => ExtractionSource::Markdown,
-        _ => ExtractionSource::TreeSitter,
+        _ => {
+            tracing::warn!("Unknown edge_source value: {}, defaulting to TreeSitter", s);
+            ExtractionSource::TreeSitter
+        }
     }
 }
 
@@ -239,7 +242,10 @@ fn parse_extraction_source(s: &str) -> ExtractionSource {
 fn parse_confidence(s: &str) -> Confidence {
     match s {
         "confirmed" => Confidence::Confirmed,
-        _ => Confidence::Detected,
+        _ => {
+            tracing::warn!("Unknown confidence value: {}, defaulting to Detected", s);
+            Confidence::Detected
+        }
     }
 }
 
@@ -679,8 +685,10 @@ pub(crate) async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<Gr
             let target_ids = batch.column_by_name("target_id").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
             let target_types = batch.column_by_name("target_type").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
             let edge_types = batch.column_by_name("edge_type").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-            let edge_sources = batch.column_by_name("edge_source").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-            let edge_confidences = batch.column_by_name("edge_confidence").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let edge_sources = batch.column_by_name("edge_source")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let edge_confidences = batch.column_by_name("edge_confidence")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             let root_ids = batch.column_by_name("root_id").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
 
             for i in 0..batch.num_rows() {
@@ -689,8 +697,12 @@ pub(crate) async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<Gr
                     None => continue,
                 };
 
-                let extraction_source = parse_extraction_source(edge_sources.value(i));
-                let confidence = parse_confidence(edge_confidences.value(i));
+                let extraction_source = edge_sources
+                    .map(|a| parse_extraction_source(a.value(i)))
+                    .unwrap_or(ExtractionSource::TreeSitter);
+                let confidence = edge_confidences
+                    .map(|a| parse_confidence(a.value(i)))
+                    .unwrap_or(Confidence::Detected);
 
                 // Parse NodeId from stable_id format: "root:file:name:kind"
                 let from = parse_node_id_from_stable(source_ids.value(i), source_types.value(i), root_ids.value(i));
