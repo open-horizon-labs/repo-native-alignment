@@ -502,12 +502,13 @@ pub(crate) async fn persist_graph_to_lance(
     // Create FTS index on symbols table for keyword search over all nodes
     // (fields, imports, keys, consts that don't get vector embeddings)
     if let Ok(symbols_table) = db.open_table("symbols").execute().await {
+        // LanceDB doesn't support composite FTS indices yet — create on `name` only
         match symbols_table
-            .create_index(&["name", "signature"], lancedb::index::Index::FTS(Default::default()))
+            .create_index(&["name"], lancedb::index::Index::FTS(Default::default()))
             .execute()
             .await
         {
-            Ok(_) => tracing::info!("Created FTS index on symbols table"),
+            Ok(_) => tracing::info!("Created FTS index on symbols.name"),
             Err(e) => tracing::warn!("Failed to create FTS index: {}", e),
         }
     }
