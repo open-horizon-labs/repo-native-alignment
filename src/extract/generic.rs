@@ -50,6 +50,9 @@ pub struct LangConfig {
     /// If set, extract this field child's text as the `value` metadata key
     /// for nodes of kind `NodeKind::Const` (e.g. `"value"` for Rust const_item).
     pub const_value_field: Option<&'static str>,
+    /// Node kinds that use the full node text as their name (e.g. `use_declaration`
+    /// in Rust where the name IS the full `use crate::foo::Bar;` text).
+    pub full_text_name_kinds: &'static [&'static str],
     /// String literal tree-sitter node kinds for synthetic Const harvesting.
     /// Each entry: (outer_node_kind, optional_content_child_kind).
     pub string_literal_kinds: &'static [(&'static str, Option<&'static str>)],
@@ -141,14 +144,28 @@ fn collect_nodes(
     if let Some(node_kind) = config.node_kinds.iter().find_map(|(ts_kind, nk)| {
         if *ts_kind == kind_str { Some(nk.clone()) } else { None }
     }) {
-        // Extract name. Try "name" field first (function, struct, field, const…).
-        // Fall back to "type" field for impl blocks (Rust: `impl Foo` / `impl Trait for Foo`).
-        let name = node
-            .child_by_field_name("name")
-            .or_else(|| node.child_by_field_name("type"))
-            .and_then(|n| n.utf8_text(source).ok())
-            .unwrap_or("unknown")
-            .to_string();
+        // Extract name.
+        // 1. Full-text kinds (e.g. Rust use_declaration): use the whole node text.
+        // 2. Nodes with both "trait" and "type" fields (Rust impl): combine as "Trait for Type".
+        // 3. Default: "name" field child.
+        let name = if config.full_text_name_kinds.contains(&kind_str) {
+            node.utf8_text(source).unwrap_or("unknown").trim().to_string()
+        } else if node.child_by_field_name("trait").is_some() {
+            // Rust `impl Trait for Type` — combine to "Trait for Type".
+            let trait_name = node.child_by_field_name("trait")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("?");
+            let type_name = node.child_by_field_name("type")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("?");
+            format!("{} for {}", trait_name, type_name)
+        } else {
+            node.child_by_field_name("name")
+                .or_else(|| node.child_by_field_name("type"))
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("unknown")
+                .to_string()
+        };
 
         if name == "unknown" && node_kind != NodeKind::Import {
             // Skip truly unnamed nodes — recurse instead.
@@ -313,7 +330,8 @@ mod tests {
     #[test]
     fn test_rust_extractor_via_generic() {
         // Use the actual Rust config from rust.rs to test end-to-end.
-        use crate::extract::rust::RustExtractor;
+        use crate::extract::rust::{RustExtractor, RUST_CONFIG};
+        let _ = &RUST_CONFIG; // ensure config compiles
         let ext = RustExtractor::new();
         let code = r#"
 pub struct Foo {

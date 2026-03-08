@@ -34,6 +34,8 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
     ],
     scope_parent_kinds: &["impl_item", "struct_item", "enum_item"],
     const_value_field: Some("value"),
+    // use_declaration: the name IS the full `use crate::foo::Bar;` text.
+    full_text_name_kinds: &["use_declaration"],
     string_literal_kinds: &[
         ("string_literal", Some("string_content")),
     ],
