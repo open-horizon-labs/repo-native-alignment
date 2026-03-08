@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::Serialize;
 
+use petgraph::Direction;
+
 use crate::embed::EmbeddingIndex;
 use crate::extract::ExtractorRegistry;
 use crate::graph::index::GraphIndex;
@@ -20,7 +22,7 @@ use crate::oh;
 use crate::query;
 use crate::roots::WorkspaceConfig;
 use crate::scanner::Scanner;
-use crate::server::{graph_lance_path, persist_graph_incremental};
+use crate::server::{graph_lance_path, load_graph_from_lance, persist_graph_incremental, persist_graph_to_lance};
 
 // ── Args ────────────────────────────────────────────────────────────
 
@@ -242,6 +244,24 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
 
     // 13. LSP virtual external nodes round-trip through LanceDB
     checks.push(run_external_calls_check().await);
+
+    // 14. list_roots -- verifies WorkspaceConfig returns at least 1 root matching the test repo
+    checks.push(run_list_roots_check(&repo));
+
+    // 15. Worktree roots -- creates a real git worktree, checks with_worktrees() sees it
+    checks.push(run_worktree_roots_check(&repo).await);
+
+    // 16. Metadata round-trip -- persist node with metadata, reload, assert identical
+    checks.push(run_metadata_roundtrip_check().await);
+
+    // 17. search_symbols -- verifies function nodes and Const nodes are findable
+    checks.push(run_search_symbols_check(&all_nodes));
+
+    // 18. graph_query -- verifies GraphIndex has edges and neighbors() is callable
+    checks.push(run_graph_query_check(&index, &all_nodes));
+
+    // 19. oh_search_context (semantic) -- searches for "alignment" in embedding index
+    checks.push(run_oh_search_context_check(&embed_index).await);
 
     Ok(print_and_return(args, checks))
 }
