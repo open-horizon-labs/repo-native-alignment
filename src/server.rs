@@ -23,7 +23,7 @@ use crate::scanner::Scanner;
 use crate::types::OhArtifactKind;
 use crate::{code, git, markdown, oh, query};
 use petgraph::Direction;
-use tokio::sync::OnceCell;
+use tokio::sync::RwLock;
 
 // ── Tool input structs ──────────────────────────────────────────────
 
@@ -498,17 +498,27 @@ async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphState> {
         index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
     }
 
-    // Build embedding index for the cached graph
+    // Try to reuse existing embedding table from cache; only rebuild if empty/missing
     let embed_index = match EmbeddingIndex::new(repo_root).await {
         Ok(idx) => {
-            match idx.index_all_with_symbols(repo_root, &nodes).await {
-                Ok(count) => {
-                    tracing::info!("Embedded {} items from cached graph ({} symbols)", count, nodes.len());
+            // Probe the existing table -- if it has data, skip the expensive rebuild
+            match idx.search("_probe_", None, 1).await {
+                Ok(_) => {
+                    tracing::info!("Loaded existing embedding index from cache");
                     Some(idx)
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to embed cached graph: {}", e);
-                    None
+                Err(_) => {
+                    // Table empty or missing -- rebuild from cached graph nodes
+                    match idx.index_all_with_symbols(repo_root, &nodes).await {
+                        Ok(count) => {
+                            tracing::info!("Rebuilt embedding index: {} items from cached graph", count);
+                            Some(idx)
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to embed cached graph: {}", e);
+                            None
+                        }
+                    }
                 }
             }
         }
@@ -605,238 +615,361 @@ pub struct GraphState {
 
 pub struct RnaHandler {
     pub repo_root: PathBuf,
-    pub graph_index: OnceCell<GraphState>,
+    pub graph: RwLock<Option<GraphState>>,
     /// Whether business context has been injected into a tool response.
     pub context_injected: std::sync::atomic::AtomicBool,
+    /// Cooldown: skip re-scanning if checked recently.
+    pub last_scan: std::sync::Mutex<std::time::Instant>,
 }
 
 impl Default for RnaHandler {
     fn default() -> Self {
         Self {
             repo_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            graph_index: OnceCell::new(),
+            graph: RwLock::new(None),
             context_injected: std::sync::atomic::AtomicBool::new(false),
+            last_scan: std::sync::Mutex::new(
+                std::time::Instant::now() - std::time::Duration::from_secs(10),
+            ),
         }
     }
 }
 
 impl RnaHandler {
-    /// Get the embedding index from the graph state.
-    /// The graph pipeline builds embeddings as part of graph construction.
-    async fn get_index(&self) -> anyhow::Result<&EmbeddingIndex> {
-        let graph = self.get_graph().await?;
-        graph.embed_index.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Embedding index not available"))
+    /// Ensure graph is built, check for file changes since last scan.
+    /// Returns a read guard to the graph.
+    async fn get_graph(&self) -> anyhow::Result<tokio::sync::RwLockReadGuard<'_, Option<GraphState>>> {
+        // Fast path: graph exists and scan cooldown hasn't expired
+        {
+            let guard = self.graph.read().await;
+            if guard.is_some() {
+                let skip_scan = {
+                    let last = self.last_scan.lock().unwrap();
+                    last.elapsed() < std::time::Duration::from_secs(2)
+                };
+                if skip_scan {
+                    return Ok(guard);
+                }
+
+                // Check for changes via scanner
+                let mut scanner = Scanner::new(self.repo_root.clone())?;
+                let scan = scanner.scan()?;
+                if scan.changed_files.is_empty()
+                    && scan.new_files.is_empty()
+                    && scan.deleted_files.is_empty()
+                {
+                    // Update cooldown timestamp
+                    *self.last_scan.lock().unwrap() = std::time::Instant::now();
+                    return Ok(guard);
+                }
+                // Changes detected — need write lock
+                drop(guard);
+            } else {
+                drop(guard);
+            }
+        }
+
+        // Slow path: build or update graph
+        {
+            let mut guard = self.graph.write().await;
+            if guard.is_none() {
+                // First build — full pipeline
+                *guard = Some(self.build_full_graph().await?);
+            } else {
+                // Incremental update — only changed files
+                let graph = guard.as_mut().unwrap();
+                self.update_graph_incrementally(graph).await?;
+            }
+        }
+
+        // Update cooldown timestamp
+        *self.last_scan.lock().unwrap() = std::time::Instant::now();
+
+        // Downgrade to read lock
+        Ok(self.graph.read().await)
     }
 
-    async fn get_graph(&self) -> anyhow::Result<&GraphState> {
-        self.graph_index
-            .get_or_try_init(|| async {
-                // Load workspace config and merge with --repo as primary root
-                let workspace = WorkspaceConfig::load()
-                    .with_primary_root(self.repo_root.clone());
-                let resolved_roots = workspace.resolved_roots();
+    /// Build the full graph from scratch. This is the original get_graph logic.
+    async fn build_full_graph(&self) -> anyhow::Result<GraphState> {
+        // Load workspace config and merge with --repo as primary root
+        let workspace = WorkspaceConfig::load()
+            .with_primary_root(self.repo_root.clone());
+        let resolved_roots = workspace.resolved_roots();
 
-                // 1. Scan all roots to detect changes
-                let mut has_changes = false;
-                let mut scanners: Vec<(String, Scanner, crate::scanner::ScanResult, PathBuf)> = Vec::new();
+        // 1. Scan all roots to detect changes
+        let mut has_changes = false;
+        let mut scanners: Vec<(String, Scanner, crate::scanner::ScanResult, PathBuf)> = Vec::new();
 
-                for resolved_root in &resolved_roots {
-                    let root_slug = &resolved_root.slug;
-                    let root_path = &resolved_root.path;
-                    let excludes = resolved_root.config.effective_excludes();
+        for resolved_root in &resolved_roots {
+            let root_slug = &resolved_root.slug;
+            let root_path = &resolved_root.path;
+            let excludes = resolved_root.config.effective_excludes();
 
-                    let is_primary = resolved_root.path == self.repo_root;
-                    let mut scanner = if is_primary {
-                        Scanner::with_excludes(root_path.clone(), excludes)?
-                    } else {
-                        let state_path = cache_state_path(root_slug);
-                        Scanner::with_excludes_and_state_path(
-                            root_path.clone(),
-                            excludes,
-                            state_path,
-                        )?
-                    };
+            let is_primary = resolved_root.path == self.repo_root;
+            let mut scanner = if is_primary {
+                Scanner::with_excludes(root_path.clone(), excludes)?
+            } else {
+                let state_path = cache_state_path(root_slug);
+                Scanner::with_excludes_and_state_path(
+                    root_path.clone(),
+                    excludes,
+                    state_path,
+                )?
+            };
 
-                    let scan_result = scanner.scan()?;
+            let scan_result = scanner.scan()?;
+            tracing::info!(
+                "Scanned root '{}' ({}): {} new, {} changed, {} deleted in {:?}",
+                root_slug,
+                resolved_root.config.root_type,
+                scan_result.new_files.len(),
+                scan_result.changed_files.len(),
+                scan_result.deleted_files.len(),
+                scan_result.scan_duration
+            );
+
+            if !scan_result.new_files.is_empty()
+                || !scan_result.changed_files.is_empty()
+                || !scan_result.deleted_files.is_empty()
+            {
+                has_changes = true;
+            }
+
+            scanners.push((root_slug.clone(), scanner, scan_result, root_path.clone()));
+        }
+
+        // 2. If no changes, try loading from LanceDB
+        if !has_changes {
+            match load_graph_from_lance(&self.repo_root).await {
+                Ok(state) => {
                     tracing::info!(
-                        "Scanned root '{}' ({}): {} new, {} changed, {} deleted in {:?}",
-                        root_slug,
-                        resolved_root.config.root_type,
-                        scan_result.new_files.len(),
-                        scan_result.changed_files.len(),
-                        scan_result.deleted_files.len(),
-                        scan_result.scan_duration
+                        "Loaded graph from LanceDB: {} nodes, {} edges",
+                        state.nodes.len(),
+                        state.edges.len()
                     );
-
-                    if !scan_result.new_files.is_empty()
-                        || !scan_result.changed_files.is_empty()
-                        || !scan_result.deleted_files.is_empty()
-                    {
-                        has_changes = true;
-                    }
-
-                    scanners.push((root_slug.clone(), scanner, scan_result, root_path.clone()));
+                    return Ok(state);
                 }
-
-                // 2. If no changes, try loading from LanceDB
-                if !has_changes {
-                    match load_graph_from_lance(&self.repo_root).await {
-                        Ok(state) => {
-                            tracing::info!(
-                                "Loaded graph from LanceDB: {} nodes, {} edges",
-                                state.nodes.len(),
-                                state.edges.len()
-                            );
-                            return Ok(state);
-                        }
-                        Err(e) => {
-                            tracing::debug!("Could not load persisted graph: {}", e);
-                        }
-                    }
+                Err(e) => {
+                    tracing::debug!("Could not load persisted graph: {}", e);
                 }
+            }
+        }
 
-                // 3. Full rebuild
-                let registry = ExtractorRegistry::with_builtins();
-                let mut all_nodes: Vec<Node> = Vec::new();
-                let mut all_edges: Vec<Edge> = Vec::new();
+        // 3. Full rebuild
+        let registry = ExtractorRegistry::with_builtins();
+        let mut all_nodes: Vec<Node> = Vec::new();
+        let mut all_edges: Vec<Edge> = Vec::new();
 
-                for (root_slug, scanner, _scan_result, root_path) in &scanners {
-                    let all_files = scanner.all_known_files();
-                    let full_scan = crate::scanner::ScanResult {
-                        changed_files: Vec::new(),
-                        new_files: all_files,
-                        deleted_files: Vec::new(),
-                        scan_duration: std::time::Duration::ZERO,
-                    };
-                    let mut extraction = registry.extract_scan_result(root_path, &full_scan);
+        for (root_slug, scanner, _scan_result, root_path) in &scanners {
+            let all_files = scanner.all_known_files();
+            let full_scan = crate::scanner::ScanResult {
+                changed_files: Vec::new(),
+                new_files: all_files,
+                deleted_files: Vec::new(),
+                scan_duration: std::time::Duration::ZERO,
+            };
+            let mut extraction = registry.extract_scan_result(root_path, &full_scan);
 
-                    for node in &mut extraction.nodes {
-                        node.id.root = root_slug.clone();
-                    }
-                    for edge in &mut extraction.edges {
-                        edge.from.root = root_slug.clone();
-                        edge.to.root = root_slug.clone();
-                    }
+            for node in &mut extraction.nodes {
+                node.id.root = root_slug.clone();
+            }
+            for edge in &mut extraction.edges {
+                edge.from.root = root_slug.clone();
+                edge.to.root = root_slug.clone();
+            }
 
-                    tracing::info!(
-                        "Extracted from '{}': {} nodes, {} edges",
-                        root_slug,
-                        extraction.nodes.len(),
-                        extraction.edges.len()
-                    );
+            tracing::info!(
+                "Extracted from '{}': {} nodes, {} edges",
+                root_slug,
+                extraction.nodes.len(),
+                extraction.edges.len()
+            );
 
-                    all_nodes.extend(extraction.nodes);
-                    all_edges.extend(extraction.edges);
-                }
+            all_nodes.extend(extraction.nodes);
+            all_edges.extend(extraction.edges);
+        }
 
-                // 4. Extract PR merges from git history
-                match git::pr_merges::extract_pr_merges(&self.repo_root, Some(100)) {
-                    Ok((pr_nodes, pr_edges)) => {
-                        let modified_edges =
-                            git::pr_merges::link_pr_to_symbols(&pr_nodes, &all_nodes);
-                        tracing::info!(
-                            "PR merges: {} nodes, {} edges, {} Modified links",
-                            pr_nodes.len(),
-                            pr_edges.len(),
-                            modified_edges.len()
-                        );
-                        all_nodes.extend(pr_nodes);
-                        all_edges.extend(pr_edges);
-                        all_edges.extend(modified_edges);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to extract PR merges: {}", e);
-                    }
-                }
-
-                // 5. Build petgraph index
-                let mut index = GraphIndex::new();
-                index.rebuild_from_edges(&all_edges);
-                for node in &all_nodes {
-                    index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
-                }
-
-                // 6. Phase 2: Run enrichers (LSP) synchronously
-                let languages: Vec<String> = all_nodes
-                    .iter()
-                    .map(|n| n.language.clone())
-                    .collect::<std::collections::HashSet<_>>()
-                    .into_iter()
-                    .collect();
-
-                let enricher_registry = EnricherRegistry::with_builtins();
-                let enrichment = enricher_registry
-                    .enrich_all(&all_nodes, &index, &languages)
-                    .await;
-
-                if !enrichment.added_edges.is_empty() {
-                    tracing::info!(
-                        "Enrichment added {} edges",
-                        enrichment.added_edges.len()
-                    );
-                    for edge in &enrichment.added_edges {
-                        let from_id = edge.from.to_stable_id();
-                        let to_id = edge.to.to_stable_id();
-                        index.add_edge(
-                            &from_id,
-                            &edge.from.kind.to_string(),
-                            &to_id,
-                            &edge.to.kind.to_string(),
-                            edge.kind.clone(),
-                        );
-                    }
-                    all_edges.extend(enrichment.added_edges);
-                }
-
-                for (node_id, patches) in &enrichment.updated_nodes {
-                    if let Some(node) = all_nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
-                        for (key, value) in patches {
-                            node.metadata.insert(key.clone(), value.clone());
-                        }
-                    }
-                }
-
+        // 4. Extract PR merges from git history
+        match git::pr_merges::extract_pr_merges(&self.repo_root, Some(100)) {
+            Ok((pr_nodes, pr_edges)) => {
+                let modified_edges =
+                    git::pr_merges::link_pr_to_symbols(&pr_nodes, &all_nodes);
                 tracing::info!(
-                    "Graph built: {} nodes, {} edges across {} root(s)",
-                    all_nodes.len(),
-                    all_edges.len(),
-                    resolved_roots.len()
+                    "PR merges: {} nodes, {} edges, {} Modified links",
+                    pr_nodes.len(),
+                    pr_edges.len(),
+                    modified_edges.len()
                 );
+                all_nodes.extend(pr_nodes);
+                all_edges.extend(pr_edges);
+                all_edges.extend(modified_edges);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to extract PR merges: {}", e);
+            }
+        }
 
-                // 7. Persist graph to LanceDB
-                if let Err(e) = persist_graph_to_lance(&self.repo_root, &all_nodes, &all_edges).await {
-                    tracing::warn!("Failed to persist graph to LanceDB: {}", e);
+        // 5. Build petgraph index
+        let mut index = GraphIndex::new();
+        index.rebuild_from_edges(&all_edges);
+        for node in &all_nodes {
+            index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+        }
+
+        // 6. Phase 2: Run enrichers (LSP) synchronously
+        let languages: Vec<String> = all_nodes
+            .iter()
+            .map(|n| n.language.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let enricher_registry = EnricherRegistry::with_builtins();
+        let enrichment = enricher_registry
+            .enrich_all(&all_nodes, &index, &languages)
+            .await;
+
+        if !enrichment.added_edges.is_empty() {
+            tracing::info!(
+                "Enrichment added {} edges",
+                enrichment.added_edges.len()
+            );
+            for edge in &enrichment.added_edges {
+                let from_id = edge.from.to_stable_id();
+                let to_id = edge.to.to_stable_id();
+                index.add_edge(
+                    &from_id,
+                    &edge.from.kind.to_string(),
+                    &to_id,
+                    &edge.to.kind.to_string(),
+                    edge.kind.clone(),
+                );
+            }
+            all_edges.extend(enrichment.added_edges);
+        }
+
+        for (node_id, patches) in &enrichment.updated_nodes {
+            if let Some(node) = all_nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
+                for (key, value) in patches {
+                    node.metadata.insert(key.clone(), value.clone());
                 }
+            }
+        }
 
-                // 8. Embed all nodes as part of the graph pipeline
-                let embed_index = match EmbeddingIndex::new(&self.repo_root).await {
-                    Ok(idx) => {
-                        match idx.index_all_with_symbols(&self.repo_root, &all_nodes).await {
-                            Ok(count) => {
-                                tracing::info!("Embedded {} items ({} symbols)", count, all_nodes.len());
-                                Some(idx)
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to embed: {}", e);
-                                None
-                            }
-                        }
+        tracing::info!(
+            "Graph built: {} nodes, {} edges across {} root(s)",
+            all_nodes.len(),
+            all_edges.len(),
+            resolved_roots.len()
+        );
+
+        // 7. Persist graph to LanceDB
+        if let Err(e) = persist_graph_to_lance(&self.repo_root, &all_nodes, &all_edges).await {
+            tracing::warn!("Failed to persist graph to LanceDB: {}", e);
+        }
+
+        // 8. Embed all nodes as part of the graph pipeline
+        let embed_index = match EmbeddingIndex::new(&self.repo_root).await {
+            Ok(idx) => {
+                match idx.index_all_with_symbols(&self.repo_root, &all_nodes).await {
+                    Ok(count) => {
+                        tracing::info!("Embedded {} items ({} symbols)", count, all_nodes.len());
+                        Some(idx)
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to create embed index: {}", e);
+                        tracing::warn!("Failed to embed: {}", e);
                         None
                     }
-                };
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to create embed index: {}", e);
+                None
+            }
+        };
 
-                Ok(GraphState {
-                    nodes: all_nodes,
-                    edges: all_edges,
-                    index,
-                    embed_index,
-                })
-            })
-            .await
+        Ok(GraphState {
+            nodes: all_nodes,
+            edges: all_edges,
+            index,
+            embed_index,
+        })
+    }
+
+    /// Incrementally update the graph for changed/new/deleted files.
+    async fn update_graph_incrementally(&self, graph: &mut GraphState) -> anyhow::Result<()> {
+        let mut scanner = Scanner::new(self.repo_root.clone())?;
+        let scan = scanner.scan()?;
+
+        if scan.changed_files.is_empty()
+            && scan.new_files.is_empty()
+            && scan.deleted_files.is_empty()
+        {
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Incremental update: {} changed, {} new, {} deleted",
+            scan.changed_files.len(),
+            scan.new_files.len(),
+            scan.deleted_files.len()
+        );
+
+        let registry = ExtractorRegistry::with_builtins();
+
+        // Remove nodes/edges for deleted + changed files
+        let files_to_remove: Vec<PathBuf> = scan
+            .deleted_files
+            .iter()
+            .chain(scan.changed_files.iter())
+            .cloned()
+            .collect();
+
+        graph
+            .nodes
+            .retain(|n| !files_to_remove.iter().any(|f| n.id.file == *f));
+        graph.edges.retain(|e| {
+            !files_to_remove
+                .iter()
+                .any(|f| e.from.file == *f || e.to.file == *f)
+        });
+
+        // Extract new + changed files
+        let extraction = registry.extract_scan_result(&self.repo_root, &scan);
+        graph.nodes.extend(extraction.nodes);
+        graph.edges.extend(extraction.edges);
+
+        // Rebuild petgraph index
+        graph.index = GraphIndex::new();
+        graph.index.rebuild_from_edges(&graph.edges);
+        for node in &graph.nodes {
+            graph
+                .index
+                .ensure_node(&node.stable_id(), &node.id.kind.to_string());
+        }
+
+        // Re-embed changed symbols (rebuild entire embed index for now --
+        // true incremental embedding is a future optimization)
+        if let Some(ref embed_idx) = graph.embed_index {
+            match embed_idx
+                .index_all_with_symbols(&self.repo_root, &graph.nodes)
+                .await
+            {
+                Ok(count) => {
+                    tracing::info!("Re-embedded {} items after incremental update", count)
+                }
+                Err(e) => tracing::warn!("Failed to re-embed: {}", e),
+            }
+        }
+
+        // Persist updated graph
+        if let Err(e) =
+            persist_graph_to_lance(&self.repo_root, &graph.nodes, &graph.edges).await
+        {
+            tracing::warn!("Failed to persist updated graph: {}", e);
+        }
+
+        Ok(())
     }
 }
 
@@ -990,7 +1123,9 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 let mut sections: Vec<String> = Vec::new();
 
                 // Search .oh/ artifacts + symbols via embedding index
-                match self.get_index().await {
+                // Create a fresh EmbeddingIndex handle (cheap — just opens LanceDB connection)
+                // to avoid holding the graph read guard during async search.
+                match EmbeddingIndex::new(root).await {
                     Ok(index) => {
                         match index.search(&args.query, args.artifact_types.as_deref(), limit).await {
                             Ok(results) => {
@@ -1175,7 +1310,8 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         let mut md = result.to_markdown();
 
                         // Append PR merge section from the graph
-                        if let Ok(graph_state) = self.get_graph().await {
+                        if let Ok(guard) = self.get_graph().await {
+                         if let Some(graph_state) = guard.as_ref() {
                             let file_patterns: Vec<String> = result
                                 .outcomes
                                 .first()
@@ -1199,6 +1335,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                 md.push('\n');
                                 md.push_str(&pr_md);
                             }
+                         }
                         }
 
                         Ok(text_result(md))
@@ -1210,7 +1347,8 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             "search_symbols" => {
                 let args: SearchSymbols = parse_args(params.arguments)?;
                 match self.get_graph().await {
-                    Ok(graph_state) => {
+                    Ok(guard) => {
+                        let graph_state = guard.as_ref().unwrap();
                         let limit = args.limit.unwrap_or(20) as usize;
                         let query_lower = args.query.to_lowercase();
 
@@ -1306,7 +1444,8 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             "graph_query" => {
                 let args: GraphQuery = parse_args(params.arguments)?;
                 match self.get_graph().await {
-                    Ok(graph_state) => {
+                    Ok(guard) => {
+                        let graph_state = guard.as_ref().unwrap();
                         let edge_filter = args.edge_types.as_ref().map(|types| {
                             types
                                 .iter()
