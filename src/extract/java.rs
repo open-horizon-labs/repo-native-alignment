@@ -1,6 +1,7 @@
 //! Java tree-sitter extractor.
 //!
-//! Extracts classes, interfaces, enums, records, methods, constructors, and imports.
+//! Generic path: classes, records, interfaces, enums, methods, constructors, fields, string literals.
+//! Special cases: static final field -> Const upgrade (text inspection), import_declaration.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -11,7 +12,8 @@ use crate::graph::{
     Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
 };
 
-use super::string_literals::harvest_string_literals;
+use super::configs::JAVA_CONFIG;
+use super::generic::GenericExtractor;
 use super::{ExtractionResult, Extractor};
 
 pub struct JavaExtractor;
@@ -32,206 +34,52 @@ impl Extractor for JavaExtractor {
     }
 
     fn extract(&self, path: &Path, content: &str) -> Result<ExtractionResult> {
+        let mut result = GenericExtractor::new(&JAVA_CONFIG).run(path, content)?;
+
+        // Java-specific: upgrade static final fields to Const, add imports.
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_java::LANGUAGE.into())?;
-        let tree = parser
-            .parse(content, None)
-            .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {}", path.display()))?;
+        if let Some(tree) = parser.parse(content, None) {
+            collect_java_specials(
+                tree.root_node(),
+                path,
+                content.as_bytes(),
+                &mut result.nodes,
+                &mut result.edges,
+            );
+        }
 
-        let mut nodes = Vec::new();
-        let mut edges = Vec::new();
-        let source = content.as_bytes();
-
-        collect_nodes(tree.root_node(), path, source, None, &mut nodes, &mut edges);
-
-        // Harvest string literals as synthetic Const nodes
-        harvest_string_literals(
-            tree.root_node(),
-            path,
-            source,
-            "java",
-            "string_literal",
-            None,
-            &mut nodes,
-        );
-
-        Ok(ExtractionResult { nodes, edges })
+        Ok(result)
     }
 }
 
-fn collect_nodes(
+/// Walk AST for Java-specific nodes not handled by the generic extractor:
+/// `field_declaration` with `static final` -> Const upgrade, `import_declaration`.
+fn collect_java_specials(
     node: tree_sitter::Node,
     path: &Path,
     source: &[u8],
-    class_scope: Option<&str>,
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
 ) {
     let kind_str = node.kind();
 
     match kind_str {
-        "class_declaration" | "record_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
-                let sig = node.utf8_text(source).unwrap_or("").lines().next().unwrap_or("").trim().to_string();
-                // Record the AST-accurate byte column of the name identifier so the
-                // LSP enricher can place the cursor without signature string searching.
-                let mut metadata = BTreeMap::new();
-                metadata.insert("name_col".to_string(), name_node.start_position().column.to_string());
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: name.clone(),
-                        kind: NodeKind::Struct,
-                    },
-                    language: "java".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: sig,
-                    body: String::new(),
-                    metadata,
-                    source: ExtractionSource::TreeSitter,
-                });
-
-                // Recurse with class scope
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32) {
-                        collect_nodes(child, path, source, Some(&name), nodes, edges);
-                    }
-                }
-                return;
-            }
-        }
-        "interface_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
-                let sig = node.utf8_text(source).unwrap_or("").lines().next().unwrap_or("").trim().to_string();
-                let mut metadata = BTreeMap::new();
-                metadata.insert("name_col".to_string(), name_node.start_position().column.to_string());
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: name.clone(),
-                        kind: NodeKind::Trait,
-                    },
-                    language: "java".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: sig,
-                    body: String::new(),
-                    metadata,
-                    source: ExtractionSource::TreeSitter,
-                });
-
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32) {
-                        collect_nodes(child, path, source, Some(&name), nodes, edges);
-                    }
-                }
-                return;
-            }
-        }
-        "enum_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
-                let sig = node.utf8_text(source).unwrap_or("").lines().next().unwrap_or("").trim().to_string();
-                let mut metadata = BTreeMap::new();
-                metadata.insert("name_col".to_string(), name_node.start_position().column.to_string());
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: name.clone(),
-                        kind: NodeKind::Enum,
-                    },
-                    language: "java".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: sig,
-                    body: String::new(),
-                    metadata,
-                    source: ExtractionSource::TreeSitter,
-                });
-            }
-        }
-        "method_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
-                let qualified = match class_scope {
-                    Some(cls) => format!("{}.{}", cls, name),
-                    None => name,
-                };
-                let body = node.utf8_text(source).unwrap_or("").to_string();
-                let sig = body.lines().next().unwrap_or("").trim().to_string();
-                let mut metadata = BTreeMap::new();
-                metadata.insert("name_col".to_string(), name_node.start_position().column.to_string());
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: qualified,
-                        kind: NodeKind::Function,
-                    },
-                    language: "java".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: sig,
-                    body,
-                    metadata,
-                    source: ExtractionSource::TreeSitter,
-                });
-            }
-        }
-        "constructor_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
-                let qualified = match class_scope {
-                    Some(cls) => format!("{}.<init>", cls),
-                    None => name,
-                };
-                let body = node.utf8_text(source).unwrap_or("").to_string();
-                let sig = body.lines().next().unwrap_or("").trim().to_string();
-                let mut metadata = BTreeMap::new();
-                metadata.insert("name_col".to_string(), name_node.start_position().column.to_string());
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: qualified,
-                        kind: NodeKind::Function,
-                    },
-                    language: "java".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: sig,
-                    body,
-                    metadata,
-                    source: ExtractionSource::TreeSitter,
-                });
-            }
-        }
         "field_declaration" => {
             // static final fields are Java constants: `public static final int MAX = 5;`
             let decl_text = node.utf8_text(source).unwrap_or("").to_string();
-            let has_static = decl_text.contains("static") && decl_text.contains("final");
-            if has_static {
+            let has_static_final = decl_text.contains("static") && decl_text.contains("final");
+            if has_static_final {
+                // Remove the generic-emitted Field node for this line and replace with Const.
+                let line = node.start_position().row + 1;
+                nodes.retain(|n| !(n.id.kind == NodeKind::Field && n.line_start == line));
+
                 // Find the variable_declarator child for name/value
                 for i in 0..node.child_count() {
                     if let Some(decl) = node.child(i as u32) {
                         if decl.kind() == "variable_declarator" {
                             if let Some(name_node) = decl.child_by_field_name("name") {
                                 let name = name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
-                                let qualified = match class_scope {
-                                    Some(cls) => format!("{}.{}", cls, name),
-                                    None => name,
-                                };
                                 let sig = decl_text.lines().next().unwrap_or("").trim().to_string();
                                 let value_str = decl
                                     .child_by_field_name("value")
@@ -253,7 +101,7 @@ fn collect_nodes(
                                     id: NodeId {
                                         root: String::new(),
                                         file: path.to_path_buf(),
-                                        name: qualified,
+                                        name,
                                         kind: NodeKind::Const,
                                     },
                                     language: "java".to_string(),
@@ -319,7 +167,7 @@ fn collect_nodes(
 
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            collect_nodes(child, path, source, class_scope, nodes, edges);
+            collect_java_specials(child, path, source, nodes, edges);
         }
     }
 }

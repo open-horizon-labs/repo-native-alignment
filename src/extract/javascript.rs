@@ -1,6 +1,7 @@
 //! JavaScript tree-sitter extractor.
 //!
-//! Extracts functions, classes, methods, and imports from `.js` / `.jsx` / `.mjs` files.
+//! Generic path: functions, generator functions, methods, classes, string literals.
+//! Special cases: lexical_declaration const (text inspection), import_statement.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -11,7 +12,8 @@ use crate::graph::{
     Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
 };
 
-use super::string_literals::harvest_string_literals;
+use super::configs::JAVASCRIPT_CONFIG;
+use super::generic::GenericExtractor;
 use super::{ExtractionResult, Extractor};
 
 pub struct JavaScriptExtractor;
@@ -32,143 +34,41 @@ impl Extractor for JavaScriptExtractor {
     }
 
     fn extract(&self, path: &Path, content: &str) -> Result<ExtractionResult> {
+        let mut result = GenericExtractor::new(&JAVASCRIPT_CONFIG).run(path, content)?;
+
+        // JavaScript-specific: lexical_declaration const, import_statement.
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_javascript::LANGUAGE.into())?;
-        let tree = parser
-            .parse(content, None)
-            .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {}", path.display()))?;
+        if let Some(tree) = parser.parse(content, None) {
+            collect_js_specials(
+                tree.root_node(),
+                path,
+                content.as_bytes(),
+                &mut result.nodes,
+                &mut result.edges,
+            );
+        }
 
-        let mut nodes = Vec::new();
-        let mut edges = Vec::new();
-        let source = content.as_bytes();
-
-        collect_nodes(tree.root_node(), path, source, None, &mut nodes, &mut edges);
-
-        // Harvest string literals as synthetic Const nodes
-        harvest_string_literals(
-            tree.root_node(),
-            path,
-            source,
-            "javascript",
-            "string",
-            Some("string_fragment"),
-            &mut nodes,
-        );
-
-        Ok(ExtractionResult { nodes, edges })
+        Ok(result)
     }
 }
 
-fn collect_nodes(
+/// Walk AST for JavaScript-specific nodes not handled by the generic extractor:
+/// `lexical_declaration` (const) and `import_statement`.
+fn collect_js_specials(
     node: tree_sitter::Node,
     path: &Path,
     source: &[u8],
-    class_scope: Option<&str>,
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
 ) {
     let kind_str = node.kind();
 
     match kind_str {
-        "function_declaration" | "generator_function_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
-                let qualified = match class_scope {
-                    Some(cls) => format!("{}.{}", cls, name),
-                    None => name.clone(),
-                };
-                let body = node.utf8_text(source).unwrap_or("").to_string();
-                let sig = body.lines().next().unwrap_or("").trim().to_string();
-                // Record the AST-accurate byte column of the name identifier so the
-                // LSP enricher can place the cursor without signature string searching.
-                let mut metadata = BTreeMap::new();
-                metadata.insert("name_col".to_string(), name_node.start_position().column.to_string());
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: qualified,
-                        kind: NodeKind::Function,
-                    },
-                    language: "javascript".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: sig,
-                    body,
-                    metadata,
-                    source: ExtractionSource::TreeSitter,
-                });
-            }
-        }
-        "class_declaration" | "class" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
-                let body = node.utf8_text(source).unwrap_or("").to_string();
-                let sig = body.lines().next().unwrap_or("").trim().to_string();
-                let mut metadata = BTreeMap::new();
-                metadata.insert("name_col".to_string(), name_node.start_position().column.to_string());
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: name.clone(),
-                        kind: NodeKind::Struct,
-                    },
-                    language: "javascript".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: sig,
-                    body: String::new(),
-                    metadata,
-                    source: ExtractionSource::TreeSitter,
-                });
-
-                // Recurse into class body with class scope
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32) {
-                        if child.kind() == "class_body" {
-                            collect_nodes(child, path, source, Some(&name), nodes, edges);
-                        }
-                    }
-                }
-                return;
-            }
-        }
-        "method_definition" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
-                let qualified = match class_scope {
-                    Some(cls) => format!("{}.{}", cls, name),
-                    None => name,
-                };
-                let body = node.utf8_text(source).unwrap_or("").to_string();
-                let sig = body.lines().next().unwrap_or("").trim().to_string();
-                let mut metadata = BTreeMap::new();
-                metadata.insert("name_col".to_string(), name_node.start_position().column.to_string());
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: qualified,
-                        kind: NodeKind::Function,
-                    },
-                    language: "javascript".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: sig,
-                    body,
-                    metadata,
-                    source: ExtractionSource::TreeSitter,
-                });
-            }
-        }
         "lexical_declaration" => {
             // `const FOO = 42;` at module level
             let decl_text = node.utf8_text(source).unwrap_or("").trim().to_string();
-            if decl_text.starts_with("const ") && class_scope.is_none() {
+            if decl_text.starts_with("const ") {
                 for i in 0..node.child_count() {
                     if let Some(decl) = node.child(i as u32) {
                         if decl.kind() == "variable_declarator" {
@@ -265,7 +165,7 @@ fn collect_nodes(
 
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            collect_nodes(child, path, source, class_scope, nodes, edges);
+            collect_js_specials(child, path, source, nodes, edges);
         }
     }
 }
