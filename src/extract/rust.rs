@@ -4,17 +4,40 @@
 //! and use declarations from Rust source files. Also detects topology
 //! patterns (subprocess spawn, network listeners, async boundaries).
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
 
 use crate::graph::{
-    Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
+    Confidence, Edge, EdgeKind, ExtractionSource, NodeId, NodeKind,
 };
 
-use super::string_literals::harvest_string_literals;
+use super::generic::{GenericExtractor, LangConfig};
 use super::{ExtractionResult, Extractor};
+
+/// Static config for the generic traversal pass.
+/// Topology detection and any Rust-specific logic run on top of this.
+pub static RUST_CONFIG: LangConfig = LangConfig {
+    language_fn: || tree_sitter_rust::LANGUAGE.into(),
+    language_name: "rust",
+    extensions: &["rs"],
+    node_kinds: &[
+        ("function_item",    NodeKind::Function),
+        ("struct_item",      NodeKind::Struct),
+        ("trait_item",       NodeKind::Trait),
+        ("impl_item",        NodeKind::Impl),
+        ("enum_item",        NodeKind::Enum),
+        ("const_item",       NodeKind::Const),
+        ("mod_item",         NodeKind::Module),
+        ("use_declaration",  NodeKind::Import),
+        ("field_declaration",NodeKind::Field),
+    ],
+    scope_parent_kinds: &["impl_item", "struct_item", "enum_item"],
+    const_value_field: Some("value"),
+    string_literal_kinds: &[
+        ("string_literal", Some("string_content")),
+    ],
+};
 
 /// Rust tree-sitter extractor with topology pattern detection.
 pub struct RustExtractor {
@@ -37,220 +60,20 @@ impl Extractor for RustExtractor {
     }
 
     fn extract(&self, path: &Path, content: &str) -> Result<ExtractionResult> {
+        // Generic pass: function/struct/field/const/import/etc. + string literals.
+        let mut result = GenericExtractor::new(&RUST_CONFIG).run(path, content)?;
+
+        // Rust-specific: topology pattern detection (subprocess, network, async).
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
-        let tree = parser
-            .parse(content, None)
-            .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {}", path.display()))?;
+        if let Some(tree) = parser.parse(content, None) {
+            detect_topology_patterns(tree.root_node(), path, content.as_bytes(), &mut result.edges);
+        }
 
-        let mut nodes = Vec::new();
-        let mut edges = Vec::new();
-        let source = content.as_bytes();
-
-        collect_nodes(
-            tree.root_node(),
-            path,
-            source,
-            &None,
-            &mut nodes,
-            &mut edges,
-        );
-
-        // Topology pattern detection
-        detect_topology_patterns(tree.root_node(), path, source, &mut edges);
-
-        // Harvest string literals as synthetic Const nodes
-        // Rust: string_literal node, value lives in string_content child
-        harvest_string_literals(
-            tree.root_node(),
-            path,
-            source,
-            "rust",
-            "string_literal",
-            Some("string_content"),
-            &mut nodes,
-        );
-
-        Ok(ExtractionResult { nodes, edges })
+        Ok(result)
     }
 }
 
-/// Map tree-sitter node kind string to our NodeKind.
-fn ts_kind_to_node_kind(kind_str: &str) -> Option<NodeKind> {
-    match kind_str {
-        "function_item" => Some(NodeKind::Function),
-        "struct_item" => Some(NodeKind::Struct),
-        "trait_item" => Some(NodeKind::Trait),
-        "impl_item" => Some(NodeKind::Impl),
-        "enum_item" => Some(NodeKind::Enum),
-        "const_item" => Some(NodeKind::Const),
-        "mod_item" => Some(NodeKind::Module),
-        "use_declaration" => Some(NodeKind::Import),
-        "field_declaration" => Some(NodeKind::Field),
-        _ => None,
-    }
-}
-
-/// Recursively collect nodes from the tree-sitter AST.
-fn collect_nodes(
-    node: tree_sitter::Node,
-    path: &Path,
-    source: &[u8],
-    parent_scope: &Option<String>,
-    nodes: &mut Vec<Node>,
-    edges: &mut Vec<Edge>,
-) {
-    let kind_str = node.kind();
-
-    if let Some(node_kind) = ts_kind_to_node_kind(kind_str) {
-        let name = extract_name(&node, &node_kind, source);
-        let body = node.utf8_text(source).unwrap_or("").to_string();
-        let signature = extract_signature(&body);
-        let line_start = node.start_position().row + 1;
-        let line_end = node.end_position().row + 1;
-
-        let mut metadata = BTreeMap::new();
-        if let Some(scope) = parent_scope {
-            metadata.insert("parent_scope".to_string(), scope.clone());
-        }
-        // Store the byte column of the name identifier from the AST so that
-        // the LSP enricher can position the cursor accurately without having
-        // to search the signature string (which is fragile for overloaded
-        // parameter names and multi-keyword prefixes).
-        if let Some(name_node) = node.child_by_field_name("name") {
-            metadata.insert(
-                "name_col".to_string(),
-                name_node.start_position().column.to_string(),
-            );
-        }
-        // For const items, extract the value from the AST and mark synthetic = false.
-        if node_kind == NodeKind::Const {
-            if let Some(val_node) = node.child_by_field_name("value") {
-                let val = val_node.utf8_text(source).unwrap_or("").trim().to_string();
-                if !val.is_empty() {
-                    metadata.insert("value".to_string(), val);
-                }
-            }
-            metadata.insert("synthetic".to_string(), "false".to_string());
-        }
-
-        let graph_node = Node {
-            id: NodeId {
-                root: String::new(),
-                file: path.to_path_buf(),
-                name: name.clone(),
-                kind: node_kind.clone(),
-            },
-            language: "rust".to_string(),
-            line_start,
-            line_end,
-            signature,
-            body,
-            metadata,
-            source: ExtractionSource::TreeSitter,
-        };
-
-        // For import nodes, produce a DependsOn edge
-        if node_kind == NodeKind::Import {
-            let import_target = parse_use_target(&name);
-            if !import_target.is_empty() {
-                let target_id = NodeId {
-                    root: String::new(),
-                    file: path.to_path_buf(),
-                    name: import_target,
-                    kind: NodeKind::Module,
-                };
-                edges.push(Edge {
-                    from: graph_node.id.clone(),
-                    to: target_id,
-                    kind: EdgeKind::DependsOn,
-                    source: ExtractionSource::TreeSitter,
-                    confidence: Confidence::Detected,
-                });
-            }
-        }
-
-        nodes.push(graph_node);
-
-        // Recurse into impl/struct/enum bodies with the type name as parent scope
-        // so fields and methods know which type they belong to.
-        if matches!(node_kind, NodeKind::Impl | NodeKind::Struct | NodeKind::Enum) {
-            let scope = Some(name);
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
-                    collect_nodes(child, path, source, &scope, nodes, edges);
-                }
-            }
-            return;
-        }
-    }
-
-    // Recurse into children
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
-            collect_nodes(child, path, source, parent_scope, nodes, edges);
-        }
-    }
-}
-
-/// Extract the symbol name from a tree-sitter node.
-fn extract_name(node: &tree_sitter::Node, kind: &NodeKind, source: &[u8]) -> String {
-    match kind {
-        NodeKind::Impl => {
-            let trait_name = node
-                .child_by_field_name("trait")
-                .and_then(|n| n.utf8_text(source).ok())
-                .map(|s| s.to_string());
-            let type_name = node
-                .child_by_field_name("type")
-                .and_then(|n| n.utf8_text(source).ok())
-                .unwrap_or("unknown")
-                .to_string();
-            match trait_name {
-                Some(t) => format!("{} for {}", t, type_name),
-                None => type_name,
-            }
-        }
-        NodeKind::Import => node
-            .utf8_text(source)
-            .unwrap_or("unknown")
-            .to_string()
-            .trim()
-            .to_string(),
-        _ => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                name_node
-                    .utf8_text(source)
-                    .unwrap_or("unknown")
-                    .to_string()
-            } else {
-                "unknown".to_string()
-            }
-        }
-    }
-}
-
-/// Extract the signature: text before the first `{`, or the first line.
-fn extract_signature(body: &str) -> String {
-    if let Some(brace_pos) = body.find('{') {
-        let sig = body[..brace_pos].trim();
-        if !sig.is_empty() {
-            return sig.to_string();
-        }
-    }
-    body.lines().next().unwrap_or("").trim().to_string()
-}
-
-/// Parse the target module/crate from a `use` declaration.
-/// e.g., "use std::path::Path;" -> "std::path::Path"
-fn parse_use_target(use_text: &str) -> String {
-    use_text
-        .trim_start_matches("use ")
-        .trim_start_matches("pub use ")
-        .trim_end_matches(';')
-        .trim()
-        .to_string()
-}
 
 // ---------------------------------------------------------------------------
 // Topology pattern detection
