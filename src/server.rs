@@ -319,6 +319,9 @@ async fn persist_graph_to_lance(
         let line_ends: Vec<u32> = nodes.iter().map(|n| n.line_end as u32).collect();
         let signatures: Vec<String> = nodes.iter().map(|n| n.signature.clone()).collect();
         let bodies: Vec<String> = nodes.iter().map(|n| n.body.clone()).collect();
+        let metadata_jsons: Vec<String> = nodes.iter()
+            .map(|n| serde_json::to_string(&n.metadata).unwrap_or_else(|_| "{}".to_string()))
+            .collect();
         let updated_ats: Vec<i64> = vec![now; nodes.len()];
 
         let batch = RecordBatch::try_new(
@@ -333,6 +336,7 @@ async fn persist_graph_to_lance(
                 Arc::new(UInt32Array::from(line_ends)),
                 Arc::new(StringArray::from(signatures)),
                 Arc::new(StringArray::from(bodies)),
+                Arc::new(StringArray::from(metadata_jsons)),
                 Arc::new(Int64Array::from(updated_ats)),
             ],
         )?;
@@ -464,6 +468,9 @@ pub(crate) async fn persist_graph_incremental(
             let line_ends: Vec<u32> = upsert_nodes.iter().map(|n| n.line_end as u32).collect();
             let signatures: Vec<String> = upsert_nodes.iter().map(|n| n.signature.clone()).collect();
             let bodies: Vec<String> = upsert_nodes.iter().map(|n| n.body.clone()).collect();
+            let metadata_jsons: Vec<String> = upsert_nodes.iter()
+                .map(|n| serde_json::to_string(&n.metadata).unwrap_or_else(|_| "{}".to_string()))
+                .collect();
             let updated_ats: Vec<i64> = vec![now; upsert_nodes.len()];
 
             let batch = RecordBatch::try_new(
@@ -478,6 +485,7 @@ pub(crate) async fn persist_graph_incremental(
                     Arc::new(UInt32Array::from(line_ends)),
                     Arc::new(StringArray::from(signatures)),
                     Arc::new(StringArray::from(bodies)),
+                    Arc::new(StringArray::from(metadata_jsons)),
                     Arc::new(Int64Array::from(updated_ats)),
                 ],
             )?;
@@ -633,12 +641,22 @@ async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphState> {
             let line_ends = batch.column_by_name("line_end").unwrap().as_any().downcast_ref::<UInt32Array>().unwrap();
             let signatures = batch.column_by_name("signature").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
             let bodies = batch.column_by_name("body").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            // metadata_json stores BTreeMap<String,String> serialised as JSON.
+            // Older rows (before this column was added) will be missing it; we
+            // fall back to an empty map in that case.
+            let metadata_jsons = batch.column_by_name("metadata_json")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             // We don't store language or source in the symbols schema, so we infer from file extension
             let _ = ids; // ids column exists but we reconstruct from components
 
             for i in 0..batch.num_rows() {
                 let file_path = PathBuf::from(file_paths.value(i));
                 let language = infer_language_from_path(&file_path);
+                let metadata: BTreeMap<String, String> = metadata_jsons
+                    .map(|col| {
+                        serde_json::from_str(col.value(i)).unwrap_or_default()
+                    })
+                    .unwrap_or_default();
                 nodes.push(Node {
                     id: NodeId {
                         root: root_ids.value(i).to_string(),
@@ -651,7 +669,7 @@ async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphState> {
                     line_end: line_ends.value(i) as usize,
                     signature: signatures.value(i).to_string(),
                     body: bodies.value(i).to_string(),
-                    metadata: BTreeMap::new(),
+                    metadata,
                     source: ExtractionSource::TreeSitter, // default; not stored in schema
                 });
             }

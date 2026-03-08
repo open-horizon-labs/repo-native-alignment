@@ -23,6 +23,10 @@ pub fn symbols_schema() -> Schema {
         Field::new("line_end", DataType::UInt32, false),
         Field::new("signature", DataType::Utf8, false),
         Field::new("body", DataType::Utf8, false),
+        // metadata_json stores BTreeMap<String,String> as a JSON object.
+        // Used to round-trip enricher-set fields (e.g. virtual=true, package=lancedb)
+        // through LanceDB without widening the schema for every new key.
+        Field::new("metadata_json", DataType::Utf8, false),
         // Vector column is added dynamically when embeddings are computed,
         // since the dimension depends on the model. See `symbols_schema_with_vector`.
         Field::new("updated_at", DataType::Int64, false),
@@ -42,6 +46,7 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("line_end", DataType::UInt32, false),
         Field::new("signature", DataType::Utf8, false),
         Field::new("body", DataType::Utf8, false),
+        Field::new("metadata_json", DataType::Utf8, false),
         Field::new(
             "vector",
             DataType::FixedSizeList(
@@ -125,6 +130,7 @@ mod tests {
         assert!(schema.field_with_name("line_end").is_ok());
         assert!(schema.field_with_name("signature").is_ok());
         assert!(schema.field_with_name("body").is_ok());
+        assert!(schema.field_with_name("metadata_json").is_ok());
         assert!(schema.field_with_name("updated_at").is_ok());
         // no vector column in base schema
         assert!(schema.field_with_name("vector").is_err());
