@@ -12,6 +12,11 @@ use arrow_schema::{DataType, Field, Schema};
 ///
 /// Stores code symbols (functions, structs, traits, etc.) with embeddings
 /// for semantic search and deterministic IDs for graph traversal.
+///
+/// Typed metadata columns (no JSON blobs for known fields):
+/// - `meta_virtual`  — true for virtual external nodes produced by LSP enrichment
+/// - `meta_package`  — crate/package name for virtual nodes (e.g. "lancedb", "tokio")
+/// - `meta_name_col` — LSP cursor column used for go-to-definition disambiguation
 pub fn symbols_schema() -> Schema {
     Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -23,10 +28,10 @@ pub fn symbols_schema() -> Schema {
         Field::new("line_end", DataType::UInt32, false),
         Field::new("signature", DataType::Utf8, false),
         Field::new("body", DataType::Utf8, false),
-        // metadata_json stores BTreeMap<String,String> as a JSON object.
-        // Used to round-trip enricher-set fields (e.g. virtual=true, package=lancedb)
-        // through LanceDB without widening the schema for every new key.
-        Field::new("metadata_json", DataType::Utf8, false),
+        // Typed metadata columns — Arrow type safety, no JSON blobs for known fields.
+        Field::new("meta_virtual", DataType::Boolean, true),
+        Field::new("meta_package", DataType::Utf8, true),
+        Field::new("meta_name_col", DataType::Int32, true),
         // Vector column is added dynamically when embeddings are computed,
         // since the dimension depends on the model. See `symbols_schema_with_vector`.
         Field::new("updated_at", DataType::Int64, false),
@@ -46,7 +51,9 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("line_end", DataType::UInt32, false),
         Field::new("signature", DataType::Utf8, false),
         Field::new("body", DataType::Utf8, false),
-        Field::new("metadata_json", DataType::Utf8, false),
+        Field::new("meta_virtual", DataType::Boolean, true),
+        Field::new("meta_package", DataType::Utf8, true),
+        Field::new("meta_name_col", DataType::Int32, true),
         Field::new(
             "vector",
             DataType::FixedSizeList(
@@ -71,8 +78,7 @@ pub fn edges_schema() -> Schema {
         Field::new("target_id", DataType::Utf8, false),
         Field::new("target_type", DataType::Utf8, false),
         Field::new("edge_type", DataType::Utf8, false),
-        Field::new("edge_source", DataType::Utf8, false),
-        Field::new("edge_confidence", DataType::Utf8, false),
+        Field::new("properties_json", DataType::Utf8, true),
         Field::new("root_id", DataType::Utf8, false),
         Field::new("updated_at", DataType::Int64, false),
     ])
@@ -131,7 +137,9 @@ mod tests {
         assert!(schema.field_with_name("line_end").is_ok());
         assert!(schema.field_with_name("signature").is_ok());
         assert!(schema.field_with_name("body").is_ok());
-        assert!(schema.field_with_name("metadata_json").is_ok());
+        assert!(schema.field_with_name("meta_virtual").is_ok());
+        assert!(schema.field_with_name("meta_package").is_ok());
+        assert!(schema.field_with_name("meta_name_col").is_ok());
         assert!(schema.field_with_name("updated_at").is_ok());
         // no vector column in base schema
         assert!(schema.field_with_name("vector").is_err());
@@ -157,8 +165,7 @@ mod tests {
         assert!(schema.field_with_name("target_id").is_ok());
         assert!(schema.field_with_name("target_type").is_ok());
         assert!(schema.field_with_name("edge_type").is_ok());
-        assert!(schema.field_with_name("edge_source").is_ok());
-        assert!(schema.field_with_name("edge_confidence").is_ok());
+        assert!(schema.field_with_name("properties_json").is_ok());
         assert!(schema.field_with_name("root_id").is_ok());
         assert!(schema.field_with_name("updated_at").is_ok());
     }

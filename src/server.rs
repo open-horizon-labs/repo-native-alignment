@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
-use arrow_array::{RecordBatch, RecordBatchIterator, StringArray, UInt32Array, Int64Array};
+use arrow_array::{Array, BooleanArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array, Int64Array};
 use async_trait::async_trait;
 use rust_mcp_sdk::macros::{self, JsonSchema};
 use rust_mcp_sdk::McpServer;
@@ -325,8 +325,14 @@ pub(crate) async fn persist_graph_to_lance(
         let line_ends: Vec<u32> = nodes.iter().map(|n| n.line_end as u32).collect();
         let signatures: Vec<String> = nodes.iter().map(|n| n.signature.clone()).collect();
         let bodies: Vec<String> = nodes.iter().map(|n| n.body.clone()).collect();
-        let metadata_jsons: Vec<String> = nodes.iter()
-            .map(|n| serde_json::to_string(&n.metadata).unwrap_or_else(|_| "{}".to_string()))
+        let meta_virtuals: Vec<Option<bool>> = nodes.iter()
+            .map(|n| if n.metadata.get("virtual").map(|v| v.as_str()) == Some("true") { Some(true) } else { None })
+            .collect();
+        let meta_packages: Vec<Option<String>> = nodes.iter()
+            .map(|n| n.metadata.get("package").cloned())
+            .collect();
+        let meta_name_cols: Vec<Option<i32>> = nodes.iter()
+            .map(|n| n.metadata.get("name_col").and_then(|s| s.parse::<i32>().ok()))
             .collect();
         let updated_ats: Vec<i64> = vec![now; nodes.len()];
 
@@ -342,7 +348,9 @@ pub(crate) async fn persist_graph_to_lance(
                 Arc::new(UInt32Array::from(line_ends)),
                 Arc::new(StringArray::from(signatures)),
                 Arc::new(StringArray::from(bodies)),
-                Arc::new(StringArray::from(metadata_jsons)),
+                Arc::new(BooleanArray::from(meta_virtuals)),
+                Arc::new(StringArray::from(meta_packages)),
+                Arc::new(Int32Array::from(meta_name_cols)),
                 Arc::new(Int64Array::from(updated_ats)),
             ],
         )?;
@@ -466,8 +474,14 @@ pub(crate) async fn persist_graph_incremental(
             let line_ends: Vec<u32> = upsert_nodes.iter().map(|n| n.line_end as u32).collect();
             let signatures: Vec<String> = upsert_nodes.iter().map(|n| n.signature.clone()).collect();
             let bodies: Vec<String> = upsert_nodes.iter().map(|n| n.body.clone()).collect();
-            let metadata_jsons: Vec<String> = upsert_nodes.iter()
-                .map(|n| serde_json::to_string(&n.metadata).unwrap_or_else(|_| "{}".to_string()))
+            let meta_virtuals: Vec<Option<bool>> = upsert_nodes.iter()
+                .map(|n| if n.metadata.get("virtual").map(|v| v.as_str()) == Some("true") { Some(true) } else { None })
+                .collect();
+            let meta_packages: Vec<Option<String>> = upsert_nodes.iter()
+                .map(|n| n.metadata.get("package").cloned())
+                .collect();
+            let meta_name_cols: Vec<Option<i32>> = upsert_nodes.iter()
+                .map(|n| n.metadata.get("name_col").and_then(|s| s.parse::<i32>().ok()))
                 .collect();
             let updated_ats: Vec<i64> = vec![now; upsert_nodes.len()];
 
@@ -483,7 +497,9 @@ pub(crate) async fn persist_graph_incremental(
                     Arc::new(UInt32Array::from(line_ends)),
                     Arc::new(StringArray::from(signatures)),
                     Arc::new(StringArray::from(bodies)),
-                    Arc::new(StringArray::from(metadata_jsons)),
+                    Arc::new(BooleanArray::from(meta_virtuals)),
+                    Arc::new(StringArray::from(meta_packages)),
+                    Arc::new(Int32Array::from(meta_name_cols)),
                     Arc::new(Int64Array::from(updated_ats)),
                 ],
             )?;
@@ -632,22 +648,35 @@ pub(crate) async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<Gr
             let line_ends = batch.column_by_name("line_end").unwrap().as_any().downcast_ref::<UInt32Array>().unwrap();
             let signatures = batch.column_by_name("signature").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
             let bodies = batch.column_by_name("body").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-            // metadata_json stores BTreeMap<String,String> serialised as JSON.
-            // Older rows (before this column was added) will be missing it; we
-            // fall back to an empty map in that case.
-            let metadata_jsons = batch.column_by_name("metadata_json")
+            // Typed metadata columns — Arrow type safety, no JSON blobs for known fields.
+            let meta_virtual_col = batch.column_by_name("meta_virtual")
+                .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
+            let meta_package_col = batch.column_by_name("meta_package")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let meta_name_col_col = batch.column_by_name("meta_name_col")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
             // We don't store language or source in the symbols schema, so we infer from file extension
             let _ = ids; // ids column exists but we reconstruct from components
 
             for i in 0..batch.num_rows() {
                 let file_path = PathBuf::from(file_paths.value(i));
                 let language = infer_language_from_path(&file_path);
-                let metadata: BTreeMap<String, String> = metadata_jsons
-                    .map(|col| {
-                        serde_json::from_str(col.value(i)).unwrap_or_default()
-                    })
-                    .unwrap_or_default();
+                let mut metadata: BTreeMap<String, String> = BTreeMap::new();
+                if let Some(col) = meta_virtual_col {
+                    if !col.is_null(i) && col.value(i) {
+                        metadata.insert("virtual".to_string(), "true".to_string());
+                    }
+                }
+                if let Some(col) = meta_package_col {
+                    if !col.is_null(i) {
+                        metadata.insert("package".to_string(), col.value(i).to_string());
+                    }
+                }
+                if let Some(col) = meta_name_col_col {
+                    if !col.is_null(i) {
+                        metadata.insert("name_col".to_string(), col.value(i).to_string());
+                    }
+                }
                 nodes.push(Node {
                     id: NodeId {
                         root: root_ids.value(i).to_string(),
@@ -926,8 +955,56 @@ impl RnaHandler {
                 let mut prev_root_slugs: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
 
+                // HEAD-change detection state.
+                let mut last_head_oid: Option<git2::Oid> = None;
+                let mut last_fetch_head_mtime: Option<std::time::SystemTime> = None;
+
                 loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(900)).await; // 15 min
+                    // Check for HEAD or FETCH_HEAD changes before waiting.
+                    // If a change is detected, trigger an immediate scan rather
+                    // than waiting for the full 15-min cadence.
+                    let head_changed = {
+                        match git2::Repository::open(&repo_root) {
+                            Ok(repo) => match repo.head().and_then(|h| h.peel_to_commit()) {
+                                Ok(commit) => {
+                                    let oid = commit.id();
+                                    let changed = last_head_oid.map_or(false, |prev| prev != oid);
+                                    last_head_oid = Some(oid);
+                                    changed
+                                }
+                                Err(_) => false,
+                            },
+                            Err(_) => false,
+                        }
+                    };
+
+                    let fetch_head_changed = {
+                        let fetch_head_path = repo_root.join(".git").join("FETCH_HEAD");
+                        match std::fs::metadata(&fetch_head_path).and_then(|m| m.modified()) {
+                            Ok(mtime) => {
+                                let changed =
+                                    last_fetch_head_mtime.map_or(false, |prev| prev != mtime);
+                                last_fetch_head_mtime = Some(mtime);
+                                changed
+                            }
+                            Err(_) => false,
+                        }
+                    };
+
+                    if head_changed {
+                        tracing::info!("HEAD changed — triggering immediate background scan");
+                    } else if fetch_head_changed {
+                        tracing::info!(
+                            "FETCH_HEAD changed — triggering immediate background scan"
+                        );
+                    } else {
+                        // No git-level change detected: wait for the 15-min heartbeat.
+                        // The baselines (last_head_oid, last_fetch_head_mtime) are
+                        // updated unconditionally at the top of every iteration, so any
+                        // commit that arrives during the sleep will be visible on the
+                        // very next wake-up without a post-sleep re-read here.
+                        tokio::time::sleep(tokio::time::Duration::from_secs(900)).await;
+                    }
 
                     // Resolve current roots (primary + any live worktrees).
                     let workspace = WorkspaceConfig::load()
@@ -1123,7 +1200,7 @@ impl RnaHandler {
                     prev_root_slugs = current_root_slugs;
                 }
             });
-            tracing::info!("Background scanner started (15min interval, worktree-aware)");
+            tracing::info!("Background scanner started (event-driven + 15min heartbeat, worktree-aware)");
         }
 
         // Downgrade to read lock
@@ -1132,9 +1209,12 @@ impl RnaHandler {
 
     /// Build the full graph from scratch. This is the original get_graph logic.
     async fn build_full_graph(&self) -> anyhow::Result<GraphState> {
-        // Load workspace config and merge with --repo as primary root
+        // Load workspace config and merge with --repo as primary root.
+        // Also auto-detect any live git worktrees so all roots are indexed
+        // on the first full build (mirrors the background scanner path).
         let workspace = WorkspaceConfig::load()
-            .with_primary_root(self.repo_root.clone());
+            .with_primary_root(self.repo_root.clone())
+            .with_worktrees(&self.repo_root);
         let resolved_roots = workspace.resolved_roots();
 
         // 1. Scan all roots to detect changes
@@ -2206,7 +2286,8 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
 
             "list_roots" => {
                 let workspace = WorkspaceConfig::load()
-                    .with_primary_root(self.repo_root.clone());
+                    .with_primary_root(self.repo_root.clone())
+                    .with_worktrees(&self.repo_root);
                 let resolved = workspace.resolved_roots();
 
                 if resolved.is_empty() {
