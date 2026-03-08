@@ -23,7 +23,7 @@ use crate::oh;
 use crate::query;
 use crate::roots::WorkspaceConfig;
 use crate::scanner::Scanner;
-use crate::server::{graph_lance_path, load_graph_from_lance, persist_graph_incremental, persist_graph_to_lance};
+use crate::server::{check_and_migrate_schema, graph_lance_path, load_graph_from_lance, persist_graph_incremental, persist_graph_to_lance};
 
 // ── Args ────────────────────────────────────────────────────────────
 
@@ -284,6 +284,9 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
 
     // 22. oh_search_context (semantic) -- searches for "alignment" in embedding index
     checks.push(run_oh_search_context_check(&embed_index).await);
+
+    // 23. Schema version check — write stale version, verify migration, verify no-op on re-check
+    checks.push(run_schema_version_check().await);
 
     Ok(print_and_return(args, checks))
 }
@@ -1176,6 +1179,139 @@ async fn run_oh_search_context_check(embed_index: &Option<EmbeddingIndex>) -> Ch
             }
         }
     }
+}
+
+/// Schema version check: verifies that `check_and_migrate_schema` detects stale versions
+/// and performs a clean migration, and is idempotent when the version already matches.
+///
+/// 1. Writes a `_schema_meta` row with version 0 (intentionally stale).
+/// 2. Calls `check_and_migrate_schema` — asserts it returns `true` (migration occurred).
+/// 3. Reads back the stored version — asserts it now equals `SCHEMA_VERSION`.
+/// 4. Calls `check_and_migrate_schema` again — asserts it returns `false` (no-op).
+async fn run_schema_version_check() -> Check {
+    use crate::graph::store::{schema_meta_schema, SCHEMA_VERSION};
+    use arrow_array::{RecordBatch, RecordBatchIterator, StringArray};
+    use futures::TryStreamExt;
+    use lancedb::query::ExecutableQuery;
+    use std::sync::Arc;
+
+    let temp_dir = std::env::temp_dir().join("rna-smoke-schema-version");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+        return Check::fail("schema_version_check", format!("Could not create temp dir: {}", e));
+    }
+
+    let db_path = temp_dir.join(".oh").join(".cache").join("lance");
+    if let Err(e) = std::fs::create_dir_all(&db_path) {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return Check::fail("schema_version_check", format!("Could not create lance dir: {}", e));
+    }
+
+    // Step 1: Seed _schema_meta with version 0 (stale).
+    let seed_result: anyhow::Result<()> = async {
+        let db = lancedb::connect(db_path.to_str().unwrap_or_default())
+            .execute()
+            .await?;
+        let schema = Arc::new(schema_meta_schema());
+        let keys = StringArray::from(vec!["schema_version"]);
+        let values = StringArray::from(vec!["0"]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(keys), Arc::new(values)])?;
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        db.create_table("_schema_meta", Box::new(batches))
+            .execute()
+            .await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = seed_result {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return Check::fail("schema_version_check", format!("Failed to seed stale meta: {}", e));
+    }
+
+    // Step 2: First call — expect migration (returns true).
+    let migrated = match check_and_migrate_schema(&db_path).await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Check::fail("schema_version_check", format!("check_and_migrate_schema failed: {}", e));
+        }
+    };
+
+    if !migrated {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return Check::fail(
+            "schema_version_check",
+            "Expected migration=true for stale version 0, got false",
+        );
+    }
+
+    // Step 3: Read back stored version — must equal SCHEMA_VERSION.
+    let stored_version: anyhow::Result<u32> = async {
+        let db = lancedb::connect(db_path.to_str().unwrap_or_default())
+            .execute()
+            .await?;
+        let tbl = db.open_table("_schema_meta").execute().await?;
+        let batches: Vec<_> = tbl.query().execute().await?.try_collect().await?;
+        for batch in &batches {
+            let keys = batch
+                .column_by_name("key")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| anyhow::anyhow!("missing key column"))?;
+            let values = batch
+                .column_by_name("value")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| anyhow::anyhow!("missing value column"))?;
+            for i in 0..batch.num_rows() {
+                if keys.value(i) == "schema_version" {
+                    return values.value(i).parse::<u32>().map_err(Into::into);
+                }
+            }
+        }
+        anyhow::bail!("schema_version key not found in _schema_meta")
+    }
+    .await;
+
+    let version = match stored_version {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Check::fail("schema_version_check", format!("Failed to read stored version: {}", e));
+        }
+    };
+
+    if version != SCHEMA_VERSION {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return Check::fail(
+            "schema_version_check",
+            format!("Stored version {} != SCHEMA_VERSION {}", version, SCHEMA_VERSION),
+        );
+    }
+
+    // Step 4: Second call — must be a no-op (returns false).
+    let noop = match check_and_migrate_schema(&db_path).await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Check::fail("schema_version_check", format!("Second check_and_migrate_schema failed: {}", e));
+        }
+    };
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    if noop {
+        return Check::fail(
+            "schema_version_check",
+            "Expected no-op (false) on second call with matching version, got true",
+        );
+    }
+
+    Check::pass(
+        "schema_version_check",
+        format!(
+            "Migration detected stale v0→v{SCHEMA_VERSION}, then confirmed no-op on re-check"
+        ),
+    )
 }
 
 // ── Output ──────────────────────────────────────────────────────────
