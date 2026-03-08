@@ -89,7 +89,7 @@ This explores your codebase, asks about your aims, writes `AGENTS.md`, scaffolds
 repo-native-alignment test --repo /path/to/your/project
 ```
 
-Runs 11 checks end-to-end: scanner init, file walk, symbol extraction, graph index, embedding index, each MCP tool category, and a worktree smoke test. Exits 0 on pass, 1 on failure. Safe to run in CI.
+Runs 22+ checks end-to-end: scanner init, file walk, symbol extraction, graph index, embedding index, each MCP tool category, worktree smoke, incremental persist, virtual external node round-trip, HEAD-change detection, cross-language constants, semantic search, and more. Exits 0 on pass, 1 on failure. Safe to run in CI.
 
 ### 5. Start working
 
@@ -135,7 +135,9 @@ All 22 extractors index constants and literal values. `search_symbols` returns t
 
 Named constants (`synthetic: false`) are declared identifiers — `const MAX_RETRIES = 5`, static final fields, ALL_CAPS module-level assignments, etc.
 
-Synthetic constants (`synthetic: true`) are inferred from structure — YAML/TOML/JSON top-level scalar values, OpenAPI enum values. They appear with a `*(literal)*` badge.
+Synthetic constants (`synthetic: true`) are inferred from structure — YAML/TOML/JSON top-level scalar values, OpenAPI enum values, and single-token string literals (e.g. `"application/json"`, `"GET"`) found in function bodies. They appear with a `*(literal)*` badge.
+
+Filter by kind in `search_symbols`: pass `synthetic: false` to see only declared constants, `synthetic: true` for inferred literals, or omit for both.
 
 Language mapping:
 - **Rust** — `const_item` with extracted value
@@ -184,9 +186,11 @@ Common servers (install for richer graphs):
 
 Plus 31 more: Ruby (solargraph), Java (jdtls), Kotlin, Lua, Zig, Elixir, Haskell, OCaml, Scala, Dart, PHP, Swift, Nix, Terraform, TOML, YAML, and others. Full list in `src/extract/mod.rs`.
 
-**Scanner (incremental, worktree-aware):**
+**Scanner (incremental, event-driven, worktree-aware):**
 - Rescans in <1s — only changed files re-extracted and upserted (O(changed files) end-to-end, including LanceDB)
+- Event-driven reindex — triggers immediately on `git pull`, `git merge`, or branch checkout; 15-minute heartbeat is the fallback, not the trigger
 - Git worktrees indexed automatically — agents running parallel branches see their own in-progress symbols, not the stale main-branch index
+- Schema versioning — `SCHEMA_VERSION` constant in `store.rs`; bump it when schemas change and the cache auto-drops and rebuilds on next startup
 - Configurable excludes via `.oh/config.toml`
 
 ## Companion Systems
@@ -265,13 +269,16 @@ No cloud dependency. Everything local, git-versioned, disposable.
 ## Status
 
 **Working today:**
-- 9 MCP tools, 22 language extractors, 159 tests
+- 9 MCP tools, 22 language extractors, 177 tests
 - `outcome_progress` joins outcomes → commits → symbols → PRs structurally
 - `graph_query(mode: "impact")` traces blast radius across your codebase and into external packages
 - `search_symbols` returns results from active git worktrees — parallel agents see their own changes
+- `search_symbols(synthetic: false)` for declared constants; `synthetic: true` for inferred literals
+- Cross-language constant + literal search — find `MAX_RETRIES = 5` in Rust, Python, Go, YAML in one query
 - Semantic search over code, docs, and business artifacts — no API key, runs locally
-- `rna test --repo .` verifies the full pipeline in one command
-- Index persists between sessions — restarts in <1s, no re-scanning
+- `rna test --repo .` verifies the full pipeline (22+ checks) in one command
+- Index persists between sessions — restarts in <1s, auto-rebuilds on schema change
+- Event-driven reindex — responds to HEAD changes immediately, not on a timer
 - Context injected on first tool call — agents start every session with business context
 - Validated on 3 repos: Rust CLI, Python+TS monorepo, self-referential (this repo)
 
