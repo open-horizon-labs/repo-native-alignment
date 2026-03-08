@@ -27,8 +27,14 @@ jobs:
       - name: Run setup tests
         run: cargo test setup::tests
 
-      - name: Build binary
+      - name: Run full unit + integration tests
+        run: cargo test
+
+      - name: Build release binary
         run: cargo build --release
+
+      - name: RNA pipeline smoke test (rna test)
+        run: cargo run --release -- test --repo .
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
