@@ -107,32 +107,32 @@ fn collect_nodes(
             source: ExtractionSource::TreeSitter,
         });
 
-        // For `variable` blocks, also emit a Const node capturing the default value
+        // For `variable` blocks, emit a Const node only when a default value is present
         if block_type == "variable" {
             if let Some(var_name) = labels.first() {
                 // Try to find `default = <value>` in the block body
                 let body_text = node.utf8_text(source).unwrap_or("").to_string();
                 let default_val = extract_hcl_attr(&body_text, "default");
-                let mut const_metadata = BTreeMap::new();
                 if let Some(ref v) = default_val {
+                    let mut const_metadata = BTreeMap::new();
                     const_metadata.insert("value".to_string(), v.clone());
+                    const_metadata.insert("synthetic".to_string(), "false".to_string());
+                    nodes.push(Node {
+                        id: NodeId {
+                            root: String::new(),
+                            file: path.to_path_buf(),
+                            name: var_name.clone(),
+                            kind: NodeKind::Const,
+                        },
+                        language: "hcl".to_string(),
+                        line_start: node.start_position().row + 1,
+                        line_end: node.end_position().row + 1,
+                        signature: format!("variable \"{}\"", var_name),
+                        body: body_text,
+                        metadata: const_metadata,
+                        source: ExtractionSource::TreeSitter,
+                    });
                 }
-                const_metadata.insert("synthetic".to_string(), "false".to_string());
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: var_name.clone(),
-                        kind: NodeKind::Const,
-                    },
-                    language: "hcl".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: format!("variable \"{}\"", var_name),
-                    body: body_text,
-                    metadata: const_metadata,
-                    source: ExtractionSource::TreeSitter,
-                });
             }
         }
 

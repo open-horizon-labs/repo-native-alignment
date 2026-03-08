@@ -195,27 +195,34 @@ fn collect_nodes(
     }
 }
 
-/// Extract a Go const_spec node (e.g., `MaxRetries = 5`).
+/// Extract a Go const_spec node (e.g., `MaxRetries = 5` or `A, B = 1, 2`).
+///
+/// In tree-sitter-go, `const_spec` may have multiple `name` children for
+/// multi-name declarations like `const A, B = 1, 2`. We emit a Const node
+/// for each name.
 fn extract_go_const_spec(
     node: tree_sitter::Node,
     path: &Path,
     source: &[u8],
     nodes: &mut Vec<Node>,
 ) {
-    // const_spec has a "name" child list and optional "value" child
-    // In tree-sitter-go, const_spec has identifier children for names
-    // and an expression_list for values
-    if let Some(name_node) = node.child_by_field_name("name") {
-        let name_str = name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
-        if name_str.is_empty() {
-            return;
-        }
-        let body = node.utf8_text(source).unwrap_or("").to_string();
+    let body = node.utf8_text(source).unwrap_or("").to_string();
+
+    // Try to get value from the expression_list (first value in a multi-name spec)
+    let value_str = node.child_by_field_name("value")
+        .and_then(|v| v.utf8_text(source).ok())
+        .map(|s| s.trim().to_string());
+
+    // Collect all name children (handles both single and multi-name specs)
+    let mut cursor = node.walk();
+    let names: Vec<String> = node
+        .children_by_field_name("name", &mut cursor)
+        .map(|n| n.utf8_text(source).unwrap_or("unknown").trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    for name_str in names {
         let signature = format!("const {}", body.trim());
-        // Try to get value from the expression_list
-        let value_str = node.child_by_field_name("value")
-            .and_then(|v| v.utf8_text(source).ok())
-            .map(|s| s.trim().to_string());
         let mut metadata = BTreeMap::new();
         if let Some(ref v) = value_str {
             let is_scalar = v.starts_with('"') || v.starts_with('`')
@@ -237,8 +244,8 @@ fn extract_go_const_spec(
             language: "go".to_string(),
             line_start: node.start_position().row + 1,
             line_end: node.end_position().row + 1,
-            signature,
-            body,
+            signature: signature.clone(),
+            body: body.clone(),
             metadata,
             source: ExtractionSource::TreeSitter,
         });
@@ -495,5 +502,19 @@ const (
         let consts: Vec<_> = result.nodes.iter().filter(|n| n.id.kind == NodeKind::Const).collect();
         assert!(!consts.is_empty(), "Should find const nodes");
         assert_eq!(consts[0].metadata.get("synthetic").map(|s| s.as_str()), Some("false"));
+    }
+
+    #[test]
+    fn test_go_multi_name_const() {
+        let extractor = GoExtractor::new();
+        let code = r#"package main
+
+const A, B = 1, 2
+"#;
+        let result = extractor.extract(Path::new("main.go"), code).unwrap();
+        let consts: Vec<_> = result.nodes.iter().filter(|n| n.id.kind == NodeKind::Const).collect();
+        let names: Vec<&str> = consts.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"A"), "Should find const A, got: {:?}", names);
+        assert!(names.contains(&"B"), "Should find const B, got: {:?}", names);
     }
 }
