@@ -664,7 +664,7 @@ impl Enricher for LspEnricher {
         &self.display_name
     }
 
-    async fn enrich(&self, nodes: &[Node], _index: &GraphIndex) -> Result<EnrichmentResult> {
+    async fn enrich(&self, nodes: &[Node], _index: &GraphIndex, repo_root: &Path) -> Result<EnrichmentResult> {
         let mut result = EnrichmentResult::default();
 
         // Filter to nodes matching this enricher's language
@@ -684,18 +684,8 @@ impl Enricher for LspEnricher {
             return Ok(result);
         }
 
-        // Use the repo root from the --repo arg, not cwd
-        let repo_root = matching_nodes.first()
-            .map(|_n| {
-                // Nodes have root_id set by multi-root scanning.
-                // For the primary root, the path in the graph state is relative to repo_root.
-                // We need the actual repo root path from the server.
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-            })
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-        // Try to initialize the language server
-        if let Err(e) = self.ensure_initialized(&repo_root).await {
+        // Try to initialize the language server using the repo root from --repo
+        if let Err(e) = self.ensure_initialized(repo_root).await {
             tracing::debug!("LSP enrichment skipped for {}: {}", self.language, e);
             return Ok(result);
         }
@@ -704,7 +694,7 @@ impl Enricher for LspEnricher {
         let root = state
             .root_path
             .clone()
-            .unwrap_or_else(|| repo_root.clone());
+            .unwrap_or_else(|| repo_root.to_path_buf());
         let transport = match state.transport.as_mut() {
             Some(t) => t,
             None => return Ok(result),
