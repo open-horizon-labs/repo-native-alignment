@@ -225,6 +225,36 @@ impl Extractor for SqlExtractor {
                     }
                 }
 
+                Statement::CreateType { name, representation } => {
+                    // PostgreSQL: CREATE TYPE status AS ENUM ('active', 'inactive');
+                    let type_name = name.to_string();
+                    if let Some(sqlparser::ast::UserDefinedTypeRepresentation::Enum { labels }) = representation {
+                        for label in labels {
+                            let label_str = label.value.clone();
+                            if !label_str.is_empty() {
+                                let mut metadata = BTreeMap::new();
+                                metadata.insert("value".to_string(), label_str.clone());
+                                metadata.insert("synthetic".to_string(), "false".to_string());
+                                nodes.push(Node {
+                                    id: NodeId {
+                                        root: String::new(),
+                                        file: path.to_path_buf(),
+                                        name: format!("{}.{}", type_name, label_str),
+                                        kind: NodeKind::Const,
+                                    },
+                                    language: "sql".to_string(),
+                                    line_start: 0,
+                                    line_end: 0,
+                                    signature: format!("{} ENUM value", type_name),
+                                    body: label_str,
+                                    metadata,
+                                    source: ExtractionSource::Schema,
+                                });
+                            }
+                        }
+                    }
+                }
+
                 _ => {} // Skip other statement types
             }
         }

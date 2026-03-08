@@ -63,6 +63,15 @@ fn collect_symbols(
         let line_start = node.start_position().row + 1;
         let line_end = node.end_position().row + 1;
 
+        // Extract value from const_item AST node if available
+        let value = if kind == SymbolKind::Const {
+            node.child_by_field_name("value")
+                .and_then(|v| v.utf8_text(source).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
         let sym = CodeSymbol {
             file_path: path.to_path_buf(),
             name: name.clone(),
@@ -72,6 +81,8 @@ fn collect_symbols(
             signature,
             parent_scope: parent_scope.clone(),
             body,
+            value,
+            synthetic: false,
         };
         symbols.push(sym);
 

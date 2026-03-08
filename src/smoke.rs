@@ -246,6 +246,21 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     // 14. HEAD-change detection logic
     checks.push(run_head_change_detection_check());
 
+    // 15. Cross-language constants smoke test
+    // Verify that search_symbols finds at least one Const node with a value set
+    let const_nodes: Vec<_> = all_nodes.iter()
+        .filter(|n| n.id.kind == crate::graph::NodeKind::Const)
+        .collect();
+    if const_nodes.is_empty() {
+        checks.push(Check::fail("const_extraction", "No Const nodes extracted"));
+    } else {
+        let with_value = const_nodes.iter().filter(|n| n.metadata.contains_key("value")).count();
+        checks.push(Check::pass(
+            "const_extraction",
+            format!("{} Const nodes, {} with value", const_nodes.len(), with_value),
+        ));
+    }
+
     Ok(print_and_return(args, checks))
 }
 

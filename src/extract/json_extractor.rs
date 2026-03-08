@@ -82,11 +82,26 @@ fn extract_top_level_keys(
             .unwrap_or("")
             .to_string();
 
+        // Check if value is a scalar (string, number, boolean, null — not object/array)
+        let val_node_opt = child.child_by_field_name("value");
+        let is_scalar = val_node_opt.map(|v| {
+            !matches!(v.kind(), "object" | "array")
+        }).unwrap_or(false);
+
         // Truncate large values
         let body = if value_text.len() > 500 {
             format!("{}...", &value_text[..500])
         } else {
-            value_text
+            value_text.clone()
+        };
+
+        let (kind, metadata) = if is_scalar && !value_text.trim().is_empty() {
+            let mut m = BTreeMap::new();
+            m.insert("value".to_string(), value_text.trim().trim_matches('"').to_string());
+            m.insert("synthetic".to_string(), "true".to_string());
+            (NodeKind::Const, m)
+        } else {
+            (NodeKind::Other("json_key".to_string()), BTreeMap::new())
         };
 
         nodes.push(Node {
@@ -94,14 +109,14 @@ fn extract_top_level_keys(
                 root: String::new(),
                 file: path.to_path_buf(),
                 name: key.clone(),
-                kind: NodeKind::Other("json_key".to_string()),
+                kind,
             },
             language: "json".to_string(),
             line_start: child.start_position().row + 1,
             line_end: child.end_position().row + 1,
             signature: format!("\"{}\":", key),
             body,
-            metadata: BTreeMap::new(),
+            metadata,
             source: ExtractionSource::TreeSitter,
         });
     }

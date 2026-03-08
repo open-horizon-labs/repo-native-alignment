@@ -2117,6 +2117,12 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                     if !n.signature.is_empty() {
                                         entry.push_str(&format!("\n  Sig: `{}`", n.signature));
                                     }
+                                    if let Some(val) = n.metadata.get("value") {
+                                        entry.push_str(&format!("\n  Value: `{}`", val));
+                                    }
+                                    if n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false) {
+                                        entry.push_str(" *(literal)*");
+                                    }
                                     if !outgoing.is_empty() {
                                         entry.push_str(&format!("\n  Out: {} edge(s)", outgoing.len()));
                                     }

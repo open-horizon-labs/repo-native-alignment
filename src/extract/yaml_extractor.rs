@@ -121,8 +121,8 @@ fn extract_document(
             continue;
         }
 
-        let value_text = pair
-            .child_by_field_name("value")
+        let value_node = pair.child_by_field_name("value");
+        let value_text = value_node
             .and_then(|v| v.utf8_text(source).ok())
             .unwrap_or("")
             .to_string();
@@ -130,7 +130,21 @@ fn extract_document(
         let body = if value_text.len() > 300 {
             format!("{}...", &value_text[..300])
         } else {
-            value_text
+            value_text.clone()
+        };
+
+        // Check if the value is a scalar (not a mapping or sequence)
+        let is_scalar = value_node.map(|v| {
+            !matches!(v.kind(), "block_mapping" | "flow_mapping" | "block_sequence" | "flow_sequence")
+        }).unwrap_or(false);
+
+        let (kind, metadata) = if is_scalar && !value_text.trim().is_empty() {
+            let mut m = BTreeMap::new();
+            m.insert("value".to_string(), value_text.trim().to_string());
+            m.insert("synthetic".to_string(), "true".to_string());
+            (NodeKind::Const, m)
+        } else {
+            (NodeKind::Other("yaml_key".to_string()), BTreeMap::new())
         };
 
         nodes.push(Node {
@@ -138,14 +152,14 @@ fn extract_document(
                 root: String::new(),
                 file: path.to_path_buf(),
                 name: key.clone(),
-                kind: NodeKind::Other("yaml_key".to_string()),
+                kind,
             },
             language: "yaml".to_string(),
             line_start: pair.start_position().row + 1,
             line_end: pair.end_position().row + 1,
             signature: format!("{}:", key),
             body,
-            metadata: BTreeMap::new(),
+            metadata,
             source: ExtractionSource::TreeSitter,
         });
     }
@@ -217,4 +231,24 @@ fn key_text(node: tree_sitter::Node, source: &[u8]) -> String {
         .trim_matches('\'')
         .trim()
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_yaml_scalar_kvs_become_const() {
+        let extractor = YamlExtractor::new();
+        let code = "version: \"1.0.0\"\nmax_connections: 100\n";
+        let result = extractor.extract(Path::new("config.yaml"), code).unwrap();
+        let consts: Vec<_> = result.nodes.iter().filter(|n| n.id.kind == NodeKind::Const).collect();
+        assert!(!consts.is_empty(), "Should find Const nodes for scalar YAML values");
+        let c = consts.iter().find(|n| n.id.name == "version").expect("Should find version");
+        assert_eq!(c.metadata.get("synthetic").map(|s| s.as_str()), Some("true"), "YAML scalars should be synthetic");
+    }
 }

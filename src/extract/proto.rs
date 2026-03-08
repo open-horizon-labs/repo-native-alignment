@@ -136,6 +136,88 @@ impl Extractor for ProtoExtractor {
                 }
             }
 
+            // enum definitions — emit enum values as Const nodes
+            if line.starts_with("enum ") {
+                let enum_name = line
+                    .trim_start_matches("enum ")
+                    .trim_end_matches('{')
+                    .trim()
+                    .to_string();
+                if !enum_name.is_empty() {
+                    let block_start = i;
+                    let block_end = find_block_end(&lines, i);
+                    // Emit each enum value as a Const
+                    for j in (block_start + 1)..block_end {
+                        let ev_line = lines[j].trim();
+                        if ev_line.is_empty() || ev_line.starts_with("//") || ev_line.starts_with("option ") {
+                            continue;
+                        }
+                        // Enum values: `FIELD_NAME = number;`
+                        if let Some(eq_pos) = ev_line.find('=') {
+                            let ev_name = ev_line[..eq_pos].trim().to_string();
+                            let ev_val = ev_line[eq_pos+1..].trim().trim_end_matches(';').trim().to_string();
+                            if !ev_name.is_empty() && !ev_name.contains(' ') {
+                                let mut metadata = BTreeMap::new();
+                                if !ev_val.is_empty() {
+                                    metadata.insert("value".to_string(), ev_val);
+                                }
+                                metadata.insert("synthetic".to_string(), "false".to_string());
+                                nodes.push(Node {
+                                    id: NodeId {
+                                        root: String::new(),
+                                        file: path.to_path_buf(),
+                                        name: format!("{}.{}", enum_name, ev_name),
+                                        kind: NodeKind::Const,
+                                    },
+                                    language: "protobuf".to_string(),
+                                    line_start: j + 1,
+                                    line_end: j + 1,
+                                    signature: ev_line.to_string(),
+                                    body: ev_line.to_string(),
+                                    metadata,
+                                    source: ExtractionSource::Schema,
+                                });
+                            }
+                        }
+                    }
+                    i = block_end + 1;
+                    continue;
+                }
+            }
+
+            // top-level option statements: `option java_package = "com.example";`
+            if line.starts_with("option ") {
+                let opt_line = line.trim_end_matches(';').trim();
+                if let Some(eq_pos) = opt_line.find('=') {
+                    let opt_name = opt_line[7..eq_pos].trim().to_string(); // strip "option "
+                    let opt_val = opt_line[eq_pos+1..].trim().trim_matches('"').to_string();
+                    if !opt_name.is_empty() {
+                        let mut metadata = BTreeMap::new();
+                        if !opt_val.is_empty() {
+                            metadata.insert("value".to_string(), opt_val);
+                        }
+                        metadata.insert("synthetic".to_string(), "false".to_string());
+                        nodes.push(Node {
+                            id: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: opt_name.clone(),
+                                kind: NodeKind::Const,
+                            },
+                            language: "protobuf".to_string(),
+                            line_start: i + 1,
+                            line_end: i + 1,
+                            signature: line.to_string(),
+                            body: line.to_string(),
+                            metadata,
+                            source: ExtractionSource::Schema,
+                        });
+                    }
+                }
+                i += 1;
+                continue;
+            }
+
             // service definitions
             if line.starts_with("service ") {
                 let svc_name = line

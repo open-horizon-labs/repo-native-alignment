@@ -118,6 +118,16 @@ fn collect_nodes(
                 });
             }
         }
+        "const_declaration" => {
+            // Go const declarations: const X = 5 or const (X = 5; Y = "hello")
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    if child.kind() == "const_spec" {
+                        extract_go_const_spec(child, path, source, nodes);
+                    }
+                }
+            }
+        }
         "type_declaration" => {
             // type_declaration contains type_spec children
             for i in 0..node.child_count() {
@@ -174,14 +184,64 @@ fn collect_nodes(
         _ => {}
     }
 
-    // Recurse into children (but skip type_declaration and import_declaration
-    // which we handle above)
-    if kind_str != "type_declaration" && kind_str != "import_declaration" {
+    // Recurse into children (but skip type_declaration, import_declaration,
+    // and const_declaration which we handle above)
+    if kind_str != "type_declaration" && kind_str != "import_declaration" && kind_str != "const_declaration" {
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i as u32) {
                 collect_nodes(child, path, source, nodes, edges);
             }
         }
+    }
+}
+
+/// Extract a Go const_spec node (e.g., `MaxRetries = 5`).
+fn extract_go_const_spec(
+    node: tree_sitter::Node,
+    path: &Path,
+    source: &[u8],
+    nodes: &mut Vec<Node>,
+) {
+    // const_spec has a "name" child list and optional "value" child
+    // In tree-sitter-go, const_spec has identifier children for names
+    // and an expression_list for values
+    if let Some(name_node) = node.child_by_field_name("name") {
+        let name_str = name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
+        if name_str.is_empty() {
+            return;
+        }
+        let body = node.utf8_text(source).unwrap_or("").to_string();
+        let signature = format!("const {}", body.trim());
+        // Try to get value from the expression_list
+        let value_str = node.child_by_field_name("value")
+            .and_then(|v| v.utf8_text(source).ok())
+            .map(|s| s.trim().to_string());
+        let mut metadata = BTreeMap::new();
+        if let Some(ref v) = value_str {
+            let is_scalar = v.starts_with('"') || v.starts_with('`')
+                || v.parse::<f64>().is_ok()
+                || v == "true" || v == "false";
+            if is_scalar {
+                let stripped = v.trim_matches('"').trim_matches('`');
+                metadata.insert("value".to_string(), stripped.to_string());
+            }
+        }
+        metadata.insert("synthetic".to_string(), "false".to_string());
+        nodes.push(Node {
+            id: NodeId {
+                root: String::new(),
+                file: path.to_path_buf(),
+                name: name_str,
+                kind: NodeKind::Const,
+            },
+            language: "go".to_string(),
+            line_start: node.start_position().row + 1,
+            line_end: node.end_position().row + 1,
+            signature,
+            body,
+            metadata,
+            source: ExtractionSource::TreeSitter,
+        });
     }
 }
 
@@ -418,5 +478,22 @@ func (f *Foo) Bar() {}
             .find(|n| n.id.name == "Bar")
             .expect("Should find method Bar");
         assert!(method.metadata.contains_key("receiver"));
+    }
+
+    #[test]
+    fn test_go_const_extraction() {
+        let extractor = GoExtractor::new();
+        let code = r#"package main
+
+const MaxRetries = 5
+const (
+    StatusOK = 200
+    StatusNotFound = 404
+)
+"#;
+        let result = extractor.extract(Path::new("main.go"), code).unwrap();
+        let consts: Vec<_> = result.nodes.iter().filter(|n| n.id.kind == NodeKind::Const).collect();
+        assert!(!consts.is_empty(), "Should find const nodes");
+        assert_eq!(consts[0].metadata.get("synthetic").map(|s| s.as_str()), Some("false"));
     }
 }

@@ -211,6 +211,52 @@ fn collect_nodes(
                 return;
             }
         }
+        "declaration" => {
+            // C/C++ constants: `constexpr int MAX = 5;` or `static const int MAX = 5;`
+            let decl_text = node.utf8_text(source).unwrap_or("").to_string();
+            let is_const = decl_text.contains("constexpr")
+                || (decl_text.contains("static") && decl_text.contains("const "));
+            if is_const {
+                if let Some(declarator) = node.child_by_field_name("declarator") {
+                    if let Some(name) = extract_cpp_name(declarator, source) {
+                        let qualified = match scope {
+                            Some(s) => format!("{}::{}", s, name),
+                            None => name,
+                        };
+                        let sig = decl_text.lines().next().unwrap_or("").trim().to_string();
+                        // Value may be after `=`
+                        let value_str = decl_text.find('=')
+                            .map(|pos| decl_text[pos+1..].trim_end_matches(';').trim().to_string())
+                            .filter(|s| !s.is_empty());
+                        let mut metadata = BTreeMap::new();
+                        if let Some(ref v) = value_str {
+                            let is_scalar = v.starts_with('"') || v.parse::<f64>().is_ok()
+                                || v == "true" || v == "false";
+                            if is_scalar {
+                                let stripped = v.trim_matches('"');
+                                metadata.insert("value".to_string(), stripped.to_string());
+                            }
+                        }
+                        metadata.insert("synthetic".to_string(), "false".to_string());
+                        nodes.push(Node {
+                            id: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: qualified,
+                                kind: NodeKind::Const,
+                            },
+                            language: "c-cpp".to_string(),
+                            line_start: node.start_position().row + 1,
+                            line_end: node.end_position().row + 1,
+                            signature: sig,
+                            body: decl_text,
+                            metadata,
+                            source: ExtractionSource::TreeSitter,
+                        });
+                    }
+                }
+            }
+        }
         _ => {}
     }
 
