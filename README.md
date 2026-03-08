@@ -154,7 +154,7 @@ Common servers (install for richer graphs):
 Plus 31 more: Ruby (solargraph), Java (jdtls), Kotlin, Lua, Zig, Elixir, Haskell, OCaml, Scala, Dart, PHP, Swift, Nix, Terraform, TOML, YAML, and others. Full list in `src/extract/mod.rs`.
 
 **Scanner (incremental, worktree-aware):**
-- Rescans in <1s — only changed files re-extracted
+- Rescans in <1s — only changed files re-extracted and upserted (O(changed files) end-to-end, including LanceDB)
 - Git worktrees indexed automatically — agents running parallel branches see their own in-progress symbols, not the stale main-branch index
 - Configurable excludes via `.oh/config.toml`
 

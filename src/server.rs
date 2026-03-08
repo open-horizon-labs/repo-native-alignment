@@ -181,7 +181,7 @@ pub struct ListRoots {}
 // ── Graph persistence (LanceDB) ─────────────────────────────────────
 
 /// LanceDB path for graph persistence.
-fn graph_lance_path(repo_root: &Path) -> PathBuf {
+pub(crate) fn graph_lance_path(repo_root: &Path) -> PathBuf {
     repo_root.join(".oh").join(".cache").join("lance")
 }
 
@@ -404,13 +404,23 @@ async fn persist_graph_to_lance(
     Ok(())
 }
 
-/// Persist graph changes incrementally using LanceDB merge_insert (upsert + delete).
+/// Persist graph changes incrementally using LanceDB merge_insert (upsert) and targeted delete.
+///
 /// Unlike `persist_graph_to_lance` (DROP+CREATE), this keeps the tables alive during writes —
 /// no query window with empty results.
-async fn persist_graph_incremental(
+///
+/// # Parameters
+/// - `upsert_nodes`: only the changed or newly added nodes (not the full graph)
+/// - `upsert_edges`: only the changed or newly added edges (not the full graph)
+/// - `deleted_edge_ids`: stable IDs of edges that reference removed/changed files — collected
+///   before the in-memory retain step in `update_graph_incrementally`
+/// - `deleted_files`: file paths whose symbols should be deleted from LanceDB
+pub(crate) async fn persist_graph_incremental(
     repo_root: &Path,
-    nodes: &[Node],
-    edges: &[Edge],
+    upsert_nodes: &[Node],
+    upsert_edges: &[Edge],
+    deleted_edge_ids: &[String],
+    deleted_files: &[PathBuf],
 ) -> anyhow::Result<()> {
     let db_path = graph_lance_path(repo_root);
     std::fs::create_dir_all(&db_path)?;
@@ -425,127 +435,164 @@ async fn persist_graph_incremental(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    // ── Upsert symbols (nodes) table ──
+    // ── Symbols (nodes) table: delete then upsert ──
     {
         let schema = Arc::new(symbols_schema());
 
-        let ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
-        let root_ids: Vec<String> = nodes.iter().map(|n| n.id.root.clone()).collect();
-        let file_paths: Vec<String> = nodes.iter().map(|n| n.id.file.display().to_string()).collect();
-        let names: Vec<String> = nodes.iter().map(|n| n.id.name.clone()).collect();
-        let kinds: Vec<String> = nodes.iter().map(|n| n.id.kind.to_string()).collect();
-        let line_starts: Vec<u32> = nodes.iter().map(|n| n.line_start as u32).collect();
-        let line_ends: Vec<u32> = nodes.iter().map(|n| n.line_end as u32).collect();
-        let signatures: Vec<String> = nodes.iter().map(|n| n.signature.clone()).collect();
-        let bodies: Vec<String> = nodes.iter().map(|n| n.body.clone()).collect();
-        let updated_ats: Vec<i64> = vec![now; nodes.len()];
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(ids)),
-                Arc::new(StringArray::from(root_ids)),
-                Arc::new(StringArray::from(file_paths)),
-                Arc::new(StringArray::from(names)),
-                Arc::new(StringArray::from(kinds)),
-                Arc::new(UInt32Array::from(line_starts)),
-                Arc::new(UInt32Array::from(line_ends)),
-                Arc::new(StringArray::from(signatures)),
-                Arc::new(StringArray::from(bodies)),
-                Arc::new(Int64Array::from(updated_ats)),
-            ],
-        )?;
-
-        match db.open_table("symbols").execute().await {
-            Ok(tbl) => {
-                let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-                let mut merge = tbl.merge_insert(&["id"]);
-                merge
-                    .when_matched_update_all(None)
-                    .when_not_matched_insert_all()
-                    .when_not_matched_by_source_delete(None);
-                merge
-                    .execute(Box::new(batches))
-                    .await
-                    .context("Failed to merge_insert symbols table")?;
+        // 1. Delete symbols for removed/changed files first so upsert is clean.
+        if !deleted_files.is_empty() {
+            if let Ok(tbl) = db.open_table("symbols").execute().await {
+                let quoted: Vec<String> = deleted_files
+                    .iter()
+                    .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
+                    .collect();
+                let predicate = format!("file_path IN ({})", quoted.join(", "));
+                if let Err(e) = tbl.delete(&predicate).await {
+                    tracing::warn!("Failed to delete symbols for removed files: {}", e);
+                }
             }
-            Err(_) => {
-                // Table doesn't exist yet — create it (first incremental run after a fresh repo)
-                let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-                db.create_table("symbols", Box::new(batches))
-                    .execute()
-                    .await
-                    .context("Failed to create symbols table")?;
+        }
+
+        // 2. Upsert changed/added nodes (insert new, update existing by stable id).
+        if !upsert_nodes.is_empty() {
+            let ids: Vec<String> = upsert_nodes.iter().map(|n| n.stable_id()).collect();
+            let root_ids: Vec<String> = upsert_nodes.iter().map(|n| n.id.root.clone()).collect();
+            let file_paths: Vec<String> = upsert_nodes.iter().map(|n| n.id.file.display().to_string()).collect();
+            let names: Vec<String> = upsert_nodes.iter().map(|n| n.id.name.clone()).collect();
+            let kinds: Vec<String> = upsert_nodes.iter().map(|n| n.id.kind.to_string()).collect();
+            let line_starts: Vec<u32> = upsert_nodes.iter().map(|n| n.line_start as u32).collect();
+            let line_ends: Vec<u32> = upsert_nodes.iter().map(|n| n.line_end as u32).collect();
+            let signatures: Vec<String> = upsert_nodes.iter().map(|n| n.signature.clone()).collect();
+            let bodies: Vec<String> = upsert_nodes.iter().map(|n| n.body.clone()).collect();
+            let updated_ats: Vec<i64> = vec![now; upsert_nodes.len()];
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(ids)),
+                    Arc::new(StringArray::from(root_ids)),
+                    Arc::new(StringArray::from(file_paths)),
+                    Arc::new(StringArray::from(names)),
+                    Arc::new(StringArray::from(kinds)),
+                    Arc::new(UInt32Array::from(line_starts)),
+                    Arc::new(UInt32Array::from(line_ends)),
+                    Arc::new(StringArray::from(signatures)),
+                    Arc::new(StringArray::from(bodies)),
+                    Arc::new(Int64Array::from(updated_ats)),
+                ],
+            )?;
+
+            match db.open_table("symbols").execute().await {
+                Ok(tbl) => {
+                    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+                    let mut merge = tbl.merge_insert(&["id"]);
+                    merge
+                        .when_matched_update_all(None)
+                        .when_not_matched_insert_all();
+                    // Note: no when_not_matched_by_source_delete — we only touch changed rows.
+                    // Untouched rows (unchanged files) are left alone.
+                    merge
+                        .execute(Box::new(batches))
+                        .await
+                        .context("Failed to merge_insert symbols table")?;
+                }
+                Err(_) => {
+                    // Table doesn't exist yet — create it (first incremental run after a fresh repo)
+                    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+                    db.create_table("symbols", Box::new(batches))
+                        .execute()
+                        .await
+                        .context("Failed to create symbols table")?;
+                }
             }
         }
     }
 
-    // ── Upsert edges table ──
+    // ── Edges table: delete then upsert ──
     {
         let schema = Arc::new(edges_schema());
 
-        let ids: Vec<String> = edges.iter().map(|e| e.stable_id()).collect();
-        let source_ids: Vec<String> = edges.iter().map(|e| e.from.to_stable_id()).collect();
-        let source_types: Vec<String> = edges.iter().map(|e| e.from.kind.to_string()).collect();
-        let target_ids: Vec<String> = edges.iter().map(|e| e.to.to_stable_id()).collect();
-        let target_types: Vec<String> = edges.iter().map(|e| e.to.kind.to_string()).collect();
-        let edge_types: Vec<String> = edges.iter().map(|e| e.kind.to_string()).collect();
-        let properties: Vec<String> = edges
-            .iter()
-            .map(|e| {
-                serde_json::json!({
-                    "source": e.source.to_string(),
-                    "confidence": e.confidence.to_string(),
-                })
-                .to_string()
-            })
-            .collect();
-        let root_ids: Vec<String> = edges.iter().map(|e| e.from.root.clone()).collect();
-        let updated_ats: Vec<i64> = vec![now; edges.len()];
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(ids)),
-                Arc::new(StringArray::from(source_ids)),
-                Arc::new(StringArray::from(source_types)),
-                Arc::new(StringArray::from(target_ids)),
-                Arc::new(StringArray::from(target_types)),
-                Arc::new(StringArray::from(edge_types)),
-                Arc::new(StringArray::from(properties)),
-                Arc::new(StringArray::from(root_ids)),
-                Arc::new(Int64Array::from(updated_ats)),
-            ],
-        )?;
-
-        match db.open_table("edges").execute().await {
-            Ok(tbl) => {
-                let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-                let mut merge = tbl.merge_insert(&["id"]);
-                merge
-                    .when_matched_update_all(None)
-                    .when_not_matched_insert_all()
-                    .when_not_matched_by_source_delete(None);
-                merge
-                    .execute(Box::new(batches))
-                    .await
-                    .context("Failed to merge_insert edges table")?;
+        // 1. Delete edges that referenced removed/changed files (by stable edge ID).
+        if !deleted_edge_ids.is_empty() {
+            if let Ok(tbl) = db.open_table("edges").execute().await {
+                let quoted: Vec<String> = deleted_edge_ids
+                    .iter()
+                    .map(|id| format!("'{}'", id.replace('\'', "''")))
+                    .collect();
+                let predicate = format!("id IN ({})", quoted.join(", "));
+                if let Err(e) = tbl.delete(&predicate).await {
+                    tracing::warn!("Failed to delete edges for removed files: {}", e);
+                }
             }
-            Err(_) => {
-                // Table doesn't exist yet — create it
-                let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-                db.create_table("edges", Box::new(batches))
-                    .execute()
-                    .await
-                    .context("Failed to create edges table")?;
+        }
+
+        // 2. Upsert changed/added edges.
+        if !upsert_edges.is_empty() {
+            let ids: Vec<String> = upsert_edges.iter().map(|e| e.stable_id()).collect();
+            let source_ids: Vec<String> = upsert_edges.iter().map(|e| e.from.to_stable_id()).collect();
+            let source_types: Vec<String> = upsert_edges.iter().map(|e| e.from.kind.to_string()).collect();
+            let target_ids: Vec<String> = upsert_edges.iter().map(|e| e.to.to_stable_id()).collect();
+            let target_types: Vec<String> = upsert_edges.iter().map(|e| e.to.kind.to_string()).collect();
+            let edge_types: Vec<String> = upsert_edges.iter().map(|e| e.kind.to_string()).collect();
+            let properties: Vec<String> = upsert_edges
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "source": e.source.to_string(),
+                        "confidence": e.confidence.to_string(),
+                    })
+                    .to_string()
+                })
+                .collect();
+            let root_ids: Vec<String> = upsert_edges.iter().map(|e| e.from.root.clone()).collect();
+            let updated_ats: Vec<i64> = vec![now; upsert_edges.len()];
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(ids)),
+                    Arc::new(StringArray::from(source_ids)),
+                    Arc::new(StringArray::from(source_types)),
+                    Arc::new(StringArray::from(target_ids)),
+                    Arc::new(StringArray::from(target_types)),
+                    Arc::new(StringArray::from(edge_types)),
+                    Arc::new(StringArray::from(properties)),
+                    Arc::new(StringArray::from(root_ids)),
+                    Arc::new(Int64Array::from(updated_ats)),
+                ],
+            )?;
+
+            match db.open_table("edges").execute().await {
+                Ok(tbl) => {
+                    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+                    let mut merge = tbl.merge_insert(&["id"]);
+                    merge
+                        .when_matched_update_all(None)
+                        .when_not_matched_insert_all();
+                    // Note: no when_not_matched_by_source_delete — untouched edges are preserved.
+                    merge
+                        .execute(Box::new(batches))
+                        .await
+                        .context("Failed to merge_insert edges table")?;
+                }
+                Err(_) => {
+                    // Table doesn't exist yet — create it
+                    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+                    db.create_table("edges", Box::new(batches))
+                        .execute()
+                        .await
+                        .context("Failed to create edges table")?;
+                }
             }
         }
     }
 
     tracing::info!(
-        "Incrementally persisted graph to LanceDB: {} nodes, {} edges",
-        nodes.len(),
-        edges.len()
+        "Incrementally persisted graph to LanceDB: {} upserted nodes, {} upserted edges, {} deleted files, {} deleted edges",
+        upsert_nodes.len(),
+        upsert_edges.len(),
+        deleted_files.len(),
+        deleted_edge_ids.len(),
     );
     Ok(())
 }
@@ -931,6 +978,17 @@ impl RnaHandler {
                         continue;
                     }
 
+                    // Collect LanceDB persist deltas per root (outside write guard so
+                    // persist_graph_incremental can run without holding the lock).
+                    // Structure: (root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove)
+                    let mut lance_deltas: Vec<(
+                        PathBuf,
+                        Vec<Node>,
+                        Vec<Edge>,
+                        Vec<String>,
+                        Vec<PathBuf>,
+                    )> = Vec::new();
+
                     let mut guard = graph.write().await;
                     if let Some(ref mut graph_state) = *guard {
                         let registry = ExtractorRegistry::with_builtins();
@@ -966,6 +1024,20 @@ impl RnaHandler {
                                 .chain(scan.changed_files.iter())
                                 .cloned()
                                 .collect();
+
+                            // Collect edge IDs to delete BEFORE retain (same pattern as foreground).
+                            let deleted_edge_ids: Vec<String> = graph_state
+                                .edges
+                                .iter()
+                                .filter(|e| {
+                                    e.from.root == *root_slug
+                                        && files_to_remove
+                                            .iter()
+                                            .any(|f| e.from.file == *f || e.to.file == *f)
+                                })
+                                .map(|e| e.stable_id())
+                                .collect();
+
                             graph_state.nodes.retain(|n| {
                                 n.id.root != *root_slug
                                     || !files_to_remove.iter().any(|f| n.id.file == *f)
@@ -984,8 +1056,18 @@ impl RnaHandler {
                                 edge.from.root = root_slug.clone();
                                 edge.to.root = root_slug.clone();
                             }
+                            let upsert_nodes = extraction.nodes.clone();
+                            let upsert_edges = extraction.edges.clone();
                             graph_state.nodes.extend(extraction.nodes);
                             graph_state.edges.extend(extraction.edges);
+
+                            lance_deltas.push((
+                                root_path.clone(),
+                                upsert_nodes,
+                                upsert_edges,
+                                deleted_edge_ids,
+                                files_to_remove,
+                            ));
                         }
 
                         // Rebuild petgraph index.
@@ -1004,6 +1086,21 @@ impl RnaHandler {
                         );
                     }
                     drop(guard);
+
+                    // Persist incremental deltas to LanceDB for each root (lock released above).
+                    for (root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove) in lance_deltas {
+                        if let Err(e) = persist_graph_incremental(
+                            &root_path,
+                            &upsert_nodes,
+                            &upsert_edges,
+                            &deleted_edge_ids,
+                            &files_to_remove,
+                        )
+                        .await
+                        {
+                            tracing::warn!("Background scan: failed to persist graph delta: {}", e);
+                        }
+                    }
 
                     // Purge removed worktree slugs from LanceDB.
                     if !removed_slugs.is_empty() {
@@ -1289,6 +1386,19 @@ impl RnaHandler {
             .cloned()
             .collect();
 
+        // Collect edge stable IDs for removed/changed files BEFORE retain, so we can
+        // delete them from LanceDB. (After retain they're gone from memory.)
+        let deleted_edge_ids: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                files_to_remove
+                    .iter()
+                    .any(|f| e.from.file == *f || e.to.file == *f)
+            })
+            .map(|e| e.stable_id())
+            .collect();
+
         graph
             .nodes
             .retain(|n| !files_to_remove.iter().any(|f| n.id.file == *f));
@@ -1300,6 +1410,9 @@ impl RnaHandler {
 
         // Extract new + changed files
         let extraction = registry.extract_scan_result(&self.repo_root, &scan);
+        // Track only the delta (new/changed) for LanceDB upsert — not the full graph.
+        let mut upsert_nodes: Vec<Node> = extraction.nodes.clone();
+        let mut upsert_edges: Vec<Edge> = extraction.edges.clone();
         graph.nodes.extend(extraction.nodes);
         graph.edges.extend(extraction.edges);
 
@@ -1348,6 +1461,8 @@ impl RnaHandler {
                 for vnode in &enrichment.new_nodes {
                     graph.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
                 }
+                // Include synthesized virtual nodes in the LanceDB upsert delta.
+                upsert_nodes.extend(enrichment.new_nodes.iter().cloned());
                 graph.nodes.extend(enrichment.new_nodes);
             }
 
@@ -1365,6 +1480,8 @@ impl RnaHandler {
                         edge.kind.clone(),
                     );
                 }
+                // Include LSP-synthesized edges in the LanceDB upsert delta.
+                upsert_edges.extend(enrichment.added_edges.iter().cloned());
                 graph.edges.extend(enrichment.added_edges);
             }
 
@@ -1389,6 +1506,17 @@ impl RnaHandler {
                         .filter(|n| enriched_node_ids.contains(&n.stable_id()))
                         .cloned()
                         .collect();
+                    // Also include LSP-enriched nodes in the LanceDB upsert delta so their
+                    // updated metadata (e.g. resolved signatures) is persisted.
+                    // Deduplicate against nodes already queued for upsert (extraction may overlap).
+                    let already_queued: std::collections::HashSet<String> =
+                        upsert_nodes.iter().map(|u| u.stable_id()).collect();
+                    let new_enriched: Vec<Node> = enriched_nodes
+                        .iter()
+                        .filter(|n| !already_queued.contains(&n.stable_id()))
+                        .cloned()
+                        .collect();
+                    upsert_nodes.extend(new_enriched);
                     match embed_idx.reindex_nodes(&enriched_nodes).await {
                         Ok(count) => tracing::info!(
                             "Re-embedded {} enriched nodes with LSP metadata",
@@ -1427,9 +1555,17 @@ impl RnaHandler {
             }
         }
 
-        // Persist updated graph incrementally (merge_insert keeps tables alive; no empty-result window)
-        if let Err(e) =
-            persist_graph_incremental(&self.repo_root, &graph.nodes, &graph.edges).await
+        // Persist updated graph incrementally — only the delta (changed/added nodes and edges).
+        // Untouched rows remain in LanceDB as-is. Deleted files are removed by targeted delete.
+        // merge_insert keeps tables alive; no empty-result query window.
+        if let Err(e) = persist_graph_incremental(
+            &self.repo_root,
+            &upsert_nodes,
+            &upsert_edges,
+            &deleted_edge_ids,
+            &files_to_remove,
+        )
+        .await
         {
             tracing::warn!("Failed to persist updated graph: {}", e);
         }
