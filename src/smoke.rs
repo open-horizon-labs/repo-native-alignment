@@ -868,8 +868,8 @@ async fn run_metadata_roundtrip_check() -> Check {
     }
 
     let mut meta = BTreeMap::new();
-    meta.insert("custom_key".to_string(), "custom_value".to_string());
-    meta.insert("priority".to_string(), "high".to_string());
+    meta.insert("value".to_string(), "42".to_string());
+    meta.insert("synthetic".to_string(), "false".to_string());
 
     let node = Node {
         id: NodeId {
