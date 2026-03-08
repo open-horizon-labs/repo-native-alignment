@@ -240,6 +240,9 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     // requires feat/rna-worktree-awareness to be merged
     checks.push(run_worktree_check(&repo).await);
 
+    // 13. LSP virtual external nodes round-trip through LanceDB
+    checks.push(run_external_calls_check().await);
+
     Ok(print_and_return(args, checks))
 }
 
@@ -506,6 +509,159 @@ fn cleanup_worktree(repo: &Path, worktree_path: &Path) {
         .args(["branch", "-D", "smoke-test-branch"])
         .current_dir(repo)
         .output();
+}
+
+/// External calls check: verifies that LSP virtual external nodes survive a
+/// LanceDB round-trip (persist → reload).
+///
+/// The check uses a synthetic virtual node so it works even when
+/// rust-analyzer is not installed. It exercises the same code paths that
+/// live LSP enrichment uses, without spawning a language server.
+///
+/// Asserts after reload:
+/// - At least one node with `id.root == "external"`
+/// - That node has `metadata["virtual"] == "true"`
+/// - That node's name contains `"::"` (FQN, e.g. `lancedb::connect`)
+async fn run_external_calls_check() -> Check {
+    use arrow_array::{Array, BooleanArray, StringArray};
+    use futures::TryStreamExt;
+    use lancedb::query::ExecutableQuery;
+    use std::collections::BTreeMap;
+    use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+
+    let temp_dir = std::env::temp_dir().join("rna-smoke-external-calls");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+        return Check::fail("external_calls_persist", format!("Could not create temp dir: {}", e));
+    }
+
+    // Synthesise a virtual node that mimics what LspEnricher produces for an
+    // external dependency call (e.g. `lancedb::connect`).
+    let mut meta = BTreeMap::new();
+    meta.insert("virtual".to_string(), "true".to_string());
+    meta.insert("package".to_string(), "lancedb".to_string());
+
+    let virtual_node = Node {
+        id: NodeId {
+            root: "external".to_string(),
+            file: std::path::PathBuf::new(),
+            name: "lancedb::connect".to_string(),
+            kind: NodeKind::Function,
+        },
+        language: "rust".to_string(),
+        line_start: 0,
+        line_end: 0,
+        signature: "lancedb::connect".to_string(),
+        body: String::new(),
+        metadata: meta,
+        source: ExtractionSource::Lsp,
+    };
+
+    // Step 1: Persist the virtual node via persist_graph_incremental.
+    if let Err(e) = persist_graph_incremental(
+        &temp_dir,
+        &[virtual_node],
+        &[],
+        &[],
+        &[],
+    ).await {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return Check::fail("external_calls_persist", format!("persist_graph_incremental failed: {}", e));
+    }
+
+    // Step 2: Reload from LanceDB — simulates a server restart.
+    let db_path = graph_lance_path(&temp_dir);
+    let db = match lancedb::connect(db_path.to_str().unwrap_or("")).execute().await {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Check::fail("external_calls_persist", format!("Could not open LanceDB: {}", e));
+        }
+    };
+    let table = match db.open_table("symbols").execute().await {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Check::fail("external_calls_persist", format!("Could not open symbols table: {}", e));
+        }
+    };
+    let stream = match table.query().execute().await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Check::fail("external_calls_persist", format!("Could not query symbols: {}", e));
+        }
+    };
+    let batches: Vec<arrow_array::RecordBatch> = match stream.try_collect().await {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Check::fail("external_calls_persist", format!("Could not collect batches: {}", e));
+        }
+    };
+
+    // Step 3: Assert the virtual node is present with correct fields.
+    let mut found_root_external = false;
+    let mut found_virtual_true = false;
+    let mut found_fqn = false;
+
+    for batch in &batches {
+        let root_ids = match batch.column_by_name("root_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        {
+            Some(a) => a,
+            None => continue,
+        };
+        let names = match batch.column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        {
+            Some(a) => a,
+            None => continue,
+        };
+        // Typed meta_virtual column — Boolean, nullable.
+        let meta_virtual_col = batch.column_by_name("meta_virtual")
+            .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
+
+        for i in 0..batch.num_rows() {
+            let root = root_ids.value(i);
+            let name = names.value(i);
+            if root == "external" && name.contains("::") {
+                found_root_external = true;
+                found_fqn = true;
+                // Check meta_virtual typed column for true
+                if let Some(col) = meta_virtual_col {
+                    if !col.is_null(i) && col.value(i) {
+                        found_virtual_true = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    if !found_root_external {
+        Check::fail(
+            "external_calls_persist",
+            "Virtual external node (root='external') not found in LanceDB after persist",
+        )
+    } else if !found_fqn {
+        Check::fail(
+            "external_calls_persist",
+            "Virtual external node name does not contain '::' (expected FQN like lancedb::connect)",
+        )
+    } else if !found_virtual_true {
+        Check::fail(
+            "external_calls_persist",
+            "Virtual external node meta_virtual != true after LanceDB round-trip — \
+             meta_virtual column missing or not populated in persist path",
+        )
+    } else {
+        Check::pass(
+            "external_calls_persist",
+            "Virtual external node round-tripped correctly: root=external, FQN name, meta_virtual=true",
+        )
+    }
 }
 
 // ── Output ──────────────────────────────────────────────────────────

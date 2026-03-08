@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
-use arrow_array::{RecordBatch, RecordBatchIterator, StringArray, UInt32Array, Int64Array};
+use arrow_array::{Array, BooleanArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array, Int64Array};
 use async_trait::async_trait;
 use rust_mcp_sdk::macros::{self, JsonSchema};
 use rust_mcp_sdk::McpServer;
@@ -319,6 +319,15 @@ async fn persist_graph_to_lance(
         let line_ends: Vec<u32> = nodes.iter().map(|n| n.line_end as u32).collect();
         let signatures: Vec<String> = nodes.iter().map(|n| n.signature.clone()).collect();
         let bodies: Vec<String> = nodes.iter().map(|n| n.body.clone()).collect();
+        let meta_virtuals: Vec<Option<bool>> = nodes.iter()
+            .map(|n| if n.metadata.get("virtual").map(|v| v.as_str()) == Some("true") { Some(true) } else { None })
+            .collect();
+        let meta_packages: Vec<Option<String>> = nodes.iter()
+            .map(|n| n.metadata.get("package").cloned())
+            .collect();
+        let meta_name_cols: Vec<Option<i32>> = nodes.iter()
+            .map(|n| n.metadata.get("name_col").and_then(|s| s.parse::<i32>().ok()))
+            .collect();
         let updated_ats: Vec<i64> = vec![now; nodes.len()];
 
         let batch = RecordBatch::try_new(
@@ -333,6 +342,9 @@ async fn persist_graph_to_lance(
                 Arc::new(UInt32Array::from(line_ends)),
                 Arc::new(StringArray::from(signatures)),
                 Arc::new(StringArray::from(bodies)),
+                Arc::new(BooleanArray::from(meta_virtuals)),
+                Arc::new(StringArray::from(meta_packages)),
+                Arc::new(Int32Array::from(meta_name_cols)),
                 Arc::new(Int64Array::from(updated_ats)),
             ],
         )?;
@@ -464,6 +476,15 @@ pub(crate) async fn persist_graph_incremental(
             let line_ends: Vec<u32> = upsert_nodes.iter().map(|n| n.line_end as u32).collect();
             let signatures: Vec<String> = upsert_nodes.iter().map(|n| n.signature.clone()).collect();
             let bodies: Vec<String> = upsert_nodes.iter().map(|n| n.body.clone()).collect();
+            let meta_virtuals: Vec<Option<bool>> = upsert_nodes.iter()
+                .map(|n| if n.metadata.get("virtual").map(|v| v.as_str()) == Some("true") { Some(true) } else { None })
+                .collect();
+            let meta_packages: Vec<Option<String>> = upsert_nodes.iter()
+                .map(|n| n.metadata.get("package").cloned())
+                .collect();
+            let meta_name_cols: Vec<Option<i32>> = upsert_nodes.iter()
+                .map(|n| n.metadata.get("name_col").and_then(|s| s.parse::<i32>().ok()))
+                .collect();
             let updated_ats: Vec<i64> = vec![now; upsert_nodes.len()];
 
             let batch = RecordBatch::try_new(
@@ -478,6 +499,9 @@ pub(crate) async fn persist_graph_incremental(
                     Arc::new(UInt32Array::from(line_ends)),
                     Arc::new(StringArray::from(signatures)),
                     Arc::new(StringArray::from(bodies)),
+                    Arc::new(BooleanArray::from(meta_virtuals)),
+                    Arc::new(StringArray::from(meta_packages)),
+                    Arc::new(Int32Array::from(meta_name_cols)),
                     Arc::new(Int64Array::from(updated_ats)),
                 ],
             )?;
@@ -633,12 +657,35 @@ async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphState> {
             let line_ends = batch.column_by_name("line_end").unwrap().as_any().downcast_ref::<UInt32Array>().unwrap();
             let signatures = batch.column_by_name("signature").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
             let bodies = batch.column_by_name("body").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            // Typed metadata columns — Arrow type safety, no JSON blobs for known fields.
+            let meta_virtual_col = batch.column_by_name("meta_virtual")
+                .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
+            let meta_package_col = batch.column_by_name("meta_package")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let meta_name_col_col = batch.column_by_name("meta_name_col")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
             // We don't store language or source in the symbols schema, so we infer from file extension
             let _ = ids; // ids column exists but we reconstruct from components
 
             for i in 0..batch.num_rows() {
                 let file_path = PathBuf::from(file_paths.value(i));
                 let language = infer_language_from_path(&file_path);
+                let mut metadata: BTreeMap<String, String> = BTreeMap::new();
+                if let Some(col) = meta_virtual_col {
+                    if !col.is_null(i) && col.value(i) {
+                        metadata.insert("virtual".to_string(), "true".to_string());
+                    }
+                }
+                if let Some(col) = meta_package_col {
+                    if !col.is_null(i) {
+                        metadata.insert("package".to_string(), col.value(i).to_string());
+                    }
+                }
+                if let Some(col) = meta_name_col_col {
+                    if !col.is_null(i) {
+                        metadata.insert("name_col".to_string(), col.value(i).to_string());
+                    }
+                }
                 nodes.push(Node {
                     id: NodeId {
                         root: root_ids.value(i).to_string(),
@@ -651,7 +698,7 @@ async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphState> {
                     line_end: line_ends.value(i) as usize,
                     signature: signatures.value(i).to_string(),
                     body: bodies.value(i).to_string(),
-                    metadata: BTreeMap::new(),
+                    metadata,
                     source: ExtractionSource::TreeSitter, // default; not stored in schema
                 });
             }
