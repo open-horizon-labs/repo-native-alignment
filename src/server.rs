@@ -289,7 +289,7 @@ async fn delete_nodes_for_roots(repo_root: &Path, slugs: &[String]) -> anyhow::R
 }
 
 /// Persist graph nodes and edges to LanceDB tables.
-async fn persist_graph_to_lance(
+pub(crate) async fn persist_graph_to_lance(
     repo_root: &Path,
     nodes: &[Node],
     edges: &[Edge],
@@ -363,17 +363,8 @@ async fn persist_graph_to_lance(
         let target_ids: Vec<String> = edges.iter().map(|e| e.to.to_stable_id()).collect();
         let target_types: Vec<String> = edges.iter().map(|e| e.to.kind.to_string()).collect();
         let edge_types: Vec<String> = edges.iter().map(|e| e.kind.to_string()).collect();
-        // Store source and confidence in properties_json
-        let properties: Vec<String> = edges
-            .iter()
-            .map(|e| {
-                serde_json::json!({
-                    "source": e.source.to_string(),
-                    "confidence": e.confidence.to_string(),
-                })
-                .to_string()
-            })
-            .collect();
+        let edge_sources: Vec<String> = edges.iter().map(|e| e.source.to_string()).collect();
+        let edge_confidences: Vec<String> = edges.iter().map(|e| e.confidence.to_string()).collect();
         let root_ids: Vec<String> = edges.iter().map(|e| e.from.root.clone()).collect();
         let updated_ats: Vec<i64> = vec![now; edges.len()];
 
@@ -386,7 +377,8 @@ async fn persist_graph_to_lance(
                 Arc::new(StringArray::from(target_ids)),
                 Arc::new(StringArray::from(target_types)),
                 Arc::new(StringArray::from(edge_types)),
-                Arc::new(StringArray::from(properties)),
+                Arc::new(StringArray::from(edge_sources)),
+                Arc::new(StringArray::from(edge_confidences)),
                 Arc::new(StringArray::from(root_ids)),
                 Arc::new(Int64Array::from(updated_ats)),
             ],
@@ -542,16 +534,8 @@ pub(crate) async fn persist_graph_incremental(
             let target_ids: Vec<String> = upsert_edges.iter().map(|e| e.to.to_stable_id()).collect();
             let target_types: Vec<String> = upsert_edges.iter().map(|e| e.to.kind.to_string()).collect();
             let edge_types: Vec<String> = upsert_edges.iter().map(|e| e.kind.to_string()).collect();
-            let properties: Vec<String> = upsert_edges
-                .iter()
-                .map(|e| {
-                    serde_json::json!({
-                        "source": e.source.to_string(),
-                        "confidence": e.confidence.to_string(),
-                    })
-                    .to_string()
-                })
-                .collect();
+            let edge_sources: Vec<String> = upsert_edges.iter().map(|e| e.source.to_string()).collect();
+            let edge_confidences: Vec<String> = upsert_edges.iter().map(|e| e.confidence.to_string()).collect();
             let root_ids: Vec<String> = upsert_edges.iter().map(|e| e.from.root.clone()).collect();
             let updated_ats: Vec<i64> = vec![now; upsert_edges.len()];
 
@@ -564,7 +548,8 @@ pub(crate) async fn persist_graph_incremental(
                     Arc::new(StringArray::from(target_ids)),
                     Arc::new(StringArray::from(target_types)),
                     Arc::new(StringArray::from(edge_types)),
-                    Arc::new(StringArray::from(properties)),
+                    Arc::new(StringArray::from(edge_sources)),
+                    Arc::new(StringArray::from(edge_confidences)),
                     Arc::new(StringArray::from(root_ids)),
                     Arc::new(Int64Array::from(updated_ats)),
                 ],
@@ -606,7 +591,7 @@ pub(crate) async fn persist_graph_incremental(
 }
 
 /// Load graph nodes and edges from LanceDB tables.
-async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphState> {
+pub(crate) async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphState> {
     use futures::TryStreamExt;
     use lancedb::query::ExecutableQuery;
 
@@ -694,7 +679,8 @@ async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphState> {
             let target_ids = batch.column_by_name("target_id").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
             let target_types = batch.column_by_name("target_type").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
             let edge_types = batch.column_by_name("edge_type").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-            let properties = batch.column_by_name("properties_json").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let edge_sources = batch.column_by_name("edge_source").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let edge_confidences = batch.column_by_name("edge_confidence").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
             let root_ids = batch.column_by_name("root_id").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
 
             for i in 0..batch.num_rows() {
@@ -703,16 +689,8 @@ async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphState> {
                     None => continue,
                 };
 
-                // Parse source and confidence from properties_json
-                let props: serde_json::Value = serde_json::from_str(properties.value(i)).unwrap_or_default();
-                let extraction_source = props.get("source")
-                    .and_then(|v| v.as_str())
-                    .map(parse_extraction_source)
-                    .unwrap_or(ExtractionSource::TreeSitter);
-                let confidence = props.get("confidence")
-                    .and_then(|v| v.as_str())
-                    .map(parse_confidence)
-                    .unwrap_or(Confidence::Detected);
+                let extraction_source = parse_extraction_source(edge_sources.value(i));
+                let confidence = parse_confidence(edge_confidences.value(i));
 
                 // Parse NodeId from stable_id format: "root:file:name:kind"
                 let from = parse_node_id_from_stable(source_ids.value(i), source_types.value(i), root_ids.value(i));
