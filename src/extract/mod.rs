@@ -112,9 +112,10 @@ pub trait Enricher: Send + Sync {
 
     /// Enrich the graph with additional edges and metadata.
     ///
-    /// Receives the current nodes and the graph index for lookup.
+    /// Receives the current nodes, the graph index for lookup, and the actual
+    /// repo root (from `--repo`, not `std::env::current_dir()`).
     /// Returns new edges and node metadata patches.
-    async fn enrich(&self, nodes: &[Node], index: &GraphIndex) -> Result<EnrichmentResult>;
+    async fn enrich(&self, nodes: &[Node], index: &GraphIndex, repo_root: &Path) -> Result<EnrichmentResult>;
 
     /// Human-readable name for this enricher (for diagnostics).
     fn name(&self) -> &str;
@@ -349,12 +350,14 @@ impl EnricherRegistry {
 
     /// Run all enrichers that support the given languages present in the graph.
     ///
+    /// `repo_root` must be the actual project root (from `--repo`), not `cwd`.
     /// Returns a merged `EnrichmentResult` from all enrichers.
     pub async fn enrich_all(
         &self,
         nodes: &[Node],
         index: &GraphIndex,
         languages: &[String],
+        repo_root: &Path,
     ) -> EnrichmentResult {
         let mut result = EnrichmentResult::default();
 
@@ -374,7 +377,7 @@ impl EnricherRegistry {
                 continue; // silently skip — too many servers to log each one
             }
 
-            match enricher.enrich(nodes, index).await {
+            match enricher.enrich(nodes, index, repo_root).await {
                 Ok(enrichment) => {
                     tracing::info!(
                         "Enricher {}: {} edges, {} node patches",

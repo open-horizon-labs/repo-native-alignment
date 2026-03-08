@@ -1007,7 +1007,7 @@ impl RnaHandler {
 
         let enricher_registry = EnricherRegistry::with_builtins();
         let enrichment = enricher_registry
-            .enrich_all(&all_nodes, &index, &languages)
+            .enrich_all(&all_nodes, &index, &languages, &self.repo_root)
             .await;
 
         if !enrichment.added_edges.is_empty() {
@@ -1162,7 +1162,7 @@ impl RnaHandler {
 
             let enricher_registry = EnricherRegistry::with_builtins();
             let enrichment = enricher_registry
-                .enrich_all(&changed_nodes, &graph.index, &languages)
+                .enrich_all(&changed_nodes, &graph.index, &languages, &self.repo_root)
                 .await;
 
             if !enrichment.added_edges.is_empty() {
