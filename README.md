@@ -228,8 +228,10 @@ No cloud dependency. Everything local, git-versioned, disposable.
 - 8 extractors: Rust, Python, TypeScript, Go, Markdown, Proto, SQL, OpenAPI
 - LSP enrichment: 252 `Calls` edges via rust-analyzer `callHierarchy/incomingCalls` (pyright, tsserver, gopls, marksman registered)
 - `graph_query(mode: "impact")` finds real callers across the codebase
-- Graph persisted to LanceDB (`.oh/.cache/lance/`) — loads in <1s on restart
-- Incremental scanner with mtime skip + git optimization + configurable excludes
+- Graph + embeddings persisted to LanceDB — loads in <1s on restart, no re-embedding
+- Incremental updates within a session — edit a file, next tool call reflects it
+- Background scanner (15min) keeps index warm during long sessions
+- Scanner uses mtime skip + git diff optimization + configurable excludes
 - Multi-root workspace scanning via `~/.config/rna/roots.toml`
 - Semantic search via local embeddings (no API key)
 - Context auto-injected on first MCP tool call — agents always see business context
