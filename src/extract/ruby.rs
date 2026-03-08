@@ -9,6 +9,7 @@ use anyhow::Result;
 
 use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
 
+use super::string_literals::harvest_string_literals;
 use super::{ExtractionResult, Extractor};
 
 pub struct RubyExtractor;
@@ -39,6 +40,17 @@ impl Extractor for RubyExtractor {
         let source = content.as_bytes();
 
         collect_nodes(tree.root_node(), path, source, None, &mut nodes);
+
+        // Harvest string literals as synthetic Const nodes
+        harvest_string_literals(
+            tree.root_node(),
+            path,
+            source,
+            "ruby",
+            "string_content",
+            None,
+            &mut nodes,
+        );
 
         Ok(ExtractionResult { nodes, edges: Vec::new() })
     }

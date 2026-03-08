@@ -10,6 +10,7 @@
 pub mod bash;
 pub mod cpp;
 pub mod csharp;
+pub mod string_literals;
 pub mod go;
 pub mod hcl;
 pub mod java;
@@ -512,5 +513,72 @@ mod tests {
         };
         a.merge(b);
         assert_eq!(a.nodes.len(), 1);
+    }
+
+    #[test]
+    fn test_string_literals_captured_as_synthetic_consts() {
+        // Verify that string literals (len > 3) are captured as synthetic Const nodes.
+        let registry = ExtractorRegistry::with_builtins();
+        let code = "fn handle() {\n    let ct = \"application/json\";\n    let m = \"POST\";\n    let s = \"ok\";\n}\n";
+        let result = registry.extract_file(Path::new("handler.rs"), code);
+        let synthetic: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.id.kind == crate::graph::NodeKind::Const
+                    && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("true")
+            })
+            .collect();
+        assert!(
+            !synthetic.is_empty(),
+            "Should capture string literals as synthetic Const nodes"
+        );
+        assert!(
+            synthetic.iter().any(|n| n.id.name == "application/json"),
+            "Should capture 'application/json'"
+        );
+        assert!(
+            synthetic.iter().any(|n| n.id.name == "POST"),
+            "Should capture 'POST' (len=4 > 3)"
+        );
+        assert!(
+            !synthetic.iter().any(|n| n.id.name == "ok"),
+            "Should NOT capture 'ok' (len=2 <= 3)"
+        );
+    }
+
+    #[test]
+    fn test_string_literals_captured_across_languages() {
+        let registry = ExtractorRegistry::with_builtins();
+        // Python
+        let py_result = registry.extract_file(
+            Path::new("handler.py"),
+            "def handle():\n    ct = \"application/json\"\n",
+        );
+        assert!(
+            py_result.nodes.iter().any(|n| n.id.kind == crate::graph::NodeKind::Const
+                && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("true")),
+            "Python should capture string literals"
+        );
+        // TypeScript
+        let ts_result = registry.extract_file(
+            Path::new("handler.ts"),
+            "function handle() {\n    const ct = \"application/json\";\n}\n",
+        );
+        assert!(
+            ts_result.nodes.iter().any(|n| n.id.kind == crate::graph::NodeKind::Const
+                && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("true")),
+            "TypeScript should capture string literals"
+        );
+        // Go
+        let go_result = registry.extract_file(
+            Path::new("handler.go"),
+            "package main\nfunc handle() {\n    ct := \"application/json\"\n}\n",
+        );
+        assert!(
+            go_result.nodes.iter().any(|n| n.id.kind == crate::graph::NodeKind::Const
+                && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("true")),
+            "Go should capture string literals"
+        );
     }
 }
