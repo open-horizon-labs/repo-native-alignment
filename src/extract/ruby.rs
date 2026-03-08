@@ -9,6 +9,7 @@ use anyhow::Result;
 
 use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
 
+use super::string_literals::harvest_string_literals;
 use super::{ExtractionResult, Extractor};
 
 pub struct RubyExtractor;
@@ -39,6 +40,20 @@ impl Extractor for RubyExtractor {
         let source = content.as_bytes();
 
         collect_nodes(tree.root_node(), path, source, None, &mut nodes);
+
+        // Harvest string literals as synthetic Const nodes.
+        // Use "string" as the outer node kind and "string_content" as the content child
+        // so that harvest_rec's non-recursion guard fires on the outer "string" node,
+        // consistent with Kotlin/Rust/C++ patterns.
+        harvest_string_literals(
+            tree.root_node(),
+            path,
+            source,
+            "ruby",
+            "string",
+            Some("string_content"),
+            &mut nodes,
+        );
 
         Ok(ExtractionResult { nodes, edges: Vec::new() })
     }
@@ -137,6 +152,52 @@ fn collect_nodes(
                     }
                 }
                 return;
+            }
+        }
+        "assignment" => {
+            // Ruby constants: `MAX_RETRIES = 5` (uppercase first letter)
+            if let Some(lhs) = node.child_by_field_name("left") {
+                // `constant` node kind in Ruby tree-sitter
+                if lhs.kind() == "constant" {
+                    let name_str = lhs.utf8_text(source).unwrap_or("").trim().to_string();
+                    if !name_str.is_empty() && name_str.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
+                        let body = node.utf8_text(source).unwrap_or("").to_string();
+                        let sig = body.lines().next().unwrap_or("").trim().to_string();
+                        let qualified = match scope {
+                            Some(s) => format!("{}::{}", s, name_str),
+                            None => name_str.clone(),
+                        };
+                        let value_str = node.child_by_field_name("right")
+                            .and_then(|v| v.utf8_text(source).ok())
+                            .map(|s| s.trim().to_string());
+                        let mut metadata = BTreeMap::new();
+                        if let Some(ref v) = value_str {
+                            let is_scalar = v.starts_with('"') || v.starts_with('\'') || v.starts_with(':')
+                                || v.parse::<f64>().is_ok()
+                                || v == "true" || v == "false";
+                            if is_scalar {
+                                let stripped = v.trim_matches('"').trim_matches('\'');
+                                metadata.insert("value".to_string(), stripped.to_string());
+                            }
+                        }
+                        metadata.insert("synthetic".to_string(), "false".to_string());
+                        nodes.push(Node {
+                            id: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: qualified,
+                                kind: NodeKind::Const,
+                            },
+                            language: "ruby".to_string(),
+                            line_start: node.start_position().row + 1,
+                            line_end: node.end_position().row + 1,
+                            signature: sig,
+                            body,
+                            metadata,
+                            source: ExtractionSource::TreeSitter,
+                        });
+                    }
+                }
             }
         }
         _ => {}

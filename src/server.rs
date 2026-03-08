@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use arrow_array::{Array, BooleanArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array, Int64Array};
+use arrow_array::builder::BooleanBuilder;
 use async_trait::async_trait;
 use rust_mcp_sdk::macros::{self, JsonSchema};
 use rust_mcp_sdk::McpServer;
@@ -143,6 +144,9 @@ pub struct SearchSymbols {
     /// Maximum results to return (default: 20)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// If true, include only synthetic (inferred) constants. If false, exclude them. If absent, return all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthetic: Option<bool>,
 }
 
 #[macros::mcp_tool(
@@ -334,6 +338,14 @@ pub(crate) async fn persist_graph_to_lance(
         let meta_name_cols: Vec<Option<i32>> = nodes.iter()
             .map(|n| n.metadata.get("name_col").and_then(|s| s.parse::<i32>().ok()))
             .collect();
+        let values: Vec<Option<String>> = nodes.iter().map(|n| n.metadata.get("value").cloned()).collect();
+        let mut synthetic_builder = BooleanBuilder::new();
+        for n in nodes.iter() {
+            match n.metadata.get("synthetic") {
+                Some(v) => synthetic_builder.append_value(v == "true"),
+                None => synthetic_builder.append_null(),
+            }
+        }
         let updated_ats: Vec<i64> = vec![now; nodes.len()];
 
         let batch = RecordBatch::try_new(
@@ -351,6 +363,8 @@ pub(crate) async fn persist_graph_to_lance(
                 Arc::new(BooleanArray::from(meta_virtuals)),
                 Arc::new(StringArray::from(meta_packages)),
                 Arc::new(Int32Array::from(meta_name_cols)),
+                Arc::new(StringArray::from(values)),
+                Arc::new(synthetic_builder.finish()),
                 Arc::new(Int64Array::from(updated_ats)),
             ],
         )?;
@@ -483,6 +497,14 @@ pub(crate) async fn persist_graph_incremental(
             let meta_name_cols: Vec<Option<i32>> = upsert_nodes.iter()
                 .map(|n| n.metadata.get("name_col").and_then(|s| s.parse::<i32>().ok()))
                 .collect();
+            let values: Vec<Option<String>> = upsert_nodes.iter().map(|n| n.metadata.get("value").cloned()).collect();
+            let mut synthetic_builder = BooleanBuilder::new();
+            for n in upsert_nodes.iter() {
+                match n.metadata.get("synthetic") {
+                    Some(v) => synthetic_builder.append_value(v == "true"),
+                    None => synthetic_builder.append_null(),
+                }
+            }
             let updated_ats: Vec<i64> = vec![now; upsert_nodes.len()];
 
             let batch = RecordBatch::try_new(
@@ -500,6 +522,8 @@ pub(crate) async fn persist_graph_incremental(
                     Arc::new(BooleanArray::from(meta_virtuals)),
                     Arc::new(StringArray::from(meta_packages)),
                     Arc::new(Int32Array::from(meta_name_cols)),
+                    Arc::new(StringArray::from(values)),
+                    Arc::new(synthetic_builder.finish()),
                     Arc::new(Int64Array::from(updated_ats)),
                 ],
             )?;
@@ -658,6 +682,12 @@ pub(crate) async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<Gr
             // We don't store language or source in the symbols schema, so we infer from file extension
             let _ = ids; // ids column exists but we reconstruct from components
 
+            // Read optional value and synthetic columns (present after schema migration)
+            let value_col = batch.column_by_name("value")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let synthetic_col = batch.column_by_name("synthetic")
+                .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
+
             for i in 0..batch.num_rows() {
                 let file_path = PathBuf::from(file_paths.value(i));
                 let language = infer_language_from_path(&file_path);
@@ -675,6 +705,16 @@ pub(crate) async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<Gr
                 if let Some(col) = meta_name_col_col {
                     if !col.is_null(i) {
                         metadata.insert("name_col".to_string(), col.value(i).to_string());
+                    }
+                }
+                if let Some(col) = value_col {
+                    if !col.is_null(i) {
+                        metadata.insert("value".to_string(), col.value(i).to_string());
+                    }
+                }
+                if let Some(col) = synthetic_col {
+                    if !col.is_null(i) {
+                        metadata.insert("synthetic".to_string(), if col.value(i) { "true" } else { "false" }.to_string());
                     }
                 }
                 nodes.push(Node {
@@ -2070,6 +2110,12 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                         return false;
                                     }
                                 }
+                                if let Some(synthetic_filter) = args.synthetic {
+                                    let is_synthetic = n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false);
+                                    if is_synthetic != synthetic_filter {
+                                        return false;
+                                    }
+                                }
                                 true
                             })
                             .collect();
@@ -2106,6 +2152,12 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                     );
                                     if !n.signature.is_empty() {
                                         entry.push_str(&format!("\n  Sig: `{}`", n.signature));
+                                    }
+                                    if let Some(val) = n.metadata.get("value") {
+                                        entry.push_str(&format!("\n  Value: `{}`", val));
+                                    }
+                                    if n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false) {
+                                        entry.push_str(" *(literal)*");
                                     }
                                     if !outgoing.is_empty() {
                                         entry.push_str(&format!("\n  Out: {} edge(s)", outgoing.len()));

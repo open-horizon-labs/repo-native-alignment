@@ -11,6 +11,7 @@ use crate::graph::{
     Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
 };
 
+use super::string_literals::harvest_string_literals;
 use super::{ExtractionResult, Extractor};
 
 pub struct JavaExtractor;
@@ -42,6 +43,17 @@ impl Extractor for JavaExtractor {
         let source = content.as_bytes();
 
         collect_nodes(tree.root_node(), path, source, None, &mut nodes, &mut edges);
+
+        // Harvest string literals as synthetic Const nodes
+        harvest_string_literals(
+            tree.root_node(),
+            path,
+            source,
+            "java",
+            "string_literal",
+            None,
+            &mut nodes,
+        );
 
         Ok(ExtractionResult { nodes, edges })
     }
@@ -203,6 +215,59 @@ fn collect_nodes(
                     metadata,
                     source: ExtractionSource::TreeSitter,
                 });
+            }
+        }
+        "field_declaration" => {
+            // static final fields are Java constants: `public static final int MAX = 5;`
+            let decl_text = node.utf8_text(source).unwrap_or("").to_string();
+            let has_static = decl_text.contains("static") && decl_text.contains("final");
+            if has_static {
+                // Find the variable_declarator child for name/value
+                for i in 0..node.child_count() {
+                    if let Some(decl) = node.child(i as u32) {
+                        if decl.kind() == "variable_declarator" {
+                            if let Some(name_node) = decl.child_by_field_name("name") {
+                                let name = name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
+                                let qualified = match class_scope {
+                                    Some(cls) => format!("{}.{}", cls, name),
+                                    None => name,
+                                };
+                                let sig = decl_text.lines().next().unwrap_or("").trim().to_string();
+                                let value_str = decl
+                                    .child_by_field_name("value")
+                                    .and_then(|v| v.utf8_text(source).ok())
+                                    .map(|s| s.trim().to_string());
+                                let mut metadata = BTreeMap::new();
+                                metadata.insert("name_col".to_string(), name_node.start_position().column.to_string());
+                                if let Some(ref v) = value_str {
+                                    let is_scalar = v.starts_with('"') || v.starts_with('\'')
+                                        || v.parse::<f64>().is_ok()
+                                        || v == "true" || v == "false";
+                                    if is_scalar {
+                                        let stripped = v.trim_matches('"').trim_matches('\'');
+                                        metadata.insert("value".to_string(), stripped.to_string());
+                                    }
+                                }
+                                metadata.insert("synthetic".to_string(), "false".to_string());
+                                nodes.push(Node {
+                                    id: NodeId {
+                                        root: String::new(),
+                                        file: path.to_path_buf(),
+                                        name: qualified,
+                                        kind: NodeKind::Const,
+                                    },
+                                    language: "java".to_string(),
+                                    line_start: node.start_position().row + 1,
+                                    line_end: node.end_position().row + 1,
+                                    signature: sig,
+                                    body: decl_text.clone(),
+                                    metadata,
+                                    source: ExtractionSource::TreeSitter,
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
         "import_declaration" => {

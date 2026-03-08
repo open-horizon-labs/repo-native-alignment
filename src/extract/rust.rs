@@ -13,6 +13,7 @@ use crate::graph::{
     Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
 };
 
+use super::string_literals::harvest_string_literals;
 use super::{ExtractionResult, Extractor};
 
 /// Rust tree-sitter extractor with topology pattern detection.
@@ -57,6 +58,18 @@ impl Extractor for RustExtractor {
 
         // Topology pattern detection
         detect_topology_patterns(tree.root_node(), path, source, &mut edges);
+
+        // Harvest string literals as synthetic Const nodes
+        // Rust: string_literal node, value lives in string_content child
+        harvest_string_literals(
+            tree.root_node(),
+            path,
+            source,
+            "rust",
+            "string_literal",
+            Some("string_content"),
+            &mut nodes,
+        );
 
         Ok(ExtractionResult { nodes, edges })
     }
@@ -108,6 +121,16 @@ fn collect_nodes(
                 "name_col".to_string(),
                 name_node.start_position().column.to_string(),
             );
+        }
+        // For const items, extract the value from the AST and mark synthetic = false.
+        if node_kind == NodeKind::Const {
+            if let Some(val_node) = node.child_by_field_name("value") {
+                let val = val_node.utf8_text(source).unwrap_or("").trim().to_string();
+                if !val.is_empty() {
+                    metadata.insert("value".to_string(), val);
+                }
+            }
+            metadata.insert("synthetic".to_string(), "false".to_string());
         }
 
         let graph_node = Node {
@@ -370,6 +393,34 @@ mod inner {
         assert!(names.contains(&"Status"), "Should find enum Status");
         assert!(names.contains(&"MAX_SIZE"), "Should find const MAX_SIZE");
         assert!(names.contains(&"inner"), "Should find module inner");
+    }
+
+    #[test]
+    fn test_rust_const_value_extraction() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+pub const MAX_RETRIES: u32 = 5;
+pub const CONTENT_TYPE: &str = "application/json";
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+        let consts: Vec<_> = result.nodes.iter().filter(|n| n.id.kind == NodeKind::Const).collect();
+        // 2 declared consts + 1 synthetic string literal ("application/json" len > 3)
+        assert!(consts.len() >= 2, "Should find at least 2 const nodes");
+
+        let declared: Vec<_> = consts.iter().filter(|n| n.metadata.get("synthetic").map(|s| s.as_str()) == Some("false")).collect();
+        assert_eq!(declared.len(), 2, "Should find exactly 2 declared (non-synthetic) const nodes");
+
+        let max_retries = declared.iter().find(|n| n.id.name == "MAX_RETRIES").expect("Should find MAX_RETRIES");
+        assert_eq!(max_retries.metadata.get("value").map(|s| s.as_str()), Some("5"), "Should extract value 5");
+        assert_eq!(max_retries.metadata.get("synthetic").map(|s| s.as_str()), Some("false"));
+
+        let content_type = declared.iter().find(|n| n.id.name == "CONTENT_TYPE").expect("Should find CONTENT_TYPE");
+        assert!(content_type.metadata.get("value").is_some(), "Should extract string value");
+
+        // The string literal value should also be captured as a synthetic Const
+        let synthetic: Vec<_> = consts.iter().filter(|n| n.metadata.get("synthetic").map(|s| s.as_str()) == Some("true")).collect();
+        assert!(!synthetic.is_empty(), "Should capture at least 1 synthetic string literal");
+        assert!(synthetic.iter().any(|n| n.id.name == "application/json"), "Should capture 'application/json'");
     }
 
     #[test]

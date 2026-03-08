@@ -71,25 +71,39 @@ impl Extractor for TomlExtractor {
                     if let Some(key_node) = child.child_by_field_name("key") {
                         let key = key_node.utf8_text(source).unwrap_or("").trim().to_string();
                         if !key.is_empty() {
-                            let val = child
-                                .child_by_field_name("value")
+                            let val_node = child.child_by_field_name("value");
+                            let val = val_node
                                 .and_then(|v| v.utf8_text(source).ok())
                                 .unwrap_or("")
                                 .to_string();
+
+                            // Check if value is a scalar (not array or inline table)
+                            let is_scalar = val_node.map(|v| {
+                                !matches!(v.kind(), "array" | "inline_table")
+                            }).unwrap_or(false);
+
+                            let (kind, metadata) = if is_scalar && !val.trim().is_empty() {
+                                let mut m = BTreeMap::new();
+                                m.insert("value".to_string(), val.trim().trim_matches('"').trim_matches('\'').to_string());
+                                m.insert("synthetic".to_string(), "true".to_string());
+                                (NodeKind::Const, m)
+                            } else {
+                                (NodeKind::Other("toml_key".to_string()), BTreeMap::new())
+                            };
 
                             nodes.push(Node {
                                 id: NodeId {
                                     root: String::new(),
                                     file: path.to_path_buf(),
                                     name: key.clone(),
-                                    kind: NodeKind::Other("toml_key".to_string()),
+                                    kind,
                                 },
                                 language: "toml".to_string(),
                                 line_start: child.start_position().row + 1,
                                 line_end: child.end_position().row + 1,
                                 signature: format!("{} = {}", key, val),
                                 body: val,
-                                metadata: BTreeMap::new(),
+                                metadata,
                                 source: ExtractionSource::TreeSitter,
                             });
                         }

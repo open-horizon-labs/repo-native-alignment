@@ -11,6 +11,7 @@ use crate::graph::{
     Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
 };
 
+use super::string_literals::harvest_string_literals;
 use super::{ExtractionResult, Extractor};
 
 pub struct KotlinExtractor;
@@ -42,6 +43,17 @@ impl Extractor for KotlinExtractor {
         let source = content.as_bytes();
 
         collect_nodes(tree.root_node(), path, source, None, &mut nodes, &mut edges);
+
+        // Harvest string literals as synthetic Const nodes
+        harvest_string_literals(
+            tree.root_node(),
+            path,
+            source,
+            "kotlin",
+            "string_literal",
+            Some("string_content"),
+            &mut nodes,
+        );
 
         Ok(ExtractionResult { nodes, edges })
     }
@@ -141,6 +153,51 @@ fn collect_nodes(
                     }
                 }
                 return;
+            }
+        }
+        "property_declaration" => {
+            // Kotlin constants: `const val MAX_SIZE = 1024`
+            let decl_text = node.utf8_text(source).unwrap_or("").to_string();
+            if decl_text.contains("const ") {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
+                    let qualified = match class_scope {
+                        Some(cls) => format!("{}.{}", cls, name),
+                        None => name,
+                    };
+                    let sig = decl_text.lines().next().unwrap_or("").trim().to_string();
+                    // Value is after the `=` sign
+                    let value_str = decl_text.find('=')
+                        .map(|pos| decl_text[pos+1..].trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let mut metadata = BTreeMap::new();
+                    if let Some(ref v) = value_str {
+                        let is_scalar = v.starts_with('"') || v.starts_with('\'')
+                            || v.parse::<f64>().is_ok()
+                            || v == "true" || v == "false";
+                        if is_scalar {
+                            let stripped = v.trim_matches('"').trim_matches('\'');
+                            metadata.insert("value".to_string(), stripped.to_string());
+                        }
+                    }
+                    metadata.insert("synthetic".to_string(), "false".to_string());
+                    nodes.push(Node {
+                        id: NodeId {
+                            root: String::new(),
+                            file: path.to_path_buf(),
+                            name: qualified,
+                            kind: NodeKind::Const,
+                        },
+                        language: "kotlin".to_string(),
+                        line_start: node.start_position().row + 1,
+                        line_end: node.end_position().row + 1,
+                        signature: sig,
+                        body: decl_text,
+                        metadata,
+                        source: ExtractionSource::TreeSitter,
+                    });
+                    return;
+                }
             }
         }
         "import" => {

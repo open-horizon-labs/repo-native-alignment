@@ -17,6 +17,8 @@ use arrow_schema::{DataType, Field, Schema};
 /// - `meta_virtual`  — true for virtual external nodes produced by LSP enrichment
 /// - `meta_package`  — crate/package name for virtual nodes (e.g. "lancedb", "tokio")
 /// - `meta_name_col` — LSP cursor column used for go-to-definition disambiguation
+/// - `value`         — constant value for Const nodes
+/// - `synthetic`     — true for synthetic/inferred constants (e.g. YAML scalar key-values)
 pub fn symbols_schema() -> Schema {
     Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -32,6 +34,8 @@ pub fn symbols_schema() -> Schema {
         Field::new("meta_virtual", DataType::Boolean, true),
         Field::new("meta_package", DataType::Utf8, true),
         Field::new("meta_name_col", DataType::Int32, true),
+        Field::new("value", DataType::Utf8, true),      // metadata["value"]
+        Field::new("synthetic", DataType::Boolean, true), // metadata["synthetic"] == "true"
         // Vector column is added dynamically when embeddings are computed,
         // since the dimension depends on the model. See `symbols_schema_with_vector`.
         Field::new("updated_at", DataType::Int64, false),
@@ -54,6 +58,8 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("meta_virtual", DataType::Boolean, true),
         Field::new("meta_package", DataType::Utf8, true),
         Field::new("meta_name_col", DataType::Int32, true),
+        Field::new("value", DataType::Utf8, true),
+        Field::new("synthetic", DataType::Boolean, true),
         Field::new(
             "vector",
             DataType::FixedSizeList(
@@ -140,6 +146,8 @@ mod tests {
         assert!(schema.field_with_name("meta_virtual").is_ok());
         assert!(schema.field_with_name("meta_package").is_ok());
         assert!(schema.field_with_name("meta_name_col").is_ok());
+        assert!(schema.field_with_name("value").is_ok());
+        assert!(schema.field_with_name("synthetic").is_ok());
         assert!(schema.field_with_name("updated_at").is_ok());
         // no vector column in base schema
         assert!(schema.field_with_name("vector").is_err());
