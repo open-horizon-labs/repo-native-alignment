@@ -944,7 +944,7 @@ async fn run_oh_search_context_check(embed_index: &Option<EmbeddingIndex>) -> Ch
         Err(e) => {
             // Table-not-found means indexing was skipped — not a hard failure
             let msg = e.to_string();
-            if msg.contains("Table not found") || msg.contains("table") {
+            if msg.contains("Table not found") {
                 Check::skip("oh_search_context", "Embedding table not found — run index_all first")
             } else {
                 Check::fail("oh_search_context", format!("Semantic search failed: {}", e))
