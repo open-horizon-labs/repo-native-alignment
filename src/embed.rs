@@ -51,6 +51,11 @@ impl SearchResult {
                 "- **{}** ({}) — relevance: {:.2}\n  {}\n  ID: `{}`\n",
                 self.title, self.kind, self.score, snippet, self.id
             )
+        } else if self.kind == "commit" {
+            format!(
+                "- **{}** ({}) — relevance: {:.2}\n  {}\n  Hash: `{}` (use: `git show {}`)\n",
+                self.title, self.kind, self.score, snippet, self.id, self.id
+            )
         } else {
             format!(
                 "- **{}** ({}) — relevance: {:.2}\n  {}\n",
