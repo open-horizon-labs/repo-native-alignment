@@ -1532,10 +1532,10 @@ impl RnaHandler {
             tracing::warn!("Failed to persist graph to LanceDB: {}", e);
         }
 
-        // 8. Embed all nodes as part of the graph pipeline.
-        // Virtual external nodes (root == "external") have no body and must NOT be embedded.
+        // 8. Embed as part of the graph pipeline.
+        // External virtuals have no body — skip them. NodeKind filtering
+        // (imports, consts, etc.) happens inside index_all_inner.
         // Probe first — if a persisted table already exists, reuse it (fast path).
-        // The background scanner handles incremental updates.
         let embeddable_nodes: Vec<Node> = all_nodes.iter()
             .filter(|n| n.id.root != "external")
             .cloned()
@@ -1550,7 +1550,7 @@ impl RnaHandler {
                     Err(_) => {
                         match idx.index_all_with_symbols(&self.repo_root, &embeddable_nodes).await {
                             Ok(count) => {
-                                tracing::info!("Embedded {} items ({} symbols)", count, all_nodes.len());
+                                tracing::info!("Embedded {} items", count);
                                 Some(idx)
                             }
                             Err(e) => {

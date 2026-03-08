@@ -96,6 +96,31 @@ impl fmt::Display for NodeKind {
     }
 }
 
+impl NodeKind {
+    /// Whether this node kind carries enough semantic signal to be worth embedding.
+    /// Imports, consts, module declarations, impl blocks, and PR merges are noise
+    /// for semantic search — the meaningful content lives in the symbols they contain
+    /// or in commit messages (which are embedded separately).
+    pub fn is_embeddable(&self) -> bool {
+        match self {
+            NodeKind::Function
+            | NodeKind::Struct
+            | NodeKind::Trait
+            | NodeKind::Enum
+            | NodeKind::ProtoMessage
+            | NodeKind::SqlTable
+            | NodeKind::ApiEndpoint
+            | NodeKind::Other(_) => true,
+
+            NodeKind::Import
+            | NodeKind::Const
+            | NodeKind::Module
+            | NodeKind::Impl
+            | NodeKind::PrMerge => false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Edge kinds
 // ---------------------------------------------------------------------------
