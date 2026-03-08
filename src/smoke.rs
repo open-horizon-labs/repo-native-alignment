@@ -523,7 +523,7 @@ fn cleanup_worktree(repo: &Path, worktree_path: &Path) {
 /// - That node has `metadata["virtual"] == "true"`
 /// - That node's name contains `"::"` (FQN, e.g. `lancedb::connect`)
 async fn run_external_calls_check() -> Check {
-    use arrow_array::StringArray;
+    use arrow_array::{Array, BooleanArray, StringArray};
     use futures::TryStreamExt;
     use lancedb::query::ExecutableQuery;
     use std::collections::BTreeMap;
@@ -618,9 +618,9 @@ async fn run_external_calls_check() -> Check {
             Some(a) => a,
             None => continue,
         };
-        // metadata_json column carries serialized BTreeMap<String,String>.
-        let metadata_col = batch.column_by_name("metadata_json")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        // Typed meta_virtual column — Boolean, nullable.
+        let meta_virtual_col = batch.column_by_name("meta_virtual")
+            .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
 
         for i in 0..batch.num_rows() {
             let root = root_ids.value(i);
@@ -628,13 +628,10 @@ async fn run_external_calls_check() -> Check {
             if root == "external" && name.contains("::") {
                 found_root_external = true;
                 found_fqn = true;
-                // Check metadata_json for virtual=true
-                if let Some(meta_col) = metadata_col {
-                    let meta_str = meta_col.value(i);
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                        if parsed.get("virtual").and_then(|v| v.as_str()) == Some("true") {
-                            found_virtual_true = true;
-                        }
+                // Check meta_virtual typed column for true
+                if let Some(col) = meta_virtual_col {
+                    if !col.is_null(i) && col.value(i) {
+                        found_virtual_true = true;
                     }
                 }
             }
@@ -656,13 +653,13 @@ async fn run_external_calls_check() -> Check {
     } else if !found_virtual_true {
         Check::fail(
             "external_calls_persist",
-            "Virtual external node metadata[\"virtual\"] != \"true\" after LanceDB round-trip — \
-             metadata_json column missing or not populated in persist path",
+            "Virtual external node meta_virtual != true after LanceDB round-trip — \
+             meta_virtual column missing or not populated in persist path",
         )
     } else {
         Check::pass(
             "external_calls_persist",
-            "Virtual external node round-tripped correctly: root=external, FQN name, virtual=true in metadata",
+            "Virtual external node round-tripped correctly: root=external, FQN name, meta_virtual=true",
         )
     }
 }
