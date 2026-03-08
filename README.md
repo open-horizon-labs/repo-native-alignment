@@ -37,7 +37,7 @@ We don't build features, we build capabilities.
 
 **The loop:** Skills guide work → MCP tools read/write context → `.oh/` accumulates learnings → git versions everything → next session starts richer.
 
-**The graph:** `search_symbols` and `graph_query` expose a multi-language code graph — symbols, imports, topology boundaries — built by incremental scanning with tree-sitter across 22 languages. LSP enrichment adds cross-file call edges and synthesizes virtual nodes for external package symbols (`tokio::Runtime`, `lancedb::Connection`), so `graph_query` traversal crosses package boundaries.
+**The graph:** `search_symbols` and `graph_query` expose a multi-language code graph — symbols, calls, imports, topology boundaries — across 22 languages. Graph traversal follows call chains into external packages (`tokio`, `lancedb`, etc.), so impact analysis doesn't stop at your repo boundary.
 
 **The join:** `outcome_progress` connects layers structurally — outcome → file patterns → tagged commits → code symbols → PR merges. Structural links, not keyword matching.
 
@@ -115,14 +115,13 @@ The repo-local intelligence layer. Scans your repo, extracts a multi-language co
 | **Join** | `outcome_progress` — structural join: outcome → commits → symbols → PRs |
 | **Workspace** | `list_roots` — show configured workspace roots |
 
-**Extraction (pluggable, 22 extractors):**
-- **tree-sitter (code)** — Rust, Python, TypeScript/TSX, JavaScript/JSX, Go, Java, Bash, Ruby, C++, C#, Kotlin, Zig, Lua, Swift (functions, classes, imports, name column for precise LSP cursors)
-- **tree-sitter (config/infra)** — HCL/Terraform, JSON, TOML, YAML (with Kubernetes manifest detection)
-- **Markdown** — heading-aware sections with YAML frontmatter
-- **Schema** — .proto messages, SQL tables, OpenAPI endpoints
-- **Topology** — `Command::new`, `TcpListener`, `tokio::spawn` → architecture edges
-- **LSP** — cross-file call edges + virtual external package nodes (see below)
-- **Embeddings** — fastembed-rs (BAAI/bge-small-en-v1.5, local ONNX, no API key)
+**Extraction (pluggable):**
+- **Code** — Rust, Python, TypeScript/TSX, JavaScript/JSX, Go, Java, Bash, Ruby, C++, C#, Kotlin, Zig, Lua, Swift
+- **Config & infra** — HCL/Terraform, JSON, TOML, YAML (Kubernetes manifests detected automatically)
+- **Docs & schema** — Markdown (heading-aware), .proto, SQL, OpenAPI
+- **Architecture** — subprocess, network, async boundaries detected as topology edges
+- **LSP** — cross-file call chains; graph traversal follows calls into external packages
+- **Embeddings** — local ONNX, no API key needed
 
 **Graph (LanceDB + petgraph):**
 - Nodes: symbols, schemas, artifacts, PR merges
@@ -134,12 +133,12 @@ The repo-local intelligence layer. Scans your repo, extracts a multi-language co
 RNA auto-discovers installed language servers and enriches the graph with cross-file edges. No configuration — if the binary is on PATH, it's used. Missing servers skipped gracefully.
 
 What LSP adds beyond tree-sitter:
-- `callHierarchy/incomingCalls` → who calls this function (`Calls` edges)
-- `callHierarchy/outgoingCalls` → what does this function call (`Calls` edges) + synthesizes **virtual nodes** for external package symbols (`tokio::Runtime`, `lancedb::Connection`) so `graph_query` traversal crosses package boundaries
-- `textDocument/implementation` → who implements this trait (`Implements` edges)
-- `textDocument/documentLink` → cross-document references for markdown/docs (`DependsOn` edges)
+- **Who calls this?** — inbound call graph, not just the function definition
+- **What does this call?** — outbound call chain, including into external packages (`tokio`, `lancedb`, your dependencies)
+- **Who implements this trait/interface?** — implementation edges across files
+- **Doc cross-references** — links between markdown documents and code
 
-Virtual external nodes have stable IDs (`external::{package}::{fqn}`) and are upserted on each scan — no manual configuration needed. They appear in graph traversal but not semantic search (no body to embed).
+The result: `graph_query(mode: "impact", from: "my_fn")` shows the blast radius of a change, following call chains across your entire codebase and into the packages it depends on.
 
 Common servers (install for richer graphs):
 
@@ -155,11 +154,9 @@ Common servers (install for richer graphs):
 Plus 31 more: Ruby (solargraph), Java (jdtls), Kotlin, Lua, Zig, Elixir, Haskell, OCaml, Scala, Dart, PHP, Swift, Nix, Terraform, TOML, YAML, and others. Full list in `src/extract/mod.rs`.
 
 **Scanner (incremental, worktree-aware):**
-- mtime-based subtree skipping — unchanged directories skipped entirely
-- git diff as precision layer when `.git` present
-- **Worktree awareness** — active git worktrees auto-detected from `.git/worktrees/` and indexed as separate roots; agents running in worktrees see their own in-progress changes via `search_symbols`
+- Rescans in <1s — only changed files re-extracted
+- Git worktrees indexed automatically — agents running parallel branches see their own in-progress symbols, not the stale main-branch index
 - Configurable excludes via `.oh/config.toml`
-- Rescans in <1s after initial scan
 
 ## Companion Systems
 
@@ -236,20 +233,16 @@ No cloud dependency. Everything local, git-versioned, disposable.
 
 ## Status
 
-- 9 intent-based MCP tools, 155 tests
-- 22 extractors: Rust, Python, TypeScript, JavaScript, Go, Java, Bash, Ruby, C++, C#, Kotlin, Zig, Lua, Swift, HCL/Terraform, JSON, TOML, YAML, Markdown, Proto, SQL, OpenAPI
-- LSP enrichment: cross-file `Calls` edges + virtual external package nodes for cross-boundary graph traversal
-- `graph_query(mode: "impact")` finds callers across codebase and into external packages
-- `rna test --repo .` — 11-check pipeline verifier (scanner → extract → embed → each tool category → worktree smoke test)
-- Worktree awareness — agents in git worktrees see their own in-progress symbols via `search_symbols`
-- Graph + embeddings persisted to LanceDB — loads in <1s on restart, no re-embedding
-- LSP metadata (resolved types, hover docs) included in embeddings — semantic search finds type-level concepts
-- Incremental updates within a session — edit a file, next tool call reflects it
-- Background scanner (15min) keeps index warm during long sessions
-- Multi-root workspace scanning via `~/.config/rna/roots.toml` + auto-detected git worktrees
-- Semantic search via local embeddings (no API key)
-- Context auto-injected on first MCP tool call — agents always see business context
-- Validated on 3 repos with different shapes (Rust, Python+TS monorepo)
+**Working today:**
+- 9 MCP tools, 22 language extractors, 155 tests
+- `outcome_progress` joins outcomes → commits → symbols → PRs structurally
+- `graph_query(mode: "impact")` traces blast radius across your codebase and into external packages
+- `search_symbols` returns results from active git worktrees — parallel agents see their own changes
+- Semantic search over code, docs, and business artifacts — no API key, runs locally
+- `rna test --repo .` verifies the full pipeline in one command
+- Index persists between sessions — restarts in <1s, no re-scanning
+- Context injected on first tool call — agents start every session with business context
+- Validated on 3 repos: Rust CLI, Python+TS monorepo, self-referential (this repo)
 
 ## Design Notes
 
