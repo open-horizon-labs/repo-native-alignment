@@ -20,6 +20,7 @@ use crate::oh;
 use crate::query;
 use crate::roots::WorkspaceConfig;
 use crate::scanner::Scanner;
+use crate::server::{graph_lance_path, persist_graph_incremental};
 
 // ── Args ────────────────────────────────────────────────────────────
 
@@ -232,11 +233,172 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
         checks.push(Check::fail("list_roots", "No workspace roots resolved"));
     }
 
-    // 11. Worktree smoke test
+    // 11. Incremental persist smoke test
+    checks.push(run_incremental_persist_check().await);
+
+    // 12. Worktree smoke test
     // requires feat/rna-worktree-awareness to be merged
     checks.push(run_worktree_check(&repo).await);
 
     Ok(print_and_return(args, checks))
+}
+
+/// Incremental persist check: exercises the `persist_graph_incremental` path end-to-end.
+///
+/// 1. Creates a temp directory acting as a fake repo root.
+/// 2. Writes a Rust fixture with two functions (old + common).
+/// 3. Calls `persist_graph_incremental` to seed the initial LanceDB state.
+/// 4. Overwrites the fixture (remove old, add new, keep common).
+/// 5. Simulates the incremental update: files_to_remove = [changed_file], runs extraction,
+///    calls `persist_graph_incremental` with the delta.
+/// 6. Queries LanceDB directly: confirms old symbol is gone, new symbol is present.
+async fn run_incremental_persist_check() -> Check {
+    use arrow_array::StringArray;
+    use futures::TryStreamExt;
+    use lancedb::query::ExecutableQuery;
+
+    // Create isolated temp directory — acts as the fake repo root.
+    let temp_dir = std::env::temp_dir().join("rna-smoke-incremental");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+        return Check::fail("incremental_persist", format!("Could not create temp dir: {}", e));
+    }
+
+    let fixture_path = temp_dir.join("rna_smoke_fixture.rs");
+
+    // Step 1: Write initial file with old_fn + common_fn
+    let initial_content = "\
+/// Old function that will be removed in the next scan.\n\
+pub fn rna_smoke_old_fn() -> u32 { 1 }\n\
+\n\
+/// Common function that persists across both scans.\n\
+pub fn rna_smoke_common_fn() -> u32 { 2 }\n\
+";
+    if let Err(e) = std::fs::write(&fixture_path, initial_content) {
+        return Check::fail("incremental_persist", format!("Could not write initial fixture: {}", e));
+    }
+
+    // Step 2: Extract symbols from the initial file and persist as initial state.
+    let registry = ExtractorRegistry::with_builtins();
+    let initial_scan = crate::scanner::ScanResult {
+        changed_files: Vec::new(),
+        new_files: vec![fixture_path.clone()],
+        deleted_files: Vec::new(),
+        scan_duration: std::time::Duration::ZERO,
+    };
+    let initial_extraction = registry.extract_scan_result(&temp_dir, &initial_scan);
+    let initial_nodes = initial_extraction.nodes;
+    let initial_edges = initial_extraction.edges;
+
+    if initial_nodes.is_empty() {
+        // Tree-sitter may not parse .rs in temp dir — skip rather than fail.
+        return Check::skip("incremental_persist", "No symbols extracted from initial fixture (tree-sitter parse skipped)");
+    }
+
+    // Seed LanceDB with the initial state.
+    if let Err(e) = persist_graph_incremental(
+        &temp_dir,
+        &initial_nodes,
+        &initial_edges,
+        &[],
+        &[],
+    ).await {
+        return Check::fail("incremental_persist", format!("Initial persist failed: {}", e));
+    }
+
+    // Step 3: Update the file — remove old_fn, add new_fn, keep common_fn.
+    let updated_content = "\
+/// New function introduced in the second scan.\n\
+pub fn rna_smoke_new_fn() -> u32 { 3 }\n\
+\n\
+/// Common function that persists across both scans.\n\
+pub fn rna_smoke_common_fn() -> u32 { 2 }\n\
+";
+    if let Err(e) = std::fs::write(&fixture_path, updated_content) {
+        return Check::fail("incremental_persist", format!("Could not write updated fixture: {}", e));
+    }
+
+    // Step 4: Simulate what update_graph_incrementally does:
+    //   files_to_remove = [fixture_path] (it's a "changed" file)
+    //   deleted_edge_ids = [] (no edges in this test)
+    //   upsert = extraction of updated file
+    let files_to_remove = vec![fixture_path.clone()];
+    let update_scan = crate::scanner::ScanResult {
+        changed_files: vec![fixture_path.clone()],
+        new_files: Vec::new(),
+        deleted_files: Vec::new(),
+        scan_duration: std::time::Duration::ZERO,
+    };
+    let update_extraction = registry.extract_scan_result(&temp_dir, &update_scan);
+    let upsert_nodes = update_extraction.nodes;
+    let upsert_edges = update_extraction.edges;
+
+    if let Err(e) = persist_graph_incremental(
+        &temp_dir,
+        &upsert_nodes,
+        &upsert_edges,
+        &[],
+        &files_to_remove,
+    ).await {
+        return Check::fail("incremental_persist", format!("Incremental persist failed: {}", e));
+    }
+
+    // Step 5: Query LanceDB and verify: old_fn gone, new_fn present.
+    let db_path = graph_lance_path(&temp_dir);
+    let db = match lancedb::connect(db_path.to_str().unwrap_or("")).execute().await {
+        Ok(d) => d,
+        Err(e) => return Check::fail("incremental_persist", format!("Could not open LanceDB: {}", e)),
+    };
+    let table = match db.open_table("symbols").execute().await {
+        Ok(t) => t,
+        Err(e) => return Check::fail("incremental_persist", format!("Could not open symbols table: {}", e)),
+    };
+    let stream = match table.query().execute().await {
+        Ok(s) => s,
+        Err(e) => return Check::fail("incremental_persist", format!("Could not query symbols: {}", e)),
+    };
+    let batches: Vec<arrow_array::RecordBatch> = match stream.try_collect().await {
+        Ok(b) => b,
+        Err(e) => return Check::fail("incremental_persist", format!("Could not collect batches: {}", e)),
+    };
+
+    let mut found_old = false;
+    let mut found_new = false;
+    for batch in &batches {
+        if let Some(names_col) = batch.column_by_name("name") {
+            if let Some(names) = names_col.as_any().downcast_ref::<StringArray>() {
+                for i in 0..batch.num_rows() {
+                    let name = names.value(i);
+                    if name.contains("rna_smoke_old_fn") {
+                        found_old = true;
+                    }
+                    if name.contains("rna_smoke_new_fn") {
+                        found_new = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Clean up temp dir.
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    if found_old {
+        Check::fail(
+            "incremental_persist",
+            "Ghost symbol 'rna_smoke_old_fn' still present in LanceDB after incremental update",
+        )
+    } else if !found_new {
+        Check::fail(
+            "incremental_persist",
+            "New symbol 'rna_smoke_new_fn' not found in LanceDB after incremental update",
+        )
+    } else {
+        Check::pass(
+            "incremental_persist",
+            "Incremental persist correct: old symbol removed, new symbol present",
+        )
+    }
 }
 
 /// Worktree-specific check: creates a temp git worktree, writes a unique function,

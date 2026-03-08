@@ -181,7 +181,7 @@ pub struct ListRoots {}
 // ── Graph persistence (LanceDB) ─────────────────────────────────────
 
 /// LanceDB path for graph persistence.
-fn graph_lance_path(repo_root: &Path) -> PathBuf {
+pub(crate) fn graph_lance_path(repo_root: &Path) -> PathBuf {
     repo_root.join(".oh").join(".cache").join("lance")
 }
 
@@ -415,7 +415,7 @@ async fn persist_graph_to_lance(
 /// - `deleted_edge_ids`: stable IDs of edges that reference removed/changed files — collected
 ///   before the in-memory retain step in `update_graph_incrementally`
 /// - `deleted_files`: file paths whose symbols should be deleted from LanceDB
-async fn persist_graph_incremental(
+pub(crate) async fn persist_graph_incremental(
     repo_root: &Path,
     upsert_nodes: &[Node],
     upsert_edges: &[Edge],
@@ -978,6 +978,17 @@ impl RnaHandler {
                         continue;
                     }
 
+                    // Collect LanceDB persist deltas per root (outside write guard so
+                    // persist_graph_incremental can run without holding the lock).
+                    // Structure: (root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove)
+                    let mut lance_deltas: Vec<(
+                        PathBuf,
+                        Vec<Node>,
+                        Vec<Edge>,
+                        Vec<String>,
+                        Vec<PathBuf>,
+                    )> = Vec::new();
+
                     let mut guard = graph.write().await;
                     if let Some(ref mut graph_state) = *guard {
                         let registry = ExtractorRegistry::with_builtins();
@@ -1013,6 +1024,20 @@ impl RnaHandler {
                                 .chain(scan.changed_files.iter())
                                 .cloned()
                                 .collect();
+
+                            // Collect edge IDs to delete BEFORE retain (same pattern as foreground).
+                            let deleted_edge_ids: Vec<String> = graph_state
+                                .edges
+                                .iter()
+                                .filter(|e| {
+                                    e.from.root == *root_slug
+                                        && files_to_remove
+                                            .iter()
+                                            .any(|f| e.from.file == *f || e.to.file == *f)
+                                })
+                                .map(|e| e.stable_id())
+                                .collect();
+
                             graph_state.nodes.retain(|n| {
                                 n.id.root != *root_slug
                                     || !files_to_remove.iter().any(|f| n.id.file == *f)
@@ -1031,8 +1056,18 @@ impl RnaHandler {
                                 edge.from.root = root_slug.clone();
                                 edge.to.root = root_slug.clone();
                             }
+                            let upsert_nodes = extraction.nodes.clone();
+                            let upsert_edges = extraction.edges.clone();
                             graph_state.nodes.extend(extraction.nodes);
                             graph_state.edges.extend(extraction.edges);
+
+                            lance_deltas.push((
+                                root_path.clone(),
+                                upsert_nodes,
+                                upsert_edges,
+                                deleted_edge_ids,
+                                files_to_remove,
+                            ));
                         }
 
                         // Rebuild petgraph index.
@@ -1051,6 +1086,21 @@ impl RnaHandler {
                         );
                     }
                     drop(guard);
+
+                    // Persist incremental deltas to LanceDB for each root (lock released above).
+                    for (root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove) in lance_deltas {
+                        if let Err(e) = persist_graph_incremental(
+                            &root_path,
+                            &upsert_nodes,
+                            &upsert_edges,
+                            &deleted_edge_ids,
+                            &files_to_remove,
+                        )
+                        .await
+                        {
+                            tracing::warn!("Background scan: failed to persist graph delta: {}", e);
+                        }
+                    }
 
                     // Purge removed worktree slugs from LanceDB.
                     if !removed_slugs.is_empty() {
@@ -1513,7 +1563,7 @@ impl RnaHandler {
             &upsert_nodes,
             &upsert_edges,
             &deleted_edge_ids,
-            &scan.deleted_files,
+            &files_to_remove,
         )
         .await
         {
