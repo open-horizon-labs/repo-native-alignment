@@ -243,6 +243,9 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     // 13. LSP virtual external nodes round-trip through LanceDB
     checks.push(run_external_calls_check().await);
 
+    // 14. HEAD-change detection logic
+    checks.push(run_head_change_detection_check());
+
     Ok(print_and_return(args, checks))
 }
 
@@ -662,6 +665,139 @@ async fn run_external_calls_check() -> Check {
             "Virtual external node round-tripped correctly: root=external, FQN name, meta_virtual=true",
         )
     }
+}
+
+/// HEAD-change detection check.
+///
+/// Verifies the logic used by the background scanner to decide whether a
+/// reindex is needed:
+///
+/// 1. Creates a temp git repo with an initial commit (HEAD = commit A).
+/// 2. Records the HEAD OID.
+/// 3. Makes a second commit (HEAD = commit B).
+/// 4. Re-reads the HEAD OID.
+/// 5. Asserts the two OIDs differ (change detected).
+/// 6. Reads the OID a third time without committing.
+/// 7. Asserts the OID is unchanged (no spurious trigger).
+///
+/// This is a unit-level check — it exercises only the git2 detection path,
+/// not the full reindex cycle.
+fn run_head_change_detection_check() -> Check {
+    fn read_head_oid(repo: &git2::Repository) -> Option<git2::Oid> {
+        repo.head()
+            .ok()?
+            .peel_to_commit()
+            .ok()
+            .map(|c| c.id())
+    }
+
+    fn make_commit(repo: &git2::Repository, message: &str) -> Result<git2::Oid, git2::Error> {
+        let sig = git2::Signature::now("Test", "test@example.com")?;
+        let mut index = repo.index()?;
+        let tree_oid = index.write_tree()?;
+        let tree = repo.find_tree(tree_oid)?;
+        let parents: Vec<git2::Commit> = match repo.head() {
+            Ok(head_ref) => {
+                let commit = head_ref.peel_to_commit()?;
+                vec![commit]
+            }
+            Err(_) => vec![],
+        };
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)
+    }
+
+    // Step 1: init temp repo.
+    let temp_dir = std::env::temp_dir().join("rna-smoke-head-change");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+        return Check::fail(
+            "head_change_detection",
+            format!("Could not create temp dir: {}", e),
+        );
+    }
+    let repo = match git2::Repository::init(&temp_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            return Check::fail(
+                "head_change_detection",
+                format!("git2::Repository::init failed: {}", e),
+            )
+        }
+    };
+
+    // Step 2: initial commit.
+    if let Err(e) = make_commit(&repo, "initial commit") {
+        return Check::fail(
+            "head_change_detection",
+            format!("First commit failed: {}", e),
+        );
+    }
+    let oid_a = match read_head_oid(&repo) {
+        Some(o) => o,
+        None => {
+            return Check::fail(
+                "head_change_detection",
+                "Could not read HEAD OID after first commit",
+            )
+        }
+    };
+
+    // Step 3: second commit.
+    if let Err(e) = make_commit(&repo, "second commit") {
+        return Check::fail(
+            "head_change_detection",
+            format!("Second commit failed: {}", e),
+        );
+    }
+    let oid_b = match read_head_oid(&repo) {
+        Some(o) => o,
+        None => {
+            return Check::fail(
+                "head_change_detection",
+                "Could not read HEAD OID after second commit",
+            )
+        }
+    };
+
+    // Step 4: assert change detected.
+    if oid_a == oid_b {
+        return Check::fail(
+            "head_change_detection",
+            format!(
+                "HEAD OID unchanged after second commit (both = {}); detection would not fire",
+                oid_a
+            ),
+        );
+    }
+
+    // Step 5: assert no spurious change on stable re-read.
+    let oid_b2 = match read_head_oid(&repo) {
+        Some(o) => o,
+        None => {
+            return Check::fail(
+                "head_change_detection",
+                "Could not re-read HEAD OID for stable-state check",
+            )
+        }
+    };
+    if oid_b != oid_b2 {
+        return Check::fail(
+            "head_change_detection",
+            "HEAD OID changed between reads without a commit; spurious trigger would occur",
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    Check::pass(
+        "head_change_detection",
+        format!(
+            "HEAD-change detection correct: A ({}) != B ({}); stable re-read matches",
+            &oid_a.to_string()[..8],
+            &oid_b.to_string()[..8],
+        ),
+    )
 }
 
 // ── Output ──────────────────────────────────────────────────────────
