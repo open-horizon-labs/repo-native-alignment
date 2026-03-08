@@ -1,6 +1,10 @@
 //! C++ tree-sitter extractor.
 //!
-//! Extracts functions, classes, structs, and namespaces from `.cpp`, `.cc`, `.cxx`, `.c`, `.h`, `.hpp` files.
+//! Generic path: classes, structs, enums, fields, string literals.
+//! Special cases:
+//!   - `function_definition` with complex `function_declarator` name extraction
+//!   - `namespace_definition` as Module nodes
+//!   - `constexpr` / `static const` declarations as Const nodes
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -9,7 +13,8 @@ use anyhow::Result;
 
 use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
 
-use super::string_literals::harvest_string_literals;
+use super::configs::CPP_CONFIG;
+use super::generic::GenericExtractor;
 use super::{ExtractionResult, Extractor};
 
 pub struct CppExtractor;
@@ -30,29 +35,16 @@ impl Extractor for CppExtractor {
     }
 
     fn extract(&self, path: &Path, content: &str) -> Result<ExtractionResult> {
+        let mut result = GenericExtractor::new(&CPP_CONFIG).run(path, content)?;
+
+        // C++-specific: functions (complex declarator), namespaces, and const declarations.
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_cpp::LANGUAGE.into())?;
-        let tree = parser
-            .parse(content, None)
-            .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {}", path.display()))?;
+        if let Some(tree) = parser.parse(content, None) {
+            collect_cpp_specials(tree.root_node(), path, content.as_bytes(), None, &mut result.nodes);
+        }
 
-        let mut nodes = Vec::new();
-        let source = content.as_bytes();
-
-        collect_nodes(tree.root_node(), path, source, None, &mut nodes);
-
-        // Harvest string literals as synthetic Const nodes
-        harvest_string_literals(
-            tree.root_node(),
-            path,
-            source,
-            "cpp",
-            "string_literal",
-            Some("string_content"),
-            &mut nodes,
-        );
-
-        Ok(ExtractionResult { nodes, edges: Vec::new() })
+        Ok(result)
     }
 }
 
@@ -64,7 +56,6 @@ fn extract_cpp_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
             Some(node.utf8_text(source).unwrap_or("unknown").to_string())
         }
         "qualified_identifier" => {
-            // Take the last segment (the actual name)
             node.child_by_field_name("name")
                 .and_then(|n| extract_cpp_name(n, source))
         }
@@ -73,7 +64,6 @@ fn extract_cpp_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
                 .and_then(|n| extract_cpp_name(n, source))
         }
         "pointer_declarator" | "reference_declarator" => {
-            // Walk child to find the actual declarator
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i as u32) {
                     if let Some(name) = extract_cpp_name(child, source) {
@@ -87,7 +77,8 @@ fn extract_cpp_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
     }
 }
 
-fn collect_nodes(
+/// Walk AST for C++-specific nodes: function_definition, namespace_definition, const declarations.
+fn collect_cpp_specials(
     node: tree_sitter::Node,
     path: &Path,
     source: &[u8],
@@ -96,7 +87,6 @@ fn collect_nodes(
 ) {
     match node.kind() {
         "function_definition" => {
-            // Name is nested inside declarator field
             if let Some(declarator) = node.child_by_field_name("declarator") {
                 if let Some(name) = extract_cpp_name(declarator, source) {
                     let qualified = match scope {
@@ -113,7 +103,7 @@ fn collect_nodes(
                             name: qualified,
                             kind: NodeKind::Function,
                         },
-                        language: "c-cpp".to_string(),
+                        language: "cpp".to_string(),
                         line_start: node.start_position().row + 1,
                         line_end: node.end_position().row + 1,
                         signature: sig,
@@ -122,73 +112,6 @@ fn collect_nodes(
                         source: ExtractionSource::TreeSitter,
                     });
                 }
-            }
-        }
-        "class_specifier" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
-                let qualified = match scope {
-                    Some(s) => format!("{}::{}", s, name),
-                    None => name.clone(),
-                };
-                let sig = node.utf8_text(source).unwrap_or("").lines().next().unwrap_or("").trim().to_string();
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: qualified.clone(),
-                        kind: NodeKind::Struct,
-                    },
-                    language: "c-cpp".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: sig,
-                    body: String::new(),
-                    metadata: BTreeMap::new(),
-                    source: ExtractionSource::TreeSitter,
-                });
-
-                // Recurse into class body
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32) {
-                        collect_nodes(child, path, source, Some(&qualified), nodes);
-                    }
-                }
-                return;
-            }
-        }
-        "struct_specifier" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
-                let qualified = match scope {
-                    Some(s) => format!("{}::{}", s, name),
-                    None => name.clone(),
-                };
-                let sig = node.utf8_text(source).unwrap_or("").lines().next().unwrap_or("").trim().to_string();
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: qualified.clone(),
-                        kind: NodeKind::Struct,
-                    },
-                    language: "c-cpp".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: sig,
-                    body: String::new(),
-                    metadata: BTreeMap::new(),
-                    source: ExtractionSource::TreeSitter,
-                });
-
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32) {
-                        collect_nodes(child, path, source, Some(&qualified), nodes);
-                    }
-                }
-                return;
             }
         }
         "namespace_definition" => {
@@ -206,7 +129,7 @@ fn collect_nodes(
                         name: qualified.clone(),
                         kind: NodeKind::Module,
                     },
-                    language: "c-cpp".to_string(),
+                    language: "cpp".to_string(),
                     line_start: node.start_position().row + 1,
                     line_end: node.end_position().row + 1,
                     signature: format!("namespace {}", name),
@@ -217,14 +140,13 @@ fn collect_nodes(
 
                 for i in 0..node.child_count() {
                     if let Some(child) = node.child(i as u32) {
-                        collect_nodes(child, path, source, Some(&qualified), nodes);
+                        collect_cpp_specials(child, path, source, Some(&qualified), nodes);
                     }
                 }
                 return;
             }
         }
         "declaration" => {
-            // C/C++ constants: `constexpr int MAX = 5;` or `static const int MAX = 5;`
             let decl_text = node.utf8_text(source).unwrap_or("").to_string();
             let is_const = decl_text.contains("constexpr")
                 || (decl_text.contains("static") && decl_text.contains("const "));
@@ -236,7 +158,6 @@ fn collect_nodes(
                             None => name,
                         };
                         let sig = decl_text.lines().next().unwrap_or("").trim().to_string();
-                        // Value may be after `=`
                         let value_str = decl_text.find('=')
                             .map(|pos| decl_text[pos+1..].trim_end_matches(';').trim().to_string())
                             .filter(|s| !s.is_empty());
@@ -257,7 +178,7 @@ fn collect_nodes(
                                 name: qualified,
                                 kind: NodeKind::Const,
                             },
-                            language: "c-cpp".to_string(),
+                            language: "cpp".to_string(),
                             line_start: node.start_position().row + 1,
                             line_end: node.end_position().row + 1,
                             signature: sig,
@@ -274,7 +195,7 @@ fn collect_nodes(
 
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            collect_nodes(child, path, source, scope, nodes);
+            collect_cpp_specials(child, path, source, scope, nodes);
         }
     }
 }

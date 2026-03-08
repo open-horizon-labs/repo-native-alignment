@@ -1,7 +1,9 @@
 //! Go tree-sitter extractor.
 //!
-//! Extracts functions, methods, type declarations, and import statements
-//! from Go source files.
+//! Generic path: functions, methods, string literals.
+//! Special cases: const_declaration (multi-name pairing), type_declaration
+//! (struct/interface disambiguation), import_declaration (grouped imports),
+//! and method receiver metadata.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -12,7 +14,8 @@ use crate::graph::{
     Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
 };
 
-use super::string_literals::harvest_string_literals;
+use super::configs::GO_CONFIG;
+use super::generic::GenericExtractor;
 use super::{ExtractionResult, Extractor};
 
 /// Go tree-sitter extractor.
@@ -34,44 +37,31 @@ impl Extractor for GoExtractor {
     }
 
     fn extract(&self, path: &Path, content: &str) -> Result<ExtractionResult> {
+        // Generic: functions + methods + string literals
+        let mut result = GenericExtractor::new(&GO_CONFIG).run(path, content)?;
+
+        // Go-specific: const_declaration, type_declaration, import_declaration,
+        // and method receiver metadata enrichment.
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_go::LANGUAGE.into())?;
-        let tree = parser
-            .parse(content, None)
-            .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {}", path.display()))?;
+        if let Some(tree) = parser.parse(content, None) {
+            collect_go_specials(
+                tree.root_node(),
+                path,
+                content.as_bytes(),
+                &mut result.nodes,
+                &mut result.edges,
+            );
+        }
 
-        let mut nodes = Vec::new();
-        let mut edges = Vec::new();
-        let source = content.as_bytes();
-
-        collect_nodes(tree.root_node(), path, source, &mut nodes, &mut edges);
-
-        // Harvest string literals as synthetic Const nodes
-        harvest_string_literals(
-            tree.root_node(),
-            path,
-            source,
-            "go",
-            "interpreted_string_literal",
-            None,
-            &mut nodes,
-        );
-        // Also harvest Go backtick raw string literals
-        harvest_string_literals(
-            tree.root_node(),
-            path,
-            source,
-            "go",
-            "raw_string_literal",
-            None,
-            &mut nodes,
-        );
-
-        Ok(ExtractionResult { nodes, edges })
+        Ok(result)
     }
 }
 
-fn collect_nodes(
+/// Walk the AST for Go-specific node kinds not handled by the generic extractor:
+/// `const_declaration`, `type_declaration`, `import_declaration`, and
+/// method receiver metadata enrichment on `method_declaration`.
+fn collect_go_specials(
     node: tree_sitter::Node,
     path: &Path,
     source: &[u8],
@@ -81,65 +71,6 @@ fn collect_nodes(
     let kind_str = node.kind();
 
     match kind_str {
-        "function_declaration" => {
-            if let Some(name) = node.child_by_field_name("name") {
-                let name_str = name.utf8_text(source).unwrap_or("unknown").to_string();
-                let body = node.utf8_text(source).unwrap_or("").to_string();
-                let signature = extract_go_signature(&body);
-                // Record the AST-accurate byte column of the name identifier so the
-                // LSP enricher can place the cursor without signature string searching.
-                let mut metadata = BTreeMap::new();
-                metadata.insert("name_col".to_string(), name.start_position().column.to_string());
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: name_str,
-                        kind: NodeKind::Function,
-                    },
-                    language: "go".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature,
-                    body,
-                    metadata,
-                    source: ExtractionSource::TreeSitter,
-                });
-            }
-        }
-        "method_declaration" => {
-            if let Some(name) = node.child_by_field_name("name") {
-                let name_str = name.utf8_text(source).unwrap_or("unknown").to_string();
-                let body = node.utf8_text(source).unwrap_or("").to_string();
-                let signature = extract_go_signature(&body);
-
-                // Extract receiver type for metadata.
-                // Also record name_col for accurate LSP cursor positioning.
-                let mut metadata = BTreeMap::new();
-                metadata.insert("name_col".to_string(), name.start_position().column.to_string());
-                if let Some(receiver) = node.child_by_field_name("receiver") {
-                    let recv_text = receiver.utf8_text(source).unwrap_or("").to_string();
-                    metadata.insert("receiver".to_string(), recv_text);
-                }
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: name_str,
-                        kind: NodeKind::Function, // methods are functions in our model
-                    },
-                    language: "go".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature,
-                    body,
-                    metadata,
-                    source: ExtractionSource::TreeSitter,
-                });
-            }
-        }
         "const_declaration" => {
             // Go const declarations: const X = 5 or const (X = 5; Y = "hello")
             for i in 0..node.child_count() {
@@ -149,6 +80,7 @@ fn collect_nodes(
                     }
                 }
             }
+            return; // Don't recurse into children we already handled
         }
         "type_declaration" => {
             // type_declaration contains type_spec children
@@ -159,6 +91,7 @@ fn collect_nodes(
                     }
                 }
             }
+            return; // Don't recurse into children we already handled
         }
         "import_declaration" => {
             // Go imports can be single or grouped
@@ -202,17 +135,37 @@ fn collect_nodes(
                     source: ExtractionSource::TreeSitter,
                 });
             }
+            return; // Don't recurse
+        }
+        "method_declaration" => {
+            // Enrich the generic-emitted method node with receiver metadata.
+            // The generic extractor already created a Function node for this method;
+            // find it and add the receiver field.
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name_str = name_node.utf8_text(source).unwrap_or("unknown");
+                if let Some(receiver) = node.child_by_field_name("receiver") {
+                    let recv_text = receiver.utf8_text(source).unwrap_or("").to_string();
+                    let line = node.start_position().row + 1;
+                    // Find the matching node emitted by generic extractor
+                    for n in nodes.iter_mut() {
+                        if n.id.name == name_str
+                            && n.id.kind == NodeKind::Function
+                            && n.line_start == line
+                        {
+                            n.metadata.insert("receiver".to_string(), recv_text);
+                            break;
+                        }
+                    }
+                }
+            }
         }
         _ => {}
     }
 
-    // Recurse into children (but skip type_declaration, import_declaration,
-    // and const_declaration which we handle above)
-    if kind_str != "type_declaration" && kind_str != "import_declaration" && kind_str != "const_declaration" {
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
-                collect_nodes(child, path, source, nodes, edges);
-            }
+    // Recurse into children
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            collect_go_specials(child, path, source, nodes, edges);
         }
     }
 }
@@ -237,7 +190,7 @@ fn extract_go_const_spec(
 
     // Collect all name children (handles both single and multi-name specs).
     // In tree-sitter-go, `children_by_field_name("name")` may include comma
-    // punctuation nodes (named=false) for multi-name specs — filter those out.
+    // punctuation nodes (named=false) for multi-name specs -- filter those out.
     let mut cursor = node.walk();
     let names: Vec<String> = node
         .children_by_field_name("name", &mut cursor)
@@ -266,7 +219,7 @@ fn extract_go_const_spec(
                 vec![None; names.len()]
             }
         } else {
-            // Single value node — use it for every name (only one name expected)
+            // Single value node -- use it for every name (only one name expected)
             let v = value_node.utf8_text(source).unwrap_or("").trim().to_string();
             vec![Some(v); names.len()]
         }
@@ -399,17 +352,6 @@ fn extract_import_spec(
 
         nodes.push(import_node);
     }
-}
-
-/// Extract signature from Go code (text before first `{`).
-fn extract_go_signature(body: &str) -> String {
-    if let Some(brace_pos) = body.find('{') {
-        let sig = body[..brace_pos].trim();
-        if !sig.is_empty() {
-            return sig.to_string();
-        }
-    }
-    body.lines().next().unwrap_or("").trim().to_string()
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 //! Kotlin tree-sitter extractor.
 //!
-//! Extracts functions, classes, objects, and imports from `.kt` / `.kts` files.
+//! Generic path: functions, classes, objects, enum bodies, properties (fields), string literals.
+//! Special cases: const val -> Const upgrade (text inspection), import handling.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -11,7 +12,8 @@ use crate::graph::{
     Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
 };
 
-use super::string_literals::harvest_string_literals;
+use super::configs::KOTLIN_CONFIG;
+use super::generic::GenericExtractor;
 use super::{ExtractionResult, Extractor};
 
 pub struct KotlinExtractor;
@@ -32,139 +34,47 @@ impl Extractor for KotlinExtractor {
     }
 
     fn extract(&self, path: &Path, content: &str) -> Result<ExtractionResult> {
+        let mut result = GenericExtractor::new(&KOTLIN_CONFIG).run(path, content)?;
+
+        // Kotlin-specific: const val upgrade to Const, import handling.
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())?;
-        let tree = parser
-            .parse(content, None)
-            .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {}", path.display()))?;
+        if let Some(tree) = parser.parse(content, None) {
+            collect_kotlin_specials(
+                tree.root_node(),
+                path,
+                content.as_bytes(),
+                &mut result.nodes,
+                &mut result.edges,
+            );
+        }
 
-        let mut nodes = Vec::new();
-        let mut edges = Vec::new();
-        let source = content.as_bytes();
-
-        collect_nodes(tree.root_node(), path, source, None, &mut nodes, &mut edges);
-
-        // Harvest string literals as synthetic Const nodes
-        harvest_string_literals(
-            tree.root_node(),
-            path,
-            source,
-            "kotlin",
-            "string_literal",
-            Some("string_content"),
-            &mut nodes,
-        );
-
-        Ok(ExtractionResult { nodes, edges })
+        Ok(result)
     }
 }
 
-fn collect_nodes(
+/// Walk AST for Kotlin-specific nodes not handled by the generic extractor:
+/// `property_declaration` with `const` -> Const upgrade, `import`.
+fn collect_kotlin_specials(
     node: tree_sitter::Node,
     path: &Path,
     source: &[u8],
-    class_scope: Option<&str>,
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
 ) {
     let kind_str = node.kind();
 
     match kind_str {
-        "function_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
-                let qualified = match class_scope {
-                    Some(cls) => format!("{}.{}", cls, name),
-                    None => name.clone(),
-                };
-                let body = node.utf8_text(source).unwrap_or("").to_string();
-                let sig = body.lines().next().unwrap_or("").trim().to_string();
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: qualified,
-                        kind: NodeKind::Function,
-                    },
-                    language: "kotlin".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: sig,
-                    body,
-                    metadata: BTreeMap::new(),
-                    source: ExtractionSource::TreeSitter,
-                });
-            }
-        }
-        "class_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
-                let sig = node.utf8_text(source).unwrap_or("").lines().next().unwrap_or("").trim().to_string();
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: name.clone(),
-                        kind: NodeKind::Struct,
-                    },
-                    language: "kotlin".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: sig,
-                    body: String::new(),
-                    metadata: BTreeMap::new(),
-                    source: ExtractionSource::TreeSitter,
-                });
-
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32) {
-                        collect_nodes(child, path, source, Some(&name), nodes, edges);
-                    }
-                }
-                return;
-            }
-        }
-        "object_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
-                let sig = node.utf8_text(source).unwrap_or("").lines().next().unwrap_or("").trim().to_string();
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: name.clone(),
-                        kind: NodeKind::Struct,
-                    },
-                    language: "kotlin".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: sig,
-                    body: String::new(),
-                    metadata: BTreeMap::new(),
-                    source: ExtractionSource::TreeSitter,
-                });
-
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32) {
-                        collect_nodes(child, path, source, Some(&name), nodes, edges);
-                    }
-                }
-                return;
-            }
-        }
         "property_declaration" => {
             // Kotlin constants: `const val MAX_SIZE = 1024`
             let decl_text = node.utf8_text(source).unwrap_or("").to_string();
             if decl_text.contains("const ") {
+                // Remove the generic-emitted Field node for this line and replace with Const.
+                let line = node.start_position().row + 1;
+                nodes.retain(|n| !(n.id.kind == NodeKind::Field && n.line_start == line));
+
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
-                    let qualified = match class_scope {
-                        Some(cls) => format!("{}.{}", cls, name),
-                        None => name,
-                    };
                     let sig = decl_text.lines().next().unwrap_or("").trim().to_string();
                     // Value is after the `=` sign
                     let value_str = decl_text.find('=')
@@ -185,7 +95,7 @@ fn collect_nodes(
                         id: NodeId {
                             root: String::new(),
                             file: path.to_path_buf(),
-                            name: qualified,
+                            name,
                             kind: NodeKind::Const,
                         },
                         language: "kotlin".to_string(),
@@ -247,7 +157,7 @@ fn collect_nodes(
 
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            collect_nodes(child, path, source, class_scope, nodes, edges);
+            collect_kotlin_specials(child, path, source, nodes, edges);
         }
     }
 }

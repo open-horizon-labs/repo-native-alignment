@@ -1,7 +1,8 @@
 //! TypeScript tree-sitter extractor.
 //!
-//! Extracts functions, classes, interfaces, type aliases, and import statements
-//! from TypeScript (and JavaScript) source files.
+//! Generic path: functions, methods, classes, interfaces, enums, fields, string literals.
+//! Special cases: lexical_declaration const (text inspection), import_statement,
+//! type_alias_declaration.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -12,7 +13,8 @@ use crate::graph::{
     Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
 };
 
-use super::string_literals::harvest_string_literals;
+use super::configs::TYPESCRIPT_CONFIG;
+use super::generic::GenericExtractor;
 use super::{ExtractionResult, Extractor};
 
 /// TypeScript tree-sitter extractor (handles .ts and .tsx files).
@@ -34,35 +36,28 @@ impl Extractor for TypeScriptExtractor {
     }
 
     fn extract(&self, path: &Path, content: &str) -> Result<ExtractionResult> {
+        let mut result = GenericExtractor::new(&TYPESCRIPT_CONFIG).run(path, content)?;
+
+        // TypeScript-specific: lexical_declaration const, import_statement, type_alias_declaration.
         let mut parser = tree_sitter::Parser::new();
-        // Use tsx parser for both .ts and .tsx — tsx is a superset
         parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())?;
-        let tree = parser
-            .parse(content, None)
-            .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {}", path.display()))?;
+        if let Some(tree) = parser.parse(content, None) {
+            collect_ts_specials(
+                tree.root_node(),
+                path,
+                content.as_bytes(),
+                &mut result.nodes,
+                &mut result.edges,
+            );
+        }
 
-        let mut nodes = Vec::new();
-        let mut edges = Vec::new();
-        let source = content.as_bytes();
-
-        collect_nodes(tree.root_node(), path, source, &mut nodes, &mut edges);
-
-        // Harvest string literals as synthetic Const nodes
-        harvest_string_literals(
-            tree.root_node(),
-            path,
-            source,
-            "typescript",
-            "string",
-            Some("string_fragment"),
-            &mut nodes,
-        );
-
-        Ok(ExtractionResult { nodes, edges })
+        Ok(result)
     }
 }
 
-fn collect_nodes(
+/// Walk AST for TypeScript-specific nodes not handled by the generic extractor:
+/// `lexical_declaration` (const), `import_statement`, `type_alias_declaration`.
+fn collect_ts_specials(
     node: tree_sitter::Node,
     path: &Path,
     source: &[u8],
@@ -72,107 +67,6 @@ fn collect_nodes(
     let kind_str = node.kind();
 
     match kind_str {
-        "function_declaration" => {
-            if let Some(name) = node.child_by_field_name("name") {
-                let name_str = name.utf8_text(source).unwrap_or("unknown").to_string();
-                let body = node.utf8_text(source).unwrap_or("").to_string();
-                let signature = extract_ts_signature(&body);
-                // Record the AST-accurate byte column of the name identifier so the
-                // LSP enricher can place the cursor without signature string searching.
-                let mut metadata = BTreeMap::new();
-                metadata.insert("name_col".to_string(), name.start_position().column.to_string());
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: name_str,
-                        kind: NodeKind::Function,
-                    },
-                    language: "typescript".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature,
-                    body,
-                    metadata,
-                    source: ExtractionSource::TreeSitter,
-                });
-            }
-        }
-        "class_declaration" => {
-            if let Some(name) = node.child_by_field_name("name") {
-                let name_str = name.utf8_text(source).unwrap_or("unknown").to_string();
-                let body = node.utf8_text(source).unwrap_or("").to_string();
-                let signature = extract_ts_signature(&body);
-                let mut metadata = BTreeMap::new();
-                metadata.insert("name_col".to_string(), name.start_position().column.to_string());
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: name_str,
-                        kind: NodeKind::Struct,
-                    },
-                    language: "typescript".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature,
-                    body,
-                    metadata,
-                    source: ExtractionSource::TreeSitter,
-                });
-            }
-        }
-        "interface_declaration" => {
-            if let Some(name) = node.child_by_field_name("name") {
-                let name_str = name.utf8_text(source).unwrap_or("unknown").to_string();
-                let body = node.utf8_text(source).unwrap_or("").to_string();
-                let signature = extract_ts_signature(&body);
-                let mut metadata = BTreeMap::new();
-                metadata.insert("name_col".to_string(), name.start_position().column.to_string());
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: name_str,
-                        kind: NodeKind::Trait, // interface -> Trait in our model
-                    },
-                    language: "typescript".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature,
-                    body,
-                    metadata,
-                    source: ExtractionSource::TreeSitter,
-                });
-            }
-        }
-        "type_alias_declaration" => {
-            if let Some(name) = node.child_by_field_name("name") {
-                let name_str = name.utf8_text(source).unwrap_or("unknown").to_string();
-                let body = node.utf8_text(source).unwrap_or("").to_string();
-                let mut metadata = BTreeMap::new();
-                metadata.insert("name_col".to_string(), name.start_position().column.to_string());
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: name_str,
-                        kind: NodeKind::Other("type_alias".to_string()),
-                    },
-                    language: "typescript".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: body.clone(),
-                    body,
-                    metadata,
-                    source: ExtractionSource::TreeSitter,
-                });
-            }
-        }
         "lexical_declaration" => {
             // `const FOO = 42;` or `const BAR = "hello";`
             let decl_text = node.utf8_text(source).unwrap_or("").trim().to_string();
@@ -263,26 +157,39 @@ fn collect_nodes(
 
             nodes.push(import_node);
         }
+        "type_alias_declaration" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                let name_str = name.utf8_text(source).unwrap_or("unknown").to_string();
+                let body = node.utf8_text(source).unwrap_or("").to_string();
+                let mut metadata = BTreeMap::new();
+                metadata.insert("name_col".to_string(), name.start_position().column.to_string());
+
+                nodes.push(Node {
+                    id: NodeId {
+                        root: String::new(),
+                        file: path.to_path_buf(),
+                        name: name_str,
+                        kind: NodeKind::Other("type_alias".to_string()),
+                    },
+                    language: "typescript".to_string(),
+                    line_start: node.start_position().row + 1,
+                    line_end: node.end_position().row + 1,
+                    signature: body.clone(),
+                    body,
+                    metadata,
+                    source: ExtractionSource::TreeSitter,
+                });
+            }
+        }
         _ => {}
     }
 
     // Recurse into children
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            collect_nodes(child, path, source, nodes, edges);
+            collect_ts_specials(child, path, source, nodes, edges);
         }
     }
-}
-
-/// Extract signature from TypeScript code (text before first `{`).
-fn extract_ts_signature(body: &str) -> String {
-    if let Some(brace_pos) = body.find('{') {
-        let sig = body[..brace_pos].trim();
-        if !sig.is_empty() {
-            return sig.to_string();
-        }
-    }
-    body.lines().next().unwrap_or("").trim().to_string()
 }
 
 /// Parse the module source from a TypeScript import statement.
@@ -315,6 +222,7 @@ fn parse_ts_import_source(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::EdgeKind;
 
     #[test]
     fn test_extract_ts_functions_and_classes() {

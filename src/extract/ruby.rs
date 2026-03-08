@@ -1,6 +1,7 @@
 //! Ruby tree-sitter extractor.
 //!
-//! Extracts methods, singleton methods, classes, and modules from `.rb` files.
+//! Generic path: methods, singleton methods, classes, modules, string literals.
+//! Special case: `assignment` with `constant` LHS as Const nodes.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -9,7 +10,8 @@ use anyhow::Result;
 
 use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
 
-use super::string_literals::harvest_string_literals;
+use super::configs::RUBY_CONFIG;
+use super::generic::GenericExtractor;
 use super::{ExtractionResult, Extractor};
 
 pub struct RubyExtractor;
@@ -30,36 +32,21 @@ impl Extractor for RubyExtractor {
     }
 
     fn extract(&self, path: &Path, content: &str) -> Result<ExtractionResult> {
+        let mut result = GenericExtractor::new(&RUBY_CONFIG).run(path, content)?;
+
+        // Ruby-specific: assignment with `constant` LHS as Const nodes.
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_ruby::LANGUAGE.into())?;
-        let tree = parser
-            .parse(content, None)
-            .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {}", path.display()))?;
+        if let Some(tree) = parser.parse(content, None) {
+            collect_constant_assignments(tree.root_node(), path, content.as_bytes(), None, &mut result.nodes);
+        }
 
-        let mut nodes = Vec::new();
-        let source = content.as_bytes();
-
-        collect_nodes(tree.root_node(), path, source, None, &mut nodes);
-
-        // Harvest string literals as synthetic Const nodes.
-        // Use "string" as the outer node kind and "string_content" as the content child
-        // so that harvest_rec's non-recursion guard fires on the outer "string" node,
-        // consistent with Kotlin/Rust/C++ patterns.
-        harvest_string_literals(
-            tree.root_node(),
-            path,
-            source,
-            "ruby",
-            "string",
-            Some("string_content"),
-            &mut nodes,
-        );
-
-        Ok(ExtractionResult { nodes, edges: Vec::new() })
+        Ok(result)
     }
 }
 
-fn collect_nodes(
+/// Walk AST for assignments with `constant` LHS (Ruby constant convention).
+fn collect_constant_assignments(
     node: tree_sitter::Node,
     path: &Path,
     source: &[u8],
@@ -67,97 +54,8 @@ fn collect_nodes(
     nodes: &mut Vec<Node>,
 ) {
     match node.kind() {
-        "method" | "singleton_method" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
-                let qualified = match scope {
-                    Some(s) => format!("{}.{}", s, name),
-                    None => name.clone(),
-                };
-                let body = node.utf8_text(source).unwrap_or("").to_string();
-                let sig = body.lines().next().unwrap_or("").trim().to_string();
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: qualified,
-                        kind: NodeKind::Function,
-                    },
-                    language: "ruby".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: sig,
-                    body,
-                    metadata: BTreeMap::new(),
-                    source: ExtractionSource::TreeSitter,
-                });
-            }
-        }
-        "class" | "singleton_class" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
-                let sig = node.utf8_text(source).unwrap_or("").lines().next().unwrap_or("").trim().to_string();
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: name.clone(),
-                        kind: NodeKind::Struct,
-                    },
-                    language: "ruby".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: sig,
-                    body: String::new(),
-                    metadata: BTreeMap::new(),
-                    source: ExtractionSource::TreeSitter,
-                });
-
-                // Recurse into class body with class name as scope
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32) {
-                        collect_nodes(child, path, source, Some(&name), nodes);
-                    }
-                }
-                return;
-            }
-        }
-        "module" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
-                let sig = node.utf8_text(source).unwrap_or("").lines().next().unwrap_or("").trim().to_string();
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: name.clone(),
-                        kind: NodeKind::Module,
-                    },
-                    language: "ruby".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: sig,
-                    body: String::new(),
-                    metadata: BTreeMap::new(),
-                    source: ExtractionSource::TreeSitter,
-                });
-
-                // Recurse with module name as scope
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32) {
-                        collect_nodes(child, path, source, Some(&name), nodes);
-                    }
-                }
-                return;
-            }
-        }
         "assignment" => {
-            // Ruby constants: `MAX_RETRIES = 5` (uppercase first letter)
             if let Some(lhs) = node.child_by_field_name("left") {
-                // `constant` node kind in Ruby tree-sitter
                 if lhs.kind() == "constant" {
                     let name_str = lhs.utf8_text(source).unwrap_or("").trim().to_string();
                     if !name_str.is_empty() && name_str.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
@@ -200,12 +98,24 @@ fn collect_nodes(
                 }
             }
         }
+        "class" | "singleton_class" | "module" => {
+            // Track scope for qualified constant names
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i as u32) {
+                        collect_constant_assignments(child, path, source, Some(&name), nodes);
+                    }
+                }
+                return;
+            }
+        }
         _ => {}
     }
 
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            collect_nodes(child, path, source, scope, nodes);
+            collect_constant_assignments(child, path, source, scope, nodes);
         }
     }
 }
