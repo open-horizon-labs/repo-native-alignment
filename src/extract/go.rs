@@ -200,6 +200,11 @@ fn collect_nodes(
 /// In tree-sitter-go, `const_spec` may have multiple `name` children for
 /// multi-name declarations like `const A, B = 1, 2`. We emit a Const node
 /// for each name.
+///
+/// When the `value` child is an `expression_list`, we split it into individual
+/// expressions and pair each with its corresponding name by index. If the value
+/// count doesn't match the name count (e.g. `const A, B = iota`), we leave
+/// `value` as None for all names rather than guessing.
 fn extract_go_const_spec(
     node: tree_sitter::Node,
     path: &Path,
@@ -208,23 +213,49 @@ fn extract_go_const_spec(
 ) {
     let body = node.utf8_text(source).unwrap_or("").to_string();
 
-    // Try to get value from the expression_list (first value in a multi-name spec)
-    let value_str = node.child_by_field_name("value")
-        .and_then(|v| v.utf8_text(source).ok())
-        .map(|s| s.trim().to_string());
-
-    // Collect all name children (handles both single and multi-name specs)
+    // Collect all name children (handles both single and multi-name specs).
+    // In tree-sitter-go, `children_by_field_name("name")` may include comma
+    // punctuation nodes (named=false) for multi-name specs — filter those out.
     let mut cursor = node.walk();
     let names: Vec<String> = node
         .children_by_field_name("name", &mut cursor)
+        .filter(|n| n.is_named())
         .map(|n| n.utf8_text(source).unwrap_or("unknown").trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
 
-    for name_str in names {
+    // Build a per-name value list.
+    // If the value child is an expression_list, extract each child expression
+    // and pair by index. If counts don't match (e.g. `iota`), use None for all.
+    let per_name_values: Vec<Option<String>> = if let Some(value_node) = node.child_by_field_name("value") {
+        if value_node.kind() == "expression_list" {
+            // Collect the non-punctuation children of the expression_list
+            let exprs: Vec<String> = (0..value_node.child_count())
+                .filter_map(|i| value_node.child(i as u32))
+                .filter(|c| c.kind() != "," && c.is_named())
+                .map(|c| c.utf8_text(source).unwrap_or("").trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            if exprs.len() == names.len() {
+                exprs.into_iter().map(Some).collect()
+            } else {
+                // Count mismatch (e.g. iota): don't guess values
+                vec![None; names.len()]
+            }
+        } else {
+            // Single value node — use it for every name (only one name expected)
+            let v = value_node.utf8_text(source).unwrap_or("").trim().to_string();
+            vec![Some(v); names.len()]
+        }
+    } else {
+        vec![None; names.len()]
+    };
+
+    for (name_str, value_opt) in names.into_iter().zip(per_name_values.into_iter()) {
         let signature = format!("const {}", body.trim());
         let mut metadata = BTreeMap::new();
-        if let Some(ref v) = value_str {
+        if let Some(v) = value_opt {
             let is_scalar = v.starts_with('"') || v.starts_with('`')
                 || v.parse::<f64>().is_ok()
                 || v == "true" || v == "false";
@@ -516,5 +547,43 @@ const A, B = 1, 2
         let names: Vec<&str> = consts.iter().map(|n| n.id.name.as_str()).collect();
         assert!(names.contains(&"A"), "Should find const A, got: {:?}", names);
         assert!(names.contains(&"B"), "Should find const B, got: {:?}", names);
+
+        // Each name should have its own paired value
+        let a = consts.iter().find(|n| n.id.name == "A").expect("Should find A");
+        let b = consts.iter().find(|n| n.id.name == "B").expect("Should find B");
+        assert_eq!(
+            a.metadata.get("value").map(|s| s.as_str()),
+            Some("1"),
+            "A should have value 1"
+        );
+        assert_eq!(
+            b.metadata.get("value").map(|s| s.as_str()),
+            Some("2"),
+            "B should have value 2"
+        );
+    }
+
+    #[test]
+    fn test_go_multi_name_const_iota_no_value() {
+        let extractor = GoExtractor::new();
+        let code = r#"package main
+
+const (
+    A = iota
+    B
+    C
+)
+"#;
+        let result = extractor.extract(Path::new("main.go"), code).unwrap();
+        let consts: Vec<_> = result.nodes.iter().filter(|n| n.id.kind == NodeKind::Const).collect();
+        let names: Vec<&str> = consts.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"A"), "Should find const A");
+        // iota is not a scalar, so value should not be set for A
+        let a = consts.iter().find(|n| n.id.name == "A").expect("Should find A");
+        assert!(
+            a.metadata.get("value").is_none(),
+            "A with iota should not have a scalar value, got: {:?}",
+            a.metadata.get("value")
+        );
     }
 }

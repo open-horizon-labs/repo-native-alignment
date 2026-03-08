@@ -144,6 +144,9 @@ pub struct SearchSymbols {
     /// Maximum results to return (default: 20)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// If true, include only synthetic (inferred) constants. If false, exclude them. If absent, return all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthetic: Option<bool>,
 }
 
 #[macros::mcp_tool(
@@ -2114,6 +2117,12 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                 }
                                 if let Some(ref root_filter) = args.root {
                                     if n.id.root.to_lowercase() != root_filter.to_lowercase() {
+                                        return false;
+                                    }
+                                }
+                                if let Some(synthetic_filter) = args.synthetic {
+                                    let is_synthetic = n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false);
+                                    if is_synthetic != synthetic_filter {
                                         return false;
                                     }
                                 }
