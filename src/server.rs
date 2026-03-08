@@ -1009,20 +1009,11 @@ impl RnaHandler {
                         );
                     } else {
                         // No git-level change detected: wait for the 15-min heartbeat.
+                        // The baselines (last_head_oid, last_fetch_head_mtime) are
+                        // updated unconditionally at the top of every iteration, so any
+                        // commit that arrives during the sleep will be visible on the
+                        // very next wake-up without a post-sleep re-read here.
                         tokio::time::sleep(tokio::time::Duration::from_secs(900)).await;
-                        // Re-read HEAD/FETCH_HEAD after sleeping so that the next
-                        // iteration's comparison reflects the post-sleep baseline.
-                        if let Ok(repo) = git2::Repository::open(&repo_root) {
-                            if let Ok(commit) = repo.head().and_then(|h| h.peel_to_commit()) {
-                                last_head_oid = Some(commit.id());
-                            }
-                        }
-                        let fetch_head_path = repo_root.join(".git").join("FETCH_HEAD");
-                        if let Ok(mtime) =
-                            std::fs::metadata(&fetch_head_path).and_then(|m| m.modified())
-                        {
-                            last_fetch_head_mtime = Some(mtime);
-                        }
                     }
 
                     // Resolve current roots (primary + any live worktrees).
