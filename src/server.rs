@@ -243,6 +243,51 @@ fn parse_confidence(s: &str) -> Confidence {
     }
 }
 
+/// Delete all symbols and edges for the given root slugs from LanceDB.
+/// Called when a worktree is detected as removed during the background scan loop.
+async fn delete_nodes_for_roots(repo_root: &Path, slugs: &[String]) -> anyhow::Result<()> {
+    if slugs.is_empty() {
+        return Ok(());
+    }
+
+    let db_path = graph_lance_path(repo_root);
+    if !db_path.exists() {
+        return Ok(());
+    }
+
+    let db = lancedb::connect(db_path.to_str().unwrap())
+        .execute()
+        .await
+        .context("Failed to connect to LanceDB for worktree cleanup")?;
+
+    // Build a SQL predicate: root_id IN ('slug1', 'slug2', ...)
+    let quoted: Vec<String> = slugs
+        .iter()
+        .map(|s| format!("'{}'", s.replace('\'', "''")))
+        .collect();
+    let predicate = format!("root_id IN ({})", quoted.join(", "));
+
+    // Delete from symbols table.
+    if let Ok(tbl) = db.open_table("symbols").execute().await {
+        if let Err(e) = tbl.delete(&predicate).await {
+            tracing::warn!("Failed to delete symbols for removed worktrees: {}", e);
+        }
+    }
+
+    // Delete from edges table.
+    if let Ok(tbl) = db.open_table("edges").execute().await {
+        if let Err(e) = tbl.delete(&predicate).await {
+            tracing::warn!("Failed to delete edges for removed worktrees: {}", e);
+        }
+    }
+
+    tracing::info!(
+        "Deleted LanceDB rows for removed worktrees: {}",
+        slugs.join(", ")
+    );
+    Ok(())
+}
+
 /// Persist graph nodes and edges to LanceDB tables.
 async fn persist_graph_to_lance(
     repo_root: &Path,
@@ -822,48 +867,158 @@ impl RnaHandler {
             let graph = Arc::clone(&self.graph);
             let repo_root = self.repo_root.clone();
             tokio::spawn(async move {
+                // Track root slugs from the previous tick to detect removed worktrees.
+                let mut prev_root_slugs: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(900)).await; // 15 min
-                    let mut scanner = match Scanner::new(repo_root.clone()) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    let scan = match scanner.scan() {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    if scan.changed_files.is_empty() && scan.new_files.is_empty() && scan.deleted_files.is_empty() {
+
+                    // Resolve current roots (primary + any live worktrees).
+                    let workspace = WorkspaceConfig::load()
+                        .with_primary_root(repo_root.clone())
+                        .with_worktrees(&repo_root);
+                    let resolved_roots = workspace.resolved_roots();
+                    let current_root_slugs: std::collections::HashSet<String> =
+                        resolved_roots.iter().map(|r| r.slug.clone()).collect();
+
+                    // Slugs that disappeared → worktree was removed.
+                    let removed_slugs: Vec<String> = prev_root_slugs
+                        .difference(&current_root_slugs)
+                        .cloned()
+                        .collect();
+
+                    // Scan every live root for file-level changes.
+                    let mut has_changes = false;
+                    let mut per_root_scans: Vec<(String, crate::scanner::ScanResult, PathBuf)> =
+                        Vec::new();
+                    for resolved_root in &resolved_roots {
+                        let root_slug = resolved_root.slug.clone();
+                        let root_path = resolved_root.path.clone();
+                        let excludes = resolved_root.config.effective_excludes();
+                        let is_primary = root_path == repo_root;
+                        let mut scanner = if is_primary {
+                            match Scanner::with_excludes(root_path.clone(), excludes) {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            }
+                        } else {
+                            let state_path = cache_state_path(&root_slug);
+                            match Scanner::with_excludes_and_state_path(
+                                root_path.clone(),
+                                excludes,
+                                state_path,
+                            ) {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            }
+                        };
+                        let scan = match scanner.scan() {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        if !scan.changed_files.is_empty()
+                            || !scan.new_files.is_empty()
+                            || !scan.deleted_files.is_empty()
+                        {
+                            has_changes = true;
+                        }
+                        per_root_scans.push((root_slug, scan, root_path));
+                    }
+
+                    if !has_changes && removed_slugs.is_empty() {
+                        prev_root_slugs = current_root_slugs;
                         continue;
                     }
-                    tracing::info!(
-                        "Background scan: {} changed, {} new, {} deleted",
-                        scan.changed_files.len(), scan.new_files.len(), scan.deleted_files.len()
-                    );
+
                     let mut guard = graph.write().await;
                     if let Some(ref mut graph_state) = *guard {
                         let registry = ExtractorRegistry::with_builtins();
-                        // Remove stale nodes/edges
-                        let files_to_remove: Vec<PathBuf> = scan.deleted_files.iter()
-                            .chain(scan.changed_files.iter())
-                            .cloned()
-                            .collect();
-                        graph_state.nodes.retain(|n| !files_to_remove.iter().any(|f| n.id.file == *f));
-                        graph_state.edges.retain(|e| !files_to_remove.iter().any(|f| e.from.file == *f || e.to.file == *f));
-                        // Re-extract
-                        let extraction = registry.extract_scan_result(&repo_root, &scan);
-                        graph_state.nodes.extend(extraction.nodes);
-                        graph_state.edges.extend(extraction.edges);
-                        // Rebuild petgraph
+
+                        // Drop in-memory nodes/edges for removed worktrees.
+                        for slug in &removed_slugs {
+                            tracing::info!(
+                                "Worktree removed — dropping in-memory nodes for root '{}'",
+                                slug
+                            );
+                            graph_state.nodes.retain(|n| &n.id.root != slug);
+                            graph_state.edges.retain(|e| &e.from.root != slug);
+                        }
+
+                        // Apply file-level changes per root.
+                        for (root_slug, scan, root_path) in &per_root_scans {
+                            if scan.changed_files.is_empty()
+                                && scan.new_files.is_empty()
+                                && scan.deleted_files.is_empty()
+                            {
+                                continue;
+                            }
+                            tracing::info!(
+                                "Background scan '{}': {} changed, {} new, {} deleted",
+                                root_slug,
+                                scan.changed_files.len(),
+                                scan.new_files.len(),
+                                scan.deleted_files.len()
+                            );
+                            let files_to_remove: Vec<PathBuf> = scan
+                                .deleted_files
+                                .iter()
+                                .chain(scan.changed_files.iter())
+                                .cloned()
+                                .collect();
+                            graph_state.nodes.retain(|n| {
+                                n.id.root != *root_slug
+                                    || !files_to_remove.iter().any(|f| n.id.file == *f)
+                            });
+                            graph_state.edges.retain(|e| {
+                                e.from.root != *root_slug
+                                    || !files_to_remove
+                                        .iter()
+                                        .any(|f| e.from.file == *f || e.to.file == *f)
+                            });
+                            let mut extraction = registry.extract_scan_result(root_path, scan);
+                            for node in &mut extraction.nodes {
+                                node.id.root = root_slug.clone();
+                            }
+                            for edge in &mut extraction.edges {
+                                edge.from.root = root_slug.clone();
+                                edge.to.root = root_slug.clone();
+                            }
+                            graph_state.nodes.extend(extraction.nodes);
+                            graph_state.edges.extend(extraction.edges);
+                        }
+
+                        // Rebuild petgraph index.
                         graph_state.index = GraphIndex::new();
                         graph_state.index.rebuild_from_edges(&graph_state.edges);
                         for node in &graph_state.nodes {
-                            graph_state.index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+                            graph_state.index.ensure_node(
+                                &node.stable_id(),
+                                &node.id.kind.to_string(),
+                            );
                         }
-                        tracing::info!("Background update: {} nodes, {} edges", graph_state.nodes.len(), graph_state.edges.len());
+                        tracing::info!(
+                            "Background update: {} nodes, {} edges",
+                            graph_state.nodes.len(),
+                            graph_state.edges.len()
+                        );
                     }
+                    drop(guard);
+
+                    // Purge removed worktree slugs from LanceDB.
+                    if !removed_slugs.is_empty() {
+                        if let Err(e) = delete_nodes_for_roots(&repo_root, &removed_slugs).await {
+                            tracing::warn!(
+                                "Failed to delete LanceDB rows for removed worktrees: {}",
+                                e
+                            );
+                        }
+                    }
+
+                    prev_root_slugs = current_root_slugs;
                 }
             });
-            tracing::info!("Background scanner started (15min interval)");
+            tracing::info!("Background scanner started (15min interval, worktree-aware)");
         }
 
         // Downgrade to read lock
