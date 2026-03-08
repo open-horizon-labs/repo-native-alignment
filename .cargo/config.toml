@@ -1,0 +1,5 @@
+[build]
+# Shared target directory across all git worktrees.
+# Without this, each worktree compiles all dependencies from scratch (~3-4 min).
+# With this, only the first build is slow; all worktrees share compiled artifacts.
+target-dir = "/Users/muness1/src/open-horizon-labs/repo-native-alignment/target"
