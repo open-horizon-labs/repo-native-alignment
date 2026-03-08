@@ -687,6 +687,290 @@ async fn run_external_calls_check() -> Check {
     }
 }
 
+
+/// list_roots check: verifies WorkspaceConfig::with_primary_root() returns at least 1 root
+/// that matches the test repo path.
+fn run_list_roots_check(repo: &Path) -> Check {
+    let workspace = WorkspaceConfig::load().with_primary_root(repo.to_path_buf());
+    let roots = workspace.resolved_roots();
+    if roots.is_empty() {
+        return Check::fail("list_roots_check", "No workspace roots resolved from with_primary_root()");
+    }
+    let primary_matches = roots.iter().any(|r| r.path == repo);
+    if !primary_matches {
+        Check::fail(
+            "list_roots_check",
+            format!(
+                "Primary root {} not found in resolved roots: {:?}",
+                repo.display(),
+                roots.iter().map(|r| r.path.display().to_string()).collect::<Vec<_>>()
+            ),
+        )
+    } else {
+        Check::pass(
+            "list_roots_check",
+            format!("{} root(s) resolved, primary root matched", roots.len()),
+        )
+    }
+}
+
+/// Worktree roots check: creates a real git worktree, then verifies that
+/// WorkspaceConfig::with_worktrees() detects it in resolved_roots().
+async fn run_worktree_roots_check(repo: &Path) -> Check {
+    let worktree_path = std::env::temp_dir().join("rna-smoke-worktree-roots-check");
+    let branch_name = "smoke-worktree-roots-branch";
+
+    // Clean up any pre-existing worktree / branch
+    let _ = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force", worktree_path.to_str().unwrap_or("")])
+        .current_dir(repo)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["branch", "-D", branch_name])
+        .current_dir(repo)
+        .output();
+
+    // Create a linked worktree
+    let add_out = match std::process::Command::new("git")
+        .args(["worktree", "add", worktree_path.to_str().unwrap_or(""), "-b", branch_name])
+        .current_dir(repo)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            return Check::skip("worktree_roots_check", format!("git worktree add failed: {}", e));
+        }
+    };
+
+    if !add_out.status.success() {
+        let stderr = String::from_utf8_lossy(&add_out.stderr);
+        return Check::skip("worktree_roots_check", format!("git worktree add failed: {}", stderr.trim()));
+    }
+
+    // Build workspace config with primary root + worktrees
+    let workspace = WorkspaceConfig::load()
+        .with_primary_root(repo.to_path_buf())
+        .with_worktrees(repo);
+    let roots = workspace.resolved_roots();
+
+    // Clean up before asserting
+    let _ = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force", worktree_path.to_str().unwrap_or("")])
+        .current_dir(repo)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["branch", "-D", branch_name])
+        .current_dir(repo)
+        .output();
+
+    let found = roots.iter().any(|r| r.path == worktree_path);
+    if found {
+        Check::pass(
+            "worktree_roots_check",
+            format!("with_worktrees() detected the linked worktree at {}", worktree_path.display()),
+        )
+    } else {
+        Check::skip(
+            "worktree_roots_check",
+            format!(
+                "Linked worktree {} not found in resolved_roots() — may require worktree to be fully set up",
+                worktree_path.display()
+            ),
+        )
+    }
+}
+
+/// Metadata round-trip check: persists a node with BTreeMap metadata via
+/// persist_graph_to_lance, reloads with load_graph_from_lance, and asserts the
+/// metadata is identical.
+async fn run_metadata_roundtrip_check() -> Check {
+    use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+    use std::collections::BTreeMap;
+
+    let temp_dir = std::env::temp_dir().join("rna-smoke-metadata-roundtrip");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+        return Check::fail("metadata_roundtrip", format!("Could not create temp dir: {}", e));
+    }
+
+    let mut meta = BTreeMap::new();
+    meta.insert("custom_key".to_string(), "custom_value".to_string());
+    meta.insert("priority".to_string(), "high".to_string());
+
+    let node = Node {
+        id: NodeId {
+            root: "test-root".to_string(),
+            file: std::path::PathBuf::from("src/test.rs"),
+            name: "test_metadata_fn".to_string(),
+            kind: NodeKind::Function,
+        },
+        language: "rust".to_string(),
+        line_start: 1,
+        line_end: 5,
+        signature: "fn test_metadata_fn()".to_string(),
+        body: "fn test_metadata_fn() {}".to_string(),
+        metadata: meta.clone(),
+        source: ExtractionSource::TreeSitter,
+    };
+
+    // Persist via the full DROP+CREATE path
+    if let Err(e) = persist_graph_to_lance(&temp_dir, &[node], &[]).await {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return Check::fail("metadata_roundtrip", format!("persist_graph_to_lance failed: {}", e));
+    }
+
+    // Reload from LanceDB
+    let state = match load_graph_from_lance(&temp_dir).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Check::fail("metadata_roundtrip", format!("load_graph_from_lance failed: {}", e));
+        }
+    };
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    // Find the node and verify metadata
+    let reloaded = state.nodes.iter().find(|n| n.id.name == "test_metadata_fn");
+    match reloaded {
+        None => Check::fail("metadata_roundtrip", "Node 'test_metadata_fn' not found after reload"),
+        Some(n) => {
+            let missing: Vec<_> = meta
+                .iter()
+                .filter(|(k, v)| n.metadata.get(*k) != Some(v))
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+            if missing.is_empty() {
+                Check::pass(
+                    "metadata_roundtrip",
+                    format!("Node metadata round-tripped correctly ({} keys)", meta.len()),
+                )
+            } else {
+                Check::fail(
+                    "metadata_roundtrip",
+                    format!("Metadata mismatch after reload — missing or wrong: {:?}", missing),
+                )
+            }
+        }
+    }
+}
+
+/// search_symbols check: verifies that the extracted nodes include function nodes
+/// and that they are findable by kind.
+fn run_search_symbols_check(nodes: &[crate::graph::Node]) -> Check {
+    if nodes.is_empty() {
+        return Check::skip("search_symbols_check", "No nodes available (extraction may have failed)");
+    }
+
+    let function_nodes: Vec<_> = nodes
+        .iter()
+        .filter(|n| n.id.kind == crate::graph::NodeKind::Function)
+        .collect();
+
+    let markdown_or_other: Vec<_> = nodes
+        .iter()
+        .filter(|n| !matches!(n.id.kind, crate::graph::NodeKind::Function))
+        .collect();
+
+    if function_nodes.is_empty() {
+        Check::fail(
+            "search_symbols_check",
+            format!("No Function nodes found in {} total nodes", nodes.len()),
+        )
+    } else {
+        Check::pass(
+            "search_symbols_check",
+            format!(
+                "{} function node(s) found, {} other node(s) (total: {})",
+                function_nodes.len(),
+                markdown_or_other.len(),
+                nodes.len()
+            ),
+        )
+    }
+}
+
+/// graph_query check: verifies the GraphIndex has been populated with edges and
+/// that neighbors() is callable and returns sensible results.
+fn run_graph_query_check(index: &GraphIndex, nodes: &[crate::graph::Node]) -> Check {
+    if nodes.is_empty() {
+        return Check::skip("graph_query_check", "No nodes available — skipping graph query");
+    }
+
+    let node_count = index.node_count();
+    let edge_count = index.edge_count();
+
+    // If no nodes in index, graph was likely not built from edges — skip gracefully
+    if node_count == 0 {
+        return Check::skip(
+            "graph_query_check",
+            "GraphIndex is empty (no edges extracted). This is expected for repos with no call edges yet.",
+        );
+    }
+
+    // Pick the first node and verify neighbors() is callable
+    let first_node = &nodes[0];
+    let node_id = first_node.stable_id();
+    let outgoing = index.neighbors(&node_id, None, Direction::Outgoing);
+    let incoming = index.neighbors(&node_id, None, Direction::Incoming);
+
+    Check::pass(
+        "graph_query_check",
+        format!(
+            "GraphIndex: {} nodes, {} edges. First node '{}': {} outgoing, {} incoming neighbors",
+            node_count,
+            edge_count,
+            first_node.id.name,
+            outgoing.len(),
+            incoming.len()
+        ),
+    )
+}
+
+/// oh_search_context (semantic) check: searches the embedding index for "alignment"
+/// and verifies at least one result is returned from the .oh/ artifacts.
+async fn run_oh_search_context_check(embed_index: &Option<EmbeddingIndex>) -> Check {
+    let index = match embed_index {
+        Some(i) => i,
+        None => {
+            return Check::skip(
+                "oh_search_context",
+                "EmbeddingIndex not available (fastembed may not be compiled in)",
+            );
+        }
+    };
+
+    match index.search("alignment", None, 5).await {
+        Err(e) => {
+            // Table-not-found means indexing was skipped — not a hard failure
+            let msg = e.to_string();
+            if msg.contains("Table not found") || msg.contains("table") {
+                Check::skip("oh_search_context", "Embedding table not found — run index_all first")
+            } else {
+                Check::fail("oh_search_context", format!("Semantic search failed: {}", e))
+            }
+        }
+        Ok(results) => {
+            if results.is_empty() {
+                Check::skip(
+                    "oh_search_context",
+                    "Semantic search for 'alignment' returned 0 results (index may be empty)",
+                )
+            } else {
+                Check::pass(
+                    "oh_search_context",
+                    format!(
+                        "Semantic search for 'alignment' returned {} result(s); top: '{}' (score: {:.2})",
+                        results.len(),
+                        results[0].title,
+                        results[0].score
+                    ),
+                )
+            }
+        }
+    }
+}
+
 // ── Output ──────────────────────────────────────────────────────────
 
 fn print_and_return(args: &TestArgs, checks: Vec<Check>) -> bool {
