@@ -11,6 +11,7 @@ const SOURCE_DECLARATION_VERSION: &str = "0.1.0";
 const SOURCE_DECLARATION_KIND: &str = "code.workspace:v1";
 const SOURCE_FACT_TYPE: &str = "code.workspace.bootstrap.health";
 
+const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
@@ -369,7 +370,7 @@ pub fn merge_mcp_json_with_binary(
         "type": "stdio",
         "command": command_path,
         "args": ["--repo", repo_path],
-        "timeout": 10000
+        "timeout": DEFAULT_MCP_TIMEOUT_MS
     });
 
     let serialised =
@@ -725,7 +726,7 @@ mod tests {
         );
         assert_eq!(v["mcpServers"]["rna-server"]["args"][0], "--repo");
         assert_eq!(v["mcpServers"]["rna-server"]["args"][1], "/my/project");
-        assert_eq!(v["mcpServers"]["rna-server"]["timeout"], 10000);
+        assert_eq!(v["mcpServers"]["rna-server"]["timeout"], DEFAULT_MCP_TIMEOUT_MS);
     }
 
     // ── merge preserves other servers ────────────────────────────────────────
@@ -792,7 +793,7 @@ mod tests {
             "/new/bin/repo-native-alignment"
         );
         assert_eq!(v["mcpServers"]["rna-server"]["args"][1], "/new/project");
-        assert_eq!(v["mcpServers"]["rna-server"]["timeout"], 10000);
+        assert_eq!(v["mcpServers"]["rna-server"]["timeout"], DEFAULT_MCP_TIMEOUT_MS);
     }
 
     // ── idempotent merge ─────────────────────────────────────────────────────

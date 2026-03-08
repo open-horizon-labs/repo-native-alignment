@@ -78,11 +78,18 @@ impl Check {
 
 pub async fn run(args: &TestArgs) -> Result<bool> {
     let repo = args.repo.canonicalize().unwrap_or_else(|_| args.repo.clone());
+    tracing::info!("Smoke: starting RNA pipeline test for {}", repo.display());
     let mut checks: Vec<Check> = Vec::new();
 
     // 1. Scanner initializes
+    let scanner_init_start = std::time::Instant::now();
+    tracing::info!("Smoke: initializing scanner");
     let mut scanner = match Scanner::new(repo.clone()) {
         Ok(s) => {
+            tracing::info!(
+                "Smoke: scanner initialized in {:?}",
+                scanner_init_start.elapsed()
+            );
             checks.push(Check::pass("scanner_init", "Scanner created successfully"));
             s
         }
@@ -93,10 +100,17 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     };
 
     // 2. File walk
+    let file_walk_start = std::time::Instant::now();
+    tracing::info!("Smoke: walking files");
     let _scan_result = match scanner.scan() {
         Ok(r) => {
             let all_files = scanner.all_known_files();
             let count = all_files.len();
+            tracing::info!(
+                "Smoke: file walk completed in {:?} ({} files known)",
+                file_walk_start.elapsed(),
+                count
+            );
             if count > 0 {
                 checks.push(Check::pass("file_walk", format!("{} files known", count)));
             } else {
@@ -111,6 +125,8 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     };
 
     // 3. Symbol extraction
+    let extraction_start = std::time::Instant::now();
+    tracing::info!("Smoke: extracting symbols from scanned files");
     let registry = ExtractorRegistry::with_builtins();
     let all_files = scanner.all_known_files();
     let full_scan = crate::scanner::ScanResult {
@@ -121,6 +137,12 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     };
     let extraction = registry.extract_scan_result(&repo, &full_scan);
     let symbol_count = extraction.nodes.len();
+    tracing::info!(
+        "Smoke: symbol extraction completed in {:?} ({} symbols, {} edges)",
+        extraction_start.elapsed(),
+        extraction.nodes.len(),
+        extraction.edges.len()
+    );
     if symbol_count > 0 {
         checks.push(Check::pass("symbol_extraction", format!("{} symbols extracted", symbol_count)));
     } else {
@@ -128,6 +150,8 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     }
 
     // 4. Graph index build
+    let graph_index_start = std::time::Instant::now();
+    tracing::info!("Smoke: building graph index");
     let all_nodes = extraction.nodes;
     let all_edges = extraction.edges;
     let mut index = GraphIndex::new();
@@ -135,14 +159,25 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     for node in &all_nodes {
         index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
     }
+    tracing::info!(
+        "Smoke: graph index built in {:?} ({} edges)",
+        graph_index_start.elapsed(),
+        all_edges.len()
+    );
     checks.push(Check::pass("graph_index", format!("{} edges indexed", all_edges.len())));
 
     // 5. Embedding index
+    let embed_start = std::time::Instant::now();
+    tracing::info!("Smoke: preparing embedding index");
     let embed_index = match EmbeddingIndex::new(&repo).await {
         Ok(idx) => {
             // Probe first: if the table already exists, reuse it; otherwise rebuild.
             match idx.search("_probe_", None, 1).await {
                 Ok(_) => {
+                    tracing::info!(
+                        "Smoke: embedding index reused in {:?}",
+                        embed_start.elapsed()
+                    );
                     checks.push(Check::pass("embed_index", "Persisted embedding index reused"));
                     Some(idx)
                 }
@@ -153,6 +188,11 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
                         .collect();
                     match idx.index_all_with_symbols(&repo, &embeddable).await {
                         Ok(count) => {
+                            tracing::info!(
+                                "Smoke: embedding index built in {:?} ({} vectors)",
+                                embed_start.elapsed(),
+                                count
+                            );
                             checks.push(Check::pass("embed_index", format!("{} vectors written", count)));
                             Some(idx)
                         }

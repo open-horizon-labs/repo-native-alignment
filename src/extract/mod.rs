@@ -239,9 +239,17 @@ impl ExtractorRegistry {
             .iter()
             .chain(scan_result.new_files.iter())
             .collect();
+        let extraction_start = std::time::Instant::now();
+        tracing::info!(
+            "ExtractorRegistry: starting extraction for {} file(s) under {}",
+            files_to_process.len(),
+            repo_root.display()
+        );
 
         for rel_path in files_to_process {
+            let file_start = std::time::Instant::now();
             let abs_path = repo_root.join(rel_path);
+            tracing::debug!("ExtractorRegistry: reading {}", abs_path.display());
             let content = match std::fs::read_to_string(&abs_path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -250,8 +258,22 @@ impl ExtractorRegistry {
                 }
             };
             let file_result = self.extract_file(rel_path, &content);
+            tracing::debug!(
+                "ExtractorRegistry: extracted {} -> {} node(s), {} edge(s) in {:?}",
+                rel_path.display(),
+                file_result.nodes.len(),
+                file_result.edges.len(),
+                file_start.elapsed()
+            );
             result.merge(file_result);
         }
+
+        tracing::info!(
+            "ExtractorRegistry: completed extraction in {:?} ({} node(s), {} edge(s))",
+            extraction_start.elapsed(),
+            result.nodes.len(),
+            result.edges.len()
+        );
 
         result
     }
