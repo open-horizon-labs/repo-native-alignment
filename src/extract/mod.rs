@@ -7,7 +7,12 @@
 //! The `ExtractorRegistry` dispatches by file extension, then calls `can_handle()`
 //! for fine-grained checks. Multiple extractors can handle the same file.
 
+pub mod bash;
 pub mod go;
+pub mod hcl;
+pub mod java;
+pub mod javascript;
+pub mod json_extractor;
 pub mod lsp;
 pub mod markdown;
 pub mod openapi;
@@ -15,7 +20,9 @@ pub mod proto;
 pub mod python;
 pub mod rust;
 pub mod sql;
+pub mod toml_extractor;
 pub mod typescript;
+pub mod yaml_extractor;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -105,9 +112,10 @@ pub trait Enricher: Send + Sync {
 
     /// Enrich the graph with additional edges and metadata.
     ///
-    /// Receives the current nodes and the graph index for lookup.
+    /// Receives the current nodes, the graph index for lookup, and the actual
+    /// repo root (from `--repo`, not `std::env::current_dir()`).
     /// Returns new edges and node metadata patches.
-    async fn enrich(&self, nodes: &[Node], index: &GraphIndex) -> Result<EnrichmentResult>;
+    async fn enrich(&self, nodes: &[Node], index: &GraphIndex, repo_root: &Path) -> Result<EnrichmentResult>;
 
     /// Human-readable name for this enricher (for diagnostics).
     fn name(&self) -> &str;
@@ -134,10 +142,20 @@ impl ExtractorRegistry {
     /// Create a registry pre-loaded with all built-in extractors.
     pub fn with_builtins() -> Self {
         let mut registry = Self::new();
+        // Code
         registry.register(Box::new(rust::RustExtractor::new()));
         registry.register(Box::new(python::PythonExtractor::new()));
         registry.register(Box::new(typescript::TypeScriptExtractor::new()));
+        registry.register(Box::new(javascript::JavaScriptExtractor::new()));
         registry.register(Box::new(go::GoExtractor::new()));
+        registry.register(Box::new(java::JavaExtractor::new()));
+        registry.register(Box::new(bash::BashExtractor::new()));
+        // Infrastructure / config
+        registry.register(Box::new(hcl::HclExtractor::new()));
+        registry.register(Box::new(json_extractor::JsonExtractor::new()));
+        registry.register(Box::new(toml_extractor::TomlExtractor::new()));
+        registry.register(Box::new(yaml_extractor::YamlExtractor::new()));
+        // Schema / API
         registry.register(Box::new(markdown::MarkdownExtractor::new()));
         registry.register(Box::new(proto::ProtoExtractor::new()));
         registry.register(Box::new(sql::SqlExtractor::new()));
@@ -332,12 +350,14 @@ impl EnricherRegistry {
 
     /// Run all enrichers that support the given languages present in the graph.
     ///
+    /// `repo_root` must be the actual project root (from `--repo`), not `cwd`.
     /// Returns a merged `EnrichmentResult` from all enrichers.
     pub async fn enrich_all(
         &self,
         nodes: &[Node],
         index: &GraphIndex,
         languages: &[String],
+        repo_root: &Path,
     ) -> EnrichmentResult {
         let mut result = EnrichmentResult::default();
 
@@ -357,7 +377,7 @@ impl EnricherRegistry {
                 continue; // silently skip — too many servers to log each one
             }
 
-            match enricher.enrich(nodes, index).await {
+            match enricher.enrich(nodes, index, repo_root).await {
                 Ok(enrichment) => {
                     tracing::info!(
                         "Enricher {}: {} edges, {} node patches",

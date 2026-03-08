@@ -146,7 +146,7 @@ fn collect_nodes(
 
     // Recurse into children
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
+        if let Some(child) = node.child(i as u32) {
             collect_nodes(child, path, source, nodes, edges);
         }
     }

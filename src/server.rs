@@ -359,6 +359,152 @@ async fn persist_graph_to_lance(
     Ok(())
 }
 
+/// Persist graph changes incrementally using LanceDB merge_insert (upsert + delete).
+/// Unlike `persist_graph_to_lance` (DROP+CREATE), this keeps the tables alive during writes —
+/// no query window with empty results.
+async fn persist_graph_incremental(
+    repo_root: &Path,
+    nodes: &[Node],
+    edges: &[Edge],
+) -> anyhow::Result<()> {
+    let db_path = graph_lance_path(repo_root);
+    std::fs::create_dir_all(&db_path)?;
+
+    let db = lancedb::connect(db_path.to_str().unwrap())
+        .execute()
+        .await
+        .context("Failed to connect to LanceDB for incremental graph persistence")?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    // ── Upsert symbols (nodes) table ──
+    {
+        let schema = Arc::new(symbols_schema());
+
+        let ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
+        let root_ids: Vec<String> = nodes.iter().map(|n| n.id.root.clone()).collect();
+        let file_paths: Vec<String> = nodes.iter().map(|n| n.id.file.display().to_string()).collect();
+        let names: Vec<String> = nodes.iter().map(|n| n.id.name.clone()).collect();
+        let kinds: Vec<String> = nodes.iter().map(|n| n.id.kind.to_string()).collect();
+        let line_starts: Vec<u32> = nodes.iter().map(|n| n.line_start as u32).collect();
+        let line_ends: Vec<u32> = nodes.iter().map(|n| n.line_end as u32).collect();
+        let signatures: Vec<String> = nodes.iter().map(|n| n.signature.clone()).collect();
+        let bodies: Vec<String> = nodes.iter().map(|n| n.body.clone()).collect();
+        let updated_ats: Vec<i64> = vec![now; nodes.len()];
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(root_ids)),
+                Arc::new(StringArray::from(file_paths)),
+                Arc::new(StringArray::from(names)),
+                Arc::new(StringArray::from(kinds)),
+                Arc::new(UInt32Array::from(line_starts)),
+                Arc::new(UInt32Array::from(line_ends)),
+                Arc::new(StringArray::from(signatures)),
+                Arc::new(StringArray::from(bodies)),
+                Arc::new(Int64Array::from(updated_ats)),
+            ],
+        )?;
+
+        match db.open_table("symbols").execute().await {
+            Ok(tbl) => {
+                let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+                let mut merge = tbl.merge_insert(&["id"]);
+                merge
+                    .when_matched_update_all(None)
+                    .when_not_matched_insert_all()
+                    .when_not_matched_by_source_delete(None);
+                merge
+                    .execute(Box::new(batches))
+                    .await
+                    .context("Failed to merge_insert symbols table")?;
+            }
+            Err(_) => {
+                // Table doesn't exist yet — create it (first incremental run after a fresh repo)
+                let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+                db.create_table("symbols", Box::new(batches))
+                    .execute()
+                    .await
+                    .context("Failed to create symbols table")?;
+            }
+        }
+    }
+
+    // ── Upsert edges table ──
+    {
+        let schema = Arc::new(edges_schema());
+
+        let ids: Vec<String> = edges.iter().map(|e| e.stable_id()).collect();
+        let source_ids: Vec<String> = edges.iter().map(|e| e.from.to_stable_id()).collect();
+        let source_types: Vec<String> = edges.iter().map(|e| e.from.kind.to_string()).collect();
+        let target_ids: Vec<String> = edges.iter().map(|e| e.to.to_stable_id()).collect();
+        let target_types: Vec<String> = edges.iter().map(|e| e.to.kind.to_string()).collect();
+        let edge_types: Vec<String> = edges.iter().map(|e| e.kind.to_string()).collect();
+        let properties: Vec<String> = edges
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "source": e.source.to_string(),
+                    "confidence": e.confidence.to_string(),
+                })
+                .to_string()
+            })
+            .collect();
+        let root_ids: Vec<String> = edges.iter().map(|e| e.from.root.clone()).collect();
+        let updated_ats: Vec<i64> = vec![now; edges.len()];
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(source_ids)),
+                Arc::new(StringArray::from(source_types)),
+                Arc::new(StringArray::from(target_ids)),
+                Arc::new(StringArray::from(target_types)),
+                Arc::new(StringArray::from(edge_types)),
+                Arc::new(StringArray::from(properties)),
+                Arc::new(StringArray::from(root_ids)),
+                Arc::new(Int64Array::from(updated_ats)),
+            ],
+        )?;
+
+        match db.open_table("edges").execute().await {
+            Ok(tbl) => {
+                let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+                let mut merge = tbl.merge_insert(&["id"]);
+                merge
+                    .when_matched_update_all(None)
+                    .when_not_matched_insert_all()
+                    .when_not_matched_by_source_delete(None);
+                merge
+                    .execute(Box::new(batches))
+                    .await
+                    .context("Failed to merge_insert edges table")?;
+            }
+            Err(_) => {
+                // Table doesn't exist yet — create it
+                let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+                db.create_table("edges", Box::new(batches))
+                    .execute()
+                    .await
+                    .context("Failed to create edges table")?;
+            }
+        }
+    }
+
+    tracing::info!(
+        "Incrementally persisted graph to LanceDB: {} nodes, {} edges",
+        nodes.len(),
+        edges.len()
+    );
+    Ok(())
+}
+
 /// Load graph nodes and edges from LanceDB tables.
 async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphState> {
     use futures::TryStreamExt;
@@ -861,7 +1007,7 @@ impl RnaHandler {
 
         let enricher_registry = EnricherRegistry::with_builtins();
         let enrichment = enricher_registry
-            .enrich_all(&all_nodes, &index, &languages)
+            .enrich_all(&all_nodes, &index, &languages, &self.repo_root)
             .await;
 
         if !enrichment.added_edges.is_empty() {
@@ -993,6 +1139,58 @@ impl RnaHandler {
                 .ensure_node(&node.stable_id(), &node.id.kind.to_string());
         }
 
+        // Run LSP enrichers on the updated nodes (same as cold-start, but scoped to changed files)
+        let changed_files: std::collections::HashSet<_> = scan
+            .changed_files
+            .iter()
+            .chain(scan.new_files.iter())
+            .collect();
+        let changed_nodes: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|n| changed_files.iter().any(|f| n.id.file == **f))
+            .cloned()
+            .collect();
+
+        if !changed_nodes.is_empty() {
+            let languages: Vec<String> = changed_nodes
+                .iter()
+                .map(|n| n.language.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            let enricher_registry = EnricherRegistry::with_builtins();
+            let enrichment = enricher_registry
+                .enrich_all(&changed_nodes, &graph.index, &languages, &self.repo_root)
+                .await;
+
+            if !enrichment.added_edges.is_empty() {
+                tracing::info!(
+                    "Incremental LSP enrichment added {} edges",
+                    enrichment.added_edges.len()
+                );
+                for edge in &enrichment.added_edges {
+                    graph.index.add_edge(
+                        &edge.from.to_stable_id(),
+                        &edge.from.kind.to_string(),
+                        &edge.to.to_stable_id(),
+                        &edge.to.kind.to_string(),
+                        edge.kind.clone(),
+                    );
+                }
+                graph.edges.extend(enrichment.added_edges);
+            }
+
+            for (node_id, patches) in &enrichment.updated_nodes {
+                if let Some(node) = graph.nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
+                    for (key, value) in patches {
+                        node.metadata.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+
         // Re-embed changed symbols (rebuild entire embed index for now --
         // true incremental embedding is a future optimization)
         if let Some(ref embed_idx) = graph.embed_index {
@@ -1007,9 +1205,9 @@ impl RnaHandler {
             }
         }
 
-        // Persist updated graph
+        // Persist updated graph incrementally (merge_insert keeps tables alive; no empty-result window)
         if let Err(e) =
-            persist_graph_to_lance(&self.repo_root, &graph.nodes, &graph.edges).await
+            persist_graph_incremental(&self.repo_root, &graph.nodes, &graph.edges).await
         {
             tracing::warn!("Failed to persist updated graph: {}", e);
         }
