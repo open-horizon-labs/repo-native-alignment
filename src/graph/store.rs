@@ -8,9 +8,12 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 
-/// Schema version — bump when any LanceDB table schema changes.
-/// Used in the index freshness footer appended to `search_symbols` and
-/// `oh_search_context` responses so agents can detect stale binaries.
+/// Schema version for all LanceDB tables.
+///
+/// Bump this whenever ANY schema changes (symbols, edges, pr_merges, file_index).
+/// The server auto-drops and rebuilds all LanceDB tables when this mismatches
+/// the stored version. No manual cache deletion needed.
+/// Also surfaced in the index freshness footer on `search_symbols` and `oh_search_context`.
 pub const SCHEMA_VERSION: u32 = 3;
 
 /// Arrow schema for the `symbols` table.
@@ -24,6 +27,8 @@ pub const SCHEMA_VERSION: u32 = 3;
 /// - `meta_name_col` — LSP cursor column used for go-to-definition disambiguation
 /// - `value`         — constant value for Const nodes
 /// - `synthetic`     — true for synthetic/inferred constants (e.g. YAML scalar key-values)
+///
+/// bump SCHEMA_VERSION in store.rs when changing this
 pub fn symbols_schema() -> Schema {
     Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -49,6 +54,8 @@ pub fn symbols_schema() -> Schema {
 
 /// Arrow schema for `symbols` including a fixed-size vector column.
 /// `dim` is the embedding dimension (e.g., 384 for BGE-small-en-v1.5).
+///
+/// bump SCHEMA_VERSION in store.rs when changing this
 pub fn symbols_schema_with_vector(dim: i32) -> Schema {
     Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -81,6 +88,8 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
 ///
 /// Stores directed relationships between nodes. Source of truth for the
 /// petgraph in-memory index (which is rebuilt from this table).
+///
+/// bump SCHEMA_VERSION in store.rs when changing this
 pub fn edges_schema() -> Schema {
     Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -102,6 +111,8 @@ pub fn edges_schema() -> Schema {
 /// branch. PRs are the natural unit of meaningful change — they have semantic
 /// intent (title/description), bounded scope, and map to graph edges via the
 /// files they modify.
+///
+/// bump SCHEMA_VERSION in store.rs when changing this
 pub fn pr_merges_schema() -> Schema {
     Schema::new(vec![
         Field::new("id", DataType::Utf8, false),           // root:merge_commit_sha
@@ -122,6 +133,8 @@ pub fn pr_merges_schema() -> Schema {
 ///
 /// Tracks which files have been indexed and by which extractors,
 /// enabling incremental re-indexing on file changes.
+///
+/// bump SCHEMA_VERSION in store.rs when changing this
 pub fn file_index_schema() -> Schema {
     Schema::new(vec![
         Field::new("path", DataType::Utf8, false),
@@ -133,9 +146,34 @@ pub fn file_index_schema() -> Schema {
     ])
 }
 
+/// Arrow schema for the `_schema_meta` table.
+///
+/// Single-row key/value table used to persist the schema version so the
+/// server can detect staleness on startup and auto-drop all tables.
+pub fn schema_meta_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("value", DataType::Utf8, false),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_schema_version_constant() {
+        // SCHEMA_VERSION must be at least 2 (bumped when _schema_meta table was introduced)
+        assert!(SCHEMA_VERSION >= 2, "SCHEMA_VERSION should be >= 2");
+    }
+
+    #[test]
+    fn test_schema_meta_schema_fields() {
+        let schema = schema_meta_schema();
+        assert!(schema.field_with_name("key").is_ok());
+        assert!(schema.field_with_name("value").is_ok());
+        assert_eq!(schema.fields().len(), 2);
+    }
 
     #[test]
     fn test_symbols_schema_fields() {

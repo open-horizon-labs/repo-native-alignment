@@ -1,0 +1,5 @@
+# NOTE: target-dir is intentionally NOT set here.
+# An absolute local path would break CI and other developers' machines.
+# To share the target directory across worktrees locally, set CARGO_TARGET_DIR
+# in your shell profile:
+#   export CARGO_TARGET_DIR=/path/to/repo/target
