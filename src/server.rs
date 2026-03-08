@@ -965,8 +965,65 @@ impl RnaHandler {
                 let mut prev_root_slugs: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
 
+                // HEAD-change detection state.
+                let mut last_head_oid: Option<git2::Oid> = None;
+                let mut last_fetch_head_mtime: Option<std::time::SystemTime> = None;
+
                 loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(900)).await; // 15 min
+                    // Check for HEAD or FETCH_HEAD changes before waiting.
+                    // If a change is detected, trigger an immediate scan rather
+                    // than waiting for the full 15-min cadence.
+                    let head_changed = {
+                        match git2::Repository::open(&repo_root) {
+                            Ok(repo) => match repo.head().and_then(|h| h.peel_to_commit()) {
+                                Ok(commit) => {
+                                    let oid = commit.id();
+                                    let changed = last_head_oid.map_or(false, |prev| prev != oid);
+                                    last_head_oid = Some(oid);
+                                    changed
+                                }
+                                Err(_) => false,
+                            },
+                            Err(_) => false,
+                        }
+                    };
+
+                    let fetch_head_changed = {
+                        let fetch_head_path = repo_root.join(".git").join("FETCH_HEAD");
+                        match std::fs::metadata(&fetch_head_path).and_then(|m| m.modified()) {
+                            Ok(mtime) => {
+                                let changed =
+                                    last_fetch_head_mtime.map_or(false, |prev| prev != mtime);
+                                last_fetch_head_mtime = Some(mtime);
+                                changed
+                            }
+                            Err(_) => false,
+                        }
+                    };
+
+                    if head_changed {
+                        tracing::info!("HEAD changed — triggering immediate background scan");
+                    } else if fetch_head_changed {
+                        tracing::info!(
+                            "FETCH_HEAD changed — triggering immediate background scan"
+                        );
+                    } else {
+                        // No git-level change detected: wait for the 15-min heartbeat.
+                        tokio::time::sleep(tokio::time::Duration::from_secs(900)).await;
+                        // Re-read HEAD/FETCH_HEAD after sleeping so that the next
+                        // iteration's comparison reflects the post-sleep baseline.
+                        if let Ok(repo) = git2::Repository::open(&repo_root) {
+                            if let Ok(commit) = repo.head().and_then(|h| h.peel_to_commit()) {
+                                last_head_oid = Some(commit.id());
+                            }
+                        }
+                        let fetch_head_path = repo_root.join(".git").join("FETCH_HEAD");
+                        if let Ok(mtime) =
+                            std::fs::metadata(&fetch_head_path).and_then(|m| m.modified())
+                        {
+                            last_fetch_head_mtime = Some(mtime);
+                        }
+                    }
 
                     // Resolve current roots (primary + any live worktrees).
                     let workspace = WorkspaceConfig::load()
@@ -1162,7 +1219,7 @@ impl RnaHandler {
                     prev_root_slugs = current_root_slugs;
                 }
             });
-            tracing::info!("Background scanner started (15min interval, worktree-aware)");
+            tracing::info!("Background scanner started (event-driven + 15min heartbeat, worktree-aware)");
         }
 
         // Downgrade to read lock
@@ -1171,9 +1228,12 @@ impl RnaHandler {
 
     /// Build the full graph from scratch. This is the original get_graph logic.
     async fn build_full_graph(&self) -> anyhow::Result<GraphState> {
-        // Load workspace config and merge with --repo as primary root
+        // Load workspace config and merge with --repo as primary root.
+        // Also auto-detect any live git worktrees so all roots are indexed
+        // on the first full build (mirrors the background scanner path).
         let workspace = WorkspaceConfig::load()
-            .with_primary_root(self.repo_root.clone());
+            .with_primary_root(self.repo_root.clone())
+            .with_worktrees(&self.repo_root);
         let resolved_roots = workspace.resolved_roots();
 
         // 1. Scan all roots to detect changes
@@ -2245,7 +2305,8 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
 
             "list_roots" => {
                 let workspace = WorkspaceConfig::load()
-                    .with_primary_root(self.repo_root.clone());
+                    .with_primary_root(self.repo_root.clone())
+                    .with_worktrees(&self.repo_root);
                 let resolved = workspace.resolved_roots();
 
                 if resolved.is_empty() {
