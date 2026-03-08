@@ -910,7 +910,7 @@ pub(crate) async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<Gr
         }
     };
 
-    Ok(GraphState { nodes, edges, index, embed_index, last_scan_completed_at: None })
+    Ok(GraphState { nodes, edges, index, embed_index, last_scan_completed_at: Some(std::time::Instant::now()) })
 }
 
 /// Parse a NodeId from its stable_id string (format: "root:file:name:kind").
