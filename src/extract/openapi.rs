@@ -251,6 +251,40 @@ fn extract_schemas(
             source: ExtractionSource::Schema,
         });
 
+        // Extract enum values from the schema definition
+        if let Some(enum_values) = schema_def.get("enum") {
+            if let Some(enum_seq) = enum_values.as_sequence() {
+                for enum_val in enum_seq {
+                    let val_str = match enum_val {
+                        Value::String(s) => s.clone(),
+                        Value::Number(n) => n.to_string(),
+                        Value::Bool(b) => b.to_string(),
+                        _ => continue,
+                    };
+                    if !val_str.is_empty() {
+                        let mut const_metadata = BTreeMap::new();
+                        const_metadata.insert("value".to_string(), val_str.clone());
+                        const_metadata.insert("synthetic".to_string(), "true".to_string());
+                        nodes.push(Node {
+                            id: NodeId {
+                                root: String::new(),
+                                file: file_path.to_path_buf(),
+                                name: format!("{}.{}", schema_name, val_str),
+                                kind: NodeKind::Const,
+                            },
+                            language: "openapi".to_string(),
+                            line_start: 0,
+                            line_end: 0,
+                            signature: format!("{} enum: {}", schema_name, val_str),
+                            body: val_str,
+                            metadata: const_metadata,
+                            source: ExtractionSource::Schema,
+                        });
+                    }
+                }
+            }
+        }
+
         // Extract properties as fields
         if let Some(properties) = schema_def.get("properties") {
             if let Some(props_map) = properties.as_mapping() {

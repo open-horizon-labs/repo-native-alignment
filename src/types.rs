@@ -88,6 +88,12 @@ pub struct CodeSymbol {
     pub signature: String,
     pub parent_scope: Option<String>,
     pub body: String,
+    /// Scalar value if extractable (e.g. "5", "application/json"). None for complex/derived.
+    #[serde(default)]
+    pub value: Option<String>,
+    /// true = inferred literal (synthetic), false = declared named constant.
+    #[serde(default)]
+    pub synthetic: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -122,12 +128,19 @@ impl std::fmt::Display for SymbolKind {
 
 impl CodeSymbol {
     pub fn to_markdown(&self) -> String {
+        let value_part = match (&self.kind, &self.value) {
+            (SymbolKind::Const, Some(v)) => format!(" = {}", v),
+            _ => String::new(),
+        };
+        let synthetic_badge = if self.synthetic { " *(literal)*" } else { "" };
         format!(
-            "- `{}:{}` **{}** `{}`",
+            "- `{}:{}` **{}** `{}`{}{}",
             self.file_path.display(),
             self.line_start,
             self.kind,
-            self.signature
+            self.signature,
+            value_part,
+            synthetic_badge,
         )
     }
 }

@@ -109,6 +109,16 @@ fn collect_nodes(
                 name_node.start_position().column.to_string(),
             );
         }
+        // For const items, extract the value from the AST and mark synthetic = false.
+        if node_kind == NodeKind::Const {
+            if let Some(val_node) = node.child_by_field_name("value") {
+                let val = val_node.utf8_text(source).unwrap_or("").trim().to_string();
+                if !val.is_empty() {
+                    metadata.insert("value".to_string(), val);
+                }
+            }
+            metadata.insert("synthetic".to_string(), "false".to_string());
+        }
 
         let graph_node = Node {
             id: NodeId {
@@ -370,6 +380,25 @@ mod inner {
         assert!(names.contains(&"Status"), "Should find enum Status");
         assert!(names.contains(&"MAX_SIZE"), "Should find const MAX_SIZE");
         assert!(names.contains(&"inner"), "Should find module inner");
+    }
+
+    #[test]
+    fn test_rust_const_value_extraction() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+pub const MAX_RETRIES: u32 = 5;
+pub const CONTENT_TYPE: &str = "application/json";
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+        let consts: Vec<_> = result.nodes.iter().filter(|n| n.id.kind == NodeKind::Const).collect();
+        assert_eq!(consts.len(), 2, "Should find 2 const nodes");
+
+        let max_retries = consts.iter().find(|n| n.id.name == "MAX_RETRIES").expect("Should find MAX_RETRIES");
+        assert_eq!(max_retries.metadata.get("value").map(|s| s.as_str()), Some("5"), "Should extract value 5");
+        assert_eq!(max_retries.metadata.get("synthetic").map(|s| s.as_str()), Some("false"));
+
+        let content_type = consts.iter().find(|n| n.id.name == "CONTENT_TYPE").expect("Should find CONTENT_TYPE");
+        assert!(content_type.metadata.get("value").is_some(), "Should extract string value");
     }
 
     #[test]

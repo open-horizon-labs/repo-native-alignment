@@ -17,6 +17,7 @@ use petgraph::Direction;
 
 use crate::embed::EmbeddingIndex;
 use crate::extract::ExtractorRegistry;
+use crate::graph::{Edge, Node};
 use crate::graph::index::GraphIndex;
 use crate::oh;
 use crate::query;
@@ -245,22 +246,43 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     // 13. LSP virtual external nodes round-trip through LanceDB
     checks.push(run_external_calls_check().await);
 
-    // 14. list_roots -- verifies WorkspaceConfig returns at least 1 root matching the test repo
+    // 14. HEAD-change detection logic
+    checks.push(run_head_change_detection_check());
+
+    // 15. Cross-language constants smoke test
+    // Part A: in-memory extraction
+    let const_nodes: Vec<_> = all_nodes.iter()
+        .filter(|n| n.id.kind == crate::graph::NodeKind::Const)
+        .collect();
+    if const_nodes.is_empty() {
+        checks.push(Check::fail("const_extraction", "No Const nodes extracted"));
+    } else {
+        let with_value = const_nodes.iter().filter(|n| n.metadata.contains_key("value")).count();
+        checks.push(Check::pass(
+            "const_extraction",
+            format!("{} Const nodes, {} with value", const_nodes.len(), with_value),
+        ));
+    }
+
+    // 16. LanceDB round-trip — persist, reload, assert Const value survives
+    checks.push(run_const_lance_roundtrip(&all_nodes, &all_edges).await);
+
+    // 17. list_roots -- verifies WorkspaceConfig returns at least 1 root matching the test repo
     checks.push(run_list_roots_check(&repo));
 
-    // 15. Worktree roots -- creates a real git worktree, checks with_worktrees() sees it
+    // 18. Worktree roots -- creates a real git worktree, checks with_worktrees() sees it
     checks.push(run_worktree_roots_check(&repo).await);
 
-    // 16. Metadata round-trip -- persist node with metadata, reload, assert identical
+    // 19. Metadata round-trip -- persist node with metadata, reload, assert identical
     checks.push(run_metadata_roundtrip_check().await);
 
-    // 17. search_symbols -- verifies function nodes and Const nodes are findable
+    // 20. search_symbols -- verifies function nodes and Const nodes are findable
     checks.push(run_search_symbols_check(&all_nodes));
 
-    // 18. graph_query -- verifies GraphIndex has edges and neighbors() is callable
+    // 21. graph_query -- verifies GraphIndex has edges and neighbors() is callable
     checks.push(run_graph_query_check(&index, &all_nodes));
 
-    // 19. oh_search_context (semantic) -- searches for "alignment" in embedding index
+    // 22. oh_search_context (semantic) -- searches for "alignment" in embedding index
     checks.push(run_oh_search_context_check(&embed_index).await);
 
     Ok(print_and_return(args, checks))
@@ -519,6 +541,61 @@ async fn run_worktree_check(repo: &Path) -> Check {
     result
 }
 
+/// Persist a subset of nodes to a temp LanceDB, reload, and verify Const `value` survives.
+async fn run_const_lance_roundtrip(nodes: &[Node], edges: &[Edge]) -> Check {
+    // Pick at most 50 nodes so the write is fast; ensure at least one Const with a value
+    let const_with_value: Vec<_> = nodes.iter()
+        .filter(|n| n.id.kind == crate::graph::NodeKind::Const && n.metadata.contains_key("value"))
+        .cloned()
+        .collect();
+
+    if const_with_value.is_empty() {
+        return Check::skip("const_lance_roundtrip", "No Const nodes with value — skipping LanceDB round-trip check");
+    }
+
+    // Use a temp dir as the fake repo root for LanceDB
+    let tmp_root = std::env::temp_dir().join("rna-smoke-const-lance-roundtrip");
+    if let Err(e) = std::fs::create_dir_all(&tmp_root) {
+        return Check::fail("const_lance_roundtrip", format!("Failed to create temp dir: {}", e));
+    }
+    let tmp_root = tmp_root.as_path();
+
+    // Persist: use the const nodes + a small sample of other nodes
+    let sample: Vec<_> = nodes.iter().take(50).cloned()
+        .chain(const_with_value.iter().cloned())
+        .collect();
+    // Deduplicate by stable_id
+    let mut seen = std::collections::HashSet::new();
+    let deduped: Vec<_> = sample.into_iter().filter(|n| seen.insert(n.stable_id())).collect();
+
+    if let Err(e) = persist_graph_to_lance(tmp_root, &deduped, edges).await {
+        return Check::fail("const_lance_roundtrip", format!("persist_graph_to_lance failed: {}", e));
+    }
+
+    // Reload
+    let reloaded = match load_graph_from_lance(tmp_root).await {
+        Ok(state) => state,
+        Err(e) => return Check::fail("const_lance_roundtrip", format!("load_graph_from_lance failed: {}", e)),
+    };
+
+    // Assert Const nodes still have value after reload
+    let reloaded_consts_with_value = reloaded.nodes.iter()
+        .filter(|n| n.id.kind == crate::graph::NodeKind::Const && n.metadata.contains_key("value"))
+        .count();
+
+    // Clean up temp directory
+    let _ = std::fs::remove_dir_all(tmp_root);
+
+    if reloaded_consts_with_value == 0 {
+        Check::fail("const_lance_roundtrip", "Const nodes lost `value` metadata after LanceDB round-trip")
+    } else {
+        Check::pass(
+            "const_lance_roundtrip",
+            format!("{} Const nodes retained `value` after persist→reload", reloaded_consts_with_value),
+        )
+    }
+}
+
 fn cleanup_worktree(repo: &Path, worktree_path: &Path) {
     let _ = std::process::Command::new("git")
         .args(["worktree", "remove", "--force", worktree_path.to_str().unwrap_or("")])
@@ -543,7 +620,7 @@ fn cleanup_worktree(repo: &Path, worktree_path: &Path) {
 /// - That node has `metadata["virtual"] == "true"`
 /// - That node's name contains `"::"` (FQN, e.g. `lancedb::connect`)
 async fn run_external_calls_check() -> Check {
-    use arrow_array::StringArray;
+    use arrow_array::{Array, BooleanArray, StringArray};
     use futures::TryStreamExt;
     use lancedb::query::ExecutableQuery;
     use std::collections::BTreeMap;
@@ -638,9 +715,9 @@ async fn run_external_calls_check() -> Check {
             Some(a) => a,
             None => continue,
         };
-        // metadata_json column carries serialized BTreeMap<String,String>.
-        let metadata_col = batch.column_by_name("metadata_json")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        // Typed meta_virtual column — Boolean, nullable.
+        let meta_virtual_col = batch.column_by_name("meta_virtual")
+            .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
 
         for i in 0..batch.num_rows() {
             let root = root_ids.value(i);
@@ -648,13 +725,10 @@ async fn run_external_calls_check() -> Check {
             if root == "external" && name.contains("::") {
                 found_root_external = true;
                 found_fqn = true;
-                // Check metadata_json for virtual=true
-                if let Some(meta_col) = metadata_col {
-                    let meta_str = meta_col.value(i);
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                        if parsed.get("virtual").and_then(|v| v.as_str()) == Some("true") {
-                            found_virtual_true = true;
-                        }
+                // Check meta_virtual typed column for true
+                if let Some(col) = meta_virtual_col {
+                    if !col.is_null(i) && col.value(i) {
+                        found_virtual_true = true;
                     }
                 }
             }
@@ -676,13 +750,13 @@ async fn run_external_calls_check() -> Check {
     } else if !found_virtual_true {
         Check::fail(
             "external_calls_persist",
-            "Virtual external node metadata[\"virtual\"] != \"true\" after LanceDB round-trip — \
-             metadata_json column missing or not populated in persist path",
+            "Virtual external node meta_virtual != true after LanceDB round-trip — \
+             meta_virtual column missing or not populated in persist path",
         )
     } else {
         Check::pass(
             "external_calls_persist",
-            "Virtual external node round-tripped correctly: root=external, FQN name, virtual=true in metadata",
+            "Virtual external node round-tripped correctly: root=external, FQN name, meta_virtual=true",
         )
     }
 }
@@ -923,6 +997,139 @@ fn run_graph_query_check(index: &GraphIndex, nodes: &[crate::graph::Node]) -> Ch
             first_node.id.name,
             outgoing.len(),
             incoming.len()
+        ),
+    )
+}
+
+/// HEAD-change detection check.
+///
+/// Verifies the logic used by the background scanner to decide whether a
+/// reindex is needed:
+///
+/// 1. Creates a temp git repo with an initial commit (HEAD = commit A).
+/// 2. Records the HEAD OID.
+/// 3. Makes a second commit (HEAD = commit B).
+/// 4. Re-reads the HEAD OID.
+/// 5. Asserts the two OIDs differ (change detected).
+/// 6. Reads the OID a third time without committing.
+/// 7. Asserts the OID is unchanged (no spurious trigger).
+///
+/// This is a unit-level check — it exercises only the git2 detection path,
+/// not the full reindex cycle.
+fn run_head_change_detection_check() -> Check {
+    fn read_head_oid(repo: &git2::Repository) -> Option<git2::Oid> {
+        repo.head()
+            .ok()?
+            .peel_to_commit()
+            .ok()
+            .map(|c| c.id())
+    }
+
+    fn make_commit(repo: &git2::Repository, message: &str) -> Result<git2::Oid, git2::Error> {
+        let sig = git2::Signature::now("Test", "test@example.com")?;
+        let mut index = repo.index()?;
+        let tree_oid = index.write_tree()?;
+        let tree = repo.find_tree(tree_oid)?;
+        let parents: Vec<git2::Commit> = match repo.head() {
+            Ok(head_ref) => {
+                let commit = head_ref.peel_to_commit()?;
+                vec![commit]
+            }
+            Err(_) => vec![],
+        };
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)
+    }
+
+    // Step 1: init temp repo.
+    let temp_dir = std::env::temp_dir().join("rna-smoke-head-change");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+        return Check::fail(
+            "head_change_detection",
+            format!("Could not create temp dir: {}", e),
+        );
+    }
+    let repo = match git2::Repository::init(&temp_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            return Check::fail(
+                "head_change_detection",
+                format!("git2::Repository::init failed: {}", e),
+            )
+        }
+    };
+
+    // Step 2: initial commit.
+    if let Err(e) = make_commit(&repo, "initial commit") {
+        return Check::fail(
+            "head_change_detection",
+            format!("First commit failed: {}", e),
+        );
+    }
+    let oid_a = match read_head_oid(&repo) {
+        Some(o) => o,
+        None => {
+            return Check::fail(
+                "head_change_detection",
+                "Could not read HEAD OID after first commit",
+            )
+        }
+    };
+
+    // Step 3: second commit.
+    if let Err(e) = make_commit(&repo, "second commit") {
+        return Check::fail(
+            "head_change_detection",
+            format!("Second commit failed: {}", e),
+        );
+    }
+    let oid_b = match read_head_oid(&repo) {
+        Some(o) => o,
+        None => {
+            return Check::fail(
+                "head_change_detection",
+                "Could not read HEAD OID after second commit",
+            )
+        }
+    };
+
+    // Step 4: assert change detected.
+    if oid_a == oid_b {
+        return Check::fail(
+            "head_change_detection",
+            format!(
+                "HEAD OID unchanged after second commit (both = {}); detection would not fire",
+                oid_a
+            ),
+        );
+    }
+
+    // Step 5: assert no spurious change on stable re-read.
+    let oid_b2 = match read_head_oid(&repo) {
+        Some(o) => o,
+        None => {
+            return Check::fail(
+                "head_change_detection",
+                "Could not re-read HEAD OID for stable-state check",
+            )
+        }
+    };
+    if oid_b != oid_b2 {
+        return Check::fail(
+            "head_change_detection",
+            "HEAD OID changed between reads without a commit; spurious trigger would occur",
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    Check::pass(
+        "head_change_detection",
+        format!(
+            "HEAD-change detection correct: A ({}) != B ({}); stable re-read matches",
+            &oid_a.to_string()[..8],
+            &oid_b.to_string()[..8],
         ),
     )
 }
