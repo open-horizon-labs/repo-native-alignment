@@ -8,28 +8,21 @@
 //! for fine-grained checks. Multiple extractors can handle the same file.
 
 pub mod bash;
-pub mod cpp;
-pub mod csharp;
 pub mod go;
 pub mod hcl;
 pub mod java;
 pub mod javascript;
 pub mod json_extractor;
-pub mod kotlin;
 pub mod lsp;
-pub mod lua;
 pub mod markdown;
 pub mod openapi;
 pub mod proto;
 pub mod python;
-pub mod ruby;
 pub mod rust;
 pub mod sql;
-pub mod swift;
 pub mod toml_extractor;
 pub mod typescript;
 pub mod yaml_extractor;
-pub mod zig;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -91,13 +84,17 @@ pub trait Extractor: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// The output of running an enricher on existing graph data.
-/// Enrichers add edges and patch node metadata — they don't create new nodes.
+/// Enrichers add edges, patch node metadata, and may synthesize virtual nodes
+/// for external (out-of-repo) symbols discovered via LSP.
 #[derive(Debug, Clone, Default)]
 pub struct EnrichmentResult {
     /// New edges discovered by the enricher (e.g., Calls, Implements).
     pub added_edges: Vec<Edge>,
     /// Metadata patches for existing nodes: (node_stable_id, key-value patches).
     pub updated_nodes: Vec<(String, BTreeMap<String, String>)>,
+    /// Virtual nodes synthesized for external symbols (e.g., tokio::spawn).
+    /// These have `root = "external"` and no body — they must NOT be embedded.
+    pub new_nodes: Vec<Node>,
 }
 
 /// Phase 2: Asynchronous enrichment after initial extraction.
@@ -119,9 +116,10 @@ pub trait Enricher: Send + Sync {
 
     /// Enrich the graph with additional edges and metadata.
     ///
-    /// Receives the current nodes and the graph index for lookup.
+    /// Receives the current nodes, the graph index for lookup, and the actual
+    /// repo root (from `--repo`, not `std::env::current_dir()`).
     /// Returns new edges and node metadata patches.
-    async fn enrich(&self, nodes: &[Node], index: &GraphIndex) -> Result<EnrichmentResult>;
+    async fn enrich(&self, nodes: &[Node], index: &GraphIndex, repo_root: &Path) -> Result<EnrichmentResult>;
 
     /// Human-readable name for this enricher (for diagnostics).
     fn name(&self) -> &str;
@@ -156,13 +154,6 @@ impl ExtractorRegistry {
         registry.register(Box::new(go::GoExtractor::new()));
         registry.register(Box::new(java::JavaExtractor::new()));
         registry.register(Box::new(bash::BashExtractor::new()));
-        registry.register(Box::new(ruby::RubyExtractor::new()));
-        registry.register(Box::new(cpp::CppExtractor::new()));
-        registry.register(Box::new(csharp::CSharpExtractor::new()));
-        registry.register(Box::new(kotlin::KotlinExtractor::new()));
-        registry.register(Box::new(zig::ZigExtractor::new()));
-        registry.register(Box::new(lua::LuaExtractor::new()));
-        registry.register(Box::new(swift::SwiftExtractor::new()));
         // Infrastructure / config
         registry.register(Box::new(hcl::HclExtractor::new()));
         registry.register(Box::new(json_extractor::JsonExtractor::new()));
@@ -363,12 +354,14 @@ impl EnricherRegistry {
 
     /// Run all enrichers that support the given languages present in the graph.
     ///
+    /// `repo_root` must be the actual project root (from `--repo`), not `cwd`.
     /// Returns a merged `EnrichmentResult` from all enrichers.
     pub async fn enrich_all(
         &self,
         nodes: &[Node],
         index: &GraphIndex,
         languages: &[String],
+        repo_root: &Path,
     ) -> EnrichmentResult {
         let mut result = EnrichmentResult::default();
 
@@ -388,16 +381,18 @@ impl EnricherRegistry {
                 continue; // silently skip — too many servers to log each one
             }
 
-            match enricher.enrich(nodes, index).await {
+            match enricher.enrich(nodes, index, repo_root).await {
                 Ok(enrichment) => {
                     tracing::info!(
-                        "Enricher {}: {} edges, {} node patches",
+                        "Enricher {}: {} edges, {} node patches, {} virtual nodes",
                         enricher.name(),
                         enrichment.added_edges.len(),
                         enrichment.updated_nodes.len(),
+                        enrichment.new_nodes.len(),
                     );
                     result.added_edges.extend(enrichment.added_edges);
                     result.updated_nodes.extend(enrichment.updated_nodes);
+                    result.new_nodes.extend(enrichment.new_nodes);
                 }
                 Err(e) => {
                     tracing::warn!("Enricher {} failed: {}", enricher.name(), e);
@@ -477,7 +472,7 @@ mod tests {
     #[test]
     fn test_registry_with_builtins_has_extractors() {
         let registry = ExtractorRegistry::with_builtins();
-        assert_eq!(registry.len(), 22); // rust, python, typescript, javascript, go, java, bash, ruby, cpp, csharp, kotlin, zig, lua, swift, hcl, json, toml, yaml, markdown, proto, sql, openapi
+        assert_eq!(registry.len(), 15); // rust, python, typescript, javascript, go, java, bash, hcl, json, toml, yaml, markdown, proto, sql, openapi
     }
 
     #[test]
