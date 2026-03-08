@@ -123,6 +123,37 @@ The repo-local intelligence layer. Scans your repo, extracts a multi-language co
 - **LSP** — cross-file call chains; graph traversal follows calls into external packages
 - **Embeddings** — local ONNX, no API key needed
 
+**Constants and literals (cross-language):**
+
+All 22 extractors index constants and literal values. `search_symbols` returns the value inline:
+
+```
+- const MAX_RETRIES (rust) src/config.rs:12  Value: `5`
+- const MAX_RETRIES (python) settings.py:3   Value: `5`
+- const MAX_RETRIES (go) config.go:8         Value: `5`
+```
+
+Named constants (`synthetic: false`) are declared identifiers — `const MAX_RETRIES = 5`, static final fields, ALL_CAPS module-level assignments, etc.
+
+Synthetic constants (`synthetic: true`) are inferred from structure — YAML/TOML/JSON top-level scalar values, OpenAPI enum values. They appear with a `*(literal)*` badge.
+
+Language mapping:
+- **Rust** — `const_item` with extracted value
+- **Python** — module-level ALL_CAPS assignments (`[A-Z][A-Z0-9_]+`)
+- **TypeScript/JavaScript** — module-level `const` declarations
+- **Go** — `const_spec` inside `const_declaration`
+- **Java** — `static final` field declarations
+- **Kotlin** — `const val` property declarations
+- **C#** — `const` field declarations
+- **Swift** — module-level `let` bindings
+- **Zig** — `const` variable declarations
+- **C/C++** — `constexpr` and `static const` declarations
+- **Lua/Ruby/Bash** — ALL_CAPS module-level assignments
+- **HCL** — `variable` block default values
+- **Proto** — enum values and `option` fields
+- **SQL** — `CREATE TYPE ... AS ENUM` values
+- **YAML/TOML/JSON/OpenAPI** — top-level scalar values (synthetic)
+
 **Graph (LanceDB + petgraph):**
 - Nodes: symbols, schemas, artifacts, PR merges
 - Edges: calls, implements, depends-on, modified, serves (with provenance + confidence)
@@ -234,7 +265,7 @@ No cloud dependency. Everything local, git-versioned, disposable.
 ## Status
 
 **Working today:**
-- 9 MCP tools, 22 language extractors, 155 tests
+- 9 MCP tools, 22 language extractors, 159 tests
 - `outcome_progress` joins outcomes → commits → symbols → PRs structurally
 - `graph_query(mode: "impact")` traces blast radius across your codebase and into external packages
 - `search_symbols` returns results from active git worktrees — parallel agents see their own changes

@@ -111,6 +111,54 @@ fn collect_nodes(
                 });
             }
         }
+        "expression_statement" => {
+            // Module-level ALL_CAPS assignments like MAX_RETRIES = 5
+            // The expression_statement wraps an assignment node
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    if child.kind() == "assignment" {
+                        if let Some(lhs) = child.child_by_field_name("left") {
+                            let name_str = lhs.utf8_text(source).unwrap_or("").trim().to_string();
+                            // Only ALL_CAPS identifiers (Python constant convention)
+                            if !name_str.is_empty()
+                                && name_str.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
+                                && name_str.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                            {
+                                let value_str = child
+                                    .child_by_field_name("right")
+                                    .and_then(|v| v.utf8_text(source).ok())
+                                    .map(|s| s.trim().to_string());
+                                let body = child.utf8_text(source).unwrap_or("").to_string();
+                                let signature = body.lines().next().unwrap_or("").trim().to_string();
+                                let mut metadata = BTreeMap::new();
+                                if let Some(ref v) = value_str {
+                                    // Only store simple scalar values
+                                    if !v.starts_with('[') && !v.starts_with('{') && !v.starts_with('(') {
+                                        metadata.insert("value".to_string(), v.clone());
+                                    }
+                                }
+                                metadata.insert("synthetic".to_string(), "false".to_string());
+                                nodes.push(Node {
+                                    id: NodeId {
+                                        root: String::new(),
+                                        file: path.to_path_buf(),
+                                        name: name_str,
+                                        kind: NodeKind::Const,
+                                    },
+                                    language: "python".to_string(),
+                                    line_start: child.start_position().row + 1,
+                                    line_end: child.end_position().row + 1,
+                                    signature,
+                                    body,
+                                    metadata,
+                                    source: ExtractionSource::TreeSitter,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
         "import_statement" | "import_from_statement" => {
             let text = node.utf8_text(source).unwrap_or("").trim().to_string();
             let target = parse_python_import_target(&text);
@@ -269,5 +317,25 @@ from typing import Optional
             .find(|n| n.id.name == "Foo")
             .expect("Should find Foo");
         assert_eq!(class_node.id.kind, NodeKind::Struct);
+    }
+
+    #[test]
+    fn test_python_allcaps_constants() {
+        let extractor = PythonExtractor::new();
+        let code = r#"
+MAX_RETRIES = 5
+API_URL = "https://api.example.com"
+not_a_constant = 42
+CamelCase = "also not a constant"
+"#;
+        let result = extractor.extract(Path::new("config.py"), code).unwrap();
+        let consts: Vec<_> = result.nodes.iter().filter(|n| n.id.kind == NodeKind::Const).collect();
+        assert_eq!(consts.len(), 2, "Should find 2 ALL_CAPS constants");
+        let names: Vec<&str> = consts.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"MAX_RETRIES"), "Should find MAX_RETRIES");
+        assert!(names.contains(&"API_URL"), "Should find API_URL");
+        let max_retries = consts.iter().find(|n| n.id.name == "MAX_RETRIES").unwrap();
+        assert_eq!(max_retries.metadata.get("value").map(|s| s.as_str()), Some("5"));
+        assert_eq!(max_retries.metadata.get("synthetic").map(|s| s.as_str()), Some("false"));
     }
 }

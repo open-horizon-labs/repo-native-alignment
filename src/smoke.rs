@@ -15,12 +15,13 @@ use serde::Serialize;
 
 use crate::embed::EmbeddingIndex;
 use crate::extract::ExtractorRegistry;
+use crate::graph::{Edge, Node};
 use crate::graph::index::GraphIndex;
 use crate::oh;
 use crate::query;
 use crate::roots::WorkspaceConfig;
 use crate::scanner::Scanner;
-use crate::server::{graph_lance_path, persist_graph_incremental};
+use crate::server::{graph_lance_path, load_graph_from_lance, persist_graph_incremental, persist_graph_to_lance};
 
 // ── Args ────────────────────────────────────────────────────────────
 
@@ -245,6 +246,24 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
 
     // 14. HEAD-change detection logic
     checks.push(run_head_change_detection_check());
+
+    // 15. Cross-language constants smoke test
+    // Part A: in-memory extraction
+    let const_nodes: Vec<_> = all_nodes.iter()
+        .filter(|n| n.id.kind == crate::graph::NodeKind::Const)
+        .collect();
+    if const_nodes.is_empty() {
+        checks.push(Check::fail("const_extraction", "No Const nodes extracted"));
+    } else {
+        let with_value = const_nodes.iter().filter(|n| n.metadata.contains_key("value")).count();
+        checks.push(Check::pass(
+            "const_extraction",
+            format!("{} Const nodes, {} with value", const_nodes.len(), with_value),
+        ));
+    }
+
+    // 16. LanceDB round-trip — persist, reload, assert Const value survives
+    checks.push(run_const_lance_roundtrip(&all_nodes, &all_edges).await);
 
     Ok(print_and_return(args, checks))
 }
@@ -500,6 +519,61 @@ async fn run_worktree_check(repo: &Path) -> Check {
 
     cleanup_worktree(repo, &worktree_path);
     result
+}
+
+/// Persist a subset of nodes to a temp LanceDB, reload, and verify Const `value` survives.
+async fn run_const_lance_roundtrip(nodes: &[Node], edges: &[Edge]) -> Check {
+    // Pick at most 50 nodes so the write is fast; ensure at least one Const with a value
+    let const_with_value: Vec<_> = nodes.iter()
+        .filter(|n| n.id.kind == crate::graph::NodeKind::Const && n.metadata.contains_key("value"))
+        .cloned()
+        .collect();
+
+    if const_with_value.is_empty() {
+        return Check::skip("const_lance_roundtrip", "No Const nodes with value — skipping LanceDB round-trip check");
+    }
+
+    // Use a temp dir as the fake repo root for LanceDB
+    let tmp_root = std::env::temp_dir().join("rna-smoke-const-lance-roundtrip");
+    if let Err(e) = std::fs::create_dir_all(&tmp_root) {
+        return Check::fail("const_lance_roundtrip", format!("Failed to create temp dir: {}", e));
+    }
+    let tmp_root = tmp_root.as_path();
+
+    // Persist: use the const nodes + a small sample of other nodes
+    let sample: Vec<_> = nodes.iter().take(50).cloned()
+        .chain(const_with_value.iter().cloned())
+        .collect();
+    // Deduplicate by stable_id
+    let mut seen = std::collections::HashSet::new();
+    let deduped: Vec<_> = sample.into_iter().filter(|n| seen.insert(n.stable_id())).collect();
+
+    if let Err(e) = persist_graph_to_lance(tmp_root, &deduped, edges).await {
+        return Check::fail("const_lance_roundtrip", format!("persist_graph_to_lance failed: {}", e));
+    }
+
+    // Reload
+    let reloaded = match load_graph_from_lance(tmp_root).await {
+        Ok(state) => state,
+        Err(e) => return Check::fail("const_lance_roundtrip", format!("load_graph_from_lance failed: {}", e)),
+    };
+
+    // Assert Const nodes still have value after reload
+    let reloaded_consts_with_value = reloaded.nodes.iter()
+        .filter(|n| n.id.kind == crate::graph::NodeKind::Const && n.metadata.contains_key("value"))
+        .count();
+
+    // Clean up temp directory
+    let _ = std::fs::remove_dir_all(tmp_root);
+
+    if reloaded_consts_with_value == 0 {
+        Check::fail("const_lance_roundtrip", "Const nodes lost `value` metadata after LanceDB round-trip")
+    } else {
+        Check::pass(
+            "const_lance_roundtrip",
+            format!("{} Const nodes retained `value` after persist→reload", reloaded_consts_with_value),
+        )
+    }
 }
 
 fn cleanup_worktree(repo: &Path, worktree_path: &Path) {
