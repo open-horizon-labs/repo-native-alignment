@@ -27,8 +27,15 @@ jobs:
       - name: Run setup tests
         run: cargo test setup::tests
 
-      - name: Build binary
+      - name: Run full unit + integration tests
+        run: cargo test
+
+      - name: Build release binary
         run: cargo build --release
+
+      - name: RNA pipeline smoke test (rna test)
+        run: ./target/release/repo-native-alignment test --repo .
+        timeout-minutes: 5
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
