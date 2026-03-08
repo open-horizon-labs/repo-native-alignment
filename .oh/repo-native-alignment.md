@@ -3,376 +3,55 @@
 ## Aim
 **Updated:** 2026-03-06
 
-**Aim:** Agents working in a codebase stay aligned to declared business outcomes — not just code correctness — because the outcomes, constraints, and progress signals live *in the repo* as queryable, evolving artifacts that agents read from and write to during normal work.
+Agents working in a codebase stay aligned to declared business outcomes — not just code correctness — because the outcomes, constraints, and progress signals live *in the repo* as queryable, evolving artifacts that agents read from and write to during normal work.
 
-**Current State:** Agents operate in a vacuum. CLAUDE.md tells them code conventions. Maybe there's a README with project goals. But there's no structured, queryable record of: what business outcome are we optimizing for? What signals tell us we're on track? What have we tried? What did we learn? Agents rediscover intent every session from scattered prose, or worse, from the user re-explaining it.
+**Current → Desired:** Agents operate in a vacuum, rediscovering intent every session from scattered prose. → An agent starting a session can query "what are the active outcomes? what constraints apply? what have we learned?" and get structured answers from the repo itself.
 
-**Desired State:** An agent starting a session can query: "What are the active business outcomes for this project? What SLOs are defined? What's the current state of each? What constraints apply? What have we learned?" — and get structured answers from the repo itself. When work is completed, the agent (or harness) records what was done towards which outcome, with what signal. Over time, the repo accumulates *situated judgment* — metis — that compounds.
-
-### Mechanism
-
-**Change:** A harness (tooling + conventions + repo structure) that:
-1. Stores **outcomes** (aims), **signals** (SLOs/feedback), **constraints** (guardrails), and **learnings** (metis) as structured artifacts in the repo
-2. Makes them **queryable** by agents at execution time (not just readable prose — structured enough to filter, match, and reason over)
-3. **Evolves** through normal work — agents contribute observations, humans curate and promote
-
-**Hypothesis:** Agent reliability improves when alignment context is explicit, queryable, and co-located with the code — because the agent doesn't have to infer intent, it reads it. The same structure that makes *code* semantically queryable (CodeState) applies to *business context*: outcomes, signals, and constraints are objects, not strings.
-
-**Assumptions:**
-1. Markdown + structured frontmatter in the repo is sufficient as the storage format (agents already parse markdown natively; git provides versioning and history)
-2. The harness is lightweight enough that people actually use it (if it's heavier than writing a CLAUDE.md section, adoption fails)
-3. Agents can meaningfully reason over outcome/signal/constraint triples at execution time (not just "read the file" — actually scope decisions by them)
-4. The value compounds — metis from early sessions genuinely improves later sessions
-
-### Feedback
-
-**Signal:** An agent, given a task, can answer "which outcome does this serve?" and "what constraints apply?" without the user explaining it. Measurable by: does the agent scope its work correctly without re-prompting?
-
-**Timeframe:** Immediate per-session. Compound effect visible after 5-10 sessions of accumulated metis.
-
-### Guardrails
-
-- **Repo-native**: no external store, no platform dependency. If you `rm -rf .oh/`, you lose context but nothing breaks.
-- **Lightweight**: adding an outcome is writing a markdown file, not configuring a system.
-- **Git-versioned**: every change to outcomes/signals/constraints is a commit. History is free.
-- **Agent-writable but human-curated**: agents can propose metis; humans promote it to guardrails.
-- **Not a replacement for OH graph**: this is the *local, repo-embedded* slice of what OH does at the organizational level. They can sync.
+**Guardrails:**
+- **Repo-native** — no external store, no platform dependency. `rm -rf .oh/` loses context but breaks nothing.
+- **Lightweight** — adding an outcome is writing a markdown file, not configuring a system.
+- **Git-versioned** — every change is a commit. History is free.
+- **Agent-writable, human-curated** — agents propose metis; humans promote to guardrails.
 
 ---
 
 ## Problem Statement
 **Updated:** 2026-03-06
 
-**Current framing:** Agents lose alignment with business intent every session because intent lives in unstructured prose they can't reason over.
+Agents can't answer "what have we done towards this outcome?" because there's no system connecting business context (aims, signals, guardrails, metis), code structure, and git history into a single queryable interface. The three exist in isolation — `.oh/` files, source code, git log — with no way to intersect them.
 
-**Reframed as:** Agents can't answer "what have we done towards this outcome?" because there's no system that connects business context (aims, signals, guardrails, metis), code structure, and git history into a single queryable interface. The three exist in isolation — `.oh/` files, source code, and git log — and the agent has no way to intersect them.
+**The shift:** From "prove the value of structured context" → "build the system that makes business context, code, and history queryable as one thing."
 
-**The shift:** From "prove the value of structured context" to "build the system that makes business context, code, and history queryable as one thing." The prototype isn't done until an agent can ask: *"What have we done to make alignment available via MCP?"* — and get back a grounded answer spanning aims, commits, and code.
+### Core Architecture Decisions (settled)
 
-### Markdown is the Lingua Franca
+**Markdown is input AND output.** All markdown (CLAUDE.md, README, ADRs, `.oh/` files) is semantic context — first-class parsing with pulldown-cmark and embedding, not just `.oh/`. MCP responses are markdown-native: tables, `file:line` links, diff blocks.
 
-Markdown is both **input and output** for agents — this is a first-class architectural concern, not a formatting choice.
+**Hybrid index:** Lightweight persistent index (symbol names, file locations, heading hierarchy, change timestamps) + on-demand deep reads (full AST, embeddings, file contents). Without the index, "just-in-time context" means "grep and hope."
 
-**As input (operational content — all markdown, not just `.oh/`):**
-- CLAUDE.md, AGENTS.md, `.oh/` session files — **agent behavior configuration**
-- README, ADRs, runbooks, changelogs — **project intent and conventions**
-- These are not "docs" — they are **semantic context** that agents need to understand constraints, patterns, and decisions
-- All markdown needs first-class parsing (pulldown-cmark) and embedding, not just `.oh/` files
+**Extractor pipeline:** Pluggable extractors produce `{ metadata, chunks }`. MarkdownExtractor (pulldown-cmark): heading-delimited sections, code span cross-references, YAML frontmatter. TreeSitterExtractor: functions/structs/traits/imports with metadata. git2 drives delta: only changed files re-extracted.
 
-**As output (query results):**
-- MCP tool responses should be **markdown-native** — tables, `file:line` links, diff blocks
-- The store is structured objects internally; markdown is the *view layer* for agent consumption
+**`.oh/` is a cache, not source of truth.** Outcomes originate in OH graph, Jira, Notion, etc. `.oh/` is the repo-local projection you can `git commit`. The vector store is the real index.
 
-**Cross-references between markdown and code:**
-- When CLAUDE.md says "always use `params![]` positional," that code span should link to actual code symbols in the index
-- pulldown-cmark extracts code spans from markdown; the index matches them against the code symbol table
-- This intersection is a differentiator — no existing tool (Codemogger, Srclight, code-memory) does this
-
-### The Hybrid Index Model
-
-Resolves the tension between Anthropic's "just-in-time context" and the VisualAge "persistent object model":
-
-```
-Lightweight persistent index  +  On-demand deep reads
-= "know WHERE everything is"  +  "read WHAT you need when you need it"
-```
-
-- **Always indexed:** symbol names, file locations, dependency edges, heading hierarchy, change timestamps — small, fast, always current
-- **On-demand:** full AST, embeddings, file contents, detailed type info — loaded through MCP tools when the agent needs them
-- **This IS just-in-time context** — the index is the mechanism that makes just-in-time *possible*. Without it, "just-in-time" means "grep and hope."
-
-### The Extractor Architecture
-
-Pluggable extractors produce `{ metadata, chunks }` from files. Same pipeline handles code and markdown:
-
-- **MarkdownExtractor** (pulldown-cmark): heading-delimited sections become chunks, code spans become cross-references, YAML frontmatter becomes structured metadata
-- **TreeSitterExtractor**: functions/structs/traits/imports become symbols with metadata (file, line range, kind, parent scope), function bodies become embeddable chunks
-- **Future extractors**: Terraform, YAML config, Dockerfile — anything with parseable structure
-- The registry matches extractors to files by path/extension. Only changed files get re-extracted (git diff drives the delta).
-
-### `.oh/` is a Cache, Not the Source of Truth
-
-Outcomes live wherever they live: OH graph, Jira, Linear, Notion, Slack, product tickets, external docs, conversations. The `.oh/` directory is the **local, repo-embedded cache** of outcomes discovered from any source. The system should:
-
-1. **Extract** aims from any MCP-accessible source as they're encountered
-2. **Capture** them into the vector store when accessed
-3. **Cache** them to `.oh/` for repo-local, offline, git-versioned access
-4. **Update** the cache conversationally — user + LLM refine together
-
-The `.oh/` reader is just one ingest adapter. The vector store (once added) is the real index. Any MCP tool result containing outcome-like content gets captured. `.oh/` is the local projection you can `git commit`.
-
-### Code Intelligence: LSP-First, Tree-Sitter Fallback
-
-When an LSP is available and running, it has richer type info than tree-sitter (hover, go-to-definition, type inference). The code extractor should try LSP first, fall back to tree-sitter for repos without LSP support.
+**Stack:** git2 (change detection) → tree-sitter (code) + pulldown-cmark (markdown) → LanceDB (columnar + vectors + full-text) → MCP server. DuckDB optional analytics overlay.
 
 ### Constraints
-- **Hard:**
-  - **Repo-native** — `.oh/` in the repo, git-versioned, no external store for core function
-  - **Lightweight** — markdown files with frontmatter, complexity in tooling not content
-  - **MCP interface** — agents query via MCP tools, not direct file reads
-  - **Must connect all three layers** — aims + code + git history, and their intersections
-  - **All markdown is first-class** — CLAUDE.md, README, session files parsed and indexed alongside `.oh/` and code
-  - **`.oh/` is a cache** — outcomes originate in external systems; `.oh/` is the repo-local projection
-
-- **Soft:**
-  - Rust + rust-mcp-sdk (matched to UHC patterns, but implementation choice)
-  - YAML frontmatter (one serialization among several)
-  - LanceDB for storage (could start simpler, but this is the target)
-  - pulldown-cmark for markdown, tree-sitter for code (best current choices, not permanent commitments)
-
-### What this framing enables
-1. Building the prototype end-to-end — MCP server that reads `.oh/`, parses code and markdown, reads git history
-2. The intersection query as the acceptance test: "what work relates to outcome X?"
-3. Cross-references between prose and code: CLAUDE.md rules linked to the symbols they reference
-4. Incremental delivery — can ship MCP tools as each layer comes online (files first, then git, then code parsing)
-5. Semantic search across all content types: "find everything about error handling" spans code, markdown, and `.oh/` files
-
-### What this framing excludes
-- OH graph sync (Phase 5) — organizational memory is out of scope for the prototype
-- DuckDB analytics overlay — optional, not required for the proof
-- Real-time incremental indexing — full rebuild is fine for prototype scale
-- LSP enrichment (type info, hover) — tree-sitter is sufficient for symbol extraction; LSP can layer on later
+- **Hard:** repo-native, lightweight, MCP interface, must connect all three layers (aims + code + history), all markdown first-class, `.oh/` is a cache
+- **Soft:** Rust + rust-mcp-sdk, YAML frontmatter, LanceDB, pulldown-cmark + tree-sitter
 
 ---
 
-## Solution Space
-**Updated:** 2026-03-06
+## System Phases
 
-**Selected approach:** Vertical Slice — build all layers thin, wired together from day one. The acceptance test is the target from commit 1.
+| Phase | Description | Status |
+|---|---|---|
+| 0: Bootstrap | Read `.oh/` from disk, 6 MCP tools, no indexing | ✅ Shipped |
+| 1: Markdown + Embeddings | pulldown-cmark all `.md`, LanceDB, semantic search | ✅ Shipped |
+| 2: Code Scanner | tree-sitter symbols, embeddings on bodies | ✅ Shipped |
+| 3: Git Awareness | git2, incremental indexing, commit↔symbol mapping | ✅ Shipped |
+| 4: Query Engine | Hybrid queries, natural language → multi-layer answer | 🔄 Current |
+| 5: OH Sync | Bidirectional `.oh/` ↔ OH graph, git push/pull semantics | ⬜ Future |
 
-**Why:** The whole point is the *intersection* of business context + code + git history. Building layers in isolation delays the moment you discover whether connecting them works. A vertical slice forces integration design from the start — which is where the novel value lives.
-
-**Accepted trade-offs:**
-- Each layer is thin initially (no embeddings, basic tree-sitter, simple git queries)
-- Will rework internals as layers deepen
-- LanceDB may be overkill for the thin slice — start with in-memory structs, graduate to LanceDB
-
-### Implementation Checklist
-
-#### 1. Project Scaffold
-- [ ] Cargo workspace with `rna-server` binary crate
-- [ ] rust-mcp-sdk dependency + Axum HTTP transport
-- [ ] `.mcp.json` config for Claude Code integration
-- [ ] Server boots, registers tools, responds to `list_tools`
-
-#### 2. `.oh/` File Reader (Business Context Layer)
-- [ ] Parse YAML frontmatter + markdown body from `.oh/` files
-- [ ] `oh_get_outcomes` — list outcomes with metadata
-- [ ] `oh_get_signals` — list signals with SLO definitions
-- [ ] `oh_get_guardrails` — list guardrails with severity
-- [ ] `oh_get_metis` — list metis entries
-- [ ] `oh_get_context` — return full `.oh/` bundle
-- [ ] `oh_record_metis` — write new metis entry to `.oh/metis/`
-- [ ] Output as markdown (tables, structured sections)
-
-#### 3. Markdown Extractor (All Markdown First-Class)
-- [ ] pulldown-cmark parses all `.md` files in repo (not just `.oh/`)
-- [ ] Heading-delimited chunking: each section = chunk with metadata (file, heading hierarchy, byte range)
-- [ ] YAML frontmatter extraction as structured metadata
-- [ ] Code span extraction from markdown (`` `params![]` `` → potential cross-reference)
-- [ ] MCP tool: `search_markdown` — find sections matching a query across all `.md` files
-
-#### 4. Code Extractor (tree-sitter)
-- [ ] tree-sitter parses `.rs` files → symbols (functions, structs, traits, imports)
-- [ ] Symbol metadata: file, line range, kind, parent scope, signature
-- [ ] MCP tool: `search_code` — find symbols by name or kind
-- [ ] Cross-reference: code spans found in markdown matched against symbol table
-
-#### 5. Git History Layer
-- [ ] git2 reads commit history (messages, changed files, timestamps, authors)
-- [ ] MCP tool: `search_commits` — find commits matching a query string
-- [ ] Map commits to files → connect to symbols and markdown sections
-- [ ] MCP tool: `file_history` — what changed in a file across commits
-
-#### 6. The Intersection Query
-- [ ] MCP tool: `query` — the compound query that crosses all layers
-- [ ] Given a natural language query, search across: `.oh/` entries, markdown sections, code symbols, git commits
-- [ ] Return results as markdown: timeline of commits, relevant code, matching `.oh/` entries, related markdown sections
-- [ ] **Acceptance test:** "What have we done to make alignment available via MCP?" returns a grounded, multi-layer answer
-
-#### 7. Markdown-Native Output
-- [ ] All MCP tool responses rendered as markdown
-- [ ] `file:line` links for code references
-- [ ] Tables for structured data (outcomes, signals, symbols)
-- [ ] Diff blocks for git changes
-
-#### 8. Hybrid Index (Lightweight Persistent + On-Demand)
-- [ ] Persistent index: symbol names, file locations, heading hierarchy, change timestamps
-- [ ] On-demand: full file contents, detailed AST, embeddings loaded when queried
-- [ ] LanceDB as the store (or in-memory structs for initial thin slice, graduate to LanceDB)
-- [ ] Extractor registry: match files to extractors by path/extension
-- [ ] Re-extract only changed files (git diff drives delta)
-
----
-
-## Convergence with CodeState
-
-CodeState and this aim are the same system viewed from two angles:
-
-| CodeState asks | This aim asks |
-|---|---|
-| How do we make *code structure* queryable so agents stop making dumb mistakes? | How do we make *business intent* queryable so agents stay aligned to outcomes? |
-
-The answer is the same architecture:
-- **Structured artifacts** in the repo (code symbols <-> outcome/signal/constraint definitions)
-- **Queryable via agent tooling** (MCP tools)
-- **Git-aware** (symbol history <-> outcome evolution over commits)
-- **Embeddings for semantic search** ("find code related to auth" <-> "find work related to reducing churn")
-- **Markdown as the lingua franca** (code docs <-> business context docs)
-
-The extractors don't just parse `.rs` and `.md` for code structure. They also parse `.oh/` files for business context. Same pipeline, different content.
-
-**The harness IS the CodeState vision, applied to the full agent working context — not just code.**
-
-### Evolved Architecture (from CodeState exploration)
-
-```
-git2              <- what changed? (replaces filesystem scanning for repos)
-tree-sitter       <- parse code -> symbols
-pulldown-cmark    <- parse markdown -> sections (including .oh/ business context)
-LanceDB           <- store + search everything (columnar + vectors + full-text)
-DuckDB (optional) <- SQL analytics overlay via lance-duckdb extension
-MCP server        <- agent interface
-```
-
----
-
-## Repo Structure
-
-```
-my-project/
-+-- .oh/                          <- the harness context
-|   +-- outcomes/
-|   |   +-- reduce-churn.md       <- aim + mechanism + signals
-|   |   +-- api-reliability.md
-|   +-- signals/
-|   |   +-- p95-latency.md        <- SLO definition + thresholds
-|   |   +-- onboarding-time.md
-|   +-- guardrails/
-|   |   +-- no-breaking-api.md    <- hard constraint
-|   |   +-- require-migration.md
-|   +-- metis/
-|   |   +-- 2026-03-caching.md    <- "we tried X, learned Y"
-|   |   +-- 2026-02-auth-flow.md
-|   +-- sessions/
-|       +-- current.md            <- active work context
-+-- CLAUDE.md                     <- code conventions (existing)
-+-- src/                          <- the code
-+-- .git/                         <- history of everything above
-```
-
----
-
-## Connection to Artium/Ross Conversations
-
-| Ross's concept | In this harness |
-|---|---|
-| "Reliability is the business goal" | Outcomes + signals make reliability measurable per project |
-| "Evals and guardrails" | Guardrails as repo artifacts with severity levels |
-| "Telemetric pricing" | Signals/SLOs provide the transaction-level value measurement |
-| "The seed that grows per client" | `.oh/` directory IS the seed — starts minimal, accumulates metis |
-| "Earned trust dial" | Guardrail severity starts at hard, relaxes as metis accumulates evidence |
-| "Artisan convergence" | Shared outcomes/signals in repo give opinionated engineers shared context |
-
----
-
-## Minimum Viable Harness
-
-The smallest thing that proves the hypothesis:
-1. One outcome file with structured frontmatter
-2. One signal file with SLO definition
-3. One MCP tool that returns them when queried
-4. An agent that demonstrably scopes its work by reading them
-5. After a session, one metis file written by the agent, curated by human
-
-## Open Horizons Integration
-
-This aim lives in the OH System context as an Aim under the OH System mission.
-
-The repo-native `.oh/` structure is the *local projection* of the OH graph into a specific codebase. The sync model:
-- `.oh/outcomes/` <-> OH Aims for this project
-- `.oh/signals/` <-> OH Signals (once that initiative ships)
-- `.oh/guardrails/` <-> OH Guardrails for this endeavor
-- `.oh/metis/` <-> OH Metis entries for this endeavor
-
-The repo is the working copy. OH is the organizational memory. Git push/pull semantics for sync (not real-time).
-
----
-
-## Problem Space: MCP Bootstrap
-**Updated:** 2026-03-06
-
-### Objective
-Time-to-self-reference: the MCP server becomes available to the coding agent ASAP, so the agent building it can use it while building it.
-
-### Key Decisions
-- **rust-mcp-sdk v0.8** — same as UHC, proven pattern with `#[mcp_tool]` macros + `ServerHandler` trait
-- **HTTP transport** (like UHC) vs **stdio** — UHC uses HTTP via Axum; stdio is simpler for standalone CLI. Decision: start with HTTP to reuse UHC pattern verbatim.
-- **No LanceDB/git2 for bootstrap** — just read `.oh/` files from disk. Embeddings and change detection come later.
-- **YAML frontmatter + markdown body** — parsed with `serde_yaml` + `pulldown-cmark`
-
-### Bootstrap Tool Surface
-| Tool | Description | Read-only? |
-|------|-------------|------------|
-| `oh_get_outcomes` | List all outcomes with frontmatter + body | Yes |
-| `oh_get_signals` | List all signals with SLO definitions | Yes |
-| `oh_get_guardrails` | List all guardrails with severity | Yes |
-| `oh_get_metis` | List all metis entries | Yes |
-| `oh_get_context` | Return everything as one bundle | Yes |
-| `oh_record_metis` | Write a new metis entry to `.oh/metis/` | No |
-
-### Reference Implementation
-UHC MCP server: `open-horizon-labs/unified-hifi-control/src/mcp/mod.rs` — exact same SDK, same macros, same patterns.
-
-### Constraints
-- Must use UHC's `rust-mcp-sdk` pattern (proven, same org)
-- `.oh/` files are source of truth (repo-native guardrail)
-- Must work with Claude Code's `.mcp.json` config
-- No external dependencies for core function (no DB, no cloud)
-
----
-
-## Full System Phases
-
-### Phase 0: MCP Bootstrap (just read files)
-- Read `.oh/` artifacts from disk, parse frontmatter, return via MCP tools
-- 6 tools: get_outcomes, get_signals, get_guardrails, get_metis, get_context, record_metis
-- No indexing, no embeddings — just structured file reads
-- **Goal:** agent can query its own outcomes/constraints while building the rest
-
-### Phase 1: Markdown Scanner + Embeddings
-- pulldown-cmark parses all `.md` files (not just `.oh/`) into heading-delimited sections
-- Each section becomes a chunk with metadata (file, heading hierarchy, byte range)
-- LanceDB stores chunks with embeddings for semantic search
-- **Goal:** "find markdown about error handling" or "what have we done towards alignment?"
-- Cross-reference extraction: code spans in markdown link to code symbols
-
-### Phase 2: Code Scanner (tree-sitter)
-- tree-sitter parses code files (.rs, .ts, .py, etc.) into symbols (functions, structs, traits, imports)
-- Symbols stored in LanceDB with metadata (file, line range, kind, parent scope)
-- Embeddings on function/struct bodies for semantic code search
-- **Goal:** "find functions related to authentication" or "what calls Database::get_connection?"
-
-### Phase 3: Git Awareness
-- git2 integration for change detection (replaces filesystem scanning)
-- `git diff` drives incremental re-indexing (only re-parse/re-embed changed files)
-- Commit history mapped to symbols: "when did this function last change? who changed it?"
-- Blame integration: per-symbol authorship
-- **Goal:** "what changed in the last 3 commits?" or "who last touched the auth module?"
-
-### Phase 4: Query Engine
-- Hybrid queries: structured filters + vector similarity in one call
-- DuckDB as optional analytics overlay via lance-duckdb extension
-- Natural language queries: "what have we done to make alignment available via MCP?"
-  - Decomposes to: search metis + git history + code changes matching "alignment" + "MCP"
-  - Returns: timeline of relevant commits, metis entries, code changes, outcome progress
-- **Goal:** agents can ask open-ended questions about project state and get grounded answers
-
-### Phase 5: OH Sync
-- Bidirectional sync between `.oh/` repo artifacts and OH graph
-- `.oh/outcomes/` <-> OH Aims, `.oh/signals/` <-> OH Signals, etc.
-- Git push/pull semantics (not real-time)
-- **Goal:** organizational memory and repo-local context stay in sync
+**Current state (2026-03-08):** Background scanner (15min), persisted embeddings, incremental graph updates (RwLock + scan cooldown), commit hash surfaced in `oh_search_context`. `git_history` tool dropped — commit info available via search results directly.
 
 ---
 
@@ -380,12 +59,72 @@ UHC MCP server: `open-horizon-labs/unified-hifi-control/src/mcp/mod.rs` — exac
 
 > "What have we done to make alignment available via MCP?"
 
-This query exercises the full stack:
-1. **Outcome lookup** — finds the "agent-alignment" outcome in `.oh/outcomes/`
-2. **Metis search** — finds learnings tagged to that outcome
-3. **Git history** — finds commits whose messages or changed files relate to "alignment" + "MCP"
-4. **Code search** — finds MCP tool definitions, handler implementations
-5. **Markdown search** — finds session file sections discussing MCP bootstrap
-6. **Synthesis** — assembles a timeline of progress towards the outcome
+Exercises the full stack: outcome lookup → metis search → git history → code search (MCP tool definitions) → markdown search (session sections) → synthesized timeline. When this query returns a grounded, multi-layer answer, the system works.
 
-When this query returns a useful answer, the system works.
+---
+
+## Repo Structure
+
+```
+my-project/
+├── .oh/
+│   ├── outcomes/        ← aim + mechanism + signals
+│   ├── signals/         ← SLO definitions + thresholds
+│   ├── guardrails/      ← hard constraints with severity
+│   ├── metis/           ← "we tried X, learned Y" (contextual, human-curated)
+│   └── sessions/        ← active work context
+├── CLAUDE.md            ← code conventions
+├── src/                 ← the code
+└── .git/                ← history of everything above
+```
+
+---
+
+## Connections
+
+**CodeState convergence:** Same architecture viewed from two angles — code structure queryable (CodeState) vs. business intent queryable (this). Same extractors, same pipeline, different content. The harness IS the CodeState vision applied to the full agent working context.
+
+**Open Horizons:** `.oh/` is the local projection of the OH graph into a repo. `.oh/outcomes/` ↔ OH Aims, `.oh/signals/` ↔ OH Signals, `.oh/guardrails/` ↔ OH Guardrails, `.oh/metis/` ↔ OH Metis. Sync is Phase 5.
+
+**Artium/Ross:** outcomes + signals make reliability measurable per project; guardrails as repo artifacts with severity; `.oh/` IS the "seed that grows per client"; earned trust dial maps to guardrail severity relaxing as metis accumulates evidence.
+
+---
+
+## New Aim: Human-Led Curation (2026-03-08)
+
+Two MCP tools that assist human judgment without replacing it — directly from the principle that LLMs can extract themes but cannot judge what matters.
+
+**`oh_propose_themes`** — surfaces patterns across accumulated metis. Clusters by semantic similarity, proposes candidates for compaction or guardrail promotion. Human reviews, selects, discards. Addresses the problem: after 20+ sessions, no human can hold all metis in mind to notice what's recurring.
+
+**`oh_propose_relevant`** — given current task, phase, and active outcome, ranks and filters the metis+guardrails corpus by likely relevance. Returns a short candidate list with reasoning. Human selects what to load into context.
+
+Neither tool makes decisions. Both reduce cognitive load in the *search-and-surface* step — which is where LLMs have leverage without needing judgment. The judgment (what to keep, promote, apply) stays human.
+
+**Guardrails for this aim:**
+- Proposals are candidates, never decisions
+- Auto-promotion to guardrail never happens without a human writing it
+- Phase-awareness is mandatory — `oh_propose_relevant` must weight phase tags heavily; cross-phase metis pollution is a known failure mode
+- Each proposal links to source metis IDs (provenance is non-negotiable)
+
+See outcome: `.oh/outcomes/human-led-curation.md`
+
+---
+
+## External Exploration: always-on-memory-agent (2026-03-08)
+
+Assessed `GoogleCloudPlatform/generative-ai/.../always-on-memory-agent`. Net verdict: nothing worth porting. Instructive as a contrast case.
+
+**What it does:** Python daemon — watches `./inbox/`, LLM-extracts memories to SQLite, auto-consolidates every 30min via LLM to find patterns, serves via HTTP.
+
+**Why nothing is worth porting:**
+- Multimodal inbox ingestion — wrong domain (we index git repos, not dropped files)
+- Flat SQLite memory store — LanceDB is strictly better
+- "No embeddings" — we use vectors intentionally
+- HTTP API — MCP is our protocol
+- **Auto-consolidation via LLM** — see metis below
+
+**Two principles reinforced by studying this system:**
+
+1. **LLMs are not for judgment** (`llm-synthesis-is-not-judgment.md`). LLMs can extract themes; they cannot decide what's significant, what should govern future behavior, what warrants promotion to a guardrail. Auto-consolidating memories creates authoritative-looking "insights" that reflect no situated experience. The human-curation step in metis→guardrail is the point, not an inefficiency.
+
+2. **Metis is contextual, not universal** (`metis-is-not-universal.md`). What works in one phase/context/task type does not carry universally. Selecting appropriate metis for a given situation is itself a cognitive act — not a lookup. The harness enables selection; it does not replace it. Building a system that auto-applies accumulated metis indiscriminately produces worse decisions than no system at all.
