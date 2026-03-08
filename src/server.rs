@@ -528,6 +528,11 @@ pub(crate) async fn persist_graph_incremental(
     let db_path = graph_lance_path(repo_root);
     std::fs::create_dir_all(&db_path)?;
 
+    // Pre-flight: ensure schema version matches before any LanceDB writes.
+    if check_and_migrate_schema(&db_path).await? {
+        tracing::info!("Schema migrated to v{} during incremental update — cache rebuilt", SCHEMA_VERSION);
+    }
+
     let db = lancedb::connect(db_path.to_str().unwrap())
         .execute()
         .await
