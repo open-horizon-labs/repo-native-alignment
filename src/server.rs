@@ -1335,7 +1335,7 @@ impl RnaHandler {
     }
 
     /// Build the full graph from scratch. This is the original get_graph logic.
-    async fn build_full_graph(&self) -> anyhow::Result<GraphState> {
+    pub async fn build_full_graph(&self) -> anyhow::Result<GraphState> {
         // Pre-flight: ensure schema version matches before any LanceDB reads/writes.
         let db_path = graph_lance_path(&self.repo_root);
         if check_and_migrate_schema(&db_path).await? {
