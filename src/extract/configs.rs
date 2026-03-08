@@ -184,10 +184,11 @@ pub static SWIFT_CONFIG: LangConfig = LangConfig {
         ("enum_declaration",        NodeKind::Enum),
         ("protocol_declaration",    NodeKind::Trait),
         ("property_declaration",    NodeKind::Field),
+        ("import_declaration",      NodeKind::Import),
     ],
     scope_parent_kinds: &["class_declaration", "struct_declaration", "enum_declaration"],
     const_value_field: None,
-    full_text_name_kinds: &[],
+    full_text_name_kinds: &["import_declaration"],
     string_literal_kinds: &[("string_literal", Some("string_literal_segment"))],
 };
 
