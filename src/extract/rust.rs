@@ -99,6 +99,16 @@ fn collect_nodes(
         if let Some(scope) = parent_scope {
             metadata.insert("parent_scope".to_string(), scope.clone());
         }
+        // Store the byte column of the name identifier from the AST so that
+        // the LSP enricher can position the cursor accurately without having
+        // to search the signature string (which is fragile for overloaded
+        // parameter names and multi-keyword prefixes).
+        if let Some(name_node) = node.child_by_field_name("name") {
+            metadata.insert(
+                "name_col".to_string(),
+                name_node.start_position().column.to_string(),
+            );
+        }
 
         let graph_node = Node {
             id: NodeId {

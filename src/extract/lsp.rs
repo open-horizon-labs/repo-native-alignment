@@ -712,10 +712,35 @@ impl Enricher for LspEnricher {
 
             // line_start is 1-based, LSP positions are 0-based
             let line = (node.line_start.saturating_sub(1)) as u32;
-            // Find column of function name in signature for accurate cursor positioning
-            let col = node.signature.find(&node.id.name)
-                .map(|i| i as u32)
-                .unwrap_or(4); // fallback: typical "fn " or "pub fn " offset
+            // Use the AST-recorded byte column of the name identifier stored by the
+            // extractor (metadata key "name_col"). This is exact and language-agnostic:
+            // tree-sitter records start_position().column for the name field node, so
+            // it works correctly even when the name appears multiple times in the
+            // signature (e.g. `pub fn from_str(from_str: &str)`) or when the keyword
+            // prefix length varies across languages (Python `def`, Go `func`, etc.).
+            // If the extractor did not populate name_col (legacy or non-tree-sitter
+            // nodes), fall back to signature scanning and log at debug so misses are
+            // visible without being noisy at info level.
+            let col = if let Some(col_str) = node.metadata.get("name_col") {
+                col_str.parse::<u32>().unwrap_or_else(|_| {
+                    tracing::debug!(
+                        node = %node.id.name,
+                        raw = %col_str,
+                        "name_col metadata could not be parsed as u32; falling back to signature scan"
+                    );
+                    node.signature.find(&node.id.name).map(|i| i as u32).unwrap_or(0)
+                })
+            } else {
+                // No name_col: node was produced before this fix or by a non-tree-sitter
+                // extractor. Try signature scan; a miss means wrong-column -> LSP null.
+                let fallback = node.signature.find(&node.id.name).map(|i| i as u32).unwrap_or(0);
+                tracing::debug!(
+                    node = %node.id.name,
+                    col = fallback,
+                    "name_col not in metadata; using signature scan fallback (may miss on overloaded names)"
+                );
+                fallback
+            };
 
             match node.id.kind {
                 NodeKind::Function => {
@@ -958,6 +983,7 @@ mod tests {
                 &self,
                 _nodes: &[Node],
                 _index: &GraphIndex,
+                _repo_root: &Path,
             ) -> Result<EnrichmentResult> {
                 Ok(EnrichmentResult::default())
             }
@@ -969,7 +995,7 @@ mod tests {
         assert_eq!(enricher.name(), "dummy");
 
         let index = GraphIndex::new();
-        let result = enricher.enrich(&[], &index).await.unwrap();
+        let result = enricher.enrich(&[], &index, std::path::Path::new(".")).await.unwrap();
         assert!(result.added_edges.is_empty());
         assert!(result.updated_nodes.is_empty());
     }
@@ -1041,7 +1067,7 @@ mod tests {
             source: ExtractionSource::TreeSitter,
         }];
 
-        let result = enricher.enrich(&nodes, &index).await.unwrap();
+        let result = enricher.enrich(&nodes, &index, std::path::Path::new(".")).await.unwrap();
         assert!(result.added_edges.is_empty());
     }
 
@@ -1088,7 +1114,7 @@ mod tests {
 
         // Enrich with no nodes should work fine for all enrichers
         let index = GraphIndex::new();
-        let result = registry.enrich_all(&[], &index, &["rust".to_string(), "python".to_string()]).await;
+        let result = registry.enrich_all(&[], &index, &["rust".to_string(), "python".to_string()], std::path::Path::new(".")).await;
         assert!(result.added_edges.is_empty());
     }
 
@@ -1154,6 +1180,6 @@ mod tests {
 
         // This may succeed or fail depending on whether we're in a Cargo project.
         // Either way, it should not panic.
-        let _result = enricher.enrich(&nodes, &index).await;
+        let _result = enricher.enrich(&nodes, &index, std::path::Path::new(".")).await;
     }
 }

@@ -466,7 +466,7 @@ mod tests {
     #[test]
     fn test_registry_with_builtins_has_extractors() {
         let registry = ExtractorRegistry::with_builtins();
-        assert_eq!(registry.len(), 8); // rust, python, typescript, go, markdown, proto, sql, openapi
+        assert_eq!(registry.len(), 15); // rust, python, typescript, javascript, go, java, bash, hcl, json, toml, yaml, markdown, proto, sql, openapi
     }
 
     #[test]
