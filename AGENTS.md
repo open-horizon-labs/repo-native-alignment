@@ -16,6 +16,19 @@
 - `/dissent` - Seek contrary evidence before one-way doors
 - `/salvage` - Extract learning, restart clean
 
+## /ship Definition (for this project)
+
+`/ship` = the full quality gate before merge. In order:
+
+1. **`/review`** — check implementation against acceptance criteria, AGENTS.md patterns, and open issues
+2. **`/dissent`** — seek contrary evidence; post findings as PR comments
+3. **Fix all** — address every review + dissent finding; no deferred items
+4. **README** — update for any new capability, changed behavior, or new flags
+5. **Smoke test** — update `src/smoke.rs` to exercise the new code path; `cargo test` must pass
+6. **Merge** — squash or merge PR into main; tag commit with `[outcome:agent-alignment]`
+
+No step is optional. "Merge when green" is not ship — ship is merge when reviewed, dissented, fixed, and documented.
+
 **Key insight:** Enter at the altitude you need. Climb back up when you drift.
 
 ## Repo-Native Alignment MCP
