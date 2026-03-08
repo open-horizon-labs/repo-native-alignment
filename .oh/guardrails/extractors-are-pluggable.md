@@ -13,6 +13,10 @@ Different file types need different extraction: code needs AST + LSP semantics, 
 
 The salvage initially recommended "extend tree-sitter beyond Rust." The user corrected: tree-sitter is one extractor. LSP gives cross-file semantics. Arbitrary metadata extraction (YAML keys, PDF text, EXIF) is also needed. The architecture should be pluggable, not tree-sitter-centric.
 
+## Validated In Practice
+
+This batch (PRs #35, #43, #44) shipped 7 new tree-sitter language extractors (Ruby, C++, C#, Kotlin, Zig, Lua, Swift) and LSP-as-extractor without touching the scanner. The pluggable interface held. Adding a new language extractor is now a self-contained PR.
+
 ## Override Protocol
 
-For v0, a fixed set of extractors is fine. The interface between scanner and extractor should be generic enough that adding new extractors doesn't require scanner changes.
+The interface between scanner and extractor must remain generic. A new extractor must not require scanner changes. If a proposed extractor requires scanner changes, refactor the interface first.
