@@ -115,7 +115,7 @@ fn collect_nodes(
         "type_declaration" => {
             // type_declaration contains type_spec children
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i) {
+                if let Some(child) = node.child(i as u32) {
                     if child.kind() == "type_spec" {
                         extract_type_spec(child, path, source, nodes);
                     }
@@ -129,10 +129,10 @@ fn collect_nodes(
             // Find all import_spec children
             let mut found_specs = false;
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i) {
+                if let Some(child) = node.child(i as u32) {
                     if child.kind() == "import_spec_list" {
                         for j in 0..child.child_count() {
-                            if let Some(spec) = child.child(j) {
+                            if let Some(spec) = child.child(j as u32) {
                                 if spec.kind() == "import_spec" {
                                     extract_import_spec(spec, path, source, nodes, edges);
                                     found_specs = true;
@@ -172,7 +172,7 @@ fn collect_nodes(
     // which we handle above)
     if kind_str != "type_declaration" && kind_str != "import_declaration" {
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
+            if let Some(child) = node.child(i as u32) {
                 collect_nodes(child, path, source, nodes, edges);
             }
         }

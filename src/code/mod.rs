@@ -79,7 +79,7 @@ fn collect_symbols(
         if kind == SymbolKind::Impl {
             let scope = Some(name);
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i) {
+                if let Some(child) = node.child(i as u32) {
                     collect_symbols(child, path, source, &scope, symbols);
                 }
             }
@@ -89,7 +89,7 @@ fn collect_symbols(
 
     // Recurse into children for non-impl nodes (or nodes that aren't symbols)
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
+        if let Some(child) = node.child(i as u32) {
             collect_symbols(child, path, source, parent_scope, symbols);
         }
     }

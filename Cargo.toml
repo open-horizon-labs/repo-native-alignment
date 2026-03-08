@@ -12,20 +12,27 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 
 # Markdown parsing (heading-aware chunking for embeddings)
-pulldown-cmark = "0.12"
+pulldown-cmark = "0.13"
 
 # Git integration (change detection, history)
 git2 = "0.20"
 
 # Code parsing (symbol extraction)
-tree-sitter = "0.25"
+tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
-tree-sitter-python = "0.23"
+tree-sitter-python = "0.25"
 tree-sitter-typescript = "0.23"
-tree-sitter-go = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-bash = "0.25"
+tree-sitter-hcl = "1.1"
+tree-sitter-json = "0.24"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
 
 # In-memory graph index (traversal, path queries, impact analysis)
-petgraph = "0.7"
+petgraph = "0.8"
 
 # Deterministic UUIDs for source envelope event IDs
 uuid = { version = "1", features = ["v4"] }
@@ -42,7 +49,7 @@ fastembed = "5"
 clap = { version = "4", features = ["derive"] }
 
 # SQL parsing (schema extraction from migrations)
-sqlparser = "0.59"
+sqlparser = "0.61"
 
 # Serialization (YAML frontmatter + JSON for MCP responses)
 serde = { version = "1", features = ["derive"] }

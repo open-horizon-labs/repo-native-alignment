@@ -113,11 +113,8 @@ impl Extractor for SqlExtractor {
 
                         // Check for REFERENCES (foreign key on column)
                         for option in &column.options {
-                            if let ColumnOption::ForeignKey {
-                                foreign_table, ..
-                            } = &option.option
-                            {
-                                let ref_table = foreign_table.to_string();
+                            if let ColumnOption::ForeignKey(fk) = &option.option {
+                                let ref_table = fk.foreign_table.to_string();
                                 edges.push(Edge {
                                     from: table_node_id.clone(),
                                     to: NodeId {
@@ -136,11 +133,8 @@ impl Extractor for SqlExtractor {
 
                     // Check table-level constraints for foreign keys
                     for constraint in &create_table.constraints {
-                        if let sqlparser::ast::TableConstraint::ForeignKey {
-                            foreign_table, ..
-                        } = constraint
-                        {
-                            let ref_table = foreign_table.to_string();
+                        if let sqlparser::ast::TableConstraint::ForeignKey(fk) = constraint {
+                            let ref_table = fk.foreign_table.to_string();
                             edges.push(Edge {
                                 from: table_node_id.clone(),
                                 to: NodeId {
@@ -157,10 +151,8 @@ impl Extractor for SqlExtractor {
                     }
                 }
 
-                Statement::AlterTable {
-                    name, operations, ..
-                } => {
-                    let table_name = name.to_string();
+                Statement::AlterTable(alter) => {
+                    let table_name = alter.name.to_string();
                     let alter_node_id = NodeId {
                         root: String::new(),
                         file: path.to_path_buf(),
@@ -194,7 +186,7 @@ impl Extractor for SqlExtractor {
                     });
 
                     // Extract added columns from ALTER TABLE operations
-                    for op in operations {
+                    for op in &alter.operations {
                         if let AlterTableOperation::AddColumn { column_def, .. } = op {
                             let col_name = column_def.name.to_string();
                             let col_type = format_data_type(&column_def.data_type);

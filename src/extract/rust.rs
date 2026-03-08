@@ -142,7 +142,7 @@ fn collect_nodes(
         if node_kind == NodeKind::Impl {
             let scope = Some(name);
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i) {
+                if let Some(child) = node.child(i as u32) {
                     collect_nodes(child, path, source, &scope, nodes, edges);
                 }
             }
@@ -152,7 +152,7 @@ fn collect_nodes(
 
     // Recurse into children
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
+        if let Some(child) = node.child(i as u32) {
             collect_nodes(child, path, source, parent_scope, nodes, edges);
         }
     }
@@ -275,7 +275,7 @@ fn detect_topology_patterns(
 
     // Recurse
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
+        if let Some(child) = node.child(i as u32) {
             detect_topology_patterns(child, path, source, edges);
         }
     }
