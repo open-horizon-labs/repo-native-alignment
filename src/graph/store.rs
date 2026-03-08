@@ -8,6 +8,11 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 
+/// Schema version — bump when any LanceDB table schema changes.
+/// Used in the index freshness footer appended to `search_symbols` and
+/// `oh_search_context` responses so agents can detect stale binaries.
+pub const SCHEMA_VERSION: u32 = 2;
+
 /// Arrow schema for the `symbols` table.
 ///
 /// Stores code symbols (functions, structs, traits, etc.) with embeddings
