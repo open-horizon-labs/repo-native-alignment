@@ -664,7 +664,7 @@ impl Enricher for LspEnricher {
         &self.display_name
     }
 
-    async fn enrich(&self, nodes: &[Node], _index: &GraphIndex) -> Result<EnrichmentResult> {
+    async fn enrich(&self, nodes: &[Node], _index: &GraphIndex, repo_root: &Path) -> Result<EnrichmentResult> {
         let mut result = EnrichmentResult::default();
 
         // Filter to nodes matching this enricher's language
@@ -684,18 +684,8 @@ impl Enricher for LspEnricher {
             return Ok(result);
         }
 
-        // Use the repo root from the --repo arg, not cwd
-        let repo_root = matching_nodes.first()
-            .map(|_n| {
-                // Nodes have root_id set by multi-root scanning.
-                // For the primary root, the path in the graph state is relative to repo_root.
-                // We need the actual repo root path from the server.
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-            })
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-        // Try to initialize the language server
-        if let Err(e) = self.ensure_initialized(&repo_root).await {
+        // Try to initialize the language server using the repo root from --repo
+        if let Err(e) = self.ensure_initialized(repo_root).await {
             tracing::debug!("LSP enrichment skipped for {}: {}", self.language, e);
             return Ok(result);
         }
@@ -704,7 +694,7 @@ impl Enricher for LspEnricher {
         let root = state
             .root_path
             .clone()
-            .unwrap_or_else(|| repo_root.clone());
+            .unwrap_or_else(|| repo_root.to_path_buf());
         let transport = match state.transport.as_mut() {
             Some(t) => t,
             None => return Ok(result),
@@ -722,10 +712,35 @@ impl Enricher for LspEnricher {
 
             // line_start is 1-based, LSP positions are 0-based
             let line = (node.line_start.saturating_sub(1)) as u32;
-            // Find column of function name in signature for accurate cursor positioning
-            let col = node.signature.find(&node.id.name)
-                .map(|i| i as u32)
-                .unwrap_or(4); // fallback: typical "fn " or "pub fn " offset
+            // Use the AST-recorded byte column of the name identifier stored by the
+            // extractor (metadata key "name_col"). This is exact and language-agnostic:
+            // tree-sitter records start_position().column for the name field node, so
+            // it works correctly even when the name appears multiple times in the
+            // signature (e.g. `pub fn from_str(from_str: &str)`) or when the keyword
+            // prefix length varies across languages (Python `def`, Go `func`, etc.).
+            // If the extractor did not populate name_col (legacy or non-tree-sitter
+            // nodes), fall back to signature scanning and log at debug so misses are
+            // visible without being noisy at info level.
+            let col = if let Some(col_str) = node.metadata.get("name_col") {
+                col_str.parse::<u32>().unwrap_or_else(|_| {
+                    tracing::debug!(
+                        node = %node.id.name,
+                        raw = %col_str,
+                        "name_col metadata could not be parsed as u32; falling back to signature scan"
+                    );
+                    node.signature.find(&node.id.name).map(|i| i as u32).unwrap_or(0)
+                })
+            } else {
+                // No name_col: node was produced before this fix or by a non-tree-sitter
+                // extractor. Try signature scan; a miss means wrong-column -> LSP null.
+                let fallback = node.signature.find(&node.id.name).map(|i| i as u32).unwrap_or(0);
+                tracing::debug!(
+                    node = %node.id.name,
+                    col = fallback,
+                    "name_col not in metadata; using signature scan fallback (may miss on overloaded names)"
+                );
+                fallback
+            };
 
             match node.id.kind {
                 NodeKind::Function => {
@@ -800,6 +815,57 @@ impl Enricher for LspEnricher {
                                             };
 
                                             if callee_path.to_string_lossy().contains(".cargo") {
+                                                // External crate symbol — synthesize a virtual node.
+                                                // rust-analyzer populates call["to"]["detail"] with the
+                                                // fully-qualified path (e.g. "tokio::runtime::Runtime::new").
+                                                // Fall back to the bare name if detail is absent.
+                                                let fqn = call["to"]["detail"]
+                                                    .as_str()
+                                                    .filter(|s| !s.is_empty())
+                                                    .unwrap_or(callee_name);
+
+                                                if fqn.is_empty() {
+                                                    continue;
+                                                }
+
+                                                // Derive package from the first path segment of the FQN.
+                                                let package = fqn.split("::").next().unwrap_or(fqn).to_string();
+
+                                                let virtual_id = NodeId {
+                                                    root: "external".to_string(),
+                                                    file: PathBuf::new(),
+                                                    name: fqn.to_string(),
+                                                    kind: NodeKind::Function,
+                                                };
+
+                                                // Deduplicate: only add if not already synthesized this run.
+                                                if !result.new_nodes.iter().any(|n| n.id == virtual_id) {
+                                                    let mut meta = std::collections::BTreeMap::new();
+                                                    meta.insert("package".to_string(), package.clone());
+                                                    meta.insert("virtual".to_string(), "true".to_string());
+                                                    result.new_nodes.push(Node {
+                                                        id: virtual_id.clone(),
+                                                        language: self.language.clone(),
+                                                        line_start: 0,
+                                                        line_end: 0,
+                                                        signature: fqn.to_string(),
+                                                        body: String::new(), // no body — must not be embedded
+                                                        metadata: meta,
+                                                        source: ExtractionSource::Lsp,
+                                                    });
+                                                    tracing::debug!(
+                                                        "Synthesized virtual node: {} (package: {})",
+                                                        fqn, package
+                                                    );
+                                                }
+
+                                                result.added_edges.push(Edge {
+                                                    from: node.id.clone(),
+                                                    to: virtual_id,
+                                                    kind: EdgeKind::Calls,
+                                                    source: ExtractionSource::Lsp,
+                                                    confidence: Confidence::Detected,
+                                                });
                                                 continue;
                                             }
 
@@ -968,6 +1034,7 @@ mod tests {
                 &self,
                 _nodes: &[Node],
                 _index: &GraphIndex,
+                _repo_root: &Path,
             ) -> Result<EnrichmentResult> {
                 Ok(EnrichmentResult::default())
             }
@@ -979,7 +1046,7 @@ mod tests {
         assert_eq!(enricher.name(), "dummy");
 
         let index = GraphIndex::new();
-        let result = enricher.enrich(&[], &index).await.unwrap();
+        let result = enricher.enrich(&[], &index, std::path::Path::new(".")).await.unwrap();
         assert!(result.added_edges.is_empty());
         assert!(result.updated_nodes.is_empty());
     }
@@ -1051,7 +1118,7 @@ mod tests {
             source: ExtractionSource::TreeSitter,
         }];
 
-        let result = enricher.enrich(&nodes, &index).await.unwrap();
+        let result = enricher.enrich(&nodes, &index, std::path::Path::new(".")).await.unwrap();
         assert!(result.added_edges.is_empty());
     }
 
@@ -1098,7 +1165,7 @@ mod tests {
 
         // Enrich with no nodes should work fine for all enrichers
         let index = GraphIndex::new();
-        let result = registry.enrich_all(&[], &index, &["rust".to_string(), "python".to_string()]).await;
+        let result = registry.enrich_all(&[], &index, &["rust".to_string(), "python".to_string()], std::path::Path::new(".")).await;
         assert!(result.added_edges.is_empty());
     }
 
@@ -1164,6 +1231,6 @@ mod tests {
 
         // This may succeed or fail depending on whether we're in a Cargo project.
         // Either way, it should not panic.
-        let _result = enricher.enrich(&nodes, &index).await;
+        let _result = enricher.enrich(&nodes, &index, std::path::Path::new(".")).await;
     }
 }

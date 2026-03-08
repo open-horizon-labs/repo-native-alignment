@@ -171,15 +171,18 @@ fn get_mapping_value<'a>(
     target_key: &str,
 ) -> Option<String> {
     for i in 0..mapping.child_count() {
-        let pair = mapping.child(i as u32)?;
+        // Use `let..else` to skip None children (punctuation/anonymous nodes)
+        // rather than `?` which would return None from the entire function.
+        let Some(pair) = mapping.child(i as u32) else { continue };
         if pair.kind() != "block_mapping_pair" {
             continue;
         }
-        let key_node = pair.child_by_field_name("key")?;
+        let Some(key_node) = pair.child_by_field_name("key") else { continue };
         if key_text(key_node, source) == target_key {
             let val = pair
                 .child_by_field_name("value")
-                .and_then(|v| v.utf8_text(source).ok())?
+                .and_then(|v| v.utf8_text(source).ok())
+                .unwrap_or("")
                 .trim()
                 .to_string();
             return Some(val);

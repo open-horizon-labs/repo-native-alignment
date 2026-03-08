@@ -1007,8 +1007,21 @@ impl RnaHandler {
 
         let enricher_registry = EnricherRegistry::with_builtins();
         let enrichment = enricher_registry
-            .enrich_all(&all_nodes, &index, &languages)
+            .enrich_all(&all_nodes, &index, &languages, &self.repo_root)
             .await;
+
+        // Add virtual nodes synthesized for external symbols (e.g., tokio::spawn).
+        // These must be persisted in the symbols table but must NOT be embedded.
+        if !enrichment.new_nodes.is_empty() {
+            tracing::info!(
+                "Enrichment synthesized {} virtual external nodes",
+                enrichment.new_nodes.len()
+            );
+            for vnode in &enrichment.new_nodes {
+                index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
+            }
+            all_nodes.extend(enrichment.new_nodes);
+        }
 
         if !enrichment.added_edges.is_empty() {
             tracing::info!(
@@ -1049,9 +1062,14 @@ impl RnaHandler {
             tracing::warn!("Failed to persist graph to LanceDB: {}", e);
         }
 
-        // 8. Embed all nodes as part of the graph pipeline
+        // 8. Embed all nodes as part of the graph pipeline.
+        // Virtual external nodes (root == "external") have no body and must NOT be embedded.
         // Probe first — if a persisted table already exists, reuse it (fast path).
         // The background scanner handles incremental updates.
+        let embeddable_nodes: Vec<Node> = all_nodes.iter()
+            .filter(|n| n.id.root != "external")
+            .cloned()
+            .collect();
         let embed_index = match EmbeddingIndex::new(&self.repo_root).await {
             Ok(idx) => {
                 match idx.search("_probe_", None, 1).await {
@@ -1060,7 +1078,7 @@ impl RnaHandler {
                         Some(idx)
                     }
                     Err(_) => {
-                        match idx.index_all_with_symbols(&self.repo_root, &all_nodes).await {
+                        match idx.index_all_with_symbols(&self.repo_root, &embeddable_nodes).await {
                             Ok(count) => {
                                 tracing::info!("Embedded {} items ({} symbols)", count, all_nodes.len());
                                 Some(idx)
@@ -1162,8 +1180,21 @@ impl RnaHandler {
 
             let enricher_registry = EnricherRegistry::with_builtins();
             let enrichment = enricher_registry
-                .enrich_all(&changed_nodes, &graph.index, &languages)
+                .enrich_all(&changed_nodes, &graph.index, &languages, &self.repo_root)
                 .await;
+
+            // Add virtual nodes synthesized for external symbols.
+            // These must NOT be re-embedded (no body).
+            if !enrichment.new_nodes.is_empty() {
+                tracing::info!(
+                    "Incremental LSP enrichment synthesized {} virtual external nodes",
+                    enrichment.new_nodes.len()
+                );
+                for vnode in &enrichment.new_nodes {
+                    graph.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
+                }
+                graph.nodes.extend(enrichment.new_nodes);
+            }
 
             if !enrichment.added_edges.is_empty() {
                 tracing::info!(
@@ -1182,6 +1213,9 @@ impl RnaHandler {
                 graph.edges.extend(enrichment.added_edges);
             }
 
+            let enriched_node_ids: std::collections::HashSet<String> =
+                enrichment.updated_nodes.iter().map(|(id, _)| id.clone()).collect();
+
             for (node_id, patches) in &enrichment.updated_nodes {
                 if let Some(node) = graph.nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
                     for (key, value) in patches {
@@ -1189,19 +1223,52 @@ impl RnaHandler {
                     }
                 }
             }
+
+            // Re-embed the enriched nodes specifically, using their post-enrichment metadata.
+            // This is scoped to only changed nodes to avoid re-embedding the entire graph.
+            if !enriched_node_ids.is_empty() {
+                if let Some(ref embed_idx) = graph.embed_index {
+                    let enriched_nodes: Vec<_> = graph
+                        .nodes
+                        .iter()
+                        .filter(|n| enriched_node_ids.contains(&n.stable_id()))
+                        .cloned()
+                        .collect();
+                    match embed_idx.reindex_nodes(&enriched_nodes).await {
+                        Ok(count) => tracing::info!(
+                            "Re-embedded {} enriched nodes with LSP metadata",
+                            count
+                        ),
+                        Err(e) => tracing::warn!("Failed to re-embed enriched nodes: {}", e),
+                    }
+                }
+            }
         }
 
-        // Re-embed changed symbols (rebuild entire embed index for now --
-        // true incremental embedding is a future optimization)
+        // Re-embed changed-file symbols. Uses the updated graph nodes so enriched
+        // metadata is included in the embedding text.
         if let Some(ref embed_idx) = graph.embed_index {
-            match embed_idx
-                .index_all_with_symbols(&self.repo_root, &graph.nodes)
-                .await
-            {
+            let changed_file_nodes: Vec<_> = graph
+                .nodes
+                .iter()
+                .filter(|n| changed_files.iter().any(|f| n.id.file == **f))
+                .cloned()
+                .collect();
+            match embed_idx.reindex_nodes(&changed_file_nodes).await {
                 Ok(count) => {
-                    tracing::info!("Re-embedded {} items after incremental update", count)
+                    tracing::info!("Re-embedded {} changed-file nodes after incremental update", count)
                 }
-                Err(e) => tracing::warn!("Failed to re-embed: {}", e),
+                Err(e) => {
+                    // reindex_nodes falls back to no-op if the table doesn't exist;
+                    // do a full rebuild instead.
+                    tracing::warn!("Targeted re-embed failed ({}), falling back to full rebuild", e);
+                    if let Err(e2) = embed_idx
+                        .index_all_with_symbols(&self.repo_root, &graph.nodes)
+                        .await
+                    {
+                        tracing::warn!("Full embed rebuild also failed: {}", e2);
+                    }
+                }
             }
         }
 

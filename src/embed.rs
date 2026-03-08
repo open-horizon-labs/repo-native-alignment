@@ -97,6 +97,121 @@ impl EmbeddingIndex {
         self.index_all_inner(repo_root, &[]).await
     }
 
+    /// Re-embed a targeted subset of nodes and upsert them into the existing table.
+    ///
+    /// Use this after LSP enrichment to update embeddings for only the nodes whose
+    /// metadata was patched — avoiding a full table rebuild for every incremental update.
+    /// If the table does not yet exist, falls back to a no-op (caller must run
+    /// `index_all_with_symbols` first).
+    pub async fn reindex_nodes(&self, nodes: &[crate::graph::Node]) -> Result<usize> {
+        if nodes.is_empty() {
+            return Ok(0);
+        }
+
+        let mut ids: Vec<String> = Vec::new();
+        let mut kinds: Vec<String> = Vec::new();
+        let mut titles: Vec<String> = Vec::new();
+        let mut bodies: Vec<String> = Vec::new();
+        let mut texts: Vec<String> = Vec::new();
+
+        for node in nodes {
+            let kind_str = match &node.id.kind {
+                crate::graph::NodeKind::Other(s) => s.clone(),
+                k => format!("{}", k),
+            };
+
+            let mut text = String::new();
+            text.push_str(&node.id.name);
+            text.push(' ');
+            text.push_str(&node.signature);
+            text.push(' ');
+            let body_snippet = if node.body.len() > 500 {
+                &node.body[..500]
+            } else {
+                &node.body
+            };
+            text.push_str(body_snippet);
+            // Include LSP-enriched metadata so type-level queries find these nodes.
+            for (key, value) in &node.metadata {
+                text.push(' ');
+                text.push_str(key);
+                text.push_str(": ");
+                text.push_str(value);
+            }
+
+            let title = format!("{} {} ({})", kind_str, node.id.name, node.language);
+            let body_display = format!(
+                "{}\n\n{}:{}",
+                node.signature,
+                node.id.file.display(),
+                node.line_start
+            );
+
+            ids.push(node.stable_id());
+            kinds.push(format!("code:{}", kind_str));
+            titles.push(title);
+            bodies.push(body_display);
+            texts.push(text);
+        }
+
+        let count = texts.len();
+        let mut model = new_model()?;
+        let embeddings = embed_texts(&mut model, texts)?;
+        let dim = embeddings[0].len();
+        let flat_embeddings: Vec<f32> = embeddings.into_iter().flatten().collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("kind", DataType::Utf8, false),
+            Field::new("title", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dim as i32,
+                ),
+                false,
+            ),
+        ]));
+
+        let id_array = Arc::new(StringArray::from(ids)) as Arc<dyn arrow_array::Array>;
+        let kind_array = Arc::new(StringArray::from(kinds)) as Arc<dyn arrow_array::Array>;
+        let title_array = Arc::new(StringArray::from(titles)) as Arc<dyn arrow_array::Array>;
+        let body_array = Arc::new(StringArray::from(bodies)) as Arc<dyn arrow_array::Array>;
+        let values = Arc::new(Float32Array::from(flat_embeddings));
+        let list_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let vector_array = Arc::new(arrow_array::FixedSizeListArray::try_new(
+            list_field, dim as i32, values, None,
+        )?) as Arc<dyn arrow_array::Array>;
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![id_array, kind_array, title_array, body_array, vector_array],
+        )?;
+
+        // Upsert into the existing table by node id.
+        let table = match self.db.open_table(&self.table_name).execute().await {
+            Ok(t) => t,
+            Err(_) => {
+                // Table not yet created — nothing to update.
+                return Ok(0);
+            }
+        };
+
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut merge = table.merge_insert(&["id"]);
+        merge
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        merge
+            .execute(Box::new(batches))
+            .await
+            .context("Failed to upsert enriched node embeddings")?;
+
+        Ok(count)
+    }
+
     async fn index_all_inner(&self, repo_root: &Path, symbols: &[crate::graph::Node]) -> Result<usize> {
         let artifacts = oh::load_oh_artifacts(repo_root)?;
 
@@ -176,6 +291,14 @@ impl EmbeddingIndex {
                 &node.body
             };
             text.push_str(body_snippet);
+            // Include LSP-enriched metadata (type info, hover docs, resolved types)
+            // so that semantic search can find nodes by type-level concepts.
+            for (key, value) in &node.metadata {
+                text.push(' ');
+                text.push_str(key);
+                text.push_str(": ");
+                text.push_str(value);
+            }
 
             let title = format!("{} {} ({})", kind_str, node.id.name, node.language);
             let body_display = format!(

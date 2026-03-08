@@ -62,6 +62,10 @@ fn collect_nodes(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
                 let sig = node.utf8_text(source).unwrap_or("").lines().next().unwrap_or("").trim().to_string();
+                // Record the AST-accurate byte column of the name identifier so the
+                // LSP enricher can place the cursor without signature string searching.
+                let mut metadata = BTreeMap::new();
+                metadata.insert("name_col".to_string(), name_node.start_position().column.to_string());
 
                 nodes.push(Node {
                     id: NodeId {
@@ -75,7 +79,7 @@ fn collect_nodes(
                     line_end: node.end_position().row + 1,
                     signature: sig,
                     body: String::new(),
-                    metadata: BTreeMap::new(),
+                    metadata,
                     source: ExtractionSource::TreeSitter,
                 });
 
@@ -92,6 +96,8 @@ fn collect_nodes(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
                 let sig = node.utf8_text(source).unwrap_or("").lines().next().unwrap_or("").trim().to_string();
+                let mut metadata = BTreeMap::new();
+                metadata.insert("name_col".to_string(), name_node.start_position().column.to_string());
 
                 nodes.push(Node {
                     id: NodeId {
@@ -105,7 +111,7 @@ fn collect_nodes(
                     line_end: node.end_position().row + 1,
                     signature: sig,
                     body: String::new(),
-                    metadata: BTreeMap::new(),
+                    metadata,
                     source: ExtractionSource::TreeSitter,
                 });
 
@@ -121,6 +127,8 @@ fn collect_nodes(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
                 let sig = node.utf8_text(source).unwrap_or("").lines().next().unwrap_or("").trim().to_string();
+                let mut metadata = BTreeMap::new();
+                metadata.insert("name_col".to_string(), name_node.start_position().column.to_string());
 
                 nodes.push(Node {
                     id: NodeId {
@@ -134,7 +142,7 @@ fn collect_nodes(
                     line_end: node.end_position().row + 1,
                     signature: sig,
                     body: String::new(),
-                    metadata: BTreeMap::new(),
+                    metadata,
                     source: ExtractionSource::TreeSitter,
                 });
             }
@@ -148,6 +156,8 @@ fn collect_nodes(
                 };
                 let body = node.utf8_text(source).unwrap_or("").to_string();
                 let sig = body.lines().next().unwrap_or("").trim().to_string();
+                let mut metadata = BTreeMap::new();
+                metadata.insert("name_col".to_string(), name_node.start_position().column.to_string());
 
                 nodes.push(Node {
                     id: NodeId {
@@ -161,7 +171,7 @@ fn collect_nodes(
                     line_end: node.end_position().row + 1,
                     signature: sig,
                     body,
-                    metadata: BTreeMap::new(),
+                    metadata,
                     source: ExtractionSource::TreeSitter,
                 });
             }
@@ -175,6 +185,8 @@ fn collect_nodes(
                 };
                 let body = node.utf8_text(source).unwrap_or("").to_string();
                 let sig = body.lines().next().unwrap_or("").trim().to_string();
+                let mut metadata = BTreeMap::new();
+                metadata.insert("name_col".to_string(), name_node.start_position().column.to_string());
 
                 nodes.push(Node {
                     id: NodeId {
@@ -188,7 +200,7 @@ fn collect_nodes(
                     line_end: node.end_position().row + 1,
                     signature: sig,
                     body,
-                    metadata: BTreeMap::new(),
+                    metadata,
                     source: ExtractionSource::TreeSitter,
                 });
             }
