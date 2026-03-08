@@ -10,6 +10,9 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use crate::git;
 use crate::oh;
 
+const EMBEDDING_BATCH_SIZE: usize = 100;
+
+
 /// Truncate `s` to at most `max_chars` Unicode scalar values, returning a
 /// valid UTF-8 slice. Safe even when a multibyte character straddles the
 /// byte boundary (the original panic trigger).
@@ -21,18 +24,80 @@ fn truncate_chars(s: &str, max_chars: usize) -> &str {
 }
 
 fn new_model() -> Result<TextEmbedding> {
-    TextEmbedding::try_new(
+    let start = std::time::Instant::now();
+    tracing::debug!("EmbeddingIndex: loading fastembed model BGE Small EN v1.5");
+    let model = TextEmbedding::try_new(
         InitOptions::new(EmbeddingModel::BGESmallENV15)
             .with_show_download_progress(false),
     )
-    .map_err(|e| anyhow::anyhow!("Failed to load embedding model: {}", e))
+    .map_err(|e| anyhow::anyhow!("Failed to load embedding model: {}", e));
+    match &model {
+        Ok(_) => tracing::debug!(
+            "EmbeddingIndex: model ready in {:?}",
+            start.elapsed()
+        ),
+        Err(err) => tracing::debug!(
+            "EmbeddingIndex: model load failed in {:?}: {}",
+            start.elapsed(),
+            err
+        ),
+    }
+    model
 }
 
-fn embed_texts(model: &mut TextEmbedding, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-    model
-        .embed(texts, None)
-        .map_err(|e| anyhow::anyhow!("Embedding failed: {}", e))
+async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    let total = texts.len();
+    if total == 0 {
+        tracing::debug!("EmbeddingIndex: no texts to embed");
+        return Ok(Vec::new());
+    }
+
+    let total_chars: usize = texts.iter().map(|t| t.len()).sum();
+    let total_batches = total.div_ceil(EMBEDDING_BATCH_SIZE);
+    let overall_start = std::time::Instant::now();
+    tracing::info!(
+        "EmbeddingIndex: embedding {} text(s) across {} batch(es) ({} chars total)",
+        total, total_batches, total_chars
+    );
+
+    let mut model = new_model()?;
+    let mut remaining = texts;
+    let mut all_embeddings = Vec::with_capacity(total);
+    let mut processed = 0usize;
+
+    for batch_idx in 0..total_batches {
+        let batch_size = remaining.len().min(EMBEDDING_BATCH_SIZE);
+        let batch: Vec<String> = remaining.drain(..batch_size).collect();
+        let batch_start = std::time::Instant::now();
+        tracing::debug!(
+            "EmbeddingIndex: batch {}/{} ({} texts)",
+            batch_idx + 1, total_batches, batch_size
+        );
+
+        let batch_embeddings = model
+            .embed(batch, None)
+            .map_err(|e| anyhow::anyhow!("Embedding failed: {}", e))?;
+        if batch_embeddings.len() != batch_size {
+            anyhow::bail!(
+                "embedding batch size mismatch: got {}, expected {}",
+                batch_embeddings.len(), batch_size
+            );
+        }
+        processed += batch_size;
+        tracing::debug!(
+            "EmbeddingIndex: batch {}/{} done in {:?} ({}/{})",
+            batch_idx + 1, total_batches, batch_start.elapsed(), processed, total
+        );
+        all_embeddings.extend(batch_embeddings);
+    }
+
+    tracing::info!(
+        "EmbeddingIndex: embedded {} text(s) in {:?}",
+        processed, overall_start.elapsed()
+    );
+    Ok(all_embeddings)
 }
+
 
 /// The embedding index: wraps LanceDB with fastembed for semantic search over .oh/ artifacts.
 pub struct EmbeddingIndex {
@@ -80,11 +145,18 @@ impl EmbeddingIndex {
     pub async fn new(repo_root: &Path) -> Result<Self> {
         let db_path = repo_root.join(".oh").join(".cache").join("embeddings");
         std::fs::create_dir_all(&db_path)?;
+        tracing::debug!("EmbeddingIndex: opening LanceDB at {}", db_path.display());
+        let open_start = std::time::Instant::now();
 
         let db = lancedb::connect(db_path.to_str().unwrap())
             .execute()
             .await
             .context("Failed to connect to LanceDB")?;
+        tracing::debug!(
+            "EmbeddingIndex: opened LanceDB at {} in {:?}",
+            db_path.display(),
+            open_start.elapsed()
+        );
 
         Ok(Self {
             db,
@@ -161,8 +233,7 @@ impl EmbeddingIndex {
         }
 
         let count = texts.len();
-        let mut model = new_model()?;
-        let embeddings = embed_texts(&mut model, texts)?;
+        let embeddings = embed_texts(texts).await?;
         let dim = embeddings[0].len();
         let flat_embeddings: Vec<f32> = embeddings.into_iter().flatten().collect();
 
@@ -219,7 +290,13 @@ impl EmbeddingIndex {
     }
 
     async fn index_all_inner(&self, repo_root: &Path, symbols: &[crate::graph::Node]) -> Result<usize> {
+        let index_start = std::time::Instant::now();
+        tracing::info!(
+            "EmbeddingIndex: rebuilding full index for {}",
+            repo_root.display()
+        );
         let artifacts = oh::load_oh_artifacts(repo_root)?;
+        let artifact_count = artifacts.len();
 
         // Collect ids, kinds, titles, bodies, and embedding texts from artifacts
         let mut ids: Vec<String> = Vec::new();
@@ -257,50 +334,71 @@ impl EmbeddingIndex {
         }
 
         // Also index all git commits
-        if let Ok(commits) = git::load_commits(repo_root, usize::MAX) {
-            for c in &commits {
-                let changed_files_str = c
-                    .changed_files
-                    .iter()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let body = format!("{}\n\nFiles: {}", c.message, changed_files_str);
-                let title = c.message.lines().next().unwrap_or(&c.message).to_string();
+        let commit_count = match git::load_commits(repo_root, usize::MAX) {
+            Ok(commits) => {
+                for c in &commits {
+                    let changed_files_str = c
+                        .changed_files
+                        .iter()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let body = format!("{}\n\nFiles: {}", c.message, changed_files_str);
+                    let title = c.message.lines().next().unwrap_or(&c.message).to_string();
 
-                ids.push(c.short_hash.clone());
-                kinds.push("commit".to_string());
-                titles.push(title);
-                bodies.push(body.clone());
-                texts.push(body);
+                    ids.push(c.short_hash.clone());
+                    kinds.push("commit".to_string());
+                    titles.push(title);
+                    bodies.push(body.clone());
+                    texts.push(body);
+                }
+                commits.len()
             }
-        }
+            Err(err) => {
+                tracing::debug!(
+                    "EmbeddingIndex: failed to load commits for {}: {}",
+                    repo_root.display(),
+                    err
+                );
+                0
+            }
+        };
+        // Filter to embeddable node kinds before counting/indexing
+        let embeddable: Vec<&crate::graph::Node> = symbols.iter()
+            .filter(|n| n.id.kind.is_embeddable())
+            .collect();
+        let skipped = symbols.len() - embeddable.len();
+        tracing::info!(
+            "EmbeddingIndex: collected {} artifact(s), {} commit(s), {} symbol(s) ({} embeddable, {} skipped) for indexing",
+            artifact_count,
+            commit_count,
+            symbols.len(),
+            embeddable.len(),
+            skipped,
+        );
 
-        // Also index code symbols and markdown sections from the graph
-        for node in symbols {
+        // Index code symbols and markdown sections from the graph
+        for node in &embeddable {
             let kind_str = match &node.id.kind {
                 crate::graph::NodeKind::Other(s) => s.clone(),
                 k => format!("{}", k),
             };
 
-            // Build searchable text from signature + body + metadata
-            let mut text = String::new();
-            text.push_str(&node.id.name);
-            text.push(' ');
-            text.push_str(&node.signature);
-            text.push(' ');
-            // Include doc comments / body for semantic matching
-            // Truncate body to avoid huge embeddings
-            let body_snippet = truncate_chars(&node.body, 500);
-            text.push_str(body_snippet);
-            // Include LSP-enriched metadata (type info, hover docs, resolved types)
-            // so that semantic search can find nodes by type-level concepts.
-            for (key, value) in &node.metadata {
-                text.push(' ');
-                text.push_str(key);
-                text.push_str(": ");
-                text.push_str(value);
-            }
+            // Build searchable text: signature is the primary signal for code search.
+            // For markdown sections, body IS the content so include it.
+            // Drop: raw function bodies (implementation noise, nobody searches by impl),
+            //       name (redundant — already in signature),
+            //       metadata (structural/positional, not semantic).
+            let text = match node.id.kind {
+                crate::graph::NodeKind::Other(ref s) if s == "Section" => {
+                    // Markdown: heading + body content (truncated)
+                    format!("{} {}", node.signature, truncate_chars(&node.body, 300))
+                }
+                _ => {
+                    // Code: signature only — fits well within 512-token budget
+                    node.signature.clone()
+                }
+            };
 
             let title = format!("{} {} ({})", kind_str, node.id.name, node.language);
             let body_display = format!(
@@ -317,19 +415,29 @@ impl EmbeddingIndex {
             texts.push(text);
         }
 
+
         if texts.is_empty() {
+            tracing::info!("EmbeddingIndex: no texts collected for {}", repo_root.display());
             return Ok(0);
         }
 
         let count = texts.len();
+        tracing::info!(
+            "EmbeddingIndex: preparing {} row(s) for full index rebuild",
+            count
+        );
 
         // Compute embeddings
-        let mut model = new_model()?;
-
-        let embeddings = embed_texts(&mut model, texts)?;
+        let embed_start = std::time::Instant::now();
+        let embeddings = embed_texts(texts).await?;
         let dim = embeddings[0].len();
-
         let flat_embeddings: Vec<f32> = embeddings.into_iter().flatten().collect();
+        tracing::info!(
+            "EmbeddingIndex: computed {} embedding row(s) with dimension {} in {:?}",
+            count,
+            dim,
+            embed_start.elapsed()
+        );
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
@@ -363,6 +471,7 @@ impl EmbeddingIndex {
         )?;
 
         // Drop existing table if it exists, then create new
+        let persist_start = std::time::Instant::now();
         let _ = self.db.drop_table(&self.table_name, &[]).await;
 
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
@@ -371,6 +480,12 @@ impl EmbeddingIndex {
             .execute()
             .await
             .context("Failed to create LanceDB table")?;
+        tracing::info!(
+            "EmbeddingIndex: persisted {} row(s) to LanceDB in {:?} (total {:?})",
+            count,
+            persist_start.elapsed(),
+            index_start.elapsed()
+        );
 
         Ok(count)
     }
@@ -390,8 +505,7 @@ impl EmbeddingIndex {
             .context("Table not found — run index_all first")?;
 
         // Embed the query
-        let mut model = new_model()?;
-        let query_embedding = embed_texts(&mut model, vec![query.to_string()])?;
+        let query_embedding = embed_texts(vec![query.to_string()]).await?;
 
         let mut search = table
             .vector_search(query_embedding[0].clone())
@@ -479,23 +593,17 @@ mod tests {
     #[test]
     fn test_truncate_chars_ascii() {
         let s = "a".repeat(600);
-        assert_eq!(truncate_chars(&s, 500).len(), 500);
+        let result = truncate_chars(&s, 500);
+        assert_eq!(result.len(), 500);
     }
 
     #[test]
     fn test_truncate_chars_multibyte_boundary() {
-        // Regression test for: byte index 500 is not a char boundary.
-        // Construct a string where byte 500 falls inside a 3-byte char ('—').
-        // 498 ASCII chars + '—' (bytes 498..501) + more chars.
-        // Old code: &s[..500] panics — byte 500 is inside '—'.
-        // New code: truncate_chars(&s, 500) returns exactly 500 chars (499 'a's + '—').
         let mut s = "a".repeat(498);
-        s.push('—'); // char 498, bytes 498..501
+        s.push('—');
         s.push_str(&"b".repeat(100));
         let result = truncate_chars(&s, 500);
-        // Must be valid UTF-8
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
-        // Must be exactly 500 chars (498 'a's + '—' + 1 'b')
         assert_eq!(result.chars().count(), 500);
     }
 

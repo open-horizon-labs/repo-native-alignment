@@ -69,19 +69,21 @@ impl ScanConfig {
         }
     }
 
-    /// Merge config with default excludes to produce final exclude list.
-    pub fn effective_excludes(&self) -> Vec<String> {
-        let mut excludes: Vec<String> = DEFAULT_EXCLUDES
-            .iter()
-            .filter(|d| !self.include.iter().any(|inc| inc == *d))
-            .map(|s| s.to_string())
-            .collect();
+    /// Merge config with a base exclude list to produce the final exclude list.
+    fn apply_to_base_excludes(&self, mut excludes: Vec<String>) -> Vec<String> {
+        excludes.retain(|pattern| !self.include.iter().any(|inc| inc == pattern));
         for extra in &self.exclude {
             if !excludes.contains(extra) {
                 excludes.push(extra.clone());
             }
         }
         excludes
+    }
+
+    /// Merge config with default excludes to produce final exclude list.
+    pub fn effective_excludes(&self) -> Vec<String> {
+        let excludes: Vec<String> = DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect();
+        self.apply_to_base_excludes(excludes)
     }
 }
 
@@ -186,12 +188,14 @@ impl Scanner {
     /// Loads exclude config from `.oh/config.toml` if it exists,
     /// and persisted state from `.oh/.cache/scan-state.json`.
     pub fn new(repo_root: PathBuf) -> Result<Self> {
-        let config = ScanConfig::load(&repo_root);
-        Self::with_excludes(repo_root, config.effective_excludes())
+        let excludes: Vec<String> = DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect();
+        Self::with_excludes(repo_root, excludes)
     }
 
     /// Create a scanner with custom exclude patterns.
     pub fn with_excludes(repo_root: PathBuf, excludes: Vec<String>) -> Result<Self> {
+        let config = ScanConfig::load(&repo_root);
+        let excludes = config.apply_to_base_excludes(excludes);
         let state = load_state(&repo_root).unwrap_or_default();
         Ok(Scanner {
             repo_root,
@@ -208,6 +212,8 @@ impl Scanner {
         excludes: Vec<String>,
         state_path_override: PathBuf,
     ) -> Result<Self> {
+        let config = ScanConfig::load(&repo_root);
+        let excludes = config.apply_to_base_excludes(excludes);
         let state = load_state_from_path(&state_path_override).unwrap_or_default();
         Ok(Scanner {
             repo_root,
@@ -237,11 +243,39 @@ impl Scanner {
     pub fn scan(&mut self) -> Result<ScanResult> {
         let start = Instant::now();
 
+        tracing::info!(
+            "Scanner: starting incremental scan for {}",
+            self.repo_root.display()
+        );
+        tracing::debug!(
+            "Scanner: active excludes ({}): {:?}",
+            self.excludes.len(),
+            self.excludes
+        );
+
         let mut changed_files = Vec::new();
         let mut new_files = Vec::new();
 
         // ── Step 2: Git optimization layer ──────────────────────────
         let git_changed = self.git_diff_changed();
+        match &git_changed {
+            Some(paths) if paths.is_empty() => {
+                tracing::debug!("Scanner: git diff found no changed files");
+            }
+            Some(paths) => {
+                tracing::debug!(
+                    "Scanner: git diff yielded {} changed path(s): {:?}",
+                    paths.len(),
+                    paths
+                );
+            }
+            None => {
+                tracing::debug!(
+                    "Scanner: git diff optimization unavailable for {}",
+                    self.repo_root.display()
+                );
+            }
+        }
 
         // ── Step 3: mtime walk ──────────────────────────────────────
         let mut new_dir_mtimes: HashMap<PathBuf, SystemTimeWrapper> = HashMap::new();
@@ -264,8 +298,16 @@ impl Scanner {
                     // If not already captured by mtime walk
                     if !changed_files.contains(&rel_path) && !new_files.contains(&rel_path) {
                         if self.state.file_mtimes.contains_key(&rel_path) {
+                            tracing::debug!(
+                                "Scanner: git diff marked changed file {}",
+                                rel_path.display()
+                            );
                             changed_files.push(rel_path);
                         } else {
+                            tracing::debug!(
+                                "Scanner: git diff marked new file {}",
+                                rel_path.display()
+                            );
                             new_files.push(rel_path);
                         }
                     }
@@ -284,6 +326,13 @@ impl Scanner {
             })
             .cloned()
             .collect();
+        if !deleted_files.is_empty() {
+            tracing::debug!(
+                "Scanner: detected {} deleted file(s): {:?}",
+                deleted_files.len(),
+                deleted_files
+            );
+        }
 
         // ── Step 5: Update and save state ───────────────────────────
         // Remove deleted files from new state
@@ -306,11 +355,22 @@ impl Scanner {
             save_state(&self.repo_root, &self.state)?;
         }
 
+        let scan_duration = start.elapsed();
+        tracing::info!(
+            "Scanner: completed scan for {} in {:?} ({} new, {} changed, {} deleted, {} tracked files)",
+            self.repo_root.display(),
+            scan_duration,
+            new_files.len(),
+            changed_files.len(),
+            deleted_files.len(),
+            self.state.file_mtimes.len()
+        );
+
         Ok(ScanResult {
             changed_files,
             new_files,
             deleted_files,
-            scan_duration: start.elapsed(),
+            scan_duration,
         })
     }
 
@@ -328,13 +388,20 @@ impl Scanner {
         new_dir_mtimes: &mut HashMap<PathBuf, SystemTimeWrapper>,
         new_file_mtimes: &mut HashMap<PathBuf, SystemTimeWrapper>,
     ) -> Result<()> {
+        let dir_start = Instant::now();
         let rel_dir = dir
             .strip_prefix(&self.repo_root)
             .unwrap_or(dir)
             .to_path_buf();
+        let rel_dir_display = if rel_dir.as_os_str().is_empty() {
+            String::from(".")
+        } else {
+            rel_dir.display().to_string()
+        };
 
         // Check exclude patterns for this directory
         if !rel_dir.as_os_str().is_empty() && self.is_excluded_dir(&rel_dir) {
+            tracing::debug!("Scanner: skipping excluded directory {}", rel_dir_display);
             return Ok(());
         }
 
@@ -357,12 +424,23 @@ impl Scanner {
         };
 
         if !dir_changed {
+            tracing::debug!(
+                "Scanner: directory unchanged, carrying subtree {}",
+                rel_dir_display
+            );
             // Directory unchanged: no files added/removed in this dir. But file
             // contents may have been modified in place. Re-check file mtimes
             // while skipping subdirectories whose mtimes are also unchanged.
             self.carry_forward_subtree(dir, changed, new, new_dir_mtimes, new_file_mtimes)?;
+            tracing::debug!(
+                "Scanner: carried subtree {} in {:?}",
+                rel_dir_display,
+                dir_start.elapsed()
+            );
             return Ok(());
         }
+
+        tracing::debug!("Scanner: enumerating directory {}", rel_dir_display);
 
         // Directory mtime changed: enumerate contents
         let entries =
@@ -376,27 +454,49 @@ impl Scanner {
             if ft.is_dir() {
                 self.walk_dir_mtime(&path, changed, new, new_dir_mtimes, new_file_mtimes)?;
             } else if ft.is_file() || ft.is_symlink() {
+                let file_start = Instant::now();
                 let rel_file = path
                     .strip_prefix(&self.repo_root)
                     .unwrap_or(&path)
                     .to_path_buf();
 
                 if self.is_excluded(&rel_file) {
+                    tracing::debug!(
+                        "Scanner: skipping excluded file {}",
+                        rel_file.display()
+                    );
                     continue;
                 }
 
                 let file_mtime = file_modified_time(&path)?;
                 new_file_mtimes.insert(rel_file.clone(), file_mtime.into());
 
-                if let Some(stored) = self.state.file_mtimes.get(&rel_file) {
+                let status = if let Some(stored) = self.state.file_mtimes.get(&rel_file) {
                     if file_mtime != stored.0 {
-                        changed.push(rel_file);
+                        changed.push(rel_file.clone());
+                        "changed"
+                    } else {
+                        "unchanged"
                     }
                 } else {
-                    new.push(rel_file);
-                }
+                    new.push(rel_file.clone());
+                    "new"
+                };
+
+                tracing::debug!(
+                    "Scanner: {} file {} in {:?}",
+                    status,
+                    rel_file.display(),
+                    file_start.elapsed()
+                );
             }
         }
+
+        tracing::debug!(
+            "Scanner: finished directory {} in {:?}",
+            rel_dir_display,
+            dir_start.elapsed()
+        );
 
         Ok(())
     }
@@ -417,6 +517,21 @@ impl Scanner {
         new_dir_mtimes: &mut HashMap<PathBuf, SystemTimeWrapper>,
         new_file_mtimes: &mut HashMap<PathBuf, SystemTimeWrapper>,
     ) -> Result<()> {
+        let subtree_start = Instant::now();
+        let rel_dir = dir
+            .strip_prefix(&self.repo_root)
+            .unwrap_or(dir)
+            .to_path_buf();
+        let rel_dir_display = if rel_dir.as_os_str().is_empty() {
+            String::from(".")
+        } else {
+            rel_dir.display().to_string()
+        };
+        tracing::debug!(
+            "Scanner: rechecking unchanged subtree {}",
+            rel_dir_display
+        );
+
         let entries =
             fs::read_dir(dir).with_context(|| format!("read_dir: {}", dir.display()))?;
 
@@ -432,6 +547,10 @@ impl Scanner {
                     .to_path_buf();
 
                 if self.is_excluded_dir(&rel_dir) {
+                    tracing::debug!(
+                        "Scanner: skipping excluded directory {} during subtree carry",
+                        rel_dir.display()
+                    );
                     continue;
                 }
 
@@ -446,6 +565,10 @@ impl Scanner {
                 new_dir_mtimes.insert(rel_dir.clone(), subdir_mtime.into());
 
                 if subdir_changed {
+                    tracing::debug!(
+                        "Scanner: subtree directory changed, rescanning {}",
+                        rel_dir.display()
+                    );
                     // Subdirectory changed: files may have been added/removed.
                     // Fall through to full enumeration via walk_dir_mtime.
                     self.walk_dir_mtime(&path, changed, new, new_dir_mtimes, new_file_mtimes)?;
@@ -460,12 +583,17 @@ impl Scanner {
                     )?;
                 }
             } else if ft.is_file() || ft.is_symlink() {
+                let file_start = Instant::now();
                 let rel_file = path
                     .strip_prefix(&self.repo_root)
                     .unwrap_or(&path)
                     .to_path_buf();
 
                 if self.is_excluded(&rel_file) {
+                    tracing::debug!(
+                        "Scanner: skipping excluded file {} during subtree carry",
+                        rel_file.display()
+                    );
                     continue;
                 }
 
@@ -474,15 +602,32 @@ impl Scanner {
                 let file_mtime = file_modified_time(&path)?;
                 new_file_mtimes.insert(rel_file.clone(), file_mtime.into());
 
-                if let Some(stored) = self.state.file_mtimes.get(&rel_file) {
+                let status = if let Some(stored) = self.state.file_mtimes.get(&rel_file) {
                     if file_mtime != stored.0 {
-                        changed.push(rel_file);
+                        changed.push(rel_file.clone());
+                        "changed"
+                    } else {
+                        "unchanged"
                     }
                 } else {
-                    new.push(rel_file);
-                }
+                    new.push(rel_file.clone());
+                    "new"
+                };
+
+                tracing::debug!(
+                    "Scanner: rechecked {} file {} in {:?}",
+                    status,
+                    rel_file.display(),
+                    file_start.elapsed()
+                );
             }
         }
+
+        tracing::debug!(
+            "Scanner: finished subtree {} in {:?}",
+            rel_dir_display,
+            subtree_start.elapsed()
+        );
 
         Ok(())
     }
@@ -492,42 +637,132 @@ impl Scanner {
     /// Use git2 to find files changed since last_commit_sha.
     /// Returns None if git is unavailable or no previous SHA is stored.
     fn git_diff_changed(&self) -> Option<Vec<PathBuf>> {
-        let last_sha = self.state.last_commit_sha.as_ref()?;
-        let repo = git2::Repository::open(&self.repo_root).ok()?;
+        let last_sha = match self.state.last_commit_sha.as_ref() {
+            Some(sha) => sha,
+            None => {
+                tracing::debug!("Scanner: git diff unavailable (no previous HEAD SHA)");
+                return None;
+            }
+        };
+        let repo = match git2::Repository::open(&self.repo_root) {
+            Ok(repo) => repo,
+            Err(err) => {
+                tracing::debug!(
+                    "Scanner: git diff unavailable for {}: {}",
+                    self.repo_root.display(),
+                    err
+                );
+                return None;
+            }
+        };
 
-        let old_oid = git2::Oid::from_str(last_sha).ok()?;
-        let old_commit = repo.find_commit(old_oid).ok()?;
-        let old_tree = old_commit.tree().ok()?;
+        let old_oid = match git2::Oid::from_str(last_sha) {
+            Ok(oid) => oid,
+            Err(err) => {
+                tracing::debug!("Scanner: invalid stored HEAD SHA {}: {}", last_sha, err);
+                return None;
+            }
+        };
+        let old_commit = match repo.find_commit(old_oid) {
+            Ok(commit) => commit,
+            Err(err) => {
+                tracing::debug!(
+                    "Scanner: previous commit {} no longer available: {}",
+                    last_sha,
+                    err
+                );
+                return None;
+            }
+        };
+        let old_tree = match old_commit.tree() {
+            Ok(tree) => tree,
+            Err(err) => {
+                tracing::debug!(
+                    "Scanner: failed to load previous tree for {}: {}",
+                    old_commit.id(),
+                    err
+                );
+                return None;
+            }
+        };
 
-        let head_ref = repo.head().ok()?;
-        let head_commit = head_ref.peel_to_commit().ok()?;
-        let head_tree = head_commit.tree().ok()?;
+        let head_ref = match repo.head() {
+            Ok(head) => head,
+            Err(err) => {
+                tracing::debug!("Scanner: failed to resolve HEAD: {}", err);
+                return None;
+            }
+        };
+        let head_commit = match head_ref.peel_to_commit() {
+            Ok(commit) => commit,
+            Err(err) => {
+                tracing::debug!("Scanner: failed to peel HEAD to commit: {}", err);
+                return None;
+            }
+        };
+        let head_tree = match head_commit.tree() {
+            Ok(tree) => tree,
+            Err(err) => {
+                tracing::debug!(
+                    "Scanner: failed to load HEAD tree for {}: {}",
+                    head_commit.id(),
+                    err
+                );
+                return None;
+            }
+        };
 
         if old_commit.id() == head_commit.id() {
+            tracing::debug!("Scanner: git HEAD unchanged at {}", head_commit.id());
             // No new commits
             return Some(Vec::new());
         }
 
         let mut opts = git2::DiffOptions::new();
-        let diff = repo
-            .diff_tree_to_tree(Some(&old_tree), Some(&head_tree), Some(&mut opts))
-            .ok()?;
+        let diff = match repo.diff_tree_to_tree(Some(&old_tree), Some(&head_tree), Some(&mut opts)) {
+            Ok(diff) => diff,
+            Err(err) => {
+                tracing::debug!(
+                    "Scanner: git diff failed from {} to {}: {}",
+                    old_commit.id(),
+                    head_commit.id(),
+                    err
+                );
+                return None;
+            }
+        };
 
         let mut paths = Vec::new();
-        diff.foreach(
-            &mut |delta, _| {
-                if let Some(path) = delta.new_file().path() {
-                    paths.push(path.to_path_buf());
-                } else if let Some(path) = delta.old_file().path() {
-                    paths.push(path.to_path_buf());
-                }
-                true
-            },
-            None,
-            None,
-            None,
-        )
-        .ok()?;
+        if diff
+            .foreach(
+                &mut |delta, _| {
+                    if let Some(path) = delta.new_file().path() {
+                        paths.push(path.to_path_buf());
+                    } else if let Some(path) = delta.old_file().path() {
+                        paths.push(path.to_path_buf());
+                    }
+                    true
+                },
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        {
+            tracing::debug!(
+                "Scanner: failed to iterate git diff entries from {} to {}",
+                old_commit.id(),
+                head_commit.id()
+            );
+            return None;
+        }
+
+        tracing::debug!(
+            "Scanner: git diff from {} to {} produced {} path(s)",
+            old_commit.id(),
+            head_commit.id(),
+            paths.len()
+        );
 
         Some(paths)
     }
@@ -892,6 +1127,34 @@ mod tests {
         assert_eq!(all.len(), 1, "Should only find 1 file, found: {:?}", all);
         assert!(all.contains(&PathBuf::from("src/main.rs")));
     }
+
+    #[test]
+    fn test_project_config_applies_to_custom_excludes() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        create_file(root, "src/main.rs", "fn main() {}\n");
+        create_file(root, ".fastembed_cache/model.onnx", "model bytes");
+        fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+        fs::write(
+            root.join(".oh/config.toml"),
+            "[scanner]\nexclude = [\".fastembed_cache/\"]\n",
+        )
+        .unwrap();
+
+        let excludes = DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect();
+        let mut scanner = Scanner::with_excludes(root.to_path_buf(), excludes).unwrap();
+        let result = scanner.scan().unwrap();
+
+        let all: Vec<_> = result.files_to_extract().into_iter().cloned().collect();
+        assert!(
+            !all.contains(&PathBuf::from(".fastembed_cache/model.onnx")),
+            "Config exclude should apply to custom scanners: {:?}",
+            all
+        );
+        assert!(all.contains(&PathBuf::from("src/main.rs")));
+    }
+
 
     // ── mtime skip optimization ─────────────────────────────────────
 

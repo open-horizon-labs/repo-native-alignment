@@ -74,6 +74,16 @@ fn server_details() -> InitializeResult {
     }
 }
 
+fn init_tracing(default_filter: &str) {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| default_filter.into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -82,6 +92,8 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Commands::Setup(args)) => return setup::run(&args),
         Some(Commands::Test(args)) => {
+            init_tracing("info");
+            tracing::info!("Running RNA pipeline smoke test for {}", args.repo.display());
             let passed = smoke::run(&args).await?;
             std::process::exit(if passed { 0 } else { 1 });
         }
@@ -99,13 +111,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.transport.as_str() {
         "stdio" => {
             // Logging to stderr only — stdout is the MCP channel
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "warn".into()),
-                )
-                .with_writer(std::io::stderr)
-                .init();
+            init_tracing("warn");
 
             tracing::info!(
                 "Starting RNA MCP server (stdio) for repo at {}",
@@ -128,13 +134,7 @@ async fn main() -> anyhow::Result<()> {
             server.start().await.map_err(|e| anyhow::anyhow!("{:?}", e))?;
         }
         "http" => {
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "info".into()),
-                )
-                .with_writer(std::io::stderr)
-                .init();
+            init_tracing("info");
 
             tracing::info!(
                 "Starting RNA MCP server on {}:{} for repo at {}",
