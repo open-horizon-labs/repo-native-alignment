@@ -141,6 +141,71 @@ impl WorkspaceConfig {
         self
     }
 
+    /// Detect active git worktrees from `.git/worktrees/` and add each as a
+    /// `CodeProject` root. Stale entries (left behind briefly after
+    /// `git worktree remove`) are skipped via `Path::exists()`.
+    ///
+    /// Slug uniqueness: `path_to_slug` encodes the **full path** so two
+    /// worktrees sharing a basename get distinct slugs.
+    pub fn with_worktrees(mut self, repo_root: &Path) -> Self {
+        let worktrees_dir = repo_root.join(".git").join("worktrees");
+        let entries = match std::fs::read_dir(&worktrees_dir) {
+            Ok(e) => e,
+            // No .git/worktrees directory means no linked worktrees.
+            Err(_) => return self,
+        };
+
+        for entry in entries.flatten() {
+            // Each subdirectory corresponds to one linked worktree.
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !meta.is_dir() {
+                continue;
+            }
+
+            // The `gitdir` file points back to the worktree's .git file.
+            // Its parent is the worktree checkout root.
+            let gitdir_file = entry.path().join("gitdir");
+            let gitdir_content = match std::fs::read_to_string(&gitdir_file) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let gitdir_path = PathBuf::from(gitdir_content.trim());
+            let worktree_path = match gitdir_path.parent() {
+                Some(p) => p.to_path_buf(),
+                None => continue,
+            };
+
+            // Guard against stale entries: paths persist briefly after removal.
+            if !worktree_path.exists() {
+                tracing::debug!(
+                    "Skipping stale worktree entry {:?} — path does not exist: {}",
+                    entry.file_name(),
+                    worktree_path.display()
+                );
+                continue;
+            }
+
+            // Avoid duplicating the primary root.
+            let canonical_primary = expand_tilde(&PathBuf::from(repo_root));
+            if worktree_path == canonical_primary {
+                continue;
+            }
+
+            // Skip if already present (e.g. from user's roots.toml).
+            if self.roots.iter().any(|r| r.resolved_path() == worktree_path) {
+                continue;
+            }
+
+            tracing::info!("Detected worktree: {}", worktree_path.display());
+            self.roots.push(RootConfig::code_project(worktree_path));
+        }
+
+        self
+    }
+
     /// Get all roots with their resolved paths and slugs.
     pub fn resolved_roots(&self) -> Vec<ResolvedRoot> {
         self.roots
@@ -222,17 +287,19 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// Convert a path to a URL-safe slug.
-/// e.g., `/Users/foo/src/my-project` -> `my-project`
-/// e.g., `/Users/foo/src/zettelkasten` -> `zettelkasten`
+/// Convert a path to a URL-safe slug using the full canonical path.
+/// Using the full path (not just basename) guarantees uniqueness even when
+/// two worktrees share the same directory name.
+/// e.g., `/Users/foo/src/my-project` -> `users-foo-src-my-project`
 fn path_to_slug(path: &Path) -> String {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("root")
+    path.to_string_lossy()
+        .trim_start_matches('/')
         .to_lowercase()
         .replace(|c: char| !c.is_alphanumeric() && c != '-', "-")
-        .trim_matches('-')
-        .to_string()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// Path for per-root scan state cache.
@@ -388,9 +455,41 @@ excludes = ["*.iso", "*.dmg"]
 
     #[test]
     fn test_path_to_slug() {
-        assert_eq!(path_to_slug(Path::new("/Users/foo/src/my-project")), "my-project");
-        assert_eq!(path_to_slug(Path::new("/home/user/zettelkasten")), "zettelkasten");
-        assert_eq!(path_to_slug(Path::new("/tmp/My Project Name")), "my-project-name");
+        assert_eq!(path_to_slug(Path::new("/Users/foo/src/my-project")), "users-foo-src-my-project");
+        assert_eq!(path_to_slug(Path::new("/home/user/zettelkasten")), "home-user-zettelkasten");
+        assert_eq!(path_to_slug(Path::new("/tmp/My Project Name")), "tmp-my-project-name");
+    }
+
+    #[test]
+    fn test_path_to_slug_uniqueness_for_same_basename() {
+        // Two worktrees at different parent paths with the same directory name
+        // must get distinct slugs.
+        let slug_a = path_to_slug(Path::new("/work/projectA/feat-x"));
+        let slug_b = path_to_slug(Path::new("/work/projectB/feat-x"));
+        assert_ne!(slug_a, slug_b);
+    }
+
+    #[test]
+    fn test_with_worktrees_skips_nonexistent_path() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+
+        // Create a fake .git/worktrees/<name>/gitdir pointing at a nonexistent path
+        let wt_admin = repo_root.join(".git").join("worktrees").join("stale");
+        std::fs::create_dir_all(&wt_admin).unwrap();
+        std::fs::write(
+            wt_admin.join("gitdir"),
+            "/definitely/does/not/exist/.git",
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::default().with_worktrees(&repo_root);
+        // Stale entry should not appear in roots.
+        assert!(
+            config.roots.is_empty(),
+            "Stale worktree must be skipped"
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ use rust_mcp_sdk::ToMcpServerHandler;
 
 use repo_native_alignment::server::RnaHandler;
 use repo_native_alignment::setup::{self, SetupArgs};
+use repo_native_alignment::smoke::{self, TestArgs};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -42,6 +43,10 @@ struct Cli {
 enum Commands {
     /// Bootstrap RNA + OH MCP setup for a project
     Setup(SetupArgs),
+    /// Run the full pipeline smoke test (scan → extract → embed → index → query).
+    ///
+    /// Exits 0 on pass, 1 on any failure. Runnable in CI with no extra dependencies.
+    Test(TestArgs),
 }
 
 fn server_details() -> InitializeResult {
@@ -73,9 +78,14 @@ fn server_details() -> InitializeResult {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // ── setup subcommand (sync, no tokio needed beyond the runtime) ──────────
-    if let Some(Commands::Setup(args)) = cli.command {
-        return setup::run(&args);
+    // ── subcommands ──────────────────────────────────────────────────────────
+    match cli.command {
+        Some(Commands::Setup(args)) => return setup::run(&args),
+        Some(Commands::Test(args)) => {
+            let passed = smoke::run(&args).await?;
+            std::process::exit(if passed { 0 } else { 1 });
+        }
+        None => {}
     }
 
     // ── server mode (default when no subcommand given) ───────────────────────

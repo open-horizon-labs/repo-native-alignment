@@ -9,6 +9,7 @@ pub mod query;
 pub mod roots;
 pub mod scanner;
 pub mod server;
+pub mod smoke;
 pub mod types;
 pub mod walk;
 
