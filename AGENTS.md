@@ -47,6 +47,12 @@ This project IS the RNA MCP server. When working here, use its own tools.
 | Recording learnings/signals | `oh_record(type, slug, ...)` |
 | Searching git history | `git_history(query)` or `git_history(file)` |
 
+**If RNA returns empty results — diagnose before falling back:**
+- Empty `search_symbols` means the symbol isn't indexed OR the query is wrong — try a broader query, different `kind`, or no filters first
+- Empty `oh_search_context` means the index hasn't built yet OR the query is too specific — try simpler terms
+- Do NOT silently fall back to Grep/Read on empty RNA results — that defeats the purpose
+- If the index is genuinely stale, say so explicitly rather than substituting file reads
+
 **9 Tools (consolidated from 20+):**
 1. `oh_get_context` -- read all business context (outcomes, signals, guardrails, metis)
 2. `oh_search_context` -- semantic search (.oh/ artifacts, optionally code + markdown)

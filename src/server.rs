@@ -123,7 +123,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search_symbols",
-    description = "Use this INSTEAD OF Grep/Read for finding code symbols. Searches functions, structs, traits, classes, interfaces across Rust, Python, TypeScript, Go, Markdown. Returns file location, line numbers, signatures, and graph edges. Faster and richer than grep."
+    description = "Use this INSTEAD OF Grep/Read for finding code symbols. Searches functions, structs, traits, classes, interfaces, and constants across Rust, Python, TypeScript, Go, and 18 more languages. Returns file location, line numbers, signatures, values, and graph edges. Faster and richer than grep. Use synthetic=false to find declared constants only (e.g. MAX_RETRIES across all languages); synthetic=true for inferred literals like \"application/json\"."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SearchSymbols {
@@ -910,7 +910,7 @@ pub(crate) async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<Gr
         }
     };
 
-    Ok(GraphState { nodes, edges, index, embed_index })
+    Ok(GraphState { nodes, edges, index, embed_index, last_scan_completed_at: None })
 }
 
 /// Parse a NodeId from its stable_id string (format: "root:file:name:kind").
@@ -991,6 +991,9 @@ pub struct GraphState {
     pub edges: Vec<Edge>,
     pub index: GraphIndex,
     pub embed_index: Option<EmbeddingIndex>,
+    /// Timestamp of the last completed scan (full or incremental).
+    /// `None` until the first scan finishes.
+    pub last_scan_completed_at: Option<std::time::Instant>,
 }
 
 // ── ServerHandler ───────────────────────────────────────────────────
@@ -1572,6 +1575,7 @@ impl RnaHandler {
             edges: all_edges,
             index,
             embed_index,
+            last_scan_completed_at: Some(std::time::Instant::now()),
         })
     }
 
@@ -1788,12 +1792,37 @@ impl RnaHandler {
             tracing::warn!("Failed to persist updated graph: {}", e);
         }
 
+        graph.last_scan_completed_at = Some(std::time::Instant::now());
+
         Ok(())
     }
 }
 
 fn text_result(s: String) -> CallToolResult {
     CallToolResult::text_content(vec![TextContent::new(s, None, None)])
+}
+
+/// Format an index freshness footer for appending to tool responses.
+///
+/// Example output: `\n*Index: 3655 symbols · last scan 4m ago · schema v2*`
+fn format_freshness(node_count: usize, last_scan: Option<std::time::Instant>) -> String {
+    let age = match last_scan {
+        None => "never".to_string(),
+        Some(t) => {
+            let secs = t.elapsed().as_secs();
+            if secs < 60 {
+                "just now".to_string()
+            } else if secs < 3600 {
+                format!("{}m ago", secs / 60)
+            } else {
+                format!("{}h ago", secs / 3600)
+            }
+        }
+    };
+    format!(
+        "\n*Index: {} symbols · last scan {} · schema v{}*",
+        node_count, age, SCHEMA_VERSION
+    )
 }
 
 /// Build a concise business context preamble from .oh/ artifacts.
@@ -1936,7 +1965,16 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
 
                 // Ensure graph is built first so symbols are embedded
                 // (get_graph builds the graph + embeds symbols in the pipeline)
-                let _ = self.get_graph().await;
+                let (graph_node_count, graph_last_scan) = match self.get_graph().await {
+                    Ok(guard) => {
+                        if let Some(gs) = guard.as_ref() {
+                            (gs.nodes.len(), gs.last_scan_completed_at)
+                        } else {
+                            (0, None)
+                        }
+                    }
+                    Err(_) => (0, None),
+                };
 
                 let mut sections: Vec<String> = Vec::new();
 
@@ -2012,16 +2050,18 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                     }
                 }
 
+                let freshness = format_freshness(graph_node_count, graph_last_scan);
                 if sections.is_empty() {
                     Ok(text_result(format!(
-                        "No results found matching \"{}\".",
-                        args.query
+                        "No results found matching \"{}\".{}",
+                        args.query, freshness
                     )))
                 } else {
                     Ok(text_result(format!(
-                        "## Semantic search: \"{}\"\n\n{}",
+                        "## Semantic search: \"{}\"\n\n{}{}",
                         args.query,
-                        sections.join("\n\n")
+                        sections.join("\n\n"),
+                        freshness
                     )))
                 }
             }
@@ -2212,10 +2252,14 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
 
                         matches.truncate(limit);
 
+                        let freshness = format_freshness(
+                            graph_state.nodes.len(),
+                            graph_state.last_scan_completed_at,
+                        );
                         if matches.is_empty() {
                             Ok(text_result(format!(
-                                "No symbols matching \"{}\".",
-                                args.query
+                                "No symbols matching \"{}\".{}",
+                                args.query, freshness
                             )))
                         } else {
                             let md: String = matches
@@ -2260,10 +2304,11 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                 .collect::<Vec<_>>()
                                 .join("\n\n");
                             Ok(text_result(format!(
-                                "## Symbol search: \"{}\"\n\n{} result(s)\n\n{}",
+                                "## Symbol search: \"{}\"\n\n{} result(s)\n\n{}{}",
                                 args.query,
                                 matches.len(),
-                                md
+                                md,
+                                freshness
                             )))
                         }
                     }

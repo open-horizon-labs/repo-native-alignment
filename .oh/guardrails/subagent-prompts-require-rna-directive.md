@@ -1,7 +1,7 @@
 ---
 id: subagent-prompts-require-rna-directive
 outcome: agent-alignment
-severity: candidate
+severity: soft
 statement: Every sub-agent prompt that performs code exploration must include an explicit "Tool usage requirements" block mandating oh_search_context before file reads, search_symbols for navigation, and LSP for type lookups. Grep/Read are last resort.
 ---
 
