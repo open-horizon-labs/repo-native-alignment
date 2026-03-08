@@ -18,7 +18,7 @@ use crate::embed::EmbeddingIndex;
 use crate::extract::{ExtractorRegistry, EnricherRegistry};
 use crate::graph::{self, EdgeKind, Node, Edge, Confidence, ExtractionSource, NodeId, NodeKind};
 use crate::graph::index::GraphIndex;
-use crate::graph::store::{symbols_schema, edges_schema};
+use crate::graph::store::{symbols_schema, edges_schema, schema_meta_schema, SCHEMA_VERSION};
 use crate::roots::{WorkspaceConfig, cache_state_path};
 use crate::scanner::Scanner;
 use crate::types::OhArtifactKind;
@@ -189,6 +189,80 @@ pub(crate) fn graph_lance_path(repo_root: &Path) -> PathBuf {
     repo_root.join(".oh").join(".cache").join("lance")
 }
 
+/// Check the stored schema version and migrate (drop + recreate meta) if it mismatches.
+///
+/// Returns `true` if tables were dropped and the meta table was rewritten (migration occurred),
+/// `false` if the stored version already matches `SCHEMA_VERSION` (no-op).
+///
+/// Downstream callers (`build_full_graph`, `persist_graph_to_lance`) use this to ensure
+/// stale LanceDB tables are discarded before any read or write.
+pub(crate) async fn check_and_migrate_schema(db_path: &Path) -> anyhow::Result<bool> {
+    use arrow_array::{RecordBatch, RecordBatchIterator, StringArray};
+    use futures::TryStreamExt;
+    use lancedb::query::ExecutableQuery;
+    use std::sync::Arc;
+
+    std::fs::create_dir_all(db_path)?;
+
+    let db = lancedb::connect(db_path.to_str().unwrap_or_default())
+        .execute()
+        .await
+        .context("check_and_migrate_schema: failed to connect to LanceDB")?;
+
+    // Try to read the stored version from _schema_meta.
+    let stored_version: Option<u32> = async {
+        let tbl = db.open_table("_schema_meta").execute().await.ok()?;
+        let batches: Vec<_> = tbl
+            .query()
+            .execute()
+            .await
+            .ok()?
+            .try_collect()
+            .await
+            .ok()?;
+        for batch in &batches {
+            let keys = batch.column_by_name("key")?.as_any().downcast_ref::<StringArray>()?;
+            let values = batch.column_by_name("value")?.as_any().downcast_ref::<StringArray>()?;
+            for i in 0..batch.num_rows() {
+                if keys.value(i) == "schema_version" {
+                    return values.value(i).parse::<u32>().ok();
+                }
+            }
+        }
+        None
+    }
+    .await;
+
+    // If version matches, nothing to do.
+    if stored_version == Some(SCHEMA_VERSION) {
+        return Ok(false);
+    }
+
+    // Version mismatch (or missing table) — drop all tables and write new meta.
+    tracing::info!(
+        "Schema version mismatch (stored={:?}, current={}) — dropping all LanceDB tables",
+        stored_version,
+        SCHEMA_VERSION
+    );
+
+    for table_name in &["symbols", "edges", "pr_merges", "file_index", "_schema_meta"] {
+        let _ = db.drop_table(table_name, &[]).await;
+    }
+
+    // Write new _schema_meta with the current version.
+    let schema = Arc::new(schema_meta_schema());
+    let keys = StringArray::from(vec!["schema_version"]);
+    let values = StringArray::from(vec![SCHEMA_VERSION.to_string()]);
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(keys), Arc::new(values)])?;
+    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    db.create_table("_schema_meta", Box::new(batches))
+        .execute()
+        .await
+        .context("check_and_migrate_schema: failed to create _schema_meta table")?;
+
+    Ok(true)
+}
+
 /// Parse a NodeKind from its string representation.
 fn parse_node_kind(s: &str) -> NodeKind {
     match s {
@@ -306,6 +380,11 @@ pub(crate) async fn persist_graph_to_lance(
 ) -> anyhow::Result<()> {
     let db_path = graph_lance_path(repo_root);
     std::fs::create_dir_all(&db_path)?;
+
+    // Safety net: ensure schema is current before any writes.
+    if check_and_migrate_schema(&db_path).await? {
+        tracing::info!("Schema migrated to v{} — cache rebuilt", SCHEMA_VERSION);
+    }
 
     let db = lancedb::connect(db_path.to_str().unwrap())
         .execute()
@@ -1249,6 +1328,12 @@ impl RnaHandler {
 
     /// Build the full graph from scratch. This is the original get_graph logic.
     async fn build_full_graph(&self) -> anyhow::Result<GraphState> {
+        // Pre-flight: ensure schema version matches before any LanceDB reads/writes.
+        let db_path = graph_lance_path(&self.repo_root);
+        if check_and_migrate_schema(&db_path).await? {
+            tracing::info!("Schema migrated to v{} — cache rebuilt", SCHEMA_VERSION);
+        }
+
         // Load workspace config and merge with --repo as primary root.
         // Also auto-detect any live git worktrees so all roots are indexed
         // on the first full build (mirrors the background scanner path).

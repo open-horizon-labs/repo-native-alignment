@@ -10,6 +10,16 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use crate::git;
 use crate::oh;
 
+/// Truncate `s` to at most `max_chars` Unicode scalar values, returning a
+/// valid UTF-8 slice. Safe even when a multibyte character straddles the
+/// byte boundary (the original panic trigger).
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
 fn new_model() -> Result<TextEmbedding> {
     TextEmbedding::try_new(
         InitOptions::new(EmbeddingModel::BGESmallENV15)
@@ -125,11 +135,7 @@ impl EmbeddingIndex {
             text.push(' ');
             text.push_str(&node.signature);
             text.push(' ');
-            let body_snippet = if node.body.len() > 500 {
-                &node.body[..500]
-            } else {
-                &node.body
-            };
+            let body_snippet = truncate_chars(&node.body, 500);
             text.push_str(body_snippet);
             // Include LSP-enriched metadata so type-level queries find these nodes.
             for (key, value) in &node.metadata {
@@ -285,11 +291,7 @@ impl EmbeddingIndex {
             text.push(' ');
             // Include doc comments / body for semantic matching
             // Truncate body to avoid huge embeddings
-            let body_snippet = if node.body.len() > 500 {
-                &node.body[..500]
-            } else {
-                &node.body
-            };
+            let body_snippet = truncate_chars(&node.body, 500);
             text.push_str(body_snippet);
             // Include LSP-enriched metadata (type info, hover docs, resolved types)
             // so that semantic search can find nodes by type-level concepts.
@@ -467,5 +469,45 @@ impl EmbeddingIndex {
         }
 
         Ok(search_results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_chars;
+
+    #[test]
+    fn test_truncate_chars_ascii() {
+        let s = "a".repeat(600);
+        assert_eq!(truncate_chars(&s, 500).len(), 500);
+    }
+
+    #[test]
+    fn test_truncate_chars_multibyte_boundary() {
+        // Regression test for: byte index 500 is not a char boundary.
+        // Construct a string where byte 500 falls inside a 3-byte char ('—').
+        // 498 ASCII chars + '—' (bytes 498..501) + more chars.
+        // Old code: &s[..500] panics — byte 500 is inside '—'.
+        // New code: truncate_chars(&s, 500) returns exactly 500 chars (499 'a's + '—').
+        let mut s = "a".repeat(498);
+        s.push('—'); // char 498, bytes 498..501
+        s.push_str(&"b".repeat(100));
+        let result = truncate_chars(&s, 500);
+        // Must be valid UTF-8
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+        // Must be exactly 500 chars (498 'a's + '—' + 1 'b')
+        assert_eq!(result.chars().count(), 500);
+    }
+
+    #[test]
+    fn test_truncate_chars_short_string() {
+        let s = "hello";
+        assert_eq!(truncate_chars(s, 500), "hello");
+    }
+
+    #[test]
+    fn test_truncate_chars_exact_boundary() {
+        let s = "a".repeat(500);
+        assert_eq!(truncate_chars(&s, 500), s.as_str());
     }
 }
