@@ -125,11 +125,8 @@ impl EmbeddingIndex {
             text.push(' ');
             text.push_str(&node.signature);
             text.push(' ');
-            let body_snippet = if node.body.len() > 500 {
-                &node.body[..500]
-            } else {
-                &node.body
-            };
+            let body_end = node.body.char_indices().nth(500).map(|(i, _)| i).unwrap_or(node.body.len());
+            let body_snippet = &node.body[..body_end];
             text.push_str(body_snippet);
             // Include LSP-enriched metadata so type-level queries find these nodes.
             for (key, value) in &node.metadata {
@@ -285,11 +282,8 @@ impl EmbeddingIndex {
             text.push(' ');
             // Include doc comments / body for semantic matching
             // Truncate body to avoid huge embeddings
-            let body_snippet = if node.body.len() > 500 {
-                &node.body[..500]
-            } else {
-                &node.body
-            };
+            let body_end = node.body.char_indices().nth(500).map(|(i, _)| i).unwrap_or(node.body.len());
+            let body_snippet = &node.body[..body_end];
             text.push_str(body_snippet);
             // Include LSP-enriched metadata (type info, hover docs, resolved types)
             // so that semantic search can find nodes by type-level concepts.
