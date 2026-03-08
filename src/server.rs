@@ -615,22 +615,25 @@ pub struct GraphState {
 
 pub struct RnaHandler {
     pub repo_root: PathBuf,
-    pub graph: RwLock<Option<GraphState>>,
+    pub graph: Arc<RwLock<Option<GraphState>>>,
     /// Whether business context has been injected into a tool response.
     pub context_injected: std::sync::atomic::AtomicBool,
     /// Cooldown: skip re-scanning if checked recently.
     pub last_scan: std::sync::Mutex<std::time::Instant>,
+    /// Whether background scanner has been spawned.
+    pub background_scanner_started: std::sync::atomic::AtomicBool,
 }
 
 impl Default for RnaHandler {
     fn default() -> Self {
         Self {
             repo_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            graph: RwLock::new(None),
+            graph: Arc::new(RwLock::new(None)),
             context_injected: std::sync::atomic::AtomicBool::new(false),
             last_scan: std::sync::Mutex::new(
                 std::time::Instant::now() - std::time::Duration::from_secs(10),
             ),
+            background_scanner_started: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -684,6 +687,55 @@ impl RnaHandler {
 
         // Update cooldown timestamp
         *self.last_scan.lock().unwrap() = std::time::Instant::now();
+
+        // Start background scanner (once) to keep index warm
+        if !self.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let graph = Arc::clone(&self.graph);
+            let repo_root = self.repo_root.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(900)).await; // 15 min
+                    let mut scanner = match Scanner::new(repo_root.clone()) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let scan = match scanner.scan() {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    if scan.changed_files.is_empty() && scan.new_files.is_empty() && scan.deleted_files.is_empty() {
+                        continue;
+                    }
+                    tracing::info!(
+                        "Background scan: {} changed, {} new, {} deleted",
+                        scan.changed_files.len(), scan.new_files.len(), scan.deleted_files.len()
+                    );
+                    let mut guard = graph.write().await;
+                    if let Some(ref mut graph_state) = *guard {
+                        let registry = ExtractorRegistry::with_builtins();
+                        // Remove stale nodes/edges
+                        let files_to_remove: Vec<PathBuf> = scan.deleted_files.iter()
+                            .chain(scan.changed_files.iter())
+                            .cloned()
+                            .collect();
+                        graph_state.nodes.retain(|n| !files_to_remove.iter().any(|f| n.id.file == *f));
+                        graph_state.edges.retain(|e| !files_to_remove.iter().any(|f| e.from.file == *f || e.to.file == *f));
+                        // Re-extract
+                        let extraction = registry.extract_scan_result(&repo_root, &scan);
+                        graph_state.nodes.extend(extraction.nodes);
+                        graph_state.edges.extend(extraction.edges);
+                        // Rebuild petgraph
+                        graph_state.index = GraphIndex::new();
+                        graph_state.index.rebuild_from_edges(&graph_state.edges);
+                        for node in &graph_state.nodes {
+                            graph_state.index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+                        }
+                        tracing::info!("Background update: {} nodes, {} edges", graph_state.nodes.len(), graph_state.edges.len());
+                    }
+                }
+            });
+            tracing::info!("Background scanner started (15min interval)");
+        }
 
         // Downgrade to read lock
         Ok(self.graph.read().await)
