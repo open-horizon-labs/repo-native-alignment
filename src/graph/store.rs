@@ -11,7 +11,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// Schema version — bump when any LanceDB table schema changes.
 /// Used in the index freshness footer appended to `search_symbols` and
 /// `oh_search_context` responses so agents can detect stale binaries.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -89,7 +89,8 @@ pub fn edges_schema() -> Schema {
         Field::new("target_id", DataType::Utf8, false),
         Field::new("target_type", DataType::Utf8, false),
         Field::new("edge_type", DataType::Utf8, false),
-        Field::new("properties_json", DataType::Utf8, true),
+        Field::new("edge_source", DataType::Utf8, false),
+        Field::new("edge_confidence", DataType::Utf8, false),
         Field::new("root_id", DataType::Utf8, false),
         Field::new("updated_at", DataType::Int64, false),
     ])
@@ -178,7 +179,8 @@ mod tests {
         assert!(schema.field_with_name("target_id").is_ok());
         assert!(schema.field_with_name("target_type").is_ok());
         assert!(schema.field_with_name("edge_type").is_ok());
-        assert!(schema.field_with_name("properties_json").is_ok());
+        assert!(schema.field_with_name("edge_source").is_ok());
+        assert!(schema.field_with_name("edge_confidence").is_ok());
         assert!(schema.field_with_name("root_id").is_ok());
         assert!(schema.field_with_name("updated_at").is_ok());
     }
