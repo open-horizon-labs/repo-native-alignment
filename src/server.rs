@@ -1139,6 +1139,58 @@ impl RnaHandler {
                 .ensure_node(&node.stable_id(), &node.id.kind.to_string());
         }
 
+        // Run LSP enrichers on the updated nodes (same as cold-start, but scoped to changed files)
+        let changed_files: std::collections::HashSet<_> = scan
+            .changed_files
+            .iter()
+            .chain(scan.new_files.iter())
+            .collect();
+        let changed_nodes: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|n| changed_files.iter().any(|f| n.id.file == **f))
+            .cloned()
+            .collect();
+
+        if !changed_nodes.is_empty() {
+            let languages: Vec<String> = changed_nodes
+                .iter()
+                .map(|n| n.language.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            let enricher_registry = EnricherRegistry::with_builtins();
+            let enrichment = enricher_registry
+                .enrich_all(&changed_nodes, &graph.index, &languages)
+                .await;
+
+            if !enrichment.added_edges.is_empty() {
+                tracing::info!(
+                    "Incremental LSP enrichment added {} edges",
+                    enrichment.added_edges.len()
+                );
+                for edge in &enrichment.added_edges {
+                    graph.index.add_edge(
+                        &edge.from.to_stable_id(),
+                        &edge.from.kind.to_string(),
+                        &edge.to.to_stable_id(),
+                        &edge.to.kind.to_string(),
+                        edge.kind.clone(),
+                    );
+                }
+                graph.edges.extend(enrichment.added_edges);
+            }
+
+            for (node_id, patches) in &enrichment.updated_nodes {
+                if let Some(node) = graph.nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
+                    for (key, value) in patches {
+                        node.metadata.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+
         // Re-embed changed symbols (rebuild entire embed index for now --
         // true incremental embedding is a future optimization)
         if let Some(ref embed_idx) = graph.embed_index {
