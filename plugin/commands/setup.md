@@ -78,7 +78,7 @@ If AGENTS.md exists in the project root, check if it already contains `<!-- RNA 
 <!-- end RNA MCP tool guidance -->
 ```
 
-If AGENTS.md doesn't exist, skip this step — `/teach-oh` will create it later.
+If AGENTS.md doesn't exist, offer to create it with the tool guidance block as the initial content. Ask: "No AGENTS.md found. Create one with RNA tool guidance?" If accepted, write the block above as the file content.
 
 ## Step 5: Inform the user
 
