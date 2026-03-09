@@ -364,6 +364,13 @@ pub struct Foo {
     pub bar: u32,
     baz: String,
 }
+
+impl Foo {
+    pub fn do_thing(&self) -> u32 {
+        self.bar
+    }
+}
+
 pub fn hello() {}
 "#;
         let result = ext.extract(Path::new("test.rs"), code).unwrap();
@@ -371,5 +378,36 @@ pub fn hello() {}
         assert!(kinds.contains(&&NodeKind::Struct), "Should find Foo struct");
         assert!(kinds.contains(&&NodeKind::Function), "Should find hello fn");
         assert!(kinds.contains(&&NodeKind::Field), "Should find bar field: {:?}", kinds);
+
+        // Assert structural edges are emitted — prevents silent regression
+        // if the edge emission block is removed.
+        let has_field_edges: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::HasField)
+            .collect();
+        assert!(
+            !has_field_edges.is_empty(),
+            "Should emit HasField edges for struct fields, got edges: {:?}",
+            result.edges.iter().map(|e| format!("{:?}", e.kind)).collect::<Vec<_>>()
+        );
+        // Verify a HasField edge connects Foo -> bar
+        assert!(
+            has_field_edges.iter().any(|e| e.from.name == "Foo" && e.to.name == "bar"
+                && e.from.kind == NodeKind::Struct && e.to.kind == NodeKind::Field),
+            "Should have HasField edge from Foo struct to bar field"
+        );
+
+        let defines_edges: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Defines)
+            .collect();
+        assert!(
+            !defines_edges.is_empty(),
+            "Should emit Defines edges for impl methods, got edges: {:?}",
+            result.edges.iter().map(|e| format!("{:?}", e.kind)).collect::<Vec<_>>()
+        );
+        // Verify a Defines edge connects Foo (impl) -> do_thing
+        assert!(
+            defines_edges.iter().any(|e| e.to.name == "do_thing" && e.to.kind == NodeKind::Function),
+            "Should have Defines edge to do_thing method"
+        );
     }
 }
