@@ -25,9 +25,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -44,15 +41,9 @@ jobs:
 
       - name: Run all tests
         run: cargo test --no-default-features
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
 
       - name: Build release binary
         run: cargo build --release --no-default-features
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
 
       - name: RNA pipeline smoke test (rna test)
         run: ./target/release/repo-native-alignment test --repo .
