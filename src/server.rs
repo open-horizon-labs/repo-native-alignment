@@ -2226,7 +2226,12 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             "outcome_progress" => {
                 let args: OutcomeProgress = parse_args(params.arguments)?;
                 let full = args.detail_level.as_deref() == Some("full");
-                match query::outcome_progress(root, &args.outcome_id) {
+                let graph_nodes = if let Ok(guard) = self.get_graph().await {
+                    guard.as_ref().map(|gs| gs.nodes.clone()).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                match query::outcome_progress(root, &args.outcome_id, &graph_nodes) {
                     Ok(result) => {
                         let mut md = if full {
                             result.to_markdown()

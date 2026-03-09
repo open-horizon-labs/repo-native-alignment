@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+
 /// Parsed .oh/ artifact (outcome, signal, guardrail, or metis)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OhArtifact {
@@ -129,6 +131,42 @@ impl std::fmt::Display for SymbolKind {
     }
 }
 
+impl From<SymbolKind> for NodeKind {
+    fn from(sk: SymbolKind) -> Self {
+        match sk {
+            SymbolKind::Function => NodeKind::Function,
+            SymbolKind::Struct => NodeKind::Struct,
+            SymbolKind::Trait => NodeKind::Trait,
+            SymbolKind::Impl => NodeKind::Impl,
+            SymbolKind::Enum => NodeKind::Enum,
+            SymbolKind::Const => NodeKind::Const,
+            SymbolKind::Module => NodeKind::Module,
+            SymbolKind::Import => NodeKind::Import,
+            SymbolKind::Other(s) => NodeKind::Other(s),
+        }
+    }
+}
+
+impl From<CodeSymbol> for Node {
+    fn from(sym: CodeSymbol) -> Self {
+        Node {
+            id: NodeId {
+                root: sym.root,
+                file: sym.file_path,
+                name: sym.name,
+                kind: sym.kind.into(),
+            },
+            language: String::from("rust"),
+            line_start: sym.line_start,
+            line_end: sym.line_end,
+            signature: sym.signature,
+            body: sym.body,
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        }
+    }
+}
+
 impl CodeSymbol {
     pub fn to_markdown(&self) -> String {
         let value_part = match (&self.kind, &self.value) {
@@ -180,7 +218,7 @@ pub struct QueryResult {
     pub query: String,
     pub outcomes: Vec<OhArtifact>,
     pub markdown_chunks: Vec<MarkdownChunk>,
-    pub code_symbols: Vec<CodeSymbol>,
+    pub code_symbols: Vec<Node>,
     pub commits: Vec<GitCommitInfo>,
 }
 
@@ -207,9 +245,14 @@ impl QueryResult {
 
         if !self.code_symbols.is_empty() {
             out.push_str("## Matching Code Symbols\n\n");
-            for s in &self.code_symbols {
-                out.push_str(&s.to_markdown());
-                out.push('\n');
+            for node in &self.code_symbols {
+                out.push_str(&format!(
+                    "- `{}:{}` **{}** `{}`\n",
+                    node.id.file.display(),
+                    node.line_start,
+                    node.id.kind,
+                    node.signature,
+                ));
             }
             out.push('\n');
         }
@@ -310,13 +353,13 @@ impl QueryResult {
             use std::collections::BTreeMap;
             let mut kind_counts: BTreeMap<String, usize> = BTreeMap::new();
             // Group symbols by file, preserving order within each file
-            let mut file_symbols: BTreeMap<String, Vec<&CodeSymbol>> = BTreeMap::new();
-            for s in &self.code_symbols {
-                *kind_counts.entry(s.kind.to_string()).or_insert(0) += 1;
+            let mut file_symbols: BTreeMap<String, Vec<&Node>> = BTreeMap::new();
+            for node in &self.code_symbols {
+                *kind_counts.entry(node.id.kind.to_string()).or_insert(0) += 1;
                 file_symbols
-                    .entry(s.file_path.display().to_string())
+                    .entry(node.id.file.display().to_string())
                     .or_default()
-                    .push(s);
+                    .push(node);
             }
 
             out.push_str("## Code Symbols\n\n");
@@ -333,23 +376,17 @@ impl QueryResult {
             ));
 
             // Top 5 files by symbol count, with up to 3 key symbols each
-            let mut files_sorted: Vec<(&String, &Vec<&CodeSymbol>)> =
+            let mut files_sorted: Vec<(&String, &Vec<&Node>)> =
                 file_symbols.iter().collect();
             files_sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
             for (file, symbols) in files_sorted.iter().take(5) {
                 out.push_str(&format!("### {} ({} symbols)\n", file, symbols.len()));
-                for sym in symbols.iter().take(3) {
-                    let stable_id = format!(
-                        "{}:{}:{}:{}",
-                        sym.root,
-                        sym.file_path.display(),
-                        sym.name,
-                        sym.kind
-                    );
+                for node in symbols.iter().take(3) {
+                    let stable_id = node.stable_id();
                     out.push_str(&format!(
                         "- `{}` ({}) -- ID: `{}`\n",
-                        sym.name, sym.kind, stable_id
+                        node.id.name, node.id.kind, stable_id
                     ));
                 }
                 if symbols.len() > 3 {

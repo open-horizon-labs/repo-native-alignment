@@ -40,9 +40,10 @@ pub fn query_all(repo_root: &Path, query: &str) -> Result<QueryResult> {
         tracing::warn!("Failed to extract code symbols: {}", e);
         Vec::new()
     });
-    let code_symbols = code::search_symbols(&all_symbols, query)
+    let code_symbols: Vec<Node> = code::search_symbols(&all_symbols, query)
         .into_iter()
         .cloned()
+        .map(Node::from)
         .collect();
 
     // Search git commits by message
@@ -72,10 +73,14 @@ pub fn get_full_context(repo_root: &Path) -> Result<QueryResult> {
         Vec::new()
     });
     let slug = path_to_slug(repo_root);
-    let code_symbols = code::extract_symbols(repo_root, &slug).unwrap_or_else(|e| {
-        tracing::warn!("Failed to extract code symbols: {}", e);
-        Vec::new()
-    });
+    let code_symbols: Vec<Node> = code::extract_symbols(repo_root, &slug)
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to extract code symbols: {}", e);
+            Vec::new()
+        })
+        .into_iter()
+        .map(Node::from)
+        .collect();
     let commits = git::load_commits(repo_root, 50).unwrap_or_else(|e| {
         tracing::warn!("Failed to load git commits: {}", e);
         Vec::new()
@@ -99,7 +104,7 @@ pub fn get_full_context(repo_root: &Path) -> Result<QueryResult> {
 /// 4. Deduplicate commits
 /// 5. For changed files in those commits, find code symbols defined there
 /// 6. Find markdown sections mentioning the outcome ID
-pub fn outcome_progress(repo_root: &Path, outcome_id: &str) -> Result<QueryResult> {
+pub fn outcome_progress(repo_root: &Path, outcome_id: &str, graph_nodes: &[Node]) -> Result<QueryResult> {
     // 1. Find the outcome
     let all_artifacts = oh::load_oh_artifacts(repo_root)?;
     let outcome = all_artifacts
@@ -144,26 +149,22 @@ pub fn outcome_progress(repo_root: &Path, outcome_id: &str) -> Result<QueryResul
         }
     }
 
-    // 5. Collect changed files from all commits, find symbols in those files.
-    //    We always extract symbols — summary mode needs stable IDs for navigable references.
-    let code_symbols = {
+    // 5. Collect changed files from all commits, find symbols in those files
+    //    from the pre-built graph nodes (all 22 languages, real stable_id()).
+    let code_symbols: Vec<Node> = {
         let changed_files: HashSet<PathBuf> = commits
             .iter()
             .flat_map(|c| c.changed_files.iter().cloned())
             .collect();
 
-        let slug = path_to_slug(repo_root);
-        let all_symbols = code::extract_symbols(repo_root, &slug).unwrap_or_default();
-        all_symbols
-            .into_iter()
-            .filter(|sym| {
-                // Match if symbol's file is in the changed files set
-                let sym_rel = sym.file_path.strip_prefix(repo_root)
-                    .unwrap_or(&sym.file_path);
-                changed_files.contains(sym_rel)
+        graph_nodes
+            .iter()
+            .filter(|node| {
+                let node_rel = node.id.file.strip_prefix(repo_root).unwrap_or(&node.id.file);
+                changed_files.contains(node_rel)
             })
-            // Skip imports — they're noise in this context
-            .filter(|sym| sym.kind != crate::types::SymbolKind::Import)
+            .filter(|node| node.id.kind != NodeKind::Import)
+            .cloned()
             .collect()
     };
 
