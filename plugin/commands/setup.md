@@ -58,7 +58,29 @@ claude mcp add rna-mcp --scope project -- repo-native-alignment --repo .
 
 This adds rna-mcp to the project's `.mcp.json` so it activates when working in this repo.
 
-## Step 4: Inform the user
+## Step 4: Update AGENTS.md with tool guidance
+
+If AGENTS.md exists in the project root, check if it already contains `<!-- RNA MCP tool guidance -->`. If not, append this block:
+
+```markdown
+<!-- RNA MCP tool guidance -->
+## Code Exploration (use RNA MCP tools, not grep/Read)
+
+| Instead of... | Use this MCP tool |
+|---|---|
+| `Grep` for symbol names | `search_symbols(query, kind, language, file)` |
+| `Read` to trace function calls | `graph_query(node_id, mode: "neighbors")` |
+| `Grep` for "who calls X" | `graph_query(node_id, mode: "impact")` |
+| `Read` to find .oh/ artifacts | `oh_search_context(query)` |
+| `Bash` with `grep -rn` | `search_symbols` or `oh_search_context` |
+| Recording learnings/signals | Write to `.oh/metis/`, `.oh/signals/`, `.oh/guardrails/` (YAML frontmatter + markdown) |
+| Searching git history | `oh_search_context(query)` — returns hash; use `git show <hash>` via Bash for diffs |
+<!-- end RNA MCP tool guidance -->
+```
+
+If AGENTS.md doesn't exist, skip this step — `/teach-oh` will create it later.
+
+## Step 5: Inform the user
 
 Tell the user:
 1. Setup is complete
