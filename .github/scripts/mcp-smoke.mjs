@@ -155,9 +155,14 @@ try {
   // ── 7. negative test: unknown tool ──────────────────────────────────────
   console.log("\n── unknown tool (negative test) ──");
   try {
-    await client.callTool({ name: "nonexistent_tool_rna_smoke", arguments: {} });
-    fail("unknown tool returns error", "Expected an error but got success");
+    const unknownResult = await client.callTool({ name: "nonexistent_tool_rna_smoke", arguments: {} });
+    if (unknownResult.isError) {
+      pass("unknown tool returns error response");
+    } else {
+      fail("unknown tool returns error", "Expected isError=true but got success");
+    }
   } catch (err) {
+    // SDK threw — also acceptable
     pass("unknown tool returns an error (not a hang)");
   }
 
