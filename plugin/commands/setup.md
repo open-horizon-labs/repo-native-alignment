@@ -25,20 +25,17 @@ mkdir -p ~/.cargo/bin
 
 **If macOS ARM M2+** (`Darwin` + `arm64` + brand_string contains "M2", "M3", or "M4"):
 ```bash
-curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64-fast -o ~/.cargo/bin/repo-native-alignment
-chmod +x ~/.cargo/bin/repo-native-alignment
+curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64-fast.tar.gz | tar xz -C ~/.cargo/bin
 ```
 
-**If macOS ARM (M1/M2/M3)** (`Darwin` + `arm64`):
+**If macOS ARM (M1)** (`Darwin` + `arm64`):
 ```bash
-curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64 -o ~/.cargo/bin/repo-native-alignment
-chmod +x ~/.cargo/bin/repo-native-alignment
+curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64.tar.gz | tar xz -C ~/.cargo/bin
 ```
 
 **If Linux x86_64** (`Linux` + `x86_64`):
 ```bash
-curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-linux-x86_64 -o ~/.cargo/bin/repo-native-alignment
-chmod +x ~/.cargo/bin/repo-native-alignment
+curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-linux-x86_64.tar.gz | tar xz -C ~/.cargo/bin
 ```
 
 **If neither:** Tell the user their platform is not yet supported. They can build from source:
