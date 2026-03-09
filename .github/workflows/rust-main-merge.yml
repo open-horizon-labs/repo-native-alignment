@@ -22,7 +22,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run setup tests
-        run: cargo test setup::tests
+        run: cargo test --no-default-features setup::tests
 
       - name: Lint — no language-specific conditionals in generic.rs
         run: |
@@ -32,10 +32,10 @@ jobs:
           fi
 
       - name: Run full unit + integration tests
-        run: cargo test
+        run: cargo test --no-default-features
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --no-default-features
 
       - name: RNA pipeline smoke test (rna test)
         run: ./target/release/repo-native-alignment test --repo .
