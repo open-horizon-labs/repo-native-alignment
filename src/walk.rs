@@ -76,10 +76,6 @@ fn walk_dir_basic(dir: &Path, extensions: &[&str], files: &mut Vec<PathBuf>) -> 
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        // Skip symlinks — they cause broken-link crashes and duplicate scanning
-        if entry.file_type()?.is_symlink() {
-            continue;
-        }
         if path.is_dir() {
             if name_str == ".git" || name_str == "target" || name_str == "node_modules" || name_str == "vendor" || name_str == ".build" || name_str == "dist" {
                 continue;
