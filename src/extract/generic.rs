@@ -224,6 +224,9 @@ fn collect_nodes(
             let import_edge = if node_kind == NodeKind::Import {
                 // Try to resolve the import to an actual file path for cross-file edges.
                 let target_file = resolve_import_path(path, &name, config.language_name);
+                if let Some(ref r) = target_file {
+                    tracing::debug!("import resolve: {} -> {}", name, r.display());
+                }
                 let (edge_file, target_name) = if let Some(ref resolved) = target_file {
                     // Use resolved file's stem as the module name
                     let stem = resolved.file_stem()
@@ -566,7 +569,10 @@ fn resolve_import_path(source_file: &Path, import_text: &str, language: &str) ->
             // Count leading dots for relative imports
             let dots = module_path.chars().take_while(|c| *c == '.').count();
             if dots == 0 {
-                return None; // absolute imports can't be resolved without sys.path
+                // Absolute import: `from src.util.user_utils import X`
+                // Convert dots to path separators and hope it's relative to repo root.
+                let rel = module_path.replace('.', "/");
+                return Some(std::path::PathBuf::from(format!("{}.py", rel)));
             }
             let rest = &module_path[dots..];
             let rel = rest.replace('.', "/");
@@ -576,9 +582,6 @@ fn resolve_import_path(source_file: &Path, import_text: &str, language: &str) ->
             for _ in 1..dots {
                 base = base.parent()?.to_path_buf();
             }
-            // Return the resolved relative path — don't check .exists() since
-            // path is relative to repo root, not CWD. The edge connects if the
-            // target file was scanned; otherwise it's a harmless dangling edge.
             Some(base.join(format!("{}.py", rel)))
         }
         "typescript" | "javascript" | "tsx" | "jsx" => {
