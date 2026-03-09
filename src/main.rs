@@ -47,6 +47,17 @@ enum Commands {
     ///
     /// Exits 0 on pass, 1 on any failure. Runnable in CI with no extra dependencies.
     Test(TestArgs),
+    /// Scan, extract, embed, and persist the full graph for a repo.
+    ///
+    /// Runs the same pipeline as MCP server startup but standalone, with timing output.
+    Scan(ScanArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct ScanArgs {
+    /// Repository root path to scan (default: current directory or --repo)
+    #[arg(long)]
+    path: Option<PathBuf>,
 }
 
 fn server_details() -> InitializeResult {
@@ -96,6 +107,26 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Running RNA pipeline smoke test for {}", args.repo.display());
             let passed = smoke::run(&args).await?;
             std::process::exit(if passed { 0 } else { 1 });
+        }
+        Some(Commands::Scan(args)) => {
+            init_tracing("info");
+            let repo_root = args.path.unwrap_or_else(|| cli.repo.clone()).canonicalize()?;
+            eprintln!("Scanning: {}", repo_root.display());
+            let t0 = std::time::Instant::now();
+            let handler = RnaHandler {
+                repo_root: repo_root.clone(),
+                ..Default::default()
+            };
+            let graph = handler.build_full_graph().await?;
+            let elapsed = t0.elapsed();
+            eprintln!();
+            eprintln!("── Scan complete ──────────────────────────");
+            eprintln!("  Symbols:    {}", graph.nodes.len());
+            eprintln!("  Edges:      {}", graph.edges.len());
+            eprintln!("  Embeddings: {}", if graph.embed_index.is_some() { "yes" } else { "no" });
+            eprintln!("  Time:       {:.2}s", elapsed.as_secs_f64());
+            eprintln!("───────────────────────────────────────────");
+            return Ok(());
         }
         None => {}
     }

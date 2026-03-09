@@ -499,6 +499,20 @@ pub(crate) async fn persist_graph_to_lance(
             .context("Failed to create edges table")?;
     }
 
+    // Create FTS index on symbols table for keyword search over all nodes
+    // (fields, imports, keys, consts that don't get vector embeddings)
+    if let Ok(symbols_table) = db.open_table("symbols").execute().await {
+        // LanceDB doesn't support composite FTS indices yet — index name only
+        match symbols_table
+            .create_index(&["name"], lancedb::index::Index::FTS(Default::default()))
+            .execute()
+            .await
+        {
+            Ok(_) => tracing::info!("Created FTS index on symbols.name"),
+            Err(e) => tracing::warn!("Failed to create FTS index: {}", e),
+        }
+    }
+
     tracing::info!(
         "Persisted graph to LanceDB: {} nodes, {} edges",
         nodes.len(),
@@ -1335,7 +1349,7 @@ impl RnaHandler {
     }
 
     /// Build the full graph from scratch. This is the original get_graph logic.
-    async fn build_full_graph(&self) -> anyhow::Result<GraphState> {
+    pub async fn build_full_graph(&self) -> anyhow::Result<GraphState> {
         // Pre-flight: ensure schema version matches before any LanceDB reads/writes.
         let db_path = graph_lance_path(&self.repo_root);
         if check_and_migrate_schema(&db_path).await? {
@@ -1470,59 +1484,6 @@ impl RnaHandler {
             index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
         }
 
-        // 6. Phase 2: Run enrichers (LSP) synchronously
-        let languages: Vec<String> = all_nodes
-            .iter()
-            .map(|n| n.language.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        let enricher_registry = EnricherRegistry::with_builtins();
-        let enrichment = enricher_registry
-            .enrich_all(&all_nodes, &index, &languages, &self.repo_root)
-            .await;
-
-        // Add virtual nodes synthesized for external symbols (e.g., tokio::spawn).
-        // These must be persisted in the symbols table but must NOT be embedded.
-        if !enrichment.new_nodes.is_empty() {
-            tracing::info!(
-                "Enrichment synthesized {} virtual external nodes",
-                enrichment.new_nodes.len()
-            );
-            for vnode in &enrichment.new_nodes {
-                index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
-            }
-            all_nodes.extend(enrichment.new_nodes);
-        }
-
-        if !enrichment.added_edges.is_empty() {
-            tracing::info!(
-                "Enrichment added {} edges",
-                enrichment.added_edges.len()
-            );
-            for edge in &enrichment.added_edges {
-                let from_id = edge.from.to_stable_id();
-                let to_id = edge.to.to_stable_id();
-                index.add_edge(
-                    &from_id,
-                    &edge.from.kind.to_string(),
-                    &to_id,
-                    &edge.to.kind.to_string(),
-                    edge.kind.clone(),
-                );
-            }
-            all_edges.extend(enrichment.added_edges);
-        }
-
-        for (node_id, patches) in &enrichment.updated_nodes {
-            if let Some(node) = all_nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
-                for (key, value) in patches {
-                    node.metadata.insert(key.clone(), value.clone());
-                }
-            }
-        }
-
         tracing::info!(
             "Graph built: {} nodes, {} edges across {} root(s)",
             all_nodes.len(),
@@ -1573,6 +1534,78 @@ impl RnaHandler {
                 None
             }
         };
+
+        // 9. LSP enrichment — runs AFTER persist+embed so agents can query immediately.
+        let languages: Vec<String> = all_nodes
+            .iter()
+            .map(|n| n.language.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let enricher_registry = EnricherRegistry::with_builtins();
+        let enrichment = enricher_registry
+            .enrich_all(&all_nodes, &index, &languages, &self.repo_root)
+            .await;
+
+        let enriched_node_ids: Vec<String> = enrichment.updated_nodes.iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        if !enrichment.new_nodes.is_empty() {
+            tracing::info!(
+                "Enrichment synthesized {} virtual external nodes",
+                enrichment.new_nodes.len()
+            );
+            for vnode in &enrichment.new_nodes {
+                index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
+            }
+            all_nodes.extend(enrichment.new_nodes);
+        }
+
+        if !enrichment.added_edges.is_empty() {
+            tracing::info!(
+                "Enrichment added {} edges",
+                enrichment.added_edges.len()
+            );
+            for edge in &enrichment.added_edges {
+                let from_id = edge.from.to_stable_id();
+                let to_id = edge.to.to_stable_id();
+                index.add_edge(
+                    &from_id,
+                    &edge.from.kind.to_string(),
+                    &to_id,
+                    &edge.to.kind.to_string(),
+                    edge.kind.clone(),
+                );
+            }
+            all_edges.extend(enrichment.added_edges);
+        }
+
+        for (node_id, patches) in &enrichment.updated_nodes {
+            if let Some(node) = all_nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
+                for (key, value) in patches {
+                    node.metadata.insert(key.clone(), value.clone());
+                }
+            }
+        }
+
+        // Persist LSP enrichment results incrementally + re-embed enriched nodes
+        if !enriched_node_ids.is_empty() {
+            let upsert_nodes: Vec<Node> = all_nodes.iter()
+                .filter(|n| enriched_node_ids.contains(&n.stable_id()))
+                .cloned()
+                .collect();
+            let _ = persist_graph_incremental(
+                &self.repo_root, &upsert_nodes, &[], &[], &[],
+            ).await;
+            if let Some(ref idx) = embed_index {
+                match idx.reindex_nodes(&upsert_nodes).await {
+                    Ok(count) if count > 0 => tracing::info!("Re-embedded {} LSP-enriched nodes", count),
+                    _ => {}
+                }
+            }
+        }
 
         Ok(GraphState {
             nodes: all_nodes,

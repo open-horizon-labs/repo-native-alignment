@@ -12,6 +12,10 @@ use crate::oh;
 
 const EMBEDDING_BATCH_SIZE: usize = 100;
 
+/// Number of recent commits to embed for temporal context.
+const RECENT_COMMIT_LIMIT: usize = 100;
+/// Number of PR merge commits to embed for structural context.
+const PR_MERGE_LIMIT: usize = 50;
 
 /// Truncate `s` to at most `max_chars` Unicode scalar values, returning a
 /// valid UTF-8 slice. Safe even when a multibyte character straddles the
@@ -333,8 +337,8 @@ impl EmbeddingIndex {
             texts.push(text);
         }
 
-        // Also index all git commits
-        let commit_count = match git::load_commits(repo_root, usize::MAX) {
+        // Index recent git commits (capped for performance)
+        let commit_count = match git::load_commits(repo_root, RECENT_COMMIT_LIMIT) {
             Ok(commits) => {
                 for c in &commits {
                     let changed_files_str = c
@@ -363,15 +367,43 @@ impl EmbeddingIndex {
                 0
             }
         };
+        // Index PR merge commits for structural context (what shipped)
+        let mut seen_merge_shas = std::collections::HashSet::new();
+        let merge_count = match git::pr_merges::extract_pr_merges(repo_root, Some(PR_MERGE_LIMIT)) {
+            Ok((merge_nodes, _edges)) => {
+                for node in &merge_nodes {
+                    let merge_sha = node.metadata.get("merge_sha").cloned().unwrap_or_default();
+                    let short = merge_sha.get(..7).unwrap_or(&merge_sha).to_string();
+                    if seen_merge_shas.contains(&short) {
+                        continue;
+                    }
+                    seen_merge_shas.insert(short.clone());
+
+                    let branch = node.metadata.get("branch_name").cloned().unwrap_or_default();
+                    let files = node.metadata.get("files_changed").cloned().unwrap_or_default();
+                    let body = format!("{}\n\nBranch: {}\nFiles: {}", node.body, branch, files);
+
+                    ids.push(format!("merge:{}", short));
+                    kinds.push("merge".to_string());
+                    titles.push(node.signature.clone());
+                    bodies.push(body.clone());
+                    texts.push(body);
+                }
+                seen_merge_shas.len()
+            }
+            Err(_) => 0,
+        };
+
         // Filter to embeddable node kinds before counting/indexing
         let embeddable: Vec<&crate::graph::Node> = symbols.iter()
             .filter(|n| n.id.kind.is_embeddable())
             .collect();
         let skipped = symbols.len() - embeddable.len();
         tracing::info!(
-            "EmbeddingIndex: collected {} artifact(s), {} commit(s), {} symbol(s) ({} embeddable, {} skipped) for indexing",
+            "EmbeddingIndex: collected {} artifact(s), {} commit(s), {} merge(s), {} symbol(s) ({} embeddable, {} skipped) for indexing",
             artifact_count,
             commit_count,
+            merge_count,
             symbols.len(),
             embeddable.len(),
             skipped,
