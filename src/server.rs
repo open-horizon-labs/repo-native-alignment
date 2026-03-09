@@ -1226,9 +1226,16 @@ impl RnaHandler {
                             for node in &mut extraction.nodes {
                                 node.id.root = root_slug.clone();
                             }
+                            // Build file index from existing + new nodes for suffix resolution
+                            let file_index: std::collections::HashSet<String> = graph_state.nodes
+                                .iter()
+                                .chain(extraction.nodes.iter())
+                                .map(|n| n.id.file.to_string_lossy().to_string())
+                                .collect();
                             for edge in &mut extraction.edges {
                                 edge.from.root = root_slug.clone();
                                 edge.to.root = root_slug.clone();
+                                resolve_edge_target_by_suffix(edge, &file_index);
                             }
                             let upsert_nodes = extraction.nodes.clone();
                             let upsert_edges = extraction.edges.clone();
@@ -1389,9 +1396,17 @@ impl RnaHandler {
             for node in &mut extraction.nodes {
                 node.id.root = root_slug.clone();
             }
+            // Build file index for suffix matching import edges
+            let file_index: std::collections::HashSet<String> = extraction.nodes
+                .iter()
+                .map(|n| n.id.file.to_string_lossy().to_string())
+                .collect();
+
             for edge in &mut extraction.edges {
                 edge.from.root = root_slug.clone();
                 edge.to.root = root_slug.clone();
+                // Resolve dangling import edges via suffix match
+                resolve_edge_target_by_suffix(edge, &file_index);
             }
 
             tracing::info!(
@@ -2516,6 +2531,38 @@ fn parse_args<T: serde::de::DeserializeOwned>(
 }
 
 /// Format a list of node IDs into markdown, enriched with node details if available.
+/// Resolve an edge's `to.file` against the set of known scanned file paths.
+/// If `to.file` doesn't match any known file but a known file ends with it
+/// (suffix match), update the edge to point to the matched file.
+/// This handles Python absolute imports where the import path is a suffix
+/// of the actual file path (e.g., `src/util/user_utils.py` matches
+/// `ai_service/src/util/user_utils.py`).
+fn resolve_edge_target_by_suffix(
+    edge: &mut graph::Edge,
+    file_index: &std::collections::HashSet<String>,
+) {
+    let target = edge.to.file.to_string_lossy().to_string();
+    if file_index.contains(&target) {
+        return; // exact match, nothing to resolve
+    }
+    // Suffix match: find a scanned file that ends with the target path
+    let suffix = format!("/{}", target);
+    let matches: Vec<&String> = file_index
+        .iter()
+        .filter(|f| f.ends_with(&suffix))
+        .collect();
+    if matches.len() == 1 {
+        edge.to.file = std::path::PathBuf::from(matches[0]);
+        edge.confidence = graph::Confidence::Confirmed;
+        tracing::debug!(
+            "Resolved import edge target: {} → {}",
+            target,
+            matches[0]
+        );
+    }
+    // If 0 or 2+ matches, leave as-is (ambiguous or truly dangling)
+}
+
 fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String]) -> String {
     ids.iter()
         .filter_map(|id| {

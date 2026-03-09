@@ -569,8 +569,8 @@ fn resolve_import_path(source_file: &Path, import_text: &str, language: &str) ->
             // Count leading dots for relative imports
             let dots = module_path.chars().take_while(|c| *c == '.').count();
             if dots == 0 {
-                // Absolute import: `from src.util.user_utils import X`
-                // Convert dots to path separators and hope it's relative to repo root.
+                // Absolute import: emit best-effort path from module dots.
+                // Graph builder resolves against scanned file index via suffix match.
                 let rel = module_path.replace('.', "/");
                 return Some(std::path::PathBuf::from(format!("{}.py", rel)));
             }
