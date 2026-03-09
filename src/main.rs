@@ -179,12 +179,36 @@ async fn main() -> anyhow::Result<()> {
                 ..Default::default()
             };
             let graph = handler.build_full_graph().await?;
+
+            // build_full_graph spawns embedding as a background task (for MCP server).
+            // For the CLI scan command, run embedding in the foreground so it completes
+            // before the process exits (avoids lance panic from cancelled tokio tasks).
+            let embed_count = match repo_native_alignment::embed::EmbeddingIndex::new(&repo_root).await {
+                Ok(idx) => {
+                    let embeddable: Vec<_> = graph.nodes.iter()
+                        .filter(|n| n.id.root != "external")
+                        .cloned()
+                        .collect();
+                    match idx.index_all_with_symbols(&repo_root, &embeddable).await {
+                        Ok(count) => count,
+                        Err(e) => {
+                            eprintln!("  Embedding failed: {}", e);
+                            0
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  Embedding init failed: {}", e);
+                    0
+                }
+            };
+
             let elapsed = t0.elapsed();
             eprintln!();
             eprintln!("── Scan complete ──────────────────────────");
             eprintln!("  Symbols:    {}", graph.nodes.len());
             eprintln!("  Edges:      {}", graph.edges.len());
-            eprintln!("  Embeddings: {}", if graph.embed_index.is_some() { "yes" } else { "no" });
+            eprintln!("  Embeddings: {}", if embed_count > 0 { format!("{} vectors", embed_count) } else { "no".to_string() });
             eprintln!("  Time:       {:.2}s", elapsed.as_secs_f64());
             eprintln!("───────────────────────────────────────────");
             return Ok(());
