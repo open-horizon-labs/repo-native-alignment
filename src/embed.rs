@@ -494,32 +494,59 @@ impl EmbeddingIndex {
             ),
         ]));
 
-        let id_array = Arc::new(StringArray::from(ids)) as Arc<dyn arrow_array::Array>;
-        let kind_array = Arc::new(StringArray::from(kinds)) as Arc<dyn arrow_array::Array>;
-        let title_array = Arc::new(StringArray::from(titles)) as Arc<dyn arrow_array::Array>;
-        let body_array = Arc::new(StringArray::from(bodies)) as Arc<dyn arrow_array::Array>;
-
-        let values = Arc::new(Float32Array::from(flat_embeddings));
-        let list_field = Arc::new(Field::new("item", DataType::Float32, true));
-        let vector_array = Arc::new(arrow_array::FixedSizeListArray::try_new(
-            list_field, dim as i32, values, None,
-        )?) as Arc<dyn arrow_array::Array>;
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![id_array, kind_array, title_array, body_array, vector_array],
-        )?;
-
-        // Drop existing table if it exists, then create new
+        // Split into batches of 2048 rows to avoid lance panics on large writes (#110).
+        const WRITE_BATCH_SIZE: usize = 2048;
         let persist_start = std::time::Instant::now();
         let _ = self.db.drop_table(&self.table_name, &[]).await;
 
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        self.db
-            .create_table(&self.table_name, Box::new(batches))
-            .execute()
-            .await
-            .context("Failed to create LanceDB table")?;
+        let total_rows = ids.len();
+        let mut offset = 0;
+        let mut first = true;
+        while offset < total_rows {
+            let end = (offset + WRITE_BATCH_SIZE).min(total_rows);
+            let batch_ids: Vec<String> = ids[offset..end].to_vec();
+            let batch_kinds: Vec<String> = kinds[offset..end].to_vec();
+            let batch_titles: Vec<String> = titles[offset..end].to_vec();
+            let batch_bodies: Vec<String> = bodies[offset..end].to_vec();
+            let batch_flat: Vec<f32> = flat_embeddings[offset * dim..end * dim].to_vec();
+
+            let id_array = Arc::new(StringArray::from(batch_ids)) as Arc<dyn arrow_array::Array>;
+            let kind_array = Arc::new(StringArray::from(batch_kinds)) as Arc<dyn arrow_array::Array>;
+            let title_array = Arc::new(StringArray::from(batch_titles)) as Arc<dyn arrow_array::Array>;
+            let body_array = Arc::new(StringArray::from(batch_bodies)) as Arc<dyn arrow_array::Array>;
+            let values = Arc::new(Float32Array::from(batch_flat));
+            let list_field = Arc::new(Field::new("item", DataType::Float32, true));
+            let vector_array = Arc::new(arrow_array::FixedSizeListArray::try_new(
+                list_field, dim as i32, values, None,
+            )?) as Arc<dyn arrow_array::Array>;
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![id_array, kind_array, title_array, body_array, vector_array],
+            )?;
+
+            if first {
+                let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+                self.db
+                    .create_table(&self.table_name, Box::new(batches))
+                    .execute()
+                    .await
+                    .context("Failed to create LanceDB table")?;
+                first = false;
+            } else {
+                let table = self.db.open_table(&self.table_name).execute().await
+                    .context("Failed to open table for append")?;
+                let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+                table.add(Box::new(batches)).execute().await
+                    .context("Failed to append batch to LanceDB table")?;
+            }
+
+            tracing::info!(
+                "EmbeddingIndex: persisted batch {}-{} of {} rows",
+                offset, end, total_rows
+            );
+            offset = end;
+        }
         tracing::info!(
             "EmbeddingIndex: persisted {} row(s) to LanceDB in {:?} (total {:?})",
             count,

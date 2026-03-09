@@ -2178,8 +2178,11 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                             })
                             .collect();
 
-                        // Rank: exact name > name contains > signature-only match
-                        // Within each tier: functions/structs/traits before imports/consts
+                        // Rank results by relevance:
+                        // 1. Exact name match > name contains > signature-only
+                        // 2. Definitions (function/struct/trait) > constants > imports
+                        // 3. Non-test files > test files
+                        // 4. More referenced symbols first (higher edge count)
                         matches.sort_by(|a, b| {
                             let a_name_lower = a.id.name.to_lowercase();
                             let b_name_lower = b.id.name.to_lowercase();
@@ -2200,16 +2203,36 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                 (false, true) => return std::cmp::Ordering::Greater,
                                 _ => {}
                             }
-                            // Tier 3: prefer code kinds over imports/modules
+                            // Tier 3: prefer definitions over imports
                             let kind_rank = |n: &Node| -> u8 {
                                 match n.id.kind {
                                     NodeKind::Function | NodeKind::Struct | NodeKind::Trait | NodeKind::Enum => 0,
                                     NodeKind::Const | NodeKind::Field | NodeKind::Impl => 1,
-                                    NodeKind::Import | NodeKind::Module => 2,
+                                    NodeKind::Import | NodeKind::Module => 3,
                                     _ => 1,
                                 }
                             };
-                            kind_rank(a).cmp(&kind_rank(b))
+                            let kr = kind_rank(a).cmp(&kind_rank(b));
+                            if kr != std::cmp::Ordering::Equal { return kr; }
+
+                            // Tier 4: non-test files before test files
+                            let is_test = |n: &Node| -> bool {
+                                let p = n.id.file.to_string_lossy();
+                                p.contains(".test.") || p.contains(".spec.") || p.contains("_test.") || p.contains("/test/") || p.contains("/tests/")
+                            };
+                            match (is_test(a), is_test(b)) {
+                                (false, true) => return std::cmp::Ordering::Less,
+                                (true, false) => return std::cmp::Ordering::Greater,
+                                _ => {}
+                            }
+
+                            // Tier 5: more edges = more important
+                            let edge_count = |n: &Node| -> usize {
+                                let sid = n.stable_id();
+                                graph_state.index.neighbors(&sid, None, Direction::Incoming).len()
+                                    + graph_state.index.neighbors(&sid, None, Direction::Outgoing).len()
+                            };
+                            edge_count(b).cmp(&edge_count(a))
                         });
                         matches.truncate(limit);
 
