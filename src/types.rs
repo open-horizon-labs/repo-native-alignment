@@ -148,6 +148,10 @@ impl From<SymbolKind> for NodeKind {
 }
 
 impl From<CodeSymbol> for Node {
+    /// Bridge for legacy `query_all`/`get_full_context` paths that still use
+    /// `code::extract_symbols` (Rust-only). Hardcodes "rust" because
+    /// `CodeSymbol` has no language field and `extract_symbols` only parses .rs files.
+    /// `outcome_progress` bypasses this entirely — it uses graph Nodes directly.
     fn from(sym: CodeSymbol) -> Self {
         Node {
             id: NodeId {
@@ -156,7 +160,7 @@ impl From<CodeSymbol> for Node {
                 name: sym.name,
                 kind: sym.kind.into(),
             },
-            language: String::from("rust"),
+            language: String::from("rust"), // Legacy: CodeSymbol is Rust-only
             line_start: sym.line_start,
             line_end: sym.line_end,
             signature: sym.signature,
