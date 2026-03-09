@@ -184,59 +184,6 @@ pub struct QueryResult {
 }
 
 impl QueryResult {
-    pub fn to_markdown(&self) -> String {
-        let mut out = format!("# Query: {}\n\n", self.query);
-
-        if !self.outcomes.is_empty() {
-            out.push_str("## Matching Outcomes / Signals / Guardrails / Metis\n\n");
-            for a in &self.outcomes {
-                out.push_str(&a.to_markdown());
-                out.push_str("\n---\n\n");
-            }
-        }
-
-        if !self.commits.is_empty() {
-            out.push_str("## Relevant Commits\n\n");
-            for c in &self.commits {
-                out.push_str(&c.to_markdown());
-                out.push('\n');
-            }
-            out.push('\n');
-        }
-
-        if !self.code_symbols.is_empty() {
-            out.push_str("## Matching Code Symbols\n\n");
-            for node in &self.code_symbols {
-                out.push_str(&format!(
-                    "- `{}:{}` **{}** `{}`\n",
-                    node.id.file.display(),
-                    node.line_start,
-                    node.id.kind,
-                    node.signature,
-                ));
-            }
-            out.push('\n');
-        }
-
-        if !self.markdown_chunks.is_empty() {
-            out.push_str("## Matching Markdown Sections\n\n");
-            for m in &self.markdown_chunks {
-                out.push_str(&m.to_markdown());
-                out.push_str("\n\n---\n\n");
-            }
-        }
-
-        if self.outcomes.is_empty()
-            && self.commits.is_empty()
-            && self.code_symbols.is_empty()
-            && self.markdown_chunks.is_empty()
-        {
-            out.push_str("_No results found._\n");
-        }
-
-        out
-    }
-
     /// Navigable summary rendering targeting <10K chars.
     /// Returns stable node IDs and suggested tool calls so agents can drill deeper.
     ///
@@ -244,7 +191,7 @@ impl QueryResult {
     /// - Commits: only tagged commits (containing [outcome:]), capped at 15, with drill-down hint
     /// - Symbols: counts by kind + top 5 files with up to 3 key symbols each, including stable IDs
     /// - Markdown: heading names + file paths
-    /// - PR Merges: count + suggestion to use detail_level='full' (appended by caller)
+    /// - PR Merges: count (appended by caller)
     pub fn to_summary_markdown(&self) -> String {
         let mut out = format!("# Query: {}\n\n", self.query);
 
