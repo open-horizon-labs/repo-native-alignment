@@ -14,30 +14,39 @@ If found, skip to Step 3.
 
 ## Step 2: Download the binary
 
-Detect the platform and download the latest release:
+Detect the platform and chip, then download to `~/.cargo/bin/` (already on PATH for Rust users):
 
 ```bash
-# Detect platform
 OS=$(uname -s)
 ARCH=$(uname -m)
+CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "")
+mkdir -p ~/.cargo/bin
 ```
 
-**If macOS ARM** (`Darwin` + `arm64`):
+**If macOS ARM M4+** (`Darwin` + `arm64` + brand_string contains "M4"):
 ```bash
-curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64 -o /usr/local/bin/repo-native-alignment
-chmod +x /usr/local/bin/repo-native-alignment
+curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64-m4 -o ~/.cargo/bin/repo-native-alignment
+chmod +x ~/.cargo/bin/repo-native-alignment
+```
+
+**If macOS ARM (M1/M2/M3)** (`Darwin` + `arm64`):
+```bash
+curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64 -o ~/.cargo/bin/repo-native-alignment
+chmod +x ~/.cargo/bin/repo-native-alignment
 ```
 
 **If Linux x86_64** (`Linux` + `x86_64`):
 ```bash
-curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-linux-x86_64 -o /usr/local/bin/repo-native-alignment
-chmod +x /usr/local/bin/repo-native-alignment
+curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-linux-x86_64 -o ~/.cargo/bin/repo-native-alignment
+chmod +x ~/.cargo/bin/repo-native-alignment
 ```
 
 **If neither:** Tell the user their platform is not yet supported. They can build from source:
 ```bash
-cargo install --locked --path . --git https://github.com/open-horizon-labs/repo-native-alignment
+cargo install --locked --git https://github.com/open-horizon-labs/repo-native-alignment
 ```
+
+If `~/.cargo/bin` is not on PATH (no Rust toolchain installed), tell the user to add it: `export PATH="$HOME/.cargo/bin:$PATH"`
 
 ## Step 3: Add MCP server to Claude Code
 
