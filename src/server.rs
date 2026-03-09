@@ -683,7 +683,7 @@ pub(crate) async fn persist_graph_incremental(
 }
 
 /// Load graph nodes and edges from LanceDB tables.
-pub(crate) async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphState> {
+pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphState> {
     use futures::TryStreamExt;
     use lancedb::query::ExecutableQuery;
 

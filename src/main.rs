@@ -60,6 +60,15 @@ enum Commands {
     ///
     /// Use `search` first to find a node ID, then `graph` to explore relationships.
     Graph(GraphArgs),
+    /// Show repo stats from the persisted index (no re-scan).
+    Stats(StatsArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct StatsArgs {
+    /// Repository root path (default: current directory)
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
 }
 
 #[derive(clap::Args, Debug)]
@@ -341,6 +350,60 @@ async fn main() -> anyhow::Result<()> {
             }
             let freshness = server::format_freshness(gs.nodes.len(), gs.last_scan_completed_at);
             eprintln!("{}", freshness);
+            return Ok(());
+        }
+        Some(Commands::Stats(args)) => {
+            init_tracing("warn");
+            let repo_root = args.repo.canonicalize()?;
+
+            let lance_path = repo_root.join(".oh").join(".cache").join("lance");
+            if !lance_path.exists() {
+                eprintln!("No index found. Run `repo-native-alignment scan --path .` first.");
+                std::process::exit(1);
+            }
+
+            let last_scan = std::fs::metadata(&lance_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                .map(|d| {
+                    let secs_ago = std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() - d.as_secs();
+                    if secs_ago < 60 { "just now".to_string() }
+                    else if secs_ago < 3600 { format!("{}m ago", secs_ago / 60) }
+                    else if secs_ago < 86400 { format!("{}h ago", secs_ago / 3600) }
+                    else { format!("{}d ago", secs_ago / 86400) }
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let gs = server::load_graph_from_lance(&repo_root).await?;
+
+            let mut langs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for n in &gs.nodes {
+                if !n.language.is_empty() && n.language != "unknown" {
+                    langs.insert(n.language.clone());
+                }
+            }
+
+            let artifacts = repo_native_alignment::oh::load_oh_artifacts(&repo_root).unwrap_or_default();
+            let outcomes = artifacts.iter().filter(|a| a.kind == repo_native_alignment::types::OhArtifactKind::Outcome).count();
+            let signals = artifacts.iter().filter(|a| a.kind == repo_native_alignment::types::OhArtifactKind::Signal).count();
+            let guardrails = artifacts.iter().filter(|a| a.kind == repo_native_alignment::types::OhArtifactKind::Guardrail).count();
+            let metis = artifacts.iter().filter(|a| a.kind == repo_native_alignment::types::OhArtifactKind::Metis).count();
+
+            let embed_str = if gs.embed_index.is_some() { "yes" } else { "no" };
+
+            println!("── Repo Stats ──────────────────────────");
+            println!("  Symbols:    {}", gs.nodes.len());
+            println!("  Edges:      {}", gs.edges.len());
+            println!("  Embeddings: {}", embed_str);
+            println!("  Languages:  {}", if langs.is_empty() { "none".to_string() } else { langs.into_iter().collect::<Vec<_>>().join(", ") });
+            println!("  Last scan:  {}", last_scan);
+            println!("  .oh/:       {} artifacts ({} outcomes, {} signals, {} guardrails, {} metis)",
+                artifacts.len(), outcomes, signals, guardrails, metis);
+            println!("───────────────────────────────────────────");
             return Ok(());
         }
         None => {}
