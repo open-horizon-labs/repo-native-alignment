@@ -44,11 +44,15 @@ Three independent fixes, all needed:
 
 ## Execute Status
 - Branch: `fix-107-graph-search-quality`
-- Cherry-picked: #105 symlink fix + broken symlink smoke test
-- **Not started:** A, B, C implementation
-- Blocked on: nothing — ready to execute
+- PR: #109 — review/dissent posted
+- **Done:** A (filter noise), B (search ranking), C (import resolution code)
+- **Pending:** C end-to-end verification blocked by lance panic (#110)
+- Lance panic on 10K+ embedding batch filed as #110
 
 ## Related
-- #105 — symlink crash (fix on branch, PR #106 pending CI)
+- #105 — symlink crash (merged via #106)
 - #107 — this issue
+- #109 — PR with fixes A+B+C
+- #110 — lance panic blocking C verification
+- #108 — Claude Code memory: CLAUDE.md already indexed, auto memory cross-reference only
 - #90 — parent DX epic (closed, but quality is DX)
