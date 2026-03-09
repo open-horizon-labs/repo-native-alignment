@@ -2178,6 +2178,39 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                             })
                             .collect();
 
+                        // Rank: exact name > name contains > signature-only match
+                        // Within each tier: functions/structs/traits before imports/consts
+                        matches.sort_by(|a, b| {
+                            let a_name_lower = a.id.name.to_lowercase();
+                            let b_name_lower = b.id.name.to_lowercase();
+                            let a_exact = a_name_lower == query_lower;
+                            let b_exact = b_name_lower == query_lower;
+                            let a_name_contains = a_name_lower.contains(&query_lower);
+                            let b_name_contains = b_name_lower.contains(&query_lower);
+
+                            // Tier 1: exact name match
+                            match (a_exact, b_exact) {
+                                (true, false) => return std::cmp::Ordering::Less,
+                                (false, true) => return std::cmp::Ordering::Greater,
+                                _ => {}
+                            }
+                            // Tier 2: name contains vs signature-only
+                            match (a_name_contains, b_name_contains) {
+                                (true, false) => return std::cmp::Ordering::Less,
+                                (false, true) => return std::cmp::Ordering::Greater,
+                                _ => {}
+                            }
+                            // Tier 3: prefer code kinds over imports/modules
+                            let kind_rank = |n: &Node| -> u8 {
+                                match n.id.kind {
+                                    NodeKind::Function | NodeKind::Struct | NodeKind::Trait | NodeKind::Enum => 0,
+                                    NodeKind::Const | NodeKind::Field | NodeKind::Impl => 1,
+                                    NodeKind::Import | NodeKind::Module => 2,
+                                    _ => 1,
+                                }
+                            };
+                            kind_rank(a).cmp(&kind_rank(b))
+                        });
                         matches.truncate(limit);
 
                         let freshness = format_freshness(
@@ -2462,9 +2495,15 @@ fn parse_args<T: serde::de::DeserializeOwned>(
 /// Format a list of node IDs into markdown, enriched with node details if available.
 fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String]) -> String {
     ids.iter()
-        .map(|id| {
+        .filter_map(|id| {
             if let Some(node) = nodes.iter().find(|n| n.stable_id() == *id) {
-                format!(
+                // Filter out module and PR-merge nodes — they're structural scaffolding,
+                // not useful for agents doing impact analysis or exploration.
+                match node.id.kind {
+                    graph::NodeKind::Module | graph::NodeKind::PrMerge => return None,
+                    _ => {}
+                }
+                Some(format!(
                     "- **{}** `{}` ({}) `{}`:{}-{}",
                     node.id.kind,
                     node.id.name,
@@ -2472,9 +2511,9 @@ fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String]) -> String {
                     node.id.file.display(),
                     node.line_start,
                     node.line_end,
-                )
+                ))
             } else {
-                format!("- `{}`", id)
+                Some(format!("- `{}`", id))
             }
         })
         .collect::<Vec<_>>()

@@ -333,8 +333,13 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 println!("## {} `{}`\n\n{} result(s)\n", args.mode, args.node, result_ids.len());
                 for id in &result_ids {
-                    // Look up full node for display
                     if let Some(node) = gs.nodes.iter().find(|n| n.stable_id() == *id) {
+                        // Filter out module and PR-merge noise
+                        match node.id.kind {
+                            repo_native_alignment::graph::NodeKind::Module
+                            | repo_native_alignment::graph::NodeKind::PrMerge => continue,
+                            _ => {}
+                        }
                         println!(
                             "- **{}** `{}` ({}) `{}`:{}-{}",
                             node.id.kind, node.id.name, node.language,

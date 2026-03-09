@@ -223,6 +223,9 @@ fn collect_nodes(
             // Import edge.
             let import_edge = if node_kind == NodeKind::Import {
                 let target_name = parse_import_target(&name);
+                // Try to resolve the import to an actual file path for cross-file edges.
+                let target_file = resolve_import_path(path, &name, config.language_name);
+                let edge_file = target_file.unwrap_or_else(|| path.to_path_buf());
                 if !target_name.is_empty() {
                     Some(crate::graph::Edge {
                         from: NodeId {
@@ -233,7 +236,7 @@ fn collect_nodes(
                         },
                         to: NodeId {
                             root: String::new(),
-                            file: path.to_path_buf(),
+                            file: edge_file,
                             name: target_name,
                             kind: NodeKind::Module,
                         },
@@ -524,6 +527,73 @@ fn extract_user_type(type_text: &str, require_uppercase: bool) -> Option<String>
 }
 
 /// Parse the target module name from an import declaration text.
+/// Resolve an import statement to a target file path.
+/// Returns `Some(path)` if the import can be resolved to a file that exists.
+fn resolve_import_path(source_file: &Path, import_text: &str, language: &str) -> Option<std::path::PathBuf> {
+    let parent = source_file.parent()?;
+
+    match language {
+        "python" => {
+            // `from .util.user_utils import X` → `./util/user_utils.py`
+            // `from ..models.user import X` → `../models/user.py`
+            let text = import_text.trim();
+            let module_path = if text.starts_with("from ") {
+                text.strip_prefix("from ")?
+                    .split_whitespace()
+                    .next()?
+            } else if text.starts_with("import ") {
+                text.strip_prefix("import ")?
+                    .split_whitespace()
+                    .next()?
+            } else {
+                return None;
+            };
+
+            // Count leading dots for relative imports
+            let dots = module_path.chars().take_while(|c| *c == '.').count();
+            if dots == 0 {
+                return None; // absolute imports can't be resolved without sys.path
+            }
+            let rest = &module_path[dots..];
+            let rel = rest.replace('.', "/");
+
+            // Go up (dots - 1) directories from parent
+            let mut base = parent.to_path_buf();
+            for _ in 1..dots {
+                base = base.parent()?.to_path_buf();
+            }
+            let candidate = base.join(format!("{}.py", rel));
+            if candidate.exists() { return Some(candidate); }
+            // Try as package: dir/__init__.py
+            let pkg = base.join(&rel).join("__init__.py");
+            if pkg.exists() { return Some(pkg); }
+            None
+        }
+        "typescript" | "javascript" | "tsx" | "jsx" => {
+            // `import X from './util/user_utils'` or `import X from '../util'`
+            // Extract the path string from quotes
+            let path_str = import_text
+                .split(['\'', '"'])
+                .nth(1)?;
+            if !path_str.starts_with('.') {
+                return None; // non-relative imports (npm packages) can't be resolved
+            }
+            let base = parent.join(path_str);
+            // Try exact, .ts, .tsx, .js, .jsx, /index.ts, /index.tsx
+            for ext in &["", ".ts", ".tsx", ".js", ".jsx"] {
+                let candidate = std::path::PathBuf::from(format!("{}{}", base.display(), ext));
+                if candidate.exists() { return Some(candidate); }
+            }
+            for index in &["index.ts", "index.tsx", "index.js"] {
+                let candidate = base.join(index);
+                if candidate.exists() { return Some(candidate); }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 fn parse_import_target(import_text: &str) -> String {
     // Strip `use ` prefix (Rust), `import ` (various), quotes, semicolons.
     let s = import_text
