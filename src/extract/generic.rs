@@ -280,9 +280,43 @@ fn collect_nodes(
                 });
             }
 
+            // Trait implementation edge.
+            if node_kind == NodeKind::Impl {
+                if let Some(trait_node) = node.child_by_field_name("trait") {
+                    let trait_name = trait_node.utf8_text(source).unwrap_or("?").to_string();
+                    if let Some(type_node) = node.child_by_field_name("type") {
+                        let type_name = type_node.utf8_text(source).unwrap_or("?").to_string();
+                        edges.push(Edge {
+                            from: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: type_name,
+                                kind: NodeKind::Struct,
+                            },
+                            to: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: trait_name,
+                                kind: NodeKind::Trait,
+                            },
+                            kind: EdgeKind::Implements,
+                            source: ExtractionSource::TreeSitter,
+                            confidence: Confidence::Detected,
+                        });
+                    }
+                }
+            }
+
             // Scope propagation into children.
             if config.scope_parent_kinds.contains(&kind_str) {
-                let scope = Some((name, node_kind));
+                let scope_kind = if node_kind == NodeKind::Impl
+                    && node.child_by_field_name("trait").is_none() {
+                    // Plain `impl Foo` — methods belong to the struct, not the impl
+                    NodeKind::Struct
+                } else {
+                    node_kind
+                };
+                let scope = Some((name, scope_kind));
                 for i in 0..node.child_count() {
                     if let Some(child) = node.child(i as u32) {
                         collect_nodes(child, path, source, config, &scope, nodes, edges);
@@ -371,6 +405,16 @@ impl Foo {
     }
 }
 
+trait Greet {
+    fn greet(&self) -> String;
+}
+
+impl Greet for Foo {
+    fn greet(&self) -> String {
+        String::new()
+    }
+}
+
 pub fn hello() {}
 "#;
         let result = ext.extract(Path::new("test.rs"), code).unwrap();
@@ -404,10 +448,23 @@ pub fn hello() {}
             "Should emit Defines edges for impl methods, got edges: {:?}",
             result.edges.iter().map(|e| format!("{:?}", e.kind)).collect::<Vec<_>>()
         );
-        // Verify a Defines edge connects Foo (impl) -> do_thing
+        // Verify a Defines edge connects Foo:struct -> do_thing (not Foo:impl)
         assert!(
-            defines_edges.iter().any(|e| e.to.name == "do_thing" && e.to.kind == NodeKind::Function),
-            "Should have Defines edge to do_thing method"
+            defines_edges.iter().any(|e| e.from.name == "Foo" && e.from.kind == NodeKind::Struct
+                && e.to.name == "do_thing" && e.to.kind == NodeKind::Function),
+            "Should have Defines edge from Foo:struct to do_thing method, got: {:?}",
+            defines_edges
+        );
+
+        // Verify Implements edge: Foo:struct -> Greet:trait
+        let implements_edges: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Implements)
+            .collect();
+        assert!(
+            implements_edges.iter().any(|e| e.from.name == "Foo" && e.from.kind == NodeKind::Struct
+                && e.to.name == "Greet" && e.to.kind == NodeKind::Trait),
+            "Should have Implements edge from Foo:struct to Greet:trait, got: {:?}",
+            implements_edges
         );
     }
 }
