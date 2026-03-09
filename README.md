@@ -51,24 +51,34 @@ We don't build features, we build capabilities.
 
 ### 1. Install
 
-**Claude Code users** (plugin install — recommended):
+**Claude Code users** (recommended):
 
 ```bash
-claude install-plugin open-horizon-labs/repo-native-alignment
+# 1. Add the marketplace
+claude plugin marketplace add open-horizon-labs/repo-native-alignment
+
+# 2. Install the plugin
+claude plugin install rna-mcp
+
+# 3. Restart Claude Code, then run the setup skill:
+/rna-mcp:setup
 ```
 
-This downloads the latest release binary for your platform and configures `.mcp.json` automatically. Restart Claude Code after install.
+Setup detects your platform (M4 optimized binary for M4+ chips), downloads the binary to `~/.cargo/bin/`, configures `.mcp.json`, and updates AGENTS.md with tool guidance.
 
 **Download a prebuilt binary** (manual):
 
 ```bash
-# macOS Apple Silicon
-curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64 -o repo-native-alignment
-chmod +x repo-native-alignment && sudo mv repo-native-alignment /usr/local/bin/
+mkdir -p ~/.cargo/bin
+
+# macOS Apple Silicon (M4+)
+curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64-m4 -o ~/.cargo/bin/repo-native-alignment && chmod +x ~/.cargo/bin/repo-native-alignment
+
+# macOS Apple Silicon (M1/M2/M3)
+curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64 -o ~/.cargo/bin/repo-native-alignment && chmod +x ~/.cargo/bin/repo-native-alignment
 
 # Linux x86_64
-curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-linux-x86_64 -o repo-native-alignment
-chmod +x repo-native-alignment && sudo mv repo-native-alignment /usr/local/bin/
+curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-linux-x86_64 -o ~/.cargo/bin/repo-native-alignment && chmod +x ~/.cargo/bin/repo-native-alignment
 ```
 
 **Build from source** (requires [Rust toolchain](https://rustup.rs)):
@@ -133,6 +143,24 @@ The system compounds from here. Agents use `oh_search_context` to discover relev
 | **Join** | `outcome_progress` — structural join: outcome → commits → symbols → PRs |
 | **Workspace** | `list_roots` — show configured workspace roots |
 
+### Plugin Skills
+
+| Skill | What it does |
+|-------|-------------|
+| `/rna-mcp:setup` | Download binary, configure MCP, update AGENTS.md |
+| `/rna-mcp:record` | Record business artifacts (metis, signals, guardrails, outcome updates) with frontmatter templates |
+
+### CLI Subcommands
+
+| Command | What it does |
+|---------|-------------|
+| `search <query>` | Search symbols by name/signature, filter by kind/language/file |
+| `graph --node <id> --mode <mode>` | Traverse neighbors, impact analysis, or reachability |
+| `scan --path <dir>` | Full scan + extract + embed + persist |
+| `stats --repo <dir>` | Show repo stats from persisted index (no re-scan) |
+| `test --repo <dir>` | Run 22+ pipeline checks end-to-end |
+| `setup --project <dir>` | Bootstrap RNA + OH MCP + skills for a project |
+
 ## The `.oh/` Directory
 
 ```
@@ -173,7 +201,7 @@ Agent wrappers for each workflow phase (`oh-aim`, `oh-execute`, `oh-ship`, etc.)
 
 ## Status
 
-**Working today:** 9 MCP tools, 22 language extractors, 190+ tests. Structural outcome-to-code joins, LSP-enriched impact analysis, cross-language constant search, Metal GPU semantic search, event-driven reindex, persistent index with <1s restarts.
+**Working today:** 7 MCP tools, 6 CLI subcommands, 22 language extractors, 190+ tests. Structural outcome-to-code joins, LSP-enriched impact analysis, cross-language constant search, Metal GPU semantic search (CPU fallback on Linux), event-driven reindex, persistent index with <1s restarts. Ships as a Claude Code plugin with setup skill and record skill.
 
 ### Tested On
 
