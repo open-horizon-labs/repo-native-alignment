@@ -29,6 +29,9 @@ pub static PYTHON_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &["import_statement", "import_from_statement"],
     string_literal_kinds: &[("string", None)],
+    param_container_field: Some("parameters"),
+    param_type_field: Some("type"),
+    return_type_field: Some("return_type"),
 };
 
 // ---------------------------------------------------------------------------
@@ -52,6 +55,9 @@ pub static TYPESCRIPT_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string", Some("string_fragment"))],
+    param_container_field: Some("parameters"),
+    param_type_field: Some("type_annotation"),
+    return_type_field: Some("return_type"),
 };
 
 // ---------------------------------------------------------------------------
@@ -74,6 +80,9 @@ pub static JAVASCRIPT_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string", Some("string_fragment"))],
+    param_container_field: None,
+    param_type_field: None,
+    return_type_field: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -96,6 +105,9 @@ pub static GO_CONFIG: LangConfig = LangConfig {
         ("interpreted_string_literal", None),
         ("raw_string_literal",         None),
     ],
+    param_container_field: Some("parameters"),
+    param_type_field: Some("type"),
+    return_type_field: Some("result"),
 };
 
 // ---------------------------------------------------------------------------
@@ -120,6 +132,9 @@ pub static JAVA_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string_literal", None)],
+    param_container_field: Some("formal_parameters"),
+    param_type_field: Some("type"),
+    return_type_field: Some("type"),
 };
 
 // ---------------------------------------------------------------------------
@@ -142,6 +157,9 @@ pub static KOTLIN_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string_literal", Some("string_content"))],
+    param_container_field: Some("value_parameters"),
+    param_type_field: Some("type"),
+    return_type_field: Some("type"),
 };
 
 // ---------------------------------------------------------------------------
@@ -167,6 +185,9 @@ pub static CSHARP_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string_literal", None)],
+    param_container_field: Some("parameter_list"),
+    param_type_field: Some("type"),
+    return_type_field: Some("type"),
 };
 
 // ---------------------------------------------------------------------------
@@ -190,6 +211,9 @@ pub static SWIFT_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &["import_declaration"],
     string_literal_kinds: &[("string_literal", Some("string_literal_segment"))],
+    param_container_field: Some("parameter"),
+    param_type_field: Some("type_annotation"),
+    return_type_field: Some("return_type"),
 };
 
 // ---------------------------------------------------------------------------
@@ -210,6 +234,9 @@ pub static ZIG_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string_literal", None)],
+    param_container_field: Some("parameters"),
+    param_type_field: Some("type"),
+    return_type_field: Some("return_type"),
 };
 
 // ---------------------------------------------------------------------------
@@ -232,6 +259,9 @@ pub static CPP_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string_literal", Some("string_content"))],
+    param_container_field: Some("parameters"),
+    param_type_field: Some("type"),
+    return_type_field: Some("type"),
 };
 
 // ---------------------------------------------------------------------------
@@ -250,6 +280,9 @@ pub static LUA_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string", None)],
+    param_container_field: None,
+    param_type_field: None,
+    return_type_field: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -272,6 +305,9 @@ pub static RUBY_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string", Some("string_content"))],
+    param_container_field: None,
+    param_type_field: None,
+    return_type_field: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -290,4 +326,7 @@ pub static BASH_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string", None)],
+    param_container_field: None,
+    param_type_field: None,
+    return_type_field: None,
 };

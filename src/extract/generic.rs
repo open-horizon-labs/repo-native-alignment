@@ -56,6 +56,13 @@ pub struct LangConfig {
     /// String literal tree-sitter node kinds for synthetic Const harvesting.
     /// Each entry: (outer_node_kind, optional_content_child_kind).
     pub string_literal_kinds: &'static [(&'static str, Option<&'static str>)],
+    /// Tree-sitter field name for the parameters container on function nodes.
+    /// None = skip DependsOn type edge extraction for this language.
+    pub param_container_field: Option<&'static str>,
+    /// Tree-sitter field name for the type annotation on each parameter.
+    pub param_type_field: Option<&'static str>,
+    /// Tree-sitter field name for the function return type.
+    pub return_type_field: Option<&'static str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -254,54 +261,60 @@ fn collect_nodes(
                 edges.push(edge);
             }
 
-            // Function parameter/return type DependsOn edges (Rust only).
-            if node_kind == NodeKind::Function && config.language_name == "rust" {
-                let fn_id = NodeId {
-                    root: String::new(),
-                    file: path.to_path_buf(),
-                    name: name.clone(),
-                    kind: NodeKind::Function,
-                };
-                // Parameter types
-                if let Some(params) = node.child_by_field_name("parameters") {
-                    for i in 0..params.child_count() {
-                        if let Some(param) = params.child(i as u32) {
-                            if let Some(type_node) = param.child_by_field_name("type") {
-                                let type_text = type_node.utf8_text(source).unwrap_or("");
-                                if let Some(type_name) = extract_user_type(type_text) {
-                                    edges.push(Edge {
-                                        from: fn_id.clone(),
-                                        to: NodeId {
-                                            root: String::new(),
-                                            file: path.to_path_buf(),
-                                            name: type_name,
-                                            kind: NodeKind::Struct,
-                                        },
-                                        kind: EdgeKind::DependsOn,
-                                        source: ExtractionSource::TreeSitter,
-                                        confidence: Confidence::Detected,
-                                    });
+            // Function parameter/return type DependsOn edges (config-driven).
+            if node_kind == NodeKind::Function {
+                if let Some(param_field) = config.param_container_field {
+                    let fn_id = NodeId {
+                        root: String::new(),
+                        file: path.to_path_buf(),
+                        name: name.clone(),
+                        kind: NodeKind::Function,
+                    };
+                    // Parameter types
+                    if let Some(params) = node.child_by_field_name(param_field) {
+                        if let Some(type_field) = config.param_type_field {
+                            for i in 0..params.child_count() {
+                                if let Some(param) = params.child(i as u32) {
+                                    if let Some(tn) = param.child_by_field_name(type_field) {
+                                        let type_text = tn.utf8_text(source).unwrap_or("");
+                                        if let Some(type_name) = extract_user_type(type_text) {
+                                            edges.push(Edge {
+                                                from: fn_id.clone(),
+                                                to: NodeId {
+                                                    root: String::new(),
+                                                    file: path.to_path_buf(),
+                                                    name: type_name,
+                                                    kind: NodeKind::Struct,
+                                                },
+                                                kind: EdgeKind::DependsOn,
+                                                source: ExtractionSource::TreeSitter,
+                                                confidence: Confidence::Detected,
+                                            });
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                // Return type
-                if let Some(ret_node) = node.child_by_field_name("return_type") {
-                    let ret_text = ret_node.utf8_text(source).unwrap_or("");
-                    if let Some(type_name) = extract_user_type(ret_text) {
-                        edges.push(Edge {
-                            from: fn_id,
-                            to: NodeId {
-                                root: String::new(),
-                                file: path.to_path_buf(),
-                                name: type_name,
-                                kind: NodeKind::Struct,
-                            },
-                            kind: EdgeKind::DependsOn,
-                            source: ExtractionSource::TreeSitter,
-                            confidence: Confidence::Detected,
-                        });
+                    // Return type
+                    if let Some(ret_field) = config.return_type_field {
+                        if let Some(rn) = node.child_by_field_name(ret_field) {
+                            let ret_text = rn.utf8_text(source).unwrap_or("");
+                            if let Some(type_name) = extract_user_type(ret_text) {
+                                edges.push(Edge {
+                                    from: fn_id,
+                                    to: NodeId {
+                                        root: String::new(),
+                                        file: path.to_path_buf(),
+                                        name: type_name,
+                                        kind: NodeKind::Struct,
+                                    },
+                                    kind: EdgeKind::DependsOn,
+                                    source: ExtractionSource::TreeSitter,
+                                    confidence: Confidence::Detected,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -434,12 +447,18 @@ fn extract_signature(body: &str) -> String {
 /// reference/lifetime prefixes like `&self`.
 fn extract_user_type(type_text: &str) -> Option<String> {
     // Strip reference prefix (e.g. "&Foo", "&mut Foo")
+    // Also strip Python/TS annotation prefix `: Foo` and `-> Foo`
     let s = type_text.trim()
+        .trim_start_matches("->")
+        .trim_start_matches(':')
+        .trim()
         .trim_start_matches('&')
+        .trim_start_matches('*')
         .trim_start_matches("mut ")
+        .trim_start_matches("const ")
         .trim();
-    // Take first identifier (before `<` generics or `::` paths)
-    let ident = s.split(|c: char| c == '<' || c == ':' || c == ' ')
+    // Take first identifier (before `<` generics, `::` paths, `[` arrays, or `|` unions)
+    let ident = s.split(|c: char| c == '<' || c == ':' || c == ' ' || c == '[' || c == '|' || c == '?')
         .next()
         .unwrap_or("")
         .trim();
@@ -450,13 +469,20 @@ fn extract_user_type(type_text: &str) -> Option<String> {
     if !ident.starts_with(|c: char| c.is_ascii_uppercase()) {
         return None;
     }
-    // Skip known standard library / primitive types
+    // Skip known standard library / primitive types (cross-language)
     const PRIMITIVES: &[&str] = &[
+        // Rust stdlib
         "String", "Vec", "Option", "Result", "Box", "Rc", "Arc",
         "HashMap", "HashSet", "BTreeMap", "BTreeSet", "Cow",
         "Cell", "RefCell", "Mutex", "RwLock",
         "Pin", "Future", "Stream", "Iterator",
         "Self",
+        // Cross-language primitives (title-cased forms)
+        "Int", "Float", "Bool", "None", "Void",
+        "Any", "Number", "Object", "Undefined", "Null",
+        "Error", "Array", "Map", "Set", "List", "Dict",
+        "Promise", "Tuple", "Type", "Interface",
+        "Boolean", "Integer", "Double", "Long", "Short", "Byte", "Char",
     ];
     if PRIMITIVES.contains(&ident) {
         return None;
