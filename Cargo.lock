@@ -5682,7 +5682,6 @@ dependencies = [
  "futures",
  "git2",
  "lancedb",
- "libc",
  "lsp-types",
  "metal-candle",
  "petgraph",
