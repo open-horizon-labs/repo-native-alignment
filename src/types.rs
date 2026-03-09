@@ -276,7 +276,6 @@ impl QueryResult {
 
             out.push_str("## Commits\n\n");
             if total_tagged > 0 {
-                let display_count = total_tagged.min(15);
                 for c in tagged.iter().take(15) {
                     let first_line = c.message.lines().next().unwrap_or(&c.message);
                     out.push_str(&format!("- **{}** {}\n", c.short_hash, first_line));
@@ -289,7 +288,7 @@ impl QueryResult {
                 }
                 out.push_str(&format!(
                     "\n{} tagged / {} total commits\n\n",
-                    display_count.min(total_tagged),
+                    total_tagged,
                     total_all
                 ));
             } else {
@@ -300,7 +299,7 @@ impl QueryResult {
             }
         }
 
-        // Symbols: counts by kind only
+        // Symbols: counts by kind only; fall back to file count from commits
         if !self.code_symbols.is_empty() {
             use std::collections::BTreeMap;
             let mut kind_counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -319,6 +318,20 @@ impl QueryResult {
                 parts.join(", "),
                 files.len()
             ));
+        } else if !self.commits.is_empty() {
+            // No symbols extracted (summary mode) — show file count from commits
+            let changed_files: std::collections::BTreeSet<String> = self
+                .commits
+                .iter()
+                .flat_map(|c| c.changed_files.iter())
+                .map(|f| f.display().to_string())
+                .collect();
+            if !changed_files.is_empty() {
+                out.push_str(&format!(
+                    "## Code\n\nChanges across {} files\n\n",
+                    changed_files.len()
+                ));
+            }
         }
 
         // Markdown: count + heading names only

@@ -252,7 +252,7 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     }
 
     // 9. outcome_progress path
-    match query::outcome_progress(&repo, "agent-alignment") {
+    match query::outcome_progress(&repo, "agent-alignment", false) {
         Ok(result) => {
             let outcome_count = result.outcomes.len();
             if outcome_count > 0 || !result.markdown_chunks.is_empty() || !result.code_symbols.is_empty() {

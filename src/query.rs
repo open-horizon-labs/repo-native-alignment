@@ -96,7 +96,7 @@ pub fn get_full_context(repo_root: &Path) -> Result<QueryResult> {
 /// 4. Deduplicate commits
 /// 5. For changed files in those commits, find code symbols defined there
 /// 6. Find markdown sections mentioning the outcome ID
-pub fn outcome_progress(repo_root: &Path, outcome_id: &str) -> Result<QueryResult> {
+pub fn outcome_progress(repo_root: &Path, outcome_id: &str, summary: bool) -> Result<QueryResult> {
     // 1. Find the outcome
     let all_artifacts = oh::load_oh_artifacts(repo_root)?;
     let outcome = all_artifacts
@@ -142,23 +142,29 @@ pub fn outcome_progress(repo_root: &Path, outcome_id: &str) -> Result<QueryResul
     }
 
     // 5. Collect changed files from all commits, find symbols in those files
-    let changed_files: HashSet<PathBuf> = commits
-        .iter()
-        .flat_map(|c| c.changed_files.iter().cloned())
-        .collect();
+    //    In summary mode, skip the expensive extract_symbols call — the renderer
+    //    falls back to showing file count from commits instead.
+    let code_symbols = if summary {
+        Vec::new()
+    } else {
+        let changed_files: HashSet<PathBuf> = commits
+            .iter()
+            .flat_map(|c| c.changed_files.iter().cloned())
+            .collect();
 
-    let all_symbols = code::extract_symbols(repo_root).unwrap_or_default();
-    let code_symbols: Vec<_> = all_symbols
-        .into_iter()
-        .filter(|sym| {
-            // Match if symbol's file is in the changed files set
-            let sym_rel = sym.file_path.strip_prefix(repo_root)
-                .unwrap_or(&sym.file_path);
-            changed_files.contains(sym_rel)
-        })
-        // Skip imports — they're noise in this context
-        .filter(|sym| sym.kind != crate::types::SymbolKind::Import)
-        .collect();
+        let all_symbols = code::extract_symbols(repo_root).unwrap_or_default();
+        all_symbols
+            .into_iter()
+            .filter(|sym| {
+                // Match if symbol's file is in the changed files set
+                let sym_rel = sym.file_path.strip_prefix(repo_root)
+                    .unwrap_or(&sym.file_path);
+                changed_files.contains(sym_rel)
+            })
+            // Skip imports — they're noise in this context
+            .filter(|sym| sym.kind != crate::types::SymbolKind::Import)
+            .collect()
+    };
 
     // 6. Find markdown mentioning this outcome
     let all_chunks = markdown::extract_markdown_chunks(repo_root).unwrap_or_default();
