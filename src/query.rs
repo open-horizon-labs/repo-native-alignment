@@ -10,6 +10,7 @@ use crate::git;
 use crate::graph::{Edge, EdgeKind, Node, NodeKind};
 use crate::markdown;
 use crate::oh;
+use crate::roots::path_to_slug;
 use crate::types::{OhArtifact, OhArtifactKind, QueryResult};
 
 /// The main intersection query: searches across all layers (.oh/ artifacts,
@@ -34,7 +35,8 @@ pub fn query_all(repo_root: &Path, query: &str) -> Result<QueryResult> {
         .collect();
 
     // Load and search code symbols
-    let all_symbols = code::extract_symbols(repo_root).unwrap_or_else(|e| {
+    let slug = path_to_slug(repo_root);
+    let all_symbols = code::extract_symbols(repo_root, &slug).unwrap_or_else(|e| {
         tracing::warn!("Failed to extract code symbols: {}", e);
         Vec::new()
     });
@@ -69,7 +71,8 @@ pub fn get_full_context(repo_root: &Path) -> Result<QueryResult> {
         tracing::warn!("Failed to extract markdown chunks: {}", e);
         Vec::new()
     });
-    let code_symbols = code::extract_symbols(repo_root).unwrap_or_else(|e| {
+    let slug = path_to_slug(repo_root);
+    let code_symbols = code::extract_symbols(repo_root, &slug).unwrap_or_else(|e| {
         tracing::warn!("Failed to extract code symbols: {}", e);
         Vec::new()
     });
@@ -149,7 +152,8 @@ pub fn outcome_progress(repo_root: &Path, outcome_id: &str) -> Result<QueryResul
             .flat_map(|c| c.changed_files.iter().cloned())
             .collect();
 
-        let all_symbols = code::extract_symbols(repo_root).unwrap_or_default();
+        let slug = path_to_slug(repo_root);
+        let all_symbols = code::extract_symbols(repo_root, &slug).unwrap_or_default();
         all_symbols
             .into_iter()
             .filter(|sym| {

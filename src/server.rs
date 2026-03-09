@@ -19,7 +19,7 @@ use crate::extract::{ExtractorRegistry, EnricherRegistry};
 use crate::graph::{self, EdgeKind, Node, Edge, Confidence, ExtractionSource, NodeId, NodeKind};
 use crate::graph::index::GraphIndex;
 use crate::graph::store::{symbols_schema, edges_schema, schema_meta_schema, SCHEMA_VERSION};
-use crate::roots::{WorkspaceConfig, cache_state_path};
+use crate::roots::{WorkspaceConfig, cache_state_path, path_to_slug};
 use crate::scanner::Scanner;
 use crate::types::OhArtifactKind;
 use crate::{code, git, markdown, oh, query};
@@ -2068,7 +2068,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
 
                 // Optionally search code symbols
                 if include_code {
-                    match code::extract_symbols(root) {
+                    match code::extract_symbols(root, &path_to_slug(root)) {
                         Ok(symbols) => {
                             let matches = code::search_symbols(&symbols, &args.query);
                             if !matches.is_empty() {

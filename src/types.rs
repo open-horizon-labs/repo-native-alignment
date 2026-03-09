@@ -80,6 +80,9 @@ impl MarkdownChunk {
 /// A code symbol extracted by tree-sitter
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeSymbol {
+    /// Workspace root slug (matches `NodeId::root` in the graph).
+    #[serde(default)]
+    pub root: String,
     pub file_path: PathBuf,
     pub name: String,
     pub kind: SymbolKind,
@@ -338,7 +341,8 @@ impl QueryResult {
                 out.push_str(&format!("### {} ({} symbols)\n", file, symbols.len()));
                 for sym in symbols.iter().take(3) {
                     let stable_id = format!(
-                        "repo:{}:{}:{}",
+                        "{}:{}:{}:{}",
+                        sym.root,
                         sym.file_path.display(),
                         sym.name,
                         sym.kind
