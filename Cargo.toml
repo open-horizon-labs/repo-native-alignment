@@ -50,7 +50,7 @@ arrow-array = "57"
 arrow-schema = "57"
 
 # Local embeddings — Metal GPU on Apple Silicon, CPU fallback
-metal-candle = { git = "https://github.com/open-horizon-labs/metal-candle", branch = "fix/candle-0.9-compat", features = ["embeddings"] }
+metal-candle = { git = "https://github.com/open-horizon-labs/metal-candle", features = ["embeddings"] }
 candle-core = { version = "0.9", features = ["metal"] }
 
 # CLI
