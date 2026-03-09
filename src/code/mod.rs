@@ -6,11 +6,11 @@ use crate::types::{CodeSymbol, SymbolKind};
 
 /// Recursively find all `.rs` files under `repo_root`, respecting .gitignore rules,
 /// parse each with tree-sitter, and return the collected symbols.
-pub fn extract_symbols(repo_root: &Path, root_slug: &str) -> Result<Vec<CodeSymbol>> {
+pub fn extract_symbols(repo_root: &Path) -> Result<Vec<CodeSymbol>> {
     let mut symbols = Vec::new();
     let rs_files = crate::walk::walk_repo_files(repo_root, &["rs"])?;
     for path in rs_files {
-        match parse_rust_file(&path, root_slug) {
+        match parse_rust_file(&path) {
             Ok(file_symbols) => symbols.extend(file_symbols),
             Err(e) => {
                 tracing::warn!("Failed to parse {}: {}", path.display(), e);
@@ -21,7 +21,7 @@ pub fn extract_symbols(repo_root: &Path, root_slug: &str) -> Result<Vec<CodeSymb
 }
 
 /// Parse a single Rust file with tree-sitter and extract code symbols.
-pub fn parse_rust_file(path: &Path, root_slug: &str) -> Result<Vec<CodeSymbol>> {
+pub fn parse_rust_file(path: &Path) -> Result<Vec<CodeSymbol>> {
     let source = std::fs::read_to_string(path)?;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
@@ -31,7 +31,7 @@ pub fn parse_rust_file(path: &Path, root_slug: &str) -> Result<Vec<CodeSymbol>> 
 
     let mut symbols = Vec::new();
     let root = tree.root_node();
-    collect_symbols(root, path, source.as_bytes(), &None, root_slug, &mut symbols);
+    collect_symbols(root, path, source.as_bytes(), &None, &mut symbols);
     Ok(symbols)
 }
 
@@ -40,7 +40,6 @@ fn collect_symbols(
     path: &Path,
     source: &[u8],
     parent_scope: &Option<String>,
-    root_slug: &str,
     symbols: &mut Vec<CodeSymbol>,
 ) {
     let kind_str = node.kind();
@@ -74,7 +73,6 @@ fn collect_symbols(
             None
         };
         let sym = CodeSymbol {
-            root: root_slug.to_string(),
             file_path: path.to_path_buf(),
             name: name.clone(),
             kind: kind.clone(),
@@ -93,7 +91,7 @@ fn collect_symbols(
             let scope = Some(name);
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i as u32) {
-                    collect_symbols(child, path, source, &scope, root_slug, symbols);
+                    collect_symbols(child, path, source, &scope, symbols);
                 }
             }
             return; // already recursed children
@@ -103,7 +101,7 @@ fn collect_symbols(
     // Recurse into children for non-impl nodes (or nodes that aren't symbols)
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            collect_symbols(child, path, source, parent_scope, root_slug, symbols);
+            collect_symbols(child, path, source, parent_scope, symbols);
         }
     }
 }

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+use crate::graph::Node;
 
 /// Parsed .oh/ artifact (outcome, signal, guardrail, or metis)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,9 +82,6 @@ impl MarkdownChunk {
 /// A code symbol extracted by tree-sitter
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeSymbol {
-    /// Workspace root slug (matches `NodeId::root` in the graph).
-    #[serde(default)]
-    pub root: String,
     pub file_path: PathBuf,
     pub name: String,
     pub kind: SymbolKind,
@@ -127,46 +124,6 @@ impl std::fmt::Display for SymbolKind {
             SymbolKind::Module => write!(f, "module"),
             SymbolKind::Import => write!(f, "import"),
             SymbolKind::Other(s) => write!(f, "{}", s),
-        }
-    }
-}
-
-impl From<SymbolKind> for NodeKind {
-    fn from(sk: SymbolKind) -> Self {
-        match sk {
-            SymbolKind::Function => NodeKind::Function,
-            SymbolKind::Struct => NodeKind::Struct,
-            SymbolKind::Trait => NodeKind::Trait,
-            SymbolKind::Impl => NodeKind::Impl,
-            SymbolKind::Enum => NodeKind::Enum,
-            SymbolKind::Const => NodeKind::Const,
-            SymbolKind::Module => NodeKind::Module,
-            SymbolKind::Import => NodeKind::Import,
-            SymbolKind::Other(s) => NodeKind::Other(s),
-        }
-    }
-}
-
-impl From<CodeSymbol> for Node {
-    /// Bridge for legacy `query_all`/`get_full_context` paths that still use
-    /// `code::extract_symbols` (Rust-only). Hardcodes "rust" because
-    /// `CodeSymbol` has no language field and `extract_symbols` only parses .rs files.
-    /// `outcome_progress` bypasses this entirely — it uses graph Nodes directly.
-    fn from(sym: CodeSymbol) -> Self {
-        Node {
-            id: NodeId {
-                root: sym.root,
-                file: sym.file_path,
-                name: sym.name,
-                kind: sym.kind.into(),
-            },
-            language: String::from("rust"), // Legacy: CodeSymbol is Rust-only
-            line_start: sym.line_start,
-            line_end: sym.line_end,
-            signature: sym.signature,
-            body: sym.body,
-            metadata: BTreeMap::new(),
-            source: ExtractionSource::TreeSitter,
         }
     }
 }

@@ -19,10 +19,10 @@ use crate::extract::{ExtractorRegistry, EnricherRegistry};
 use crate::graph::{self, EdgeKind, Node, Edge, Confidence, ExtractionSource, NodeId, NodeKind};
 use crate::graph::index::GraphIndex;
 use crate::graph::store::{symbols_schema, edges_schema, schema_meta_schema, SCHEMA_VERSION};
-use crate::roots::{WorkspaceConfig, cache_state_path, path_to_slug};
+use crate::roots::{WorkspaceConfig, cache_state_path};
 use crate::scanner::Scanner;
 use crate::types::OhArtifactKind;
-use crate::{code, git, markdown, oh, query};
+use crate::{git, markdown, oh, query};
 use petgraph::Direction;
 use tokio::sync::RwLock;
 
@@ -2066,26 +2066,37 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                     Err(e) => sections.push(format!("Index error: {}", e)),
                 }
 
-                // Optionally search code symbols
+                // Optionally search code symbols from the graph
                 if include_code {
-                    match code::extract_symbols(root, &path_to_slug(root)) {
-                        Ok(symbols) => {
-                            let matches = code::search_symbols(&symbols, &args.query);
+                    if let Ok(guard) = self.get_graph().await {
+                        if let Some(gs) = guard.as_ref() {
+                            let query_lower = args.query.to_lowercase();
+                            let matches: Vec<&Node> = gs.nodes.iter()
+                                .filter(|n| n.id.kind != NodeKind::Import && n.id.root != "external")
+                                .filter(|n| {
+                                    n.id.name.to_lowercase().contains(&query_lower)
+                                        || n.signature.to_lowercase().contains(&query_lower)
+                                })
+                                .take(limit)
+                                .collect();
                             if !matches.is_empty() {
-                                let md = matches
-                                    .iter()
-                                    .take(limit)
-                                    .map(|s| s.to_markdown())
+                                let md = matches.iter()
+                                    .map(|n| format!(
+                                        "- **{} {} ({})** ({})\n  `{}`\n  ID: `{}`",
+                                        n.id.kind, n.id.name, n.language,
+                                        n.id.file.display(),
+                                        n.signature,
+                                        n.stable_id(),
+                                    ))
                                     .collect::<Vec<_>>()
-                                    .join("\n");
+                                    .join("\n\n");
                                 sections.push(format!(
                                     "### Code symbols ({} result(s))\n\n{}",
-                                    matches.len().min(limit),
+                                    matches.len(),
                                     md
                                 ));
                             }
                         }
-                        Err(e) => sections.push(format!("Code search error: {}", e)),
                     }
                 }
 

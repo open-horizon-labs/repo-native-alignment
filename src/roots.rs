@@ -291,7 +291,7 @@ fn home_dir() -> Option<PathBuf> {
 /// Using the full path (not just basename) guarantees uniqueness even when
 /// two worktrees share the same directory name.
 /// e.g., `/Users/foo/src/my-project` -> `users-foo-src-my-project`
-pub(crate) fn path_to_slug(path: &Path) -> String {
+fn path_to_slug(path: &Path) -> String {
     path.to_string_lossy()
         .trim_start_matches('/')
         .to_lowercase()
