@@ -222,10 +222,20 @@ fn collect_nodes(
 
             // Import edge.
             let import_edge = if node_kind == NodeKind::Import {
-                let target_name = parse_import_target(&name);
                 // Try to resolve the import to an actual file path for cross-file edges.
                 let target_file = resolve_import_path(path, &name, config.language_name);
-                let edge_file = target_file.unwrap_or_else(|| path.to_path_buf());
+                let (edge_file, target_name) = if let Some(ref resolved) = target_file {
+                    // Use resolved file's stem as the module name
+                    let stem = resolved.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    (resolved.clone(), stem)
+                } else {
+                    let fallback = parse_import_target(&name);
+                    if fallback.is_empty() { (path.to_path_buf(), String::new()) }
+                    else { (path.to_path_buf(), fallback) }
+                };
                 if !target_name.is_empty() {
                     Some(crate::graph::Edge {
                         from: NodeId {
@@ -242,7 +252,11 @@ fn collect_nodes(
                         },
                         kind: crate::graph::EdgeKind::DependsOn,
                         source: ExtractionSource::TreeSitter,
-                        confidence: crate::graph::Confidence::Detected,
+                        confidence: if target_file.is_some() {
+                            crate::graph::Confidence::Confirmed
+                        } else {
+                            crate::graph::Confidence::Detected
+                        },
                     })
                 } else { None }
             } else { None };
