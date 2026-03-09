@@ -44,7 +44,7 @@ This project IS the RNA MCP server. When working here, use its own tools.
 | `Grep` for "who calls X" | `graph_query(node_id, mode: "impact")` |
 | `Read` to find .oh/ artifacts | `oh_search_context(query)` |
 | `Bash` with `grep -rn` | `search_symbols` or `oh_search_context` |
-| Recording learnings/signals | `oh_record(type, slug, ...)` |
+| Recording learnings/signals | Write to `.oh/metis/`, `.oh/signals/`, `.oh/guardrails/` (YAML frontmatter + markdown) |
 | Searching git history | `git_history(query)` or `git_history(file)` |
 
 **If RNA returns empty results — diagnose before falling back:**
@@ -53,23 +53,22 @@ This project IS the RNA MCP server. When working here, use its own tools.
 - Do NOT silently fall back to Grep/Read on empty RNA results — that defeats the purpose
 - If the index is genuinely stale, say so explicitly rather than substituting file reads
 
-**9 Tools (consolidated from 20+):**
+**7 MCP Tools (read + query only):**
 1. `oh_get_context` -- read all business context (outcomes, signals, guardrails, metis)
 2. `oh_search_context` -- semantic search (.oh/ artifacts, optionally code + markdown)
-3. `oh_record` -- write any business artifact (metis, signal, guardrail, outcome update)
-4. `oh_init` -- scaffold .oh/ directory
-5. `outcome_progress` -- structural join for outcome tracking
-6. `search_symbols` -- graph-aware code symbol search
-7. `graph_query` -- graph traversal (neighbors, impact, reachable)
-8. `git_history` -- commit search + file history
-9. `list_roots` -- workspace root management
+3. `outcome_progress` -- structural join for outcome tracking
+4. `search_symbols` -- graph-aware code symbol search
+5. `graph_query` -- graph traversal (neighbors, impact, reachable)
+6. `list_roots` -- workspace root management
+
+**Writing business artifacts:** Write directly to `.oh/` using the Write tool. See `.oh/metis/`, `.oh/signals/`, `.oh/guardrails/` for frontmatter templates.
 
 **Workflow:**
 - Before starting work: call `oh_get_context` (business context auto-injected on first tool call)
 - Explore code: `search_symbols` -> `graph_query(mode: "neighbors")` -> `graph_query(mode: "impact")`
-- After completing work: call `oh_record(type: "metis", ...)` with key learnings
+- After completing work: write learnings to `.oh/metis/<slug>.md`
 - When checking progress: call `outcome_progress` with `agent-alignment`
-- When discovering constraints: call `oh_record(type: "guardrail", ...)`
+- When discovering constraints: write to `.oh/guardrails/<slug>.md`
 - Tag commits with `[outcome:agent-alignment]`
 
 ---
@@ -93,7 +92,7 @@ MCP server with a workspace-wide context engine. Incrementally scans repos, extr
 
 ## Patterns to Follow
 - `[outcome:X]` in commit messages to link work to outcomes
-- Use `oh_record(type, slug, ...)` to close the feedback loop (metis, signal, guardrail, outcome)
+- Write to `.oh/` to close the feedback loop (metis, signal, guardrail, outcome) — see existing files for frontmatter format
 - Structural joins (outcome_progress) over keyword search for the core use case
 - Pluggable extractors: implement `Extractor` trait for new file types (Phase 1: sync). `Enricher` trait for background enrichment (Phase 2: async, e.g., LSP)
 - Graph model: `Node` + `Edge` types with `ExtractionSource` provenance and `Confidence` levels

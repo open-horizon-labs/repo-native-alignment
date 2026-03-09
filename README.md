@@ -119,16 +119,14 @@ Runs 22+ checks end-to-end. Exits 0 on pass, 1 on failure. Safe to run in CI.
 
 ### 5. Start working
 
-The system compounds from here. Agents use `oh_search_context` to discover relevant context, `search_symbols` to explore code, and `oh_record` to capture learnings. Each session starts richer than the last.
+The system compounds from here. Agents use `oh_search_context` to discover relevant context, `search_symbols` to explore code, and write learnings to `.oh/metis/`. Each session starts richer than the last.
 
-## RNA MCP Server — 9 tools
+## RNA MCP Server — 7 tools
 
 | Category | Tools |
 |----------|-------|
 | **Context** | `oh_get_context` — all business artifacts in one call |
 | **Search** | `oh_search_context` — semantic search over .oh/ + commits (optionally code + markdown) |
-| **Write** | `oh_record` — record metis, signals, guardrails, or update outcomes |
-| **Scaffold** | `oh_init` — bootstrap .oh/ directory (see `/teach-oh` for full setup) |
 | **Code** | `search_symbols` — multi-language symbol search with graph edges |
 | **Graph** | `graph_query` — traverse neighbors, impact analysis, reachability |
 | **History** | `oh_search_context` returns commit hash — use `git show <hash>` via Bash for diffs |

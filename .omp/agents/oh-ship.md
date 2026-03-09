@@ -313,8 +313,8 @@ After shipping, the outer loop continues:
 ## Repo-Native Alignment MCP
 When rna-server tools are available:
 - Call `outcome_progress` to verify the work maps to a declared outcome
-- Call `oh_record_signal` to record measurable progress after shipping
-- Call `oh_update_outcome` if the outcome status should change (e.g., achieved)
+- Write progress signals to `.oh/signals/<slug>.md`
+- Update outcome status in `.oh/outcomes/<slug>.md` frontmatter if needed (e.g., achieved)
 
 ---
 

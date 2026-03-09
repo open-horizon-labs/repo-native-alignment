@@ -327,8 +327,8 @@ When rna-server tools are available:
 - Call `oh_get_guardrails` for pre-flight constraint check
 - During execution: use `search_code` with kind/file filters to understand existing code
 - After completing work: tag commits with `[outcome:X]` for the relevant outcome
-- If discovering constraints: call `oh_record_guardrail_candidate`
-- If learning something worth preserving: call `oh_record_metis`
+- If discovering constraints: write to `.oh/guardrails/<slug>.md` with YAML frontmatter
+- If learning something worth preserving: write to `.oh/metis/<slug>.md` with YAML frontmatter
 
 ---
 
