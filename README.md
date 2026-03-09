@@ -1,8 +1,18 @@
 # Repo-Native Alignment
 
+[![CI](https://github.com/open-horizon-labs/repo-native-alignment/actions/workflows/rust-main-merge.yml/badge.svg)](https://github.com/open-horizon-labs/repo-native-alignment/actions) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Aim-conditioned decision infrastructure for coding agents. Agents don't just execute — they plan and adapt conditioned on declared aims, treating repo artifacts as evidence that updates confidence in whether the current aim framing is still correct.
 
 We don't build features, we build capabilities.
+
+## Platform Support
+
+| Platform | Status | Embeddings |
+|----------|--------|------------|
+| macOS Apple Silicon (ARM) | Full support | Metal GPU (fast) |
+| Linux x86_64 | Supported | CPU-only (slower semantic search) |
+| Windows | Untested | — |
 
 ## How It Works
 
@@ -39,19 +49,44 @@ We don't build features, we build capabilities.
 
 ## Quick Start
 
-### Prerequisites
-
-| Dependency | Install | Required? |
-|------------|---------|-----------|
-| `cargo` | [rustup.rs](https://rustup.rs) | Yes |
-| `npx` | ships with Node.js — [nodejs.org](https://nodejs.org) | Only for `setup --project` (installs OH Skills) |
-
 ### 1. Install
+
+**Claude Code users** (plugin install — recommended):
+
+```bash
+claude install-plugin open-horizon-labs/repo-native-alignment
+```
+
+This downloads the latest release binary for your platform and configures `.mcp.json` automatically. Restart Claude Code after install.
+
+**Download a prebuilt binary** (manual):
+
+```bash
+# macOS Apple Silicon
+curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64 -o repo-native-alignment
+chmod +x repo-native-alignment && sudo mv repo-native-alignment /usr/local/bin/
+
+# Linux x86_64
+curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-linux-x86_64 -o repo-native-alignment
+chmod +x repo-native-alignment && sudo mv repo-native-alignment /usr/local/bin/
+```
+
+**Build from source** (requires [Rust toolchain](https://rustup.rs)):
 
 ```bash
 git clone https://github.com/open-horizon-labs/repo-native-alignment.git
 cd repo-native-alignment
 cargo install --locked --path .
+```
+
+### 1b. Try it from the CLI
+
+Before wiring up MCP, evaluate RNA directly from the terminal:
+
+```bash
+repo-native-alignment search "auth" --repo /path/to/your/project
+repo-native-alignment graph --node "<stable-id-from-search>" --mode impact --repo .
+repo-native-alignment scan --path /path/to/your/project
 ```
 
 ### 2. Set up a project
@@ -86,10 +121,6 @@ Runs 22+ checks end-to-end. Exits 0 on pass, 1 on failure. Safe to run in CI.
 
 The system compounds from here. Agents use `oh_search_context` to discover relevant context, `search_symbols` to explore code, and `oh_record` to capture learnings. Each session starts richer than the last.
 
----
-
-**Manual path:** Build from source (`cargo build --release`), add `rna-server` to your `.mcp.json` pointing at the binary with `--repo <project path>`. The setup command automates this.
-
 ## RNA MCP Server — 9 tools
 
 | Category | Tools |
@@ -111,10 +142,11 @@ The system compounds from here. Agents use `oh_search_context` to discover relev
 ├── outcomes/        <- what we're optimizing for (YAML frontmatter + markdown)
 ├── signals/         <- how we measure progress (SLO definitions + observations)
 ├── guardrails/      <- constraints that shape behavior (hard/soft/candidate)
-├── metis/           <- learnings that compound (the institutional memory)
+├── metis/           <- learnings that compound across sessions
 ├── config.toml      <- scanner excludes, per-project tuning
 └── .cache/          <- scan state, embedding index (gitignored)
 ```
+
 
 Outcomes declare `files:` patterns linking to code. Commits tag `[outcome:X]` linking to outcomes. These structural links power `outcome_progress`.
 
@@ -143,7 +175,36 @@ Agent wrappers for each workflow phase (`oh-aim`, `oh-execute`, `oh-ship`, etc.)
 
 ## Status
 
-**Working today:** 9 MCP tools, 22 language extractors, 190+ tests. Structural outcome-to-code joins, LSP-enriched impact analysis, cross-language constant search, Metal GPU semantic search, event-driven reindex, persistent index with <1s restarts. Validated on 3 repos.
+**Working today:** 9 MCP tools, 22 language extractors, 190+ tests. Structural outcome-to-code joins, LSP-enriched impact analysis, cross-language constant search, Metal GPU semantic search, event-driven reindex, persistent index with <1s restarts.
+
+### Tested On
+
+| Harness | Repo types |
+|---------|-----------|
+| Claude Code | Rust, Python/TypeScript monorepo, Rust/TypeScript |
+| Oh-My-Pi | Rust, Python/TypeScript monorepo |
+
+Only tested on Apple Silicon (M-series) Macs. Linux x86_64 builds are available but less battle-tested.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+## Glossary
+
+| Term | What it means |
+|------|--------------|
+| **Tree-sitter** | A parser that reads source code and produces a syntax tree — the structured representation of functions, classes, imports, etc. RNA uses it to extract symbols from 22 languages without running the code. |
+| **LSP** | Language Server Protocol. The same protocol your editor uses for go-to-definition and find-references. RNA talks to language servers to enrich the graph with type information and call hierarchies. |
+| **Graph** | A network of nodes (symbols, files, outcomes) and edges (calls, depends_on, implements). RNA builds this in memory so you can ask "what depends on this function?" or "what's the blast radius of this change?" |
+| **Embeddings** | Vector representations of text that capture meaning. RNA embeds code signatures, commit messages, and business artifacts so `oh_search_context` can find relevant results by meaning, not just keywords. Uses Metal GPU on Apple Silicon, CPU elsewhere. |
+| **LanceDB** | The columnar + vector database RNA uses to store the graph and embeddings on disk. Lives in `.oh/.cache/`. |
+| **petgraph** | The in-memory graph index RNA uses for fast traversal (neighbors, impact analysis, reachability). Rebuilt from LanceDB on startup. |
+| **Outcome** | A business result you're optimizing for. Example: "Agents correctly scope work to declared aims." |
+| **Signal** | How you measure progress toward an outcome. Example: "Agent identifies which outcome a task serves without re-prompting." |
+| **Guardrail** | A constraint that shapes behavior — hard (never bend), soft (negotiate), or candidate (proposed). Example: "No language-specific conditionals in generic.rs." |
+| **Metis** | A learning earned through experience — [Greek: practical wisdom](https://en.wikipedia.org/wiki/Metis_(mythology)) gained from doing, not reading. Example: "Protocol version mismatch silently hangs MCP clients." |
+| **MCP** | Model Context Protocol. The standard for connecting AI agents to external tools. RNA exposes its capabilities as MCP tools that Claude Code (and other MCP clients) can call. |
 
 ## Detailed Documentation
 
