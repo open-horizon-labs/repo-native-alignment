@@ -1226,9 +1226,16 @@ impl RnaHandler {
                             for node in &mut extraction.nodes {
                                 node.id.root = root_slug.clone();
                             }
+                            // Build file index from existing + new nodes for suffix resolution
+                            let file_index: std::collections::HashSet<String> = graph_state.nodes
+                                .iter()
+                                .chain(extraction.nodes.iter())
+                                .map(|n| n.id.file.to_string_lossy().to_string())
+                                .collect();
                             for edge in &mut extraction.edges {
                                 edge.from.root = root_slug.clone();
                                 edge.to.root = root_slug.clone();
+                                resolve_edge_target_by_suffix(edge, &file_index);
                             }
                             let upsert_nodes = extraction.nodes.clone();
                             let upsert_edges = extraction.edges.clone();
@@ -1389,9 +1396,17 @@ impl RnaHandler {
             for node in &mut extraction.nodes {
                 node.id.root = root_slug.clone();
             }
+            // Build file index for suffix matching import edges
+            let file_index: std::collections::HashSet<String> = extraction.nodes
+                .iter()
+                .map(|n| n.id.file.to_string_lossy().to_string())
+                .collect();
+
             for edge in &mut extraction.edges {
                 edge.from.root = root_slug.clone();
                 edge.to.root = root_slug.clone();
+                // Resolve dangling import edges via suffix match
+                resolve_edge_target_by_suffix(edge, &file_index);
             }
 
             tracing::info!(
@@ -2178,6 +2193,62 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                             })
                             .collect();
 
+                        // Rank results by relevance:
+                        // 1. Exact name match > name contains > signature-only
+                        // 2. Definitions (function/struct/trait) > constants > imports
+                        // 3. Non-test files > test files
+                        // 4. More referenced symbols first (higher edge count)
+                        matches.sort_by(|a, b| {
+                            let a_name_lower = a.id.name.to_lowercase();
+                            let b_name_lower = b.id.name.to_lowercase();
+                            let a_exact = a_name_lower == query_lower;
+                            let b_exact = b_name_lower == query_lower;
+                            let a_name_contains = a_name_lower.contains(&query_lower);
+                            let b_name_contains = b_name_lower.contains(&query_lower);
+
+                            // Tier 1: exact name match
+                            match (a_exact, b_exact) {
+                                (true, false) => return std::cmp::Ordering::Less,
+                                (false, true) => return std::cmp::Ordering::Greater,
+                                _ => {}
+                            }
+                            // Tier 2: name contains vs signature-only
+                            match (a_name_contains, b_name_contains) {
+                                (true, false) => return std::cmp::Ordering::Less,
+                                (false, true) => return std::cmp::Ordering::Greater,
+                                _ => {}
+                            }
+                            // Tier 3: prefer definitions over imports
+                            let kind_rank = |n: &Node| -> u8 {
+                                match n.id.kind {
+                                    NodeKind::Function | NodeKind::Struct | NodeKind::Trait | NodeKind::Enum => 0,
+                                    NodeKind::Const | NodeKind::Field | NodeKind::Impl => 1,
+                                    NodeKind::Import | NodeKind::Module => 3,
+                                    _ => 1,
+                                }
+                            };
+                            let kr = kind_rank(a).cmp(&kind_rank(b));
+                            if kr != std::cmp::Ordering::Equal { return kr; }
+
+                            // Tier 4: non-test files before test files
+                            let is_test = |n: &Node| -> bool {
+                                let p = n.id.file.to_string_lossy();
+                                p.contains(".test.") || p.contains(".spec.") || p.contains("_test.") || p.contains("/test/") || p.contains("/tests/")
+                            };
+                            match (is_test(a), is_test(b)) {
+                                (false, true) => return std::cmp::Ordering::Less,
+                                (true, false) => return std::cmp::Ordering::Greater,
+                                _ => {}
+                            }
+
+                            // Tier 5: more edges = more important
+                            let edge_count = |n: &Node| -> usize {
+                                let sid = n.stable_id();
+                                graph_state.index.neighbors(&sid, None, Direction::Incoming).len()
+                                    + graph_state.index.neighbors(&sid, None, Direction::Outgoing).len()
+                            };
+                            edge_count(b).cmp(&edge_count(a))
+                        });
                         matches.truncate(limit);
 
                         let freshness = format_freshness(
@@ -2460,11 +2531,49 @@ fn parse_args<T: serde::de::DeserializeOwned>(
 }
 
 /// Format a list of node IDs into markdown, enriched with node details if available.
+/// Resolve an edge's `to.file` against the set of known scanned file paths.
+/// If `to.file` doesn't match any known file but a known file ends with it
+/// (suffix match), update the edge to point to the matched file.
+/// This handles Python absolute imports where the import path is a suffix
+/// of the actual file path (e.g., `src/util/user_utils.py` matches
+/// `ai_service/src/util/user_utils.py`).
+fn resolve_edge_target_by_suffix(
+    edge: &mut graph::Edge,
+    file_index: &std::collections::HashSet<String>,
+) {
+    let target = edge.to.file.to_string_lossy().to_string();
+    if file_index.contains(&target) {
+        return; // exact match, nothing to resolve
+    }
+    // Suffix match: find a scanned file that ends with the target path
+    let suffix = format!("/{}", target);
+    let matches: Vec<&String> = file_index
+        .iter()
+        .filter(|f| f.ends_with(&suffix))
+        .collect();
+    if matches.len() == 1 {
+        edge.to.file = std::path::PathBuf::from(matches[0]);
+        edge.confidence = graph::Confidence::Confirmed;
+        tracing::debug!(
+            "Resolved import edge target: {} → {}",
+            target,
+            matches[0]
+        );
+    }
+    // If 0 or 2+ matches, leave as-is (ambiguous or truly dangling)
+}
+
 fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String]) -> String {
     ids.iter()
-        .map(|id| {
+        .filter_map(|id| {
             if let Some(node) = nodes.iter().find(|n| n.stable_id() == *id) {
-                format!(
+                // Filter out module and PR-merge nodes — they're structural scaffolding,
+                // not useful for agents doing impact analysis or exploration.
+                match node.id.kind {
+                    graph::NodeKind::Module | graph::NodeKind::PrMerge => return None,
+                    _ => {}
+                }
+                Some(format!(
                     "- **{}** `{}` ({}) `{}`:{}-{}",
                     node.id.kind,
                     node.id.name,
@@ -2472,9 +2581,9 @@ fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String]) -> String {
                     node.id.file.display(),
                     node.line_start,
                     node.line_end,
-                )
+                ))
             } else {
-                format!("- `{}`", id)
+                Some(format!("- `{}`", id))
             }
         })
         .collect::<Vec<_>>()

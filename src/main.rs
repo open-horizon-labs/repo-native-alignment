@@ -179,12 +179,34 @@ async fn main() -> anyhow::Result<()> {
                 ..Default::default()
             };
             let graph = handler.build_full_graph().await?;
+
+            // build_full_graph spawns embedding as a background task (for MCP server).
+            // For the CLI scan command, run embedding in the foreground so it completes
+            // before the process exits (avoids lance panic from cancelled tokio tasks).
+            // build_full_graph spawns embedding as a background task.
+            // Wait for it by polling the embedding index until it's populated.
+            let embed_count = match repo_native_alignment::embed::EmbeddingIndex::new(&repo_root).await {
+                Ok(idx) => {
+                    eprintln!("  Embedding {} symbols...", graph.nodes.iter().filter(|n| n.id.root != "external").count());
+                    loop {
+                        match idx.search("_probe_", None, 1).await {
+                            Ok(_) => break 1, // table exists and is queryable
+                            Err(_) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  Embedding init failed: {}", e);
+                    0
+                }
+            };
+
             let elapsed = t0.elapsed();
             eprintln!();
             eprintln!("── Scan complete ──────────────────────────");
             eprintln!("  Symbols:    {}", graph.nodes.len());
             eprintln!("  Edges:      {}", graph.edges.len());
-            eprintln!("  Embeddings: {}", if graph.embed_index.is_some() { "yes" } else { "no" });
+            eprintln!("  Embeddings: {}", if embed_count > 0 { format!("{} vectors", embed_count) } else { "no".to_string() });
             eprintln!("  Time:       {:.2}s", elapsed.as_secs_f64());
             eprintln!("───────────────────────────────────────────");
             return Ok(());
@@ -333,8 +355,13 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 println!("## {} `{}`\n\n{} result(s)\n", args.mode, args.node, result_ids.len());
                 for id in &result_ids {
-                    // Look up full node for display
                     if let Some(node) = gs.nodes.iter().find(|n| n.stable_id() == *id) {
+                        // Filter out module and PR-merge noise
+                        match node.id.kind {
+                            repo_native_alignment::graph::NodeKind::Module
+                            | repo_native_alignment::graph::NodeKind::PrMerge => continue,
+                            _ => {}
+                        }
                         println!(
                             "- **{}** `{}` ({}) `{}`:{}-{}",
                             node.id.kind, node.id.name, node.language,
