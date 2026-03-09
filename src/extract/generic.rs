@@ -24,7 +24,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::graph::{ExtractionSource, Node, NodeId, NodeKind, Edge};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 use super::string_literals::harvest_string_literals;
 use super::{ExtractionResult, Extractor};
 
@@ -56,6 +56,16 @@ pub struct LangConfig {
     /// String literal tree-sitter node kinds for synthetic Const harvesting.
     /// Each entry: (outer_node_kind, optional_content_child_kind).
     pub string_literal_kinds: &'static [(&'static str, Option<&'static str>)],
+    /// Tree-sitter field name for the parameters container on function nodes.
+    /// None = skip DependsOn type edge extraction for this language.
+    pub param_container_field: Option<&'static str>,
+    /// Tree-sitter field name for the type annotation on each parameter.
+    pub param_type_field: Option<&'static str>,
+    /// Tree-sitter field name for the function return type.
+    pub return_type_field: Option<&'static str>,
+    /// Whether user-defined types must start with uppercase.
+    /// false for Go (unexported types) and Python (lowercase classes).
+    pub type_requires_uppercase: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +144,7 @@ fn collect_nodes(
     path: &Path,
     source: &[u8],
     config: &LangConfig,
-    parent_scope: &Option<String>,
+    parent_scope: &Option<(String, NodeKind)>,
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
 ) {
@@ -178,8 +188,8 @@ fn collect_nodes(
             let mut metadata = BTreeMap::new();
 
             // Parent scope.
-            if let Some(scope) = parent_scope {
-                metadata.insert("parent_scope".to_string(), scope.clone());
+            if let Some((scope_name, _)) = parent_scope {
+                metadata.insert("parent_scope".to_string(), scope_name.clone());
             }
 
             // Name column for LSP cursor positioning.
@@ -254,9 +264,159 @@ fn collect_nodes(
                 edges.push(edge);
             }
 
+            // Function parameter/return type DependsOn edges (config-driven).
+            // Parameter and return type extraction are independent -- a language
+            // may support return type extraction even if param container isn't
+            // accessible via a simple field name (e.g. C++).
+            if node_kind == NodeKind::Function {
+                let has_type_edges = config.param_container_field.is_some()
+                    || config.return_type_field.is_some();
+                if has_type_edges {
+                    let fn_id = NodeId {
+                        root: String::new(),
+                        file: path.to_path_buf(),
+                        name: name.clone(),
+                        kind: NodeKind::Function,
+                    };
+                    // Parameter types
+                    if let Some(param_field) = config.param_container_field {
+                        if let Some(params) = node.child_by_field_name(param_field) {
+                            if let Some(type_field) = config.param_type_field {
+                                for i in 0..params.child_count() {
+                                    if let Some(param) = params.child(i as u32) {
+                                        if let Some(tn) = param.child_by_field_name(type_field) {
+                                            let type_text = tn.utf8_text(source).unwrap_or("");
+                                            if let Some(type_name) = extract_user_type(type_text, config.type_requires_uppercase) {
+                                                edges.push(Edge {
+                                                    from: fn_id.clone(),
+                                                    to: NodeId {
+                                                        root: String::new(),
+                                                        file: path.to_path_buf(),
+                                                        name: type_name,
+                                                        kind: NodeKind::Struct,
+                                                    },
+                                                    kind: EdgeKind::DependsOn,
+                                                    source: ExtractionSource::TreeSitter,
+                                                    confidence: Confidence::Detected,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Return type (independent of param extraction)
+                    if let Some(ret_field) = config.return_type_field {
+                        if let Some(rn) = node.child_by_field_name(ret_field) {
+                            let ret_text = rn.utf8_text(source).unwrap_or("");
+                            if let Some(type_name) = extract_user_type(ret_text, config.type_requires_uppercase) {
+                                edges.push(Edge {
+                                    from: fn_id,
+                                    to: NodeId {
+                                        root: String::new(),
+                                        file: path.to_path_buf(),
+                                        name: type_name,
+                                        kind: NodeKind::Struct,
+                                    },
+                                    kind: EdgeKind::DependsOn,
+                                    source: ExtractionSource::TreeSitter,
+                                    confidence: Confidence::Detected,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Module-level containment: top-level symbols get Defines edge from file module.
+            if parent_scope.is_none() && node_kind != NodeKind::Import {
+                let module_id = NodeId {
+                    root: String::new(),
+                    file: path.to_path_buf(),
+                    name: path.file_stem()
+                        .unwrap_or(std::ffi::OsStr::new("module"))
+                        .to_string_lossy()
+                        .to_string(),
+                    kind: NodeKind::Module,
+                };
+                edges.push(Edge {
+                    from: module_id,
+                    to: NodeId {
+                        root: String::new(),
+                        file: path.to_path_buf(),
+                        name: name.clone(),
+                        kind: node_kind.clone(),
+                    },
+                    kind: EdgeKind::Defines,
+                    source: ExtractionSource::TreeSitter,
+                    confidence: Confidence::Detected,
+                });
+            }
+
+            // Emit structural edge from parent scope to this node.
+            if let Some((scope_name, parent_kind)) = parent_scope {
+                let edge_kind = if node_kind == NodeKind::Field {
+                    EdgeKind::HasField
+                } else {
+                    EdgeKind::Defines
+                };
+                edges.push(Edge {
+                    from: NodeId {
+                        root: String::new(),
+                        file: path.to_path_buf(),
+                        name: scope_name.clone(),
+                        kind: parent_kind.clone(),
+                    },
+                    to: NodeId {
+                        root: String::new(),
+                        file: path.to_path_buf(),
+                        name: name.clone(),
+                        kind: node_kind.clone(),
+                    },
+                    kind: edge_kind,
+                    source: ExtractionSource::TreeSitter,
+                    confidence: Confidence::Detected,
+                });
+            }
+
+            // Trait implementation edge.
+            if node_kind == NodeKind::Impl {
+                if let Some(trait_node) = node.child_by_field_name("trait") {
+                    let trait_name = trait_node.utf8_text(source).unwrap_or("?").to_string();
+                    if let Some(type_node) = node.child_by_field_name("type") {
+                        let type_name = type_node.utf8_text(source).unwrap_or("?").to_string();
+                        edges.push(Edge {
+                            from: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: type_name,
+                                kind: NodeKind::Struct,
+                            },
+                            to: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: trait_name,
+                                kind: NodeKind::Trait,
+                            },
+                            kind: EdgeKind::Implements,
+                            source: ExtractionSource::TreeSitter,
+                            confidence: Confidence::Detected,
+                        });
+                    }
+                }
+            }
+
             // Scope propagation into children.
             if config.scope_parent_kinds.contains(&kind_str) {
-                let scope = Some(name);
+                let scope_kind = if node_kind == NodeKind::Impl
+                    && node.child_by_field_name("trait").is_none() {
+                    // Plain `impl Foo` — methods belong to the struct, not the impl
+                    NodeKind::Struct
+                } else {
+                    node_kind
+                };
+                let scope = Some((name, scope_kind));
                 for i in 0..node.child_count() {
                     if let Some(child) = node.child(i as u32) {
                         collect_nodes(child, path, source, config, &scope, nodes, edges);
@@ -288,6 +448,79 @@ fn extract_signature(body: &str) -> String {
         }
     }
     body.lines().next().unwrap_or("").trim().to_string()
+}
+
+/// Extract a user-defined type name from a type text, skipping primitives.
+///
+/// Takes the first identifier (before any `<` generics), returns `None` for
+/// primitives like `u32`, `bool`, `String`, `Vec`, `Option`, `Result`, and
+/// reference/lifetime prefixes like `&self`.
+///
+/// When `require_uppercase` is true, the identifier must start with an
+/// uppercase letter (convention for most languages). When false, any
+/// non-primitive identifier is accepted (needed for Go unexported types
+/// and Python lowercase classes).
+fn extract_user_type(type_text: &str, require_uppercase: bool) -> Option<String> {
+    // Strip reference prefix (e.g. "&Foo", "&mut Foo")
+    // Also strip Python/TS annotation prefix `: Foo` and `-> Foo`
+    let s = type_text.trim()
+        .trim_start_matches("->")
+        .trim_start_matches(':')
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches('*')
+        .trim_start_matches("mut ")
+        .trim_start_matches("const ")
+        .trim();
+    // Take first identifier (before `<` generics, `::` paths, `[` arrays, or `|` unions)
+    let ident = s.split(|c: char| c == '<' || c == ':' || c == ' ' || c == '[' || c == '|' || c == '?')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if ident.is_empty() {
+        return None;
+    }
+    // When require_uppercase is set, the identifier must start with uppercase
+    // to be considered a user-defined type. When false (Go, Python), any
+    // non-primitive, non-keyword identifier is accepted.
+    if require_uppercase && !ident.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return None;
+    }
+    // Even without uppercase requirement, skip lowercase keywords and builtins
+    if !require_uppercase && !ident.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    // Skip known standard library / primitive types (cross-language)
+    const PRIMITIVES: &[&str] = &[
+        // Rust stdlib
+        "String", "Vec", "Option", "Result", "Box", "Rc", "Arc",
+        "HashMap", "HashSet", "BTreeMap", "BTreeSet", "Cow",
+        "Cell", "RefCell", "Mutex", "RwLock",
+        "Pin", "Future", "Stream", "Iterator",
+        "Self",
+        // Cross-language primitives (title-cased forms)
+        "Int", "Float", "Bool", "None", "Void",
+        "Any", "Number", "Object", "Undefined", "Null",
+        "Error", "Array", "Map", "Set", "List", "Dict",
+        "Promise", "Tuple", "Type", "Interface",
+        "Boolean", "Integer", "Double", "Long", "Short", "Byte", "Char",
+        // Lowercase primitives (Go, Python, C, etc.)
+        "int", "int8", "int16", "int32", "int64",
+        "uint", "uint8", "uint16", "uint32", "uint64",
+        "float32", "float64", "float", "double",
+        "string", "bool", "byte", "rune", "uintptr",
+        "error", "any", "comparable",
+        "str", "bytes", "list", "dict", "set", "tuple", "object", "type",
+        "void", "char", "short", "long", "unsigned", "signed",
+        "self", "none",
+        "usize", "isize", "u8", "u16", "u32", "u64", "u128",
+        "i8", "i16", "i32", "i64", "i128", "f32", "f64",
+        "comptime_int", "comptime_float", "noreturn",
+    ];
+    if PRIMITIVES.contains(&ident) {
+        return None;
+    }
+    Some(ident.to_string())
 }
 
 /// Parse the target module name from an import declaration text.
@@ -338,6 +571,23 @@ pub struct Foo {
     pub bar: u32,
     baz: String,
 }
+
+impl Foo {
+    pub fn do_thing(&self, other: Bar) -> u32 {
+        self.bar
+    }
+}
+
+trait Greet {
+    fn greet(&self) -> String;
+}
+
+impl Greet for Foo {
+    fn greet(&self) -> String {
+        String::new()
+    }
+}
+
 pub fn hello() {}
 "#;
         let result = ext.extract(Path::new("test.rs"), code).unwrap();
@@ -345,5 +595,284 @@ pub fn hello() {}
         assert!(kinds.contains(&&NodeKind::Struct), "Should find Foo struct");
         assert!(kinds.contains(&&NodeKind::Function), "Should find hello fn");
         assert!(kinds.contains(&&NodeKind::Field), "Should find bar field: {:?}", kinds);
+
+        // Assert structural edges are emitted — prevents silent regression
+        // if the edge emission block is removed.
+        let has_field_edges: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::HasField)
+            .collect();
+        assert!(
+            !has_field_edges.is_empty(),
+            "Should emit HasField edges for struct fields, got edges: {:?}",
+            result.edges.iter().map(|e| format!("{:?}", e.kind)).collect::<Vec<_>>()
+        );
+        // Verify a HasField edge connects Foo -> bar
+        assert!(
+            has_field_edges.iter().any(|e| e.from.name == "Foo" && e.to.name == "bar"
+                && e.from.kind == NodeKind::Struct && e.to.kind == NodeKind::Field),
+            "Should have HasField edge from Foo struct to bar field"
+        );
+
+        let defines_edges: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Defines)
+            .collect();
+        assert!(
+            !defines_edges.is_empty(),
+            "Should emit Defines edges for impl methods, got edges: {:?}",
+            result.edges.iter().map(|e| format!("{:?}", e.kind)).collect::<Vec<_>>()
+        );
+        // Verify a Defines edge connects Foo:struct -> do_thing (not Foo:impl)
+        assert!(
+            defines_edges.iter().any(|e| e.from.name == "Foo" && e.from.kind == NodeKind::Struct
+                && e.to.name == "do_thing" && e.to.kind == NodeKind::Function),
+            "Should have Defines edge from Foo:struct to do_thing method, got: {:?}",
+            defines_edges
+        );
+
+        // Verify Implements edge: Foo:struct -> Greet:trait
+        let implements_edges: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Implements)
+            .collect();
+        assert!(
+            implements_edges.iter().any(|e| e.from.name == "Foo" && e.from.kind == NodeKind::Struct
+                && e.to.name == "Greet" && e.to.kind == NodeKind::Trait),
+            "Should have Implements edge from Foo:struct to Greet:trait, got: {:?}",
+            implements_edges
+        );
+
+        // Verify module-level Defines: test:module -> hello:function
+        let module_defines: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Defines && e.from.kind == NodeKind::Module)
+            .collect();
+        assert!(
+            module_defines.iter().any(|e| e.from.name == "test" && e.to.name == "hello"
+                && e.to.kind == NodeKind::Function),
+            "Should have Defines edge from test:module to hello:function, got: {:?}",
+            module_defines
+        );
+
+        // Verify DependsOn: do_thing:function -> Bar:struct (parameter type)
+        let depends_on_edges: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::DependsOn)
+            .collect();
+        assert!(
+            depends_on_edges.iter().any(|e| e.from.name == "do_thing" && e.from.kind == NodeKind::Function
+                && e.to.name == "Bar" && e.to.kind == NodeKind::Struct),
+            "Should have DependsOn edge from do_thing:function to Bar:struct, got: {:?}",
+            depends_on_edges
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-language DependsOn edge extraction tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: extract DependsOn edges from a code snippet using a given config.
+    fn depends_on_edges_for(config: &'static LangConfig, path: &str, code: &str) -> Vec<Edge> {
+        let ext = GenericExtractor::new(config);
+        let result = ext.run(Path::new(path), code).unwrap();
+        result.edges.into_iter()
+            .filter(|e| e.kind == EdgeKind::DependsOn && e.from.kind == NodeKind::Function)
+            .collect()
+    }
+
+    #[test]
+    fn test_depends_on_python() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = "class Foo:\n    pass\n\ndef process(item: Foo) -> Bar:\n    pass\n";
+        let edges = depends_on_edges_for(&PYTHON_CONFIG, "test.py", code);
+        assert!(
+            edges.iter().any(|e| e.to.name == "Foo"),
+            "Python: should emit DependsOn for param type Foo, got: {:?}",
+            edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+        assert!(
+            edges.iter().any(|e| e.to.name == "Bar"),
+            "Python: should emit DependsOn for return type Bar, got: {:?}",
+            edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_depends_on_typescript() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let code = "class Foo {}\nfunction process(item: Foo): Bar {\n    return new Bar();\n}\n";
+        let edges = depends_on_edges_for(&TYPESCRIPT_CONFIG, "test.ts", code);
+        assert!(
+            edges.iter().any(|e| e.to.name == "Foo"),
+            "TypeScript: should emit DependsOn for param type Foo, got: {:?}",
+            edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+        assert!(
+            edges.iter().any(|e| e.to.name == "Bar"),
+            "TypeScript: should emit DependsOn for return type Bar, got: {:?}",
+            edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_depends_on_go() {
+        use crate::extract::configs::GO_CONFIG;
+        let code = "package main\n\ntype Foo struct{}\nfunc Process(item Foo) Bar {\n    return Bar{}\n}\n";
+        let edges = depends_on_edges_for(&GO_CONFIG, "test.go", code);
+        assert!(
+            edges.iter().any(|e| e.to.name == "Foo"),
+            "Go: should emit DependsOn for param type Foo, got: {:?}",
+            edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+        assert!(
+            edges.iter().any(|e| e.to.name == "Bar"),
+            "Go: should emit DependsOn for return type Bar, got: {:?}",
+            edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_depends_on_go_unexported_types() {
+        // Go unexported types (lowercase) should still be detected as user types.
+        use crate::extract::configs::GO_CONFIG;
+        let code = "package main\n\nfunc process(item myStruct) otherType {\n    return otherType{}\n}\n";
+        let edges = depends_on_edges_for(&GO_CONFIG, "test.go", code);
+        assert!(
+            edges.iter().any(|e| e.to.name == "myStruct"),
+            "Go: should emit DependsOn for unexported param type myStruct, got: {:?}",
+            edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+        assert!(
+            edges.iter().any(|e| e.to.name == "otherType"),
+            "Go: should emit DependsOn for unexported return type otherType, got: {:?}",
+            edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_depends_on_go_skips_primitives() {
+        // Go primitives (string, int, bool, error) should NOT produce DependsOn edges.
+        use crate::extract::configs::GO_CONFIG;
+        let code = "package main\n\nfunc process(name string, count int) error {\n    return nil\n}\n";
+        let edges = depends_on_edges_for(&GO_CONFIG, "test.go", code);
+        assert!(
+            edges.is_empty(),
+            "Go: should NOT emit DependsOn for primitive types, got: {:?}",
+            edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_depends_on_python_lowercase_class() {
+        // Python classes can be lowercase -- should still be detected.
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = "def process(item: my_class) -> other_class:\n    pass\n";
+        let edges = depends_on_edges_for(&PYTHON_CONFIG, "test.py", code);
+        assert!(
+            edges.iter().any(|e| e.to.name == "my_class"),
+            "Python: should emit DependsOn for lowercase class my_class, got: {:?}",
+            edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_depends_on_java() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let code = "class Foo {}\nclass Main {\n    Bar process(Foo item) {\n        return null;\n    }\n}\n";
+        let edges = depends_on_edges_for(&JAVA_CONFIG, "test.java", code);
+        assert!(
+            edges.iter().any(|e| e.to.name == "Foo"),
+            "Java: should emit DependsOn for param type Foo, got: {:?}",
+            edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+        assert!(
+            edges.iter().any(|e| e.to.name == "Bar"),
+            "Java: should emit DependsOn for return type Bar, got: {:?}",
+            edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_depends_on_csharp() {
+        use crate::extract::configs::CSHARP_CONFIG;
+        let code = "class Foo {}\nclass Main {\n    Bar Process(Foo item) {\n        return null;\n    }\n}\n";
+        let edges = depends_on_edges_for(&CSHARP_CONFIG, "test.cs", code);
+        assert!(
+            edges.iter().any(|e| e.to.name == "Foo"),
+            "C#: should emit DependsOn for param type Foo, got: {:?}",
+            edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+        assert!(
+            edges.iter().any(|e| e.to.name == "Bar"),
+            "C#: should emit DependsOn for return type Bar, got: {:?}",
+            edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_depends_on_cpp_return_type() {
+        // C++ param types need per-language logic (params are on declarator),
+        // but return type IS accessible via field "type" on function_definition.
+        use crate::extract::configs::CPP_CONFIG;
+        let code = "class Foo {};\nBar process(Foo item) {\n    return Bar();\n}\n";
+        let edges = depends_on_edges_for(&CPP_CONFIG, "test.cpp", code);
+        assert!(
+            edges.iter().any(|e| e.to.name == "Bar"),
+            "C++: should emit DependsOn for return type Bar, got: {:?}",
+            edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+    }
+
+    // Kotlin, Swift, and Zig DependsOn tests: these languages have tree-sitter
+    // grammars where function parameter/return type nodes are NOT accessible via
+    // simple field names on the function node. DependsOn extraction for these
+    // languages requires per-language extractor logic (TODO).
+    // The configs correctly set param_container_field = None to avoid silent
+    // failures. When per-language extractors are added, these tests should be
+    // updated to assert DependsOn edges.
+
+    #[test]
+    fn test_depends_on_kotlin_skipped() {
+        // Kotlin tree-sitter-kotlin-ng does not expose function params/return type
+        // via field names -- DependsOn intentionally skipped via None config.
+        use crate::extract::configs::KOTLIN_CONFIG;
+        assert!(KOTLIN_CONFIG.param_container_field.is_none(),
+            "Kotlin param_container_field should be None (grammar lacks field names)");
+    }
+
+    #[test]
+    fn test_depends_on_swift_skipped() {
+        // Swift tree-sitter does not expose function params via a container field,
+        // and overloads the "name" field for types -- DependsOn intentionally skipped.
+        use crate::extract::configs::SWIFT_CONFIG;
+        assert!(SWIFT_CONFIG.param_container_field.is_none(),
+            "Swift param_container_field should be None (grammar lacks container field)");
+    }
+
+    #[test]
+    fn test_depends_on_zig_skipped() {
+        // Zig tree-sitter: "parameters" is a child node kind, not a field name
+        // on function_declaration -- DependsOn intentionally skipped.
+        use crate::extract::configs::ZIG_CONFIG;
+        assert!(ZIG_CONFIG.param_container_field.is_none(),
+            "Zig param_container_field should be None (not a field name in grammar)");
+    }
+
+    #[test]
+    fn test_extract_user_type_uppercase_required() {
+        // With require_uppercase = true (default for most languages)
+        assert_eq!(extract_user_type("Foo", true), Some("Foo".to_string()));
+        assert_eq!(extract_user_type("Bar<T>", true), Some("Bar".to_string()));
+        assert_eq!(extract_user_type("&Foo", true), Some("Foo".to_string()));
+        assert_eq!(extract_user_type("u32", true), None);
+        assert_eq!(extract_user_type("String", true), None); // stdlib
+        assert_eq!(extract_user_type("foo", true), None); // lowercase rejected
+    }
+
+    #[test]
+    fn test_extract_user_type_no_uppercase_required() {
+        // With require_uppercase = false (Go, Python)
+        assert_eq!(extract_user_type("Foo", false), Some("Foo".to_string()));
+        assert_eq!(extract_user_type("myStruct", false), Some("myStruct".to_string()));
+        assert_eq!(extract_user_type("string", false), None); // primitive
+        assert_eq!(extract_user_type("int", false), None); // primitive
+        assert_eq!(extract_user_type("error", false), None); // Go builtin
+        assert_eq!(extract_user_type("bool", false), None); // primitive
     }
 }
