@@ -39,11 +39,11 @@ jobs:
             exit 1
           fi
 
-      - name: Run all tests
-        run: cargo test --no-default-features
-
       - name: Build release binary
         run: cargo build --release --no-default-features
+
+      - name: Run all tests (release profile)
+        run: cargo test --release --no-default-features
 
       - name: RNA pipeline smoke test (rna test)
         run: ./target/release/repo-native-alignment test --repo .
