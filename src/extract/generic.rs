@@ -254,6 +254,83 @@ fn collect_nodes(
                 edges.push(edge);
             }
 
+            // Function parameter/return type DependsOn edges (Rust only).
+            if node_kind == NodeKind::Function && config.language_name == "rust" {
+                let fn_id = NodeId {
+                    root: String::new(),
+                    file: path.to_path_buf(),
+                    name: name.clone(),
+                    kind: NodeKind::Function,
+                };
+                // Parameter types
+                if let Some(params) = node.child_by_field_name("parameters") {
+                    for i in 0..params.child_count() {
+                        if let Some(param) = params.child(i as u32) {
+                            if let Some(type_node) = param.child_by_field_name("type") {
+                                let type_text = type_node.utf8_text(source).unwrap_or("");
+                                if let Some(type_name) = extract_user_type(type_text) {
+                                    edges.push(Edge {
+                                        from: fn_id.clone(),
+                                        to: NodeId {
+                                            root: String::new(),
+                                            file: path.to_path_buf(),
+                                            name: type_name,
+                                            kind: NodeKind::Struct,
+                                        },
+                                        kind: EdgeKind::DependsOn,
+                                        source: ExtractionSource::TreeSitter,
+                                        confidence: Confidence::Detected,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                // Return type
+                if let Some(ret_node) = node.child_by_field_name("return_type") {
+                    let ret_text = ret_node.utf8_text(source).unwrap_or("");
+                    if let Some(type_name) = extract_user_type(ret_text) {
+                        edges.push(Edge {
+                            from: fn_id,
+                            to: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: type_name,
+                                kind: NodeKind::Struct,
+                            },
+                            kind: EdgeKind::DependsOn,
+                            source: ExtractionSource::TreeSitter,
+                            confidence: Confidence::Detected,
+                        });
+                    }
+                }
+            }
+
+            // Module-level containment: top-level symbols get Defines edge from file module.
+            if parent_scope.is_none() && node_kind != NodeKind::Import {
+                let module_id = NodeId {
+                    root: String::new(),
+                    file: path.to_path_buf(),
+                    name: path.file_stem()
+                        .unwrap_or(std::ffi::OsStr::new("module"))
+                        .to_string_lossy()
+                        .to_string(),
+                    kind: NodeKind::Module,
+                };
+                edges.push(Edge {
+                    from: module_id,
+                    to: NodeId {
+                        root: String::new(),
+                        file: path.to_path_buf(),
+                        name: name.clone(),
+                        kind: node_kind.clone(),
+                    },
+                    kind: EdgeKind::Defines,
+                    source: ExtractionSource::TreeSitter,
+                    confidence: Confidence::Detected,
+                });
+            }
+
             // Emit structural edge from parent scope to this node.
             if let Some((scope_name, parent_kind)) = parent_scope {
                 let edge_kind = if node_kind == NodeKind::Field {
@@ -350,6 +427,43 @@ fn extract_signature(body: &str) -> String {
     body.lines().next().unwrap_or("").trim().to_string()
 }
 
+/// Extract a user-defined type name from a type text, skipping primitives.
+///
+/// Takes the first identifier (before any `<` generics), returns `None` for
+/// primitives like `u32`, `bool`, `String`, `Vec`, `Option`, `Result`, and
+/// reference/lifetime prefixes like `&self`.
+fn extract_user_type(type_text: &str) -> Option<String> {
+    // Strip reference prefix (e.g. "&Foo", "&mut Foo")
+    let s = type_text.trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim();
+    // Take first identifier (before `<` generics or `::` paths)
+    let ident = s.split(|c: char| c == '<' || c == ':' || c == ' ')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if ident.is_empty() {
+        return None;
+    }
+    // Must start with uppercase to be a user-defined type
+    if !ident.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return None;
+    }
+    // Skip known standard library / primitive types
+    const PRIMITIVES: &[&str] = &[
+        "String", "Vec", "Option", "Result", "Box", "Rc", "Arc",
+        "HashMap", "HashSet", "BTreeMap", "BTreeSet", "Cow",
+        "Cell", "RefCell", "Mutex", "RwLock",
+        "Pin", "Future", "Stream", "Iterator",
+        "Self",
+    ];
+    if PRIMITIVES.contains(&ident) {
+        return None;
+    }
+    Some(ident.to_string())
+}
+
 /// Parse the target module name from an import declaration text.
 fn parse_import_target(import_text: &str) -> String {
     // Strip `use ` prefix (Rust), `import ` (various), quotes, semicolons.
@@ -400,7 +514,7 @@ pub struct Foo {
 }
 
 impl Foo {
-    pub fn do_thing(&self) -> u32 {
+    pub fn do_thing(&self, other: Bar) -> u32 {
         self.bar
     }
 }
@@ -465,6 +579,28 @@ pub fn hello() {}
                 && e.to.name == "Greet" && e.to.kind == NodeKind::Trait),
             "Should have Implements edge from Foo:struct to Greet:trait, got: {:?}",
             implements_edges
+        );
+
+        // Verify module-level Defines: test:module -> hello:function
+        let module_defines: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Defines && e.from.kind == NodeKind::Module)
+            .collect();
+        assert!(
+            module_defines.iter().any(|e| e.from.name == "test" && e.to.name == "hello"
+                && e.to.kind == NodeKind::Function),
+            "Should have Defines edge from test:module to hello:function, got: {:?}",
+            module_defines
+        );
+
+        // Verify DependsOn: do_thing:function -> Bar:struct (parameter type)
+        let depends_on_edges: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::DependsOn)
+            .collect();
+        assert!(
+            depends_on_edges.iter().any(|e| e.from.name == "do_thing" && e.from.kind == NodeKind::Function
+                && e.to.name == "Bar" && e.to.kind == NodeKind::Struct),
+            "Should have DependsOn edge from do_thing:function to Bar:struct, got: {:?}",
+            depends_on_edges
         );
     }
 }
