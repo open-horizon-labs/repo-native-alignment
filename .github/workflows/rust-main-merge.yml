@@ -51,6 +51,20 @@ jobs:
         run: ./target/release/repo-native-alignment test --repo .
         timeout-minutes: 5
 
+      - name: CLI search smoke test
+        run: |
+          OUTPUT=$(./target/release/repo-native-alignment search "main" --repo . --limit 3 2>/dev/null)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "Symbol search" || { echo "FAIL: search returned no results"; exit 1; }
+
+      - name: CLI graph smoke test
+        run: |
+          NODE_ID=$(./target/release/repo-native-alignment search "main" --repo . --limit 1 2>/dev/null | grep "ID:" | head -1 | sed 's/.*`\(.*\)`.*/\1/')
+          echo "Node: $NODE_ID"
+          OUTPUT=$(./target/release/repo-native-alignment graph --node "$NODE_ID" --mode neighbors --repo . 2>/dev/null)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "neighbors\|No results" || { echo "FAIL: graph returned unexpected output"; exit 1; }
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:

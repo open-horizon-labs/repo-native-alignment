@@ -2,11 +2,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use petgraph::Direction;
 use rust_mcp_sdk::McpServer;
 use rust_mcp_sdk::schema::{Implementation, InitializeResult, ServerCapabilities};
 use rust_mcp_sdk::ToMcpServerHandler;
 
-use repo_native_alignment::server::RnaHandler;
+use repo_native_alignment::server::{self, RnaHandler};
 use repo_native_alignment::setup::{self, SetupArgs};
 use repo_native_alignment::smoke::{self, TestArgs};
 
@@ -51,6 +52,14 @@ enum Commands {
     ///
     /// Runs the same pipeline as MCP server startup but standalone, with timing output.
     Scan(ScanArgs),
+    /// Search code symbols by name or signature.
+    ///
+    /// Scans the repo on first use, then filters symbols by query, kind, language, and file.
+    Search(SearchArgs),
+    /// Traverse the code graph: neighbors, impact analysis, or reachability.
+    ///
+    /// Use `search` first to find a node ID, then `graph` to explore relationships.
+    Graph(GraphArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -58,6 +67,49 @@ struct ScanArgs {
     /// Repository root path to scan (default: current directory or --repo)
     #[arg(long)]
     path: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct SearchArgs {
+    /// Search query (matched against symbol name and signature)
+    query: String,
+    /// Repository root path (default: current directory)
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Filter by symbol kind: function, struct, trait, enum, module, import, const
+    #[arg(long)]
+    kind: Option<String>,
+    /// Filter by language: rust, python, typescript, go, etc.
+    #[arg(long)]
+    language: Option<String>,
+    /// Filter by file path substring
+    #[arg(long)]
+    file: Option<String>,
+    /// Maximum results (default: 20)
+    #[arg(long, default_value_t = 20)]
+    limit: usize,
+}
+
+#[derive(clap::Args, Debug)]
+struct GraphArgs {
+    /// Stable node ID from search results
+    #[arg(long)]
+    node: String,
+    /// Query mode: neighbors, impact, reachable (default: neighbors)
+    #[arg(long, default_value = "neighbors")]
+    mode: String,
+    /// Direction: outgoing, incoming, both (neighbors mode only, default: outgoing)
+    #[arg(long, default_value = "outgoing")]
+    direction: String,
+    /// Filter by edge types (comma-separated): calls, depends_on, implements, etc.
+    #[arg(long)]
+    edge_types: Option<String>,
+    /// Maximum hops (default: 1 for neighbors, 3 for impact/reachable)
+    #[arg(long)]
+    max_hops: Option<usize>,
+    /// Repository root path (default: current directory)
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
 }
 
 fn server_details() -> InitializeResult {
@@ -126,6 +178,169 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("  Embeddings: {}", if graph.embed_index.is_some() { "yes" } else { "no" });
             eprintln!("  Time:       {:.2}s", elapsed.as_secs_f64());
             eprintln!("───────────────────────────────────────────");
+            return Ok(());
+        }
+        Some(Commands::Search(args)) => {
+            init_tracing("warn");
+            let repo_root = args.repo.canonicalize()?;
+            eprintln!("Scanning {}...", repo_root.display());
+            let handler = RnaHandler {
+                repo_root: repo_root.clone(),
+                ..Default::default()
+            };
+            let gs = handler.build_full_graph().await?;
+            let query_lower = args.query.to_lowercase();
+
+            let mut matches: Vec<_> = gs.nodes.iter()
+                .filter(|n| {
+                    let name_match = n.id.name.to_lowercase().contains(&query_lower)
+                        || n.signature.to_lowercase().contains(&query_lower);
+                    if !name_match { return false; }
+                    if let Some(ref k) = args.kind {
+                        if n.id.kind.to_string().to_lowercase() != k.to_lowercase() {
+                            return false;
+                        }
+                    }
+                    if let Some(ref l) = args.language {
+                        if n.language.to_lowercase() != l.to_lowercase() {
+                            return false;
+                        }
+                    }
+                    if let Some(ref f) = args.file {
+                        if !n.id.file.to_string_lossy().contains(f.as_str()) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect();
+
+            matches.truncate(args.limit);
+
+            if matches.is_empty() {
+                println!("No symbols matching \"{}\".", args.query);
+            } else {
+                println!("## Symbol search: \"{}\"\n\n{} result(s)\n", args.query, matches.len());
+                for n in &matches {
+                    let stable_id = n.stable_id();
+                    let outgoing = gs.index.neighbors(&stable_id, None, Direction::Outgoing);
+                    let incoming = gs.index.neighbors(&stable_id, None, Direction::Incoming);
+                    println!(
+                        "- **{}** `{}` ({}) `{}`:{}-{}",
+                        n.id.kind, n.id.name, n.language,
+                        n.id.file.display(), n.line_start, n.line_end,
+                    );
+                    println!("  ID: `{}`", stable_id);
+                    if !n.signature.is_empty() {
+                        println!("  Sig: `{}`", n.signature);
+                    }
+                    if let Some(val) = n.metadata.get("value") {
+                        println!("  Value: `{}`", val);
+                    }
+                    if !outgoing.is_empty() {
+                        println!("  Out: {} edge(s)", outgoing.len());
+                    }
+                    if !incoming.is_empty() {
+                        println!("  In: {} edge(s)", incoming.len());
+                    }
+                    println!();
+                }
+            }
+            let freshness = server::format_freshness(gs.nodes.len(), gs.last_scan_completed_at);
+            eprintln!("{}", freshness);
+            return Ok(());
+        }
+        Some(Commands::Graph(args)) => {
+            init_tracing("warn");
+            let repo_root = args.repo.canonicalize()?;
+            eprintln!("Scanning {}...", repo_root.display());
+            let handler = RnaHandler {
+                repo_root: repo_root.clone(),
+                ..Default::default()
+            };
+            let gs = handler.build_full_graph().await?;
+
+            let edge_filter = args.edge_types.as_ref().map(|types| {
+                types.split(',')
+                    .filter_map(|t| server::parse_edge_kind(t.trim()))
+                    .collect::<Vec<_>>()
+            });
+            let edge_filter_slice = edge_filter.as_deref();
+
+            let result_ids = match args.mode.as_str() {
+                "neighbors" => {
+                    let max_hops = args.max_hops.unwrap_or(1);
+                    match args.direction.as_str() {
+                        "outgoing" => {
+                            if max_hops == 1 {
+                                gs.index.neighbors(&args.node, edge_filter_slice, Direction::Outgoing)
+                            } else {
+                                gs.index.reachable(&args.node, max_hops, edge_filter_slice)
+                            }
+                        }
+                        "incoming" => {
+                            if max_hops == 1 {
+                                gs.index.neighbors(&args.node, edge_filter_slice, Direction::Incoming)
+                            } else {
+                                gs.index.impact(&args.node, max_hops)
+                            }
+                        }
+                        "both" => {
+                            let mut ids = if max_hops == 1 {
+                                gs.index.neighbors(&args.node, edge_filter_slice, Direction::Outgoing)
+                            } else {
+                                gs.index.reachable(&args.node, max_hops, edge_filter_slice)
+                            };
+                            let inc = if max_hops == 1 {
+                                gs.index.neighbors(&args.node, edge_filter_slice, Direction::Incoming)
+                            } else {
+                                gs.index.impact(&args.node, max_hops)
+                            };
+                            ids.extend(inc);
+                            ids.sort();
+                            ids.dedup();
+                            ids
+                        }
+                        other => {
+                            anyhow::bail!("Invalid direction: \"{}\". Use outgoing, incoming, or both.", other);
+                        }
+                    }
+                }
+                "impact" => {
+                    let max_hops = args.max_hops.unwrap_or(3);
+                    gs.index.impact(&args.node, max_hops)
+                }
+                "reachable" => {
+                    let max_hops = args.max_hops.unwrap_or(3);
+                    gs.index.reachable(&args.node, max_hops, edge_filter_slice)
+                }
+                other => {
+                    anyhow::bail!("Invalid mode: \"{}\". Use neighbors, impact, or reachable.", other);
+                }
+            };
+
+            if result_ids.is_empty() {
+                println!("No results for `{}` ({}).", args.node, args.mode);
+            } else {
+                println!("## {} `{}`\n\n{} result(s)\n", args.mode, args.node, result_ids.len());
+                for id in &result_ids {
+                    // Look up full node for display
+                    if let Some(node) = gs.nodes.iter().find(|n| n.stable_id() == *id) {
+                        println!(
+                            "- **{}** `{}` ({}) `{}`:{}-{}",
+                            node.id.kind, node.id.name, node.language,
+                            node.id.file.display(), node.line_start, node.line_end,
+                        );
+                        if !node.signature.is_empty() {
+                            println!("  Sig: `{}`", node.signature);
+                        }
+                    } else {
+                        println!("- `{}`", id);
+                    }
+                }
+            }
+            let freshness = server::format_freshness(gs.nodes.len(), gs.last_scan_completed_at);
+            eprintln!("{}", freshness);
             return Ok(());
         }
         None => {}

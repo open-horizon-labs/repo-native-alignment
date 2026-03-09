@@ -283,7 +283,7 @@ fn parse_node_kind(s: &str) -> NodeKind {
 }
 
 /// Parse an EdgeKind from its string representation.
-fn parse_edge_kind(s: &str) -> Option<EdgeKind> {
+pub fn parse_edge_kind(s: &str) -> Option<EdgeKind> {
     Some(match s {
         "calls" => EdgeKind::Calls,
         "implements" => EdgeKind::Implements,
@@ -1866,7 +1866,7 @@ fn text_result(s: String) -> CallToolResult {
 /// Format an index freshness footer for appending to tool responses.
 ///
 /// Example output: `\n*Index: 3655 symbols · last scan 4m ago · schema v2*`
-fn format_freshness(node_count: usize, last_scan: Option<std::time::Instant>) -> String {
+pub fn format_freshness(node_count: usize, last_scan: Option<std::time::Instant>) -> String {
     let age = match last_scan {
         None => "never".to_string(),
         Some(t) => {
