@@ -111,20 +111,10 @@ Preview first: `repo-native-alignment setup --project . --dry-run`
 
 ### 3. Teach your agents (optional — requires [OH Skills](https://github.com/open-horizon-labs/skills))
 
-Install the skills framework, then open a Claude Code session in your project:
-
-```bash
-# Add the skills marketplace
-claude plugin marketplace add open-horizon-labs/skills
-
-# Install OH Skills
-claude plugin install oh-skills
-```
-
-Then run:
+Install OH Skills ([see instructions](https://github.com/open-horizon-labs/skills#install)), then open a Claude Code session in your project and run:
 
 ```
-/oh-skills:teach-oh
+/teach-oh
 ```
 
 This explores your codebase, asks about your aims, writes `AGENTS.md`, scaffolds `.oh/` with outcomes and constraints, and installs phase agents. RNA tools are automatically detected and used during exploration if installed.
