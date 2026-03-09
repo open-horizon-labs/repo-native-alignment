@@ -48,7 +48,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "release-${{ matrix.target }}-${{ matrix.artifact }}"
+          shared-key: "release-${{ matrix.target }}"
           cache-all-crates: true
           cache-on-failure: true
 
