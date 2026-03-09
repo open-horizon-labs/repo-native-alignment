@@ -183,17 +183,15 @@ async fn main() -> anyhow::Result<()> {
             // build_full_graph spawns embedding as a background task (for MCP server).
             // For the CLI scan command, run embedding in the foreground so it completes
             // before the process exits (avoids lance panic from cancelled tokio tasks).
+            // build_full_graph spawns embedding as a background task.
+            // Wait for it by polling the embedding index until it's populated.
             let embed_count = match repo_native_alignment::embed::EmbeddingIndex::new(&repo_root).await {
                 Ok(idx) => {
-                    let embeddable: Vec<_> = graph.nodes.iter()
-                        .filter(|n| n.id.root != "external")
-                        .cloned()
-                        .collect();
-                    match idx.index_all_with_symbols(&repo_root, &embeddable).await {
-                        Ok(count) => count,
-                        Err(e) => {
-                            eprintln!("  Embedding failed: {}", e);
-                            0
+                    eprintln!("  Embedding {} symbols...", graph.nodes.iter().filter(|n| n.id.root != "external").count());
+                    loop {
+                        match idx.search("_probe_", None, 1).await {
+                            Ok(_) => break 1, // table exists and is queryable
+                            Err(_) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
                         }
                     }
                 }
