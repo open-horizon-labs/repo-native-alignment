@@ -1593,6 +1593,7 @@ impl RnaHandler {
                 }
                 gs.nodes.extend(enrichment.new_nodes);
 
+                let persist_edges = enrichment.added_edges.clone();
                 for edge in &enrichment.added_edges {
                     let from_id = edge.from.to_stable_id();
                     let to_id = edge.to.to_stable_id();
@@ -1624,7 +1625,7 @@ impl RnaHandler {
                     .collect();
                 drop(guard); // release lock before async persist
                 let _ = persist_graph_incremental(
-                    &bg_repo_root, &upsert_nodes, &[], &[], &[],
+                    &bg_repo_root, &upsert_nodes, &persist_edges, &[], &[],
                 ).await;
             }
         });

@@ -24,7 +24,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::graph::{ExtractionSource, Node, NodeId, NodeKind, Edge};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 use super::string_literals::harvest_string_literals;
 use super::{ExtractionResult, Extractor};
 
@@ -134,7 +134,7 @@ fn collect_nodes(
     path: &Path,
     source: &[u8],
     config: &LangConfig,
-    parent_scope: &Option<String>,
+    parent_scope: &Option<(String, NodeKind)>,
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
 ) {
@@ -178,8 +178,8 @@ fn collect_nodes(
             let mut metadata = BTreeMap::new();
 
             // Parent scope.
-            if let Some(scope) = parent_scope {
-                metadata.insert("parent_scope".to_string(), scope.clone());
+            if let Some((scope_name, _)) = parent_scope {
+                metadata.insert("parent_scope".to_string(), scope_name.clone());
             }
 
             // Name column for LSP cursor positioning.
@@ -254,9 +254,35 @@ fn collect_nodes(
                 edges.push(edge);
             }
 
+            // Emit structural edge from parent scope to this node.
+            if let Some((scope_name, parent_kind)) = parent_scope {
+                let edge_kind = if node_kind == NodeKind::Field {
+                    EdgeKind::HasField
+                } else {
+                    EdgeKind::Defines
+                };
+                edges.push(Edge {
+                    from: NodeId {
+                        root: String::new(),
+                        file: path.to_path_buf(),
+                        name: scope_name.clone(),
+                        kind: parent_kind.clone(),
+                    },
+                    to: NodeId {
+                        root: String::new(),
+                        file: path.to_path_buf(),
+                        name: name.clone(),
+                        kind: node_kind.clone(),
+                    },
+                    kind: edge_kind,
+                    source: ExtractionSource::TreeSitter,
+                    confidence: Confidence::Detected,
+                });
+            }
+
             // Scope propagation into children.
             if config.scope_parent_kinds.contains(&kind_str) {
-                let scope = Some(name);
+                let scope = Some((name, node_kind));
                 for i in 0..node.child_count() {
                     if let Some(child) = node.child(i as u32) {
                         collect_nodes(child, path, source, config, &scope, nodes, edges);
