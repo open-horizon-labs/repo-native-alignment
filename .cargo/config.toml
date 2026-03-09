@@ -3,3 +3,9 @@
 # To share the target directory across worktrees locally, set CARGO_TARGET_DIR
 # in your shell profile:
 #   export CARGO_TARGET_DIR=/path/to/repo/target
+
+# Optimize for the local CPU (M4 AMX/SME, ARMv9).
+# This enables native SIMD, Accelerate framework AMX paths, and
+# LLVM scheduling tuned for Apple Silicon.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "target-cpu=native", "-C", "opt-level=3"]

@@ -1,0 +1,11 @@
+{
+  "name": "rna-mcp",
+  "version": "0.1.0",
+  "description": "Repo-Native Alignment MCP - Aim-conditioned code intelligence for agents",
+  "author": {
+    "name": "Open Horizon Labs",
+    "url": "https://github.com/open-horizon-labs/repo-native-alignment"
+  },
+  "repository": "https://github.com/open-horizon-labs/repo-native-alignment",
+  "homepage": "https://github.com/open-horizon-labs/repo-native-alignment"
+}

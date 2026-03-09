@@ -6,23 +6,33 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     timeout-minutes: 20
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-
-      - name: Run setup tests
-        run: cargo test setup::tests
+        with:
+          shared-key: "ci-build"
+          cache-all-crates: true
+          cache-on-failure: true
 
       - name: Lint — no language-specific conditionals in generic.rs
         run: |
@@ -31,11 +41,11 @@ jobs:
             exit 1
           fi
 
-      - name: Run full unit + integration tests
-        run: cargo test
-
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --no-default-features
+
+      - name: Run all tests (release profile)
+        run: cargo test --release --no-default-features
 
       - name: RNA pipeline smoke test (rna test)
         run: ./target/release/repo-native-alignment test --repo .
@@ -45,6 +55,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install MCP TypeScript SDK
         run: npm install --no-save @modelcontextprotocol/sdk

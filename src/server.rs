@@ -320,6 +320,7 @@ fn parse_extraction_source(s: &str) -> ExtractionSource {
 fn parse_confidence(s: &str) -> Confidence {
     match s {
         "confirmed" => Confidence::Confirmed,
+        "detected" => Confidence::Detected,
         _ => {
             tracing::warn!("Unknown confidence value: {}, defaulting to Detected", s);
             Confidence::Detected

@@ -1,0 +1,22 @@
+{
+  "name": "rna-mcp",
+  "owner": {
+    "name": "Open Horizon Labs",
+    "email": "hello@openhorizonlabs.com"
+  },
+  "metadata": {
+    "description": "Repo-Native Alignment MCP - Aim-conditioned code intelligence for agents",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "rna-mcp",
+      "source": "./plugin",
+      "description": "Repo-Native Alignment MCP - 9 tools for business outcome alignment, semantic code search, graph traversal, and structural outcome-to-code joins. 22 language extractors, Metal GPU embeddings on macOS.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Open Horizon Labs"
+      }
+    }
+  ]
+}

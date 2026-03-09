@@ -32,11 +32,18 @@ fn truncate_chars(s: &str, max_chars: usize) -> &str {
 fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
     let start = std::time::Instant::now();
 
+    #[cfg(feature = "metal")]
     let device = candle_core::Device::new_metal(0).unwrap_or_else(|_| {
         tracing::info!("EmbeddingIndex: Metal GPU not available, using CPU");
         candle_core::Device::Cpu
     });
+    #[cfg(not(feature = "metal"))]
+    let device = candle_core::Device::Cpu;
+
+    #[cfg(feature = "metal")]
     let device_name = if matches!(device, candle_core::Device::Metal(_)) { "Metal GPU" } else { "CPU" };
+    #[cfg(not(feature = "metal"))]
+    let device_name = "CPU";
 
     let model = metal_candle::embeddings::EmbeddingModel::from_pretrained(
         metal_candle::embeddings::EmbeddingModelType::AllMiniLmL6V2,

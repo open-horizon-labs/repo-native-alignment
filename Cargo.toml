@@ -51,8 +51,8 @@ arrow-array = "57"
 arrow-schema = "57"
 
 # Local embeddings — Metal GPU on Apple Silicon, CPU fallback
-metal-candle = { git = "https://github.com/open-horizon-labs/metal-candle", features = ["embeddings"] }
-candle-core = { version = "0.9", features = ["metal"] }
+metal-candle = { git = "https://github.com/open-horizon-labs/metal-candle", default-features = false, features = ["embeddings"] }
+candle-core = { version = "0.9" }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -78,6 +78,10 @@ anyhow = "1"
 # Logging (stderr only — stdout reserved for MCP stdio transport)
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = ["metal"]
+metal = ["candle-core/metal", "candle-core/accelerate", "metal-candle/custom-metal"]
 
 [dev-dependencies]
 tempfile = "3.26.0"

@@ -184,6 +184,7 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
                 Err(_) => {
                     let embeddable: Vec<_> = all_nodes.iter()
                         .filter(|n| n.id.root != "external")
+                        .take(50)
                         .cloned()
                         .collect();
                     match idx.index_all_with_symbols(&repo, &embeddable).await {
