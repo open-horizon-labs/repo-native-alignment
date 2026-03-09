@@ -60,5 +60,5 @@ Tell the user:
    - `search_symbols` - Multi-language symbol search with graph edges
    - `graph_query` - Impact analysis, neighbor traversal, reachability
    - `outcome_progress` - Structural outcome-to-code joins
-   - `oh_record` - Record learnings, signals, guardrails
+   - `list_roots` - Workspace root management
 4. Optional: run `repo-native-alignment setup --project .` for full OH Skills + agents setup

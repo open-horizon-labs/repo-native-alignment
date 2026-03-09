@@ -369,7 +369,7 @@ When rna-server tools are available:
 - Call `oh_get_guardrails` to validate candidate solutions against constraints
 - Call `search_code` to understand existing patterns before proposing alternatives
 - Call `outcome_progress` to check what's already been tried for this outcome
-- After selecting a solution: call `oh_record_metis` to capture the decision rationale
+- After selecting a solution: write decision rationale to `.oh/metis/<slug>.md`
 
 ---
 
