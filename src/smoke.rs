@@ -329,6 +329,9 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     // 23. Schema version check — write stale version, verify migration, verify no-op on re-check
     checks.push(run_schema_version_check().await);
 
+    // 24. Broken symlink check — scanner must not crash on broken symlinks
+    checks.push(run_broken_symlink_check().await);
+
     Ok(print_and_return(args, checks))
 }
 
@@ -1353,6 +1356,51 @@ async fn run_schema_version_check() -> Check {
             "Migration detected stale v0→v{SCHEMA_VERSION}, then confirmed no-op on re-check"
         ),
     )
+}
+
+/// Broken symlink check: creates a temp repo with a broken symlink,
+/// verifies the scanner completes without crashing.
+async fn run_broken_symlink_check() -> Check {
+    let temp_dir = std::env::temp_dir().join("rna-smoke-broken-symlink");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+        return Check::fail("broken_symlink", format!("Could not create temp dir: {}", e));
+    }
+
+    // Init a git repo so the scanner can use it
+    let _ = std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&temp_dir)
+        .output();
+
+    // Create a real file so the scan has something to find
+    let _ = std::fs::write(temp_dir.join("main.rs"), "fn hello() {}\n");
+
+    // Create a broken symlink
+    #[cfg(unix)]
+    {
+        let _ = std::os::unix::fs::symlink("/nonexistent/path/that/does/not/exist", temp_dir.join("broken-link.rs"));
+    }
+
+    // Scan — should complete without error
+    let mut scanner = match crate::scanner::Scanner::new(temp_dir.clone()) {
+        Ok(s) => s,
+        Err(e) => return Check::fail("broken_symlink", format!("Scanner init failed: {}", e)),
+    };
+
+    match scanner.scan() {
+        Ok(result) => {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            Check::pass(
+                "broken_symlink",
+                format!("Scan completed with broken symlink present ({} files)", result.changed_files.len() + result.new_files.len()),
+            )
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            Check::fail("broken_symlink", format!("Scan crashed on broken symlink: {}", e))
+        }
+    }
 }
 
 // ── Output ──────────────────────────────────────────────────────────
