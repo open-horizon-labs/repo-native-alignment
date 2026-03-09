@@ -576,12 +576,10 @@ fn resolve_import_path(source_file: &Path, import_text: &str, language: &str) ->
             for _ in 1..dots {
                 base = base.parent()?.to_path_buf();
             }
-            let candidate = base.join(format!("{}.py", rel));
-            if candidate.exists() { return Some(candidate); }
-            // Try as package: dir/__init__.py
-            let pkg = base.join(&rel).join("__init__.py");
-            if pkg.exists() { return Some(pkg); }
-            None
+            // Return the resolved relative path — don't check .exists() since
+            // path is relative to repo root, not CWD. The edge connects if the
+            // target file was scanned; otherwise it's a harmless dangling edge.
+            Some(base.join(format!("{}.py", rel)))
         }
         "typescript" | "javascript" | "tsx" | "jsx" => {
             // `import X from './util/user_utils'` or `import X from '../util'`
@@ -592,17 +590,11 @@ fn resolve_import_path(source_file: &Path, import_text: &str, language: &str) ->
             if !path_str.starts_with('.') {
                 return None; // non-relative imports (npm packages) can't be resolved
             }
+            // Return the import path with .ts extension as best guess.
+            // Can't check .exists() (relative path, CWD != repo root).
+            // The edge connects if the target was scanned; dangling otherwise.
             let base = parent.join(path_str);
-            // Try exact, .ts, .tsx, .js, .jsx, /index.ts, /index.tsx
-            for ext in &["", ".ts", ".tsx", ".js", ".jsx"] {
-                let candidate = std::path::PathBuf::from(format!("{}{}", base.display(), ext));
-                if candidate.exists() { return Some(candidate); }
-            }
-            for index in &["index.ts", "index.tsx", "index.js"] {
-                let candidate = base.join(index);
-                if candidate.exists() { return Some(candidate); }
-            }
-            None
+            Some(std::path::PathBuf::from(format!("{}.ts", base.display())))
         }
         _ => None,
     }
