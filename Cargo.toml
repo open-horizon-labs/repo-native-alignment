@@ -83,5 +83,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 default = ["metal"]
 metal = ["candle-core/metal", "candle-core/accelerate", "metal-candle/custom-metal"]
 
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
 [dev-dependencies]
 tempfile = "3.26.0"

@@ -64,15 +64,15 @@ claude plugin install rna-mcp
 /rna-mcp:setup
 ```
 
-Setup detects your platform (M4 optimized binary for M4+ chips), downloads the binary to `~/.cargo/bin/`, configures `.mcp.json`, and updates AGENTS.md with tool guidance.
+Setup detects your platform (optimized binary for M2+ chips with bf16/i8mm), downloads the binary to `~/.cargo/bin/`, configures `.mcp.json`, and updates AGENTS.md with tool guidance.
 
 **Download a prebuilt binary** (manual):
 
 ```bash
 mkdir -p ~/.cargo/bin
 
-# macOS Apple Silicon (M4+)
-curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64-m4 -o ~/.cargo/bin/repo-native-alignment && chmod +x ~/.cargo/bin/repo-native-alignment
+# macOS Apple Silicon (M2+ optimized — bf16/i8mm)
+curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64-fast -o ~/.cargo/bin/repo-native-alignment && chmod +x ~/.cargo/bin/repo-native-alignment
 
 # macOS Apple Silicon (M1/M2/M3)
 curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64 -o ~/.cargo/bin/repo-native-alignment && chmod +x ~/.cargo/bin/repo-native-alignment

@@ -16,12 +16,12 @@ jobs:
             target: aarch64-apple-darwin
             features: ""
             artifact: repo-native-alignment-darwin-arm64
-            rustflags: "-C target-cpu=apple-m1 -C opt-level=3"
+            rustflags: "-C target-cpu=apple-m1 -C link-arg=-Wl,-dead_strip"
           - os: macos-latest
             target: aarch64-apple-darwin
             features: ""
-            artifact: repo-native-alignment-darwin-arm64-m4
-            rustflags: "-C target-cpu=apple-m4 -C opt-level=3"
+            artifact: repo-native-alignment-darwin-arm64-fast
+            rustflags: "-C target-cpu=apple-m4 -C link-arg=-Wl,-dead_strip"
           - os: namespace-profile-default
             target: x86_64-unknown-linux-gnu
             features: "--no-default-features"
@@ -86,5 +86,5 @@ jobs:
             --title "${{ github.ref_name }}" \
             --generate-notes \
             repo-native-alignment-darwin-arm64/repo-native-alignment-darwin-arm64 \
-            repo-native-alignment-darwin-arm64-m4/repo-native-alignment-darwin-arm64-m4 \
+            repo-native-alignment-darwin-arm64-fast/repo-native-alignment-darwin-arm64-fast \
             repo-native-alignment-linux-x86_64/repo-native-alignment-linux-x86_64

@@ -23,9 +23,9 @@ CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "")
 mkdir -p ~/.cargo/bin
 ```
 
-**If macOS ARM M4+** (`Darwin` + `arm64` + brand_string contains "M4"):
+**If macOS ARM M2+** (`Darwin` + `arm64` + brand_string contains "M2", "M3", or "M4"):
 ```bash
-curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64-m4 -o ~/.cargo/bin/repo-native-alignment
+curl -L https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download/repo-native-alignment-darwin-arm64-fast -o ~/.cargo/bin/repo-native-alignment
 chmod +x ~/.cargo/bin/repo-native-alignment
 ```
 
