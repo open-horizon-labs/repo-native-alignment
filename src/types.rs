@@ -229,6 +229,130 @@ impl QueryResult {
 
         out
     }
+
+    /// Compact summary rendering targeting <5K chars.
+    /// - Outcome: status line + first paragraph only (max 300 chars)
+    /// - Commits: only tagged commits (containing [outcome:]), capped at 15
+    /// - Symbols: counts by kind only
+    /// - Markdown: count + heading names only
+    pub fn to_summary_markdown(&self) -> String {
+        let mut out = format!("# Query: {}\n\n", self.query);
+
+        // Outcomes: status line + truncated first paragraph
+        if !self.outcomes.is_empty() {
+            out.push_str("## Outcomes\n\n");
+            for a in &self.outcomes {
+                out.push_str(&format!("### {} ({})\n", a.id(), a.kind));
+                if let Some(status) = a.frontmatter.get("status") {
+                    out.push_str(&format!("- **status:** {}\n", yaml_value_to_string(status)));
+                }
+                if let Some(aim) = a.frontmatter.get("aim") {
+                    out.push_str(&format!("- **aim:** {}\n", yaml_value_to_string(aim)));
+                }
+                // First paragraph of body only, max 300 chars
+                let first_para = a.body.split("\n\n").next().unwrap_or("");
+                let truncated: String = first_para.chars().take(300).collect();
+                if !truncated.is_empty() {
+                    out.push('\n');
+                    out.push_str(&truncated);
+                    if truncated.len() < first_para.len() {
+                        out.push_str("...");
+                    }
+                    out.push('\n');
+                }
+                out.push('\n');
+            }
+        }
+
+        // Commits: only tagged commits (containing [outcome:])
+        if !self.commits.is_empty() {
+            let tagged: Vec<&GitCommitInfo> = self
+                .commits
+                .iter()
+                .filter(|c| c.message.contains("[outcome:"))
+                .collect();
+            let total_tagged = tagged.len();
+            let total_all = self.commits.len();
+
+            out.push_str("## Commits\n\n");
+            if total_tagged > 0 {
+                let display_count = total_tagged.min(15);
+                for c in tagged.iter().take(15) {
+                    let first_line = c.message.lines().next().unwrap_or(&c.message);
+                    out.push_str(&format!("- **{}** {}\n", c.short_hash, first_line));
+                }
+                if total_tagged > 15 {
+                    out.push_str(&format!(
+                        "\n...and {} more tagged commits\n",
+                        total_tagged - 15
+                    ));
+                }
+                out.push_str(&format!(
+                    "\n{} tagged / {} total commits\n\n",
+                    display_count.min(total_tagged),
+                    total_all
+                ));
+            } else {
+                out.push_str(&format!(
+                    "{} commits (none tagged with [outcome:])\n\n",
+                    total_all
+                ));
+            }
+        }
+
+        // Symbols: counts by kind only
+        if !self.code_symbols.is_empty() {
+            use std::collections::BTreeMap;
+            let mut kind_counts: BTreeMap<String, usize> = BTreeMap::new();
+            let mut files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for s in &self.code_symbols {
+                *kind_counts.entry(s.kind.to_string()).or_insert(0) += 1;
+                files.insert(s.file_path.display().to_string());
+            }
+            out.push_str("## Code Symbols\n\n");
+            let parts: Vec<String> = kind_counts
+                .iter()
+                .map(|(k, count)| format!("{} {}s", count, k))
+                .collect();
+            out.push_str(&format!(
+                "{} across {} files\n\n",
+                parts.join(", "),
+                files.len()
+            ));
+        }
+
+        // Markdown: count + heading names only
+        if !self.markdown_chunks.is_empty() {
+            out.push_str("## Markdown Sections\n\n");
+            out.push_str(&format!(
+                "{} matching sections:\n",
+                self.markdown_chunks.len()
+            ));
+            for m in &self.markdown_chunks {
+                let heading = m
+                    .heading_hierarchy
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "(untitled)".to_string());
+                out.push_str(&format!(
+                    "- {} ({})\n",
+                    heading,
+                    m.file_path.display()
+                ));
+            }
+            out.push('\n');
+        }
+
+        if self.outcomes.is_empty()
+            && self.commits.is_empty()
+            && self.code_symbols.is_empty()
+            && self.markdown_chunks.is_empty()
+        {
+            out.push_str("_No results found._\n");
+        }
+
+        out
+    }
 }
 
 fn yaml_value_to_string(v: &serde_yaml::Value) -> String {

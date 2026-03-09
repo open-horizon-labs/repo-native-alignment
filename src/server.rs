@@ -113,12 +113,15 @@ pub struct OhInit {
 
 #[macros::mcp_tool(
     name = "outcome_progress",
-    description = "The real intersection query: given an outcome ID, finds related commits (by [outcome:X] tags and file pattern matches), code symbols in changed files, and markdown mentioning the outcome. This joins layers structurally, not by keyword."
+    description = "The real intersection query: given an outcome ID, finds related commits (by [outcome:X] tags and file pattern matches), code symbols in changed files, and markdown mentioning the outcome. This joins layers structurally, not by keyword. Returns summary by default (<5K chars); use detail_level='full' for complete data."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct OutcomeProgress {
     /// The outcome ID (e.g. 'agent-alignment') from .oh/outcomes/
     pub outcome_id: String,
+    /// Detail level: 'summary' (default, <5K chars) or 'full' (complete data)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_level: Option<String>,
 }
 
 #[macros::mcp_tool(
@@ -2222,9 +2225,14 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
 
             "outcome_progress" => {
                 let args: OutcomeProgress = parse_args(params.arguments)?;
+                let full = args.detail_level.as_deref() == Some("full");
                 match query::outcome_progress(root, &args.outcome_id) {
                     Ok(result) => {
-                        let mut md = result.to_markdown();
+                        let mut md = if full {
+                            result.to_markdown()
+                        } else {
+                            result.to_summary_markdown()
+                        };
 
                         // Append PR merge section from the graph
                         if let Ok(guard) = self.get_graph().await {
@@ -2247,10 +2255,17 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                 &args.outcome_id,
                                 &file_patterns,
                             );
-                            let pr_md = query::format_pr_merges_markdown(&pr_nodes);
-                            if !pr_md.is_empty() {
-                                md.push('\n');
-                                md.push_str(&pr_md);
+                            if full {
+                                let pr_md = query::format_pr_merges_markdown(&pr_nodes);
+                                if !pr_md.is_empty() {
+                                    md.push('\n');
+                                    md.push_str(&pr_md);
+                                }
+                            } else if !pr_nodes.is_empty() {
+                                md.push_str(&format!(
+                                    "\n## PR Merges\n\n{} PR merge(s) serving this outcome (use detail_level='full' to see details)\n",
+                                    pr_nodes.len()
+                                ));
                             }
                          }
                         }
