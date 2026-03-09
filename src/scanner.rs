@@ -453,7 +453,7 @@ impl Scanner {
 
             if ft.is_dir() {
                 self.walk_dir_mtime(&path, changed, new, new_dir_mtimes, new_file_mtimes)?;
-            } else if ft.is_file() || ft.is_symlink() {
+            } else if ft.is_file() {
                 let file_start = Instant::now();
                 let rel_file = path
                     .strip_prefix(&self.repo_root)
@@ -582,7 +582,7 @@ impl Scanner {
                         new_file_mtimes,
                     )?;
                 }
-            } else if ft.is_file() || ft.is_symlink() {
+            } else if ft.is_file() {
                 let file_start = Instant::now();
                 let rel_file = path
                     .strip_prefix(&self.repo_root)
@@ -871,17 +871,27 @@ fn save_state_to_path(path: &Path, state: &ScanState) -> Result<()> {
 // ── Filesystem helpers ──────────────────────────────────────────────
 
 fn dir_modified_time(path: &Path) -> Result<SystemTime> {
-    fs::metadata(path)
-        .with_context(|| format!("metadata for {}", path.display()))?
-        .modified()
-        .with_context(|| format!("modified time for {}", path.display()))
+    match fs::symlink_metadata(path) {
+        Ok(meta) => meta.modified()
+            .with_context(|| format!("modified time for {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!("Skipping inaccessible path: {}", path.display());
+            Ok(SystemTime::UNIX_EPOCH)
+        }
+        Err(e) => Err(e).with_context(|| format!("metadata for {}", path.display())),
+    }
 }
 
 fn file_modified_time(path: &Path) -> Result<SystemTime> {
-    fs::metadata(path)
-        .with_context(|| format!("metadata for {}", path.display()))?
-        .modified()
-        .with_context(|| format!("modified time for {}", path.display()))
+    match fs::symlink_metadata(path) {
+        Ok(meta) => meta.modified()
+            .with_context(|| format!("modified time for {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!("Skipping inaccessible path: {}", path.display());
+            Ok(SystemTime::UNIX_EPOCH)
+        }
+        Err(e) => Err(e).with_context(|| format!("metadata for {}", path.display())),
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
