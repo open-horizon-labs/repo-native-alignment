@@ -74,7 +74,6 @@ try {
   const requiredTools = new Set([
     "oh_get_context",
     "oh_search_context",
-    "oh_record",
     "outcome_progress",
     "search_symbols",
     "graph_query",
