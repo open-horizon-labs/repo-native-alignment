@@ -76,14 +76,31 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
 
+      - name: Checkout (for tag annotation)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --repo "${{ github.repository }}" \
-            --title "${{ github.ref_name }}" \
-            --generate-notes \
-            repo-native-alignment-darwin-arm64/repo-native-alignment-darwin-arm64.tar.gz \
-            repo-native-alignment-darwin-arm64-fast/repo-native-alignment-darwin-arm64-fast.tar.gz \
-            repo-native-alignment-linux-x86_64/repo-native-alignment-linux-x86_64.tar.gz
+          # Use annotated tag message as release notes, fall back to auto-generated
+          NOTES=$(git tag -l --format='%(contents)' "${{ github.ref_name }}" 2>/dev/null || echo "")
+          if [ -n "$NOTES" ]; then
+            gh release create "${{ github.ref_name }}" \
+              --repo "${{ github.repository }}" \
+              --title "${{ github.ref_name }}" \
+              --notes "$NOTES" \
+              repo-native-alignment-darwin-arm64/repo-native-alignment-darwin-arm64.tar.gz \
+              repo-native-alignment-darwin-arm64-fast/repo-native-alignment-darwin-arm64-fast.tar.gz \
+              repo-native-alignment-linux-x86_64/repo-native-alignment-linux-x86_64.tar.gz
+          else
+            gh release create "${{ github.ref_name }}" \
+              --repo "${{ github.repository }}" \
+              --title "${{ github.ref_name }}" \
+              --generate-notes \
+              repo-native-alignment-darwin-arm64/repo-native-alignment-darwin-arm64.tar.gz \
+              repo-native-alignment-darwin-arm64-fast/repo-native-alignment-darwin-arm64-fast.tar.gz \
+              repo-native-alignment-linux-x86_64/repo-native-alignment-linux-x86_64.tar.gz
+          fi
