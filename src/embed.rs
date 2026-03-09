@@ -12,7 +12,6 @@ use crate::oh;
 /// Embedding batch size. Benchmarked on M4 MacBook Pro with MiniLM-L6-v2:
 /// batch=32 gives best sustained throughput (~880 t/s) with ~240MB memory.
 /// Larger batches (64, 128) showed no improvement or regression.
-#[cfg(feature = "metal")]
 const BATCH_SIZE: usize = 32;
 
 /// Number of recent commits to embed for temporal context.
@@ -30,15 +29,21 @@ fn truncate_chars(s: &str, max_chars: usize) -> &str {
     }
 }
 
-#[cfg(feature = "metal")]
 fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
     let start = std::time::Instant::now();
 
+    #[cfg(feature = "metal")]
     let device = candle_core::Device::new_metal(0).unwrap_or_else(|_| {
         tracing::info!("EmbeddingIndex: Metal GPU not available, using CPU");
         candle_core::Device::Cpu
     });
+    #[cfg(not(feature = "metal"))]
+    let device = candle_core::Device::Cpu;
+
+    #[cfg(feature = "metal")]
     let device_name = if matches!(device, candle_core::Device::Metal(_)) { "Metal GPU" } else { "CPU" };
+    #[cfg(not(feature = "metal"))]
+    let device_name = "CPU";
 
     let model = metal_candle::embeddings::EmbeddingModel::from_pretrained(
         metal_candle::embeddings::EmbeddingModelType::AllMiniLmL6V2,
@@ -59,7 +64,6 @@ fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
     model
 }
 
-#[cfg(feature = "metal")]
 async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
     let total = texts.len();
     if total == 0 {
@@ -104,15 +108,6 @@ async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         processed, overall_start.elapsed()
     );
     Ok(all_embeddings)
-}
-
-#[cfg(not(feature = "metal"))]
-async fn embed_texts(_texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-    anyhow::bail!(
-        "Semantic embeddings require the 'metal' feature (macOS Apple Silicon). \
-         Build with: cargo build --release --features metal. \
-         Structural search (search_symbols, graph_query) works without embeddings."
-    )
 }
 
 
