@@ -96,7 +96,7 @@ pub fn get_full_context(repo_root: &Path) -> Result<QueryResult> {
 /// 4. Deduplicate commits
 /// 5. For changed files in those commits, find code symbols defined there
 /// 6. Find markdown sections mentioning the outcome ID
-pub fn outcome_progress(repo_root: &Path, outcome_id: &str, summary: bool) -> Result<QueryResult> {
+pub fn outcome_progress(repo_root: &Path, outcome_id: &str) -> Result<QueryResult> {
     // 1. Find the outcome
     let all_artifacts = oh::load_oh_artifacts(repo_root)?;
     let outcome = all_artifacts
@@ -141,12 +141,9 @@ pub fn outcome_progress(repo_root: &Path, outcome_id: &str, summary: bool) -> Re
         }
     }
 
-    // 5. Collect changed files from all commits, find symbols in those files
-    //    In summary mode, skip the expensive extract_symbols call — the renderer
-    //    falls back to showing file count from commits instead.
-    let code_symbols = if summary {
-        Vec::new()
-    } else {
+    // 5. Collect changed files from all commits, find symbols in those files.
+    //    We always extract symbols — summary mode needs stable IDs for navigable references.
+    let code_symbols = {
         let changed_files: HashSet<PathBuf> = commits
             .iter()
             .flat_map(|c| c.changed_files.iter().cloned())

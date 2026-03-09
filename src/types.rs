@@ -230,11 +230,14 @@ impl QueryResult {
         out
     }
 
-    /// Compact summary rendering targeting <5K chars.
+    /// Navigable summary rendering targeting <10K chars.
+    /// Returns stable node IDs and suggested tool calls so agents can drill deeper.
+    ///
     /// - Outcome: status line + first paragraph only (max 300 chars)
-    /// - Commits: only tagged commits (containing [outcome:]), capped at 15
-    /// - Symbols: counts by kind only
-    /// - Markdown: count + heading names only
+    /// - Commits: only tagged commits (containing [outcome:]), capped at 15, with drill-down hint
+    /// - Symbols: counts by kind + top 5 files with up to 3 key symbols each, including stable IDs
+    /// - Markdown: heading names + file paths
+    /// - PR Merges: count + suggestion to use detail_level='full' (appended by caller)
     pub fn to_summary_markdown(&self) -> String {
         let mut out = format!("# Query: {}\n\n", self.query);
 
@@ -264,7 +267,7 @@ impl QueryResult {
             }
         }
 
-        // Commits: only tagged commits (containing [outcome:])
+        // Commits: only tagged commits (containing [outcome:]), capped at 15
         if !self.commits.is_empty() {
             let tagged: Vec<&GitCommitInfo> = self
                 .commits
@@ -287,28 +290,35 @@ impl QueryResult {
                     ));
                 }
                 out.push_str(&format!(
-                    "\n{} tagged / {} total commits\n\n",
-                    total_tagged,
-                    total_all
+                    "\n{} tagged / {} total commits\n",
+                    total_tagged, total_all
                 ));
             } else {
                 out.push_str(&format!(
-                    "{} commits (none tagged with [outcome:])\n\n",
+                    "{} commits (none tagged with [outcome:])\n",
                     total_all
                 ));
             }
+            out.push_str("\nUse `git show <hash>` for full diff\n\n");
         }
 
-        // Symbols: counts by kind only; fall back to file count from commits
+        // Symbols: counts by kind + top 5 files with navigable symbol IDs
         if !self.code_symbols.is_empty() {
             use std::collections::BTreeMap;
             let mut kind_counts: BTreeMap<String, usize> = BTreeMap::new();
-            let mut files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            // Group symbols by file, preserving order within each file
+            let mut file_symbols: BTreeMap<String, Vec<&CodeSymbol>> = BTreeMap::new();
             for s in &self.code_symbols {
                 *kind_counts.entry(s.kind.to_string()).or_insert(0) += 1;
-                files.insert(s.file_path.display().to_string());
+                file_symbols
+                    .entry(s.file_path.display().to_string())
+                    .or_default()
+                    .push(s);
             }
+
             out.push_str("## Code Symbols\n\n");
+
+            // Summary counts line
             let parts: Vec<String> = kind_counts
                 .iter()
                 .map(|(k, count)| format!("{} {}s", count, k))
@@ -316,25 +326,49 @@ impl QueryResult {
             out.push_str(&format!(
                 "{} across {} files\n\n",
                 parts.join(", "),
-                files.len()
+                file_symbols.len()
             ));
-        } else if !self.commits.is_empty() {
-            // No symbols extracted (summary mode) — show file count from commits
-            let changed_files: std::collections::BTreeSet<String> = self
-                .commits
-                .iter()
-                .flat_map(|c| c.changed_files.iter())
-                .map(|f| f.display().to_string())
-                .collect();
-            if !changed_files.is_empty() {
+
+            // Top 5 files by symbol count, with up to 3 key symbols each
+            let mut files_sorted: Vec<(&String, &Vec<&CodeSymbol>)> =
+                file_symbols.iter().collect();
+            files_sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+            for (file, symbols) in files_sorted.iter().take(5) {
+                out.push_str(&format!("### {} ({} symbols)\n", file, symbols.len()));
+                for sym in symbols.iter().take(3) {
+                    let stable_id = format!(
+                        "repo:{}:{}:{}",
+                        sym.file_path.display(),
+                        sym.name,
+                        sym.kind
+                    );
+                    out.push_str(&format!(
+                        "- `{}` ({}) -- ID: `{}`\n",
+                        sym.name, sym.kind, stable_id
+                    ));
+                }
+                if symbols.len() > 3 {
+                    out.push_str(&format!(
+                        "- ...and {} more symbols\n",
+                        symbols.len() - 3
+                    ));
+                }
+                out.push('\n');
+            }
+            if files_sorted.len() > 5 {
                 out.push_str(&format!(
-                    "## Code\n\nChanges across {} files\n\n",
-                    changed_files.len()
+                    "...and {} more files\n\n",
+                    files_sorted.len() - 5
                 ));
             }
+
+            out.push_str(
+                "Use `search_symbols` to explore further, `graph_query` with any ID above for impact/neighbors\n\n",
+            );
         }
 
-        // Markdown: count + heading names only
+        // Markdown: heading names + file paths
         if !self.markdown_chunks.is_empty() {
             out.push_str("## Markdown Sections\n\n");
             out.push_str(&format!(
@@ -347,11 +381,7 @@ impl QueryResult {
                     .last()
                     .cloned()
                     .unwrap_or_else(|| "(untitled)".to_string());
-                out.push_str(&format!(
-                    "- {} ({})\n",
-                    heading,
-                    m.file_path.display()
-                ));
+                out.push_str(&format!("- {} (`{}`)\n", heading, m.file_path.display()));
             }
             out.push('\n');
         }
