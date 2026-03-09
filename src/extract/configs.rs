@@ -32,6 +32,7 @@ pub static PYTHON_CONFIG: LangConfig = LangConfig {
     param_container_field: Some("parameters"),
     param_type_field: Some("type"),
     return_type_field: Some("return_type"),
+    type_requires_uppercase: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -55,9 +56,12 @@ pub static TYPESCRIPT_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string", Some("string_fragment"))],
+    // TS: formal_parameters accessed via field "parameters",
+    // each required_parameter has field "type" -> type_annotation node
     param_container_field: Some("parameters"),
-    param_type_field: Some("type_annotation"),
+    param_type_field: Some("type"),
     return_type_field: Some("return_type"),
+    type_requires_uppercase: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -83,10 +87,11 @@ pub static JAVASCRIPT_CONFIG: LangConfig = LangConfig {
     param_container_field: None,
     param_type_field: None,
     return_type_field: None,
+    type_requires_uppercase: true,
 };
 
 // ---------------------------------------------------------------------------
-// Go — thin config; multi-name const and receiver handled in go.rs
+// Go -- thin config; multi-name const and receiver handled in go.rs
 // ---------------------------------------------------------------------------
 
 pub static GO_CONFIG: LangConfig = LangConfig {
@@ -108,6 +113,7 @@ pub static GO_CONFIG: LangConfig = LangConfig {
     param_container_field: Some("parameters"),
     param_type_field: Some("type"),
     return_type_field: Some("result"),
+    type_requires_uppercase: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -132,9 +138,12 @@ pub static JAVA_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string_literal", None)],
-    param_container_field: Some("formal_parameters"),
+    // Java: formal_parameters node accessed via field "parameters" on
+    // method_declaration; each formal_parameter has field "type".
+    param_container_field: Some("parameters"),
     param_type_field: Some("type"),
     return_type_field: Some("type"),
+    type_requires_uppercase: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -157,9 +166,13 @@ pub static KOTLIN_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string_literal", Some("string_content"))],
-    param_container_field: Some("value_parameters"),
-    param_type_field: Some("type"),
-    return_type_field: Some("type"),
+    // Kotlin tree-sitter-kotlin-ng: function_value_parameters and parameter
+    // types are not accessible via field names -- DependsOn skipped for now.
+    // TODO: add per-language extractor logic for Kotlin DependsOn edges.
+    param_container_field: None,
+    param_type_field: None,
+    return_type_field: None,
+    type_requires_uppercase: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -185,9 +198,12 @@ pub static CSHARP_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string_literal", None)],
-    param_container_field: Some("parameter_list"),
+    // C#: parameter_list via field "parameters", param type via field "type",
+    // return type via field "returns" (NOT "type" on method_declaration).
+    param_container_field: Some("parameters"),
     param_type_field: Some("type"),
-    return_type_field: Some("type"),
+    return_type_field: Some("returns"),
+    type_requires_uppercase: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -211,9 +227,14 @@ pub static SWIFT_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &["import_declaration"],
     string_literal_kinds: &[("string_literal", Some("string_literal_segment"))],
-    param_container_field: Some("parameter"),
-    param_type_field: Some("type_annotation"),
-    return_type_field: Some("return_type"),
+    // Swift tree-sitter: parameters are direct children (no container field),
+    // and type/return_type use the overloaded "name" field.
+    // DependsOn skipped for now -- needs per-language extractor logic.
+    // TODO: add per-language extractor logic for Swift DependsOn edges.
+    param_container_field: None,
+    param_type_field: None,
+    return_type_field: None,
+    type_requires_uppercase: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -234,9 +255,14 @@ pub static ZIG_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string_literal", None)],
-    param_container_field: Some("parameters"),
-    param_type_field: Some("type"),
-    return_type_field: Some("return_type"),
+    // Zig: "parameters" is NOT a field name on function_declaration (it's a
+    // child node kind). But param type is field "type" and return type is
+    // field "type" on the function_declaration node.
+    // TODO: add per-language extractor logic for Zig DependsOn param edges.
+    param_container_field: None,
+    param_type_field: None,
+    return_type_field: None,
+    type_requires_uppercase: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -259,9 +285,14 @@ pub static CPP_CONFIG: LangConfig = LangConfig {
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string_literal", Some("string_content"))],
-    param_container_field: Some("parameters"),
-    param_type_field: Some("type"),
+    // C++: parameters are on function_declarator (child of function_definition),
+    // not directly on function_definition. Return type IS field "type" on
+    // function_definition. DependsOn for params needs per-language logic.
+    // TODO: add per-language extractor logic for C++ DependsOn param edges.
+    param_container_field: None,
+    param_type_field: None,
     return_type_field: Some("type"),
+    type_requires_uppercase: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -283,6 +314,7 @@ pub static LUA_CONFIG: LangConfig = LangConfig {
     param_container_field: None,
     param_type_field: None,
     return_type_field: None,
+    type_requires_uppercase: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -308,6 +340,7 @@ pub static RUBY_CONFIG: LangConfig = LangConfig {
     param_container_field: None,
     param_type_field: None,
     return_type_field: None,
+    type_requires_uppercase: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -329,4 +362,5 @@ pub static BASH_CONFIG: LangConfig = LangConfig {
     param_container_field: None,
     param_type_field: None,
     return_type_field: None,
+    type_requires_uppercase: true,
 };

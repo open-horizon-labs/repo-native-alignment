@@ -42,6 +42,7 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
     param_container_field: Some("parameters"),
     param_type_field: Some("type"),
     return_type_field: Some("return_type"),
+    type_requires_uppercase: true,
 };
 
 /// Rust tree-sitter extractor with topology pattern detection.
