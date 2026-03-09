@@ -35,12 +35,6 @@ jobs:
           cache-all-crates: true
           cache-on-failure: true
 
-      - name: Run setup tests
-        run: cargo test --no-default-features setup::tests
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-
       - name: Lint — no language-specific conditionals in generic.rs
         run: |
           if grep -n 'language_name ==' src/extract/generic.rs; then
@@ -48,7 +42,7 @@ jobs:
             exit 1
           fi
 
-      - name: Run full unit + integration tests
+      - name: Run all tests
         run: cargo test --no-default-features
         env:
           SCCACHE_GHA_ENABLED: "true"
