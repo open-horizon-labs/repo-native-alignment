@@ -1,6 +1,6 @@
 # Repo-Native Alignment
 
-Aim-conditioned decision infrastructure for coding agents. Agents don't just execute -- they plan and adapt conditioned on declared aims, treating repo artifacts as evidence that updates confidence in whether the current aim framing is still correct.
+Aim-conditioned decision infrastructure for coding agents. Agents don't just execute — they plan and adapt conditioned on declared aims, treating repo artifacts as evidence that updates confidence in whether the current aim framing is still correct.
 
 We don't build features, we build capabilities.
 
@@ -35,7 +35,7 @@ We don't build features, we build capabilities.
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**The loop:** Skills guide work -> MCP tools read/write context -> `.oh/` accumulates learnings -> git versions everything -> next session starts richer.
+**The loop:** Skills guide work → MCP tools read/write context → `.oh/` accumulates learnings → git versions everything → next session starts richer.
 
 ## Quick Start
 
@@ -44,7 +44,7 @@ We don't build features, we build capabilities.
 | Dependency | Install | Required? |
 |------------|---------|-----------|
 | `cargo` | [rustup.rs](https://rustup.rs) | Yes |
-| `npx` | ships with Node.js -- [nodejs.org](https://nodejs.org) | Only for `setup --project` (installs OH Skills) |
+| `npx` | ships with Node.js — [nodejs.org](https://nodejs.org) | Only for `setup --project` (installs OH Skills) |
 
 ### 1. Install
 
@@ -90,19 +90,19 @@ The system compounds from here. Agents use `oh_search_context` to discover relev
 
 **Manual path:** Build from source (`cargo build --release`), add `rna-server` to your `.mcp.json` pointing at the binary with `--repo <project path>`. The setup command automates this.
 
-## RNA MCP Server -- 9 tools
+## RNA MCP Server — 9 tools
 
 | Category | Tools |
 |----------|-------|
-| **Context** | `oh_get_context` -- all business artifacts in one call |
-| **Search** | `oh_search_context` -- semantic search over .oh/ + commits (optionally code + markdown) |
-| **Write** | `oh_record` -- record metis, signals, guardrails, or update outcomes |
-| **Scaffold** | `oh_init` -- initialize .oh/ directory from project context |
-| **Code** | `search_symbols` -- multi-language symbol search with graph edges |
-| **Graph** | `graph_query` -- traverse neighbors, impact analysis, reachability |
-| **History** | `oh_search_context` returns commit hash -- use `git show <hash>` via Bash for diffs |
-| **Join** | `outcome_progress` -- structural join: outcome -> commits -> symbols -> PRs |
-| **Workspace** | `list_roots` -- show configured workspace roots |
+| **Context** | `oh_get_context` — all business artifacts in one call |
+| **Search** | `oh_search_context` — semantic search over .oh/ + commits (optionally code + markdown) |
+| **Write** | `oh_record` — record metis, signals, guardrails, or update outcomes |
+| **Scaffold** | `oh_init` — initialize .oh/ directory from project context |
+| **Code** | `search_symbols` — multi-language symbol search with graph edges |
+| **Graph** | `graph_query` — traverse neighbors, impact analysis, reachability |
+| **History** | `oh_search_context` returns commit hash — use `git show <hash>` via Bash for diffs |
+| **Join** | `outcome_progress` — structural join: outcome → commits → symbols → PRs |
+| **Workspace** | `list_roots` — show configured workspace roots |
 
 ## The `.oh/` Directory
 
@@ -122,11 +122,11 @@ Outcomes declare `files:` patterns linking to code. Commits tag `[outcome:X]` li
 
 ## Companion Systems
 
-### [OH MCP](https://github.com/cloud-atlas-ai/oh-mcp-server) -- organizational context
+### [OH MCP](https://github.com/cloud-atlas-ai/oh-mcp-server) — organizational context
 
 Missions, aims, endeavors, decision logs, cross-project context. RNA's `.oh/` is the repo-local projection of the OH graph.
 
-### [OH Skills](https://github.com/open-horizon-labs/skills) -- workflow skills
+### [OH Skills](https://github.com/open-horizon-labs/skills) — workflow skills
 
 | Skill | What it does |
 |-------|-------------|
@@ -137,7 +137,7 @@ Missions, aims, endeavors, decision logs, cross-project context. RNA's `.oh/` is
 | `/solution-space` | Evaluate approaches before committing |
 | `/execute` | Build with pre-flight checks and drift detection |
 
-### OH Phase Agents -- isolated execution
+### OH Phase Agents — isolated execution
 
 Agent wrappers for each workflow phase (`oh-aim`, `oh-execute`, `oh-ship`, etc.). Each runs in its own context window with scoped tools. Installed to `.claude/agents/`.
 
@@ -147,8 +147,8 @@ Agent wrappers for each workflow phase (`oh-aim`, `oh-execute`, `oh-ship`, etc.)
 
 ## Detailed Documentation
 
-- [Extractors](docs/extractors.md) -- 22 language extractors, constants, synthetic literals
-- [LSP Enrichment](docs/lsp-enrichment.md) -- 37 auto-detected language servers
-- [Scanner](docs/scanner.md) -- incremental, event-driven, worktree-aware scanning
-- [Graph Architecture](docs/graph.md) -- LanceDB + petgraph, edge types, SourceEnvelope
-- [Source Compatibility](docs/rna-source-compatibility.md) -- source-capability design for future Context Assembler integration
+- [Extractors](docs/extractors.md) — 22 language extractors, constants, synthetic literals
+- [LSP Enrichment](docs/lsp-enrichment.md) — 37 auto-detected language servers
+- [Scanner](docs/scanner.md) — incremental, event-driven, worktree-aware scanning
+- [Graph Architecture](docs/graph.md) — LanceDB + petgraph, edge types, SourceEnvelope
+- [Source Compatibility](docs/rna-source-compatibility.md) — source-capability design for future Context Assembler integration
