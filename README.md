@@ -97,7 +97,7 @@ The system compounds from here. Agents use `oh_search_context` to discover relev
 | **Context** | `oh_get_context` — all business artifacts in one call |
 | **Search** | `oh_search_context` — semantic search over .oh/ + commits (optionally code + markdown) |
 | **Write** | `oh_record` — record metis, signals, guardrails, or update outcomes |
-| **Scaffold** | `oh_init` — initialize .oh/ directory from project context |
+| **Scaffold** | `oh_init` — bootstrap .oh/ directory (see `/teach-oh` for full setup) |
 | **Code** | `search_symbols` — multi-language symbol search with graph edges |
 | **Graph** | `graph_query` — traverse neighbors, impact analysis, reachability |
 | **History** | `oh_search_context` returns commit hash — use `git show <hash>` via Bash for diffs |
