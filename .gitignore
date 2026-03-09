@@ -6,3 +6,4 @@
 .oh/.cache/
 .claude/worktrees/
 .mcp.json
+!plugin/.mcp.json
