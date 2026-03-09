@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::graph::Node;
+
 /// Parsed .oh/ artifact (outcome, signal, guardrail, or metis)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OhArtifact {
@@ -177,7 +179,7 @@ pub struct QueryResult {
     pub query: String,
     pub outcomes: Vec<OhArtifact>,
     pub markdown_chunks: Vec<MarkdownChunk>,
-    pub code_symbols: Vec<CodeSymbol>,
+    pub code_symbols: Vec<Node>,
     pub commits: Vec<GitCommitInfo>,
 }
 
@@ -204,9 +206,14 @@ impl QueryResult {
 
         if !self.code_symbols.is_empty() {
             out.push_str("## Matching Code Symbols\n\n");
-            for s in &self.code_symbols {
-                out.push_str(&s.to_markdown());
-                out.push('\n');
+            for node in &self.code_symbols {
+                out.push_str(&format!(
+                    "- `{}:{}` **{}** `{}`\n",
+                    node.id.file.display(),
+                    node.line_start,
+                    node.id.kind,
+                    node.signature,
+                ));
             }
             out.push('\n');
         }
@@ -217,6 +224,168 @@ impl QueryResult {
                 out.push_str(&m.to_markdown());
                 out.push_str("\n\n---\n\n");
             }
+        }
+
+        if self.outcomes.is_empty()
+            && self.commits.is_empty()
+            && self.code_symbols.is_empty()
+            && self.markdown_chunks.is_empty()
+        {
+            out.push_str("_No results found._\n");
+        }
+
+        out
+    }
+
+    /// Navigable summary rendering targeting <10K chars.
+    /// Returns stable node IDs and suggested tool calls so agents can drill deeper.
+    ///
+    /// - Outcome: status line + first paragraph only (max 300 chars)
+    /// - Commits: only tagged commits (containing [outcome:]), capped at 15, with drill-down hint
+    /// - Symbols: counts by kind + top 5 files with up to 3 key symbols each, including stable IDs
+    /// - Markdown: heading names + file paths
+    /// - PR Merges: count + suggestion to use detail_level='full' (appended by caller)
+    pub fn to_summary_markdown(&self) -> String {
+        let mut out = format!("# Query: {}\n\n", self.query);
+
+        // Outcomes: status line + truncated first paragraph
+        if !self.outcomes.is_empty() {
+            out.push_str("## Outcomes\n\n");
+            for a in &self.outcomes {
+                out.push_str(&format!("### {} ({})\n", a.id(), a.kind));
+                if let Some(status) = a.frontmatter.get("status") {
+                    out.push_str(&format!("- **status:** {}\n", yaml_value_to_string(status)));
+                }
+                if let Some(aim) = a.frontmatter.get("aim") {
+                    out.push_str(&format!("- **aim:** {}\n", yaml_value_to_string(aim)));
+                }
+                // First paragraph of body only, max 300 chars
+                let first_para = a.body.split("\n\n").next().unwrap_or("");
+                let truncated: String = first_para.chars().take(300).collect();
+                if !truncated.is_empty() {
+                    out.push('\n');
+                    out.push_str(&truncated);
+                    if truncated.len() < first_para.len() {
+                        out.push_str("...");
+                    }
+                    out.push('\n');
+                }
+                out.push('\n');
+            }
+        }
+
+        // Commits: only tagged commits (containing [outcome:]), capped at 15
+        if !self.commits.is_empty() {
+            let tagged: Vec<&GitCommitInfo> = self
+                .commits
+                .iter()
+                .filter(|c| c.message.contains("[outcome:"))
+                .collect();
+            let total_tagged = tagged.len();
+            let total_all = self.commits.len();
+
+            out.push_str("## Commits\n\n");
+            if total_tagged > 0 {
+                for c in tagged.iter().take(15) {
+                    let first_line = c.message.lines().next().unwrap_or(&c.message);
+                    out.push_str(&format!("- **{}** {}\n", c.short_hash, first_line));
+                }
+                if total_tagged > 15 {
+                    out.push_str(&format!(
+                        "\n...and {} more tagged commits\n",
+                        total_tagged - 15
+                    ));
+                }
+                out.push_str(&format!(
+                    "\n{} tagged / {} total commits\n",
+                    total_tagged, total_all
+                ));
+            } else {
+                out.push_str(&format!(
+                    "{} commits (none tagged with [outcome:])\n",
+                    total_all
+                ));
+            }
+            out.push_str("\nUse `git show <hash>` for full diff\n\n");
+        }
+
+        // Symbols: counts by kind + top 5 files with navigable symbol IDs
+        if !self.code_symbols.is_empty() {
+            use std::collections::BTreeMap;
+            let mut kind_counts: BTreeMap<String, usize> = BTreeMap::new();
+            // Group symbols by file, preserving order within each file
+            let mut file_symbols: BTreeMap<String, Vec<&Node>> = BTreeMap::new();
+            for node in &self.code_symbols {
+                *kind_counts.entry(node.id.kind.to_string()).or_insert(0) += 1;
+                file_symbols
+                    .entry(node.id.file.display().to_string())
+                    .or_default()
+                    .push(node);
+            }
+
+            out.push_str("## Code Symbols\n\n");
+
+            // Summary counts line
+            let parts: Vec<String> = kind_counts
+                .iter()
+                .map(|(k, count)| format!("{} {}s", count, k))
+                .collect();
+            out.push_str(&format!(
+                "{} across {} files\n\n",
+                parts.join(", "),
+                file_symbols.len()
+            ));
+
+            // Top 5 files by symbol count, with up to 3 key symbols each
+            let mut files_sorted: Vec<(&String, &Vec<&Node>)> =
+                file_symbols.iter().collect();
+            files_sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+            for (file, symbols) in files_sorted.iter().take(5) {
+                out.push_str(&format!("### {} ({} symbols)\n", file, symbols.len()));
+                for node in symbols.iter().take(3) {
+                    let stable_id = node.stable_id();
+                    out.push_str(&format!(
+                        "- `{}` ({}) -- ID: `{}`\n",
+                        node.id.name, node.id.kind, stable_id
+                    ));
+                }
+                if symbols.len() > 3 {
+                    out.push_str(&format!(
+                        "- ...and {} more symbols\n",
+                        symbols.len() - 3
+                    ));
+                }
+                out.push('\n');
+            }
+            if files_sorted.len() > 5 {
+                out.push_str(&format!(
+                    "...and {} more files\n\n",
+                    files_sorted.len() - 5
+                ));
+            }
+
+            out.push_str(
+                "Use `search_symbols` to explore further, `graph_query` with any ID above for impact/neighbors\n\n",
+            );
+        }
+
+        // Markdown: heading names + file paths
+        if !self.markdown_chunks.is_empty() {
+            out.push_str("## Markdown Sections\n\n");
+            out.push_str(&format!(
+                "{} matching sections:\n",
+                self.markdown_chunks.len()
+            ));
+            for m in &self.markdown_chunks {
+                let heading = m
+                    .heading_hierarchy
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "(untitled)".to_string());
+                out.push_str(&format!("- {} (`{}`)\n", heading, m.file_path.display()));
+            }
+            out.push('\n');
         }
 
         if self.outcomes.is_empty()
