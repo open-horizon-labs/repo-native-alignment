@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "rna-mcp": {
-      "type": "stdio",
-      "command": "repo-native-alignment",
-      "args": ["--repo", "."]
-    }
-  }
-}
