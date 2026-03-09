@@ -49,8 +49,9 @@ lancedb = "0.26"
 arrow-array = "57"
 arrow-schema = "57"
 
-# Local embeddings (no API key, ONNX-based)
-fastembed = "5"
+# Local embeddings — Metal GPU on Apple Silicon, CPU fallback
+metal-candle = { git = "https://github.com/open-horizon-labs/metal-candle", branch = "fix/candle-0.9-compat", features = ["embeddings"] }
+candle-core = { version = "0.9", features = ["metal"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -69,6 +70,9 @@ futures = "0.3"
 
 # LSP protocol types (for Phase 2 enrichment via language servers)
 lsp-types = "0.97"
+
+# System memory detection for adaptive batch sizing
+libc = "0.2"
 
 # Error handling
 anyhow = "1"

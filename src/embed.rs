@@ -4,13 +4,61 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arrow_array::{Float32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use lancedb::query::{ExecutableQuery, QueryBase};
 
 use crate::git;
 use crate::oh;
 
-const EMBEDDING_BATCH_SIZE: usize = 100;
+/// Maximum fraction of system memory to use for embedding buffers.
+/// Metal GPU uses unified memory — GPU buffers ARE system memory.
+const MAX_MEMORY_FRACTION: f64 = 0.20;
+/// Per-text memory estimate for Metal GPU embedding (model activations + buffers).
+/// Empirically: batch=64 × 26K texts peaked at 17GB → ~650KB per text in-flight.
+const BYTES_PER_TEXT_ESTIMATE: usize = 700_000;
+/// Minimum batch size (too small = GPU underutilized).
+const MIN_BATCH_SIZE: usize = 8;
+/// Maximum batch size (cap for safety even on large-RAM machines).
+const MAX_BATCH_SIZE: usize = 64;
+
+fn compute_batch_size() -> usize {
+    let total_mem = total_system_memory_bytes();
+    let budget = (total_mem as f64 * MAX_MEMORY_FRACTION) as usize;
+    let batch = (budget / BYTES_PER_TEXT_ESTIMATE).max(MIN_BATCH_SIZE).min(MAX_BATCH_SIZE);
+    tracing::info!(
+        "EmbeddingIndex: system RAM {:.1}GB, {:.0}% budget = {:.1}GB → batch_size={}",
+        total_mem as f64 / 1e9,
+        MAX_MEMORY_FRACTION * 100.0,
+        budget as f64 / 1e9,
+        batch
+    );
+    batch
+}
+
+#[cfg(target_os = "macos")]
+fn total_system_memory_bytes() -> usize {
+    use std::ffi::CString;
+    let name = CString::new("hw.memsize").unwrap();
+    let mut value: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    unsafe {
+        if libc::sysctlbyname(
+            name.as_ptr(),
+            &mut value as *mut _ as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) == 0 {
+            value as usize
+        } else {
+            16 * 1024 * 1024 * 1024 // default 16GB
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn total_system_memory_bytes() -> usize {
+    16 * 1024 * 1024 * 1024 // default 16GB
+}
 
 /// Number of recent commits to embed for temporal context.
 const RECENT_COMMIT_LIMIT: usize = 100;
@@ -27,23 +75,29 @@ fn truncate_chars(s: &str, max_chars: usize) -> &str {
     }
 }
 
-fn new_model() -> Result<TextEmbedding> {
+fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
     let start = std::time::Instant::now();
-    tracing::debug!("EmbeddingIndex: loading fastembed model BGE Small EN v1.5");
-    let model = TextEmbedding::try_new(
-        InitOptions::new(EmbeddingModel::BGESmallENV15)
-            .with_show_download_progress(false),
+
+    let device = candle_core::Device::new_metal(0).unwrap_or_else(|_| {
+        tracing::info!("EmbeddingIndex: Metal GPU not available, using CPU");
+        candle_core::Device::Cpu
+    });
+    let device_name = if matches!(device, candle_core::Device::Metal(_)) { "Metal GPU" } else { "CPU" };
+
+    let model = metal_candle::embeddings::EmbeddingModel::from_pretrained(
+        metal_candle::embeddings::EmbeddingModelType::AllMiniLmL6V2,
+        device,
     )
     .map_err(|e| anyhow::anyhow!("Failed to load embedding model: {}", e));
+
     match &model {
-        Ok(_) => tracing::debug!(
-            "EmbeddingIndex: model ready in {:?}",
-            start.elapsed()
+        Ok(m) => tracing::info!(
+            "EmbeddingIndex: MiniLM-L6-v2 ready on {} (dim={}) in {:?}",
+            device_name, m.dimension(), start.elapsed()
         ),
-        Err(err) => tracing::debug!(
+        Err(err) => tracing::warn!(
             "EmbeddingIndex: model load failed in {:?}: {}",
-            start.elapsed(),
-            err
+            start.elapsed(), err
         ),
     }
     model
@@ -52,43 +106,36 @@ fn new_model() -> Result<TextEmbedding> {
 async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
     let total = texts.len();
     if total == 0 {
-        tracing::debug!("EmbeddingIndex: no texts to embed");
         return Ok(Vec::new());
     }
 
+    let batch_size = compute_batch_size();
     let total_chars: usize = texts.iter().map(|t| t.len()).sum();
-    let total_batches = total.div_ceil(EMBEDDING_BATCH_SIZE);
+    let total_batches = total.div_ceil(batch_size);
     let overall_start = std::time::Instant::now();
     tracing::info!(
         "EmbeddingIndex: embedding {} text(s) across {} batch(es) ({} chars total)",
         total, total_batches, total_chars
     );
 
-    let mut model = new_model()?;
+    let model = new_model()?;
     let mut remaining = texts;
     let mut all_embeddings = Vec::with_capacity(total);
     let mut processed = 0usize;
 
     for batch_idx in 0..total_batches {
-        let batch_size = remaining.len().min(EMBEDDING_BATCH_SIZE);
+        let batch_size = remaining.len().min(batch_size);
         let batch: Vec<String> = remaining.drain(..batch_size).collect();
         let batch_start = std::time::Instant::now();
-        tracing::debug!(
-            "EmbeddingIndex: batch {}/{} ({} texts)",
-            batch_idx + 1, total_batches, batch_size
-        );
 
-        let batch_embeddings = model
-            .embed(batch, None)
+        let refs: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
+        let tensor = model.encode(&refs)
             .map_err(|e| anyhow::anyhow!("Embedding failed: {}", e))?;
-        if batch_embeddings.len() != batch_size {
-            anyhow::bail!(
-                "embedding batch size mismatch: got {}, expected {}",
-                batch_embeddings.len(), batch_size
-            );
-        }
-        processed += batch_size;
-        tracing::debug!(
+        let batch_embeddings: Vec<Vec<f32>> = tensor.to_vec2::<f32>()
+            .map_err(|e| anyhow::anyhow!("Tensor conversion failed: {}", e))?;
+
+        processed += batch_embeddings.len();
+        tracing::info!(
             "EmbeddingIndex: batch {}/{} done in {:?} ({}/{})",
             batch_idx + 1, total_batches, batch_start.elapsed(), processed, total
         );
