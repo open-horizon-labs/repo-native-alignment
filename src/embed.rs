@@ -14,7 +14,9 @@ use crate::oh;
 /// on constrained Apple Silicon devices (e.g. MacBook Air M2 with 8GB),
 /// we start small and grow/shrink based on observed per-item latency.
 const BATCH_FLOOR: usize = 4;
-const BATCH_CEILING: usize = 64;
+/// Benchmarked on M4 Pro: batch=32 gives best throughput (~880 t/s).
+/// Don't overshoot — larger batches don't help and can hurt.
+const BATCH_CEILING: usize = 32;
 /// Yield duration between batches to let other system tasks breathe.
 const BATCH_YIELD_MS: u64 = 50;
 /// If per-item time exceeds this multiple of the rolling average, halve batch size.
