@@ -38,7 +38,7 @@ pub struct OhGetContext {}
 
 #[macros::mcp_tool(
     name = "oh_search_context",
-    description = "Semantic search across business context, commits, code, and markdown. Describe what you need in plain language. Returns results ranked 0-1 by relevance; test files are demoted. Enable include_code for symbol search, include_markdown for doc sections. For exact symbol name lookup use search_symbols instead."
+    description = "Semantic search across business context, commits, code, and markdown. Describe what you need in plain language. Returns results ranked 0-1 by relevance; test files are demoted. Enable include_code for ranked symbol search (exact name > contains > signature, production before tests), include_markdown for doc sections. For exact symbol name lookup use search_symbols instead."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct OhSearchContext {
