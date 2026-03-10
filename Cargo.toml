@@ -42,6 +42,9 @@ tree-sitter-yaml = "0.7"
 # In-memory graph index (traversal, path queries, impact analysis)
 petgraph = "0.8"
 
+# Lock-free atomic pointer swap (double-buffered embed index)
+arc-swap = "1"
+
 # Deterministic UUIDs for source envelope event IDs
 uuid = { version = "1", features = ["v4"] }
 

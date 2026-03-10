@@ -23,6 +23,7 @@ use crate::roots::{WorkspaceConfig, cache_state_path};
 use crate::scanner::Scanner;
 use crate::types::OhArtifactKind;
 use crate::{git, markdown, oh, query, ranking};
+use arc_swap::ArcSwap;
 use petgraph::Direction;
 use tokio::sync::RwLock;
 
@@ -849,37 +850,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
         index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
     }
 
-    // Try to reuse existing embedding table from cache; only rebuild if empty/missing
-    let embed_index = match EmbeddingIndex::new(repo_root).await {
-        Ok(idx) => {
-            // Probe the existing table -- if it has data, skip the expensive rebuild
-            match idx.search("_probe_", None, 1).await {
-                Ok(_) => {
-                    tracing::info!("Loaded existing embedding index from cache");
-                    Some(idx)
-                }
-                Err(_) => {
-                    // Table empty or missing -- rebuild from cached graph nodes
-                    match idx.index_all_with_symbols(repo_root, &nodes).await {
-                        Ok(count) => {
-                            tracing::info!("Rebuilt embedding index: {} items from cached graph", count);
-                            Some(idx)
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to embed cached graph: {}", e);
-                            None
-                        }
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to create embed index: {}", e);
-            None
-        }
-    };
-
-    Ok(GraphState { nodes, edges, index, embed_index, last_scan_completed_at: Some(std::time::Instant::now()) })
+    Ok(GraphState { nodes, edges, index, last_scan_completed_at: Some(std::time::Instant::now()) })
 }
 
 /// Parse a NodeId from its stable_id string (format: "root:file:name:kind").
@@ -959,7 +930,6 @@ pub struct GraphState {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub index: GraphIndex,
-    pub embed_index: Option<EmbeddingIndex>,
     /// Timestamp of the last completed scan (full or incremental).
     /// `None` until the first scan finishes.
     pub last_scan_completed_at: Option<std::time::Instant>,
@@ -970,6 +940,8 @@ pub struct GraphState {
 pub struct RnaHandler {
     pub repo_root: PathBuf,
     pub graph: Arc<RwLock<Option<GraphState>>>,
+    /// Double-buffered embedding index.
+    pub embed_index: Arc<ArcSwap<Option<EmbeddingIndex>>>,
     /// Whether business context has been injected into a tool response.
     pub context_injected: std::sync::atomic::AtomicBool,
     /// Cooldown: skip re-scanning if checked recently.
@@ -983,6 +955,7 @@ impl Default for RnaHandler {
         Self {
             repo_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             graph: Arc::new(RwLock::new(None)),
+            embed_index: Arc::new(ArcSwap::from_pointee(None)),
             context_injected: std::sync::atomic::AtomicBool::new(false),
             last_scan: std::sync::Mutex::new(
                 std::time::Instant::now() - std::time::Duration::from_secs(10),
@@ -1379,6 +1352,24 @@ impl RnaHandler {
                         state.nodes.len(),
                         state.edges.len()
                     );
+                    // Warm embed index from cached LanceDB table
+                    if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await {
+                        match idx.search("_probe_", None, 1).await {
+                            Ok(_) => {
+                                tracing::info!("Loaded existing embedding index from cache");
+                                self.embed_index.store(Arc::new(Some(idx)));
+                            }
+                            Err(_) => {
+                                match idx.index_all_with_symbols(&self.repo_root, &state.nodes).await {
+                                    Ok(count) => {
+                                        tracing::info!("Rebuilt embedding index: {} items from cached graph", count);
+                                        self.embed_index.store(Arc::new(Some(idx)));
+                                    }
+                                    Err(e) => tracing::warn!("Failed to embed cached graph: {}", e),
+                                }
+                            }
+                        }
+                    }
                     return Ok(state);
                 }
                 Err(e) => {
@@ -1473,22 +1464,21 @@ impl RnaHandler {
         let symbols_ready_at = std::time::Instant::now();
 
         // Try to reuse existing embedding table (fast path for warm starts)
-        let embed_index = match EmbeddingIndex::new(&self.repo_root).await {
+        match EmbeddingIndex::new(&self.repo_root).await {
             Ok(idx) => {
                 match idx.search("_probe_", None, 1).await {
                     Ok(_) => {
                         tracing::info!("Reusing persisted embedding index (skipping rebuild)");
-                        Some(idx)
+                        self.embed_index.store(Arc::new(Some(idx)));
                     }
                     Err(_) => {
                         tracing::info!("Embedding index empty — will rebuild in background");
-                        Some(idx)
+                        self.embed_index.store(Arc::new(Some(idx)));
                     }
                 }
             }
             Err(e) => {
                 tracing::warn!("Failed to create embed index: {}", e);
-                None
             }
         };
 
@@ -1496,6 +1486,7 @@ impl RnaHandler {
         // The graph is queryable NOW — these improve quality progressively.
         let bg_repo_root = self.repo_root.clone();
         let bg_graph = self.graph.clone();
+        let bg_embed_index = self.embed_index.clone();
         let bg_nodes = all_nodes.clone();
         let bg_languages: Vec<String> = all_nodes
             .iter()
@@ -1517,10 +1508,8 @@ impl RnaHandler {
                         match idx.index_all_with_symbols(&bg_repo_root, &embeddable_nodes).await {
                             Ok(count) => {
                                 tracing::info!("[background] Embedded {} items", count);
-                                // Update the shared graph with the embed index
-                                if let Ok(guard) = bg_graph.write().await.as_mut().ok_or(()) {
-                                    guard.embed_index = Some(idx);
-                                }
+                                // Atomic store — no mutex needed
+                                bg_embed_index.store(Arc::new(Some(idx)));
                             }
                             Err(e) => tracing::warn!("[background] Embedding failed: {}", e),
                         }
@@ -1606,7 +1595,6 @@ impl RnaHandler {
             nodes: all_nodes,
             edges: all_edges,
             index,
-            embed_index,
             last_scan_completed_at: Some(symbols_ready_at),
         })
     }
@@ -1753,7 +1741,8 @@ impl RnaHandler {
             // Re-embed the enriched nodes specifically, using their post-enrichment metadata.
             // This is scoped to only changed nodes to avoid re-embedding the entire graph.
             if !enriched_node_ids.is_empty() {
-                if let Some(ref embed_idx) = graph.embed_index {
+                let embed_guard = self.embed_index.load();
+                if let Some(ref embed_idx) = **embed_guard {
                     let enriched_nodes: Vec<_> = graph
                         .nodes
                         .iter()
@@ -1784,7 +1773,8 @@ impl RnaHandler {
 
         // Re-embed changed-file symbols. Uses the updated graph nodes so enriched
         // metadata is included in the embedding text.
-        if let Some(ref embed_idx) = graph.embed_index {
+        let embed_guard2 = self.embed_index.load();
+        if let Some(ref embed_idx) = **embed_guard2 {
             let changed_file_nodes: Vec<_> = graph
                 .nodes
                 .iter()
@@ -2012,12 +2002,13 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
 
                 let mut sections: Vec<String> = Vec::new();
 
-                // Search .oh/ artifacts + symbols via embedding index
-                // Create a fresh EmbeddingIndex handle (cheap — just opens LanceDB connection)
-                // to avoid holding the graph read guard during async search.
-                match EmbeddingIndex::new(root).await {
-                    Ok(index) => {
-                        match index.search(query, args.artifact_types.as_deref(), limit).await {
+                // Search .oh/ artifacts + symbols via embedding index.
+                // Lock-free load from ArcSwap — no mutex contention with graph writes.
+                {
+                    let embed_guard = self.embed_index.load();
+                    match embed_guard.as_ref() {
+                        Some(index) => {
+                            match index.search(query, args.artifact_types.as_deref(), limit).await {
                             Ok(results) => {
                                 if !results.is_empty() {
                                     let md: String = results
@@ -2032,10 +2023,11 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                     ));
                                 }
                             }
-                            Err(e) => sections.push(format!("Artifact search error: {}", e)),
+                                Err(e) => sections.push(format!("Artifact search error: {}", e)),
+                            }
                         }
+                        None => sections.push("Embedding index not yet available".to_string()),
                     }
-                    Err(e) => sections.push(format!("Index error: {}", e)),
                 }
 
                 // Optionally search code symbols from the graph (with 5-tier ranking)
@@ -2316,10 +2308,11 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                     // Explicit node ID — backward compatible path
                     (vec![node_id.to_string()], String::new())
                 } else if let Some(query_text) = query {
-                    // Semantic search path — find entry nodes by natural language
-                    let embed_result = EmbeddingIndex::new(&self.repo_root).await;
-                    match embed_result {
-                        Ok(embed_idx) => {
+                    // Semantic search path — find entry nodes by natural language.
+                    // Lock-free load from ArcSwap — no mutex contention.
+                    let embed_guard = self.embed_index.load();
+                    match embed_guard.as_ref() {
+                        Some(embed_idx) => {
                             // Search without type filter, then keep only code:* kinds.
                             // This is robust to new code kinds added to the embedding pipeline
                             // (the pipeline already gates what gets indexed via is_embeddable()).
@@ -2366,7 +2359,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                 }
                             }
                         }
-                        Err(_) => {
+                        None => {
                             return Ok(text_result(
                                 "Embedding index not available. Use node_id from search_symbols instead, or wait for the background index to build.".to_string()
                             ));
