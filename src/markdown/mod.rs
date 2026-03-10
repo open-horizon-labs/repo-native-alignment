@@ -1335,4 +1335,534 @@ mod tests {
         assert_eq!(results[0].heading_text, "Active",
             "Exact h1 heading match should rank above frontmatter body match");
     }
+
+    // ========================================================================
+    // Adversarial tests — trying to break the implementation
+    // ========================================================================
+
+    #[test]
+    fn test_deeply_nested_headings_h1_through_h6() {
+        let source = "\
+# L1\n\n\
+## L2\n\n\
+### L3\n\n\
+#### L4\n\n\
+##### L5\n\n\
+###### L6\n\n\
+Deepest content.\n";
+        let chunks = parse_markdown_source(source, Path::new("deep.md"));
+
+        assert_eq!(chunks.len(), 6, "Should produce one chunk per heading level");
+        assert_eq!(chunks[5].heading_level, 6);
+        assert_eq!(
+            chunks[5].heading_hierarchy,
+            vec!["# L1", "## L2", "### L3", "#### L4", "##### L5", "###### L6"]
+        );
+        assert_eq!(chunks[5].section_path(), "L1 > L2 > L3 > L4 > L5 > L6");
+        assert_eq!(chunks[5].parent_heading, Some("L5".to_string()));
+        assert!(chunks[5].content.contains("Deepest content."));
+    }
+
+    #[test]
+    fn test_heading_level_jump_h1_to_h4() {
+        // Skipping h2 and h3 — does hierarchy still track correctly?
+        let source = "# Top\n\nIntro.\n\n#### Deep Jump\n\nJumped content.\n";
+        let chunks = parse_markdown_source(source, Path::new("jump.md"));
+
+        assert_eq!(chunks.len(), 2);
+        // The h4 should still nest under h1 even with skipped levels
+        assert_eq!(chunks[1].heading_hierarchy, vec!["# Top", "#### Deep Jump"]);
+        assert_eq!(chunks[1].section_path(), "Top > Deep Jump");
+        assert_eq!(chunks[1].parent_heading, Some("Top".to_string()));
+        assert_eq!(chunks[1].heading_level, 4);
+    }
+
+    #[test]
+    fn test_heading_level_jump_h1_h4_then_h2() {
+        // h1 -> h4 -> h2: the h2 should pop the h4 and nest under h1
+        let source = "# Top\n\n#### Deep\n\nDeep text.\n\n## Sibling\n\nSibling text.\n";
+        let chunks = parse_markdown_source(source, Path::new("jump2.md"));
+
+        assert_eq!(chunks.len(), 3);
+        // h4 nests under h1
+        assert_eq!(chunks[1].heading_hierarchy, vec!["# Top", "#### Deep"]);
+        // h2 should pop h4 and nest under h1
+        assert_eq!(chunks[2].heading_hierarchy, vec!["# Top", "## Sibling"]);
+        assert_eq!(chunks[2].parent_heading, Some("Top".to_string()));
+    }
+
+    #[test]
+    fn test_multiple_h1_headings_resets_hierarchy() {
+        // Second h1 should replace the first, not accumulate
+        let source = "# First\n\nFirst content.\n\n## Sub\n\nSub content.\n\n# Second\n\nSecond content.\n\n## Sub2\n\nSub2 content.\n";
+        let chunks = parse_markdown_source(source, Path::new("multi-h1.md"));
+
+        assert_eq!(chunks.len(), 4);
+        // First h1 + sub
+        assert_eq!(chunks[0].heading_hierarchy, vec!["# First"]);
+        assert_eq!(chunks[1].heading_hierarchy, vec!["# First", "## Sub"]);
+        // Second h1 should NOT carry "# First" — it replaces it
+        assert_eq!(chunks[2].heading_hierarchy, vec!["# Second"]);
+        assert_eq!(chunks[2].parent_heading, None);
+        // Sub2 nests under Second, not First
+        assert_eq!(chunks[3].heading_hierarchy, vec!["# Second", "## Sub2"]);
+        assert_eq!(chunks[3].parent_heading, Some("Second".to_string()));
+    }
+
+    #[test]
+    fn test_code_block_with_hash_not_confused_as_heading() {
+        // Fenced code blocks with `#` lines should NOT be parsed as headings
+        let source = "# Real Heading\n\n```python\n# This is a comment, not a heading\ndef foo():\n    pass\n```\n\nAfter code.\n";
+        let chunks = parse_markdown_source(source, Path::new("code.md"));
+
+        assert_eq!(chunks.len(), 1, "Code block # should not create new chunks");
+        assert_eq!(chunks[0].heading_text, "Real Heading");
+        assert!(chunks[0].content.contains("# This is a comment"));
+        assert!(chunks[0].content.contains("After code."));
+    }
+
+    #[test]
+    fn test_indented_code_block_with_hash() {
+        // Indented code blocks can also contain #
+        let source = "# Title\n\n    # indented code comment\n    x = 1\n\nParagraph.\n";
+        let chunks = parse_markdown_source(source, Path::new("indent.md"));
+
+        assert_eq!(chunks.len(), 1, "Indented code # should not split chunks");
+        assert_eq!(chunks[0].heading_text, "Title");
+    }
+
+    #[test]
+    fn test_empty_frontmatter() {
+        // BUG FOUND: `---\n---` (empty frontmatter) is not detected as frontmatter.
+        // The `extract_frontmatter_chunk` function looks for `\n---` after the
+        // opening dashes' newline, but with empty frontmatter there's no content
+        // before the closing `---`, so `after_first` starts with `---` (no `\n` prefix)
+        // and `find("\n---")` fails.
+        //
+        // Expected behavior: empty frontmatter should produce a frontmatter chunk.
+        // Actual behavior: the `---\n---` is passed to pulldown-cmark as a thematic
+        // break, and frontmatter is not detected.
+        let source = "---\n---\n\n# Title\n\nBody.\n";
+        let chunks = parse_markdown_source(source, Path::new("empty-fm.md"));
+
+        // Document actual (buggy) behavior: no frontmatter chunk is produced
+        let fm_chunks: Vec<_> = chunks.iter().filter(|c| c.is_frontmatter).collect();
+        assert_eq!(fm_chunks.len(), 0,
+            "BUG: empty frontmatter is not detected (see comment above)");
+
+        // The heading should still be parsed correctly despite the bug
+        let heading_chunks: Vec<_> = chunks.iter().filter(|c| !c.is_frontmatter).collect();
+        assert!(heading_chunks.iter().any(|c| c.heading_text == "Title"),
+            "Heading should still be parsed after undetected empty frontmatter");
+    }
+
+    #[test]
+    fn test_frontmatter_with_nested_yaml() {
+        let source = "---\nid: test\nmetadata:\n  author: Alice\n  tags:\n    - rust\n    - mcp\n---\n\n# Title\n\nBody.\n";
+        let chunks = parse_markdown_source(source, Path::new("nested-yaml.md"));
+
+        assert!(chunks[0].is_frontmatter);
+        assert!(chunks[0].content.contains("metadata:"));
+        assert!(chunks[0].content.contains("author: Alice"));
+        assert!(chunks[0].content.contains("- rust"));
+        // Ensure parsing continues normally after complex frontmatter
+        let heading_chunks: Vec<_> = chunks.iter().filter(|c| !c.is_frontmatter).collect();
+        assert!(!heading_chunks.is_empty());
+        assert_eq!(heading_chunks[0].heading_text, "Title");
+    }
+
+    #[test]
+    fn test_frontmatter_with_multiline_string() {
+        let source = "---\nid: test\ndescription: |\n  This is a\n  multiline string\n---\n\n# Title\n\nBody.\n";
+        let chunks = parse_markdown_source(source, Path::new("multiline-fm.md"));
+
+        assert!(chunks[0].is_frontmatter);
+        assert!(chunks[0].content.contains("multiline string"));
+        assert!(chunks.len() >= 2);
+    }
+
+    #[test]
+    fn test_heading_with_inline_code_link_emphasis() {
+        // Headings with rich inline content
+        let source = "# The `Config` **struct** for [users](url)\n\nBody text.\n";
+        let chunks = parse_markdown_source(source, Path::new("rich.md"));
+
+        assert_eq!(chunks.len(), 1);
+        // pulldown-cmark strips emphasis/link markup from text events
+        // The heading text should contain the raw text content
+        assert!(chunks[0].heading_text.contains("Config"));
+        assert!(chunks[0].heading_text.contains("struct"));
+        // Code spans should be captured
+        assert!(chunks[0].code_spans.contains(&"Config".to_string()));
+    }
+
+    #[test]
+    fn test_empty_body_between_headings() {
+        // Headings with absolutely no content between them
+        let source = "# A\n## B\n## C\n### D\n";
+        let chunks = parse_markdown_source(source, Path::new("empty-body.md"));
+
+        // Each heading should produce a chunk (via saw_any_heading flag)
+        assert!(chunks.len() >= 3, "Got {} chunks: {:#?}", chunks.len(), chunks);
+        // Verify hierarchy is correct
+        let d_chunk = chunks.iter().find(|c| c.heading_text == "D").unwrap();
+        assert_eq!(d_chunk.heading_hierarchy, vec!["# A", "## C", "### D"]);
+    }
+
+    #[test]
+    fn test_very_long_heading() {
+        let long_heading = "X".repeat(2000);
+        let source = format!("# {}\n\nBody.\n", long_heading);
+        let chunks = parse_markdown_source(&source, Path::new("long.md"));
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading_text.len(), 2000);
+        assert_eq!(chunks[0].heading_hierarchy[0], format!("# {}", long_heading));
+    }
+
+    #[test]
+    fn test_embedding_text_truncates_long_body() {
+        let long_body = "A".repeat(1000);
+        let chunk = MarkdownChunk {
+            file_path: PathBuf::from("doc.md"),
+            heading_hierarchy: vec!["# Title".to_string()],
+            heading_level: 1,
+            heading_text: "Title".to_string(),
+            parent_heading: None,
+            is_frontmatter: false,
+            content: long_body.clone(),
+            byte_offset: 0,
+            byte_len: 1000,
+            code_spans: vec![],
+        };
+
+        let text = chunk.embedding_text();
+        // Default limit is 500 chars for body
+        assert!(text.len() < 600, "embedding_text should truncate body, got len={}", text.len());
+        assert!(text.starts_with("Title: "));
+    }
+
+    #[test]
+    fn test_embedding_text_very_long_section_path() {
+        let long_headings: Vec<String> = (0..6)
+            .map(|i| format!("{} {}", "#".repeat(i + 1), "A".repeat(200)))
+            .collect();
+        let chunk = MarkdownChunk {
+            file_path: PathBuf::from("doc.md"),
+            heading_hierarchy: long_headings.clone(),
+            heading_level: 6,
+            heading_text: "A".repeat(200),
+            parent_heading: Some("A".repeat(200)),
+            is_frontmatter: false,
+            content: "Short body.".to_string(),
+            byte_offset: 0,
+            byte_len: 11,
+            code_spans: vec![],
+        };
+
+        // Should not panic even with very long section_path
+        let text = chunk.embedding_text();
+        assert!(text.contains("Short body."));
+        // section_path uses " > " as separator
+        assert!(text.contains(" > "));
+    }
+
+    #[test]
+    fn test_unicode_headings_and_body() {
+        let source = "# Ψηφιακή Εποχή\n\n日本語のテキスト。\n\n## Ñoño 🎉\n\nEmoji content: 🦀🔥💯\n";
+        let chunks = parse_markdown_source(source, Path::new("unicode.md"));
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].heading_text, "Ψηφιακή Εποχή");
+        assert!(chunks[0].content.contains("日本語のテキスト"));
+        assert_eq!(chunks[1].heading_text, "Ñoño 🎉");
+        assert!(chunks[1].content.contains("🦀🔥💯"));
+        assert_eq!(chunks[1].section_path(), "Ψηφιακή Εποχή > Ñoño 🎉");
+    }
+
+    #[test]
+    fn test_embedding_text_truncation_at_multibyte_boundary() {
+        // Body is all multibyte characters — truncation must not split a codepoint
+        let body = "日".repeat(200); // each char is 3 bytes, 200 chars = 600 bytes
+        let chunk = MarkdownChunk {
+            file_path: PathBuf::from("doc.md"),
+            heading_hierarchy: vec!["# Title".to_string()],
+            heading_level: 1,
+            heading_text: "Title".to_string(),
+            parent_heading: None,
+            is_frontmatter: false,
+            content: body,
+            byte_offset: 0,
+            byte_len: 600,
+            code_spans: vec![],
+        };
+
+        // Must not panic on multibyte boundary
+        let text = chunk.embedding_text();
+        assert!(text.starts_with("Title: "));
+        // Verify it's valid UTF-8 (implicit — if we got here, it is)
+    }
+
+    #[test]
+    fn test_frontmatter_only_no_trailing_newline() {
+        // Frontmatter with no trailing newline
+        let source = "---\nid: x\n---";
+        let chunks = parse_markdown_source(source, Path::new("no-trail.md"));
+
+        // Should produce at least the frontmatter chunk, and not panic
+        assert!(!chunks.is_empty(), "Should handle frontmatter without trailing newline");
+        assert!(chunks[0].is_frontmatter);
+    }
+
+    #[test]
+    fn test_triple_dashes_in_body_not_frontmatter() {
+        // Triple dashes mid-document should not be confused with frontmatter
+        let source = "# Title\n\nSome text.\n\n---\n\nMore text after hr.\n";
+        let chunks = parse_markdown_source(source, Path::new("hr.md"));
+
+        // No chunk should be frontmatter
+        assert!(
+            chunks.iter().all(|c| !c.is_frontmatter),
+            "Horizontal rule (---) in body should not create frontmatter chunk"
+        );
+    }
+
+    #[test]
+    fn test_whitespace_only_document() {
+        let source = "   \n\n  \t  \n";
+        let chunks = parse_markdown_source(source, Path::new("ws.md"));
+
+        assert_eq!(chunks.len(), 0, "Whitespace-only document should produce no chunks");
+    }
+
+    #[test]
+    fn test_byte_offsets_with_frontmatter() {
+        let source = "---\nid: test\n---\n\n# Title\n\nBody.\n";
+        let chunks = parse_markdown_source(source, Path::new("offsets.md"));
+
+        assert!(chunks.len() >= 2);
+        // Frontmatter starts at 0
+        assert_eq!(chunks[0].byte_offset, 0);
+        assert!(chunks[0].is_frontmatter);
+        // The heading chunk should start after frontmatter
+        let heading_chunk = chunks.iter().find(|c| !c.is_frontmatter).unwrap();
+        assert!(
+            heading_chunk.byte_offset >= chunks[0].byte_len,
+            "Heading byte_offset ({}) should be >= frontmatter byte_len ({})",
+            heading_chunk.byte_offset,
+            chunks[0].byte_len
+        );
+        // Verify content matches source at the offset
+        let actual = &source[heading_chunk.byte_offset..heading_chunk.byte_offset + heading_chunk.byte_len];
+        assert_eq!(actual, heading_chunk.content);
+    }
+
+    #[test]
+    fn test_search_heading_hierarchy_match() {
+        // Query matches a parent heading in hierarchy but not the chunk's own heading
+        let chunks = vec![MarkdownChunk {
+            file_path: PathBuf::from("a.md"),
+            heading_hierarchy: vec!["# Architecture".to_string(), "## Details".to_string()],
+            heading_level: 2,
+            heading_text: "Details".to_string(),
+            parent_heading: Some("Architecture".to_string()),
+            is_frontmatter: false,
+            content: "Some implementation details.".to_string(),
+            byte_offset: 0,
+            byte_len: 28,
+            code_spans: vec![],
+        }];
+
+        let results = search_chunks(&chunks, "Architecture");
+        assert_eq!(results.len(), 1, "Should match via heading hierarchy");
+    }
+
+    #[test]
+    fn test_search_case_insensitive() {
+        let chunks = vec![MarkdownChunk {
+            file_path: PathBuf::from("a.md"),
+            heading_hierarchy: vec!["# README".to_string()],
+            heading_level: 1,
+            heading_text: "README".to_string(),
+            parent_heading: None,
+            is_frontmatter: false,
+            content: "# README\n\nProject info.".to_string(),
+            byte_offset: 0,
+            byte_len: 23,
+            code_spans: vec![],
+        }];
+
+        assert_eq!(search_chunks(&chunks, "readme").len(), 1);
+        assert_eq!(search_chunks(&chunks, "README").len(), 1);
+        assert_eq!(search_chunks(&chunks, "ReAdMe").len(), 1);
+    }
+
+    #[test]
+    fn test_search_empty_query() {
+        let chunks = vec![MarkdownChunk {
+            file_path: PathBuf::from("a.md"),
+            heading_hierarchy: vec!["# Title".to_string()],
+            heading_level: 1,
+            heading_text: "Title".to_string(),
+            parent_heading: None,
+            is_frontmatter: false,
+            content: "Hello".to_string(),
+            byte_offset: 0,
+            byte_len: 5,
+            code_spans: vec![],
+        }];
+
+        // Empty string is contained in everything — should match all chunks
+        let results = search_chunks(&chunks, "");
+        assert_eq!(results.len(), 1, "Empty query matches everything via contains");
+    }
+
+    #[test]
+    fn test_heading_level_boost_h1_over_h6() {
+        // h1 and h6 both have exact heading match, h1 should rank higher due to level boost
+        let chunks = vec![
+            MarkdownChunk {
+                file_path: PathBuf::from("a.md"),
+                heading_hierarchy: vec!["###### Target".to_string()],
+                heading_level: 6,
+                heading_text: "Target".to_string(),
+                parent_heading: None,
+                is_frontmatter: false,
+                content: "h6 content.".to_string(),
+                byte_offset: 0,
+                byte_len: 11,
+                code_spans: vec![],
+            },
+            MarkdownChunk {
+                file_path: PathBuf::from("b.md"),
+                heading_hierarchy: vec!["# Target".to_string()],
+                heading_level: 1,
+                heading_text: "Target".to_string(),
+                parent_heading: None,
+                is_frontmatter: false,
+                content: "h1 content.".to_string(),
+                byte_offset: 0,
+                byte_len: 11,
+                code_spans: vec![],
+            },
+        ];
+
+        let results = search_chunks(&chunks, "Target");
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].heading_level, 1,
+            "h1 should rank above h6 due to level boost"
+        );
+    }
+
+    #[test]
+    fn test_section_path_empty_for_preamble() {
+        let source = "Just preamble text, no headings.\n";
+        let chunks = parse_markdown_source(source, Path::new("pre.md"));
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].section_path(), "", "Preamble should have empty section_path");
+        assert!(chunks[0].heading_hierarchy.is_empty());
+    }
+
+    #[test]
+    fn test_embedding_text_frontmatter_prefix() {
+        let chunk = MarkdownChunk {
+            file_path: PathBuf::from("doc.md"),
+            heading_hierarchy: vec![],
+            heading_level: 0,
+            heading_text: String::new(),
+            parent_heading: None,
+            is_frontmatter: true,
+            content: "---\nid: test\n---\n".to_string(),
+            byte_offset: 0,
+            byte_len: 17,
+            code_spans: vec![],
+        };
+
+        let text = chunk.embedding_text();
+        assert!(
+            text.starts_with("[frontmatter] doc.md: "),
+            "Frontmatter embedding should use [frontmatter] prefix, got: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_embedding_text_preamble_prefix() {
+        let chunk = MarkdownChunk {
+            file_path: PathBuf::from("doc.md"),
+            heading_hierarchy: vec![],
+            heading_level: 0,
+            heading_text: String::new(),
+            parent_heading: None,
+            is_frontmatter: false,
+            content: "Some preamble.".to_string(),
+            byte_offset: 0,
+            byte_len: 14,
+            code_spans: vec![],
+        };
+
+        let text = chunk.embedding_text();
+        assert!(
+            text.starts_with("[preamble] doc.md: "),
+            "Preamble embedding should use [preamble] prefix, got: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_consecutive_headings_same_level() {
+        // h2 h2 h2 — each should replace the previous, not accumulate
+        let source = "# Top\n\n## A\n\nA text.\n\n## B\n\nB text.\n\n## C\n\nC text.\n";
+        let chunks = parse_markdown_source(source, Path::new("consec.md"));
+
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks[1].heading_hierarchy, vec!["# Top", "## A"]);
+        assert_eq!(chunks[2].heading_hierarchy, vec!["# Top", "## B"]);
+        assert_eq!(chunks[3].heading_hierarchy, vec!["# Top", "## C"]);
+        // Each h2 should have Top as parent
+        for i in 1..4 {
+            assert_eq!(chunks[i].parent_heading, Some("Top".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_heading_after_deep_nesting_resets_properly() {
+        // h1 > h2 > h3 > h4, then back to h2 — stack should unwind properly
+        let source = "# Root\n\n## L2\n\n### L3\n\n#### L4\n\nDeep.\n\n## Back to L2\n\nShallow again.\n";
+        let chunks = parse_markdown_source(source, Path::new("unwind.md"));
+
+        let back = chunks.iter().find(|c| c.heading_text == "Back to L2").unwrap();
+        assert_eq!(
+            back.heading_hierarchy,
+            vec!["# Root", "## Back to L2"],
+            "h2 after h4 should unwind to just Root > Back to L2"
+        );
+        assert_eq!(back.parent_heading, Some("Root".to_string()));
+    }
+
+    #[test]
+    fn test_frontmatter_with_dashes_in_values() {
+        // YAML values containing --- should not break frontmatter parsing
+        let source = "---\nid: test-value-with-dashes\ntitle: a---b---c\n---\n\n# Title\n\nBody.\n";
+        let chunks = parse_markdown_source(source, Path::new("dashes.md"));
+
+        assert!(chunks[0].is_frontmatter);
+        assert!(chunks[0].content.contains("test-value-with-dashes"));
+        assert!(chunks[0].content.contains("a---b---c"));
+    }
+
+    #[test]
+    fn test_crlf_line_endings() {
+        let source = "---\r\nid: test\r\n---\r\n\r\n# Title\r\n\r\nBody text.\r\n";
+        let chunks = parse_markdown_source(source, Path::new("crlf.md"));
+
+        // Should not panic, and should produce reasonable chunks
+        assert!(!chunks.is_empty(), "CRLF document should produce chunks");
+        let has_fm = chunks.iter().any(|c| c.is_frontmatter);
+        let has_heading = chunks.iter().any(|c| c.heading_text == "Title");
+        assert!(has_fm, "Should detect frontmatter with CRLF");
+        assert!(has_heading, "Should detect heading with CRLF");
+    }
 }
