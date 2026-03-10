@@ -2498,9 +2498,10 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
 fn parse_args<T: serde::de::DeserializeOwned>(
     arguments: Option<serde_json::Map<String, serde_json::Value>>,
 ) -> Result<T, CallToolError> {
-    let value = arguments
-        .map(serde_json::Value::Object)
-        .unwrap_or(serde_json::Value::Null);
+    let value = match arguments {
+        Some(map) => serde_json::Value::Object(map),
+        None => serde_json::Value::Object(serde_json::Map::new()), // empty object, not null
+    };
     serde_json::from_value(value)
         .map_err(|e| CallToolError::from_message(format!("Invalid arguments: {}", e)))
 }
