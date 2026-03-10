@@ -177,6 +177,7 @@ async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
 
 
 /// The embedding index: wraps LanceDB with fastembed for semantic search over .oh/ artifacts.
+#[derive(Clone)]
 pub struct EmbeddingIndex {
     db: lancedb::Connection,
     table_name: String,
