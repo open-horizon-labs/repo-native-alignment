@@ -420,7 +420,10 @@ async fn main() -> anyhow::Result<()> {
             let guardrails = artifacts.iter().filter(|a| a.kind == repo_native_alignment::types::OhArtifactKind::Guardrail).count();
             let metis = artifacts.iter().filter(|a| a.kind == repo_native_alignment::types::OhArtifactKind::Metis).count();
 
-            let embed_str = if gs.embed_index.is_some() { "yes" } else { "no" };
+            let embed_str = match repo_native_alignment::embed::EmbeddingIndex::new(&repo_root).await {
+                Ok(idx) => if idx.search("_probe_", None, 1).await.is_ok() { "yes" } else { "no" },
+                Err(_) => "no",
+            };
 
             println!("── Repo Stats ──────────────────────────");
             println!("  Symbols:    {}", gs.nodes.len());
