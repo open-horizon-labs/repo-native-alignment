@@ -6,6 +6,7 @@ pub mod graph;
 pub mod markdown;
 pub mod oh;
 pub mod query;
+pub mod ranking;
 pub mod roots;
 pub mod scanner;
 pub mod server;

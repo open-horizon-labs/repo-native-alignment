@@ -22,7 +22,7 @@ use crate::graph::store::{symbols_schema, edges_schema, schema_meta_schema, SCHE
 use crate::roots::{WorkspaceConfig, cache_state_path};
 use crate::scanner::Scanner;
 use crate::types::OhArtifactKind;
-use crate::{git, markdown, oh, query};
+use crate::{git, markdown, oh, query, ranking};
 use petgraph::Direction;
 use tokio::sync::RwLock;
 
@@ -2027,28 +2027,38 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                     Err(e) => sections.push(format!("Index error: {}", e)),
                 }
 
-                // Optionally search code symbols from the graph
+                // Optionally search code symbols from the graph (with 5-tier ranking)
                 if include_code {
                     if let Ok(guard) = self.get_graph().await {
                         if let Some(gs) = guard.as_ref() {
                             let query_lower = args.query.to_lowercase();
-                            let matches: Vec<&Node> = gs.nodes.iter()
+                            let mut matches: Vec<&Node> = gs.nodes.iter()
                                 .filter(|n| n.id.kind != NodeKind::Import && n.id.root != "external")
                                 .filter(|n| {
                                     n.id.name.to_lowercase().contains(&query_lower)
                                         || n.signature.to_lowercase().contains(&query_lower)
                                 })
-                                .take(limit)
                                 .collect();
+
+                            // Rank using the shared 5-tier cascade (same logic as search_symbols)
+                            ranking::sort_symbol_matches(&mut matches, &query_lower, &gs.index);
+                            matches.truncate(limit);
+
                             if !matches.is_empty() {
+                                // Output format intentionally matches search_symbols
+                                // (unordered list with `- **`) for backward compatibility.
+                                // Results are sorted by relevance but use the same bullet
+                                // style so agents parsing the old format are unaffected.
                                 let md = matches.iter()
-                                    .map(|n| format!(
-                                        "- **{} {} ({})** ({})\n  `{}`\n  ID: `{}`",
-                                        n.id.kind, n.id.name, n.language,
-                                        n.id.file.display(),
-                                        n.signature,
-                                        n.stable_id(),
-                                    ))
+                                    .map(|n| {
+                                        format!(
+                                            "- **{} {} ({})** ({})\n  `{}`\n  ID: `{}`",
+                                            n.id.kind, n.id.name, n.language,
+                                            n.id.file.display(),
+                                            n.signature,
+                                            n.stable_id(),
+                                        )
+                                    })
                                     .collect::<Vec<_>>()
                                     .join("\n\n");
                                 sections.push(format!(
@@ -2061,21 +2071,28 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                     }
                 }
 
-                // Optionally search markdown
+                // Optionally search markdown (with relevance scoring)
                 if include_markdown {
                     match markdown::extract_markdown_chunks(root) {
                         Ok(chunks) => {
-                            let matches = markdown::search_chunks(&chunks, &args.query);
-                            if !matches.is_empty() {
-                                let md = matches
+                            let scored = markdown::search_chunks_ranked(&chunks, &args.query);
+                            if !scored.is_empty() {
+                                // Backward-compatible format: `- ` bullets, same header
+                                // as before. Score is appended as a parenthetical so
+                                // agents that ignore it are unaffected.
+                                let md = scored
                                     .iter()
                                     .take(limit)
-                                    .map(|c| c.to_markdown())
+                                    .map(|sc| {
+                                        format!(
+                                            "- (score: {:.2}) {}", sc.score, sc.chunk.to_markdown()
+                                        )
+                                    })
                                     .collect::<Vec<_>>()
                                     .join("\n\n---\n\n");
                                 sections.push(format!(
                                     "### Markdown ({} result(s))\n\n{}",
-                                    matches.len().min(limit),
+                                    scored.len().min(limit),
                                     md
                                 ));
                             }
@@ -2195,62 +2212,9 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                             })
                             .collect();
 
-                        // Rank results by relevance:
-                        // 1. Exact name match > name contains > signature-only
-                        // 2. Definitions (function/struct/trait) > constants > imports
-                        // 3. Non-test files > test files
-                        // 4. More referenced symbols first (higher edge count)
-                        matches.sort_by(|a, b| {
-                            let a_name_lower = a.id.name.to_lowercase();
-                            let b_name_lower = b.id.name.to_lowercase();
-                            let a_exact = a_name_lower == query_lower;
-                            let b_exact = b_name_lower == query_lower;
-                            let a_name_contains = a_name_lower.contains(&query_lower);
-                            let b_name_contains = b_name_lower.contains(&query_lower);
-
-                            // Tier 1: exact name match
-                            match (a_exact, b_exact) {
-                                (true, false) => return std::cmp::Ordering::Less,
-                                (false, true) => return std::cmp::Ordering::Greater,
-                                _ => {}
-                            }
-                            // Tier 2: name contains vs signature-only
-                            match (a_name_contains, b_name_contains) {
-                                (true, false) => return std::cmp::Ordering::Less,
-                                (false, true) => return std::cmp::Ordering::Greater,
-                                _ => {}
-                            }
-                            // Tier 3: prefer definitions over imports
-                            let kind_rank = |n: &Node| -> u8 {
-                                match n.id.kind {
-                                    NodeKind::Function | NodeKind::Struct | NodeKind::Trait | NodeKind::Enum => 0,
-                                    NodeKind::Const | NodeKind::Field | NodeKind::Impl => 1,
-                                    NodeKind::Import | NodeKind::Module => 3,
-                                    _ => 1,
-                                }
-                            };
-                            let kr = kind_rank(a).cmp(&kind_rank(b));
-                            if kr != std::cmp::Ordering::Equal { return kr; }
-
-                            // Tier 4: non-test files before test files
-                            let is_test = |n: &Node| -> bool {
-                                let p = n.id.file.to_string_lossy();
-                                p.contains(".test.") || p.contains(".spec.") || p.contains("_test.") || p.contains("/test/") || p.contains("/tests/")
-                            };
-                            match (is_test(a), is_test(b)) {
-                                (false, true) => return std::cmp::Ordering::Less,
-                                (true, false) => return std::cmp::Ordering::Greater,
-                                _ => {}
-                            }
-
-                            // Tier 5: more edges = more important
-                            let edge_count = |n: &Node| -> usize {
-                                let sid = n.stable_id();
-                                graph_state.index.neighbors(&sid, None, Direction::Incoming).len()
-                                    + graph_state.index.neighbors(&sid, None, Direction::Outgoing).len()
-                            };
-                            edge_count(b).cmp(&edge_count(a))
-                        });
+                        // Rank results using the shared 5-tier cascade
+                        // (see ranking::sort_symbol_matches for tier documentation)
+                        ranking::sort_symbol_matches(&mut matches, &query_lower, &graph_state.index);
                         matches.truncate(limit);
 
                         let freshness = format_freshness(
