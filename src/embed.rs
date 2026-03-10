@@ -22,12 +22,11 @@ const PR_MERGE_LIMIT: usize = 50;
 /// Maximum character budget for code embedding text.
 ///
 /// MiniLM-L6-v2 has a 256-token effective max sequence length.  Code
-/// tokenizes poorly with WordPiece (~3-4 subword tokens per identifier),
-/// so we budget ~800 chars total to stay safely within 256 tokens.
+/// tokenizes poorly with WordPiece (~3.5 subword tokens per identifier),
+/// so we budget ~650 chars to target ~180 tokens, safely within 256.
 /// The name is always included; the body (which already contains the
-/// signature) is truncated to fill the remaining budget; metadata is
-/// appended only if space remains.
-const CODE_EMBED_CHAR_BUDGET: usize = 800;
+/// signature) gets at least 50% of the budget; metadata fills remaining space.
+const CODE_EMBED_CHAR_BUDGET: usize = 650;
 
 /// Truncate `s` to at most `max_chars` Unicode scalar values, returning a
 /// valid UTF-8 slice. Safe even when a multibyte character straddles the
@@ -54,26 +53,41 @@ fn build_code_embedding_text(
     let mut t = String::with_capacity(CODE_EMBED_CHAR_BUDGET);
     t.push_str(name);
 
-    // Reserve some space for metadata (key: value pairs)
+    let name_chars = name.chars().count();
+    // Body always gets at least 50% of the budget
+    let min_body_budget = CODE_EMBED_CHAR_BUDGET / 2;
+    let after_name = CODE_EMBED_CHAR_BUDGET.saturating_sub(name_chars + 1);
+
+    // Estimate metadata cost in chars (not bytes) and cap to leave room for body
     let meta_estimate: usize = metadata
         .iter()
-        .map(|(k, v)| k.len() + v.len() + 3) // "key: value "
+        .map(|(k, v)| k.chars().count() + v.chars().count() + 3) // " key: value"
         .sum();
-    // Body gets the remaining budget after name + metadata estimate
-    let body_budget = CODE_EMBED_CHAR_BUDGET
-        .saturating_sub(name.chars().count() + 1)
-        .saturating_sub(meta_estimate);
+    let meta_budget = after_name.saturating_sub(min_body_budget).min(meta_estimate);
 
-    if body_budget > 0 {
+    // Truncate metadata entries to fit within meta_budget
+    let mut meta_parts: Vec<String> = Vec::new();
+    let mut meta_used = 0usize;
+    for (key, value) in metadata {
+        let entry = format!(" {}: {}", key, value);
+        let entry_chars = entry.chars().count();
+        if meta_used + entry_chars > meta_budget {
+            break;
+        }
+        meta_used += entry_chars;
+        meta_parts.push(entry);
+    }
+
+    // Body gets everything remaining after name and actual metadata used
+    let body_budget = after_name.saturating_sub(meta_used);
+
+    if body_budget > 0 && !body.is_empty() {
         t.push(' ');
         t.push_str(truncate_chars(body, body_budget));
     }
 
-    for (key, value) in metadata {
-        t.push(' ');
-        t.push_str(key);
-        t.push_str(": ");
-        t.push_str(value);
+    for part in &meta_parts {
+        t.push_str(part);
     }
 
     // Final safety truncation to hard budget
@@ -1102,10 +1116,13 @@ mod tests {
         // Fill body to exactly what should fit
         let mut metadata = BTreeMap::new();
         metadata.insert("key".into(), "val".into());
-        // meta_estimate = 3 + 3 + 3 = 9 bytes
-        // body_budget = 800 - (1 + 1) - 9 = 789
+        // meta entry " key: val" = 9 chars
+        // after_name = 650 - 2 = 648
+        // min_body_budget = 325
+        // meta_budget = min(648 - 325, 9) = 9
+        // body_budget = 648 - 9 = 639
 
-        let body = "x".repeat(789);
+        let body = "x".repeat(639);
         let text = build_code_embedding_text(name, &body, &metadata);
 
         // With ASCII metadata, byte == char, so budget should be exact
@@ -1116,7 +1133,7 @@ mod tests {
         );
         // Body should be fully included (not truncated)
         assert!(
-            text.contains(&"x".repeat(789)),
+            text.contains(&"x".repeat(639)),
             "full body should fit within budget when metadata is small"
         );
     }
