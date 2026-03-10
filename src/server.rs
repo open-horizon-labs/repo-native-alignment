@@ -31,14 +31,14 @@ use tokio::sync::RwLock;
 
 #[macros::mcp_tool(
     name = "oh_get_context",
-    description = "Returns concise business context: outcomes, signals, guardrails, metis. Use this to understand project aims and constraints. For code exploration use search_symbols instead."
+    description = "Get project business context: outcomes (what we're aiming for), guardrails (constraints), signals (metrics), and metis (accumulated learnings). Returns a concise summary — use oh_search_context to search within these."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct OhGetContext {}
 
 #[macros::mcp_tool(
     name = "oh_search_context",
-    description = "Use this INSTEAD OF Grep for searching business context, commits, and optionally code/markdown. Describe what you need in natural language. Set include_code=true to also search code symbols, include_markdown=true for markdown sections."
+    description = "Semantic search across business context, commits, code, and markdown. Describe what you need in plain language. Returns results ranked 0-1 by relevance; test files are demoted. Enable include_code for symbol search, include_markdown for doc sections. For exact symbol name lookup use search_symbols instead."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct OhSearchContext {
@@ -61,7 +61,7 @@ pub struct OhSearchContext {
 
 #[macros::mcp_tool(
     name = "outcome_progress",
-    description = "The real intersection query: given an outcome ID, finds related commits (by [outcome:X] tags and file pattern matches), code symbols in changed files, and markdown mentioning the outcome. This joins layers structurally, not by keyword. Returns a navigable summary (<5K chars) with stable Node IDs — use search_symbols and graph_query to drill deeper."
+    description = "Track progress on a business outcome. Finds tagged commits, code symbols in changed files, and related markdown. Returns a navigable summary with stable Node IDs for use with search_symbols and graph_query."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct OutcomeProgress {
@@ -71,7 +71,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search_symbols",
-    description = "Use this INSTEAD OF Grep/Read for finding code symbols. Searches functions, structs, traits, classes, interfaces, and constants across Rust, Python, TypeScript, Go, and 18 more languages. Returns file location, line numbers, signatures, values, and graph edges. Faster and richer than grep. Use synthetic=false to find declared constants only (e.g. MAX_RETRIES across all languages); synthetic=true for inferred literals like \"application/json\"."
+    description = "Find code symbols by name or signature across all supported languages. Returns file location, line numbers, signatures, and graph edges. Filter by kind (function/struct/trait/etc.), language, or file path. Results ranked: exact name > contains > signature-only, production code before tests. Use synthetic=false for declared constants only, synthetic=true for inferred literals."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SearchSymbols {
@@ -99,7 +99,7 @@ pub struct SearchSymbols {
 
 #[macros::mcp_tool(
     name = "graph_query",
-    description = "Use this INSTEAD OF Read/Grep for tracing code relationships. Accepts either a stable node_id (from search_symbols) OR a natural language query (e.g. \"authentication handler\") to find entry points via semantic search. When using query, the top matching code symbols become entry nodes for the traversal. Find neighbors (what calls/depends on a symbol), impact analysis (what depends on this), or reachable nodes within N hops."
+    description = "Trace code relationships from a symbol or natural language query. Modes: neighbors (direct connections), impact (what depends on this), reachable (forward BFS). Edges point from caller to callee, impl to trait, dependent to dependency. Use direction=\"incoming\" to reverse — what calls/implements/depends on this?"
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GraphQuery {
@@ -112,7 +112,7 @@ pub struct GraphQuery {
     /// Query mode: "neighbors" (default), "impact" (reverse dependents), "reachable" (forward BFS)
     #[serde(default = "default_graph_mode")]
     pub mode: String,
-    /// Direction for neighbors mode: "outgoing" (default), "incoming", "both"
+    /// Direction for neighbors mode: "outgoing" (default — what does this call/implement/depend on?), "incoming" (what calls/implements/depends on this?), "both"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
     /// Filter edge types: calls, depends_on, implements, defines, etc.
