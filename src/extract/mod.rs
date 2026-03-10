@@ -21,6 +21,7 @@ pub mod json_extractor;
 pub mod kotlin;
 pub mod lsp;
 pub mod lua;
+#[cfg(feature = "scip")]
 pub mod scip;
 pub mod markdown;
 pub mod openapi;
@@ -372,6 +373,7 @@ impl EnricherRegistry {
         ];
 
         // SCIP enricher: compiler-grade batch indexing (runs before LSP)
+        #[cfg(feature = "scip")]
         registry.register(Box::new(scip::ScipEnricher::new()));
 
         for &(lang, cmd, args, exts) in servers {

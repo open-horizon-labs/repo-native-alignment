@@ -73,8 +73,9 @@ futures = "0.3"
 lsp-types = "0.97"
 
 # SCIP protocol types (compiler-grade symbol index, batch enrichment)
-scip = "0.6"
-protobuf = "3.7"
+# Behind `scip` feature flag — not needed by most users and adds binary size.
+scip = { version = "0.6", optional = true }
+protobuf = { version = "3.7", optional = true }
 
 # Error handling
 anyhow = "1"
@@ -86,6 +87,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [features]
 default = ["metal"]
 metal = ["candle-core/metal", "candle-core/accelerate", "metal-candle/custom-metal"]
+scip = ["dep:scip", "dep:protobuf"]
 
 [profile.release]
 opt-level = 3

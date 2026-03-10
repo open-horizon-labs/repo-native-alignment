@@ -238,6 +238,25 @@ impl GraphIndex {
 
         result
     }
+
+    /// Return all edges as (from_id, to_id, edge_kind) triples.
+    ///
+    /// Used for cross-source edge deduplication: enrichers can check whether
+    /// an edge already exists in the graph before adding it.
+    pub fn all_edges(&self) -> Vec<(String, String, EdgeKind)> {
+        self.graph
+            .edge_indices()
+            .filter_map(|eidx| {
+                let (src_idx, tgt_idx) = self.graph.edge_endpoints(eidx)?;
+                let weight = &self.graph[eidx];
+                Some((
+                    self.graph[src_idx].id.clone(),
+                    self.graph[tgt_idx].id.clone(),
+                    weight.edge_type.clone(),
+                ))
+            })
+            .collect()
+    }
 }
 
 impl Default for GraphIndex {

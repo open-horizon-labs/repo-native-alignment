@@ -2,7 +2,7 @@
 //!
 //! Phase 2 enrichment: runs a SCIP indexer as a child process, parses the
 //! resulting `index.scip` protobuf file, and extracts high-confidence edges
-//! (CALLS, IMPLEMENTS, DEPENDS_ON) from compiler-grade symbol information.
+//! (CALLS, IMPLEMENTS) from compiler-grade symbol information.
 //!
 //! Supported SCIP indexers (auto-detected on PATH):
 //! - `rust-analyzer scip .` (Rust)
@@ -13,12 +13,14 @@
 //! Design decisions:
 //! - Runs the indexer on first `enrich()` call, not at startup
 //! - If the indexer binary is not installed, logs info and skips gracefully
-//! - 60-second timeout per indexer invocation
+//! - 120-second timeout per indexer invocation; child process is killed on timeout
 //! - Parses `index.scip` once, extracts all edges in a single pass
+//! - Caches the parsed index keyed by git HEAD — skips re-indexing if HEAD unchanged
 //! - Cleans up `index.scip` after parsing
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -91,11 +93,17 @@ const KNOWN_INDEXERS: &[ScipIndexerConfig] = &[
 ];
 
 /// Timeout for running a SCIP indexer.
-const INDEXER_TIMEOUT: Duration = Duration::from_secs(60);
+const INDEXER_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ---------------------------------------------------------------------------
 // ScipEnricher
 // ---------------------------------------------------------------------------
+
+/// Cached SCIP index keyed by (indexer name, git HEAD OID).
+struct CachedIndex {
+    head_oid: String,
+    index: scip::types::Index,
+}
 
 /// Enricher that runs SCIP indexers and parses their output to produce
 /// high-confidence edges.
@@ -104,18 +112,20 @@ const INDEXER_TIMEOUT: Duration = Duration::from_secs(60);
 /// root, parses the `index.scip` protobuf, and extracts symbol definitions,
 /// references, and relationships.
 pub struct ScipEnricher {
-    /// Which languages this enricher instance covers.
-    /// Determined at construction by checking which indexers are available.
-    #[allow(dead_code)]
-    supported_languages: Vec<String>,
+    /// Which languages this enricher instance covers (only those with
+    /// indexers actually found on PATH). Stored as `&'static str` refs
+    /// borrowed from `KNOWN_INDEXERS` so we can return `&[&str]`.
+    supported_languages: Vec<&'static str>,
     /// Indexer configs that were found on PATH.
     available_indexers: Vec<ScipIndexerConfig>,
+    /// Cache: indexer name -> CachedIndex. Reused if git HEAD hasn't changed.
+    cache: Mutex<HashMap<String, CachedIndex>>,
 }
 
 impl ScipEnricher {
     /// Create a new SCIP enricher, auto-detecting available indexers on PATH.
     pub fn new() -> Self {
-        let mut supported_languages = Vec::new();
+        let mut supported_languages: Vec<&'static str> = Vec::new();
         let mut available_indexers = Vec::new();
 
         for config in KNOWN_INDEXERS {
@@ -125,9 +135,9 @@ impl ScipEnricher {
                     config.name,
                     config.binary
                 );
-                for lang in config.languages {
-                    if !supported_languages.contains(&lang.to_string()) {
-                        supported_languages.push(lang.to_string());
+                for &lang in config.languages {
+                    if !supported_languages.contains(&lang) {
+                        supported_languages.push(lang);
                     }
                 }
                 available_indexers.push(config.clone());
@@ -146,15 +156,34 @@ impl ScipEnricher {
         Self {
             supported_languages,
             available_indexers,
+            cache: Mutex::new(HashMap::new()),
         }
     }
 
     /// Run a single SCIP indexer and parse the output.
+    /// Uses a cached result if git HEAD hasn't changed since the last run.
     async fn run_indexer(
         &self,
         config: &ScipIndexerConfig,
         repo_root: &Path,
     ) -> Result<scip::types::Index> {
+        // Check git HEAD for cache freshness
+        let head_oid = git_head_oid(repo_root).unwrap_or_default();
+
+        if !head_oid.is_empty() {
+            let cache = self.cache.lock().unwrap();
+            if let Some(cached) = cache.get(config.name) {
+                if cached.head_oid == head_oid {
+                    tracing::info!(
+                        "SCIP cache hit for '{}' (HEAD={})",
+                        config.name,
+                        &head_oid[..8.min(head_oid.len())]
+                    );
+                    return Ok(cached.index.clone());
+                }
+            }
+        }
+
         let output_path = repo_root.join(config.output_file);
 
         // Clean up any stale index file
@@ -170,33 +199,56 @@ impl ScipEnricher {
             repo_root.display()
         );
 
-        let result = tokio::time::timeout(INDEXER_TIMEOUT, async {
-            tokio::process::Command::new(config.binary)
-                .args(config.args)
-                .current_dir(repo_root)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output()
-                .await
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "SCIP indexer '{}' timed out after {}s",
-                config.name,
-                INDEXER_TIMEOUT.as_secs()
-            )
-        })?
-        .with_context(|| format!("Failed to spawn SCIP indexer '{}'", config.name))?;
+        // Spawn the child process so we can kill it on timeout.
+        // We use `spawn()` + `wait()` instead of `.output()` so the child
+        // handle stays alive and can be killed if the timeout fires.
+        let mut child = tokio::process::Command::new(config.binary)
+            .args(config.args)
+            .current_dir(repo_root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .with_context(|| format!("Failed to spawn SCIP indexer '{}'", config.name))?;
 
-        if !result.status.success() {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            anyhow::bail!(
-                "SCIP indexer '{}' exited with {}: {}",
-                config.name,
-                result.status,
-                stderr.chars().take(500).collect::<String>()
-            );
+        let wait_result = tokio::time::timeout(INDEXER_TIMEOUT, child.wait()).await;
+
+        match wait_result {
+            Err(_elapsed) => {
+                // Timeout — kill the child process to prevent resource leak
+                tracing::warn!(
+                    "SCIP indexer '{}' timed out after {}s, killing child process",
+                    config.name,
+                    INDEXER_TIMEOUT.as_secs()
+                );
+                let _ = child.kill().await;
+                anyhow::bail!(
+                    "SCIP indexer '{}' timed out after {}s",
+                    config.name,
+                    INDEXER_TIMEOUT.as_secs()
+                );
+            }
+            Ok(Err(e)) => {
+                // Process error
+                anyhow::bail!("SCIP indexer '{}' failed: {}", config.name, e);
+            }
+            Ok(Ok(status)) => {
+                if !status.success() {
+                    // Try to read stderr for diagnostics
+                    let stderr_msg = if let Some(mut stderr) = child.stderr.take() {
+                        let mut buf = Vec::new();
+                        let _ = tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut buf).await;
+                        String::from_utf8_lossy(&buf).chars().take(500).collect::<String>()
+                    } else {
+                        String::new()
+                    };
+                    anyhow::bail!(
+                        "SCIP indexer '{}' exited with {}: {}",
+                        config.name,
+                        status,
+                        stderr_msg
+                    );
+                }
+            }
         }
 
         // Parse the output protobuf
@@ -229,16 +281,33 @@ impl ScipEnricher {
             index.external_symbols.len()
         );
 
+        // Cache the result
+        if !head_oid.is_empty() {
+            let mut cache = self.cache.lock().unwrap();
+            cache.insert(
+                config.name.to_string(),
+                CachedIndex {
+                    head_oid,
+                    index: index.clone(),
+                },
+            );
+        }
+
         Ok(index)
     }
 
     /// Extract edges from a parsed SCIP index.
+    ///
+    /// `existing_edge_ids` contains the `stable_id()` of edges already in the
+    /// graph (from tree-sitter or other sources). SCIP edges that duplicate an
+    /// existing edge are skipped to prevent cross-source duplication.
     fn extract_edges(
         &self,
         index: &scip::types::Index,
         nodes: &[Node],
         _graph_index: &GraphIndex,
         _repo_root: &Path,
+        existing_edge_ids: &HashSet<String>,
     ) -> EnrichmentResult {
         let mut result = EnrichmentResult::default();
 
@@ -291,13 +360,17 @@ impl ScipEnricher {
                         ) {
                             for impl_id in implementor_ids {
                                 for iface_id in interface_ids {
-                                    result.added_edges.push(Edge {
+                                    let edge = Edge {
                                         from: impl_id.clone(),
                                         to: iface_id.clone(),
                                         kind: EdgeKind::Implements,
                                         source: ExtractionSource::Scip,
                                         confidence: Confidence::Confirmed,
-                                    });
+                                    };
+                                    // Skip if tree-sitter (or another source) already has this edge
+                                    if !existing_edge_ids.contains(&edge.stable_id()) {
+                                        result.added_edges.push(edge);
+                                    }
                                 }
                             }
                         }
@@ -333,28 +406,33 @@ impl ScipEnricher {
                             if caller_id == *target_id {
                                 continue;
                             }
-                            result.added_edges.push(Edge {
+                            let edge = Edge {
                                 from: caller_id.clone(),
                                 to: target_id.clone(),
                                 kind: EdgeKind::Calls,
                                 source: ExtractionSource::Scip,
                                 confidence: Confidence::Confirmed,
-                            });
+                            };
+                            // Skip if tree-sitter (or another source) already has this edge
+                            if !existing_edge_ids.contains(&edge.stable_id()) {
+                                result.added_edges.push(edge);
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Deduplicate edges
+        // Deduplicate edges within SCIP output
         let edge_count_before = result.added_edges.len();
         result.added_edges.sort_by(|a, b| a.stable_id().cmp(&b.stable_id()));
         result.added_edges.dedup_by(|a, b| a.stable_id() == b.stable_id());
 
         tracing::info!(
-            "SCIP enrichment: {} edges ({} before dedup)",
+            "SCIP enrichment: {} edges ({} before dedup, {} skipped as cross-source dupes)",
             result.added_edges.len(),
-            edge_count_before
+            edge_count_before,
+            edge_count_before - result.added_edges.len()
         );
 
         result
@@ -368,10 +446,8 @@ impl ScipEnricher {
 #[async_trait::async_trait]
 impl Enricher for ScipEnricher {
     fn languages(&self) -> &[&str] {
-        // Return a static slice — we can't return &[&str] from Vec<String>
-        // without a static lifetime, so we match against the known set.
-        // The actual filtering happens in enrich().
-        &["rust", "python", "typescript", "javascript", "go"]
+        // Returns only languages whose indexer binary was found on PATH.
+        &self.supported_languages
     }
 
     fn is_ready(&self) -> bool {
@@ -389,7 +465,7 @@ impl Enricher for ScipEnricher {
         }
 
         // Determine which languages are present in the graph
-        let graph_languages: std::collections::HashSet<&str> = nodes
+        let graph_languages: HashSet<&str> = nodes
             .iter()
             .map(|n| n.language.as_str())
             .collect();
@@ -408,7 +484,19 @@ impl Enricher for ScipEnricher {
 
             match self.run_indexer(config, repo_root).await {
                 Ok(scip_index) => {
-                    let enrichment = self.extract_edges(&scip_index, nodes, index, repo_root);
+                    // Build the set of existing edge stable_ids for cross-source dedup.
+                    // This includes edges from tree-sitter (already in the graph)
+                    // plus any edges already added by earlier SCIP indexers in this run.
+                    let existing_ids: HashSet<String> = index
+                        .all_edges()
+                        .iter()
+                        .map(|(from, to, kind)| format!("{}->{}->{}", from, kind, to))
+                        .chain(combined.added_edges.iter().map(|e| e.stable_id()))
+                        .collect();
+
+                    let enrichment = self.extract_edges(
+                        &scip_index, nodes, index, repo_root, &existing_ids,
+                    );
                     combined.added_edges.extend(enrichment.added_edges);
                     combined.new_nodes.extend(enrichment.new_nodes);
                     combined.updated_nodes.extend(enrichment.updated_nodes);
@@ -436,15 +524,34 @@ impl Enricher for ScipEnricher {
 // Helper functions
 // ---------------------------------------------------------------------------
 
-/// Check if a binary is available on PATH.
+/// Check if a binary is available on PATH by attempting to run it.
+///
+/// Tries the binary with `--version` (or bare invocation) and checks for a
+/// successful spawn. This is portable across macOS, Linux, and Windows,
+/// unlike shelling out to `which`.
 fn is_binary_on_path(binary: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(binary)
+    // Try to spawn the binary with --help. We don't care about the exit code
+    // (some tools return non-zero for --help), only whether the spawn succeeds.
+    // If the binary doesn't exist, spawn() returns Err (NotFound).
+    std::process::Command::new(binary)
+        .arg("--help")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .map(|mut child| {
+            let _ = child.kill();
+            let _ = child.wait();
+            true
+        })
         .unwrap_or(false)
+}
+
+/// Read the current git HEAD OID for cache staleness checks.
+fn git_head_oid(repo_root: &Path) -> Option<String> {
+    let repo = git2::Repository::open(repo_root).ok()?;
+    let head = repo.head().ok()?;
+    head.target().map(|oid| oid.to_string())
 }
 
 /// Get the start line (0-indexed) from a SCIP occurrence's range field.
@@ -520,6 +627,26 @@ mod tests {
             body: String::new(),
             metadata: BTreeMap::new(),
             source: ExtractionSource::TreeSitter,
+        }
+    }
+
+    fn make_edge(from_name: &str, from_file: &str, to_name: &str, to_file: &str, kind: EdgeKind) -> Edge {
+        Edge {
+            from: NodeId {
+                root: String::new(),
+                file: PathBuf::from(from_file),
+                name: from_name.to_string(),
+                kind: NodeKind::Function,
+            },
+            to: NodeId {
+                root: String::new(),
+                file: PathBuf::from(to_file),
+                name: to_name.to_string(),
+                kind: NodeKind::Function,
+            },
+            kind,
+            source: ExtractionSource::TreeSitter,
+            confidence: Confidence::Detected,
         }
     }
 
@@ -605,6 +732,7 @@ mod tests {
         let enricher = ScipEnricher {
             supported_languages: vec![],
             available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
         };
         assert!(!enricher.is_ready());
         assert_eq!(enricher.name(), "scip");
@@ -613,14 +741,15 @@ mod tests {
     #[test]
     fn test_extract_edges_empty_index() {
         let enricher = ScipEnricher {
-            supported_languages: vec!["rust".to_string()],
+            supported_languages: vec!["rust"],
             available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
         };
         let index = scip::types::Index::new();
         let nodes = vec![make_node("src/main.rs", "main", NodeKind::Function, 1, 10)];
         let graph_index = GraphIndex::new();
 
-        let result = enricher.extract_edges(&index, &nodes, &graph_index, Path::new("/tmp"));
+        let result = enricher.extract_edges(&index, &nodes, &graph_index, Path::new("/tmp"), &HashSet::new());
         assert!(result.added_edges.is_empty());
         assert!(result.new_nodes.is_empty());
     }
@@ -628,8 +757,9 @@ mod tests {
     #[test]
     fn test_extract_edges_with_definition_and_reference() {
         let enricher = ScipEnricher {
-            supported_languages: vec!["rust".to_string()],
+            supported_languages: vec!["rust"],
             available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
         };
 
         let nodes = vec![
@@ -661,7 +791,7 @@ mod tests {
         index.documents.push(doc2);
 
         let graph_index = GraphIndex::new();
-        let result = enricher.extract_edges(&index, &nodes, &graph_index, Path::new("/tmp"));
+        let result = enricher.extract_edges(&index, &nodes, &graph_index, Path::new("/tmp"), &HashSet::new());
 
         assert_eq!(result.added_edges.len(), 1, "Should have one CALLS edge");
         let edge = &result.added_edges[0];
@@ -675,8 +805,9 @@ mod tests {
     #[test]
     fn test_extract_edges_implements_relationship() {
         let enricher = ScipEnricher {
-            supported_languages: vec!["rust".to_string()],
+            supported_languages: vec!["rust"],
             available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
         };
 
         let nodes = vec![
@@ -714,7 +845,7 @@ mod tests {
         index.documents.push(doc);
 
         let graph_index = GraphIndex::new();
-        let result = enricher.extract_edges(&index, &nodes, &graph_index, Path::new("/tmp"));
+        let result = enricher.extract_edges(&index, &nodes, &graph_index, Path::new("/tmp"), &HashSet::new());
 
         assert_eq!(result.added_edges.len(), 1, "Should have one IMPLEMENTS edge");
         let edge = &result.added_edges[0];
@@ -723,5 +854,99 @@ mod tests {
         assert_eq!(edge.kind, EdgeKind::Implements);
         assert_eq!(edge.source, ExtractionSource::Scip);
         assert_eq!(edge.confidence, Confidence::Confirmed);
+    }
+
+    #[test]
+    fn test_cross_source_dedup_skips_existing_edges() {
+        // If tree-sitter already found main->helper CALLS, SCIP should skip it
+        let enricher = ScipEnricher {
+            supported_languages: vec!["rust"],
+            available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
+        };
+
+        let nodes = vec![
+            make_node("src/main.rs", "main", NodeKind::Function, 1, 10),
+            make_node("src/lib.rs", "helper", NodeKind::Function, 1, 5),
+        ];
+
+        // Build a SCIP index that would produce main->helper CALLS
+        let mut index = scip::types::Index::new();
+        let mut doc1 = scip::types::Document::new();
+        doc1.relative_path = "src/lib.rs".to_string();
+        let mut def_occ = scip::types::Occurrence::new();
+        def_occ.range = vec![0, 0, 10];
+        def_occ.symbol = "rust-analyzer cargo test . helper.".to_string();
+        def_occ.symbol_roles = scip::types::SymbolRole::Definition.value();
+        doc1.occurrences.push(def_occ);
+        index.documents.push(doc1);
+
+        let mut doc2 = scip::types::Document::new();
+        doc2.relative_path = "src/main.rs".to_string();
+        let mut ref_occ = scip::types::Occurrence::new();
+        ref_occ.range = vec![4, 0, 10];
+        ref_occ.symbol = "rust-analyzer cargo test . helper.".to_string();
+        ref_occ.symbol_roles = 0;
+        doc2.occurrences.push(ref_occ);
+        index.documents.push(doc2);
+
+        // Simulate that tree-sitter already found this edge
+        let existing_edge = make_edge("main", "src/main.rs", "helper", "src/lib.rs", EdgeKind::Calls);
+        let existing_ids: HashSet<String> = [existing_edge.stable_id()].into_iter().collect();
+
+        let graph_index = GraphIndex::new();
+        let result = enricher.extract_edges(&index, &nodes, &graph_index, Path::new("/tmp"), &existing_ids);
+
+        assert_eq!(
+            result.added_edges.len(),
+            0,
+            "SCIP should skip edges already found by tree-sitter"
+        );
+    }
+
+    #[test]
+    fn test_is_binary_on_path_nonexistent() {
+        // A binary that definitely doesn't exist
+        assert!(!is_binary_on_path("definitely_not_a_real_binary_xyz_12345"));
+    }
+
+    #[tokio::test]
+    async fn test_enrich_empty_when_no_indexers() {
+        let enricher = ScipEnricher {
+            supported_languages: vec![],
+            available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
+        };
+        let nodes = vec![make_node("src/main.rs", "main", NodeKind::Function, 1, 10)];
+        let graph_index = GraphIndex::new();
+
+        let result = enricher.enrich(&nodes, &graph_index, Path::new("/tmp")).await.unwrap();
+        assert!(result.added_edges.is_empty());
+        assert!(result.new_nodes.is_empty());
+        assert!(result.updated_nodes.is_empty());
+    }
+
+    #[test]
+    fn test_languages_reflects_available_indexers() {
+        // With no indexers, languages() should return empty
+        let enricher = ScipEnricher {
+            supported_languages: vec![],
+            available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
+        };
+        assert!(
+            enricher.languages().is_empty(),
+            "languages() should be empty when no indexers are available"
+        );
+
+        // With rust indexer only, should only return "rust"
+        let enricher = ScipEnricher {
+            supported_languages: vec!["rust"],
+            available_indexers: vec![KNOWN_INDEXERS[0].clone()], // rust-analyzer
+            cache: Mutex::new(HashMap::new()),
+        };
+        let langs = enricher.languages();
+        assert_eq!(langs.len(), 1);
+        assert_eq!(langs[0], "rust");
     }
 }
