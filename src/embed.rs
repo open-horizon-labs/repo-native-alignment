@@ -644,6 +644,11 @@ impl EmbeddingIndex {
             .vector_search(query_embedding[0].clone())
             .context("Failed to create vector search")?;
 
+        // Cosine distance [0, 2]: 0 = identical, 2 = opposite.
+        // MiniLM embeddings are normalized, so cosine is the correct metric.
+        // Default L2 produces large distances (1.5+) even for decent matches,
+        // making the 1-distance score always negative.
+        search = search.distance_type(lancedb::DistanceType::Cosine);
         search = search.limit(limit * 3); // over-fetch to filter by type
 
         let results = search
