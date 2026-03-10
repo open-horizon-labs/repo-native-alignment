@@ -1593,6 +1593,7 @@ impl RnaHandler {
                         .enrich_all(&gs.nodes, &gs.index, &bg_languages, &bg_repo_root)
                         .await
                 } else {
+                    bg_lsp_status.set_complete(0);
                     return;
                 }
             };
