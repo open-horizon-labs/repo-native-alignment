@@ -424,11 +424,17 @@ impl EmbeddingIndex {
                 k => format!("{}", k),
             };
 
-            // Build searchable text: signature is the primary signal for code search.
-            // For markdown sections, body IS the content so include it.
-            // Drop: raw function bodies (implementation noise, nobody searches by impl),
-            //       name (redundant — already in signature),
-            //       metadata (structural/positional, not semantic).
+            // Build searchable text for embedding.
+            //
+            // For code symbols we include signature + truncated body so that
+            // intent-based queries like "error handling" or "rate limiting" can
+            // match functions whose *body* implements that concept even when the
+            // function name/signature doesn't mention it.  The body is truncated
+            // to 500 chars to stay within the 512-token budget of MiniLM-L6-v2.
+            //
+            // This mirrors what `reindex_nodes` already does for LSP-enriched
+            // nodes, closing the gap where the initial full build embedded only
+            // the signature.
             let text = match node.id.kind {
                 crate::graph::NodeKind::Other(ref s) if s == "markdown_section" || s == "Section" => {
                     // Markdown sections: just the body text, no breadcrumb prefix.
@@ -437,8 +443,22 @@ impl EmbeddingIndex {
                     truncate_chars(&node.body, 500).to_string()
                 }
                 _ => {
-                    // Code: signature only — fits well within 512-token budget
-                    node.signature.clone()
+                    // Code: signature + body snippet + metadata for semantic richness
+                    let mut t = String::new();
+                    t.push_str(&node.id.name);
+                    t.push(' ');
+                    t.push_str(&node.signature);
+                    t.push(' ');
+                    let body_snippet = truncate_chars(&node.body, 500);
+                    t.push_str(body_snippet);
+                    // Include any metadata (e.g. LSP-enriched type info)
+                    for (key, value) in &node.metadata {
+                        t.push(' ');
+                        t.push_str(key);
+                        t.push_str(": ");
+                        t.push_str(value);
+                    }
+                    t
                 }
             };
 
