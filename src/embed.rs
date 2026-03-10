@@ -286,6 +286,16 @@ impl EmbeddingIndex {
         })
     }
 
+    /// Check whether the embedding table has been created yet.
+    /// Returns false during initial indexing before the first batch is written.
+    pub async fn is_ready(&self) -> bool {
+        self.db
+            .open_table(&self.table_name)
+            .execute()
+            .await
+            .is_ok()
+    }
+
     /// Index all .oh/ artifacts, git commits, and optionally code symbols.
     /// Call with symbols from the graph to enable semantic code search.
     pub async fn index_all_with_symbols(
@@ -674,12 +684,20 @@ impl EmbeddingIndex {
         artifact_types: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
-        let table = self
+        let table = match self
             .db
             .open_table(&self.table_name)
             .execute()
             .await
-            .context("Table not found — run index_all first")?;
+        {
+            Ok(t) => t,
+            Err(_) => {
+                // Table doesn't exist yet — embedding index is still building.
+                // Return empty results instead of erroring so callers can show
+                // a "building" status rather than an opaque error.
+                return Ok(vec![]);
+            }
+        };
 
         // Embed the query
         let query_embedding = embed_texts(vec![query.to_string()]).await?;
