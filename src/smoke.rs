@@ -332,6 +332,9 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     // 24. Broken symlink check — scanner must not crash on broken symlinks
     checks.push(run_broken_symlink_check().await);
 
+    // 25. LSP status footer — verifies format_freshness renders all 3 LSP states
+    checks.push(run_lsp_status_footer_check());
+
     Ok(print_and_return(args, checks))
 }
 
@@ -1046,6 +1049,34 @@ fn run_graph_query_check(index: &GraphIndex, nodes: &[crate::graph::Node]) -> Ch
             incoming.len()
         ),
     )
+}
+
+fn run_lsp_status_footer_check() -> Check {
+    use crate::server::{format_freshness, LspEnrichmentStatus};
+
+    let status = LspEnrichmentStatus::default();
+
+    // Not started → no LSP in footer
+    let footer = format_freshness(100, Some(std::time::Instant::now()), Some(&status));
+    if footer.contains("LSP") {
+        return Check::fail("lsp_status_footer", "Footer shows LSP segment in NotStarted state");
+    }
+
+    // Running → "LSP: pending"
+    status.set_running();
+    let footer = format_freshness(100, Some(std::time::Instant::now()), Some(&status));
+    if !footer.contains("LSP: pending") {
+        return Check::fail("lsp_status_footer", format!("Expected 'LSP: pending', got: {}", footer));
+    }
+
+    // Complete → "LSP: enriched (N edges)"
+    status.set_complete(42);
+    let footer = format_freshness(100, Some(std::time::Instant::now()), Some(&status));
+    if !footer.contains("LSP: enriched (42 edges)") {
+        return Check::fail("lsp_status_footer", format!("Expected 'LSP: enriched (42 edges)', got: {}", footer));
+    }
+
+    Check::pass("lsp_status_footer", "Footer renders all 3 LSP states correctly")
 }
 
 /// HEAD-change detection check.
