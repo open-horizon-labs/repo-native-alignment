@@ -55,12 +55,23 @@ impl OhArtifact {
     }
 }
 
-/// A heading-delimited section from any markdown file
+/// A heading-delimited section from any markdown file.
+///
+/// Each chunk represents a coherent semantic block: a heading plus all body
+/// text until the next heading of equal or higher level. Chunks are never
+/// split mid-paragraph, mid-list, or mid-code-block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarkdownChunk {
     pub file_path: PathBuf,
     pub heading_hierarchy: Vec<String>,
     pub heading_level: u32,
+    /// The heading text without the `#` prefix (e.g., "Section A").
+    /// Empty for preamble/frontmatter chunks.
+    pub heading_text: String,
+    /// Parent heading text (the nearest ancestor heading), if any.
+    pub parent_heading: Option<String>,
+    /// Whether this chunk is YAML frontmatter.
+    pub is_frontmatter: bool,
     pub content: String,
     pub byte_offset: usize,
     pub byte_len: usize,
@@ -69,6 +80,16 @@ pub struct MarkdownChunk {
 }
 
 impl MarkdownChunk {
+    /// Breadcrumb path through the heading hierarchy (e.g., "Aim > Mechanism > Hypothesis").
+    /// Derived from `heading_hierarchy` — no separate storage needed.
+    pub fn section_path(&self) -> String {
+        self.heading_hierarchy
+            .iter()
+            .map(|h| h.trim_start_matches('#').trim())
+            .collect::<Vec<_>>()
+            .join(" > ")
+    }
+
     pub fn to_markdown(&self) -> String {
         let location = format!(
             "`{}` > {}",
@@ -76,6 +97,25 @@ impl MarkdownChunk {
             self.heading_hierarchy.join(" > ")
         );
         format!("{}\n\n{}", location, self.content)
+    }
+
+    /// Produce embedding text: just the body content, truncated to fit
+    /// within a 512-token embedding model budget (MiniLM-L6-v2).
+    ///
+    /// No breadcrumb prefix — the section_path() adds no validated value
+    /// for MiniLM-L6-v2 and wastes embedding budget. The body text alone
+    /// is the semantic signal.
+    pub fn embedding_text(&self) -> String {
+        self.embedding_text_with_limit(500)
+    }
+
+    /// Internal: produce embedding text with a configurable char limit on body.
+    fn embedding_text_with_limit(&self, max_body_chars: usize) -> String {
+        if self.content.len() > max_body_chars {
+            self.content[..self.content.floor_char_boundary(max_body_chars)].to_string()
+        } else {
+            self.content.clone()
+        }
     }
 }
 

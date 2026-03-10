@@ -430,9 +430,11 @@ impl EmbeddingIndex {
             //       name (redundant — already in signature),
             //       metadata (structural/positional, not semantic).
             let text = match node.id.kind {
-                crate::graph::NodeKind::Other(ref s) if s == "Section" => {
-                    // Markdown: heading + body content (truncated)
-                    format!("{} {}", node.signature, truncate_chars(&node.body, 300))
+                crate::graph::NodeKind::Other(ref s) if s == "markdown_section" || s == "Section" => {
+                    // Markdown sections: just the body text, no breadcrumb prefix.
+                    // Mirrors MarkdownChunk::embedding_text() — the section path
+                    // adds no validated value for MiniLM-L6-v2.
+                    truncate_chars(&node.body, 500).to_string()
                 }
                 _ => {
                     // Code: signature only — fits well within 512-token budget
