@@ -727,12 +727,13 @@ impl LspEnricher {
         }
     }
 
-    /// Use type hierarchy to discover supertypes and subtypes for a node,
-    /// creating Implements edges for each resolved relationship.
+    /// Use type hierarchy to discover supertypes for a node, creating
+    /// Implements edges for each resolved supertype relationship.
     ///
-    /// Skips subtypes query for Trait nodes (find_implementations already covers that
-    /// direction, so querying subtypes would produce duplicate edges). Also skips subtypes
-    /// for Struct/Enum nodes (in Rust, these can't have subtypes).
+    /// Only called for Trait/Struct/Enum nodes (the only kinds eligible for
+    /// type hierarchy). Subtypes are not queried here because find_implementations
+    /// already covers that direction for Traits, and Rust Struct/Enum nodes
+    /// cannot have subtypes.
     ///
     /// Returns `true` if the prepare call succeeded, `false` if it failed (used for
     /// strike counting).
@@ -789,46 +790,6 @@ impl LspEnricher {
                 }
             }
 
-            // Subtypes: skip for Trait nodes (find_implementations already produces these
-            // edges) and for Struct/Enum nodes (they can't have subtypes in Rust).
-            // Only query subtypes for nodes where it's meaningful and non-redundant.
-            let skip_subtypes = matches!(
-                node.id.kind,
-                NodeKind::Trait | NodeKind::Struct | NodeKind::Enum
-            );
-            if !skip_subtypes {
-                match Self::type_hierarchy_subtypes(transport, item).await {
-                    Ok(subtypes) => {
-                        for subtype in &subtypes {
-                            if let Some(target_id) = Self::resolve_type_hierarchy_item(
-                                subtype, matching_nodes, root,
-                            ) {
-                                // Skip self-references
-                                if target_id == node.id {
-                                    continue;
-                                }
-                                tracing::debug!(
-                                    "Type hierarchy: {} (subtype) implements {}",
-                                    target_id.name, node.id.name
-                                );
-                                result.added_edges.push(Edge {
-                                    from: target_id,
-                                    to: node.id.clone(),
-                                    kind: EdgeKind::Implements,
-                                    source: ExtractionSource::Lsp,
-                                    confidence: Confidence::Confirmed,
-                                });
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            "typeHierarchy/subtypes failed for {}: {}",
-                            node.id.name, e
-                        );
-                    }
-                }
-            }
         }
 
         true // prepare succeeded
@@ -963,25 +924,6 @@ impl LspEnricher {
         Ok(result.as_array().cloned().unwrap_or_default())
     }
 
-    /// Find subtypes for a TypeHierarchyItem.
-    async fn type_hierarchy_subtypes(
-        transport: &mut LspTransport,
-        item: &serde_json::Value,
-    ) -> Result<Vec<serde_json::Value>> {
-        let params = serde_json::json!({
-            "item": item
-        });
-
-        let result: serde_json::Value = transport
-            .request("typeHierarchy/subtypes", &params)
-            .await?;
-
-        if result.is_null() {
-            return Ok(Vec::new());
-        }
-
-        Ok(result.as_array().cloned().unwrap_or_default())
-    }
 }
 
 #[async_trait::async_trait]
