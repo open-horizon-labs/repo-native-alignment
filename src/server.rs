@@ -1982,6 +1982,10 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
 
             "oh_search_context" => {
                 let args: OhSearchContext = parse_args(params.arguments)?;
+                let query = args.query.trim();
+                if query.is_empty() {
+                    return Ok(text_result("Empty query. Please describe what you're looking for.".into()));
+                }
                 let limit = args.limit.unwrap_or(5) as usize;
                 let include_code = args.include_code.unwrap_or(false);
                 let include_markdown = args.include_markdown.unwrap_or(false);
@@ -2006,7 +2010,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 // to avoid holding the graph read guard during async search.
                 match EmbeddingIndex::new(root).await {
                     Ok(index) => {
-                        match index.search(&args.query, args.artifact_types.as_deref(), limit).await {
+                        match index.search(query, args.artifact_types.as_deref(), limit).await {
                             Ok(results) => {
                                 if !results.is_empty() {
                                     let md: String = results
@@ -2031,7 +2035,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 if include_code {
                     if let Ok(guard) = self.get_graph().await {
                         if let Some(gs) = guard.as_ref() {
-                            let query_lower = args.query.to_lowercase();
+                            let query_lower = query.to_lowercase();
                             let mut matches: Vec<&Node> = gs.nodes.iter()
                                 .filter(|n| n.id.kind != NodeKind::Import && n.id.root != "external")
                                 .filter(|n| {
@@ -2075,7 +2079,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 if include_markdown {
                     match markdown::extract_markdown_chunks(root) {
                         Ok(chunks) => {
-                            let scored = markdown::search_chunks_ranked(&chunks, &args.query);
+                            let scored = markdown::search_chunks_ranked(&chunks, query);
                             if !scored.is_empty() {
                                 // Backward-compatible format: `- ` bullets, same header
                                 // as before. Score is appended as a parenthetical so
@@ -2105,12 +2109,12 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 if sections.is_empty() {
                     Ok(text_result(format!(
                         "No results found matching \"{}\".{}",
-                        args.query, freshness
+                        query, freshness
                     )))
                 } else {
                     Ok(text_result(format!(
                         "## Semantic search: \"{}\"\n\n{}{}",
-                        args.query,
+                        query,
                         sections.join("\n\n"),
                         freshness
                     )))
@@ -2166,11 +2170,15 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
 
             "search_symbols" => {
                 let args: SearchSymbols = parse_args(params.arguments)?;
+                let query = args.query.trim();
+                if query.is_empty() {
+                    return Ok(text_result("Empty query. Please describe what you're looking for.".into()));
+                }
                 match self.get_graph().await {
                     Ok(guard) => {
                         let graph_state = guard.as_ref().unwrap();
                         let limit = args.limit.unwrap_or(20) as usize;
-                        let query_lower = args.query.to_lowercase();
+                        let query_lower = query.to_lowercase();
 
                         let mut matches: Vec<&Node> = graph_state
                             .nodes
@@ -2224,7 +2232,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         if matches.is_empty() {
                             Ok(text_result(format!(
                                 "No symbols matching \"{}\".{}",
-                                args.query, freshness
+                                query, freshness
                             )))
                         } else {
                             let md: String = matches
@@ -2270,7 +2278,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                 .join("\n\n");
                             Ok(text_result(format!(
                                 "## Symbol search: \"{}\"\n\n{} result(s)\n\n{}{}",
-                                args.query,
+                                query,
                                 matches.len(),
                                 md,
                                 freshness
