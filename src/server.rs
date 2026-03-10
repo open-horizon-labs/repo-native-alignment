@@ -1095,10 +1095,11 @@ impl RnaHandler {
                         tokio::time::sleep(tokio::time::Duration::from_secs(900)).await;
                     }
 
-                    // Resolve current roots (primary + any live worktrees).
+                    // Resolve current roots (primary + any live worktrees + claude memory).
                     let workspace = WorkspaceConfig::load()
                         .with_primary_root(repo_root.clone())
-                        .with_worktrees(&repo_root);
+                        .with_worktrees(&repo_root)
+                        .with_claude_memory(&repo_root);
                     let resolved_roots = workspace.resolved_roots();
                     let current_root_slugs: std::collections::HashSet<String> =
                         resolved_roots.iter().map(|r| r.slug.clone()).collect();
@@ -1312,11 +1313,12 @@ impl RnaHandler {
         }
 
         // Load workspace config and merge with --repo as primary root.
-        // Also auto-detect any live git worktrees so all roots are indexed
-        // on the first full build (mirrors the background scanner path).
+        // Also auto-detect any live git worktrees and Claude Code memory
+        // so all roots are indexed on the first full build.
         let workspace = WorkspaceConfig::load()
             .with_primary_root(self.repo_root.clone())
-            .with_worktrees(&self.repo_root);
+            .with_worktrees(&self.repo_root)
+            .with_claude_memory(&self.repo_root);
         let resolved_roots = workspace.resolved_roots();
 
         // 1. Scan all roots to detect changes
@@ -2473,7 +2475,8 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             "list_roots" => {
                 let workspace = WorkspaceConfig::load()
                     .with_primary_root(self.repo_root.clone())
-                    .with_worktrees(&self.repo_root);
+                    .with_worktrees(&self.repo_root)
+                    .with_claude_memory(&self.repo_root);
                 let resolved = workspace.resolved_roots();
 
                 if resolved.is_empty() {

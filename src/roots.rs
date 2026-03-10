@@ -206,6 +206,29 @@ impl WorkspaceConfig {
         self
     }
 
+    /// Add the Claude Code auto-memory directory as a `Notes` root.
+    ///
+    /// Claude Code stores per-project memory at
+    /// `~/.claude/projects/-{path-with-slashes-as-dashes}/memory/`.
+    /// If that directory exists it is added as a Notes root so
+    /// `oh_search_context` can surface operational knowledge.
+    pub fn with_claude_memory(mut self, repo_root: &Path) -> Self {
+        if let Some(memory_dir) = claude_memory_dir(repo_root) {
+            // Skip if already present (e.g. user added it in roots.toml).
+            if self.roots.iter().any(|r| r.resolved_path() == memory_dir) {
+                return self;
+            }
+
+            self.roots.push(RootConfig {
+                path: memory_dir,
+                root_type: RootType::Notes,
+                git_aware: false,
+                excludes: vec![],
+            });
+        }
+        self
+    }
+
     /// Get all roots with their resolved paths and slugs.
     pub fn resolved_roots(&self) -> Vec<ResolvedRoot> {
         self.roots
@@ -300,6 +323,29 @@ fn path_to_slug(path: &Path) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("-")
+}
+
+/// Compute the Claude Code auto-memory directory for a given repo root.
+///
+/// Claude Code encodes the absolute path by stripping the leading `/`,
+/// replacing non-alphanumeric non-hyphen characters (including `/` and `.`)
+/// with `-`, and prefixing with `-`. Case is preserved.
+///
+/// e.g. `/Users/foo/src/bar` → `~/.claude/projects/-Users-foo-src-bar/memory/`
+///      `/tmp/my.project`    → `~/.claude/projects/-tmp-my-project/memory/`
+///
+/// Returns `None` if `HOME` is not set.
+pub fn claude_memory_dir(repo_root: &Path) -> Option<PathBuf> {
+    let home = home_dir()?;
+    let canonical = expand_tilde(repo_root);
+    let encoded: String = canonical
+        .to_string_lossy()
+        .trim_start_matches('/')
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    let key = format!("-{}", encoded);
+    Some(home.join(".claude").join("projects").join(key).join("memory"))
 }
 
 /// Path for per-root scan state cache.
@@ -594,5 +640,77 @@ excludes = ["*.iso", "*.dmg"]
 
         // Verify state was persisted at the custom path
         assert!(notes_state.exists(), "Notes scan state should be persisted at custom path");
+    }
+
+    #[test]
+    fn test_claude_memory_dir_format() {
+        let dir = claude_memory_dir(Path::new("/Users/foo/src/bar"));
+        assert!(dir.is_some());
+        let dir = dir.unwrap();
+        let dir_str = dir.to_string_lossy();
+        assert!(
+            dir_str.ends_with("/.claude/projects/-Users-foo-src-bar/memory"),
+            "Got: {}",
+            dir_str
+        );
+    }
+
+    #[test]
+    fn test_claude_memory_dir_replaces_dots() {
+        // Claude Code replaces '.' with '-' in the project key
+        let dir = claude_memory_dir(Path::new("/Users/foo/Downloads/improve-deployments.md"))
+            .unwrap();
+        let dir_str = dir.to_string_lossy();
+        assert!(
+            dir_str.ends_with("/.claude/projects/-Users-foo-Downloads-improve-deployments-md/memory"),
+            "Dots should become dashes. Got: {}",
+            dir_str
+        );
+    }
+
+    #[test]
+    fn test_with_claude_memory_adds_root_when_dir_exists() {
+        // Use the real HOME to compute where claude_memory_dir would point,
+        // then create that directory so the test can verify it gets added.
+        let cwd = std::env::current_dir().unwrap();
+        let memory_dir = match claude_memory_dir(&cwd) {
+            Some(d) => d,
+            None => return, // No HOME set, can't test
+        };
+
+        if !memory_dir.exists() {
+            // If the real memory dir doesn't exist, we can't create it
+            // without side effects. Just verify the method is a no-op.
+            let config = WorkspaceConfig::default()
+                .with_primary_root(cwd.clone())
+                .with_claude_memory(&cwd);
+            // Memory root added but resolved_roots filters non-existent
+            let resolved = config.resolved_roots();
+            assert_eq!(resolved.len(), 1, "Only primary root when memory dir missing");
+            return;
+        }
+
+        // Memory dir exists — verify it gets added
+        let config = WorkspaceConfig::default()
+            .with_primary_root(cwd.clone())
+            .with_claude_memory(&cwd);
+        let resolved = config.resolved_roots();
+        assert!(resolved.len() >= 2, "Expected primary + memory root");
+        let memory_root = resolved.iter().find(|r| r.path == memory_dir);
+        assert!(memory_root.is_some(), "Memory root should be in resolved roots");
+        assert_eq!(memory_root.unwrap().config.root_type, RootType::Notes);
+    }
+
+    #[test]
+    fn test_with_claude_memory_skips_when_dir_missing() {
+        // Memory dir won't exist for a random path
+        let tmp = TempDir::new().unwrap();
+        let config = WorkspaceConfig::default()
+            .with_primary_root(tmp.path().to_path_buf())
+            .with_claude_memory(tmp.path());
+
+        // resolved_roots filters non-existent, so memory root won't appear
+        let resolved = config.resolved_roots();
+        assert_eq!(resolved.len(), 1, "Only primary root should be present");
     }
 }

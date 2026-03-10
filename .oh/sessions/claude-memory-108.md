@@ -7,10 +7,12 @@ Index Claude Code auto memory (`~/.claude/projects/<project>/memory/`) as a scan
 Add the memory dir as an optional root in the scanner. Path: `~/.claude/projects/{repo_root_slashes_as_dashes}/memory/`. Documented by Anthropic.
 
 ## Execute Status
-- **In progress:** Need to find where roots are constructed in `roots.rs` (not `resolved_roots` which just filters)
-- `resolved_roots()` at `src/roots.rs:210` iterates `self.roots` and filters by `.exists()`
-- Need to find where `self.roots` is populated — likely a `new()` or `from_repo()` constructor
-- Then add the memory dir as an additional root with type "claude-memory" or similar
+- **Complete:** 2026-03-09
+- Added `claude_memory_dir()` helper — computes `~/.claude/projects/-{path}/memory/`
+- Added `WorkspaceConfig::with_claude_memory()` — builder method, adds Notes root if dir exists
+- Wired into all 3 call sites in `server.rs` (background scanner, initial build, list_roots)
+- 3 new tests: path format, adds-when-exists, skips-when-missing
+- 22/22 roots tests pass, clean build
 
 ## Key facts
 - Memory path: `~/.claude/projects/-Users-muness-src-open-horizon-labs-repo-native-alignment/memory/`
