@@ -155,6 +155,83 @@ pub fn search_chunks<'a>(chunks: &'a [MarkdownChunk], query: &str) -> Vec<&'a Ma
         .collect()
 }
 
+/// A markdown chunk with a relevance score for ranked search results.
+pub struct ScoredMarkdownChunk<'a> {
+    pub chunk: &'a MarkdownChunk,
+    pub score: f32,
+}
+
+/// Search markdown chunks with relevance scoring.
+///
+/// Scoring tiers (higher = more relevant):
+/// 1. Heading match quality: exact heading match > heading contains > content-only match
+/// 2. Heading level: h1 (0.10 bonus) > h2 (0.08) > h3 (0.06) > h4+ (0.04)
+/// 3. Code span match: bonus if query matches a code span (cross-reference signal)
+/// 4. Match density: more occurrences of query in content = higher score
+///
+/// Returns results sorted by descending score.
+pub fn search_chunks_ranked<'a>(chunks: &'a [MarkdownChunk], query: &str) -> Vec<ScoredMarkdownChunk<'a>> {
+    let query_lower = query.to_lowercase();
+
+    let mut scored: Vec<ScoredMarkdownChunk<'a>> = chunks
+        .iter()
+        .filter_map(|chunk| {
+            let content_lower = chunk.content.to_lowercase();
+            let heading_match = chunk
+                .heading_hierarchy
+                .iter()
+                .any(|h| h.to_lowercase().contains(&query_lower));
+            let content_match = content_lower.contains(&query_lower);
+
+            if !heading_match && !content_match {
+                return None;
+            }
+
+            let mut score: f32 = 0.0;
+
+            // Tier 1: Match location quality
+            if heading_match {
+                // Check if any heading is an exact match (ignoring the # prefix)
+                let exact_heading = chunk.heading_hierarchy.iter().any(|h| {
+                    let text = h.trim_start_matches('#').trim().to_lowercase();
+                    text == query_lower
+                });
+                if exact_heading {
+                    score += 1.0; // Best: exact heading match
+                } else {
+                    score += 0.7; // Good: heading contains query
+                }
+            } else {
+                score += 0.4; // Baseline: content-only match
+            }
+
+            // Tier 2: Heading level bonus (higher-level = more important context)
+            match chunk.heading_level {
+                0 => score += 0.02, // preamble (no heading)
+                1 => score += 0.10,
+                2 => score += 0.08,
+                3 => score += 0.06,
+                _ => score += 0.04,
+            }
+
+            // Tier 3: Code span match bonus
+            if chunk.code_spans.iter().any(|s| s.to_lowercase().contains(&query_lower)) {
+                score += 0.15;
+            }
+
+            // Tier 4: Match density (count occurrences, capped contribution)
+            let occurrence_count = content_lower.matches(&query_lower).count();
+            let density_bonus = (occurrence_count as f32 * 0.02).min(0.10);
+            score += density_bonus;
+
+            Some(ScoredMarkdownChunk { chunk, score })
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+}
+
 fn heading_level_to_u32(level: HeadingLevel) -> u32 {
     match level {
         HeadingLevel::H1 => 1,
@@ -325,5 +402,143 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].heading_hierarchy, vec!["# The Config struct"]);
         assert!(chunks[0].code_spans.contains(&"Config".to_string()));
+    }
+
+    #[test]
+    fn test_search_chunks_ranked_heading_vs_content() {
+        let chunks = vec![
+            MarkdownChunk {
+                file_path: PathBuf::from("a.md"),
+                heading_hierarchy: vec!["# Config".to_string()],
+                heading_level: 1,
+                content: "Details about configuration.".to_string(),
+                byte_offset: 0,
+                byte_len: 27,
+                code_spans: vec![],
+            },
+            MarkdownChunk {
+                file_path: PathBuf::from("b.md"),
+                heading_hierarchy: vec!["# Setup".to_string()],
+                heading_level: 1,
+                content: "You need to edit the config file.".to_string(),
+                byte_offset: 0,
+                byte_len: 32,
+                code_spans: vec![],
+            },
+        ];
+
+        let results = search_chunks_ranked(&chunks, "config");
+        assert_eq!(results.len(), 2);
+        // Exact heading match ("Config") should rank above content-only match
+        assert_eq!(results[0].chunk.file_path, PathBuf::from("a.md"));
+        assert!(results[0].score > results[1].score);
+    }
+
+    #[test]
+    fn test_search_chunks_ranked_heading_level_bonus() {
+        let chunks = vec![
+            MarkdownChunk {
+                file_path: PathBuf::from("a.md"),
+                heading_hierarchy: vec!["# Top".to_string(), "### Deep".to_string()],
+                heading_level: 3,
+                content: "Some search term here.".to_string(),
+                byte_offset: 0,
+                byte_len: 22,
+                code_spans: vec![],
+            },
+            MarkdownChunk {
+                file_path: PathBuf::from("b.md"),
+                heading_hierarchy: vec!["# Top".to_string()],
+                heading_level: 1,
+                content: "Some search term here.".to_string(),
+                byte_offset: 0,
+                byte_len: 22,
+                code_spans: vec![],
+            },
+        ];
+
+        let results = search_chunks_ranked(&chunks, "search term");
+        assert_eq!(results.len(), 2);
+        // h1 chunk should rank higher than h3 chunk (both content-only matches)
+        assert_eq!(results[0].chunk.file_path, PathBuf::from("b.md"));
+        assert!(results[0].score > results[1].score);
+    }
+
+    #[test]
+    fn test_search_chunks_ranked_code_span_bonus() {
+        let chunks = vec![
+            MarkdownChunk {
+                file_path: PathBuf::from("a.md"),
+                heading_hierarchy: vec!["# A".to_string()],
+                heading_level: 1,
+                content: "Mentions parse_config in text.".to_string(),
+                byte_offset: 0,
+                byte_len: 30,
+                code_spans: vec!["parse_config".to_string()],
+            },
+            MarkdownChunk {
+                file_path: PathBuf::from("b.md"),
+                heading_hierarchy: vec!["# B".to_string()],
+                heading_level: 1,
+                content: "Mentions parse_config in text.".to_string(),
+                byte_offset: 0,
+                byte_len: 30,
+                code_spans: vec![],
+            },
+        ];
+
+        let results = search_chunks_ranked(&chunks, "parse_config");
+        assert_eq!(results.len(), 2);
+        // Chunk with code span match should rank higher
+        assert_eq!(results[0].chunk.file_path, PathBuf::from("a.md"));
+        assert!(results[0].score > results[1].score);
+    }
+
+    #[test]
+    fn test_search_chunks_ranked_no_match() {
+        let chunks = vec![
+            MarkdownChunk {
+                file_path: PathBuf::from("a.md"),
+                heading_hierarchy: vec!["# Alpha".to_string()],
+                heading_level: 1,
+                content: "Hello world".to_string(),
+                byte_offset: 0,
+                byte_len: 11,
+                code_spans: vec![],
+            },
+        ];
+
+        let results = search_chunks_ranked(&chunks, "nonexistent");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_chunks_ranked_density_bonus() {
+        let chunks = vec![
+            MarkdownChunk {
+                file_path: PathBuf::from("a.md"),
+                heading_hierarchy: vec!["# A".to_string()],
+                heading_level: 1,
+                content: "error once".to_string(),
+                byte_offset: 0,
+                byte_len: 10,
+                code_spans: vec![],
+            },
+            MarkdownChunk {
+                file_path: PathBuf::from("b.md"),
+                heading_hierarchy: vec!["# B".to_string()],
+                heading_level: 1,
+                content: "error error error error error".to_string(),
+                byte_offset: 0,
+                byte_len: 29,
+                code_spans: vec![],
+            },
+        ];
+
+        let results = search_chunks_ranked(&chunks, "error");
+        assert_eq!(results.len(), 2);
+        // Higher density chunk should rank higher
+        assert_eq!(results[0].chunk.file_path, PathBuf::from("b.md"));
+        assert!(results[0].score > results[1].score);
     }
 }
