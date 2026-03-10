@@ -230,6 +230,26 @@ MIT — see [LICENSE](LICENSE).
 | **Metis** | A learning earned through experience — [Greek: practical wisdom](https://en.wikipedia.org/wiki/Metis_(mythology)) gained from doing, not reading. Example: "Protocol version mismatch silently hangs MCP clients." |
 | **MCP** | Model Context Protocol. The standard for connecting AI agents to external tools. RNA exposes its capabilities as MCP tools that Claude Code (and other MCP clients) can call. |
 
+## Optional: SCIP Indexing
+
+RNA can ingest [SCIP](https://sourcegraph.com/docs/code-navigation/explanations/scip) index files for compiler-grade cross-reference data. This is behind a feature flag because most users get sufficient enrichment from tree-sitter + LSP.
+
+**When to use SCIP:** When you have pre-built `.scip` index files (e.g., from `rust-analyzer scip .` or `scip-typescript`) and want batch enrichment without running a live language server.
+
+**Build with SCIP support:**
+
+```bash
+cargo install --locked --path . --features scip
+```
+
+**Supported indexers:** Any tool that produces SCIP v0.6 index files, including:
+- `rust-analyzer scip .` (Rust)
+- `scip-typescript` (TypeScript/JavaScript)
+- `scip-java` (Java/Kotlin)
+- `scip-python` (Python)
+
+SCIP enrichment runs automatically during scanning when the `scip` feature is enabled and `.scip` index files are found in the workspace.
+
 ## Detailed Documentation
 
 - [Extractors](docs/extractors.md) — 22 language extractors, constants, synthetic literals
