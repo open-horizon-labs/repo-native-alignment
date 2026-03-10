@@ -39,6 +39,8 @@ pub fn is_test_file(n: &Node) -> bool {
         || p.contains("_test.")
         || p.contains("/test/")
         || p.contains("/tests/")
+        || p.starts_with("test/")
+        || p.starts_with("tests/")
 }
 
 /// Sort code symbol nodes by a 5-tier relevance cascade.
@@ -113,7 +115,7 @@ pub fn sort_symbol_matches<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{Edge, NodeId};
+    use crate::graph::{ExtractionSource, NodeId};
     use crate::graph::index::GraphIndex;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -128,9 +130,16 @@ mod tests {
             },
             language: "rust".to_string(),
             signature: format!("fn {}", name),
-            byte_range: (0, 100),
+            line_start: 0,
+            line_end: 10,
+            body: String::new(),
             metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
         }
+    }
+
+    fn empty_index() -> GraphIndex {
+        GraphIndex::new()
     }
 
     #[test]
@@ -150,8 +159,7 @@ mod tests {
         let exact = make_node("parse", NodeKind::Function, "a.rs");
         let contains = make_node("parse_config", NodeKind::Function, "a.rs");
 
-        let edges: Vec<Edge> = vec![];
-        let index = GraphIndex::from_edges(&edges);
+        let index = empty_index();
         let mut matches: Vec<&Node> = vec![&contains, &exact];
         sort_symbol_matches(&mut matches, "parse", &index);
 
@@ -164,8 +172,7 @@ mod tests {
         let func = make_node("foo", NodeKind::Function, "a.rs");
         let imp = make_node("foo", NodeKind::Import, "a.rs");
 
-        let edges: Vec<Edge> = vec![];
-        let index = GraphIndex::from_edges(&edges);
+        let index = empty_index();
         let mut matches: Vec<&Node> = vec![&imp, &func];
         sort_symbol_matches(&mut matches, "foo", &index);
 
@@ -178,8 +185,7 @@ mod tests {
         let prod = make_node("foo", NodeKind::Function, "src/lib.rs");
         let test = make_node("foo", NodeKind::Function, "tests/test_lib.rs");
 
-        let edges: Vec<Edge> = vec![];
-        let index = GraphIndex::from_edges(&edges);
+        let index = empty_index();
         let mut matches: Vec<&Node> = vec![&test, &prod];
         sort_symbol_matches(&mut matches, "foo", &index);
 
@@ -187,5 +193,211 @@ mod tests {
             matches[0].id.file,
             PathBuf::from("src/lib.rs")
         );
+    }
+
+    // ==================== Adversarial tests ====================
+
+    /// Empty query: `"".to_lowercase()` is `""`, and `"anything".contains("")`
+    /// is true in Rust. So an empty query makes EVERY node an "exact match"
+    /// (since `"foo" == ""` is false, but `"foo".contains("")` is true).
+    /// Worse: `"" == ""` is true, so a node with empty name IS an exact match.
+    /// This test documents the behavior.
+    #[test]
+    fn test_sort_empty_query_all_contain() {
+        let a = make_node("alpha", NodeKind::Function, "a.rs");
+        let b = make_node("beta", NodeKind::Function, "b.rs");
+
+        let index = empty_index();
+        let mut matches: Vec<&Node> = vec![&a, &b];
+        // Empty query: both names "contain" it. Neither is "exact".
+        // This should not panic.
+        sort_symbol_matches(&mut matches, "", &index);
+        assert_eq!(matches.len(), 2);
+    }
+
+    /// Empty-name node: a node with name "" gets `"" == ""` -> exact match
+    /// for any empty-like query. Verify it doesn't crash sort.
+    #[test]
+    fn test_sort_empty_name_node() {
+        let empty = Node {
+            id: NodeId {
+                kind: NodeKind::Function,
+                name: "".to_string(),
+                file: PathBuf::from("a.rs"),
+                root: "local".to_string(),
+            },
+            language: "rust".to_string(),
+            signature: "fn ()".to_string(),
+            line_start: 0,
+            line_end: 1,
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let normal = make_node("parse", NodeKind::Function, "b.rs");
+
+        let index = empty_index();
+        let mut matches: Vec<&Node> = vec![&empty, &normal];
+        sort_symbol_matches(&mut matches, "parse", &index);
+
+        // "parse" is exact match for normal, empty name doesn't contain "parse"
+        assert_eq!(matches[0].id.name, "parse");
+    }
+
+    /// is_test_file false positive: "contested.rs" contains "_test." as a
+    /// substring iff we're not careful — actually "_test." checks for the
+    /// literal substring. "con_test_ed.rs" contains "_test_".
+    /// But "contested.rs" does NOT contain "_test." — let's verify.
+    #[test]
+    fn test_is_test_file_false_positive_contested() {
+        // "contested.rs" should NOT be detected as test file
+        let node = make_node("f", NodeKind::Function, "src/contested.rs");
+        assert!(
+            !is_test_file(&node),
+            "contested.rs should not be flagged as test file"
+        );
+
+        // But "my_test.rs" SHOULD be detected
+        let test_node = make_node("f", NodeKind::Function, "src/my_test.rs");
+        assert!(
+            is_test_file(&test_node),
+            "my_test.rs should be flagged as test file"
+        );
+    }
+
+    /// is_test_file: path with "test" in directory but not as "/test/" pattern.
+    /// e.g. "attestation/lib.rs" contains "test" but not "/test/".
+    #[test]
+    fn test_is_test_file_attestation_not_test() {
+        let node = make_node("f", NodeKind::Function, "attestation/lib.rs");
+        assert!(
+            !is_test_file(&node),
+            "attestation/lib.rs should not be flagged as test file"
+        );
+    }
+
+    /// is_test_file: edge case with ".test." in filename (JS convention).
+    #[test]
+    fn test_is_test_file_js_convention() {
+        let node = make_node("f", NodeKind::Function, "src/config.test.ts");
+        assert!(is_test_file(&node));
+
+        let node = make_node("f", NodeKind::Function, "src/config.spec.ts");
+        assert!(is_test_file(&node));
+    }
+
+    /// Sorting stability: when all nodes have identical properties, the sort
+    /// should produce a deterministic order across multiple runs.
+    #[test]
+    fn test_sort_stability_identical_nodes() {
+        let nodes: Vec<Node> = (0..10)
+            .map(|i| {
+                let mut n = make_node("foo", NodeKind::Function, "a.rs");
+                // Give them different signatures so we can tell them apart
+                n.signature = format!("fn foo_{}", i);
+                n
+            })
+            .collect();
+
+        let index = empty_index();
+
+        let first_order: Vec<String> = {
+            let mut matches: Vec<&Node> = nodes.iter().collect();
+            sort_symbol_matches(&mut matches, "foo", &index);
+            matches.iter().map(|n| n.signature.clone()).collect()
+        };
+
+        for _ in 0..5 {
+            let mut matches: Vec<&Node> = nodes.iter().collect();
+            sort_symbol_matches(&mut matches, "foo", &index);
+            let order: Vec<String> = matches.iter().map(|n| n.signature.clone()).collect();
+            assert_eq!(first_order, order, "Sort is not stable across runs");
+        }
+    }
+
+    /// kind_rank covers all NodeKind variants without panicking.
+    #[test]
+    fn test_kind_rank_all_variants() {
+        let variants = vec![
+            NodeKind::Function,
+            NodeKind::Struct,
+            NodeKind::Trait,
+            NodeKind::Enum,
+            NodeKind::Module,
+            NodeKind::Import,
+            NodeKind::Const,
+            NodeKind::Impl,
+            NodeKind::ProtoMessage,
+            NodeKind::SqlTable,
+            NodeKind::ApiEndpoint,
+            NodeKind::Field,
+            NodeKind::PrMerge,
+        ];
+
+        for kind in variants {
+            let node = make_node("x", kind.clone(), "a.rs");
+            let rank = kind_rank(&node);
+            assert!(
+                rank <= 2,
+                "kind_rank({:?}) = {} — expected 0, 1, or 2",
+                node.id.kind,
+                rank
+            );
+        }
+    }
+
+    /// Tier precedence: exact name match should beat kind priority.
+    /// An Import with exact name match should rank above a Function
+    /// with only a contains match.
+    #[test]
+    fn test_sort_exact_match_beats_kind_priority() {
+        let import_exact = make_node("parse", NodeKind::Import, "a.rs");
+        let func_contains = make_node("parse_config", NodeKind::Function, "b.rs");
+
+        let index = empty_index();
+        let mut matches: Vec<&Node> = vec![&func_contains, &import_exact];
+        sort_symbol_matches(&mut matches, "parse", &index);
+
+        // Exact match (Import) should beat contains match (Function)
+        // despite Import having worse kind_rank
+        assert_eq!(
+            matches[0].id.name, "parse",
+            "Exact name match should beat better kind_rank with only contains match"
+        );
+        assert_eq!(matches[0].id.kind, NodeKind::Import);
+    }
+
+    /// Tier precedence: name-contains should beat kind priority.
+    /// A Const with name-contains should rank above a Function with
+    /// signature-only match.
+    #[test]
+    fn test_sort_name_contains_beats_kind() {
+        let mut func_sig_only = make_node("do_stuff", NodeKind::Function, "a.rs");
+        func_sig_only.signature = "fn do_stuff(config: Config)".to_string();
+        let const_name = make_node("config_max", NodeKind::Const, "b.rs");
+
+        let index = empty_index();
+        let mut matches: Vec<&Node> = vec![&func_sig_only, &const_name];
+        sort_symbol_matches(&mut matches, "config", &index);
+
+        // const_name contains "config" in name, func only in signature
+        assert_eq!(
+            matches[0].id.name, "config_max",
+            "Name-contains should beat signature-only match"
+        );
+    }
+
+    /// Unicode node names: verify sorting works with non-ASCII identifiers.
+    #[test]
+    fn test_sort_unicode_names() {
+        let node_a = make_node("Größe", NodeKind::Function, "a.rs");
+        let node_b = make_node("größe_berechnen", NodeKind::Function, "b.rs");
+
+        let index = empty_index();
+        let mut matches: Vec<&Node> = vec![&node_b, &node_a];
+        sort_symbol_matches(&mut matches, "größe", &index);
+
+        // Exact match should come first
+        assert_eq!(matches[0].id.name, "Größe");
     }
 }
