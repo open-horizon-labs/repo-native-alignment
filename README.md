@@ -199,7 +199,7 @@ Agent wrappers for each workflow phase (`oh-aim`, `oh-execute`, `oh-ship`, etc.)
 
 ## Status
 
-**Working today:** 7 MCP tools, 6 CLI subcommands, 22 language extractors, 190+ tests. Structural outcome-to-code joins, LSP-enriched impact analysis, cross-language constant search, Metal GPU semantic search (CPU fallback on Linux), event-driven reindex, persistent index with <1s restarts. Ships as a Claude Code plugin with setup skill and record skill.
+**Working today:** 7 MCP tools, 6 CLI subcommands, 22 language extractors, 360+ tests. Structural outcome-to-code joins, LSP-enriched impact analysis with status awareness (query footers show `LSP: pending` during enrichment), cross-language constant search, Metal GPU semantic search with adaptive batch sizing (CPU fallback on Linux), event-driven reindex, persistent index with <1s restarts. Ships as a Claude Code plugin with setup skill and record skill.
 
 ### Tested On
 
