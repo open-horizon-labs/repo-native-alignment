@@ -476,4 +476,131 @@ mod tests {
 
         assert!(index.get_node("nonexistent").is_none());
     }
+
+    // ── Multi-entry traversal tests (PR #113 semantic graph entry) ──────
+
+    /// Helper: simulate the multi-entry traversal + dedup pattern from the
+    /// graph_query handler. Returns (all_ids_deduped, entry_nodes_stripped).
+    fn multi_entry_neighbors(
+        index: &GraphIndex,
+        entry_ids: &[&str],
+        edge_filter: Option<&[EdgeKind]>,
+        direction: Direction,
+    ) -> Vec<String> {
+        let mut all_ids: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for node_id in entry_ids {
+            let ids = index.neighbors(node_id, edge_filter, direction);
+            for id in ids {
+                if seen.insert(id.clone()) {
+                    all_ids.push(id);
+                }
+            }
+        }
+
+        // Strip entry nodes from results (matches handler behavior)
+        let entry_set: std::collections::HashSet<&str> =
+            entry_ids.iter().copied().collect();
+        all_ids.retain(|id| !entry_set.contains(id.as_str()));
+        all_ids
+    }
+
+    #[test]
+    fn test_multi_entry_deduplicates_shared_neighbors() {
+        // a -> c, b -> c  (both entry nodes point to same neighbor)
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+
+        let result = multi_entry_neighbors(&index, &["a", "b"], None, Direction::Outgoing);
+        // c should appear exactly once, not twice
+        assert_eq!(result, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn test_multi_entry_strips_entry_nodes_from_results() {
+        // a -> b -> c, where b is also an entry node
+        // If entry nodes are {a, b}, then b's outgoing neighbor c should appear
+        // but a and b themselves should be stripped from the result
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+
+        let result = multi_entry_neighbors(&index, &["a", "b"], None, Direction::Outgoing);
+        // a's neighbor is b (stripped as entry), b's neighbor is c (kept)
+        assert_eq!(result, vec!["c".to_string()]);
+        assert!(!result.contains(&"a".to_string()));
+        assert!(!result.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn test_multi_entry_entry_node_is_neighbor_of_another_entry() {
+        // a -> b, b -> c   (entry nodes: a, b)
+        // b is both an entry node AND a neighbor of entry node a
+        // The handler strips entry nodes, so we lose the a->b edge info
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("a", "fn", "d", "fn", EdgeKind::Calls);
+
+        let result = multi_entry_neighbors(&index, &["a", "b"], None, Direction::Outgoing);
+        // b is stripped (entry node), even though it's a valid neighbor of a
+        // This is the behavior bug noted in review finding #5
+        assert!(!result.contains(&"b".to_string()));
+        assert!(result.contains(&"c".to_string()));
+        assert!(result.contains(&"d".to_string()));
+    }
+
+    #[test]
+    fn test_multi_entry_all_neighbors_are_entry_nodes() {
+        // a -> b, b -> a   (entry nodes: a, b, cyclic)
+        // All neighbors are entry nodes — result should be empty
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "a", "fn", EdgeKind::Calls);
+
+        let result = multi_entry_neighbors(&index, &["a", "b"], None, Direction::Outgoing);
+        // Both a and b are entry nodes, so everything gets stripped
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_multi_entry_single_entry_same_as_old_behavior() {
+        // a -> b, a -> c (single entry node: equivalent to old non-multi code path)
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("a", "fn", "c", "struct", EdgeKind::DependsOn);
+
+        let multi = multi_entry_neighbors(&index, &["a"], None, Direction::Outgoing);
+        let single = index.neighbors("a", None, Direction::Outgoing);
+        // Single entry should give same results (no stripping since entry != neighbor)
+        assert_eq!(multi.len(), single.len());
+        for id in &single {
+            assert!(multi.contains(id));
+        }
+    }
+
+    #[test]
+    fn test_multi_entry_nonexistent_entry_nodes_produce_empty() {
+        let index = GraphIndex::new();
+        // No nodes in graph at all
+        let result = multi_entry_neighbors(&index, &["ghost1", "ghost2"], None, Direction::Outgoing);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_multi_entry_preserves_insertion_order() {
+        // a -> x, a -> y, b -> z
+        // Order should be: x, y (from a), z (from b) — insertion order preserved
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "x", "fn", EdgeKind::Calls);
+        index.add_edge("a", "fn", "y", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "z", "fn", EdgeKind::Calls);
+
+        let result = multi_entry_neighbors(&index, &["a", "b"], None, Direction::Outgoing);
+        assert_eq!(result.len(), 3);
+        // z should be last since it comes from the second entry node
+        assert_eq!(result[2], "z".to_string());
+    }
 }
