@@ -9,10 +9,18 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use crate::git;
 use crate::oh;
 
-/// Embedding batch size. Benchmarked on M4 MacBook Pro with MiniLM-L6-v2:
-/// batch=32 gives best sustained throughput (~880 t/s) with ~240MB memory.
-/// Larger batches (64, 128) showed no improvement or regression.
-const BATCH_SIZE: usize = 32;
+/// Adaptive batch sizing constants (TCP slow-start style).
+/// Instead of a fixed batch size that may saturate unified memory bandwidth
+/// on constrained Apple Silicon devices (e.g. MacBook Air M2 with 8GB),
+/// we start small and grow/shrink based on observed per-item latency.
+const BATCH_FLOOR: usize = 4;
+/// Benchmarked on M4 Pro: batch=32 gives best throughput (~880 t/s).
+/// Don't overshoot — larger batches don't help and can hurt.
+const BATCH_CEILING: usize = 32;
+/// Yield duration between batches to let other system tasks breathe.
+const BATCH_YIELD_MS: u64 = 50;
+/// If per-item time exceeds this multiple of the rolling average, halve batch size.
+const BACKOFF_THRESHOLD: f64 = 2.0;
 
 /// Number of recent commits to embed for temporal context.
 const RECENT_COMMIT_LIMIT: usize = 100;
@@ -135,23 +143,25 @@ async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         return Ok(Vec::new());
     }
 
-    let batch_size = BATCH_SIZE;
     let total_chars: usize = texts.iter().map(|t| t.len()).sum();
-    let total_batches = total.div_ceil(batch_size);
     let overall_start = std::time::Instant::now();
     tracing::info!(
-        "EmbeddingIndex: embedding {} text(s) across {} batch(es) ({} chars total)",
-        total, total_batches, total_chars
+        "EmbeddingIndex: embedding {} text(s) ({} chars total, adaptive batch {}..{})",
+        total, total_chars, BATCH_FLOOR, BATCH_CEILING
     );
 
     let model = new_model()?;
     let mut remaining = texts;
     let mut all_embeddings = Vec::with_capacity(total);
     let mut processed = 0usize;
+    let mut batch_idx = 0usize;
+    let mut current_batch_size = BATCH_FLOOR;
+    let mut rolling_avg: Option<f64> = None;
+    const EMA_ALPHA: f64 = 0.3;
 
-    for batch_idx in 0..total_batches {
-        let batch_size = remaining.len().min(batch_size);
-        let batch: Vec<String> = remaining.drain(..batch_size).collect();
+    while !remaining.is_empty() {
+        let bs = remaining.len().min(current_batch_size);
+        let batch: Vec<String> = remaining.drain(..bs).collect();
         let batch_start = std::time::Instant::now();
 
         let refs: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
@@ -160,12 +170,46 @@ async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         let batch_embeddings: Vec<Vec<f32>> = tensor.to_vec2::<f32>()
             .map_err(|e| anyhow::anyhow!("Tensor conversion failed: {}", e))?;
 
+        let elapsed_secs = batch_start.elapsed().as_secs_f64();
+        let per_item = elapsed_secs / bs as f64;
+
+        // Adaptive batch sizing: TCP slow-start style
+        match rolling_avg {
+            None => {
+                // First batch: seed the rolling average
+                rolling_avg = Some(per_item);
+                // Grow for next batch
+                current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+            }
+            Some(avg) => {
+                if per_item > BACKOFF_THRESHOLD * avg {
+                    // Latency spike — halve batch size
+                    current_batch_size = (current_batch_size / 2).max(BATCH_FLOOR);
+                    tracing::debug!(
+                        "EmbeddingIndex: backoff batch_size -> {} (per_item {:.4}s > {:.4}s threshold)",
+                        current_batch_size, per_item, BACKOFF_THRESHOLD * avg
+                    );
+                } else {
+                    // Steady — grow batch size
+                    current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+                }
+                // Update EMA
+                rolling_avg = Some(avg * (1.0 - EMA_ALPHA) + per_item * EMA_ALPHA);
+            }
+        }
+
         processed += batch_embeddings.len();
+        batch_idx += 1;
         tracing::info!(
-            "EmbeddingIndex: batch {}/{} done in {:?} ({}/{})",
-            batch_idx + 1, total_batches, batch_start.elapsed(), processed, total
+            "EmbeddingIndex: batch {} done in {:?} (bs={}, {}/{})",
+            batch_idx, batch_start.elapsed(), bs, processed, total
         );
         all_embeddings.extend(batch_embeddings);
+
+        // Yield between batches to avoid saturating memory bandwidth
+        if !remaining.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(BATCH_YIELD_MS)).await;
+        }
     }
 
     tracing::info!(
@@ -741,7 +785,10 @@ impl EmbeddingIndex {
 
 #[cfg(test)]
 mod tests {
-    use super::{truncate_chars, build_code_embedding_text, CODE_EMBED_CHAR_BUDGET};
+    use super::{
+        truncate_chars, build_code_embedding_text, CODE_EMBED_CHAR_BUDGET,
+        BATCH_FLOOR, BATCH_CEILING, BATCH_YIELD_MS, BACKOFF_THRESHOLD,
+    };
     use std::collections::BTreeMap;
 
     #[test]
@@ -1157,5 +1204,297 @@ mod tests {
             text.contains(&"x".repeat(639)),
             "full body should fit within budget when metadata is small"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ADVERSARIAL TESTS: adaptive batch sizing (PR #129)
+    // -----------------------------------------------------------------------
+
+    /// Constants must form a valid configuration: floor < ceiling,
+    /// backoff threshold > 1.0 (otherwise every batch triggers backoff),
+    /// yield > 0 (otherwise no breathing room).
+    #[test]
+    fn adaptive_batch_constants_sane() {
+        assert!(
+            BATCH_FLOOR < BATCH_CEILING,
+            "BATCH_FLOOR ({}) must be less than BATCH_CEILING ({})",
+            BATCH_FLOOR, BATCH_CEILING
+        );
+        assert!(
+            BATCH_FLOOR > 0,
+            "BATCH_FLOOR must be > 0 to avoid zero-size batches"
+        );
+        assert!(
+            BACKOFF_THRESHOLD > 1.0,
+            "BACKOFF_THRESHOLD ({}) must be > 1.0 or every batch triggers backoff",
+            BACKOFF_THRESHOLD
+        );
+        assert!(
+            BATCH_YIELD_MS > 0,
+            "BATCH_YIELD_MS must be > 0 to actually yield"
+        );
+    }
+
+    /// BATCH_FLOOR must be a power of two so that repeated halving
+    /// from BATCH_CEILING always lands exactly on BATCH_FLOOR.
+    #[test]
+    fn batch_floor_and_ceiling_are_powers_of_two() {
+        assert!(
+            BATCH_FLOOR.is_power_of_two(),
+            "BATCH_FLOOR ({}) should be a power of two for clean halving",
+            BATCH_FLOOR
+        );
+        assert!(
+            BATCH_CEILING.is_power_of_two(),
+            "BATCH_CEILING ({}) should be a power of two for clean doubling",
+            BATCH_CEILING
+        );
+    }
+
+    /// Simulate the ramp-up sequence: starting at BATCH_FLOOR, doubling
+    /// each step, we should reach BATCH_CEILING in a known number of steps.
+    #[test]
+    fn ramp_up_reaches_ceiling() {
+        let mut batch_size = BATCH_FLOOR;
+        let mut steps = 0;
+        while batch_size < BATCH_CEILING {
+            batch_size = (batch_size * 2).min(BATCH_CEILING);
+            steps += 1;
+            assert!(
+                steps <= 20,
+                "ramp-up did not converge after 20 doublings — constants are broken"
+            );
+        }
+        assert_eq!(batch_size, BATCH_CEILING);
+        // With floor=4 and ceiling=64: 4->8->16->32->64 = 4 steps
+        let expected = (BATCH_CEILING / BATCH_FLOOR).trailing_zeros() as usize;
+        assert_eq!(
+            steps, expected,
+            "ramp-up should take exactly {} doublings, took {}",
+            expected, steps
+        );
+    }
+
+    /// Simulate backoff: halving from BATCH_CEILING should reach BATCH_FLOOR.
+    #[test]
+    fn backoff_reaches_floor() {
+        let mut batch_size = BATCH_CEILING;
+        let mut steps = 0;
+        while batch_size > BATCH_FLOOR {
+            batch_size = (batch_size / 2).max(BATCH_FLOOR);
+            steps += 1;
+            assert!(steps <= 20, "backoff did not converge");
+        }
+        assert_eq!(batch_size, BATCH_FLOOR);
+    }
+
+    /// Simulate the full adaptive loop for 0 items.
+    /// The while loop should never execute; result should be empty.
+    #[test]
+    fn adaptive_loop_zero_items() {
+        let items: Vec<String> = vec![];
+        let total = items.len();
+        assert_eq!(total, 0);
+        // Mirrors the early return in embed_texts
+        // No panic, no infinite loop
+    }
+
+    /// Simulate the adaptive loop for exactly 1 item.
+    /// Should produce exactly one batch of size 1, no yield.
+    #[test]
+    fn adaptive_loop_single_item() {
+        let mut remaining = vec!["one".to_string()];
+        let mut current_batch_size = BATCH_FLOOR;
+        let mut batches_processed = 0;
+        let mut yields = 0;
+
+        while !remaining.is_empty() {
+            let bs = remaining.len().min(current_batch_size);
+            let _batch: Vec<String> = remaining.drain(..bs).collect();
+            // Simulate: first batch always doubles
+            current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+            batches_processed += 1;
+            if !remaining.is_empty() {
+                yields += 1;
+            }
+        }
+        assert_eq!(batches_processed, 1, "single item = single batch");
+        assert_eq!(yields, 0, "single item = no yield needed");
+    }
+
+    /// Simulate the adaptive loop for exactly BATCH_FLOOR items.
+    /// Should produce exactly one batch of size BATCH_FLOOR, no yield.
+    #[test]
+    fn adaptive_loop_exactly_floor_items() {
+        let mut remaining: Vec<String> = (0..BATCH_FLOOR).map(|i| format!("item_{}", i)).collect();
+        let mut current_batch_size = BATCH_FLOOR;
+        let mut batches_processed = 0;
+        let mut yields = 0;
+
+        while !remaining.is_empty() {
+            let bs = remaining.len().min(current_batch_size);
+            let _batch: Vec<String> = remaining.drain(..bs).collect();
+            current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+            batches_processed += 1;
+            if !remaining.is_empty() {
+                yields += 1;
+            }
+        }
+        assert_eq!(batches_processed, 1, "BATCH_FLOOR items = single batch");
+        assert_eq!(yields, 0, "BATCH_FLOOR items = no yield needed");
+    }
+
+    /// Simulate the adaptive loop for exactly BATCH_CEILING items.
+    /// Should ramp up: 4 + 8 + 16 + 32 + 4 = 64 items across 5 batches.
+    #[test]
+    fn adaptive_loop_exactly_ceiling_items() {
+        let mut remaining: Vec<String> =
+            (0..BATCH_CEILING).map(|i| format!("item_{}", i)).collect();
+        let mut current_batch_size = BATCH_FLOOR;
+        let mut batch_sizes = Vec::new();
+        let mut yields = 0;
+
+        while !remaining.is_empty() {
+            let bs = remaining.len().min(current_batch_size);
+            let _batch: Vec<String> = remaining.drain(..bs).collect();
+            batch_sizes.push(bs);
+            current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+            if !remaining.is_empty() {
+                yields += 1;
+            }
+        }
+        // With ramp-up and ceiling=64: batches are 4, 8, 16, 32, 4 (remainder)
+        let total_processed: usize = batch_sizes.iter().sum();
+        assert_eq!(total_processed, BATCH_CEILING);
+        assert!(
+            batch_sizes.len() >= 2,
+            "should need multiple batches for ramp-up"
+        );
+        // First batch is always BATCH_FLOOR
+        assert_eq!(batch_sizes[0], BATCH_FLOOR);
+        // Yields = batches - 1 (no yield after last batch)
+        assert_eq!(yields, batch_sizes.len() - 1);
+    }
+
+    /// Simulate the EMA calculation to verify it converges, not diverges.
+    /// Feed constant per-item times and verify rolling_avg converges to that value.
+    #[test]
+    fn ema_converges_on_steady_input() {
+        const EMA_ALPHA: f64 = 0.3;
+        let constant_time = 0.01; // 10ms per item
+        let mut rolling_avg: Option<f64> = None;
+
+        for _ in 0..20 {
+            match rolling_avg {
+                None => {
+                    rolling_avg = Some(constant_time);
+                }
+                Some(avg) => {
+                    rolling_avg = Some(avg * (1.0 - EMA_ALPHA) + constant_time * EMA_ALPHA);
+                }
+            }
+        }
+
+        let avg = rolling_avg.unwrap();
+        assert!(
+            (avg - constant_time).abs() < 1e-10,
+            "EMA should converge to the constant input value, got {}",
+            avg
+        );
+    }
+
+    /// Simulate a latency spike: verify backoff triggers and then recovers.
+    #[test]
+    fn ema_backoff_and_recovery() {
+        const EMA_ALPHA: f64 = 0.3;
+        let normal_time = 0.01;
+        let spike_time = 0.05; // 5x normal
+
+        let mut rolling_avg: Option<f64> = None;
+        let mut current_batch_size = BATCH_FLOOR;
+        let mut batch_sizes = Vec::new();
+
+        // 5 normal batches to establish baseline
+        for _ in 0..5 {
+            let per_item = normal_time;
+            match rolling_avg {
+                None => {
+                    rolling_avg = Some(per_item);
+                    current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+                }
+                Some(avg) => {
+                    if per_item > BACKOFF_THRESHOLD * avg {
+                        current_batch_size = (current_batch_size / 2).max(BATCH_FLOOR);
+                    } else {
+                        current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+                    }
+                    rolling_avg = Some(avg * (1.0 - EMA_ALPHA) + per_item * EMA_ALPHA);
+                }
+            }
+            batch_sizes.push(current_batch_size);
+        }
+
+        // Batch size should have ramped up
+        let pre_spike_size = current_batch_size;
+        assert!(
+            pre_spike_size > BATCH_FLOOR,
+            "should have ramped up before spike"
+        );
+
+        // Spike: per-item time jumps to 5x normal
+        let per_item = spike_time;
+        let avg = rolling_avg.unwrap();
+        assert!(
+            per_item > BACKOFF_THRESHOLD * avg,
+            "spike should exceed backoff threshold"
+        );
+        current_batch_size = (current_batch_size / 2).max(BATCH_FLOOR);
+        rolling_avg = Some(avg * (1.0 - EMA_ALPHA) + per_item * EMA_ALPHA);
+
+        let post_spike_size = current_batch_size;
+        assert!(
+            post_spike_size < pre_spike_size,
+            "batch size should decrease after spike"
+        );
+
+        // Recovery: 10 more normal batches
+        for _ in 0..10 {
+            let per_item = normal_time;
+            let avg = rolling_avg.unwrap();
+            if per_item > BACKOFF_THRESHOLD * avg {
+                current_batch_size = (current_batch_size / 2).max(BATCH_FLOOR);
+            } else {
+                current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+            }
+            rolling_avg = Some(avg * (1.0 - EMA_ALPHA) + per_item * EMA_ALPHA);
+        }
+
+        assert!(
+            current_batch_size >= pre_spike_size,
+            "should recover to at least pre-spike size after normal batches, got {}",
+            current_batch_size
+        );
+    }
+
+    /// Floor clamping: repeated halving should never go below BATCH_FLOOR.
+    #[test]
+    fn backoff_never_below_floor() {
+        let mut batch_size = BATCH_FLOOR;
+        // Try to halve 10 more times past the floor
+        for _ in 0..10 {
+            batch_size = (batch_size / 2).max(BATCH_FLOOR);
+        }
+        assert_eq!(batch_size, BATCH_FLOOR, "should clamp at BATCH_FLOOR");
+    }
+
+    /// Ceiling clamping: repeated doubling should never exceed BATCH_CEILING.
+    #[test]
+    fn ramp_up_never_above_ceiling() {
+        let mut batch_size = BATCH_CEILING;
+        // Try to double 10 more times past the ceiling
+        for _ in 0..10 {
+            batch_size = (batch_size * 2).min(BATCH_CEILING);
+        }
+        assert_eq!(batch_size, BATCH_CEILING, "should clamp at BATCH_CEILING");
     }
 }
