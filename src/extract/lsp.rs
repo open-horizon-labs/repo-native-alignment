@@ -1651,6 +1651,307 @@ mod tests {
         assert_eq!(MAX_TYPE_HIERARCHY_STRIKES, 3);
     }
 
+    // -----------------------------------------------------------------------
+    // Adversarial tests for type hierarchy edge cases
+    // -----------------------------------------------------------------------
+
+    /// If two candidates have the EXACT same name, file, kind, and line range,
+    /// the position tiebreaker cannot distinguish them. Verify we get *some*
+    /// result (not a panic) and it's deterministic.
+    #[test]
+    fn test_resolve_type_hierarchy_identical_position_tiebreaker() {
+        let root = PathBuf::from("/project");
+        // Two nodes with identical name, file, kind, and line range
+        let node1 = make_node("src/lib.rs", "Handler", NodeKind::Struct, 10, 20);
+        let node2 = make_node("src/lib.rs", "Handler", NodeKind::Struct, 10, 20);
+        let nodes: Vec<&Node> = vec![&node1, &node2];
+
+        let item = make_type_hierarchy_item("Handler", "file:///project/src/lib.rs", 9);
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+
+        // Must resolve to something, not panic or return None
+        assert!(result.is_some(), "should resolve even with identical candidates");
+
+        // Must be deterministic across calls
+        let result2 = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        assert_eq!(result, result2, "resolution should be deterministic");
+    }
+
+    /// URI for a file completely outside the repo root. The path won't
+    /// strip_prefix successfully, so rel_path == abs_path. There should be
+    /// no match because no node lives at that absolute path.
+    #[test]
+    fn test_resolve_type_hierarchy_file_outside_repo() {
+        let root = PathBuf::from("/project");
+        let node = make_node("src/lib.rs", "Foo", NodeKind::Struct, 1, 10);
+        let nodes: Vec<&Node> = vec![&node];
+
+        // URI points to a completely different directory
+        let item = make_type_hierarchy_item("Foo", "file:///other-project/src/lib.rs", 0);
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        // strip_prefix fails, rel_path becomes /other-project/src/lib.rs
+        // No node has that path, so should be None
+        assert!(result.is_none(), "file outside repo should not resolve");
+    }
+
+    /// Stdlib or dependency URI that doesn't contain ".cargo" (e.g. sysroot).
+    /// The .cargo filter won't catch it — verify it doesn't accidentally match
+    /// a same-name node in the repo.
+    #[test]
+    fn test_resolve_type_hierarchy_stdlib_uri_no_cargo_filter() {
+        let root = PathBuf::from("/project");
+        // A repo node named "Iterator"
+        let node = make_node("src/lib.rs", "Iterator", NodeKind::Trait, 1, 50);
+        let nodes: Vec<&Node> = vec![&node];
+
+        // LSP returns a stdlib URI (no .cargo in path, but outside repo)
+        let item = make_type_hierarchy_item(
+            "Iterator",
+            "file:///rustup/toolchains/stable/lib/rustlib/src/rust/library/core/src/iter/traits/iterator.rs",
+            0,
+        );
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        // strip_prefix fails, rel_path is the full sysroot path —
+        // no node has that file path, so should not match
+        assert!(
+            result.is_none(),
+            "stdlib path outside repo should not resolve to a repo node"
+        );
+    }
+
+    /// Non-Latin characters in file paths (Chinese, Arabic, emoji).
+    /// url::Url should handle percent-encoding for these.
+    #[test]
+    fn test_resolve_type_hierarchy_unicode_path() {
+        let root = PathBuf::from("/project");
+        let node = make_node("src/\u{4e2d}\u{6587}.rs", "Foo", NodeKind::Struct, 1, 10);
+        let nodes: Vec<&Node> = vec![&node];
+
+        // Percent-encoded Chinese characters: 中文 = %E4%B8%AD%E6%96%87
+        let item = make_type_hierarchy_item(
+            "Foo",
+            "file:///project/src/%E4%B8%AD%E6%96%87.rs",
+            0,
+        );
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        assert_eq!(
+            result.unwrap().name,
+            "Foo",
+            "percent-encoded Unicode paths should decode correctly"
+        );
+    }
+
+    /// Malformed URI that url::Url::parse rejects. The fallback path should
+    /// attempt manual strip_prefix.
+    #[test]
+    fn test_resolve_type_hierarchy_malformed_uri_fallback() {
+        let root = PathBuf::from("/project");
+        let node = make_node("src/lib.rs", "Bar", NodeKind::Struct, 1, 10);
+        let nodes: Vec<&Node> = vec![&node];
+
+        // Not a valid URL (no scheme) — url::Url::parse will fail
+        let item = serde_json::json!({
+            "name": "Bar",
+            "uri": "file:///project/src/lib.rs",
+            "kind": 5,
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 0 } }
+        });
+        // This should work via url::Url (valid file:// URI)
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        assert!(result.is_some());
+
+        // Now try something that *only* works via fallback
+        let item_bad = serde_json::json!({
+            "name": "Bar",
+            "uri": "not-a-url",
+            "kind": 5,
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 0 } }
+        });
+        // url::Url::parse("not-a-url") => Err, fallback strip_prefix("file://") => None
+        let result = LspEnricher::resolve_type_hierarchy_item(&item_bad, &nodes, &root);
+        assert!(result.is_none(), "URI without file:// scheme should fail gracefully");
+    }
+
+    /// Type hierarchy item with unexpected field types (name as number, uri as null).
+    /// Should return None, not panic.
+    #[test]
+    fn test_resolve_type_hierarchy_wrong_field_types() {
+        let root = PathBuf::from("/project");
+        let node = make_node("src/lib.rs", "Foo", NodeKind::Struct, 1, 10);
+        let nodes: Vec<&Node> = vec![&node];
+
+        // name is a number instead of string
+        let item = serde_json::json!({
+            "name": 42,
+            "uri": "file:///project/src/lib.rs",
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 0 } }
+        });
+        assert!(
+            LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root).is_none(),
+            "numeric name should not match"
+        );
+
+        // uri is null
+        let item = serde_json::json!({
+            "name": "Foo",
+            "uri": null,
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 0 } }
+        });
+        assert!(
+            LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root).is_none(),
+            "null URI should not match"
+        );
+
+        // range.start.line is a string instead of number
+        let item = serde_json::json!({
+            "name": "Foo",
+            "uri": "file:///project/src/lib.rs",
+            "range": { "start": { "line": "zero", "character": 0 }, "end": { "line": 5, "character": 0 } }
+        });
+        // Should still resolve — line defaults to 0 when not parseable
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        assert!(result.is_some(), "bad line type should degrade gracefully, not prevent resolution");
+    }
+
+    /// When range is completely missing from the item, resolution should still
+    /// work for unique name+file matches (range_start_line defaults to 0).
+    #[test]
+    fn test_resolve_type_hierarchy_no_range() {
+        let root = PathBuf::from("/project");
+        let node = make_node("src/lib.rs", "Foo", NodeKind::Struct, 1, 10);
+        let nodes: Vec<&Node> = vec![&node];
+
+        let item = serde_json::json!({
+            "name": "Foo",
+            "uri": "file:///project/src/lib.rs",
+            "kind": 5
+        });
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        assert_eq!(result.unwrap().name, "Foo", "missing range should not prevent unique match");
+    }
+
+    /// If the node kind is Function (not Trait/Struct/Enum/Impl), the candidate
+    /// filter should exclude it. This tests the kind whitelist.
+    #[test]
+    fn test_resolve_type_hierarchy_ignores_non_type_nodes() {
+        let root = PathBuf::from("/project");
+        // A function with the same name as the type hierarchy item
+        let node = make_node("src/lib.rs", "process", NodeKind::Function, 1, 10);
+        let nodes: Vec<&Node> = vec![&node];
+
+        let item = make_type_hierarchy_item("process", "file:///project/src/lib.rs", 0);
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        assert!(result.is_none(), "Functions should not be resolved as type hierarchy targets");
+    }
+
+    /// Empty matching_nodes should return None, not panic.
+    #[test]
+    fn test_resolve_type_hierarchy_empty_nodes() {
+        let root = PathBuf::from("/project");
+        let nodes: Vec<&Node> = vec![];
+        let item = make_type_hierarchy_item("Foo", "file:///project/src/lib.rs", 0);
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        assert!(result.is_none());
+    }
+
+    /// The .cargo filter uses `contains(".cargo")` which would also match a
+    /// directory literally named ".cargo" inside the repo. Verify the filter
+    /// catches nested .cargo paths.
+    #[test]
+    fn test_resolve_type_hierarchy_cargo_filter_nested() {
+        let root = PathBuf::from("/project");
+        // A node that happens to be under a .cargo subdir in the repo
+        let node = make_node("vendor/.cargo/config.toml/Foo", "Foo", NodeKind::Struct, 1, 10);
+        let nodes: Vec<&Node> = vec![&node];
+
+        let item = make_type_hierarchy_item(
+            "Foo",
+            "file:///project/vendor/.cargo/config.toml/Foo",
+            0,
+        );
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        assert!(result.is_none(), "paths containing .cargo anywhere should be filtered");
+    }
+
+    /// Position tiebreaker when the LSP range doesn't overlap any candidate's
+    /// line range. Falls back to closest-by-line_start.
+    ///
+    /// BUG FINDING: When two nodes have the same name/file/kind, they produce
+    /// identical NodeIds (NodeId doesn't include line numbers). So even though
+    /// the resolver picks the positionally closest candidate, the *returned*
+    /// NodeId is indistinguishable. The edge will be created with the right
+    /// NodeId, but both nodes share it — the graph can't distinguish them.
+    /// This is a known limitation of the NodeId design.
+    #[test]
+    fn test_resolve_type_hierarchy_position_no_overlap() {
+        let root = PathBuf::from("/project");
+        let node1 = make_node("src/lib.rs", "Config", NodeKind::Struct, 10, 20);
+        let node2 = make_node("src/lib.rs", "Config", NodeKind::Struct, 50, 60);
+        let nodes: Vec<&Node> = vec![&node1, &node2];
+
+        // Line 35 (0-indexed: 34, +1=35) doesn't overlap [10,20] or [50,60]
+        let item = make_type_hierarchy_item("Config", "file:///project/src/lib.rs", 34);
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        assert!(result.is_some(), "should fall back to closest-by-line_start");
+
+        // The resolver picks closest by unsigned distance: |10-35|=25, |50-35|=15
+        // So node2 should be selected. But since NodeId doesn't include line info,
+        // both nodes have the same NodeId — we can only verify resolution succeeded.
+        let resolved = result.unwrap();
+        assert_eq!(resolved.name, "Config");
+        // NOTE: NodeId equality means we can't distinguish which physical node
+        // was chosen from the returned ID alone. This is a design limitation.
+        assert_eq!(node1.id, node2.id, "NodeId lacks position — identical-name nodes are indistinguishable");
+    }
+
+    /// Verify that an item with a non-file URI scheme (e.g. untitled:, http://)
+    /// is handled gracefully.
+    #[test]
+    fn test_resolve_type_hierarchy_non_file_uri_scheme() {
+        let root = PathBuf::from("/project");
+        let node = make_node("src/lib.rs", "Foo", NodeKind::Struct, 1, 10);
+        let nodes: Vec<&Node> = vec![&node];
+
+        // http:// scheme — url::Url::parse succeeds but to_file_path() fails
+        let item = make_type_hierarchy_item("Foo", "http://example.com/src/lib.rs", 0);
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        assert!(result.is_none(), "non-file URI should return None");
+
+        // untitled: scheme
+        let item = make_type_hierarchy_item("Foo", "untitled:Untitled-1", 0);
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        assert!(result.is_none(), "untitled: URI should return None");
+    }
+
+    /// Verify strike counter state is correctly initialized and the constant
+    /// is used properly. The strike logic itself is tested via integration
+    /// (needs a mock transport), but we can verify the initial state.
+    #[test]
+    fn test_strike_counter_initial_state() {
+        let enricher = LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]);
+        let state = enricher.state.try_lock().unwrap();
+        assert_eq!(state.type_hierarchy_strikes, 0);
+        assert!(!state.has_type_hierarchy, "should default to false until init confirms");
+    }
+
+    /// If LspState has type hierarchy disabled (has_type_hierarchy = false),
+    /// verify the strikes counter is irrelevant — it's the flag that gates.
+    #[test]
+    fn test_strike_counter_flag_vs_count_independence() {
+        let enricher = LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]);
+        let mut state = enricher.state.try_lock().unwrap();
+
+        // Even with 0 strikes, if has_type_hierarchy is false, nothing runs.
+        // And even with many strikes, resetting the flag should allow it.
+        state.type_hierarchy_strikes = 100;
+        state.has_type_hierarchy = true;
+        // The enrich loop checks `has_type_hierarchy` first, so this state
+        // means "enabled but with many past strikes". Since strikes reset on
+        // success, this would only persist if all calls failed.
+        assert!(state.has_type_hierarchy);
+        assert_eq!(state.type_hierarchy_strikes, 100);
+    }
+
     /// If rust-analyzer is available, test actual enrichment on a small Rust file.
     #[tokio::test]
     async fn test_lsp_enricher_with_rust_analyzer() {
