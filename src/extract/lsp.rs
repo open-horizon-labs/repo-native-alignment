@@ -672,6 +672,61 @@ impl LspEnricher {
         Ok(locations)
     }
 
+    /// Compute the 0-based LSP line and column for a node.
+    ///
+    /// Uses the AST-recorded byte column of the name identifier stored by the
+    /// extractor (metadata key "name_col"). This is exact and language-agnostic:
+    /// tree-sitter records start_position().column for the name field node, so
+    /// it works correctly even when the name appears multiple times in the
+    /// signature (e.g. `pub fn from_str(from_str: &str)`) or when the keyword
+    /// prefix length varies across languages (Python `def`, Go `func`, etc.).
+    /// If the extractor did not populate name_col (legacy or non-tree-sitter
+    /// nodes), falls back to signature scanning.
+    fn node_lsp_position(node: &Node) -> (u32, u32) {
+        let line = (node.line_start.saturating_sub(1)) as u32;
+        let col = if let Some(col_str) = node.metadata.get("name_col") {
+            col_str.parse::<u32>().unwrap_or_else(|_| {
+                tracing::debug!(
+                    node = %node.id.name,
+                    raw = %col_str,
+                    "name_col metadata could not be parsed as u32; falling back to signature scan"
+                );
+                node.signature.find(&node.id.name).map(|i| i as u32).unwrap_or(0)
+            })
+        } else {
+            let fallback = node.signature.find(&node.id.name).map(|i| i as u32).unwrap_or(0);
+            tracing::debug!(
+                node = %node.id.name,
+                col = fallback,
+                "name_col not in metadata; using signature scan fallback (may miss on overloaded names)"
+            );
+            fallback
+        };
+        (line, col)
+    }
+
+    /// Update the type hierarchy strike counter after a single enrich attempt.
+    /// Resets on success, increments on failure, and disables the feature after
+    /// `MAX_TYPE_HIERARCHY_STRIKES` consecutive failures.
+    fn update_type_hierarchy_strikes(
+        ok: bool,
+        strikes: &mut u32,
+        enabled: &mut bool,
+    ) {
+        if ok {
+            *strikes = 0;
+        } else {
+            *strikes += 1;
+            if *strikes >= MAX_TYPE_HIERARCHY_STRIKES {
+                tracing::warn!(
+                    "Type hierarchy disabled after {} consecutive failures",
+                    *strikes
+                );
+                *enabled = false;
+            }
+        }
+    }
+
     /// Use type hierarchy to discover supertypes and subtypes for a node,
     /// creating Implements edges for each resolved relationship.
     ///
@@ -981,7 +1036,10 @@ impl Enricher for LspEnricher {
             None => return Ok(result),
         };
 
-        // Process functions and traits/interfaces
+        // ------------------------------------------------------------------
+        // Pass 1: call hierarchy, find_implementations, and document links.
+        // These are the primary enrichment requests — one per node.
+        // ------------------------------------------------------------------
         let mut attempted = 0u32;
         let mut errors = 0u32;
         for node in &matching_nodes {
@@ -991,37 +1049,7 @@ impl Enricher for LspEnricher {
                 Err(_) => continue,
             };
 
-            // line_start is 1-based, LSP positions are 0-based
-            let line = (node.line_start.saturating_sub(1)) as u32;
-            // Use the AST-recorded byte column of the name identifier stored by the
-            // extractor (metadata key "name_col"). This is exact and language-agnostic:
-            // tree-sitter records start_position().column for the name field node, so
-            // it works correctly even when the name appears multiple times in the
-            // signature (e.g. `pub fn from_str(from_str: &str)`) or when the keyword
-            // prefix length varies across languages (Python `def`, Go `func`, etc.).
-            // If the extractor did not populate name_col (legacy or non-tree-sitter
-            // nodes), fall back to signature scanning and log at debug so misses are
-            // visible without being noisy at info level.
-            let col = if let Some(col_str) = node.metadata.get("name_col") {
-                col_str.parse::<u32>().unwrap_or_else(|_| {
-                    tracing::debug!(
-                        node = %node.id.name,
-                        raw = %col_str,
-                        "name_col metadata could not be parsed as u32; falling back to signature scan"
-                    );
-                    node.signature.find(&node.id.name).map(|i| i as u32).unwrap_or(0)
-                })
-            } else {
-                // No name_col: node was produced before this fix or by a non-tree-sitter
-                // extractor. Try signature scan; a miss means wrong-column -> LSP null.
-                let fallback = node.signature.find(&node.id.name).map(|i| i as u32).unwrap_or(0);
-                tracing::debug!(
-                    node = %node.id.name,
-                    col = fallback,
-                    "name_col not in metadata; using signature scan fallback (may miss on overloaded names)"
-                );
-                fallback
-            };
+            let (line, col) = Self::node_lsp_position(node);
 
             match node.id.kind {
                 NodeKind::Function => {
@@ -1223,48 +1251,6 @@ impl Enricher for LspEnricher {
                             );
                         }
                     }
-
-                    // Type hierarchy: discover supertypes (subtypes skipped — find_implementations covers that)
-                    if has_type_hierarchy {
-                        let ok = Self::enrich_type_hierarchy(
-                            transport, &file_uri, line, col,
-                            node, &matching_nodes, &root, &mut result,
-                        ).await;
-                        if !ok {
-                            type_hierarchy_strikes += 1;
-                            if type_hierarchy_strikes >= MAX_TYPE_HIERARCHY_STRIKES {
-                                tracing::warn!(
-                                    "Type hierarchy disabled after {} consecutive failures",
-                                    type_hierarchy_strikes
-                                );
-                                has_type_hierarchy = false;
-                            }
-                        } else {
-                            type_hierarchy_strikes = 0;
-                        }
-                    }
-                }
-                NodeKind::Struct | NodeKind::Enum => {
-                    // Type hierarchy for structs/enums: discover supertypes only
-                    // (subtypes skipped — Rust structs/enums can't have subtypes)
-                    if has_type_hierarchy {
-                        let ok = Self::enrich_type_hierarchy(
-                            transport, &file_uri, line, col,
-                            node, &matching_nodes, &root, &mut result,
-                        ).await;
-                        if !ok {
-                            type_hierarchy_strikes += 1;
-                            if type_hierarchy_strikes >= MAX_TYPE_HIERARCHY_STRIKES {
-                                tracing::warn!(
-                                    "Type hierarchy disabled after {} consecutive failures",
-                                    type_hierarchy_strikes
-                                );
-                                has_type_hierarchy = false;
-                            }
-                        } else {
-                            type_hierarchy_strikes = 0;
-                        }
-                    }
                 }
                 _ => {
                     // For non-code nodes (markdown sections, etc.), try documentLink
@@ -1308,6 +1294,59 @@ impl Enricher for LspEnricher {
                             Err(_) => {} // documentLink not supported — fine
                         }
                     }
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Pass 2: type hierarchy — batch all Trait/Struct/Enum nodes.
+        //
+        // Separated from pass 1 so type hierarchy requests are not interleaved
+        // with call hierarchy requests. This makes the request pattern cleaner
+        // and positions the code for future concurrent batching.
+        //
+        // NOTE: true concurrent batching requires refactoring LspTransport to
+        // use `&self` (e.g. via interior mutability or a request-ID multiplexer).
+        // JSON-RPC 2.0 supports multiplexed request IDs, but the current
+        // transport takes `&mut self`, so requests remain sequential here.
+        // ------------------------------------------------------------------
+        if has_type_hierarchy {
+            // Collect type-hierarchy-eligible nodes up front
+            let type_nodes: Vec<&Node> = matching_nodes
+                .iter()
+                .filter(|n| matches!(n.id.kind, NodeKind::Trait | NodeKind::Struct | NodeKind::Enum))
+                .copied()
+                .collect();
+
+            if !type_nodes.is_empty() {
+                tracing::debug!(
+                    "Type hierarchy pass: {} eligible nodes",
+                    type_nodes.len()
+                );
+            }
+
+            for node in &type_nodes {
+                let abs_path = root.join(&node.id.file);
+                let file_uri = match path_to_uri(&abs_path) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                let (line, col) = Self::node_lsp_position(node);
+
+                let ok = Self::enrich_type_hierarchy(
+                    transport, &file_uri, line, col,
+                    node, &matching_nodes, &root, &mut result,
+                ).await;
+
+                Self::update_type_hierarchy_strikes(
+                    ok,
+                    &mut type_hierarchy_strikes,
+                    &mut has_type_hierarchy,
+                );
+
+                // Early exit: no point continuing the batch if strikes disabled it
+                if !has_type_hierarchy {
+                    break;
                 }
             }
         }
