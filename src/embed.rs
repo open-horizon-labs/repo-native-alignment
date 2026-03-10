@@ -431,19 +431,32 @@ impl EmbeddingIndex {
             //       metadata (structural/positional, not semantic).
             let text = match node.id.kind {
                 crate::graph::NodeKind::Other(ref s) if s == "markdown_section" || s == "Section" => {
-                    // Markdown sections: use the same embedding format as
-                    // MarkdownChunk::embedding_text() to avoid logic drift.
-                    // Detect frontmatter via the is_frontmatter metadata flag
-                    // (not heuristic body inspection).
+                    // Markdown sections: mirror MarkdownChunk::embedding_text()
+                    // logic to avoid drift. See types.rs for rationale.
                     let is_frontmatter = node.metadata.get("is_frontmatter")
                         .map(|v| v == "true")
                         .unwrap_or(false);
+                    let body_text = truncate_chars(&node.body, 500);
                     if is_frontmatter {
-                        format!("[frontmatter] {}: {}", node.id.file.display(), truncate_chars(&node.body, 500))
+                        // Frontmatter: no prefix — YAML metadata is noise for MiniLM
+                        body_text.to_string()
                     } else if node.signature.is_empty() {
-                        format!("[preamble] {}: {}", node.id.file.display(), truncate_chars(&node.body, 500))
+                        // Preamble (no headings): file-path prefix for context
+                        format!("[preamble] {}: {}", node.id.file.display(), body_text)
                     } else {
-                        format!("{}: {}", node.signature, truncate_chars(&node.body, 500))
+                        // Check hierarchy depth: signature contains " > " for
+                        // multi-level paths. Single-level headings skip the
+                        // prefix since heading text is already in the body.
+                        // (EXPERIMENTAL: breadcrumb prefixing is unvalidated
+                        // with MiniLM — see types.rs embedding_text() docs.)
+                        let has_hierarchy = node.metadata.get("heading_hierarchy")
+                            .map(|h| h.contains(" > "))
+                            .unwrap_or(false);
+                        if has_hierarchy {
+                            format!("{}: {}", node.signature, body_text)
+                        } else {
+                            body_text.to_string()
+                        }
                     }
                 }
                 _ => {

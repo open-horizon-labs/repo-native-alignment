@@ -218,7 +218,8 @@ fn extract_frontmatter_chunk<'a>(
 /// Scoring:
 /// - Exact heading match: +10
 /// - Heading contains query: +5
-/// - Frontmatter match: +8
+/// - Frontmatter match: +3 (kept low — frontmatter is machine metadata, not
+///   human-readable content, so it should rank below heading matches)
 /// - Body/content match: +2
 /// - Higher heading level (lower number) gets a boost: +(7 - level)
 ///
@@ -245,9 +246,13 @@ pub fn search_chunks<'a>(chunks: &'a [MarkdownChunk], query: &str) -> Vec<&'a Ma
                 }
             }
 
-            // Frontmatter match
+            // Frontmatter match: low bonus (+3) because frontmatter is machine
+            // metadata (YAML keys/values), not human-readable content. This ensures
+            // h1 body-only matches (2 + 6 = 8) outrank frontmatter body-only
+            // matches (3 + 2 = 5). Frontmatter heading matches (exact match on a
+            // YAML key) are still competitive at 3 + 10 = 13.
             if chunk.is_frontmatter && chunk.content.to_lowercase().contains(&query_lower) {
-                score += 8;
+                score += 3;
             }
 
             // Body/content match
@@ -258,7 +263,7 @@ pub fn search_chunks<'a>(chunks: &'a [MarkdownChunk], query: &str) -> Vec<&'a Ma
             if score > 0 {
                 // Heading level boost: h1 gets +6, h2 gets +5, etc.
                 // Frontmatter (level 0) gets no level boost — "heading level"
-                // is meaningless for frontmatter, and the +8 frontmatter bonus
+                // is meaningless for frontmatter, and the frontmatter bonus
                 // already accounts for its importance.
                 if !chunk.is_frontmatter {
                     let level_boost = 7u32.saturating_sub(chunk.heading_level);
@@ -1301,7 +1306,9 @@ mod tests {
 
     #[test]
     fn test_frontmatter_scoring_no_level_inflation() {
-        // Verify frontmatter body-only match does not outscore an exact h1 heading match
+        // Verify frontmatter body-only match does not outscore an exact h1 heading match.
+        // Scoring: h1 exact heading (10) + body (2) + level boost (6) = 18
+        //          frontmatter body (3 + 2) = 5
         let chunks = vec![
             MarkdownChunk {
                 file_path: PathBuf::from("a.md"),
@@ -1334,6 +1341,48 @@ mod tests {
         // The h1 with exact heading match must rank above frontmatter body-only match
         assert_eq!(results[0].heading_text, "Active",
             "Exact h1 heading match should rank above frontmatter body match");
+    }
+
+    #[test]
+    fn test_h1_body_only_outranks_frontmatter_body_only() {
+        // Both chunks match only via body content (no heading match).
+        // h1 body-only: body (2) + level boost (6) = 8
+        // frontmatter body-only: frontmatter bonus (3) + body (2) = 5
+        // h1 should rank higher because it's actual content, not metadata.
+        let chunks = vec![
+            MarkdownChunk {
+                file_path: PathBuf::from("a.md"),
+                heading_hierarchy: vec![],
+                heading_level: 0,
+                heading_text: String::new(),
+                parent_heading: None,
+                is_frontmatter: true,
+                content: "---\nstatus: active\n---\n".to_string(),
+                byte_offset: 0,
+                byte_len: 22,
+                code_spans: vec![],
+            },
+            MarkdownChunk {
+                file_path: PathBuf::from("a.md"),
+                heading_hierarchy: vec!["# Overview".to_string()],
+                heading_level: 1,
+                heading_text: "Overview".to_string(),
+                parent_heading: None,
+                is_frontmatter: false,
+                content: "# Overview\n\nThe active status means...\n".to_string(),
+                byte_offset: 22,
+                byte_len: 38,
+                code_spans: vec![],
+            },
+        ];
+
+        let results = search_chunks(&chunks, "active");
+        assert_eq!(results.len(), 2);
+        // h1 body-only (score 8) must outrank frontmatter body-only (score 5)
+        assert_eq!(results[0].heading_text, "Overview",
+            "h1 body-only match (score 8) should rank above frontmatter body-only match (score 5)");
+        assert!(results[1].is_frontmatter,
+            "frontmatter should be second");
     }
 
     // ========================================================================
@@ -1537,9 +1586,9 @@ Deepest content.\n";
         };
 
         let text = chunk.embedding_text();
-        // Default limit is 500 chars for body
-        assert!(text.len() < 600, "embedding_text should truncate body, got len={}", text.len());
-        assert!(text.starts_with("Title: "));
+        // Default limit is 500 chars for body. Single-level heading skips
+        // breadcrumb prefix, so the text IS the truncated body.
+        assert!(text.len() <= 500, "embedding_text should truncate body, got len={}", text.len());
     }
 
     #[test]
@@ -1599,7 +1648,8 @@ Deepest content.\n";
 
         // Must not panic on multibyte boundary
         let text = chunk.embedding_text();
-        assert!(text.starts_with("Title: "));
+        // Single-level heading: no breadcrumb prefix, body starts directly
+        assert!(text.starts_with("日"), "Single-level heading should have no prefix, got: {}", &text[..20.min(text.len())]);
         // Verify it's valid UTF-8 (implicit — if we got here, it is)
     }
 
@@ -1766,7 +1816,7 @@ Deepest content.\n";
     }
 
     #[test]
-    fn test_embedding_text_frontmatter_prefix() {
+    fn test_embedding_text_frontmatter_no_prefix() {
         let chunk = MarkdownChunk {
             file_path: PathBuf::from("doc.md"),
             heading_hierarchy: vec![],
@@ -1781,9 +1831,11 @@ Deepest content.\n";
         };
 
         let text = chunk.embedding_text();
-        assert!(
-            text.starts_with("[frontmatter] doc.md: "),
-            "Frontmatter embedding should use [frontmatter] prefix, got: {}",
+        // Frontmatter skips prefix entirely — YAML metadata like
+        // "frontmatter: status: active..." is noise for MiniLM.
+        assert_eq!(
+            text, "---\nid: test\n---\n",
+            "Frontmatter embedding should have no prefix, got: {}",
             text
         );
     }
