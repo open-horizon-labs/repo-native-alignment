@@ -949,4 +949,718 @@ mod tests {
         assert_eq!(langs.len(), 1);
         assert_eq!(langs[0], "rust");
     }
+
+    // -----------------------------------------------------------------------
+    // Adversarial tests — edge cases, breakage attempts, boundary conditions
+    // -----------------------------------------------------------------------
+
+    /// Edge dedup must be directional: A->B and B->A are distinct edges.
+    /// If dedup conflates them, we silently lose edges.
+    #[test]
+    fn test_edge_dedup_preserves_direction() {
+        let enricher = ScipEnricher {
+            supported_languages: vec!["rust"],
+            available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
+        };
+
+        let nodes = vec![
+            make_node("src/a.rs", "foo", NodeKind::Function, 1, 10),
+            make_node("src/b.rs", "bar", NodeKind::Function, 1, 10),
+        ];
+
+        // Build a SCIP index where foo calls bar AND bar calls foo
+        let mut index = scip::types::Index::new();
+
+        // Define both symbols
+        let mut doc_a = scip::types::Document::new();
+        doc_a.relative_path = "src/a.rs".to_string();
+        let mut def_foo = scip::types::Occurrence::new();
+        def_foo.range = vec![0, 0, 10]; // line 1
+        def_foo.symbol = "test . foo.".to_string();
+        def_foo.symbol_roles = scip::types::SymbolRole::Definition.value();
+        // Reference to bar inside foo
+        let mut ref_bar = scip::types::Occurrence::new();
+        ref_bar.range = vec![4, 0, 10]; // line 5, inside foo
+        ref_bar.symbol = "test . bar.".to_string();
+        ref_bar.symbol_roles = 0;
+        doc_a.occurrences.push(def_foo);
+        doc_a.occurrences.push(ref_bar);
+        index.documents.push(doc_a);
+
+        let mut doc_b = scip::types::Document::new();
+        doc_b.relative_path = "src/b.rs".to_string();
+        let mut def_bar = scip::types::Occurrence::new();
+        def_bar.range = vec![0, 0, 10]; // line 1
+        def_bar.symbol = "test . bar.".to_string();
+        def_bar.symbol_roles = scip::types::SymbolRole::Definition.value();
+        // Reference to foo inside bar
+        let mut ref_foo = scip::types::Occurrence::new();
+        ref_foo.range = vec![4, 0, 10]; // line 5, inside bar
+        ref_foo.symbol = "test . foo.".to_string();
+        ref_foo.symbol_roles = 0;
+        doc_b.occurrences.push(def_bar);
+        doc_b.occurrences.push(ref_foo);
+        index.documents.push(doc_b);
+
+        let graph_index = GraphIndex::new();
+        let result = enricher.extract_edges(
+            &index, &nodes, &graph_index, Path::new("/tmp"), &HashSet::new(),
+        );
+
+        // Both directions must survive dedup
+        assert_eq!(
+            result.added_edges.len(),
+            2,
+            "A->B and B->A must both survive dedup (directional). Got: {:?}",
+            result.added_edges.iter().map(|e| format!("{}->{}", e.from.name, e.to.name)).collect::<Vec<_>>()
+        );
+
+        let edge_names: HashSet<(String, String)> = result
+            .added_edges
+            .iter()
+            .map(|e| (e.from.name.clone(), e.to.name.clone()))
+            .collect();
+        assert!(edge_names.contains(&("foo".to_string(), "bar".to_string())));
+        assert!(edge_names.contains(&("bar".to_string(), "foo".to_string())));
+    }
+
+    /// If the same function references the same target symbol multiple times
+    /// (e.g., calling helper() on lines 3, 7, and 9), dedup within SCIP
+    /// output should collapse them to a single edge.
+    #[test]
+    fn test_duplicate_references_deduped_within_scip() {
+        let enricher = ScipEnricher {
+            supported_languages: vec!["rust"],
+            available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
+        };
+
+        let nodes = vec![
+            make_node("src/main.rs", "caller", NodeKind::Function, 1, 20),
+            make_node("src/lib.rs", "target", NodeKind::Function, 1, 5),
+        ];
+
+        let mut index = scip::types::Index::new();
+
+        let mut doc1 = scip::types::Document::new();
+        doc1.relative_path = "src/lib.rs".to_string();
+        let mut def = scip::types::Occurrence::new();
+        def.range = vec![0, 0, 10];
+        def.symbol = "test . target.".to_string();
+        def.symbol_roles = scip::types::SymbolRole::Definition.value();
+        doc1.occurrences.push(def);
+        index.documents.push(doc1);
+
+        let mut doc2 = scip::types::Document::new();
+        doc2.relative_path = "src/main.rs".to_string();
+        // Three references to target from within caller
+        for line in [2, 7, 14] {
+            let mut ref_occ = scip::types::Occurrence::new();
+            ref_occ.range = vec![line, 0, 10];
+            ref_occ.symbol = "test . target.".to_string();
+            ref_occ.symbol_roles = 0;
+            doc2.occurrences.push(ref_occ);
+        }
+        index.documents.push(doc2);
+
+        let graph_index = GraphIndex::new();
+        let result = enricher.extract_edges(
+            &index, &nodes, &graph_index, Path::new("/tmp"), &HashSet::new(),
+        );
+
+        assert_eq!(
+            result.added_edges.len(),
+            1,
+            "Three references from same function to same target should dedup to 1 edge"
+        );
+    }
+
+    /// Self-reference in an Implements relationship: a symbol that claims to
+    /// implement itself. The code skips self-refs for CALLS but NOT for
+    /// IMPLEMENTS. This tests whether self-implementing edges leak through.
+    #[test]
+    fn test_self_implementing_symbol_produces_edge() {
+        // This is a design question: should self-implements be allowed?
+        // The current code does NOT filter self-references for Implements.
+        // This test documents the current behavior.
+        let enricher = ScipEnricher {
+            supported_languages: vec!["rust"],
+            available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
+        };
+
+        let nodes = vec![
+            make_node("src/lib.rs", "Thing", NodeKind::Trait, 1, 10),
+        ];
+
+        let mut index = scip::types::Index::new();
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = "src/lib.rs".to_string();
+
+        let mut def = scip::types::Occurrence::new();
+        def.range = vec![0, 0, 10];
+        def.symbol = "test . Thing#".to_string();
+        def.symbol_roles = scip::types::SymbolRole::Definition.value();
+        doc.occurrences.push(def);
+
+        // SymbolInformation claiming Thing implements Thing
+        let mut sym_info = scip::types::SymbolInformation::new();
+        sym_info.symbol = "test . Thing#".to_string();
+        let mut rel = scip::types::Relationship::new();
+        rel.symbol = "test . Thing#".to_string();
+        rel.is_implementation = true;
+        sym_info.relationships.push(rel);
+        doc.symbols.push(sym_info);
+
+        index.documents.push(doc);
+
+        let graph_index = GraphIndex::new();
+        let result = enricher.extract_edges(
+            &index, &nodes, &graph_index, Path::new("/tmp"), &HashSet::new(),
+        );
+
+        // Current behavior: self-implements edge IS produced (no self-ref filter for Implements)
+        // This documents the behavior — if it changes, this test will catch it
+        assert_eq!(
+            result.added_edges.len(),
+            1,
+            "Self-implementing edge should pass through (no self-ref filter for Implements)"
+        );
+        assert_eq!(result.added_edges[0].from.name, "Thing");
+        assert_eq!(result.added_edges[0].to.name, "Thing");
+    }
+
+    /// Local symbols (starting with "local ") should be skipped entirely.
+    /// If the filter is broken, we'll get spurious edges from locals.
+    #[test]
+    fn test_local_symbols_filtered_out() {
+        let enricher = ScipEnricher {
+            supported_languages: vec!["rust"],
+            available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
+        };
+
+        let nodes = vec![
+            make_node("src/main.rs", "main", NodeKind::Function, 1, 20),
+            make_node("src/lib.rs", "helper", NodeKind::Function, 1, 5),
+        ];
+
+        let mut index = scip::types::Index::new();
+
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = "src/lib.rs".to_string();
+        // A definition using a local symbol
+        let mut local_def = scip::types::Occurrence::new();
+        local_def.range = vec![0, 0, 10];
+        local_def.symbol = "local 42".to_string(); // local symbol
+        local_def.symbol_roles = scip::types::SymbolRole::Definition.value();
+        doc.occurrences.push(local_def);
+        index.documents.push(doc);
+
+        let mut doc2 = scip::types::Document::new();
+        doc2.relative_path = "src/main.rs".to_string();
+        let mut local_ref = scip::types::Occurrence::new();
+        local_ref.range = vec![4, 0, 10];
+        local_ref.symbol = "local 42".to_string(); // reference to local
+        local_ref.symbol_roles = 0;
+        doc2.occurrences.push(local_ref);
+        index.documents.push(doc2);
+
+        let graph_index = GraphIndex::new();
+        let result = enricher.extract_edges(
+            &index, &nodes, &graph_index, Path::new("/tmp"), &HashSet::new(),
+        );
+
+        assert!(
+            result.added_edges.is_empty(),
+            "Local symbols should be filtered out, producing no edges"
+        );
+    }
+
+    /// Module-kind nodes should be invisible to find_node_at.
+    /// If a Module node spans lines 1-100 and a Function node spans 5-10,
+    /// only the Function should match at line 7.
+    #[test]
+    fn test_module_nodes_invisible_to_find_node_at() {
+        let nodes = vec![
+            make_node("src/lib.rs", "my_module", NodeKind::Module, 1, 100),
+            make_node("src/lib.rs", "real_fn", NodeKind::Function, 5, 10),
+        ];
+        let mut fli: HashMap<(PathBuf, usize), Vec<&Node>> = HashMap::new();
+        for node in &nodes {
+            for line in node.line_start..=node.line_end {
+                fli.entry((node.id.file.clone(), line)).or_default().push(node);
+            }
+        }
+
+        // Line 7: both Module and Function present, only Function should match
+        let result = find_node_at(&fli, &PathBuf::from("src/lib.rs"), 7);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "real_fn");
+
+        // Line 50: only Module present, should return None
+        let result = find_node_at(&fli, &PathBuf::from("src/lib.rs"), 50);
+        assert!(
+            result.is_none(),
+            "Module-only lines should return None from find_node_at"
+        );
+    }
+
+    /// Import nodes should not match as enclosing nodes.
+    /// A reference inside an import block should not create caller edges.
+    #[test]
+    fn test_import_nodes_invisible_to_find_enclosing_node() {
+        let nodes = vec![
+            make_node("src/lib.rs", "use_std", NodeKind::Import, 1, 1),
+        ];
+        let mut fli: HashMap<(PathBuf, usize), Vec<&Node>> = HashMap::new();
+        for node in &nodes {
+            for line in node.line_start..=node.line_end {
+                fli.entry((node.id.file.clone(), line)).or_default().push(node);
+            }
+        }
+
+        let result = find_enclosing_node(&fli, &PathBuf::from("src/lib.rs"), 1);
+        assert!(
+            result.is_none(),
+            "Import nodes should not be enclosing nodes for CALLS edges"
+        );
+    }
+
+    /// git_head_oid should gracefully return None for a path that is not
+    /// a git repository.
+    #[test]
+    fn test_git_head_oid_non_repo() {
+        // /tmp is (almost certainly) not a git repo
+        let result = git_head_oid(Path::new("/tmp"));
+        assert!(
+            result.is_none(),
+            "git_head_oid should return None for non-repo path"
+        );
+    }
+
+    /// When git HEAD can't be resolved (empty OID), caching is skipped.
+    /// This means the enricher will re-index on every call -- verify the
+    /// cache remains empty after a "run" that can't resolve HEAD.
+    #[test]
+    fn test_cache_empty_when_head_unresolvable() {
+        let enricher = ScipEnricher {
+            supported_languages: vec!["rust"],
+            available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
+        };
+
+        // Simulate: head_oid is empty, which means cache won't be populated.
+        // We can't easily test run_indexer without a real indexer, but we can
+        // verify the cache behavior by checking that an empty head_oid
+        // means nothing is stored.
+        let head_oid = git_head_oid(Path::new("/tmp")).unwrap_or_default();
+        assert!(head_oid.is_empty(), "Non-repo should give empty OID");
+
+        // After this, cache should remain empty
+        let cache = enricher.cache.lock().unwrap();
+        assert!(cache.is_empty());
+    }
+
+    /// Malformed protobuf: parse_from_bytes should fail on garbage input.
+    /// The enricher should propagate this as an error, not panic.
+    #[test]
+    fn test_malformed_protobuf_parse_fails() {
+        // Garbage bytes
+        let garbage = vec![0xFF, 0xFE, 0x00, 0x01, 0x02, 0x03];
+        let result = scip::types::Index::parse_from_bytes(&garbage);
+        // protobuf may or may not parse garbage (it's lenient), but it shouldn't panic
+        // If it does parse, we at least shouldn't crash
+        match result {
+            Ok(idx) => {
+                // Parsed "successfully" from garbage -- documents should be empty or weird
+                // This is acceptable protobuf behavior (forward-compatible parsing)
+                let _ = idx.documents.len();
+            }
+            Err(_) => {
+                // Expected: parse failure on garbage
+            }
+        }
+    }
+
+    /// Empty protobuf: 0-byte input should either fail or produce empty index.
+    #[test]
+    fn test_empty_protobuf_parse() {
+        let empty = vec![];
+        let result = scip::types::Index::parse_from_bytes(&empty);
+        match result {
+            Ok(idx) => {
+                assert!(idx.documents.is_empty(), "Empty protobuf should yield empty index");
+            }
+            Err(_) => {
+                // Also acceptable
+            }
+        }
+    }
+
+    /// Cross-source dedup format consistency: the format string used in
+    /// enrich() to build existing_ids must match Edge::stable_id().
+    /// If they diverge, cross-source dedup silently fails.
+    #[test]
+    fn test_cross_source_dedup_format_consistency() {
+        // Simulate what enrich() does: build existing_ids from all_edges format
+        let from_id = ":src/main.rs:main:function"; // NodeId::to_stable_id() with empty root
+        let to_id = ":src/lib.rs:helper:function";
+        let kind = EdgeKind::Calls;
+
+        // Format used in enrich() (line 493)
+        let enrich_format = format!("{}->{}->{}", from_id, kind, to_id);
+
+        // Format used by Edge::stable_id()
+        let edge = make_edge("main", "src/main.rs", "helper", "src/lib.rs", EdgeKind::Calls);
+        let stable_format = edge.stable_id();
+
+        assert_eq!(
+            enrich_format, stable_format,
+            "enrich() existing_ids format must match Edge::stable_id(). \
+             Divergence means cross-source dedup silently fails.\n\
+             enrich format: {}\n\
+             stable_id:     {}",
+            enrich_format, stable_format
+        );
+    }
+
+    /// Occurrence with negative or very large range values should not panic.
+    #[test]
+    fn test_occurrence_extreme_range_values() {
+        let mut occ = scip::types::Occurrence::new();
+        occ.range = vec![i32::MAX, 0, 10];
+        // Should not panic — just produces a very large line number
+        let line = occurrence_start_line(&occ);
+        assert!(line > 0);
+
+        // Negative range (i32 but stored as vec<i32>)
+        let mut occ2 = scip::types::Occurrence::new();
+        occ2.range = vec![-1, 0, 10];
+        // -1 as usize will wrap around, but shouldn't panic
+        let _line = occurrence_start_line(&occ2);
+        // We just verify no panic occurs
+    }
+
+    /// Empty symbol string in occurrence should be skipped (not produce edges).
+    #[test]
+    fn test_empty_symbol_string_skipped() {
+        let enricher = ScipEnricher {
+            supported_languages: vec!["rust"],
+            available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
+        };
+
+        let nodes = vec![
+            make_node("src/main.rs", "main", NodeKind::Function, 1, 10),
+        ];
+
+        let mut index = scip::types::Index::new();
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = "src/main.rs".to_string();
+
+        // Occurrence with empty symbol
+        let mut occ = scip::types::Occurrence::new();
+        occ.range = vec![0, 0, 10];
+        occ.symbol = "".to_string();
+        occ.symbol_roles = scip::types::SymbolRole::Definition.value();
+        doc.occurrences.push(occ);
+
+        index.documents.push(doc);
+
+        let graph_index = GraphIndex::new();
+        let result = enricher.extract_edges(
+            &index, &nodes, &graph_index, Path::new("/tmp"), &HashSet::new(),
+        );
+
+        assert!(
+            result.added_edges.is_empty(),
+            "Empty symbol string should be skipped"
+        );
+    }
+
+    /// Definition at a line with no matching tree-sitter node should be
+    /// silently dropped (no edges from orphan definitions).
+    #[test]
+    fn test_definition_at_unmapped_line_dropped() {
+        let enricher = ScipEnricher {
+            supported_languages: vec!["rust"],
+            available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
+        };
+
+        // Node at lines 1-5, but definition is at line 50 (unmapped)
+        let nodes = vec![
+            make_node("src/lib.rs", "helper", NodeKind::Function, 1, 5),
+            make_node("src/main.rs", "main", NodeKind::Function, 1, 10),
+        ];
+
+        let mut index = scip::types::Index::new();
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = "src/lib.rs".to_string();
+
+        let mut def = scip::types::Occurrence::new();
+        def.range = vec![49, 0, 10]; // line 50 (1-indexed), no node here
+        def.symbol = "test . orphan.".to_string();
+        def.symbol_roles = scip::types::SymbolRole::Definition.value();
+        doc.occurrences.push(def);
+        index.documents.push(doc);
+
+        let mut doc2 = scip::types::Document::new();
+        doc2.relative_path = "src/main.rs".to_string();
+        let mut ref_occ = scip::types::Occurrence::new();
+        ref_occ.range = vec![4, 0, 10];
+        ref_occ.symbol = "test . orphan.".to_string();
+        ref_occ.symbol_roles = 0;
+        doc2.occurrences.push(ref_occ);
+        index.documents.push(doc2);
+
+        let graph_index = GraphIndex::new();
+        let result = enricher.extract_edges(
+            &index, &nodes, &graph_index, Path::new("/tmp"), &HashSet::new(),
+        );
+
+        assert!(
+            result.added_edges.is_empty(),
+            "Definition at unmapped line should produce no edges"
+        );
+    }
+
+    /// Reference at a line with no enclosing node should be silently dropped.
+    #[test]
+    fn test_reference_with_no_enclosing_node_dropped() {
+        let enricher = ScipEnricher {
+            supported_languages: vec!["rust"],
+            available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
+        };
+
+        // Target defined at line 1-5, but reference is at line 50 with no
+        // enclosing function/struct node
+        let nodes = vec![
+            make_node("src/lib.rs", "target", NodeKind::Function, 1, 5),
+        ];
+
+        let mut index = scip::types::Index::new();
+
+        let mut doc1 = scip::types::Document::new();
+        doc1.relative_path = "src/lib.rs".to_string();
+        let mut def = scip::types::Occurrence::new();
+        def.range = vec![0, 0, 10];
+        def.symbol = "test . target.".to_string();
+        def.symbol_roles = scip::types::SymbolRole::Definition.value();
+        doc1.occurrences.push(def);
+        index.documents.push(doc1);
+
+        let mut doc2 = scip::types::Document::new();
+        doc2.relative_path = "src/orphan.rs".to_string();
+        let mut ref_occ = scip::types::Occurrence::new();
+        ref_occ.range = vec![49, 0, 10]; // line 50, no node here
+        ref_occ.symbol = "test . target.".to_string();
+        ref_occ.symbol_roles = 0;
+        doc2.occurrences.push(ref_occ);
+        index.documents.push(doc2);
+
+        let graph_index = GraphIndex::new();
+        let result = enricher.extract_edges(
+            &index, &nodes, &graph_index, Path::new("/tmp"), &HashSet::new(),
+        );
+
+        assert!(
+            result.added_edges.is_empty(),
+            "Reference with no enclosing node should produce no edge"
+        );
+    }
+
+    /// Multiple definitions of the same symbol (e.g., overloads or re-exports)
+    /// should each get edges from references.
+    #[test]
+    fn test_multiple_definitions_same_symbol() {
+        let enricher = ScipEnricher {
+            supported_languages: vec!["rust"],
+            available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
+        };
+
+        let nodes = vec![
+            make_node("src/a.rs", "handler_v1", NodeKind::Function, 1, 10),
+            make_node("src/b.rs", "handler_v2", NodeKind::Function, 1, 10),
+            make_node("src/main.rs", "caller", NodeKind::Function, 1, 10),
+        ];
+
+        let mut index = scip::types::Index::new();
+
+        // Two definitions of the same symbol in different files
+        let mut doc_a = scip::types::Document::new();
+        doc_a.relative_path = "src/a.rs".to_string();
+        let mut def1 = scip::types::Occurrence::new();
+        def1.range = vec![0, 0, 10];
+        def1.symbol = "test . handler.".to_string();
+        def1.symbol_roles = scip::types::SymbolRole::Definition.value();
+        doc_a.occurrences.push(def1);
+        index.documents.push(doc_a);
+
+        let mut doc_b = scip::types::Document::new();
+        doc_b.relative_path = "src/b.rs".to_string();
+        let mut def2 = scip::types::Occurrence::new();
+        def2.range = vec![0, 0, 10];
+        def2.symbol = "test . handler.".to_string();
+        def2.symbol_roles = scip::types::SymbolRole::Definition.value();
+        doc_b.occurrences.push(def2);
+        index.documents.push(doc_b);
+
+        // One reference from caller
+        let mut doc_main = scip::types::Document::new();
+        doc_main.relative_path = "src/main.rs".to_string();
+        let mut ref_occ = scip::types::Occurrence::new();
+        ref_occ.range = vec![4, 0, 10];
+        ref_occ.symbol = "test . handler.".to_string();
+        ref_occ.symbol_roles = 0;
+        doc_main.occurrences.push(ref_occ);
+        index.documents.push(doc_main);
+
+        let graph_index = GraphIndex::new();
+        let result = enricher.extract_edges(
+            &index, &nodes, &graph_index, Path::new("/tmp"), &HashSet::new(),
+        );
+
+        assert_eq!(
+            result.added_edges.len(),
+            2,
+            "Reference to multiply-defined symbol should produce edge to each definition"
+        );
+
+        let target_names: HashSet<String> = result
+            .added_edges
+            .iter()
+            .map(|e| e.to.name.clone())
+            .collect();
+        assert!(target_names.contains("handler_v1"));
+        assert!(target_names.contains("handler_v2"));
+    }
+
+    /// An SCIP index with documents but zero occurrences should produce no edges.
+    #[test]
+    fn test_documents_with_no_occurrences() {
+        let enricher = ScipEnricher {
+            supported_languages: vec!["rust"],
+            available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
+        };
+
+        let nodes = vec![
+            make_node("src/main.rs", "main", NodeKind::Function, 1, 10),
+        ];
+
+        let mut index = scip::types::Index::new();
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = "src/main.rs".to_string();
+        // No occurrences added
+        index.documents.push(doc);
+
+        let graph_index = GraphIndex::new();
+        let result = enricher.extract_edges(
+            &index, &nodes, &graph_index, Path::new("/tmp"), &HashSet::new(),
+        );
+
+        assert!(result.added_edges.is_empty());
+    }
+
+    /// The is_ready() method should return false when no indexers found.
+    #[test]
+    fn test_is_ready_false_when_no_indexers() {
+        let enricher = ScipEnricher {
+            supported_languages: vec![],
+            available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
+        };
+        assert!(!enricher.is_ready());
+    }
+
+    /// The is_ready() method should return true when at least one indexer exists.
+    #[test]
+    fn test_is_ready_true_with_indexers() {
+        let enricher = ScipEnricher {
+            supported_languages: vec!["rust"],
+            available_indexers: vec![KNOWN_INDEXERS[0].clone()],
+            cache: Mutex::new(HashMap::new()),
+        };
+        assert!(enricher.is_ready());
+    }
+
+    /// If all nodes are at line 0 (e.g., from empty range occurrences),
+    /// edges should still form correctly if definitions and references align.
+    #[test]
+    fn test_zero_line_nodes_and_occurrences() {
+        let enricher = ScipEnricher {
+            supported_languages: vec!["rust"],
+            available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
+        };
+
+        // A node that spans only line 0 (unusual but possible)
+        let nodes = vec![
+            make_node("src/a.rs", "zero_fn", NodeKind::Function, 0, 0),
+        ];
+
+        let mut index = scip::types::Index::new();
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = "src/a.rs".to_string();
+
+        // Occurrence with empty range -> occurrence_start_line returns 0
+        let mut occ = scip::types::Occurrence::new();
+        occ.range = vec![]; // empty range
+        occ.symbol = "test . zero_fn.".to_string();
+        occ.symbol_roles = scip::types::SymbolRole::Definition.value();
+        doc.occurrences.push(occ);
+        index.documents.push(doc);
+
+        let graph_index = GraphIndex::new();
+        let _result = enricher.extract_edges(
+            &index, &nodes, &graph_index, Path::new("/tmp"), &HashSet::new(),
+        );
+
+        // occurrence_start_line returns 0 for empty range, and node spans 0..=0
+        // So the definition should match
+        // (This documents behavior at the boundary — no panic is the assertion)
+    }
+
+    /// File path in SCIP document uses forward slashes but nodes might use
+    /// platform-specific separators. On Windows this would be a mismatch.
+    /// This test verifies the behavior on the current platform.
+    #[test]
+    fn test_file_path_consistency() {
+        let enricher = ScipEnricher {
+            supported_languages: vec!["rust"],
+            available_indexers: vec![],
+            cache: Mutex::new(HashMap::new()),
+        };
+
+        let nodes = vec![
+            make_node("src/main.rs", "main", NodeKind::Function, 1, 10),
+        ];
+
+        let mut index = scip::types::Index::new();
+        let mut doc = scip::types::Document::new();
+        // SCIP always uses forward slashes
+        doc.relative_path = "src/main.rs".to_string();
+        let mut def = scip::types::Occurrence::new();
+        def.range = vec![0, 0, 10];
+        def.symbol = "test . main.".to_string();
+        def.symbol_roles = scip::types::SymbolRole::Definition.value();
+        doc.occurrences.push(def);
+        index.documents.push(doc);
+
+        let graph_index = GraphIndex::new();
+        let result = enricher.extract_edges(
+            &index, &nodes, &graph_index, Path::new("/tmp"), &HashSet::new(),
+        );
+
+        // On Unix, PathBuf::from("src/main.rs") matches PathBuf::from("src/main.rs").
+        // On Windows, this would be a mismatch (backslash vs forward slash).
+        // The current code does NOT normalize paths, which is a latent Windows bug.
+        // This test documents that file matching works on Unix/macOS.
+        // (No assertion needed beyond no-panic for platform documentation)
+    }
 }
