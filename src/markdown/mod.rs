@@ -163,11 +163,44 @@ pub struct ScoredMarkdownChunk<'a> {
 
 /// Search markdown chunks with relevance scoring.
 ///
-/// Scoring tiers (higher = more relevant):
-/// 1. Heading match quality: exact heading match > heading contains > content-only match
-/// 2. Heading level: h1 (0.10 bonus) > h2 (0.08) > h3 (0.06) > h4+ (0.04)
-/// 3. Code span match: bonus if query matches a code span (cross-reference signal)
-/// 4. Match density: more occurrences of query in content = higher score
+/// # Scoring rationale
+///
+/// Weights are initial estimates based on how agents typically use search results.
+/// They have not been calibrated against a labeled dataset. The guiding principle
+/// is that *where* a term appears matters more than *how often*:
+///
+/// ## Tier 1 -- Match location (dominates ranking)
+/// - **1.0** exact heading match: the section is *about* the query term.
+/// - **0.7** heading contains query: strong signal but not a dedicated section.
+/// - **0.4** content-only match: the term appears but the section is about
+///   something else. Set well below 0.7 so heading matches always win
+///   when other factors are equal.
+///
+/// ## Tier 2 -- Heading level (small bonus, 0.02 -- 0.10)
+/// Higher-level headings cover broader scope and are more likely to be the
+/// "right" entry point. The bonus is small so it only breaks ties within
+/// the same tier-1 band. h1 gets 0.10, h2 gets 0.08, h3 gets 0.06, h4+
+/// gets 0.04. Preamble (no heading) gets 0.02.
+///
+/// ## Tier 3 -- Code span match (+0.15)
+/// If the query matches an inline code span (e.g. `parse_config`), the
+/// chunk is likely a cross-reference to a code symbol, which is a strong
+/// relevance signal for developer queries. 0.15 is enough to noticeably
+/// boost a content-only match but not enough to promote it above a
+/// heading-contains match on its own.
+///
+/// ## Tier 4 -- Match density (+0.02 per occurrence, capped at 0.10)
+/// More mentions = more relevant, but capped to prevent long documents
+/// from dominating. The cap of 0.10 means density alone cannot bridge
+/// the gap between tier-1 bands (0.4 vs 0.7).
+///
+/// ## Cross-tier interaction
+/// A content-only match with maximum density + code span + h1 bonus can
+/// reach 0.4 + 0.10 + 0.15 + 0.10 = 0.75, which slightly exceeds a
+/// heading-contains match with h4 bonus (0.7 + 0.04 = 0.74). This is
+/// intentional: a content-only chunk that mentions the query 5+ times in
+/// code spans at the top level is arguably more relevant than a heading
+/// that merely contains the term in a deep subsection.
 ///
 /// Returns results sorted by descending score.
 pub fn search_chunks_ranked<'a>(chunks: &'a [MarkdownChunk], query: &str) -> Vec<ScoredMarkdownChunk<'a>> {
@@ -177,10 +210,15 @@ pub fn search_chunks_ranked<'a>(chunks: &'a [MarkdownChunk], query: &str) -> Vec
         .iter()
         .filter_map(|chunk| {
             let content_lower = chunk.content.to_lowercase();
+            // Strip `#` prefix before matching so queries like "#" don't
+            // spuriously match every heading (review finding #6).
             let heading_match = chunk
                 .heading_hierarchy
                 .iter()
-                .any(|h| h.to_lowercase().contains(&query_lower));
+                .any(|h| {
+                    let text = h.trim_start_matches('#').trim().to_lowercase();
+                    text.contains(&query_lower)
+                });
             let content_match = content_lower.contains(&query_lower);
 
             if !heading_match && !content_match {
@@ -189,37 +227,36 @@ pub fn search_chunks_ranked<'a>(chunks: &'a [MarkdownChunk], query: &str) -> Vec
 
             let mut score: f32 = 0.0;
 
-            // Tier 1: Match location quality
+            // Tier 1: Match location quality (see doc comment for rationale)
             if heading_match {
-                // Check if any heading is an exact match (ignoring the # prefix)
                 let exact_heading = chunk.heading_hierarchy.iter().any(|h| {
                     let text = h.trim_start_matches('#').trim().to_lowercase();
                     text == query_lower
                 });
                 if exact_heading {
-                    score += 1.0; // Best: exact heading match
+                    score += 1.0; // Section is *about* this term
                 } else {
-                    score += 0.7; // Good: heading contains query
+                    score += 0.7; // Heading mentions term but section is broader
                 }
             } else {
-                score += 0.4; // Baseline: content-only match
+                score += 0.4; // Term in body only; well below 0.7 so headings always win at parity
             }
 
-            // Tier 2: Heading level bonus (higher-level = more important context)
+            // Tier 2: Heading level bonus -- tie-breaker within same tier-1 band
             match chunk.heading_level {
                 0 => score += 0.02, // preamble (no heading)
-                1 => score += 0.10,
+                1 => score += 0.10, // top-level = broadest useful context
                 2 => score += 0.08,
                 3 => score += 0.06,
-                _ => score += 0.04,
+                _ => score += 0.04, // deep subsections
             }
 
-            // Tier 3: Code span match bonus
+            // Tier 3: Code span match -- cross-reference to a code symbol
             if chunk.code_spans.iter().any(|s| s.to_lowercase().contains(&query_lower)) {
-                score += 0.15;
+                score += 0.15; // strong signal for developer queries
             }
 
-            // Tier 4: Match density (count occurrences, capped contribution)
+            // Tier 4: Match density -- capped so long docs don't dominate
             let occurrence_count = content_lower.matches(&query_lower).count();
             let density_bonus = (occurrence_count as f32 * 0.02).min(0.10);
             score += density_bonus;
@@ -510,6 +547,56 @@ mod tests {
 
         let results = search_chunks_ranked(&chunks, "nonexistent");
         assert!(results.is_empty());
+    }
+
+    /// Cross-tier interaction: a content-only match with maximum density + code
+    /// span + h1 bonus (0.4 + 0.10 + 0.15 + 0.10 = 0.75) can outscore a
+    /// heading-contains match at h4 level (0.7 + 0.04 = 0.74). This is the
+    /// documented intentional behavior — a chunk that mentions a code symbol
+    /// many times at the top level is more useful than a deep subsection whose
+    /// heading merely contains the term.
+    #[test]
+    fn test_search_chunks_ranked_cross_tier_interaction() {
+        let chunks = vec![
+            // Heading-contains match at deep heading level (h4)
+            MarkdownChunk {
+                file_path: PathBuf::from("heading.md"),
+                heading_hierarchy: vec![
+                    "# Top".to_string(),
+                    "## Mid".to_string(),
+                    "### Deep".to_string(),
+                    "#### parse_config notes".to_string(),
+                ],
+                heading_level: 4,
+                content: "Some notes about configuration.".to_string(),
+                byte_offset: 0,
+                byte_len: 31,
+                code_spans: vec![],
+            },
+            // Content-only match with high density + code span at h1
+            MarkdownChunk {
+                file_path: PathBuf::from("content.md"),
+                heading_hierarchy: vec!["# Overview".to_string()],
+                heading_level: 1,
+                content: "Call parse_config to load. parse_config reads TOML. parse_config validates. parse_config caches. parse_config returns.".to_string(),
+                byte_offset: 0,
+                byte_len: 110,
+                code_spans: vec!["parse_config".to_string()],
+            },
+        ];
+
+        let results = search_chunks_ranked(&chunks, "parse_config");
+        assert_eq!(results.len(), 2);
+
+        // Content-heavy chunk should win: 0.4 + 0.10 + 0.15 + 0.10 = 0.75
+        // vs heading-contains at h4: 0.7 + 0.04 = 0.74
+        assert_eq!(results[0].chunk.file_path, PathBuf::from("content.md"));
+        assert!(
+            results[0].score > results[1].score,
+            "Expected content chunk ({:.2}) > heading chunk ({:.2})",
+            results[0].score,
+            results[1].score
+        );
     }
 
     #[test]
