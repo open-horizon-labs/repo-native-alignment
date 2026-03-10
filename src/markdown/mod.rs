@@ -42,7 +42,7 @@ pub fn parse_markdown_file(path: &Path) -> Result<Vec<MarkdownChunk>> {
 /// Produces heading-hierarchy-aware chunks:
 /// - YAML frontmatter (if present) becomes its own chunk with `is_frontmatter = true`
 /// - Each heading + body until the next heading of same/higher level is one chunk
-/// - Nested headings track parent context via `section_path` and `parent_heading`
+/// - Nested headings track parent context via `parent_heading`
 /// - Never splits mid-paragraph, mid-list, or mid-code-block
 pub fn parse_markdown_source(source: &str, path: &Path) -> Vec<MarkdownChunk> {
     let mut chunks = Vec::new();
@@ -56,7 +56,6 @@ pub fn parse_markdown_source(source: &str, path: &Path) -> Vec<MarkdownChunk> {
 
     // State tracking
     let mut heading_stack: Vec<(u32, String)> = Vec::new(); // (level, heading text with prefix)
-    let mut plain_heading_stack: Vec<(u32, String)> = Vec::new(); // (level, plain heading text without #)
     let mut current_heading_level: u32 = 0;
     let mut current_heading_plain_text = String::new(); // heading text without # prefix
     let mut current_code_spans: Vec<String> = Vec::new();
@@ -77,15 +76,13 @@ pub fn parse_markdown_source(source: &str, path: &Path) -> Vec<MarkdownChunk> {
                 let byte_end = range.start;
                 if saw_any_heading || has_content(parse_source, chunk_byte_start, byte_end) {
                     let hierarchy = build_hierarchy(&heading_stack);
-                    let section_path = build_section_path(&plain_heading_stack);
-                    let parent = parent_heading_text(&plain_heading_stack);
+                    let parent = parent_heading_text(&heading_stack);
                     chunks.push(MarkdownChunk {
                         file_path: path.to_path_buf(),
                         heading_hierarchy: hierarchy,
                         heading_level: current_heading_level,
                         heading_text: current_heading_plain_text.clone(),
                         parent_heading: parent,
-                        section_path,
                         is_frontmatter: false,
                         content: parse_source[chunk_byte_start..byte_end].to_string(),
                         byte_offset: chunk_byte_start + byte_offset_base,
@@ -101,7 +98,6 @@ pub fn parse_markdown_source(source: &str, path: &Path) -> Vec<MarkdownChunk> {
                 while let Some(&(stack_lvl, _)) = heading_stack.last() {
                     if stack_lvl >= lvl {
                         heading_stack.pop();
-                        plain_heading_stack.pop();
                     } else {
                         break;
                     }
@@ -118,7 +114,6 @@ pub fn parse_markdown_source(source: &str, path: &Path) -> Vec<MarkdownChunk> {
                 let heading_str = format!("{} {}", prefix, plain_text);
 
                 heading_stack.push((current_heading_lvl, heading_str));
-                plain_heading_stack.push((current_heading_lvl, plain_text.clone()));
                 current_heading_level = current_heading_lvl;
                 current_heading_plain_text = plain_text;
                 saw_any_heading = true;
@@ -148,15 +143,13 @@ pub fn parse_markdown_source(source: &str, path: &Path) -> Vec<MarkdownChunk> {
     let byte_end = parse_source.len();
     if saw_any_heading || has_content(parse_source, chunk_byte_start, byte_end) {
         let hierarchy = build_hierarchy(&heading_stack);
-        let section_path = build_section_path(&plain_heading_stack);
-        let parent = parent_heading_text(&plain_heading_stack);
+        let parent = parent_heading_text(&heading_stack);
         chunks.push(MarkdownChunk {
             file_path: path.to_path_buf(),
             heading_hierarchy: hierarchy,
             heading_level: current_heading_level,
             heading_text: current_heading_plain_text,
             parent_heading: parent,
-            section_path,
             is_frontmatter: false,
             content: parse_source[chunk_byte_start..byte_end].to_string(),
             byte_offset: chunk_byte_start + byte_offset_base,
@@ -174,18 +167,19 @@ fn extract_frontmatter_chunk<'a>(
     source: &'a str,
     path: &Path,
 ) -> (Option<MarkdownChunk>, &'a str, usize) {
-    let trimmed = source.trim_start();
+    let leading_ws = source.len() - source.trim_start().len();
+    let trimmed = &source[leading_ws..];
     if !trimmed.starts_with("---") {
         return (None, source, 0);
     }
 
-    let after_first = &trimmed[3..];
-    let after_first = after_first.trim_start_matches(['\r', '\n']);
+    let after_opening_dashes = &trimmed[3..];
+    let newline_skip = after_opening_dashes.len() - after_opening_dashes.trim_start_matches(['\r', '\n']).len();
+    let after_first = &after_opening_dashes[newline_skip..];
     if let Some(end_idx) = after_first.find("\n---") {
-        // end_idx is relative to after_first; compute absolute byte end of the frontmatter block
-        let fm_block_end_in_trimmed = (after_first.as_ptr() as usize - trimmed.as_ptr() as usize) + end_idx + 4; // +4 for "\n---"
-        let leading_ws = source.len() - trimmed.len();
-        let absolute_end = leading_ws + fm_block_end_in_trimmed;
+        // Compute absolute byte end of the frontmatter block using tracked offsets.
+        // leading_ws + 3 (opening ---) + newline_skip + end_idx + 4 (\n---)
+        let absolute_end = leading_ws + 3 + newline_skip + end_idx + 4;
 
         // Skip past any trailing newline after the closing ---
         let rest_start = if absolute_end < source.len() && source.as_bytes()[absolute_end] == b'\n' {
@@ -206,7 +200,6 @@ fn extract_frontmatter_chunk<'a>(
             heading_level: 0,
             heading_text: String::new(),
             parent_heading: None,
-            section_path: String::new(),
             is_frontmatter: true,
             content: fm_content.to_string(),
             byte_offset: 0,
@@ -264,9 +257,13 @@ pub fn search_chunks<'a>(chunks: &'a [MarkdownChunk], query: &str) -> Vec<&'a Ma
 
             if score > 0 {
                 // Heading level boost: h1 gets +6, h2 gets +5, etc.
-                // Frontmatter (level 0) gets +7
-                let level_boost = 7u32.saturating_sub(chunk.heading_level);
-                score += level_boost;
+                // Frontmatter (level 0) gets no level boost — "heading level"
+                // is meaningless for frontmatter, and the +8 frontmatter bonus
+                // already accounts for its importance.
+                if !chunk.is_frontmatter {
+                    let level_boost = 7u32.saturating_sub(chunk.heading_level);
+                    score += level_boost;
+                }
                 Some((chunk, score))
             } else {
                 None
@@ -408,19 +405,12 @@ fn build_hierarchy(heading_stack: &[(u32, String)]) -> Vec<String> {
     heading_stack.iter().map(|(_, text)| text.clone()).collect()
 }
 
-/// Build a breadcrumb section path from plain heading text (e.g., "Aim > Mechanism > Hypothesis").
-fn build_section_path(plain_heading_stack: &[(u32, String)]) -> String {
-    plain_heading_stack
-        .iter()
-        .map(|(_, text)| text.as_str())
-        .collect::<Vec<_>>()
-        .join(" > ")
-}
-
-/// Get the parent heading text (second-to-last in the plain stack).
-fn parent_heading_text(plain_heading_stack: &[(u32, String)]) -> Option<String> {
-    if plain_heading_stack.len() >= 2 {
-        Some(plain_heading_stack[plain_heading_stack.len() - 2].1.clone())
+/// Get the parent heading text (second-to-last in the heading stack).
+/// Strips `#` prefixes to return plain text (e.g., "Aim" not "# Aim").
+fn parent_heading_text(heading_stack: &[(u32, String)]) -> Option<String> {
+    if heading_stack.len() >= 2 {
+        let raw = &heading_stack[heading_stack.len() - 2].1;
+        Some(raw.trim_start_matches('#').trim().to_string())
     } else {
         None
     }
@@ -457,7 +447,7 @@ mod tests {
         assert_eq!(chunks[0].heading_hierarchy, vec!["# Title"]);
         assert_eq!(chunks[0].heading_level, 1);
         assert_eq!(chunks[0].heading_text, "Title");
-        assert_eq!(chunks[0].section_path, "Title");
+        assert_eq!(chunks[0].section_path(), "Title");
         assert_eq!(chunks[0].parent_heading, None);
         assert!(!chunks[0].is_frontmatter);
         assert!(chunks[0].content.contains("Some intro text."));
@@ -466,7 +456,7 @@ mod tests {
         assert_eq!(chunks[1].heading_hierarchy, vec!["# Title", "## Section A"]);
         assert_eq!(chunks[1].heading_level, 2);
         assert_eq!(chunks[1].heading_text, "Section A");
-        assert_eq!(chunks[1].section_path, "Title > Section A");
+        assert_eq!(chunks[1].section_path(), "Title > Section A");
         assert_eq!(chunks[1].parent_heading, Some("Title".to_string()));
         assert!(chunks[1].content.contains("Content A"));
         assert!(chunks[1].code_spans.contains(&"foo_bar".to_string()));
@@ -483,7 +473,7 @@ mod tests {
         );
         assert_eq!(chunks[3].heading_level, 3);
         assert_eq!(chunks[3].heading_text, "Subsection B1");
-        assert_eq!(chunks[3].section_path, "Title > Section B > Subsection B1");
+        assert_eq!(chunks[3].section_path(), "Title > Section B > Subsection B1");
         assert_eq!(chunks[3].parent_heading, Some("Section B".to_string()));
         assert!(chunks[3].code_spans.contains(&"baz".to_string()));
     }
@@ -510,7 +500,7 @@ mod tests {
                 heading_level: 1,
                 heading_text: "Alpha".to_string(),
                 parent_heading: None,
-                section_path: "Alpha".to_string(),
+
                 is_frontmatter: false,
                 content: "Hello world".to_string(),
                 byte_offset: 0,
@@ -523,7 +513,7 @@ mod tests {
                 heading_level: 1,
                 heading_text: "Beta".to_string(),
                 parent_heading: None,
-                section_path: "Beta".to_string(),
+
                 is_frontmatter: false,
                 content: "Goodbye world".to_string(),
                 byte_offset: 0,
@@ -553,7 +543,7 @@ mod tests {
                 heading_level: 1,
                 heading_text: "Aim".to_string(),
                 parent_heading: None,
-                section_path: "Aim".to_string(),
+
                 is_frontmatter: false,
                 content: "# Aim\n\nThis is the aim section.".to_string(),
                 byte_offset: 0,
@@ -566,7 +556,7 @@ mod tests {
                 heading_level: 2,
                 heading_text: "Details".to_string(),
                 parent_heading: Some("Aim".to_string()),
-                section_path: "Aim > Details".to_string(),
+
                 is_frontmatter: false,
                 content: "## Details\n\nThe aim is described here.".to_string(),
                 byte_offset: 30,
@@ -601,13 +591,13 @@ mod tests {
         let chunks = parse_markdown_source(source, Path::new("test.md"));
 
         assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0].section_path, "Top");
+        assert_eq!(chunks[0].section_path(), "Top");
         assert_eq!(chunks[0].parent_heading, None);
 
-        assert_eq!(chunks[1].section_path, "Top > Sub");
+        assert_eq!(chunks[1].section_path(), "Top > Sub");
         assert_eq!(chunks[1].parent_heading, Some("Top".to_string()));
 
-        assert_eq!(chunks[2].section_path, "Top > Sub > Deep");
+        assert_eq!(chunks[2].section_path(), "Top > Sub > Deep");
         assert_eq!(chunks[2].parent_heading, Some("Sub".to_string()));
     }
 
@@ -619,7 +609,7 @@ mod tests {
             heading_level: 2,
             heading_text: "Hypothesis".to_string(),
             parent_heading: Some("Aim".to_string()),
-            section_path: "Aim > Hypothesis".to_string(),
+
             is_frontmatter: false,
             content: "We believe X will cause Y.".to_string(),
             byte_offset: 0,
@@ -877,6 +867,8 @@ mod tests {
         assert!(results[0].score > results[1].score);
     }
 
+    // 
+    #[test]
     // ==================== Adversarial tests ====================
 
     /// Empty query: `"".contains("")` is true in Rust, so an empty query
@@ -1266,5 +1258,81 @@ mod tests {
             results[0].score,
             results[1].score
         );
+    }
+
+    #[test]
+    fn test_empty_document() {
+        let chunks = parse_markdown_source("", Path::new("empty.md"));
+        assert_eq!(chunks.len(), 0, "Empty document should produce no chunks");
+    }
+
+    #[test]
+    fn test_frontmatter_only_document() {
+        let source = "---\nid: x\nstatus: draft\n---\n";
+        let chunks = parse_markdown_source(source, Path::new("fm-only.md"));
+
+        assert_eq!(chunks.len(), 1, "Frontmatter-only doc should produce exactly one chunk");
+        assert!(chunks[0].is_frontmatter);
+        assert!(chunks[0].content.contains("id: x"));
+    }
+
+    #[test]
+    fn test_frontmatter_with_body_no_headings() {
+        let source = "---\nid: x\n---\nJust body text.\n";
+        let chunks = parse_markdown_source(source, Path::new("fm-body.md"));
+
+        assert_eq!(chunks.len(), 2, "Frontmatter + body text without headings");
+        assert!(chunks[0].is_frontmatter);
+        assert!(!chunks[1].is_frontmatter);
+        assert!(chunks[1].content.contains("Just body text."));
+    }
+
+    #[test]
+    fn test_headings_without_body_text() {
+        let source = "# Title\n\n## Empty\n\n## Next\n\nContent.\n";
+        let chunks = parse_markdown_source(source, Path::new("sparse.md"));
+
+        assert_eq!(chunks.len(), 3, "Each heading gets its own chunk even without body");
+        assert_eq!(chunks[0].heading_text, "Title");
+        assert_eq!(chunks[1].heading_text, "Empty");
+        assert_eq!(chunks[2].heading_text, "Next");
+        assert!(chunks[2].content.contains("Content."));
+    }
+
+    #[test]
+    fn test_frontmatter_scoring_no_level_inflation() {
+        // Verify frontmatter body-only match does not outscore an exact h1 heading match
+        let chunks = vec![
+            MarkdownChunk {
+                file_path: PathBuf::from("a.md"),
+                heading_hierarchy: vec![],
+                heading_level: 0,
+                heading_text: String::new(),
+                parent_heading: None,
+                is_frontmatter: true,
+                content: "---\nstatus: active\n---\n".to_string(),
+                byte_offset: 0,
+                byte_len: 22,
+                code_spans: vec![],
+            },
+            MarkdownChunk {
+                file_path: PathBuf::from("a.md"),
+                heading_hierarchy: vec!["# Active".to_string()],
+                heading_level: 1,
+                heading_text: "Active".to_string(),
+                parent_heading: None,
+                is_frontmatter: false,
+                content: "# Active\n\nThis section is active.\n".to_string(),
+                byte_offset: 22,
+                byte_len: 33,
+                code_spans: vec![],
+            },
+        ];
+
+        let results = search_chunks(&chunks, "active");
+        assert_eq!(results.len(), 2);
+        // The h1 with exact heading match must rank above frontmatter body-only match
+        assert_eq!(results[0].heading_text, "Active",
+            "Exact h1 heading match should rank above frontmatter body match");
     }
 }

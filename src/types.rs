@@ -70,9 +70,6 @@ pub struct MarkdownChunk {
     pub heading_text: String,
     /// Parent heading text (the nearest ancestor heading), if any.
     pub parent_heading: Option<String>,
-    /// Breadcrumb path through the heading hierarchy (e.g., "Aim > Mechanism > Hypothesis").
-    /// Uses plain heading text without `#` prefixes.
-    pub section_path: String,
     /// Whether this chunk is YAML frontmatter.
     pub is_frontmatter: bool,
     pub content: String,
@@ -83,6 +80,16 @@ pub struct MarkdownChunk {
 }
 
 impl MarkdownChunk {
+    /// Breadcrumb path through the heading hierarchy (e.g., "Aim > Mechanism > Hypothesis").
+    /// Derived from `heading_hierarchy` — no separate storage needed.
+    pub fn section_path(&self) -> String {
+        self.heading_hierarchy
+            .iter()
+            .map(|h| h.trim_start_matches('#').trim())
+            .collect::<Vec<_>>()
+            .join(" > ")
+    }
+
     pub fn to_markdown(&self) -> String {
         let location = format!(
             "`{}` > {}",
@@ -96,17 +103,25 @@ impl MarkdownChunk {
     ///
     /// Format: `"section_path: body_text"` so the embedding model
     /// captures WHERE in the document this section lives.
-    /// Body is truncated to ~2000 chars to stay within typical token budgets.
+    /// Body is truncated to ~500 chars to stay within a 512-token embedding
+    /// model budget (MiniLM-L6-v2). The breadcrumb prefix typically adds
+    /// 20-50 chars, leaving ~125-150 tokens for body content.
     pub fn embedding_text(&self) -> String {
+        self.embedding_text_with_limit(500)
+    }
+
+    /// Internal: produce embedding text with a configurable char limit on body.
+    fn embedding_text_with_limit(&self, max_body_chars: usize) -> String {
+        let sp = self.section_path();
         let prefix = if self.is_frontmatter {
             format!("[frontmatter] {}", self.file_path.display())
-        } else if self.section_path.is_empty() {
+        } else if sp.is_empty() {
             format!("[preamble] {}", self.file_path.display())
         } else {
-            self.section_path.clone()
+            sp
         };
-        let body = if self.content.len() > 2000 {
-            &self.content[..self.content.floor_char_boundary(2000)]
+        let body = if self.content.len() > max_body_chars {
+            &self.content[..self.content.floor_char_boundary(max_body_chars)]
         } else {
             &self.content
         };

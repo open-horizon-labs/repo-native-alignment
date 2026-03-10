@@ -75,8 +75,9 @@ impl Extractor for MarkdownExtractor {
             }
 
             // Section path breadcrumbs (e.g., "Aim > Mechanism > Hypothesis")
-            if !chunk.section_path.is_empty() {
-                metadata.insert("section_path".to_string(), chunk.section_path.clone());
+            let sp = chunk.section_path();
+            if !sp.is_empty() {
+                metadata.insert("section_path".to_string(), sp.clone());
             }
 
             // Frontmatter flag
@@ -129,8 +130,8 @@ impl Extractor for MarkdownExtractor {
                 line_end,
                 signature: if chunk.is_frontmatter {
                     "[frontmatter]".to_string()
-                } else if !chunk.section_path.is_empty() {
-                    chunk.section_path.clone()
+                } else if !sp.is_empty() {
+                    sp
                 } else {
                     chunk.heading_hierarchy.join(" > ")
                 },

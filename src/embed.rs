@@ -431,13 +431,13 @@ impl EmbeddingIndex {
             //       metadata (structural/positional, not semantic).
             let text = match node.id.kind {
                 crate::graph::NodeKind::Other(ref s) if s == "markdown_section" || s == "Section" => {
-                    // Markdown sections: include heading hierarchy as breadcrumbs
-                    // plus body content for semantic context.
-                    // The signature already contains "Parent > Child" hierarchy.
-                    let is_frontmatter = node.metadata.get("heading_level")
-                        .map(|l| l == "0")
-                        .unwrap_or(false)
-                        && node.body.trim_start().starts_with("---");
+                    // Markdown sections: use the same embedding format as
+                    // MarkdownChunk::embedding_text() to avoid logic drift.
+                    // Detect frontmatter via the is_frontmatter metadata flag
+                    // (not heuristic body inspection).
+                    let is_frontmatter = node.metadata.get("is_frontmatter")
+                        .map(|v| v == "true")
+                        .unwrap_or(false);
                     if is_frontmatter {
                         format!("[frontmatter] {}: {}", node.id.file.display(), truncate_chars(&node.body, 500))
                     } else if node.signature.is_empty() {
