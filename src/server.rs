@@ -120,6 +120,9 @@ pub struct GraphQuery {
     /// Maximum hops to traverse (default: 1 for neighbors, 3 for impact/reachable)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_hops: Option<u32>,
+    /// Maximum number of entry nodes from semantic search (default: 3). Only used with query parameter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
 }
 
 fn default_graph_mode() -> String {
@@ -2330,26 +2333,31 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                     (vec![node_id.clone()], String::new())
                 } else if let Some(ref query_text) = args.query {
                     // Semantic search path — find entry nodes by natural language
+                    let top_k = args.top_k.unwrap_or(3) as usize;
                     let embed_result = EmbeddingIndex::new(&self.repo_root).await;
                     match embed_result {
                         Ok(embed_idx) => {
-                            // Search for code symbols only (filter to code:* kinds)
-                            let code_types: Vec<String> = vec![
-                                "code:Function".to_string(),
-                                "code:Struct".to_string(),
-                                "code:Impl".to_string(),
-                                "code:Trait".to_string(),
-                                "code:Enum".to_string(),
-                                "code:Method".to_string(),
-                                "code:Interface".to_string(),
-                                "code:Class".to_string(),
-                                "code:Type".to_string(),
-                                "code:Constant".to_string(),
-                            ];
-                            match embed_idx.search(query_text, Some(&code_types), 3).await {
+                            // Search without type filter, then keep only code:* kinds.
+                            // This is robust to new code kinds added to the embedding pipeline
+                            // (the pipeline already gates what gets indexed via is_embeddable()).
+                            // We over-fetch by 3x to have enough results after filtering.
+                            match embed_idx.search(query_text, None, top_k * 3).await {
                                 Ok(results) if !results.is_empty() => {
+                                    // Filter to code symbols only and take top_k
+                                    let code_results: Vec<_> = results.into_iter()
+                                        .filter(|r| r.kind.starts_with("code:"))
+                                        .take(top_k)
+                                        .collect();
+
+                                    if code_results.is_empty() {
+                                        return Ok(text_result(format!(
+                                            "No code symbols matched query \"{}\". Try a different query or use node_id from search_symbols.",
+                                            query_text
+                                        )));
+                                    }
+
                                     let mut header = format!("### Matched entry nodes for \"{}\"\n\n", query_text);
-                                    let ids: Vec<String> = results.iter()
+                                    let ids: Vec<String> = code_results.iter()
                                         .map(|r| {
                                             header.push_str(&format!(
                                                 "- `{}` — {} (score: {:.2})\n",
