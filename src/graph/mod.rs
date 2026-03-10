@@ -184,6 +184,8 @@ pub enum ExtractionSource {
     Git,
     /// Extracted from markdown parsing (pulldown-cmark).
     Markdown,
+    /// Extracted from SCIP index (compiler-grade, batch).
+    Scip,
 }
 
 impl fmt::Display for ExtractionSource {
@@ -194,6 +196,7 @@ impl fmt::Display for ExtractionSource {
             ExtractionSource::Schema => write!(f, "schema"),
             ExtractionSource::Git => write!(f, "git"),
             ExtractionSource::Markdown => write!(f, "markdown"),
+            ExtractionSource::Scip => write!(f, "scip"),
         }
     }
 }

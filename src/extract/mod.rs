@@ -21,6 +21,7 @@ pub mod json_extractor;
 pub mod kotlin;
 pub mod lsp;
 pub mod lua;
+pub mod scip;
 pub mod markdown;
 pub mod openapi;
 pub mod proto;
@@ -370,6 +371,9 @@ impl EnricherRegistry {
             ("typst",        "tinymist",                   &[],         &["typ"]),
         ];
 
+        // SCIP enricher: compiler-grade batch indexing (runs before LSP)
+        registry.register(Box::new(scip::ScipEnricher::new()));
+
         for &(lang, cmd, args, exts) in servers {
             let enricher = lsp::LspEnricher::new(lang, cmd, args, exts);
             // Add pyright-specific settings
@@ -405,7 +409,7 @@ impl EnricherRegistry {
         let mut result = EnrichmentResult::default();
 
         tracing::info!(
-            "LSP enrichment: {} language(s) detected in graph: [{}]",
+            "Enrichment (SCIP + LSP): {} language(s) detected in graph: [{}]",
             languages.len(),
             languages.join(", ")
         );

@@ -72,6 +72,10 @@ futures = "0.3"
 # LSP protocol types (for Phase 2 enrichment via language servers)
 lsp-types = "0.97"
 
+# SCIP protocol types (compiler-grade symbol index, batch enrichment)
+scip = "0.6"
+protobuf = "3.7"
+
 # Error handling
 anyhow = "1"
 
