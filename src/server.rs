@@ -935,6 +935,67 @@ pub struct GraphState {
     pub last_scan_completed_at: Option<std::time::Instant>,
 }
 
+// ── LSP enrichment status ────────────────────────────────────────────
+
+/// Tracks whether background LSP enrichment has run, so query footers
+/// can tell the agent "results may be incomplete" vs "enrichment done."
+pub struct LspEnrichmentStatus {
+    /// 0 = not started, 1 = running, 2 = complete
+    state: std::sync::atomic::AtomicU8,
+    /// Number of edges added by the most recent enrichment pass.
+    edge_count: std::sync::atomic::AtomicUsize,
+    /// When enrichment last completed (for auto-hide after 30 s).
+    completed_at: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl Default for LspEnrichmentStatus {
+    fn default() -> Self {
+        Self {
+            state: std::sync::atomic::AtomicU8::new(0),
+            edge_count: std::sync::atomic::AtomicUsize::new(0),
+            completed_at: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl LspEnrichmentStatus {
+    const NOT_STARTED: u8 = 0;
+    const RUNNING: u8 = 1;
+    const COMPLETE: u8 = 2;
+
+    pub fn set_running(&self) {
+        self.state.store(Self::RUNNING, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn set_complete(&self, edge_count: usize) {
+        self.edge_count.store(edge_count, std::sync::atomic::Ordering::Release);
+        *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
+        self.state.store(Self::COMPLETE, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Render a short footer segment, or `None` if nothing useful to show.
+    pub fn footer_segment(&self) -> Option<String> {
+        match self.state.load(std::sync::atomic::Ordering::Acquire) {
+            Self::NOT_STARTED => None,
+            Self::RUNNING => Some("LSP: pending".to_string()),
+            Self::COMPLETE => {
+                let guard = self.completed_at.lock().unwrap();
+                if let Some(t) = *guard {
+                    if t.elapsed().as_secs() < 30 {
+                        let count = self.edge_count.load(std::sync::atomic::Ordering::Acquire);
+                        Some(format!("LSP: enriched ({} edges)", count))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
 // ── ServerHandler ───────────────────────────────────────────────────
 
 pub struct RnaHandler {
@@ -948,6 +1009,8 @@ pub struct RnaHandler {
     pub last_scan: std::sync::Mutex<std::time::Instant>,
     /// Whether background scanner has been spawned.
     pub background_scanner_started: std::sync::atomic::AtomicBool,
+    /// LSP enrichment status — shared with background enrichment tasks.
+    pub lsp_status: Arc<LspEnrichmentStatus>,
 }
 
 impl Default for RnaHandler {
@@ -961,6 +1024,7 @@ impl Default for RnaHandler {
                 std::time::Instant::now() - std::time::Duration::from_secs(10),
             ),
             background_scanner_started: std::sync::atomic::AtomicBool::new(false),
+            lsp_status: Arc::new(LspEnrichmentStatus::default()),
         }
     }
 }
@@ -1487,6 +1551,7 @@ impl RnaHandler {
         let bg_repo_root = self.repo_root.clone();
         let bg_graph = self.graph.clone();
         let bg_embed_index = self.embed_index.clone();
+        let bg_lsp_status = self.lsp_status.clone();
         let bg_nodes = all_nodes.clone();
         let bg_languages: Vec<String> = all_nodes
             .iter()
@@ -1519,6 +1584,7 @@ impl RnaHandler {
             }
 
             // Phase 2: LSP enrichment
+            bg_lsp_status.set_running();
             let enricher_registry = EnricherRegistry::with_builtins();
             let enrichment = {
                 let guard = bg_graph.read().await;
@@ -1536,6 +1602,7 @@ impl RnaHandler {
                 && enrichment.updated_nodes.is_empty()
             {
                 tracing::info!("[background] LSP enrichment: no changes");
+                bg_lsp_status.set_complete(0);
                 return;
             }
 
@@ -1584,10 +1651,12 @@ impl RnaHandler {
                     .filter(|n| enriched_node_ids.contains(&n.stable_id()))
                     .cloned()
                     .collect();
+                let edge_count = persist_edges.len();
                 drop(guard); // release lock before async persist
                 let _ = persist_graph_incremental(
                     &bg_repo_root, &upsert_nodes, &persist_edges, &[], &[],
                 ).await;
+                bg_lsp_status.set_complete(edge_count);
             }
         });
 
@@ -1688,10 +1757,13 @@ impl RnaHandler {
                 .into_iter()
                 .collect();
 
+            self.lsp_status.set_running();
             let enricher_registry = EnricherRegistry::with_builtins();
             let enrichment = enricher_registry
                 .enrich_all(&changed_nodes, &graph.index, &languages, &self.repo_root)
                 .await;
+
+            let incr_edge_count = enrichment.added_edges.len();
 
             // Add virtual nodes synthesized for external symbols.
             // These must NOT be re-embedded (no body).
@@ -1769,6 +1841,8 @@ impl RnaHandler {
                     }
                 }
             }
+
+            self.lsp_status.set_complete(incr_edge_count);
         }
 
         // Re-embed changed-file symbols. Uses the updated graph nodes so enriched
@@ -1827,7 +1901,11 @@ fn text_result(s: String) -> CallToolResult {
 /// Format an index freshness footer for appending to tool responses.
 ///
 /// Example output: `\n*Index: 3655 symbols · last scan 4m ago · schema v2*`
-pub fn format_freshness(node_count: usize, last_scan: Option<std::time::Instant>) -> String {
+pub fn format_freshness(
+    node_count: usize,
+    last_scan: Option<std::time::Instant>,
+    lsp_status: Option<&LspEnrichmentStatus>,
+) -> String {
     let age = match last_scan {
         None => "never".to_string(),
         Some(t) => {
@@ -1841,10 +1919,17 @@ pub fn format_freshness(node_count: usize, last_scan: Option<std::time::Instant>
             }
         }
     };
-    format!(
-        "\n*Index: {} symbols · last scan {} · schema v{}*",
-        node_count, age, SCHEMA_VERSION
-    )
+    let lsp_segment = lsp_status.and_then(|s| s.footer_segment());
+    match lsp_segment {
+        Some(seg) => format!(
+            "\n*Index: {} symbols · last scan {} · {} · schema v{}*",
+            node_count, age, seg, SCHEMA_VERSION
+        ),
+        None => format!(
+            "\n*Index: {} symbols · last scan {} · schema v{}*",
+            node_count, age, SCHEMA_VERSION
+        ),
+    }
 }
 
 /// Build a concise business context preamble from .oh/ artifacts.
@@ -2104,7 +2189,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                     }
                 }
 
-                let freshness = format_freshness(graph_node_count, graph_last_scan);
+                let freshness = format_freshness(graph_node_count, graph_last_scan, Some(&self.lsp_status));
                 if sections.is_empty() {
                     Ok(text_result(format!(
                         "No results found matching \"{}\".{}",
@@ -2227,6 +2312,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         let freshness = format_freshness(
                             graph_state.nodes.len(),
                             graph_state.last_scan_completed_at,
+                            Some(&self.lsp_status),
                         );
                         if matches.is_empty() {
                             Ok(text_result(format!(
@@ -2486,6 +2572,12 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         let mode_label = args.mode.as_str();
                         let direction = args.direction.as_deref().unwrap_or("outgoing");
 
+                        let freshness = format_freshness(
+                            graph_state.nodes.len(),
+                            graph_state.last_scan_completed_at,
+                            Some(&self.lsp_status),
+                        );
+
                         if all_ids.is_empty() {
                             let mode_desc = match mode_label {
                                 "neighbors" => format!("No {} neighbors for {}.", direction, entry_label),
@@ -2493,7 +2585,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                 "reachable" => format!("No reachable nodes from {} within {} hops.", entry_label, args.max_hops.unwrap_or(3)),
                                 _ => format!("No results for {}.", entry_label),
                             };
-                            Ok(text_result(format!("{}{}", entry_header, mode_desc)))
+                            Ok(text_result(format!("{}{}{}", entry_header, mode_desc, freshness)))
                         } else {
                             let md = format_neighbor_nodes(&graph_state.nodes, &all_ids);
                             let heading = match mode_label {
@@ -2511,7 +2603,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                 ),
                                 _ => String::new(),
                             };
-                            Ok(text_result(format!("{}{}{}", entry_header, heading, md)))
+                            Ok(text_result(format!("{}{}{}{}", entry_header, heading, md, freshness)))
                         }
                     }
                     Err(e) => Ok(text_result(format!("Graph error: {}", e))),
@@ -2913,5 +3005,61 @@ mod tests {
         // This depends on whether GraphQuery has #[serde(deny_unknown_fields)]
         // If it does, this will fail — which is a problem for forward compat
         assert!(result.is_ok(), "extra fields should be ignored for forward compat");
+    }
+
+    // ── LspEnrichmentStatus tests ───────────────────────────────────────
+
+    #[test]
+    fn test_lsp_status_not_started_no_footer() {
+        let status = LspEnrichmentStatus::default();
+        assert!(status.footer_segment().is_none());
+    }
+
+    #[test]
+    fn test_lsp_status_running_shows_pending() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        assert_eq!(status.footer_segment().unwrap(), "LSP: pending");
+    }
+
+    #[test]
+    fn test_lsp_status_complete_shows_edge_count() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_complete(42);
+        assert_eq!(status.footer_segment().unwrap(), "LSP: enriched (42 edges)");
+    }
+
+    #[test]
+    fn test_lsp_status_complete_zero_edges() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_complete(0);
+        assert_eq!(status.footer_segment().unwrap(), "LSP: enriched (0 edges)");
+    }
+
+    #[test]
+    fn test_format_freshness_without_lsp_status() {
+        let result = format_freshness(100, Some(std::time::Instant::now()), None);
+        assert!(result.contains("100 symbols"));
+        assert!(result.contains("just now"));
+        assert!(!result.contains("LSP"));
+    }
+
+    #[test]
+    fn test_format_freshness_with_pending_lsp() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        let result = format_freshness(100, Some(std::time::Instant::now()), Some(&status));
+        assert!(result.contains("100 symbols"));
+        assert!(result.contains("LSP: pending"));
+    }
+
+    #[test]
+    fn test_format_freshness_with_enriched_lsp() {
+        let status = LspEnrichmentStatus::default();
+        status.set_complete(1247);
+        let result = format_freshness(100, Some(std::time::Instant::now()), Some(&status));
+        assert!(result.contains("LSP: enriched (1247 edges)"));
     }
 }

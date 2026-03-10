@@ -277,7 +277,7 @@ async fn main() -> anyhow::Result<()> {
                     println!();
                 }
             }
-            let freshness = server::format_freshness(gs.nodes.len(), gs.last_scan_completed_at);
+            let freshness = server::format_freshness(gs.nodes.len(), gs.last_scan_completed_at, None);
             eprintln!("{}", freshness);
             return Ok(());
         }
@@ -375,7 +375,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            let freshness = server::format_freshness(gs.nodes.len(), gs.last_scan_completed_at);
+            let freshness = server::format_freshness(gs.nodes.len(), gs.last_scan_completed_at, None);
             eprintln!("{}", freshness);
             return Ok(());
         }
