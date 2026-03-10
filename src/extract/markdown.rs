@@ -41,7 +41,9 @@ impl Extractor for MarkdownExtractor {
         let chunks = parse_markdown_file_from_source(content, path);
 
         for (i, chunk) in chunks.iter().enumerate() {
-            let section_name = if chunk.heading_hierarchy.is_empty() {
+            let section_name = if chunk.is_frontmatter {
+                "frontmatter".to_string()
+            } else if chunk.heading_hierarchy.is_empty() {
                 "preamble".to_string()
             } else {
                 chunk
@@ -62,13 +64,42 @@ impl Extractor for MarkdownExtractor {
             }
             metadata.insert("heading_level".to_string(), chunk.heading_level.to_string());
 
+            // Heading text (without # prefix)
+            if !chunk.heading_text.is_empty() {
+                metadata.insert("heading_text".to_string(), chunk.heading_text.clone());
+            }
+
+            // Parent heading for hierarchy context
+            if let Some(ref parent) = chunk.parent_heading {
+                metadata.insert("parent_heading".to_string(), parent.clone());
+            }
+
+            // Section path breadcrumbs (e.g., "Aim > Mechanism > Hypothesis")
+            if !chunk.section_path.is_empty() {
+                metadata.insert("section_path".to_string(), chunk.section_path.clone());
+            }
+
+            // Frontmatter flag
+            if chunk.is_frontmatter {
+                metadata.insert("is_frontmatter".to_string(), "true".to_string());
+            }
+
             // Code spans as metadata (potential cross-references)
             if !chunk.code_spans.is_empty() {
                 metadata.insert("code_spans".to_string(), chunk.code_spans.join(", "));
             }
 
-            // Attach frontmatter to the first chunk (preamble or first heading)
-            if i == 0 {
+            // Attach frontmatter key-value pairs to the frontmatter chunk itself,
+            // or to the first non-frontmatter chunk if there's no frontmatter chunk.
+            let attach_frontmatter = if chunk.is_frontmatter {
+                true
+            } else if i == 0 || (i == 1 && chunks.first().map_or(false, |c| c.is_frontmatter)) {
+                // First non-frontmatter chunk: attach frontmatter for backward compat
+                !frontmatter.is_empty()
+            } else {
+                false
+            };
+            if attach_frontmatter {
                 for (key, value) in &frontmatter {
                     metadata.insert(format!("frontmatter.{}", key), value.clone());
                 }
@@ -96,7 +127,13 @@ impl Extractor for MarkdownExtractor {
                 language: "markdown".to_string(),
                 line_start,
                 line_end,
-                signature: chunk.heading_hierarchy.join(" > "),
+                signature: if chunk.is_frontmatter {
+                    "[frontmatter]".to_string()
+                } else if !chunk.section_path.is_empty() {
+                    chunk.section_path.clone()
+                } else {
+                    chunk.heading_hierarchy.join(" > ")
+                },
                 body: chunk.content.clone(),
                 metadata,
                 source: ExtractionSource::Markdown,

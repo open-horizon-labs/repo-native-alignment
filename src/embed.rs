@@ -430,9 +430,21 @@ impl EmbeddingIndex {
             //       name (redundant — already in signature),
             //       metadata (structural/positional, not semantic).
             let text = match node.id.kind {
-                crate::graph::NodeKind::Other(ref s) if s == "Section" => {
-                    // Markdown: heading + body content (truncated)
-                    format!("{} {}", node.signature, truncate_chars(&node.body, 300))
+                crate::graph::NodeKind::Other(ref s) if s == "markdown_section" || s == "Section" => {
+                    // Markdown sections: include heading hierarchy as breadcrumbs
+                    // plus body content for semantic context.
+                    // The signature already contains "Parent > Child" hierarchy.
+                    let is_frontmatter = node.metadata.get("heading_level")
+                        .map(|l| l == "0")
+                        .unwrap_or(false)
+                        && node.body.trim_start().starts_with("---");
+                    if is_frontmatter {
+                        format!("[frontmatter] {}: {}", node.id.file.display(), truncate_chars(&node.body, 500))
+                    } else if node.signature.is_empty() {
+                        format!("[preamble] {}: {}", node.id.file.display(), truncate_chars(&node.body, 500))
+                    } else {
+                        format!("{}: {}", node.signature, truncate_chars(&node.body, 500))
+                    }
                 }
                 _ => {
                     // Code: signature only — fits well within 512-token budget

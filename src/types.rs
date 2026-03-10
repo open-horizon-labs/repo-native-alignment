@@ -55,12 +55,26 @@ impl OhArtifact {
     }
 }
 
-/// A heading-delimited section from any markdown file
+/// A heading-delimited section from any markdown file.
+///
+/// Each chunk represents a coherent semantic block: a heading plus all body
+/// text until the next heading of equal or higher level. Chunks are never
+/// split mid-paragraph, mid-list, or mid-code-block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarkdownChunk {
     pub file_path: PathBuf,
     pub heading_hierarchy: Vec<String>,
     pub heading_level: u32,
+    /// The heading text without the `#` prefix (e.g., "Section A").
+    /// Empty for preamble/frontmatter chunks.
+    pub heading_text: String,
+    /// Parent heading text (the nearest ancestor heading), if any.
+    pub parent_heading: Option<String>,
+    /// Breadcrumb path through the heading hierarchy (e.g., "Aim > Mechanism > Hypothesis").
+    /// Uses plain heading text without `#` prefixes.
+    pub section_path: String,
+    /// Whether this chunk is YAML frontmatter.
+    pub is_frontmatter: bool,
     pub content: String,
     pub byte_offset: usize,
     pub byte_len: usize,
@@ -76,6 +90,27 @@ impl MarkdownChunk {
             self.heading_hierarchy.join(" > ")
         );
         format!("{}\n\n{}", location, self.content)
+    }
+
+    /// Produce embedding text with contextual breadcrumbs.
+    ///
+    /// Format: `"section_path: body_text"` so the embedding model
+    /// captures WHERE in the document this section lives.
+    /// Body is truncated to ~2000 chars to stay within typical token budgets.
+    pub fn embedding_text(&self) -> String {
+        let prefix = if self.is_frontmatter {
+            format!("[frontmatter] {}", self.file_path.display())
+        } else if self.section_path.is_empty() {
+            format!("[preamble] {}", self.file_path.display())
+        } else {
+            self.section_path.clone()
+        };
+        let body = if self.content.len() > 2000 {
+            &self.content[..self.content.floor_char_boundary(2000)]
+        } else {
+            &self.content
+        };
+        format!("{}: {}", prefix, body)
     }
 }
 
