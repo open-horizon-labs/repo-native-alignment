@@ -2327,13 +2327,24 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             "graph_query" => {
                 let args: GraphQuery = parse_args(params.arguments)?;
 
+                // Normalize inputs: treat empty/whitespace strings as None, cap top_k
+                let node_id = args.node_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                let query = args.query.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                let top_k = args.top_k.unwrap_or(3).clamp(1, 50) as usize;
+
+                // Reject if both are empty after normalization
+                if node_id.is_none() && query.is_none() {
+                    return Ok(text_result(
+                        "Either node_id or query is required. Provide a stable node ID (from search_symbols) or a natural language query.".to_string()
+                    ));
+                }
+
                 // Resolve entry node IDs: either from explicit node_id or semantic query
-                let (entry_node_ids, entry_header): (Vec<String>, String) = if let Some(ref node_id) = args.node_id {
+                let (entry_node_ids, entry_header): (Vec<String>, String) = if let Some(node_id) = node_id {
                     // Explicit node ID — backward compatible path
-                    (vec![node_id.clone()], String::new())
-                } else if let Some(ref query_text) = args.query {
+                    (vec![node_id.to_string()], String::new())
+                } else if let Some(query_text) = query {
                     // Semantic search path — find entry nodes by natural language
-                    let top_k = args.top_k.unwrap_or(3) as usize;
                     let embed_result = EmbeddingIndex::new(&self.repo_root).await;
                     match embed_result {
                         Ok(embed_idx) => {
@@ -2341,7 +2352,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                             // This is robust to new code kinds added to the embedding pipeline
                             // (the pipeline already gates what gets indexed via is_embeddable()).
                             // We over-fetch by 3x to have enough results after filtering.
-                            match embed_idx.search(query_text, None, top_k * 3).await {
+                            match embed_idx.search(query_text, None, top_k.min(50) * 3).await {
                                 Ok(results) if !results.is_empty() => {
                                     // Filter to code symbols only and take top_k
                                     let code_results: Vec<_> = results.into_iter()
@@ -2390,9 +2401,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         }
                     }
                 } else {
-                    return Ok(text_result(
-                        "Either node_id or query is required. Provide a stable node ID (from search_symbols) or a natural language query.".to_string()
-                    ));
+                    unreachable!("both-empty case handled above");
                 };
 
                 match self.get_graph().await {
