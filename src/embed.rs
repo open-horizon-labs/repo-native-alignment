@@ -9,10 +9,16 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use crate::git;
 use crate::oh;
 
-/// Embedding batch size. Benchmarked on M4 MacBook Pro with MiniLM-L6-v2:
-/// batch=32 gives best sustained throughput (~880 t/s) with ~240MB memory.
-/// Larger batches (64, 128) showed no improvement or regression.
-const BATCH_SIZE: usize = 32;
+/// Adaptive batch sizing constants (TCP slow-start style).
+/// Instead of a fixed batch size that may saturate unified memory bandwidth
+/// on constrained Apple Silicon devices (e.g. MacBook Air M2 with 8GB),
+/// we start small and grow/shrink based on observed per-item latency.
+const BATCH_FLOOR: usize = 4;
+const BATCH_CEILING: usize = 64;
+/// Yield duration between batches to let other system tasks breathe.
+const BATCH_YIELD_MS: u64 = 50;
+/// If per-item time exceeds this multiple of the rolling average, halve batch size.
+const BACKOFF_THRESHOLD: f64 = 2.0;
 
 /// Number of recent commits to embed for temporal context.
 const RECENT_COMMIT_LIMIT: usize = 100;
@@ -135,23 +141,25 @@ async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         return Ok(Vec::new());
     }
 
-    let batch_size = BATCH_SIZE;
     let total_chars: usize = texts.iter().map(|t| t.len()).sum();
-    let total_batches = total.div_ceil(batch_size);
     let overall_start = std::time::Instant::now();
     tracing::info!(
-        "EmbeddingIndex: embedding {} text(s) across {} batch(es) ({} chars total)",
-        total, total_batches, total_chars
+        "EmbeddingIndex: embedding {} text(s) ({} chars total, adaptive batch {}..{})",
+        total, total_chars, BATCH_FLOOR, BATCH_CEILING
     );
 
     let model = new_model()?;
     let mut remaining = texts;
     let mut all_embeddings = Vec::with_capacity(total);
     let mut processed = 0usize;
+    let mut batch_idx = 0usize;
+    let mut current_batch_size = BATCH_FLOOR;
+    let mut rolling_avg: Option<f64> = None;
+    const EMA_ALPHA: f64 = 0.3;
 
-    for batch_idx in 0..total_batches {
-        let batch_size = remaining.len().min(batch_size);
-        let batch: Vec<String> = remaining.drain(..batch_size).collect();
+    while !remaining.is_empty() {
+        let bs = remaining.len().min(current_batch_size);
+        let batch: Vec<String> = remaining.drain(..bs).collect();
         let batch_start = std::time::Instant::now();
 
         let refs: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
@@ -160,12 +168,46 @@ async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         let batch_embeddings: Vec<Vec<f32>> = tensor.to_vec2::<f32>()
             .map_err(|e| anyhow::anyhow!("Tensor conversion failed: {}", e))?;
 
+        let elapsed_secs = batch_start.elapsed().as_secs_f64();
+        let per_item = elapsed_secs / bs as f64;
+
+        // Adaptive batch sizing: TCP slow-start style
+        match rolling_avg {
+            None => {
+                // First batch: seed the rolling average
+                rolling_avg = Some(per_item);
+                // Grow for next batch
+                current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+            }
+            Some(avg) => {
+                if per_item > BACKOFF_THRESHOLD * avg {
+                    // Latency spike — halve batch size
+                    current_batch_size = (current_batch_size / 2).max(BATCH_FLOOR);
+                    tracing::debug!(
+                        "EmbeddingIndex: backoff batch_size -> {} (per_item {:.4}s > {:.4}s threshold)",
+                        current_batch_size, per_item, BACKOFF_THRESHOLD * avg
+                    );
+                } else {
+                    // Steady — grow batch size
+                    current_batch_size = (current_batch_size * 2).min(BATCH_CEILING);
+                }
+                // Update EMA
+                rolling_avg = Some(avg * (1.0 - EMA_ALPHA) + per_item * EMA_ALPHA);
+            }
+        }
+
         processed += batch_embeddings.len();
+        batch_idx += 1;
         tracing::info!(
-            "EmbeddingIndex: batch {}/{} done in {:?} ({}/{})",
-            batch_idx + 1, total_batches, batch_start.elapsed(), processed, total
+            "EmbeddingIndex: batch {} done in {:?} (bs={}, {}/{})",
+            batch_idx, batch_start.elapsed(), bs, processed, total
         );
         all_embeddings.extend(batch_embeddings);
+
+        // Yield between batches to avoid saturating memory bandwidth
+        if !remaining.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(BATCH_YIELD_MS)).await;
+        }
     }
 
     tracing::info!(
