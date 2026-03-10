@@ -1531,11 +1531,11 @@ impl RnaHandler {
         match EmbeddingIndex::new(&self.repo_root).await {
             Ok(idx) => {
                 match idx.search("_probe_", None, 1).await {
-                    Ok(_) => {
+                    Ok(SearchOutcome::Results(_)) => {
                         tracing::info!("Reusing persisted embedding index (skipping rebuild)");
                         self.embed_index.store(Arc::new(Some(idx)));
                     }
-                    Err(_) => {
+                    Ok(SearchOutcome::NotReady) | Err(_) => {
                         tracing::info!("Embedding index empty — will rebuild in background");
                         self.embed_index.store(Arc::new(Some(idx)));
                     }
@@ -1569,7 +1569,11 @@ impl RnaHandler {
             match EmbeddingIndex::new(&bg_repo_root).await {
                 Ok(idx) => {
                     // Only rebuild if not already populated
-                    if idx.search("_probe_", None, 1).await.is_err() {
+                    let needs_rebuild = match idx.search("_probe_", None, 1).await {
+                        Ok(SearchOutcome::Results(_)) => false,
+                        Ok(SearchOutcome::NotReady) | Err(_) => true,
+                    };
+                    if needs_rebuild {
                         match idx.index_all_with_symbols(&bg_repo_root, &embeddable_nodes).await {
                             Ok(count) => {
                                 tracing::info!("[background] Embedded {} items", count);
