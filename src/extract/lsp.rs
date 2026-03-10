@@ -284,6 +284,8 @@ struct LspState {
     root_path: Option<PathBuf>,
     /// Whether we already tried and failed to start the language server.
     init_failed: bool,
+    /// Whether the language server supports type hierarchy requests.
+    has_type_hierarchy: bool,
 }
 
 impl LspEnricher {
@@ -311,6 +313,7 @@ impl LspEnricher {
                 transport: None,
                 root_path: None,
                 init_failed: false,
+                has_type_hierarchy: false,
             }),
         }
     }
@@ -408,21 +411,33 @@ impl LspEnricher {
             init_params.initialization_options = Some(settings.clone());
         }
 
-        let transport = state.transport.as_mut().unwrap();
-        let init_result = transport.request("initialize", &init_params).await?;
+        let init_result = {
+            let transport = state.transport.as_mut().unwrap();
+            transport.request("initialize", &init_params).await?
+        };
 
         // Parse and check server capabilities
+        // Check type hierarchy provider from raw JSON before from_value consumes it,
+        // because lsp-types 0.97 ServerCapabilities is missing the field.
+        let has_type_hierarchy = init_result
+            .pointer("/capabilities/typeHierarchyProvider")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+
         let init_result_parsed: InitializeResult = serde_json::from_value(init_result)
             .context("Failed to parse initialize result")?;
 
         let has_references = init_result_parsed.capabilities.references_provider.is_some();
         let has_implementation = init_result_parsed.capabilities.implementation_provider.is_some();
         tracing::info!(
-            "{} capabilities: references={}, implementation={}",
-            self.server_command, has_references, has_implementation
+            "{} capabilities: references={}, implementation={}, type_hierarchy={}",
+            self.server_command, has_references, has_implementation, has_type_hierarchy
         );
 
+        state.has_type_hierarchy = has_type_hierarchy;
+
         // Send initialized notification
+        let transport = state.transport.as_mut().unwrap();
         transport
             .notify("initialized", serde_json::json!({}))
             .await?;
@@ -648,6 +663,209 @@ impl LspEnricher {
 
         Ok(locations)
     }
+
+    /// Use type hierarchy to discover supertypes and subtypes for a node,
+    /// creating Implements edges for each resolved relationship.
+    async fn enrich_type_hierarchy(
+        transport: &mut LspTransport,
+        file_uri: &Uri,
+        line: u32,
+        character: u32,
+        node: &Node,
+        matching_nodes: &[&Node],
+        root: &Path,
+        result: &mut EnrichmentResult,
+    ) {
+        let items = match Self::prepare_type_hierarchy(transport, file_uri, line, character).await {
+            Ok(items) if !items.is_empty() => items,
+            Ok(_) => return, // No type hierarchy item at this position
+            Err(e) => {
+                tracing::debug!("prepareTypeHierarchy failed for {}: {}", node.id.name, e);
+                return;
+            }
+        };
+
+        for item in &items {
+            // Supertypes: this node implements/inherits from each supertype
+            match Self::type_hierarchy_supertypes(transport, item).await {
+                Ok(supertypes) => {
+                    for supertype in &supertypes {
+                        if let Some(target_id) = Self::resolve_type_hierarchy_item(
+                            supertype, matching_nodes, root,
+                        ) {
+                            // Skip self-references
+                            if target_id == node.id {
+                                continue;
+                            }
+                            tracing::debug!(
+                                "Type hierarchy: {} implements supertype {}",
+                                node.id.name, target_id.name
+                            );
+                            result.added_edges.push(Edge {
+                                from: node.id.clone(),
+                                to: target_id,
+                                kind: EdgeKind::Implements,
+                                source: ExtractionSource::Lsp,
+                                confidence: Confidence::Confirmed,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "typeHierarchy/supertypes failed for {}: {}",
+                        node.id.name, e
+                    );
+                }
+            }
+
+            // Subtypes: each subtype implements/inherits from this node
+            match Self::type_hierarchy_subtypes(transport, item).await {
+                Ok(subtypes) => {
+                    for subtype in &subtypes {
+                        if let Some(target_id) = Self::resolve_type_hierarchy_item(
+                            subtype, matching_nodes, root,
+                        ) {
+                            // Skip self-references
+                            if target_id == node.id {
+                                continue;
+                            }
+                            tracing::debug!(
+                                "Type hierarchy: {} (subtype) implements {}",
+                                target_id.name, node.id.name
+                            );
+                            result.added_edges.push(Edge {
+                                from: target_id,
+                                to: node.id.clone(),
+                                kind: EdgeKind::Implements,
+                                source: ExtractionSource::Lsp,
+                                confidence: Confidence::Confirmed,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "typeHierarchy/subtypes failed for {}: {}",
+                        node.id.name, e
+                    );
+                }
+            }
+        }
+    }
+
+    /// Resolve a TypeHierarchyItem (JSON) to a NodeId in the graph.
+    /// Returns None if the item's file/name doesn't match any known node.
+    fn resolve_type_hierarchy_item(
+        item: &serde_json::Value,
+        matching_nodes: &[&Node],
+        root: &Path,
+    ) -> Option<NodeId> {
+        let name = item.get("name")?.as_str()?;
+        let uri_str = item.get("uri")?.as_str()?;
+        let file_path_str = uri_str.strip_prefix("file://")?;
+
+        let abs_path = PathBuf::from(file_path_str);
+        let rel_path = abs_path.strip_prefix(root).unwrap_or(&abs_path).to_path_buf();
+
+        // Skip external dependencies
+        if rel_path.to_string_lossy().contains(".cargo") {
+            return None;
+        }
+
+        let range_start_line = item
+            .pointer("/range/start/line")
+            .and_then(|v| v.as_u64())
+            .map(|l| l as usize + 1)
+            .unwrap_or(0);
+
+        // Try exact name + file match first
+        let target = matching_nodes.iter()
+            .filter(|n| n.id.file == rel_path)
+            .filter(|n| n.id.name == name)
+            .filter(|n| matches!(n.id.kind,
+                NodeKind::Trait | NodeKind::Struct | NodeKind::Enum | NodeKind::Impl
+            ))
+            .next()
+            .map(|n| n.id.clone());
+
+        if target.is_some() {
+            return target;
+        }
+
+        // Fallback: find enclosing symbol at the position
+        matching_nodes.iter()
+            .filter(|n| n.id.file == rel_path)
+            .filter(|n| matches!(n.id.kind,
+                NodeKind::Trait | NodeKind::Struct | NodeKind::Enum | NodeKind::Impl
+            ))
+            .filter(|n| range_start_line == 0 || (n.line_start <= range_start_line && n.line_end >= range_start_line))
+            .min_by_key(|n| n.line_end - n.line_start)
+            .map(|n| n.id.clone())
+    }
+
+    /// Prepare type hierarchy at a position. Returns the TypeHierarchyItem(s) if found.
+    async fn prepare_type_hierarchy(
+        transport: &mut LspTransport,
+        file_uri: &Uri,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<serde_json::Value>> {
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri.as_str() },
+            "position": { "line": line, "character": character }
+        });
+
+        let result: serde_json::Value = transport
+            .request("textDocument/prepareTypeHierarchy", &params)
+            .await?;
+
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+
+        Ok(result.as_array().cloned().unwrap_or_default())
+    }
+
+    /// Find supertypes for a TypeHierarchyItem.
+    async fn type_hierarchy_supertypes(
+        transport: &mut LspTransport,
+        item: &serde_json::Value,
+    ) -> Result<Vec<serde_json::Value>> {
+        let params = serde_json::json!({
+            "item": item
+        });
+
+        let result: serde_json::Value = transport
+            .request("typeHierarchy/supertypes", &params)
+            .await?;
+
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+
+        Ok(result.as_array().cloned().unwrap_or_default())
+    }
+
+    /// Find subtypes for a TypeHierarchyItem.
+    async fn type_hierarchy_subtypes(
+        transport: &mut LspTransport,
+        item: &serde_json::Value,
+    ) -> Result<Vec<serde_json::Value>> {
+        let params = serde_json::json!({
+            "item": item
+        });
+
+        let result: serde_json::Value = transport
+            .request("typeHierarchy/subtypes", &params)
+            .await?;
+
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+
+        Ok(result.as_array().cloned().unwrap_or_default())
+    }
 }
 
 #[async_trait::async_trait]
@@ -695,6 +913,7 @@ impl Enricher for LspEnricher {
             .root_path
             .clone()
             .unwrap_or_else(|| repo_root.to_path_buf());
+        let has_type_hierarchy = state.has_type_hierarchy;
         let transport = match state.transport.as_mut() {
             Some(t) => t,
             None => return Ok(result),
@@ -941,6 +1160,23 @@ impl Enricher for LspEnricher {
                                 e
                             );
                         }
+                    }
+
+                    // Type hierarchy: discover supertypes and subtypes via LSP
+                    if has_type_hierarchy {
+                        Self::enrich_type_hierarchy(
+                            transport, &file_uri, line, col,
+                            node, &matching_nodes, &root, &mut result,
+                        ).await;
+                    }
+                }
+                NodeKind::Struct | NodeKind::Enum => {
+                    // Type hierarchy for structs/enums: discover inheritance/implementation chains
+                    if has_type_hierarchy {
+                        Self::enrich_type_hierarchy(
+                            transport, &file_uri, line, col,
+                            node, &matching_nodes, &root, &mut result,
+                        ).await;
                     }
                 }
                 _ => {
