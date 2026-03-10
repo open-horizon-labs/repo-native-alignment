@@ -98,12 +98,16 @@ pub struct SearchSymbols {
 
 #[macros::mcp_tool(
     name = "graph_query",
-    description = "Use this INSTEAD OF Read/Grep for tracing code relationships. Find neighbors (what calls/depends on a symbol), impact analysis (what depends on this), or reachable nodes within N hops. Use after search_symbols to get a node_id."
+    description = "Use this INSTEAD OF Read/Grep for tracing code relationships. Accepts either a stable node_id (from search_symbols) OR a natural language query (e.g. \"authentication handler\") to find entry points via semantic search. When using query, the top matching code symbols become entry nodes for the traversal. Find neighbors (what calls/depends on a symbol), impact analysis (what depends on this), or reachable nodes within N hops."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GraphQuery {
-    /// Stable ID from search_symbols results
-    pub node_id: String,
+    /// Stable ID from search_symbols results. Takes precedence over query if both provided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    /// Natural language query to find entry nodes via semantic search (e.g. "authentication handler", "database connection pool"). Used when node_id is not provided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
     /// Query mode: "neighbors" (default), "impact" (reverse dependents), "reachable" (forward BFS)
     #[serde(default = "default_graph_mode")]
     pub mode: String,
@@ -2319,9 +2323,90 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
 
             "graph_query" => {
                 let args: GraphQuery = parse_args(params.arguments)?;
+
+                // Resolve entry node IDs: either from explicit node_id or semantic query
+                let (entry_node_ids, entry_header): (Vec<String>, String) = if let Some(ref node_id) = args.node_id {
+                    // Explicit node ID — backward compatible path
+                    (vec![node_id.clone()], String::new())
+                } else if let Some(ref query_text) = args.query {
+                    // Semantic search path — find entry nodes by natural language
+                    let embed_result = EmbeddingIndex::new(&self.repo_root).await;
+                    match embed_result {
+                        Ok(embed_idx) => {
+                            // Search for code symbols only (filter to code:* kinds)
+                            let code_types: Vec<String> = vec![
+                                "code:Function".to_string(),
+                                "code:Struct".to_string(),
+                                "code:Impl".to_string(),
+                                "code:Trait".to_string(),
+                                "code:Enum".to_string(),
+                                "code:Method".to_string(),
+                                "code:Interface".to_string(),
+                                "code:Class".to_string(),
+                                "code:Type".to_string(),
+                                "code:Constant".to_string(),
+                            ];
+                            match embed_idx.search(query_text, Some(&code_types), 3).await {
+                                Ok(results) if !results.is_empty() => {
+                                    let mut header = format!("### Matched entry nodes for \"{}\"\n\n", query_text);
+                                    let ids: Vec<String> = results.iter()
+                                        .map(|r| {
+                                            header.push_str(&format!(
+                                                "- `{}` — {} (score: {:.2})\n",
+                                                r.id, r.title, r.score
+                                            ));
+                                            r.id.clone()
+                                        })
+                                        .collect();
+                                    header.push('\n');
+                                    (ids, header)
+                                }
+                                Ok(_) => {
+                                    return Ok(text_result(format!(
+                                        "No code symbols matched query \"{}\". Try a different query or use node_id from search_symbols.",
+                                        query_text
+                                    )));
+                                }
+                                Err(e) => {
+                                    return Ok(text_result(format!(
+                                        "Semantic search failed: {}. Use node_id from search_symbols instead.",
+                                        e
+                                    )));
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            return Ok(text_result(
+                                "Embedding index not available. Use node_id from search_symbols instead, or wait for the background index to build.".to_string()
+                            ));
+                        }
+                    }
+                } else {
+                    return Ok(text_result(
+                        "Either node_id or query is required. Provide a stable node ID (from search_symbols) or a natural language query.".to_string()
+                    ));
+                };
+
                 match self.get_graph().await {
                     Ok(guard) => {
                         let graph_state = guard.as_ref().unwrap();
+
+                        // Filter entry nodes to only those present in the graph
+                        let valid_entry_ids: Vec<&String> = entry_node_ids.iter()
+                            .filter(|id| graph_state.index.get_node(id).is_some())
+                            .collect();
+
+                        if valid_entry_ids.is_empty() {
+                            let id_list = entry_node_ids.iter()
+                                .map(|id| format!("`{}`", id))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            return Ok(text_result(format!(
+                                "{}No graph nodes found for {}. The node(s) may not have edges in the graph. Try search_symbols to find valid node IDs.",
+                                entry_header, id_list
+                            )));
+                        }
+
                         let edge_filter = args.edge_types.as_ref().map(|types| {
                             types
                                 .iter()
@@ -2330,142 +2415,121 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         });
                         let edge_filter_slice = edge_filter.as_deref();
 
-                        match args.mode.as_str() {
-                            "neighbors" => {
-                                let max_hops = args.max_hops.unwrap_or(1) as usize;
-                                let direction = args.direction.as_deref().unwrap_or("outgoing");
+                        // Helper: run traversal from a single node and collect IDs
+                        let run_traversal = |node_id: &str| -> Result<Vec<String>, String> {
+                            match args.mode.as_str() {
+                                "neighbors" => {
+                                    let max_hops = args.max_hops.unwrap_or(1) as usize;
+                                    let direction = args.direction.as_deref().unwrap_or("outgoing");
 
-                                let mut all_ids: Vec<String> = Vec::new();
-
-                                match direction {
-                                    "outgoing" => {
-                                        if max_hops == 1 {
-                                            all_ids = graph_state.index.neighbors(
-                                                &args.node_id,
-                                                edge_filter_slice,
-                                                Direction::Outgoing,
-                                            );
-                                        } else {
-                                            all_ids = graph_state.index.reachable(
-                                                &args.node_id,
-                                                max_hops,
-                                                edge_filter_slice,
-                                            );
+                                    match direction {
+                                        "outgoing" => {
+                                            if max_hops == 1 {
+                                                Ok(graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Outgoing))
+                                            } else {
+                                                Ok(graph_state.index.reachable(node_id, max_hops, edge_filter_slice))
+                                            }
                                         }
-                                    }
-                                    "incoming" => {
-                                        if max_hops == 1 {
-                                            all_ids = graph_state.index.neighbors(
-                                                &args.node_id,
-                                                edge_filter_slice,
-                                                Direction::Incoming,
-                                            );
-                                        } else {
-                                            all_ids = graph_state.index.impact(&args.node_id, max_hops);
+                                        "incoming" => {
+                                            if max_hops == 1 {
+                                                Ok(graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Incoming))
+                                            } else {
+                                                Ok(graph_state.index.impact(node_id, max_hops))
+                                            }
                                         }
-                                    }
-                                    "both" => {
-                                        let out = if max_hops == 1 {
-                                            graph_state.index.neighbors(
-                                                &args.node_id,
-                                                edge_filter_slice,
-                                                Direction::Outgoing,
-                                            )
-                                        } else {
-                                            graph_state.index.reachable(
-                                                &args.node_id,
-                                                max_hops,
-                                                edge_filter_slice,
-                                            )
-                                        };
-                                        let inc = if max_hops == 1 {
-                                            graph_state.index.neighbors(
-                                                &args.node_id,
-                                                edge_filter_slice,
-                                                Direction::Incoming,
-                                            )
-                                        } else {
-                                            graph_state.index.impact(&args.node_id, max_hops)
-                                        };
-                                        all_ids.extend(out);
-                                        all_ids.extend(inc);
-                                        all_ids.sort();
-                                        all_ids.dedup();
-                                    }
-                                    _ => {
-                                        return Ok(text_result(format!(
+                                        "both" => {
+                                            let out = if max_hops == 1 {
+                                                graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Outgoing)
+                                            } else {
+                                                graph_state.index.reachable(node_id, max_hops, edge_filter_slice)
+                                            };
+                                            let inc = if max_hops == 1 {
+                                                graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Incoming)
+                                            } else {
+                                                graph_state.index.impact(node_id, max_hops)
+                                            };
+                                            let mut combined = out;
+                                            combined.extend(inc);
+                                            Ok(combined)
+                                        }
+                                        _ => Err(format!(
                                             "Invalid direction: \"{}\". Use \"outgoing\", \"incoming\", or \"both\".",
                                             direction
-                                        )));
+                                        )),
                                     }
                                 }
-
-                                if all_ids.is_empty() {
-                                    Ok(text_result(format!(
-                                        "No {} neighbors for `{}`.",
-                                        direction, args.node_id
-                                    )))
-                                } else {
-                                    let md = format_neighbor_nodes(&graph_state.nodes, &all_ids);
-                                    Ok(text_result(format!(
-                                        "## Graph neighbors ({}) of `{}`\n\n{} result(s)\n\n{}",
-                                        direction,
-                                        args.node_id,
-                                        all_ids.len(),
-                                        md
-                                    )))
+                                "impact" => {
+                                    let max_hops = args.max_hops.unwrap_or(3) as usize;
+                                    Ok(graph_state.index.impact(node_id, max_hops))
                                 }
-                            }
-                            "impact" => {
-                                let max_hops = args.max_hops.unwrap_or(3) as usize;
-                                let impacted = graph_state.index.impact(&args.node_id, max_hops);
-
-                                if impacted.is_empty() {
-                                    Ok(text_result(format!(
-                                        "No dependents found for `{}` within {} hops.",
-                                        args.node_id, max_hops
-                                    )))
-                                } else {
-                                    let md = format_neighbor_nodes(&graph_state.nodes, &impacted);
-                                    Ok(text_result(format!(
-                                        "## Impact analysis for `{}`\n\n{} dependent(s) within {} hop(s)\n\n{}",
-                                        args.node_id,
-                                        impacted.len(),
-                                        max_hops,
-                                        md
-                                    )))
+                                "reachable" => {
+                                    let max_hops = args.max_hops.unwrap_or(3) as usize;
+                                    Ok(graph_state.index.reachable(node_id, max_hops, edge_filter_slice))
                                 }
-                            }
-                            "reachable" => {
-                                let max_hops = args.max_hops.unwrap_or(3) as usize;
-                                let reachable = graph_state.index.reachable(
-                                    &args.node_id,
-                                    max_hops,
-                                    edge_filter_slice,
-                                );
-
-                                if reachable.is_empty() {
-                                    Ok(text_result(format!(
-                                        "No reachable nodes from `{}` within {} hops.",
-                                        args.node_id, max_hops
-                                    )))
-                                } else {
-                                    let md = format_neighbor_nodes(&graph_state.nodes, &reachable);
-                                    Ok(text_result(format!(
-                                        "## Reachable from `{}`\n\n{} node(s) within {} hop(s)\n\n{}",
-                                        args.node_id,
-                                        reachable.len(),
-                                        max_hops,
-                                        md
-                                    )))
-                                }
-                            }
-                            other => {
-                                Ok(text_result(format!(
+                                other => Err(format!(
                                     "Unknown mode: \"{}\". Use \"neighbors\", \"impact\", or \"reachable\".",
                                     other
-                                )))
+                                )),
                             }
+                        };
+
+                        // Run traversal from each entry node, merge and deduplicate
+                        let mut all_ids: Vec<String> = Vec::new();
+                        let mut seen = std::collections::HashSet::new();
+
+                        for node_id in &valid_entry_ids {
+                            match run_traversal(node_id) {
+                                Ok(ids) => {
+                                    for id in ids {
+                                        if seen.insert(id.clone()) {
+                                            all_ids.push(id);
+                                        }
+                                    }
+                                }
+                                Err(msg) => return Ok(text_result(msg)),
+                            }
+                        }
+
+                        // Remove entry nodes from results (they're already shown in the header)
+                        let entry_set: std::collections::HashSet<&str> = valid_entry_ids.iter().map(|s| s.as_str()).collect();
+                        all_ids.retain(|id| !entry_set.contains(id.as_str()));
+
+                        // Format the label for the entry point(s)
+                        let entry_label = if valid_entry_ids.len() == 1 {
+                            format!("`{}`", valid_entry_ids[0])
+                        } else {
+                            format!("{} entry nodes", valid_entry_ids.len())
+                        };
+
+                        let mode_label = args.mode.as_str();
+                        let direction = args.direction.as_deref().unwrap_or("outgoing");
+
+                        if all_ids.is_empty() {
+                            let mode_desc = match mode_label {
+                                "neighbors" => format!("No {} neighbors for {}.", direction, entry_label),
+                                "impact" => format!("No dependents found for {} within {} hops.", entry_label, args.max_hops.unwrap_or(3)),
+                                "reachable" => format!("No reachable nodes from {} within {} hops.", entry_label, args.max_hops.unwrap_or(3)),
+                                _ => format!("No results for {}.", entry_label),
+                            };
+                            Ok(text_result(format!("{}{}", entry_header, mode_desc)))
+                        } else {
+                            let md = format_neighbor_nodes(&graph_state.nodes, &all_ids);
+                            let heading = match mode_label {
+                                "neighbors" => format!(
+                                    "## Graph neighbors ({}) of {}\n\n{} result(s)\n\n",
+                                    direction, entry_label, all_ids.len()
+                                ),
+                                "impact" => format!(
+                                    "## Impact analysis for {}\n\n{} dependent(s) within {} hop(s)\n\n",
+                                    entry_label, all_ids.len(), args.max_hops.unwrap_or(3)
+                                ),
+                                "reachable" => format!(
+                                    "## Reachable from {}\n\n{} node(s) within {} hop(s)\n\n",
+                                    entry_label, all_ids.len(), args.max_hops.unwrap_or(3)
+                                ),
+                                _ => String::new(),
+                            };
+                            Ok(text_result(format!("{}{}{}", entry_header, heading, md)))
                         }
                     }
                     Err(e) => Ok(text_result(format!("Graph error: {}", e))),
