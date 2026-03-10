@@ -208,6 +208,19 @@ pub fn glob_match_public(pattern: &str, path: &str) -> bool {
     }
 }
 
+// ── shared utilities ────────────────────────────────────────────────
+
+/// Returns the current HEAD commit OID as a hex string, or `None` if the
+/// path is not a git repository or HEAD cannot be resolved.
+///
+/// Useful for cache-invalidation: enrichers can skip re-processing when
+/// HEAD hasn't changed since the last run.
+pub fn head_oid(repo_root: &Path) -> Option<String> {
+    let repo = Repository::open(repo_root).ok()?;
+    let head = repo.head().ok()?;
+    head.target().map(|oid| oid.to_string())
+}
+
 // ── internal helpers ────────────────────────────────────────────────
 
 /// Extracts changed files for a single commit by diffing against its first parent

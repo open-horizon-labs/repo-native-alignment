@@ -8,7 +8,7 @@ pub mod index;
 pub mod store;
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -248,7 +248,7 @@ pub struct SourceEnvelope<T> {
     /// Unique event ID (UUID v4).
     pub event_id: String,
     /// Deterministic idempotency key derived from content.
-    /// Same input → same key → safe to replay.
+    /// Same input -> same key -> safe to replay.
     pub idempotency_key: String,
     /// Source identifier: "code.workspace:v1"
     pub source: String,
@@ -285,7 +285,7 @@ impl<T> SourceEnvelope<T> {
 // ---------------------------------------------------------------------------
 
 /// A node in the code graph: a symbol, schema element, component, or artifact.
-/// This is the canonical source record — independent of LanceDB layout.
+/// This is the canonical source record -- independent of LanceDB layout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     pub id: NodeId,
@@ -329,5 +329,328 @@ impl Edge {
             self.kind,
             self.to.to_stable_id()
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Edge deduplication
+// ---------------------------------------------------------------------------
+
+/// A pre-built index mapping `(file, line)` pairs to the nodes that span
+/// that line. Built once, then used for repeated lookups.
+pub type FileLineIndex<'a> = HashMap<(PathBuf, usize), Vec<&'a Node>>;
+
+/// Build a `HashSet` of existing edge stable IDs for O(1) dedup lookups.
+///
+/// Enrichers that produce edges from a second source (LSP, SCIP, etc.) can
+/// use this set to skip edges that were already discovered by tree-sitter or
+/// another enricher. The key is `Edge::stable_id()` which encodes
+/// `from -> kind -> to` directionality, so A->B and B->A are distinct.
+///
+/// # Example
+/// ```ignore
+/// let existing = edge_id_set(&existing_edges);
+/// for candidate in new_edges {
+///     if !existing.contains(&candidate.stable_id()) {
+///         result.push(candidate);
+///     }
+/// }
+/// ```
+pub fn edge_id_set(edges: &[Edge]) -> HashSet<String> {
+    edges.iter().map(|e| e.stable_id()).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Node line-range lookup
+// ---------------------------------------------------------------------------
+
+/// Build a `FileLineIndex` from a slice of nodes.
+///
+/// For each node, every line in `[line_start..=line_end]` gets an entry
+/// pointing back to that node. This enables O(1) lookup of "which nodes
+/// contain this line?" -- useful for mapping diagnostics, coverage data,
+/// or external references back to graph nodes.
+pub fn build_file_line_index<'a>(nodes: &'a [Node]) -> FileLineIndex<'a> {
+    let mut index: FileLineIndex<'a> = HashMap::new();
+    for node in nodes {
+        for line in node.line_start..=node.line_end {
+            index
+                .entry((node.id.file.clone(), line))
+                .or_default()
+                .push(node);
+        }
+    }
+    index
+}
+
+/// Find the narrowest enclosing node at a given file + line.
+///
+/// Given a `FileLineIndex`, returns the `NodeId` of the tightest-enclosing
+/// node (smallest `line_end - line_start`) that matches the allowed kinds.
+/// Only considers `Function`, `Impl`, and `Struct` kinds -- skips `Module`,
+/// `Import`, and other kinds that span large ranges without semantic
+/// enclosure meaning.
+///
+/// Use case: mapping an external reference (LSP location, SCIP occurrence,
+/// diagnostic) to the function or struct that "owns" it.
+pub fn find_enclosing_node(
+    index: &FileLineIndex<'_>,
+    file: &PathBuf,
+    line: usize,
+) -> Option<NodeId> {
+    index.get(&(file.clone(), line)).and_then(|nodes| {
+        nodes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n.id.kind,
+                    NodeKind::Function | NodeKind::Impl | NodeKind::Struct
+                )
+            })
+            .min_by_key(|n| n.line_end.saturating_sub(n.line_start))
+            .map(|n| n.id.clone())
+    })
+}
+
+/// Find the narrowest node at a given file + line, considering only
+/// semantically meaningful kinds (Function, Struct, Trait, Enum, Const).
+///
+/// Unlike `find_enclosing_node`, this is used for exact-match lookups
+/// (e.g., "what symbol is defined at this line?") rather than enclosure.
+pub fn find_node_at(
+    index: &FileLineIndex<'_>,
+    file: &PathBuf,
+    line: usize,
+) -> Option<NodeId> {
+    index.get(&(file.clone(), line)).and_then(|nodes| {
+        nodes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n.id.kind,
+                    NodeKind::Function
+                        | NodeKind::Struct
+                        | NodeKind::Trait
+                        | NodeKind::Enum
+                        | NodeKind::Const
+                )
+            })
+            .min_by_key(|n| n.line_end.saturating_sub(n.line_start))
+            .map(|n| n.id.clone())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_node(
+        file: &str,
+        name: &str,
+        kind: NodeKind,
+        line_start: usize,
+        line_end: usize,
+    ) -> Node {
+        Node {
+            id: NodeId {
+                root: String::new(),
+                file: PathBuf::from(file),
+                name: name.to_string(),
+                kind,
+            },
+            language: "rust".to_string(),
+            line_start,
+            line_end,
+            signature: format!("fn {}()", name),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        }
+    }
+
+    fn make_edge(from_name: &str, to_name: &str, kind: EdgeKind) -> Edge {
+        Edge {
+            from: NodeId {
+                root: String::new(),
+                file: PathBuf::from("src/lib.rs"),
+                name: from_name.to_string(),
+                kind: NodeKind::Function,
+            },
+            to: NodeId {
+                root: String::new(),
+                file: PathBuf::from("src/lib.rs"),
+                name: to_name.to_string(),
+                kind: NodeKind::Function,
+            },
+            kind,
+            source: ExtractionSource::TreeSitter,
+            confidence: Confidence::Detected,
+        }
+    }
+
+    // -- edge_id_set tests --
+
+    #[test]
+    fn test_edge_id_set_empty() {
+        let set = edge_id_set(&[]);
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn test_edge_id_set_contains_stable_ids() {
+        let edges = vec![
+            make_edge("foo", "bar", EdgeKind::Calls),
+            make_edge("bar", "baz", EdgeKind::DependsOn),
+        ];
+        let set = edge_id_set(&edges);
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&edges[0].stable_id()));
+        assert!(set.contains(&edges[1].stable_id()));
+    }
+
+    #[test]
+    fn test_edge_id_set_directional() {
+        // A->B and B->A should be distinct entries
+        let edges = vec![
+            make_edge("foo", "bar", EdgeKind::Calls),
+            make_edge("bar", "foo", EdgeKind::Calls),
+        ];
+        let set = edge_id_set(&edges);
+        assert_eq!(set.len(), 2, "A->B and B->A must be distinct");
+    }
+
+    #[test]
+    fn test_edge_id_set_dedup_same_edge() {
+        // Two identical edges should produce one set entry
+        let edges = vec![
+            make_edge("foo", "bar", EdgeKind::Calls),
+            make_edge("foo", "bar", EdgeKind::Calls),
+        ];
+        let set = edge_id_set(&edges);
+        assert_eq!(set.len(), 1, "Duplicate edges should collapse in the set");
+    }
+
+    // -- build_file_line_index + find_enclosing_node tests --
+
+    #[test]
+    fn test_build_file_line_index() {
+        let nodes = vec![
+            make_node("src/main.rs", "main", NodeKind::Function, 1, 10),
+            make_node("src/main.rs", "helper", NodeKind::Function, 12, 20),
+        ];
+        let index = build_file_line_index(&nodes);
+
+        // Line 5 should map to "main"
+        let at_5 = index.get(&(PathBuf::from("src/main.rs"), 5));
+        assert!(at_5.is_some());
+        assert_eq!(at_5.unwrap().len(), 1);
+        assert_eq!(at_5.unwrap()[0].id.name, "main");
+
+        // Line 15 should map to "helper"
+        let at_15 = index.get(&(PathBuf::from("src/main.rs"), 15));
+        assert!(at_15.is_some());
+        assert_eq!(at_15.unwrap()[0].id.name, "helper");
+
+        // Line 25 should be absent
+        let at_25 = index.get(&(PathBuf::from("src/main.rs"), 25));
+        assert!(at_25.is_none());
+    }
+
+    #[test]
+    fn test_find_enclosing_node_prefers_narrowest() {
+        let nodes = vec![
+            make_node("src/lib.rs", "outer", NodeKind::Function, 1, 20),
+            make_node("src/lib.rs", "inner", NodeKind::Function, 5, 10),
+        ];
+        let index = build_file_line_index(&nodes);
+
+        // Line 7 is in both, should return inner (narrower)
+        let result = find_enclosing_node(&index, &PathBuf::from("src/lib.rs"), 7);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "inner");
+
+        // Line 15 is only in outer
+        let result = find_enclosing_node(&index, &PathBuf::from("src/lib.rs"), 15);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "outer");
+    }
+
+    #[test]
+    fn test_find_enclosing_node_skips_module() {
+        let nodes = vec![
+            make_node("src/lib.rs", "my_module", NodeKind::Module, 1, 100),
+            make_node("src/lib.rs", "real_fn", NodeKind::Function, 5, 10),
+        ];
+        let index = build_file_line_index(&nodes);
+
+        // Line 7: both Module and Function present, only Function matches
+        let result = find_enclosing_node(&index, &PathBuf::from("src/lib.rs"), 7);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "real_fn");
+
+        // Line 50: only Module present, should return None
+        let result = find_enclosing_node(&index, &PathBuf::from("src/lib.rs"), 50);
+        assert!(result.is_none(), "Module-only lines should return None");
+    }
+
+    #[test]
+    fn test_find_enclosing_node_skips_import() {
+        let nodes = vec![make_node(
+            "src/lib.rs",
+            "use_std",
+            NodeKind::Import,
+            1,
+            1,
+        )];
+        let index = build_file_line_index(&nodes);
+
+        let result = find_enclosing_node(&index, &PathBuf::from("src/lib.rs"), 1);
+        assert!(
+            result.is_none(),
+            "Import nodes should not be enclosing nodes"
+        );
+    }
+
+    // -- find_node_at tests --
+
+    #[test]
+    fn test_find_node_at_basic() {
+        let nodes = vec![
+            make_node("src/main.rs", "main", NodeKind::Function, 1, 10),
+            make_node("src/main.rs", "helper", NodeKind::Function, 12, 20),
+        ];
+        let index = build_file_line_index(&nodes);
+
+        let result = find_node_at(&index, &PathBuf::from("src/main.rs"), 5);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "main");
+
+        let result = find_node_at(&index, &PathBuf::from("src/main.rs"), 15);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "helper");
+
+        let result = find_node_at(&index, &PathBuf::from("src/main.rs"), 25);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_node_at_skips_module() {
+        let nodes = vec![
+            make_node("src/lib.rs", "my_module", NodeKind::Module, 1, 100),
+            make_node("src/lib.rs", "real_fn", NodeKind::Function, 5, 10),
+        ];
+        let index = build_file_line_index(&nodes);
+
+        let result = find_node_at(&index, &PathBuf::from("src/lib.rs"), 7);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "real_fn");
+
+        // Module-only line
+        let result = find_node_at(&index, &PathBuf::from("src/lib.rs"), 50);
+        assert!(result.is_none());
     }
 }

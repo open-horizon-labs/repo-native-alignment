@@ -5,6 +5,7 @@ pub mod git;
 pub mod graph;
 pub mod markdown;
 pub mod oh;
+pub mod process;
 pub mod query;
 pub mod ranking;
 pub mod roots;
