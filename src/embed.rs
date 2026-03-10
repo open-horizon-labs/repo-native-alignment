@@ -644,6 +644,11 @@ impl EmbeddingIndex {
             .vector_search(query_embedding[0].clone())
             .context("Failed to create vector search")?;
 
+        // Cosine distance [0, 2]: 0 = identical, 2 = opposite.
+        // MiniLM embeddings are normalized, so cosine is the correct metric.
+        // Default L2 produces large distances (1.5+) even for decent matches,
+        // making the 1-distance score always negative.
+        search = search.distance_type(lancedb::DistanceType::Cosine);
         search = search.limit(limit * 3); // over-fetch to filter by type
 
         let results = search
@@ -698,22 +703,37 @@ impl EmbeddingIndex {
                     }
                 }
 
-                // Convert distance to similarity score (1 - distance for L2, or just negate)
-                let score = 1.0 - distances.value(i);
+                // Convert distance to similarity (1 - distance), clamp to [0, 1].
+                // Cosine distance ranges [0, 2] for normalized vectors, so
+                // scores below 0 mean "worse than orthogonal" — pure noise.
+                let raw_score = (1.0 - distances.value(i)).max(0.0);
+
+                // Demote test files: reduce score so production code ranks above
+                // test code at similar vector distances. Uses same path conventions
+                // as ranking::is_test_file.
+                let id_str = ids.value(i).to_string();
+                let is_test = id_str.contains("/tests/")
+                    || id_str.contains("/test/")
+                    || id_str.contains("_test.")
+                    || id_str.contains(".test.")
+                    || id_str.contains(".spec.");
+                let score = if is_test { raw_score * 0.7 } else { raw_score };
 
                 search_results.push(SearchResult {
-                    id: ids.value(i).to_string(),
+                    id: id_str,
                     kind,
                     title: titles.value(i).to_string(),
                     body: bodies.value(i).to_string(),
                     score,
                 });
-
-                if search_results.len() >= limit {
-                    break;
-                }
             }
         }
+
+        // Re-sort by adjusted score (descending) and truncate.
+        // LanceDB returns results sorted by raw distance, but our
+        // test-file demotion may reorder them.
+        search_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        search_results.truncate(limit);
 
         Ok(search_results)
     }
