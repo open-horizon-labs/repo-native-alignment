@@ -173,7 +173,7 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
         Ok(idx) => {
             // Probe first: if the table already exists, reuse it; otherwise rebuild.
             match idx.search("_probe_", None, 1).await {
-                Ok(_) => {
+                Ok(crate::embed::SearchOutcome::Results(_)) => {
                     tracing::info!(
                         "Smoke: embedding index reused in {:?}",
                         embed_start.elapsed()
@@ -181,7 +181,7 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
                     checks.push(Check::pass("embed_index", "Persisted embedding index reused"));
                     Some(idx)
                 }
-                Err(_) => {
+                Ok(crate::embed::SearchOutcome::NotReady) | Err(_) => {
                     let embeddable: Vec<_> = all_nodes.iter()
                         .filter(|n| n.id.root != "external")
                         .take(50)
@@ -225,8 +225,11 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     match &embed_index {
         Some(idx) => {
             match idx.search("main", None, 5).await {
-                Ok(results) if !results.is_empty() => {
+                Ok(crate::embed::SearchOutcome::Results(results)) if !results.is_empty() => {
                     checks.push(Check::pass("oh_search_context", format!("{} results for query \"main\"", results.len())));
+                }
+                Ok(crate::embed::SearchOutcome::NotReady) => {
+                    checks.push(Check::skip("oh_search_context", "Embedding table not built yet"));
                 }
                 Ok(_) => {
                     checks.push(Check::fail("oh_search_context", "Query \"main\" returned 0 results"));
@@ -1226,16 +1229,10 @@ async fn run_oh_search_context_check(embed_index: &Option<EmbeddingIndex>) -> Ch
     };
 
     match index.search("alignment", None, 5).await {
-        Err(e) => {
-            // Table-not-found means indexing was skipped — not a hard failure
-            let msg = e.to_string();
-            if msg.contains("Table not found") {
-                Check::skip("oh_search_context", "Embedding table not found — run index_all first")
-            } else {
-                Check::fail("oh_search_context", format!("Semantic search failed: {}", e))
-            }
+        Ok(crate::embed::SearchOutcome::NotReady) => {
+            Check::skip("oh_search_context", "Embedding table not built yet — index is still building")
         }
-        Ok(results) => {
+        Ok(crate::embed::SearchOutcome::Results(results)) => {
             if results.is_empty() {
                 Check::skip(
                     "oh_search_context",
@@ -1252,6 +1249,9 @@ async fn run_oh_search_context_check(embed_index: &Option<EmbeddingIndex>) -> Ch
                     ),
                 )
             }
+        }
+        Err(e) => {
+            Check::fail("oh_search_context", format!("Semantic search failed: {}", e))
         }
     }
 }

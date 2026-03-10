@@ -227,6 +227,14 @@ pub struct EmbeddingIndex {
     table_name: String,
 }
 
+/// Result of a semantic search — either results or "not ready yet."
+pub enum SearchOutcome {
+    /// Index is ready; here are the results (may be empty).
+    Results(Vec<SearchResult>),
+    /// Embedding table hasn't been created yet — index is still building.
+    NotReady,
+}
+
 /// A search result with the artifact and its relevance score.
 pub struct SearchResult {
     pub id: String,
@@ -286,15 +294,7 @@ impl EmbeddingIndex {
         })
     }
 
-    /// Check whether the embedding table has been created yet.
-    /// Returns false during initial indexing before the first batch is written.
-    pub async fn is_ready(&self) -> bool {
-        self.db
-            .open_table(&self.table_name)
-            .execute()
-            .await
-            .is_ok()
-    }
+
 
     /// Index all .oh/ artifacts, git commits, and optionally code symbols.
     /// Call with symbols from the graph to enable semantic code search.
@@ -678,12 +678,14 @@ impl EmbeddingIndex {
     }
 
     /// Semantic search over indexed artifacts.
+    /// Returns `SearchOutcome::NotReady` if the table hasn't been created yet,
+    /// `SearchOutcome::Results(vec)` otherwise (may be empty).
     pub async fn search(
         &self,
         query: &str,
         artifact_types: Option<&[String]>,
         limit: usize,
-    ) -> Result<Vec<SearchResult>> {
+    ) -> Result<SearchOutcome> {
         let table = match self
             .db
             .open_table(&self.table_name)
@@ -691,11 +693,12 @@ impl EmbeddingIndex {
             .await
         {
             Ok(t) => t,
-            Err(_) => {
-                // Table doesn't exist yet — embedding index is still building.
-                // Return empty results instead of erroring so callers can show
-                // a "building" status rather than an opaque error.
-                return Ok(vec![]);
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("was not found") || msg.contains("does not exist") || msg.contains("not found") {
+                    return Ok(SearchOutcome::NotReady);
+                }
+                return Err(e).context("Failed to open embedding table");
             }
         };
 
@@ -797,7 +800,7 @@ impl EmbeddingIndex {
         search_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         search_results.truncate(limit);
 
-        Ok(search_results)
+        Ok(SearchOutcome::Results(search_results))
     }
 }
 

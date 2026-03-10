@@ -14,7 +14,7 @@ use rust_mcp_sdk::schema::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::embed::EmbeddingIndex;
+use crate::embed::{EmbeddingIndex, SearchOutcome};
 use crate::extract::{ExtractorRegistry, EnricherRegistry};
 use crate::graph::{self, EdgeKind, Node, Edge, Confidence, ExtractionSource, NodeId, NodeKind};
 use crate::graph::index::GraphIndex;
@@ -2094,26 +2094,25 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                     let embed_guard = self.embed_index.load();
                     match embed_guard.as_ref() {
                         Some(index) => {
-                            if !index.is_ready().await {
-                                sections.push("Embedding index: building — semantic results will appear shortly. Retry in a few seconds.".to_string());
-                            } else {
-                                match index.search(query, args.artifact_types.as_deref(), limit).await {
-                                    Ok(results) => {
-                                        if !results.is_empty() {
-                                            let md: String = results
-                                                .iter()
-                                                .map(|r| r.to_markdown())
-                                                .collect::<Vec<_>>()
-                                                .join("\n");
-                                            sections.push(format!(
-                                                "### Artifacts ({} result(s))\n\n{}",
-                                                results.len(),
-                                                md
-                                            ));
-                                        }
+                            match index.search(query, args.artifact_types.as_deref(), limit).await {
+                                Ok(SearchOutcome::Results(results)) => {
+                                    if !results.is_empty() {
+                                        let md: String = results
+                                            .iter()
+                                            .map(|r| r.to_markdown())
+                                            .collect::<Vec<_>>()
+                                            .join("\n");
+                                        sections.push(format!(
+                                            "### Artifacts ({} result(s))\n\n{}",
+                                            results.len(),
+                                            md
+                                        ));
                                     }
-                                    Err(e) => sections.push(format!("Artifact search error: {}", e)),
                                 }
+                                Ok(SearchOutcome::NotReady) => {
+                                    sections.push("Embedding index: building — semantic results will appear shortly. Retry in a few seconds.".to_string());
+                                }
+                                Err(e) => sections.push(format!("Artifact search error: {}", e)),
                             }
                         }
                         None => sections.push("Embedding index not yet available".to_string()),
@@ -2404,17 +2403,12 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                     let embed_guard = self.embed_index.load();
                     match embed_guard.as_ref() {
                         Some(embed_idx) => {
-                            if !embed_idx.is_ready().await {
-                                return Ok(text_result(
-                                    "Embedding index: building — semantic graph queries will work shortly. Use node_id from search_symbols instead, or retry in a few seconds.".to_string()
-                                ));
-                            }
                             // Search without type filter, then keep only code:* kinds.
                             // This is robust to new code kinds added to the embedding pipeline
                             // (the pipeline already gates what gets indexed via is_embeddable()).
                             // We over-fetch by 3x to have enough results after filtering.
                             match embed_idx.search(query_text, None, top_k.min(50) * 3).await {
-                                Ok(results) if !results.is_empty() => {
+                                Ok(SearchOutcome::Results(results)) if !results.is_empty() => {
                                     // Filter to code symbols only and take top_k
                                     let code_results: Vec<_> = results.into_iter()
                                         .filter(|r| r.kind.starts_with("code:"))
@@ -2440,6 +2434,11 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                         .collect();
                                     header.push('\n');
                                     (ids, header)
+                                }
+                                Ok(SearchOutcome::NotReady) => {
+                                    return Ok(text_result(
+                                        "Embedding index: building — semantic graph queries will work shortly. Use node_id from search_symbols instead, or retry in a few seconds.".to_string()
+                                    ));
                                 }
                                 Ok(_) => {
                                     return Ok(text_result(format!(
