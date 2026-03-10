@@ -72,6 +72,9 @@ futures = "0.3"
 # LSP protocol types (for Phase 2 enrichment via language servers)
 lsp-types = "0.97"
 
+# URI parsing (percent-decoding for LSP file:// URIs)
+url = "2"
+
 # Error handling
 anyhow = "1"
 

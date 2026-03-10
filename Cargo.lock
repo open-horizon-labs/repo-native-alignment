@@ -5750,6 +5750,7 @@ dependencies = [
  "tree-sitter-typescript",
  "tree-sitter-yaml",
  "tree-sitter-zig",
+ "url",
  "uuid",
 ]
 

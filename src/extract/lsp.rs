@@ -286,7 +286,14 @@ struct LspState {
     init_failed: bool,
     /// Whether the language server supports type hierarchy requests.
     has_type_hierarchy: bool,
+    /// Consecutive type hierarchy failures. After MAX_TYPE_HIERARCHY_STRIKES,
+    /// type hierarchy is disabled for the rest of the session.
+    type_hierarchy_strikes: u32,
 }
+
+/// After this many consecutive type hierarchy failures, disable type hierarchy
+/// for the remainder of the enrichment pass to avoid stalling on broken servers.
+const MAX_TYPE_HIERARCHY_STRIKES: u32 = 3;
 
 impl LspEnricher {
     /// Create a new LSP enricher for the given language server.
@@ -314,6 +321,7 @@ impl LspEnricher {
                 root_path: None,
                 init_failed: false,
                 has_type_hierarchy: false,
+                type_hierarchy_strikes: 0,
             }),
         }
     }
@@ -666,6 +674,13 @@ impl LspEnricher {
 
     /// Use type hierarchy to discover supertypes and subtypes for a node,
     /// creating Implements edges for each resolved relationship.
+    ///
+    /// Skips subtypes query for Trait nodes (find_implementations already covers that
+    /// direction, so querying subtypes would produce duplicate edges). Also skips subtypes
+    /// for Struct/Enum nodes (in Rust, these can't have subtypes).
+    ///
+    /// Returns `true` if the prepare call succeeded, `false` if it failed (used for
+    /// strike counting).
     async fn enrich_type_hierarchy(
         transport: &mut LspTransport,
         file_uri: &Uri,
@@ -675,13 +690,13 @@ impl LspEnricher {
         matching_nodes: &[&Node],
         root: &Path,
         result: &mut EnrichmentResult,
-    ) {
+    ) -> bool {
         let items = match Self::prepare_type_hierarchy(transport, file_uri, line, character).await {
             Ok(items) if !items.is_empty() => items,
-            Ok(_) => return, // No type hierarchy item at this position
+            Ok(_) => return true, // No type hierarchy item — not a failure
             Err(e) => {
                 tracing::debug!("prepareTypeHierarchy failed for {}: {}", node.id.name, e);
-                return;
+                return false;
             }
         };
 
@@ -719,39 +734,49 @@ impl LspEnricher {
                 }
             }
 
-            // Subtypes: each subtype implements/inherits from this node
-            match Self::type_hierarchy_subtypes(transport, item).await {
-                Ok(subtypes) => {
-                    for subtype in &subtypes {
-                        if let Some(target_id) = Self::resolve_type_hierarchy_item(
-                            subtype, matching_nodes, root,
-                        ) {
-                            // Skip self-references
-                            if target_id == node.id {
-                                continue;
+            // Subtypes: skip for Trait nodes (find_implementations already produces these
+            // edges) and for Struct/Enum nodes (they can't have subtypes in Rust).
+            // Only query subtypes for nodes where it's meaningful and non-redundant.
+            let skip_subtypes = matches!(
+                node.id.kind,
+                NodeKind::Trait | NodeKind::Struct | NodeKind::Enum
+            );
+            if !skip_subtypes {
+                match Self::type_hierarchy_subtypes(transport, item).await {
+                    Ok(subtypes) => {
+                        for subtype in &subtypes {
+                            if let Some(target_id) = Self::resolve_type_hierarchy_item(
+                                subtype, matching_nodes, root,
+                            ) {
+                                // Skip self-references
+                                if target_id == node.id {
+                                    continue;
+                                }
+                                tracing::debug!(
+                                    "Type hierarchy: {} (subtype) implements {}",
+                                    target_id.name, node.id.name
+                                );
+                                result.added_edges.push(Edge {
+                                    from: target_id,
+                                    to: node.id.clone(),
+                                    kind: EdgeKind::Implements,
+                                    source: ExtractionSource::Lsp,
+                                    confidence: Confidence::Confirmed,
+                                });
                             }
-                            tracing::debug!(
-                                "Type hierarchy: {} (subtype) implements {}",
-                                target_id.name, node.id.name
-                            );
-                            result.added_edges.push(Edge {
-                                from: target_id,
-                                to: node.id.clone(),
-                                kind: EdgeKind::Implements,
-                                source: ExtractionSource::Lsp,
-                                confidence: Confidence::Confirmed,
-                            });
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        "typeHierarchy/subtypes failed for {}: {}",
-                        node.id.name, e
-                    );
+                    Err(e) => {
+                        tracing::debug!(
+                            "typeHierarchy/subtypes failed for {}: {}",
+                            node.id.name, e
+                        );
+                    }
                 }
             }
         }
+
+        true // prepare succeeded
     }
 
     /// Resolve a TypeHierarchyItem (JSON) to a NodeId in the graph.
@@ -763,9 +788,20 @@ impl LspEnricher {
     ) -> Option<NodeId> {
         let name = item.get("name")?.as_str()?;
         let uri_str = item.get("uri")?.as_str()?;
-        let file_path_str = uri_str.strip_prefix("file://")?;
 
-        let abs_path = PathBuf::from(file_path_str);
+        // Use url::Url for proper percent-decoding of file:// URIs
+        let abs_path = match url::Url::parse(uri_str) {
+            Ok(url) => match url.to_file_path() {
+                Ok(p) => p,
+                Err(_) => return None,
+            },
+            Err(_) => {
+                // Fallback: manual strip for non-standard URIs
+                let file_path_str = uri_str.strip_prefix("file://")?;
+                PathBuf::from(file_path_str)
+            }
+        };
+
         let rel_path = abs_path.strip_prefix(root).unwrap_or(&abs_path).to_path_buf();
 
         // Skip external dependencies
@@ -780,17 +816,42 @@ impl LspEnricher {
             .unwrap_or(0);
 
         // Try exact name + file match first
-        let target = matching_nodes.iter()
+        let candidates: Vec<_> = matching_nodes.iter()
             .filter(|n| n.id.file == rel_path)
             .filter(|n| n.id.name == name)
             .filter(|n| matches!(n.id.kind,
                 NodeKind::Trait | NodeKind::Struct | NodeKind::Enum | NodeKind::Impl
             ))
-            .next()
-            .map(|n| n.id.clone());
+            .collect();
 
-        if target.is_some() {
-            return target;
+        if candidates.len() == 1 {
+            return Some(candidates[0].id.clone());
+        }
+
+        if candidates.len() > 1 {
+            // Ambiguous name match — use position to disambiguate (issue #2: name collision)
+            tracing::debug!(
+                "resolve_type_hierarchy_item: {} candidates for '{}' in {}, using position tiebreaker",
+                candidates.len(), name, rel_path.display()
+            );
+            if range_start_line > 0 {
+                if let Some(best) = candidates.iter()
+                    .filter(|n| n.line_start <= range_start_line && n.line_end >= range_start_line)
+                    .min_by_key(|n| n.line_end - n.line_start)
+                {
+                    return Some(best.id.clone());
+                }
+            }
+            // If position doesn't help, pick closest by line_start
+            if range_start_line > 0 {
+                if let Some(best) = candidates.iter()
+                    .min_by_key(|n| (n.line_start as isize - range_start_line as isize).unsigned_abs())
+                {
+                    return Some(best.id.clone());
+                }
+            }
+            // Last resort: take first
+            return Some(candidates[0].id.clone());
         }
 
         // Fallback: find enclosing symbol at the position
@@ -913,7 +974,8 @@ impl Enricher for LspEnricher {
             .root_path
             .clone()
             .unwrap_or_else(|| repo_root.to_path_buf());
-        let has_type_hierarchy = state.has_type_hierarchy;
+        let mut has_type_hierarchy = state.has_type_hierarchy;
+        let mut type_hierarchy_strikes = state.type_hierarchy_strikes;
         let transport = match state.transport.as_mut() {
             Some(t) => t,
             None => return Ok(result),
@@ -1162,21 +1224,46 @@ impl Enricher for LspEnricher {
                         }
                     }
 
-                    // Type hierarchy: discover supertypes and subtypes via LSP
+                    // Type hierarchy: discover supertypes (subtypes skipped — find_implementations covers that)
                     if has_type_hierarchy {
-                        Self::enrich_type_hierarchy(
+                        let ok = Self::enrich_type_hierarchy(
                             transport, &file_uri, line, col,
                             node, &matching_nodes, &root, &mut result,
                         ).await;
+                        if !ok {
+                            type_hierarchy_strikes += 1;
+                            if type_hierarchy_strikes >= MAX_TYPE_HIERARCHY_STRIKES {
+                                tracing::warn!(
+                                    "Type hierarchy disabled after {} consecutive failures",
+                                    type_hierarchy_strikes
+                                );
+                                has_type_hierarchy = false;
+                            }
+                        } else {
+                            type_hierarchy_strikes = 0;
+                        }
                     }
                 }
                 NodeKind::Struct | NodeKind::Enum => {
-                    // Type hierarchy for structs/enums: discover inheritance/implementation chains
+                    // Type hierarchy for structs/enums: discover supertypes only
+                    // (subtypes skipped — Rust structs/enums can't have subtypes)
                     if has_type_hierarchy {
-                        Self::enrich_type_hierarchy(
+                        let ok = Self::enrich_type_hierarchy(
                             transport, &file_uri, line, col,
                             node, &matching_nodes, &root, &mut result,
                         ).await;
+                        if !ok {
+                            type_hierarchy_strikes += 1;
+                            if type_hierarchy_strikes >= MAX_TYPE_HIERARCHY_STRIKES {
+                                tracing::warn!(
+                                    "Type hierarchy disabled after {} consecutive failures",
+                                    type_hierarchy_strikes
+                                );
+                                has_type_hierarchy = false;
+                            }
+                        } else {
+                            type_hierarchy_strikes = 0;
+                        }
                     }
                 }
                 _ => {
@@ -1224,6 +1311,10 @@ impl Enricher for LspEnricher {
                 }
             }
         }
+
+        // Persist strike counter back to state for the next enrich() call
+        state.type_hierarchy_strikes = type_hierarchy_strikes;
+        state.has_type_hierarchy = has_type_hierarchy;
 
         tracing::info!(
             "LSP enrichment complete for {}: {} edges added ({} attempted, {} errors)",
@@ -1427,6 +1518,137 @@ mod tests {
         let uri = Uri::from_str("file:///home/user/project/src/main.rs").unwrap();
         let rel = uri_to_relative_path(&uri, &root);
         assert_eq!(rel, PathBuf::from("src/main.rs"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for resolve_type_hierarchy_item (pure function, no LSP server needed)
+    // -----------------------------------------------------------------------
+
+    fn make_node(file: &str, name: &str, kind: NodeKind, line_start: usize, line_end: usize) -> Node {
+        let kind_str = match &kind {
+            NodeKind::Trait => "trait",
+            NodeKind::Struct => "struct",
+            NodeKind::Enum => "enum",
+            _ => "impl",
+        };
+        Node {
+            id: NodeId {
+                root: String::new(),
+                file: PathBuf::from(file),
+                name: name.to_string(),
+                kind,
+            },
+            language: "rust".to_string(),
+            line_start,
+            line_end,
+            signature: format!("{} {}", kind_str, name),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        }
+    }
+
+    fn make_type_hierarchy_item(name: &str, uri: &str, start_line: u64) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "uri": uri,
+            "kind": 5,
+            "range": {
+                "start": { "line": start_line, "character": 0 },
+                "end": { "line": start_line + 5, "character": 0 }
+            }
+        })
+    }
+
+    #[test]
+    fn test_resolve_type_hierarchy_single_match() {
+        let root = PathBuf::from("/project");
+        let node = make_node("src/lib.rs", "MyTrait", NodeKind::Trait, 10, 20);
+        let nodes: Vec<&Node> = vec![&node];
+
+        let item = make_type_hierarchy_item("MyTrait", "file:///project/src/lib.rs", 9);
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        assert_eq!(result.unwrap().name, "MyTrait");
+    }
+
+    #[test]
+    fn test_resolve_type_hierarchy_name_collision_uses_position() {
+        let root = PathBuf::from("/project");
+        let node1 = make_node("src/lib.rs", "Config", NodeKind::Struct, 10, 20);
+        let node2 = make_node("src/lib.rs", "Config", NodeKind::Struct, 50, 60);
+        let nodes: Vec<&Node> = vec![&node1, &node2];
+
+        // Item at line 50 (0-indexed: 49) should resolve to node2
+        let item = make_type_hierarchy_item("Config", "file:///project/src/lib.rs", 49);
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        assert_eq!(result.as_ref().unwrap().name, "Config");
+        // The resolved node should be the one at line 50-60 (node2)
+        let resolved_id = result.unwrap();
+        assert!(
+            nodes.iter().any(|n| n.id == resolved_id && n.line_start == 50),
+            "should resolve to the node at line 50, not line 10"
+        );
+    }
+
+    #[test]
+    fn test_resolve_type_hierarchy_position_fallback() {
+        let root = PathBuf::from("/project");
+        let node = make_node("src/lib.rs", "MyStruct", NodeKind::Struct, 10, 20);
+        let nodes: Vec<&Node> = vec![&node];
+
+        // Item with a different name — should fall through to position-based fallback
+        let item = make_type_hierarchy_item("DifferentName", "file:///project/src/lib.rs", 14);
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        // line 14 (0-indexed) + 1 = 15, which is within [10, 20]
+        assert_eq!(result.unwrap().name, "MyStruct");
+    }
+
+    #[test]
+    fn test_resolve_type_hierarchy_external_dependency_filtered() {
+        let root = PathBuf::from("/project");
+        let node = make_node(".cargo/registry/src/tokio/lib.rs", "Runtime", NodeKind::Struct, 1, 100);
+        let nodes: Vec<&Node> = vec![&node];
+
+        let item = make_type_hierarchy_item("Runtime", "file:///project/.cargo/registry/src/tokio/lib.rs", 0);
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        assert!(result.is_none(), ".cargo paths should be filtered out");
+    }
+
+    #[test]
+    fn test_resolve_type_hierarchy_missing_fields_returns_none() {
+        let root = PathBuf::from("/project");
+        let node = make_node("src/lib.rs", "Foo", NodeKind::Struct, 1, 10);
+        let nodes: Vec<&Node> = vec![&node];
+
+        // Missing "uri"
+        let item = serde_json::json!({"name": "Foo"});
+        assert!(LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root).is_none());
+
+        // Missing "name"
+        let item = serde_json::json!({"uri": "file:///project/src/lib.rs"});
+        assert!(LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root).is_none());
+
+        // Empty object
+        let item = serde_json::json!({});
+        assert!(LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root).is_none());
+    }
+
+    #[test]
+    fn test_resolve_type_hierarchy_percent_encoded_uri() {
+        let root = PathBuf::from("/my project");
+        let node = make_node("src/lib.rs", "Foo", NodeKind::Struct, 1, 10);
+        let nodes: Vec<&Node> = vec![&node];
+
+        // URI with percent-encoded space
+        let item = make_type_hierarchy_item("Foo", "file:///my%20project/src/lib.rs", 0);
+        let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
+        assert_eq!(result.unwrap().name, "Foo");
+    }
+
+    #[test]
+    fn test_max_type_hierarchy_strikes_constant() {
+        // Verify the constant is reasonable
+        assert_eq!(MAX_TYPE_HIERARCHY_STRIKES, 3);
     }
 
     /// If rust-analyzer is available, test actual enrichment on a small Rust file.
