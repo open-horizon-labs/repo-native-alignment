@@ -99,52 +99,22 @@ impl MarkdownChunk {
         format!("{}\n\n{}", location, self.content)
     }
 
-    /// Produce embedding text with contextual breadcrumbs.
+    /// Produce embedding text: just the body content, truncated to fit
+    /// within a 512-token embedding model budget (MiniLM-L6-v2).
     ///
-    /// Format: `"section_path: body_text"` so the embedding model
-    /// captures WHERE in the document this section lives.
-    /// Body is truncated to ~500 chars to stay within a 512-token embedding
-    /// model budget (MiniLM-L6-v2). The breadcrumb prefix typically adds
-    /// 20-50 chars, leaving ~125-150 tokens for body content.
-    ///
-    /// EXPERIMENTAL: Breadcrumb prefixing ("Aim > Mechanism: body") is
-    /// unvalidated with MiniLM — the model has no understanding of `>` as
-    /// hierarchy. The prefix is conditional:
-    /// - Frontmatter: no prefix (YAML metadata like "status: active" is noise
-    ///   for MiniLM; the body speaks for itself)
-    /// - Preamble (no headings): file-path prefix for minimal context
-    /// - Single-level heading (e.g., just "# Title"): no breadcrumb prefix,
-    ///   since the heading text is already in the body content
-    /// - Multi-level hierarchy (2+ levels): breadcrumb prefix to convey
-    ///   structural context (e.g., "Aim > Mechanism: body")
+    /// No breadcrumb prefix — the section_path() adds no validated value
+    /// for MiniLM-L6-v2 and wastes embedding budget. The body text alone
+    /// is the semantic signal.
     pub fn embedding_text(&self) -> String {
         self.embedding_text_with_limit(500)
     }
 
     /// Internal: produce embedding text with a configurable char limit on body.
     fn embedding_text_with_limit(&self, max_body_chars: usize) -> String {
-        let body = if self.content.len() > max_body_chars {
-            &self.content[..self.content.floor_char_boundary(max_body_chars)]
+        if self.content.len() > max_body_chars {
+            self.content[..self.content.floor_char_boundary(max_body_chars)].to_string()
         } else {
-            &self.content
-        };
-
-        if self.is_frontmatter {
-            // Frontmatter: skip prefix entirely — "frontmatter: status: active..."
-            // wastes embedding budget with noise for MiniLM.
-            body.to_string()
-        } else if self.heading_hierarchy.is_empty() {
-            // Preamble (no headings): file-path prefix for minimal context
-            format!("[preamble] {}: {}", self.file_path.display(), body)
-        } else if self.heading_hierarchy.len() == 1 {
-            // Single heading level: the heading text is already in the body
-            // content, so a "Heading: body" prefix is redundant.
-            body.to_string()
-        } else {
-            // Multi-level hierarchy: breadcrumb prefix conveys structural
-            // context (EXPERIMENTAL — unvalidated with MiniLM).
-            let sp = self.section_path();
-            format!("{}: {}", sp, body)
+            self.content.clone()
         }
     }
 }

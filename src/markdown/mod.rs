@@ -655,8 +655,8 @@ mod tests {
         };
 
         let text = chunk.embedding_text();
-        assert!(text.starts_with("Aim > Hypothesis: "));
-        assert!(text.contains("We believe X will cause Y."));
+        // No breadcrumb prefix — just the body text
+        assert_eq!(text, "We believe X will cause Y.");
     }
 
     #[test]
@@ -1636,9 +1636,8 @@ Deepest content.\n";
 
         // Should not panic even with very long section_path
         let text = chunk.embedding_text();
-        assert!(text.contains("Short body."));
-        // section_path uses " > " as separator
-        assert!(text.contains(" > "));
+        // No breadcrumb prefix — just the body text
+        assert_eq!(text, "Short body.");
     }
 
     #[test]
@@ -1881,9 +1880,10 @@ Deepest content.\n";
         };
 
         let text = chunk.embedding_text();
-        assert!(
-            text.starts_with("[preamble] doc.md: "),
-            "Preamble embedding should use [preamble] prefix, got: {}",
+        // No prefix — just the body text
+        assert_eq!(
+            text, "Some preamble.",
+            "Preamble embedding should have no prefix, got: {}",
             text
         );
     }
