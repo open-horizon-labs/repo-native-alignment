@@ -3063,4 +3063,69 @@ mod tests {
         let result = format_freshness(100, Some(std::time::Instant::now()), Some(&status));
         assert!(result.contains("LSP: enriched (1247 edges)"));
     }
+
+    // ── Adversarial LspEnrichmentStatus tests ─────────────────────────
+
+    #[test]
+    fn test_lsp_status_set_complete_without_set_running() {
+        // Should not panic — direct transition from NotStarted to Complete
+        let status = LspEnrichmentStatus::default();
+        status.set_complete(10);
+        assert_eq!(status.footer_segment().unwrap(), "LSP: enriched (10 edges)");
+    }
+
+    #[test]
+    fn test_lsp_status_double_set_running() {
+        // Calling set_running twice shouldn't corrupt state
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_running();
+        assert_eq!(status.footer_segment().unwrap(), "LSP: pending");
+    }
+
+    #[test]
+    fn test_lsp_status_complete_then_running_again() {
+        // Simulates a second enrichment pass (incremental after full)
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_complete(100);
+        assert!(status.footer_segment().unwrap().contains("100 edges"));
+        // New enrichment pass starts
+        status.set_running();
+        assert_eq!(status.footer_segment().unwrap(), "LSP: pending");
+        status.set_complete(150);
+        assert!(status.footer_segment().unwrap().contains("150 edges"));
+    }
+
+    #[test]
+    fn test_lsp_status_concurrent_reads() {
+        // Multiple threads reading footer_segment while state changes
+        use std::sync::Arc;
+        let status = Arc::new(LspEnrichmentStatus::default());
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let s = status.clone();
+                std::thread::spawn(move || {
+                    if i % 2 == 0 {
+                        s.set_running();
+                    } else {
+                        s.set_complete(i * 10);
+                    }
+                    // Should never panic
+                    let _ = s.footer_segment();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_lsp_status_large_edge_count() {
+        let status = LspEnrichmentStatus::default();
+        status.set_complete(usize::MAX);
+        let seg = status.footer_segment().unwrap();
+        assert!(seg.contains("edges"));
+    }
 }
