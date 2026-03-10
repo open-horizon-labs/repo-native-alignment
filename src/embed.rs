@@ -19,6 +19,16 @@ const RECENT_COMMIT_LIMIT: usize = 100;
 /// Number of PR merge commits to embed for structural context.
 const PR_MERGE_LIMIT: usize = 50;
 
+/// Maximum character budget for code embedding text.
+///
+/// MiniLM-L6-v2 has a 256-token effective max sequence length.  Code
+/// tokenizes poorly with WordPiece (~3-4 subword tokens per identifier),
+/// so we budget ~800 chars total to stay safely within 256 tokens.
+/// The name is always included; the body (which already contains the
+/// signature) is truncated to fill the remaining budget; metadata is
+/// appended only if space remains.
+const CODE_EMBED_CHAR_BUDGET: usize = 800;
+
 /// Truncate `s` to at most `max_chars` Unicode scalar values, returning a
 /// valid UTF-8 slice. Safe even when a multibyte character straddles the
 /// byte boundary (the original panic trigger).
@@ -27,6 +37,47 @@ fn truncate_chars(s: &str, max_chars: usize) -> &str {
         Some((byte_idx, _)) => &s[..byte_idx],
         None => s,
     }
+}
+
+/// Build embedding text for a code node within the MiniLM-L6-v2 token budget.
+///
+/// Layout: `name body_excerpt [metadata]`
+///
+/// `body` already includes the signature (it's the full AST node text),
+/// so we don't push the signature separately.  The body is truncated so
+/// the total stays within [`CODE_EMBED_CHAR_BUDGET`].
+fn build_code_embedding_text(
+    name: &str,
+    body: &str,
+    metadata: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let mut t = String::with_capacity(CODE_EMBED_CHAR_BUDGET);
+    t.push_str(name);
+
+    // Reserve some space for metadata (key: value pairs)
+    let meta_estimate: usize = metadata
+        .iter()
+        .map(|(k, v)| k.len() + v.len() + 3) // "key: value "
+        .sum();
+    // Body gets the remaining budget after name + metadata estimate
+    let body_budget = CODE_EMBED_CHAR_BUDGET
+        .saturating_sub(name.chars().count() + 1)
+        .saturating_sub(meta_estimate);
+
+    if body_budget > 0 {
+        t.push(' ');
+        t.push_str(truncate_chars(body, body_budget));
+    }
+
+    for (key, value) in metadata {
+        t.push(' ');
+        t.push_str(key);
+        t.push_str(": ");
+        t.push_str(value);
+    }
+
+    // Final safety truncation to hard budget
+    truncate_chars(&t, CODE_EMBED_CHAR_BUDGET).to_string()
 }
 
 fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
@@ -214,20 +265,7 @@ impl EmbeddingIndex {
                 k => format!("{}", k),
             };
 
-            let mut text = String::new();
-            text.push_str(&node.id.name);
-            text.push(' ');
-            text.push_str(&node.signature);
-            text.push(' ');
-            let body_snippet = truncate_chars(&node.body, 500);
-            text.push_str(body_snippet);
-            // Include LSP-enriched metadata so type-level queries find these nodes.
-            for (key, value) in &node.metadata {
-                text.push(' ');
-                text.push_str(key);
-                text.push_str(": ");
-                text.push_str(value);
-            }
+            let text = build_code_embedding_text(&node.id.name, &node.body, &node.metadata);
 
             let title = format!("{} {} ({})", kind_str, node.id.name, node.language);
             let body_display = format!(
@@ -426,15 +464,21 @@ impl EmbeddingIndex {
 
             // Build searchable text for embedding.
             //
-            // For code symbols we include signature + truncated body so that
+            // For code symbols we include name + truncated body so that
             // intent-based queries like "error handling" or "rate limiting" can
             // match functions whose *body* implements that concept even when the
-            // function name/signature doesn't mention it.  The body is truncated
-            // to 500 chars to stay within the 512-token budget of MiniLM-L6-v2.
+            // function name/signature doesn't mention it.
             //
-            // This mirrors what `reindex_nodes` already does for LSP-enriched
-            // nodes, closing the gap where the initial full build embedded only
-            // the signature.
+            // body already contains the signature (full AST node text), so we
+            // don't push the signature separately — avoids wasting tokens on
+            // redundant text.
+            //
+            // Total text is budgeted to ~800 chars to stay within MiniLM-L6-v2's
+            // 256-token effective limit (code tokenizes at ~3-4 tokens/identifier).
+            //
+            // This mirrors what `reindex_nodes` does for LSP-enriched nodes,
+            // closing the gap where the initial full build embedded only the
+            // signature.
             let text = match node.id.kind {
                 crate::graph::NodeKind::Other(ref s) if s == "markdown_section" || s == "Section" => {
                     // Markdown sections: just the body text, no breadcrumb prefix.
@@ -443,22 +487,7 @@ impl EmbeddingIndex {
                     truncate_chars(&node.body, 500).to_string()
                 }
                 _ => {
-                    // Code: signature + body snippet + metadata for semantic richness
-                    let mut t = String::new();
-                    t.push_str(&node.id.name);
-                    t.push(' ');
-                    t.push_str(&node.signature);
-                    t.push(' ');
-                    let body_snippet = truncate_chars(&node.body, 500);
-                    t.push_str(body_snippet);
-                    // Include any metadata (e.g. LSP-enriched type info)
-                    for (key, value) in &node.metadata {
-                        t.push(' ');
-                        t.push_str(key);
-                        t.push_str(": ");
-                        t.push_str(value);
-                    }
-                    t
+                    build_code_embedding_text(&node.id.name, &node.body, &node.metadata)
                 }
             };
 
@@ -677,7 +706,8 @@ impl EmbeddingIndex {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_chars;
+    use super::{truncate_chars, build_code_embedding_text, CODE_EMBED_CHAR_BUDGET};
+    use std::collections::BTreeMap;
 
     #[test]
     fn test_truncate_chars_ascii() {
@@ -706,5 +736,109 @@ mod tests {
     fn test_truncate_chars_exact_boundary() {
         let s = "a".repeat(500);
         assert_eq!(truncate_chars(&s, 500), s.as_str());
+    }
+
+    #[test]
+    fn test_code_embedding_text_within_budget() {
+        // Simulate a realistic Rust function body (body includes signature)
+        let name = "handle_timeout_error";
+        let body = concat!(
+            "pub async fn handle_timeout_error(&self, req: Request) -> Result<Response> {\n",
+            "    let timeout = self.config.timeout_ms;\n",
+            "    let result = tokio::time::timeout(\n",
+            "        Duration::from_millis(timeout),\n",
+            "        self.inner.call(req),\n",
+            "    ).await;\n",
+            "    match result {\n",
+            "        Ok(Ok(resp)) => Ok(resp),\n",
+            "        Ok(Err(e)) => Err(e.into()),\n",
+            "        Err(_) => {\n",
+            "            tracing::warn!(\"Request timed out after {}ms\", timeout);\n",
+            "            Err(AppError::Timeout { duration_ms: timeout })\n",
+            "        }\n",
+            "    }\n",
+            "}\n",
+        );
+        let metadata = BTreeMap::new();
+        let text = build_code_embedding_text(name, body, &metadata);
+
+        assert!(
+            text.chars().count() <= CODE_EMBED_CHAR_BUDGET,
+            "embedding text {} chars exceeds budget {}",
+            text.chars().count(),
+            CODE_EMBED_CHAR_BUDGET,
+        );
+        // Name should be present
+        assert!(text.starts_with(name), "text should start with the function name");
+        // Body content (signature) should be present -- but NOT duplicated
+        assert!(text.contains("handle_timeout_error"), "text should contain function name");
+        let sig_occurrences = text.matches("handle_timeout_error").count();
+        // name appears once at start, once inside the body's signature line = 2 max
+        assert!(
+            sig_occurrences <= 2,
+            "function name appears {} times — possible duplication",
+            sig_occurrences,
+        );
+    }
+
+    #[test]
+    fn test_code_embedding_text_long_body_truncated() {
+        let name = "process";
+        // A body much larger than the budget
+        let body = format!(
+            "fn process(data: &[u8]) -> Result<()> {{\n{}\n}}",
+            "x".repeat(2000)
+        );
+        let metadata = BTreeMap::new();
+        let text = build_code_embedding_text(name, &body, &metadata);
+
+        assert!(
+            text.chars().count() <= CODE_EMBED_CHAR_BUDGET,
+            "embedding text {} chars exceeds budget {}",
+            text.chars().count(),
+            CODE_EMBED_CHAR_BUDGET,
+        );
+    }
+
+    #[test]
+    fn test_code_embedding_text_with_metadata() {
+        let name = "foo";
+        let body = "fn foo() -> i32 { 42 }";
+        let mut metadata = BTreeMap::new();
+        metadata.insert("return_type".to_string(), "i32".to_string());
+        metadata.insert("visibility".to_string(), "pub".to_string());
+        let text = build_code_embedding_text(name, body, &metadata);
+
+        assert!(
+            text.chars().count() <= CODE_EMBED_CHAR_BUDGET,
+            "embedding text {} chars exceeds budget {}",
+            text.chars().count(),
+            CODE_EMBED_CHAR_BUDGET,
+        );
+        // Should contain the metadata
+        assert!(text.contains("return_type: i32"), "metadata should be in text");
+    }
+
+    #[test]
+    fn test_code_embedding_no_signature_duplication() {
+        // The key review finding: body already contains the signature.
+        // We should NOT see name + signature + body (which would duplicate).
+        let name = "search";
+        let signature = "pub fn search(&self, query: &str) -> Vec<Result>";
+        let body = format!(
+            "{} {{\n    self.db.query(query).collect()\n}}",
+            signature
+        );
+        let metadata = BTreeMap::new();
+        let text = build_code_embedding_text(name, &body, &metadata);
+
+        // The signature text should appear exactly once in the embedding
+        // (inside the body excerpt), NOT separately prepended.
+        let sig_count = text.matches(signature).count();
+        assert_eq!(
+            sig_count, 1,
+            "signature should appear exactly once in embedding text, found {}",
+            sig_count,
+        );
     }
 }
