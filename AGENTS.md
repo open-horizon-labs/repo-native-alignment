@@ -2,7 +2,7 @@
 
 **The shift:** Action is cheap. Knowing what to do is scarce. We don't build features, we build capabilities.
 
-**The sequence:** aim → problem-space → problem-statement → solution-space → execute → ship
+**The sequence:** aim → problem-space → problem-statement → solution-space → **draft PR** → execute → ship
 
 **Where to start (triggers):**
 - Can't explain why you're building this → `/aim`
@@ -15,6 +15,16 @@
 - `/review` - Check alignment before committing
 - `/dissent` - Seek contrary evidence before one-way doors
 - `/salvage` - Extract learning, restart clean
+
+## Draft PR (between solution-space and execute)
+
+After `/solution-space` produces a recommendation, **create a draft PR before writing code**. The draft PR:
+- Names the branch, states the problem, and links the issue
+- Summarizes the chosen solution from solution-space analysis
+- Becomes the home for all /ship pipeline comments (review, dissent, adversarial test, merit assessment, etc.)
+- `/execute` writes code on this branch; `/ship` runs the quality gate on this PR
+
+This ensures every piece of work has a PR home before implementation begins. No orphan branches, no post-hoc PR creation.
 
 ## /ship Definition (for this project)
 
