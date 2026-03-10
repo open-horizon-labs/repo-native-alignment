@@ -2892,18 +2892,14 @@ mod tests {
     // ── parse_args edge cases ───────────────────────────────────────────
 
     #[test]
-    fn test_parse_args_none_arguments_returns_error() {
-        // BUG FINDING: When arguments is None, parse_args passes Value::Null
-        // to serde, which fails because serde expects an Object, not Null.
-        // This means calling graph_query with zero arguments returns a generic
-        // "Invalid arguments" parse error instead of the friendly
-        // "Either node_id or query is required" message.
-        // The handler's nice error message at the bottom of the if/else chain
-        // is unreachable when arguments is completely absent.
+    fn test_parse_args_none_arguments_returns_empty_object() {
+        // After #120 fix: None maps to empty object {}, not null.
+        // GraphQuery has all optional fields, so empty object deserializes OK.
+        // The handler's validation (node_id or query required) catches this.
         let result: Result<GraphQuery, _> = parse_args(None);
         assert!(
-            result.is_err(),
-            "parse_args(None) should fail — Null cannot deserialize to GraphQuery"
+            result.is_ok(),
+            "parse_args(None) should succeed — None maps to empty object, not null"
         );
     }
 
