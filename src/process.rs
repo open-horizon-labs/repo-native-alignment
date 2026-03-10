@@ -69,7 +69,12 @@ pub async fn run_with_timeout(config: &ProcessConfig<'_>) -> Result<ProcessOutpu
         .spawn()
         .with_context(|| format!("Failed to spawn '{}'", config.binary))?;
 
-    let wait_result = tokio::time::timeout(config.timeout, child.wait_with_output()).await;
+    // Take stdout/stderr handles before waiting, so we can still kill the
+    // child on timeout (wait_with_output takes ownership).
+    let mut stdout_handle = child.stdout.take();
+    let mut stderr_handle = child.stderr.take();
+
+    let wait_result = tokio::time::timeout(config.timeout, child.wait()).await;
 
     let output = match wait_result {
         Err(_elapsed) => {
@@ -94,11 +99,21 @@ pub async fn run_with_timeout(config: &ProcessConfig<'_>) -> Result<ProcessOutpu
         Ok(Err(e)) => {
             anyhow::bail!("'{}' failed to execute: {}", config.binary, e);
         }
-        Ok(Ok(child_output)) => ProcessOutput {
-            stdout: child_output.stdout,
-            stderr: child_output.stderr,
-            success: child_output.status.success(),
-        },
+        Ok(Ok(status)) => {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            if let Some(ref mut h) = stdout_handle {
+                let _ = tokio::io::AsyncReadExt::read_to_end(h, &mut stdout).await;
+            }
+            if let Some(ref mut h) = stderr_handle {
+                let _ = tokio::io::AsyncReadExt::read_to_end(h, &mut stderr).await;
+            }
+            ProcessOutput {
+                stdout,
+                stderr,
+                success: status.success(),
+            }
+        }
     };
 
     // Clean up output files regardless of success/failure
