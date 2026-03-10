@@ -227,6 +227,14 @@ pub struct EmbeddingIndex {
     table_name: String,
 }
 
+/// Result of a semantic search — either results or "not ready yet."
+pub enum SearchOutcome {
+    /// Index is ready; here are the results (may be empty).
+    Results(Vec<SearchResult>),
+    /// Embedding table hasn't been created yet — index is still building.
+    NotReady,
+}
+
 /// A search result with the artifact and its relevance score.
 pub struct SearchResult {
     pub id: String,
@@ -285,6 +293,8 @@ impl EmbeddingIndex {
             table_name: "artifacts".to_string(),
         })
     }
+
+
 
     /// Index all .oh/ artifacts, git commits, and optionally code symbols.
     /// Call with symbols from the graph to enable semantic code search.
@@ -668,18 +678,29 @@ impl EmbeddingIndex {
     }
 
     /// Semantic search over indexed artifacts.
+    /// Returns `SearchOutcome::NotReady` if the table hasn't been created yet,
+    /// `SearchOutcome::Results(vec)` otherwise (may be empty).
     pub async fn search(
         &self,
         query: &str,
         artifact_types: Option<&[String]>,
         limit: usize,
-    ) -> Result<Vec<SearchResult>> {
-        let table = self
+    ) -> Result<SearchOutcome> {
+        let table = match self
             .db
             .open_table(&self.table_name)
             .execute()
             .await
-            .context("Table not found — run index_all first")?;
+        {
+            Ok(t) => t,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("was not found") || msg.contains("does not exist") || msg.contains("not found") {
+                    return Ok(SearchOutcome::NotReady);
+                }
+                return Err(e).context("Failed to open embedding table");
+            }
+        };
 
         // Embed the query
         let query_embedding = embed_texts(vec![query.to_string()]).await?;
@@ -779,7 +800,7 @@ impl EmbeddingIndex {
         search_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         search_results.truncate(limit);
 
-        Ok(search_results)
+        Ok(SearchOutcome::Results(search_results))
     }
 }
 
