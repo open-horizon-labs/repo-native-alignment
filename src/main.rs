@@ -190,8 +190,10 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("  Embedding {} symbols...", graph.nodes.iter().filter(|n| n.id.root != "external").count());
                     loop {
                         match idx.search("_probe_", None, 1).await {
-                            Ok(_) => break 1, // table exists and is queryable
-                            Err(_) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+                            Ok(repo_native_alignment::embed::SearchOutcome::Results(_)) => break 1,
+                            Ok(repo_native_alignment::embed::SearchOutcome::NotReady) | Err(_) => {
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await
+                            }
                         }
                     }
                 }
@@ -421,7 +423,10 @@ async fn main() -> anyhow::Result<()> {
             let metis = artifacts.iter().filter(|a| a.kind == repo_native_alignment::types::OhArtifactKind::Metis).count();
 
             let embed_str = match repo_native_alignment::embed::EmbeddingIndex::new(&repo_root).await {
-                Ok(idx) => if idx.search("_probe_", None, 1).await.is_ok() { "yes" } else { "no" },
+                Ok(idx) => match idx.search("_probe_", None, 1).await {
+                    Ok(repo_native_alignment::embed::SearchOutcome::Results(_)) => "yes",
+                    _ => "no",
+                },
                 Err(_) => "no",
             };
 

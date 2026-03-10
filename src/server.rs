@@ -1419,11 +1419,11 @@ impl RnaHandler {
                     // Warm embed index from cached LanceDB table
                     if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await {
                         match idx.search("_probe_", None, 1).await {
-                            Ok(_) => {
+                            Ok(SearchOutcome::Results(_)) => {
                                 tracing::info!("Loaded existing embedding index from cache");
                                 self.embed_index.store(Arc::new(Some(idx)));
                             }
-                            Err(_) => {
+                            Ok(SearchOutcome::NotReady) | Err(_) => {
                                 match idx.index_all_with_symbols(&self.repo_root, &state.nodes).await {
                                     Ok(count) => {
                                         tracing::info!("Rebuilt embedding index: {} items from cached graph", count);
