@@ -167,10 +167,22 @@ impl ScipEnricher {
         config: &ScipIndexerConfig,
         repo_root: &Path,
     ) -> Result<scip::types::Index> {
-        // Check git HEAD for cache freshness
-        let head_oid = git_head_oid(repo_root).unwrap_or_default();
+        // Check git HEAD for cache freshness.
+        // SCIP indexers assume a git repo — skip enrichment entirely for non-git dirs
+        // to avoid redundant 120s indexer runs with no cache.
+        let head_oid = match git_head_oid(repo_root) {
+            Some(oid) => oid,
+            None => {
+                tracing::info!(
+                    "SCIP enrichment skipped for '{}': not a git repository ({})",
+                    config.name,
+                    repo_root.display()
+                );
+                return Ok(scip::types::Index::new());
+            }
+        };
 
-        if !head_oid.is_empty() {
+        {
             let cache = self.cache.lock().unwrap();
             if let Some(cached) = cache.get(config.name) {
                 if cached.head_oid == head_oid {
@@ -281,8 +293,8 @@ impl ScipEnricher {
             index.external_symbols.len()
         );
 
-        // Cache the result
-        if !head_oid.is_empty() {
+        // Cache the result (head_oid is guaranteed non-empty here)
+        {
             let mut cache = self.cache.lock().unwrap();
             cache.insert(
                 config.name.to_string(),
@@ -327,6 +339,9 @@ impl ScipEnricher {
 
         // First pass: collect symbol definitions from all documents
         for doc in &index.documents {
+            // TODO(windows): SCIP always emits forward slashes in relative_path,
+            // but PathBuf on Windows uses backslashes. File matching will silently
+            // fail on Windows. RNA targets macOS/Linux so this is not urgent.
             let rel_path = PathBuf::from(&doc.relative_path);
 
             for occ in &doc.occurrences {
@@ -360,6 +375,10 @@ impl ScipEnricher {
                         ) {
                             for impl_id in implementor_ids {
                                 for iface_id in interface_ids {
+                                    // Skip self-references (same as Calls path)
+                                    if impl_id == iface_id {
+                                        continue;
+                                    }
                                     let edge = Edge {
                                         from: impl_id.clone(),
                                         to: iface_id.clone(),
@@ -487,10 +506,16 @@ impl Enricher for ScipEnricher {
                     // Build the set of existing edge stable_ids for cross-source dedup.
                     // This includes edges from tree-sitter (already in the graph)
                     // plus any edges already added by earlier SCIP indexers in this run.
+                    // Use the same stable_id format as Edge::stable_id() to
+                    // prevent silent drift between the two dedup paths.
                     let existing_ids: HashSet<String> = index
                         .all_edges()
                         .iter()
-                        .map(|(from, to, kind)| format!("{}->{}->{}", from, kind, to))
+                        .map(|(from, to, kind)| {
+                            // Mirror Edge::stable_id(): "{from}->{kind}->{to}"
+                            // where from/to are already NodeId::to_stable_id() strings.
+                            format!("{}->{}->{}", from, kind, to)
+                        })
                         .chain(combined.added_edges.iter().map(|e| e.stable_id()))
                         .collect();
 
@@ -1077,13 +1102,9 @@ mod tests {
     }
 
     /// Self-reference in an Implements relationship: a symbol that claims to
-    /// implement itself. The code skips self-refs for CALLS but NOT for
-    /// IMPLEMENTS. This tests whether self-implementing edges leak through.
+    /// implement itself. Both Calls and Implements paths filter self-refs.
     #[test]
-    fn test_self_implementing_symbol_produces_edge() {
-        // This is a design question: should self-implements be allowed?
-        // The current code does NOT filter self-references for Implements.
-        // This test documents the current behavior.
+    fn test_self_implementing_symbol_filtered() {
         let enricher = ScipEnricher {
             supported_languages: vec!["rust"],
             available_indexers: vec![],
@@ -1120,15 +1141,12 @@ mod tests {
             &index, &nodes, &graph_index, Path::new("/tmp"), &HashSet::new(),
         );
 
-        // Current behavior: self-implements edge IS produced (no self-ref filter for Implements)
-        // This documents the behavior — if it changes, this test will catch it
+        // Self-implementing edges are filtered out (same as Calls self-ref check)
         assert_eq!(
             result.added_edges.len(),
-            1,
-            "Self-implementing edge should pass through (no self-ref filter for Implements)"
+            0,
+            "Self-implementing edge should be filtered (self-ref check)"
         );
-        assert_eq!(result.added_edges[0].from.name, "Thing");
-        assert_eq!(result.added_edges[0].to.name, "Thing");
     }
 
     /// Local symbols (starting with "local ") should be skipped entirely.
@@ -1240,25 +1258,21 @@ mod tests {
         );
     }
 
-    /// When git HEAD can't be resolved (empty OID), caching is skipped.
-    /// This means the enricher will re-index on every call -- verify the
-    /// cache remains empty after a "run" that can't resolve HEAD.
+    /// When git HEAD can't be resolved (non-git dir), run_indexer returns
+    /// an empty index and skips enrichment entirely (no redundant indexer runs).
     #[test]
-    fn test_cache_empty_when_head_unresolvable() {
+    fn test_non_git_dir_skips_enrichment() {
+        // git_head_oid returns None for non-git dirs
+        let head_oid = git_head_oid(Path::new("/tmp"));
+        assert!(head_oid.is_none(), "Non-repo should return None");
+
+        // run_indexer would return an empty Index for non-git dirs,
+        // which means no edges are extracted. Verify cache stays empty.
         let enricher = ScipEnricher {
             supported_languages: vec!["rust"],
             available_indexers: vec![],
             cache: Mutex::new(HashMap::new()),
         };
-
-        // Simulate: head_oid is empty, which means cache won't be populated.
-        // We can't easily test run_indexer without a real indexer, but we can
-        // verify the cache behavior by checking that an empty head_oid
-        // means nothing is stored.
-        let head_oid = git_head_oid(Path::new("/tmp")).unwrap_or_default();
-        assert!(head_oid.is_empty(), "Non-repo should give empty OID");
-
-        // After this, cache should remain empty
         let cache = enricher.cache.lock().unwrap();
         assert!(cache.is_empty());
     }
