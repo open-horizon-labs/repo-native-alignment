@@ -841,4 +841,283 @@ mod tests {
             sig_count,
         );
     }
+
+    // -----------------------------------------------------------------------
+    // ADVERSARIAL TESTS: edge cases, budget attacks, consistency probes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn truncate_chars_empty_string() {
+        assert_eq!(truncate_chars("", 500), "");
+    }
+
+    #[test]
+    fn truncate_chars_zero_limit() {
+        assert_eq!(truncate_chars("hello", 0), "");
+    }
+
+    /// Empty body should degrade gracefully: just the name, no crash.
+    #[test]
+    fn empty_body_degrades_gracefully() {
+        let text = build_code_embedding_text("foo", "", &BTreeMap::new());
+        assert!(text.contains("foo"), "must contain name");
+        // Should not be just whitespace or have excessive padding
+        assert_eq!(text.trim(), "foo", "empty body should produce just name (trimmed)");
+    }
+
+    /// Empty name: the function must not panic and body should still appear.
+    #[test]
+    fn empty_name_no_panic() {
+        let text = build_code_embedding_text("", "fn () { 42 }", &BTreeMap::new());
+        assert!(text.contains("fn () { 42 }"), "body must be present even with empty name");
+    }
+
+    /// Both name and body empty: should produce an empty or near-empty string.
+    #[test]
+    fn all_empty_inputs() {
+        let text = build_code_embedding_text("", "", &BTreeMap::new());
+        assert!(text.chars().count() <= CODE_EMBED_CHAR_BUDGET);
+        // Should not crash
+    }
+
+    /// BUG PROBE: meta_estimate uses .len() (bytes) but body budget
+    /// subtracts from a char-counted budget. For metadata with multibyte
+    /// characters, the byte-based estimate overcounts, stealing more body
+    /// budget than necessary.
+    #[test]
+    fn multibyte_metadata_steals_body_budget() {
+        let name = "f";
+        // 100 chars of body content
+        let body = "x".repeat(100);
+
+        // Metadata with multibyte values: 10 chars but 30 bytes each
+        let mut metadata = BTreeMap::new();
+        // Each value is 10 chars of 3-byte emoji = 30 bytes
+        let emoji_val: String = std::iter::repeat('\u{1f600}').take(10).collect();
+        metadata.insert("key".into(), emoji_val.clone());
+
+        let text = build_code_embedding_text(name, &body, &metadata);
+
+        // The metadata byte estimate will be: 3 + 30 + 3 = 36 bytes
+        // But the actual char cost is: 3 + 10 + 3 = 16 chars
+        // This means body_budget is reduced by 36 instead of 16,
+        // wasting 20 chars of body budget.
+        //
+        // Verify the body content is still present (it's short enough
+        // to fit even with the overcounting)
+        assert!(text.contains(&"x".repeat(50)),
+            "body should contain at least 50 x's, but meta byte overcounting \
+             may have stolen body budget. Text: {}", text);
+    }
+
+    /// Attack: enormous name that exceeds CODE_EMBED_CHAR_BUDGET.
+    /// The safety truncation must catch this.
+    #[test]
+    fn enormous_name_exceeds_budget() {
+        let name = "a".repeat(2000);
+        let body = "fn big() { }";
+        let text = build_code_embedding_text(&name, body, &BTreeMap::new());
+
+        assert!(
+            text.chars().count() <= CODE_EMBED_CHAR_BUDGET,
+            "enormous name ({} chars) must be truncated to budget ({}), got {}",
+            name.len(), CODE_EMBED_CHAR_BUDGET, text.chars().count()
+        );
+    }
+
+    /// Attack: enormous metadata that floods past budget.
+    /// Even with final safety truncation, the metadata loop runs to
+    /// completion before truncating. This is wasteful but not incorrect.
+    #[test]
+    fn enormous_metadata_within_budget() {
+        let name = "f";
+        let body = "fn f() {}";
+        let mut metadata = BTreeMap::new();
+        for i in 0..50 {
+            metadata.insert(
+                format!("type_ref_{:03}", i),
+                format!("some::deeply::nested::module::Type{}<Generic{}, Another{}>", i, i, i),
+            );
+        }
+
+        let text = build_code_embedding_text(name, body, &metadata);
+        assert!(
+            text.chars().count() <= CODE_EMBED_CHAR_BUDGET,
+            "50 metadata entries must stay within budget, got {} chars",
+            text.chars().count()
+        );
+    }
+
+    /// BUG PROBE: When metadata is very large, body_budget saturates to 0.
+    /// The body content (which includes the signature!) gets entirely
+    /// dropped. The embedding becomes: name + metadata -- losing the
+    /// function's actual code, which defeats the purpose of this PR.
+    #[test]
+    fn large_metadata_evicts_body_entirely() {
+        let name = "search";
+        let body = "pub fn search(&self, q: &str) -> Vec<R> { self.db.query(q) }";
+        let mut metadata = BTreeMap::new();
+        // ~600 bytes of metadata, which will consume most of the 800-char budget
+        for i in 0..15 {
+            metadata.insert(
+                format!("param_type_{}", i),
+                format!("std::collections::HashMap<String, Vec<Arc<Mutex<Type{}>>>>", i),
+            );
+        }
+
+        let text = build_code_embedding_text(name, body, &metadata);
+        // The body should still be present, at least partially
+        // If meta_estimate > budget - name, body_budget = 0 and body is gone
+        let has_body = text.contains("search") && text.contains("query");
+        if !has_body {
+            // Document the failure mode -- body was evicted
+            panic!(
+                "BUG: large metadata evicted the function body entirely. \
+                 The embedding text is: name + metadata with no code content. \
+                 This defeats the purpose of embedding function bodies.\n\
+                 Text ({} chars): {}",
+                text.chars().count(),
+                &text[..text.len().min(300)]
+            );
+        }
+    }
+
+    /// Single-line function: body IS the signature. Embedding should
+    /// contain it exactly once (from body), plus the name.
+    #[test]
+    fn single_line_function_no_duplication() {
+        let sig_and_body = "fn default_port() -> u16 { 8080 }";
+        let text = build_code_embedding_text("default_port", sig_and_body, &BTreeMap::new());
+
+        let count = text.matches(sig_and_body).count();
+        assert_eq!(
+            count, 1,
+            "single-line function should appear once in text, found {}. Text: {}",
+            count, text
+        );
+    }
+
+    /// Unicode in name and body: must not panic on multibyte boundaries.
+    #[test]
+    fn unicode_identifiers_safe() {
+        let text = build_code_embedding_text(
+            "\u{1f600}_handler",
+            "fn \u{1f600}_handler() { let \u{03b1} = \u{03b2} + \u{03b3}; }",
+            &BTreeMap::new(),
+        );
+        assert!(std::str::from_utf8(text.as_bytes()).is_ok(), "must be valid UTF-8");
+        assert!(text.contains("\u{1f600}"), "emoji must survive");
+    }
+
+    /// Whitespace-only body should not produce excessive padding.
+    #[test]
+    fn whitespace_only_body() {
+        let text = build_code_embedding_text("blank", "   \n\t\n   ", &BTreeMap::new());
+        assert!(text.starts_with("blank"), "name must be at start");
+        assert!(text.chars().count() <= CODE_EMBED_CHAR_BUDGET);
+    }
+
+    /// Determinism: same inputs always produce same output.
+    #[test]
+    fn embedding_text_deterministic() {
+        let meta = BTreeMap::from([("k".into(), "v".into())]);
+        let t1 = build_code_embedding_text("f", "fn f() {}", &meta);
+        let t2 = build_code_embedding_text("f", "fn f() {}", &meta);
+        assert_eq!(t1, t2, "embedding text must be deterministic");
+    }
+
+    /// BUG PROBE: The budget is 800 chars, but MiniLM-L6-v2 only accepts
+    /// 256 tokens. At ~2.8 chars per code token (WordPiece), 800 chars =
+    /// ~286 tokens, which exceeds the model's limit.
+    ///
+    /// This test constructs a maximal embedding text and estimates whether
+    /// it could fit in 256 tokens.
+    #[test]
+    fn budget_800_chars_may_exceed_256_tokens() {
+        // Fill exactly to budget with code-like content
+        let name = "handle_complex_request";
+        let body_content = concat!(
+            "pub async fn handle_complex_request(&self, req: HttpRequest<Body>, ",
+            "ctx: &RequestContext, middleware: &[Box<dyn Middleware>]) ",
+            "-> Result<HttpResponse<Body>, AppError> {\n",
+            "    let session = self.session_store.get_or_create(req.headers());\n",
+            "    let auth_result = self.auth_service.validate_token(\n",
+            "        req.headers().get(\"Authorization\"),\n",
+            "        &session,\n",
+            "    ).await?;\n",
+            "    if !auth_result.has_permission(ctx.required_permission()) {\n",
+            "        return Err(AppError::Forbidden {\n",
+            "            user: auth_result.user_id().to_string(),\n",
+            "            resource: ctx.resource_path().to_string(),\n",
+            "        });\n",
+            "    }\n",
+            "    let mut response = self.inner_handler.handle(req, ctx).await?;\n",
+            "    for mw in middleware.iter().rev() {\n",
+            "        response = mw.after(response, ctx).await?;\n",
+            "    }\n",
+            "    self.metrics.record_request(ctx, &response);\n",
+            "    Ok(response)\n",
+            "}\n",
+        );
+        let text = build_code_embedding_text(name, body_content, &BTreeMap::new());
+        let char_count = text.chars().count();
+
+        // Conservative token estimate for code: ~2.8 chars per token
+        // (identifiers like handle_complex_request split into multiple
+        // subword tokens with WordPiece)
+        let estimated_tokens = char_count as f64 / 2.8;
+
+        // If this fails, the 800-char budget is too generous for 256 tokens.
+        // It's a documentation assertion, not necessarily a hard failure.
+        if estimated_tokens > 256.0 {
+            panic!(
+                "WARNING: embedding text of {} chars (~{:.0} estimated tokens) \
+                 likely exceeds MiniLM-L6-v2's 256-token limit. The model will \
+                 silently truncate, potentially discarding meaningful content.\n\
+                 Consider reducing CODE_EMBED_CHAR_BUDGET to ~700 chars.\n\
+                 Text (first 200 chars): {}",
+                char_count,
+                estimated_tokens,
+                &text[..text.len().min(200)]
+            );
+        }
+    }
+
+    /// Verify that body_budget calculation doesn't underflow when name is
+    /// close to CODE_EMBED_CHAR_BUDGET.
+    #[test]
+    fn body_budget_no_underflow() {
+        // Name that's exactly at budget
+        let name = "a".repeat(CODE_EMBED_CHAR_BUDGET);
+        let text = build_code_embedding_text(&name, "body content", &BTreeMap::new());
+        // Should not panic from underflow; body should be omitted
+        assert!(text.chars().count() <= CODE_EMBED_CHAR_BUDGET);
+    }
+
+    /// When metadata byte-length equals char-length (ASCII only),
+    /// the body budget calculation should be accurate.
+    #[test]
+    fn ascii_metadata_budget_accurate() {
+        let name = "f";
+        // Fill body to exactly what should fit
+        let mut metadata = BTreeMap::new();
+        metadata.insert("key".into(), "val".into());
+        // meta_estimate = 3 + 3 + 3 = 9 bytes
+        // body_budget = 800 - (1 + 1) - 9 = 789
+
+        let body = "x".repeat(789);
+        let text = build_code_embedding_text(name, &body, &metadata);
+
+        // With ASCII metadata, byte == char, so budget should be exact
+        assert!(
+            text.chars().count() <= CODE_EMBED_CHAR_BUDGET,
+            "text {} chars exceeds budget {}",
+            text.chars().count(), CODE_EMBED_CHAR_BUDGET
+        );
+        // Body should be fully included (not truncated)
+        assert!(
+            text.contains(&"x".repeat(789)),
+            "full body should fit within budget when metadata is small"
+        );
+    }
 }
