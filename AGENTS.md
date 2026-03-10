@@ -123,6 +123,7 @@ MCP server with a workspace-wide context engine. Incrementally scans repos, extr
 - Scanner excludes configurable via `.oh/config.toml`
 - Use compiler-driven refactoring (add field, let `cargo check` find every construction site)
 - `cargo install --path .` before `/mcp` reconnect (or restart Claude Code)
+- Parallel worktree builds: `scripts/prep-worktree.sh <path> <branch>` creates a worktree with warm build cache (hardlinks `target/`). Set `CARGO_TARGET_DIR=$WORKTREE/target` before cargo commands. Enables genuinely parallel builds on M4 Max without cache thrashing.
 
 ## Anti-Patterns to Avoid
 - Don't search function bodies in code search (noise) — match name + signature only
