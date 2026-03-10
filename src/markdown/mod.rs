@@ -4,6 +4,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use gray_matter::{engine::YAML, Matter, ParsedEntity};
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 
 use crate::types::MarkdownChunk;
@@ -163,53 +164,84 @@ pub fn parse_markdown_source(source: &str, path: &Path) -> Vec<MarkdownChunk> {
 
 /// Detect YAML frontmatter (`---\n...\n---`) at the start of a markdown file.
 /// Returns (optional frontmatter chunk, remaining source to parse, byte offset of remaining source).
+///
+/// Uses the `gray_matter` crate for robust frontmatter detection (handles empty
+/// frontmatter, CRLF line endings, `---` inside YAML values, etc.), then computes
+/// byte offsets from the original source for the chunking pipeline.
 fn extract_frontmatter_chunk<'a>(
     source: &'a str,
     path: &Path,
 ) -> (Option<MarkdownChunk>, &'a str, usize) {
-    let leading_ws = source.len() - source.trim_start().len();
-    let trimmed = &source[leading_ws..];
-    if !trimmed.starts_with("---") {
+    let matter: Matter<YAML> = Matter::new();
+    let parsed: ParsedEntity = match matter.parse(source) {
+        Ok(p) => p,
+        Err(_) => return (None, source, 0),
+    };
+
+    // gray_matter detected frontmatter if the content is shorter than the original,
+    // OR if `matter` is non-empty. For empty frontmatter (`---\n---`), both `data`
+    // and `matter` are empty, but `content` will differ from the original.
+    let has_frontmatter = !parsed.matter.is_empty()
+        || (source.trim_start().starts_with("---") && parsed.content.len() < source.len());
+
+    if !has_frontmatter {
         return (None, source, 0);
     }
 
-    let after_opening_dashes = &trimmed[3..];
-    let newline_skip = after_opening_dashes.len() - after_opening_dashes.trim_start_matches(['\r', '\n']).len();
-    let after_first = &after_opening_dashes[newline_skip..];
-    if let Some(end_idx) = after_first.find("\n---") {
-        // Compute absolute byte end of the frontmatter block using tracked offsets.
-        // leading_ws + 3 (opening ---) + newline_skip + end_idx + 4 (\n---)
-        let absolute_end = leading_ws + 3 + newline_skip + end_idx + 4;
+    // Compute byte offset of the end of the frontmatter block in the original source.
+    // Walk lines to find the closing `---` delimiter, matching gray_matter's logic:
+    // first line must be `---` (with optional \r), then scan for a line that is exactly `---`.
+    let bytes = source.as_bytes();
+    let mut pos = 0;
 
-        // Skip past any trailing newline after the closing ---
-        let rest_start = if absolute_end < source.len() && source.as_bytes()[absolute_end] == b'\n' {
-            absolute_end + 1
-        } else if absolute_end + 1 < source.len()
-            && source.as_bytes()[absolute_end] == b'\r'
-            && source.as_bytes()[absolute_end + 1] == b'\n'
-        {
-            absolute_end + 2
-        } else {
-            absolute_end
-        };
+    // Skip the opening `---` line
+    while pos < bytes.len() && bytes[pos] != b'\n' {
+        pos += 1;
+    }
+    if pos < bytes.len() {
+        pos += 1; // skip \n
+    }
 
-        let fm_content = &source[..rest_start];
-        let chunk = MarkdownChunk {
-            file_path: path.to_path_buf(),
-            heading_hierarchy: Vec::new(),
-            heading_level: 0,
-            heading_text: String::new(),
-            parent_heading: None,
-            is_frontmatter: true,
-            content: fm_content.to_string(),
-            byte_offset: 0,
-            byte_len: rest_start,
-            code_spans: Vec::new(),
-        };
-
-        (Some(chunk), &source[rest_start..], rest_start)
-    } else {
-        (None, source, 0)
+    // Scan for closing `---` line
+    loop {
+        if pos >= bytes.len() {
+            // Reached end without finding closing delimiter — treat as no frontmatter
+            return (None, source, 0);
+        }
+        let line_start = pos;
+        while pos < bytes.len() && bytes[pos] != b'\n' {
+            pos += 1;
+        }
+        let line = &source[line_start..pos];
+        let trimmed_line = line.trim_end();
+        if trimmed_line == "---" {
+            // `pos` is at the \n after `---`, or at end of source
+            let absolute_end = pos; // points to \n or end-of-source
+            // Skip past the trailing newline after closing ---
+            let rest_start = if absolute_end < bytes.len() && bytes[absolute_end] == b'\n' {
+                absolute_end + 1
+            } else {
+                absolute_end
+            };
+            let fm_content = &source[..rest_start];
+            let chunk = MarkdownChunk {
+                file_path: path.to_path_buf(),
+                heading_hierarchy: Vec::new(),
+                heading_level: 0,
+                heading_text: String::new(),
+                parent_heading: None,
+                is_frontmatter: true,
+                content: fm_content.to_string(),
+                byte_offset: 0,
+                byte_len: rest_start,
+                code_spans: Vec::new(),
+            };
+            return (Some(chunk), &source[rest_start..], rest_start);
+        }
+        // Move past the \n
+        if pos < bytes.len() {
+            pos += 1;
+        }
     }
 }
 
@@ -1482,27 +1514,20 @@ Deepest content.\n";
 
     #[test]
     fn test_empty_frontmatter() {
-        // BUG FOUND: `---\n---` (empty frontmatter) is not detected as frontmatter.
-        // The `extract_frontmatter_chunk` function looks for `\n---` after the
-        // opening dashes' newline, but with empty frontmatter there's no content
-        // before the closing `---`, so `after_first` starts with `---` (no `\n` prefix)
-        // and `find("\n---")` fails.
-        //
-        // Expected behavior: empty frontmatter should produce a frontmatter chunk.
-        // Actual behavior: the `---\n---` is passed to pulldown-cmark as a thematic
-        // break, and frontmatter is not detected.
+        // Empty frontmatter (`---\n---`) should be detected as a frontmatter chunk
+        // with empty body. Previously this was a known bug (manual parser couldn't
+        // handle it); now handled correctly by gray_matter.
         let source = "---\n---\n\n# Title\n\nBody.\n";
         let chunks = parse_markdown_source(source, Path::new("empty-fm.md"));
 
-        // Document actual (buggy) behavior: no frontmatter chunk is produced
         let fm_chunks: Vec<_> = chunks.iter().filter(|c| c.is_frontmatter).collect();
-        assert_eq!(fm_chunks.len(), 0,
-            "BUG: empty frontmatter is not detected (see comment above)");
+        assert_eq!(fm_chunks.len(), 1,
+            "Empty frontmatter should produce a frontmatter chunk");
 
-        // The heading should still be parsed correctly despite the bug
+        // The heading should still be parsed correctly
         let heading_chunks: Vec<_> = chunks.iter().filter(|c| !c.is_frontmatter).collect();
         assert!(heading_chunks.iter().any(|c| c.heading_text == "Title"),
-            "Heading should still be parsed after undetected empty frontmatter");
+            "Heading should still be parsed after empty frontmatter");
     }
 
     #[test]
