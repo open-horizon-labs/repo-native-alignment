@@ -20,7 +20,7 @@ use crate::graph::{self, EdgeKind, Node, Edge, Confidence, ExtractionSource, Nod
 use crate::graph::index::GraphIndex;
 use crate::graph::store::{symbols_schema, edges_schema, schema_meta_schema, SCHEMA_VERSION};
 use crate::roots::{WorkspaceConfig, cache_state_path};
-use crate::scanner::Scanner;
+use crate::scanner::{ScanResult, Scanner};
 use crate::types::OhArtifactKind;
 use crate::{git, markdown, oh, query, ranking};
 use arc_swap::ArcSwap;
@@ -1027,7 +1027,7 @@ impl RnaHandler {
     /// Returns a read guard to the graph.
     async fn get_graph(&self) -> anyhow::Result<tokio::sync::RwLockReadGuard<'_, Option<GraphState>>> {
         // Fast path: graph exists and scan cooldown hasn't expired
-        {
+        let pending_scan: Option<ScanResult> = {
             let guard = self.graph.read().await;
             if guard.is_some() {
                 let skip_scan = {
@@ -1049,12 +1049,14 @@ impl RnaHandler {
                     *self.last_scan.lock().unwrap() = std::time::Instant::now();
                     return Ok(guard);
                 }
-                // Changes detected — need write lock
+                // Changes detected — carry the scan result forward
                 drop(guard);
+                Some(scan)
             } else {
                 drop(guard);
+                None
             }
-        }
+        };
 
         // Slow path: build or update graph
         {
@@ -1063,9 +1065,10 @@ impl RnaHandler {
                 // First build — full pipeline
                 *guard = Some(self.build_full_graph().await?);
             } else {
-                // Incremental update — only changed files
+                // Incremental update — pass the already-completed scan so we
+                // don't re-scan (the first scan already saved updated state).
                 let graph = guard.as_mut().unwrap();
-                self.update_graph_incrementally(graph).await?;
+                self.update_graph_with_scan(graph, pending_scan).await?;
             }
         }
 
@@ -1666,10 +1669,24 @@ impl RnaHandler {
         })
     }
 
-    /// Incrementally update the graph for changed/new/deleted files.
-    async fn update_graph_incrementally(&self, graph: &mut GraphState) -> anyhow::Result<()> {
-        let mut scanner = Scanner::new(self.repo_root.clone())?;
-        let scan = scanner.scan()?;
+    /// Incrementally update the graph, accepting an optional pre-computed scan.
+    ///
+    /// When `pending_scan` is `Some`, the caller already ran the scanner and
+    /// saved state — we reuse that result instead of scanning again (which
+    /// would see zero changes because state was already updated).
+    async fn update_graph_with_scan(
+        &self,
+        graph: &mut GraphState,
+        pending_scan: Option<ScanResult>,
+    ) -> anyhow::Result<()> {
+        let scan = match pending_scan {
+            Some(s) => s,
+            None => {
+                // Fallback: scan fresh (used by background scanner path)
+                let mut scanner = Scanner::new(self.repo_root.clone())?;
+                scanner.scan()?
+            }
+        };
 
         if scan.changed_files.is_empty()
             && scan.new_files.is_empty()
