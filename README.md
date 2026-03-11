@@ -248,7 +248,7 @@ Agent wrappers for each workflow phase (`oh-aim`, `oh-execute`, `oh-ship`, etc.)
 
 **Working:**
 
-- Function-level semantic search — embeds function bodies (not just names), markdown sections, commits, and .oh/ artifacts in one vector space. Searches by meaning, scored 0-1 with production code ranked above tests
+- Function-level semantic search — embeds function bodies (not just names), all markdown, and commits in one vector space. Searches by meaning, scored 0-1 with production code ranked above tests
 - Structural outcome-to-code joins — agents scope work to declared business outcomes without re-prompting
 - Metal GPU semantic search with adaptive batch sizing — self-tunes to hardware
 - LSP-enriched call/type graph — compiler-grade call hierarchy and Implements edges across 37 language servers

@@ -44,12 +44,12 @@ RNA's two-tier approach (tree-sitter + LSP) gives the broadest coverage with the
 |---|---|---|---|
 | **Model** | MiniLM-L6-v2 (384-dim) | UniXcoder (768-dim, code-specific) | None |
 | **Hardware** | Metal GPU on Apple Silicon, CPU fallback | CPU | N/A |
-| **What's embedded** | Function bodies, markdown sections, .oh/ artifacts, commits | Function bodies | Nothing |
-| **Indexed together** | Code + docs + business context + git history | Code only | N/A |
+| **What's embedded** | Function bodies, all markdown, commits | Function bodies | Nothing |
+| **Indexed together** | Code + markdown + git history | Code only | N/A |
 | **Score normalization** | 0-1 cosine, 5-tier ranking, test files demoted | Raw similarity | N/A |
 | **Markdown** | Heading-scoped chunks with hierarchy | None | None |
 
-RNA's unique advantage: semantic search spans code AND business artifacts in the same vector space. "Find functions related to our payment reliability outcome" is a query only RNA can answer. Results are ranked 0-1 with a 5-tier system: exact name > contains > signature-only, definitions before imports, production code before tests. CGR's UniXcoder is a code-specific model (better at pure code semantics), but RNA embeds function bodies, markdown sections, commit messages, and business artifacts together — breadth over specialization.
+RNA's unique advantage: semantic search spans code AND business artifacts in the same vector space. "Find functions related to our payment reliability outcome" is a query only RNA can answer. Results are ranked 0-1 with a 5-tier system: exact name > contains > signature-only, definitions before imports, production code before tests. CGR's UniXcoder is a code-specific model (better at pure code semantics), but RNA embeds function bodies, all markdown (chunked by heading), and commit messages together — breadth over specialization.
 
 ## MCP Tool Philosophy
 
@@ -65,7 +65,7 @@ RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents
 
 1. **More accurate graph** — 22-language tree-sitter extraction + 37 LSP servers for compiler-grade call/type hierarchy and `Implements` edges. Neither CGR nor CGC has LSP enrichment. RNA's edges come from the same language servers your editor uses.
 2. **Faster queries** — In-process petgraph + LanceDB. No network hop, no Docker, no external DB. Microsecond graph traversal, millisecond semantic search.
-3. **Deeper semantic search** — Function bodies (not just names), markdown sections with heading hierarchy, commits, and business artifacts in one vector space. Results ranked 0-1 with test file demotion. CGR embeds function bodies but with raw scores. CGC doesn't embed at all.
+3. **Deeper semantic search** — Function bodies (not just names), all markdown (chunked by heading with hierarchy), and commits in one vector space. Results ranked 0-1 with test file demotion. CGR embeds function bodies but with raw scores. CGC doesn't embed at all.
 4. **Semantic graph entry points** — `graph_query(query="database pool", mode="impact")` works directly. No need to look up a `node_id` first. CGR and CGC require exact node identifiers.
 
 ## What RNA Does That Others Don't
