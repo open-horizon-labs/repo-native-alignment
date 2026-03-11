@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   build:
@@ -34,6 +35,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Patch version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$OSTYPE" == darwin* ]]; then
+            sed -i '' 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
+            sed -i '' 's/"version": "[^"]*"/"version": "'"$VERSION"'"/g' .claude-plugin/marketplace.json
+          else
+            sed -i 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
+            sed -i 's/"version": "[^"]*"/"version": "'"$VERSION"'"/g' .claude-plugin/marketplace.json
+          fi
 
       - name: Install protoc
         uses: arduino/setup-protoc@v3
@@ -102,3 +114,37 @@ jobs:
               repo-native-alignment-darwin-arm64-fast/repo-native-alignment-darwin-arm64-fast.tar.gz \
               repo-native-alignment-linux-x86_64/repo-native-alignment-linux-x86_64.tar.gz
           fi
+
+  bump-source:
+    needs: release
+    runs-on: namespace-profile-default
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Patch version in source
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
+          sed -i 's/"version": "[^"]*"/"version": "'"$VERSION"'"/g' .claude-plugin/marketplace.json
+
+      - name: Create PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          BRANCH="chore/bump-version-$VERSION"
+          git checkout -b "$BRANCH"
+          git add Cargo.toml .claude-plugin/marketplace.json
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: bump version to $VERSION"
+          git push origin "$BRANCH"
+          gh pr create \
+            --title "chore: bump version to $VERSION" \
+            --body "Auto-generated from release ${{ github.ref_name }}." \
+            --base main \
+            --head "$BRANCH"
