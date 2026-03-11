@@ -4,30 +4,26 @@ RNA builds a better code graph — more languages, compiler-grade edges from LSP
 
 ## At a Glance
 
-| | **RNA** | **Code-Graph-RAG** | **CodeGraphContext** | **OpenDev** |
-|---|---|---|---|---|
-| **What it is** | Aim-conditioned MCP server | Code RAG system | Code graph toolkit + MCP | AI coding agent |
-| **Layer** | Infrastructure (serves agents) | Infrastructure (serves agents) | Infrastructure (serves agents) | Agent harness (consumes tools) |
-| **Language** | Rust | Python | Python | Python |
-| **Install** | `cargo install` / binary | Docker + uv + Memgraph + API key | `pip install` + (KuzuDB\|Neo4j) | `pip install` + API key |
-| **External deps** | None | Docker, Memgraph, LLM API | Graph DB (embedded or Docker) | LLM API (required) |
-| **Languages parsed** | 22 | 11 | 14 | N/A (uses LSP per-query) |
-| **Graph storage** | LanceDB + petgraph (embedded) | Memgraph (Docker) | KuzuDB/FalkorDB/Neo4j | None (ephemeral) |
-| **Embeddings** | MiniLM-L6-v2 on Metal GPU (local) | UniXcoder (local) | None | None |
-| **LSP integration** | 37 servers, batch enrichment | None | None | 37 servers, per-query |
-| **MCP tools** | 7 | 10 | 17 | N/A (is an MCP client) |
-| **Business context** | Outcomes, signals, guardrails, metis | None | None | None |
-| **License** | MIT | MIT | MIT | MIT |
+| | **RNA** | **Code-Graph-RAG** | **CodeGraphContext** |
+|---|---|---|---|
+| **Install** | `cargo install` / binary | Docker + uv + Memgraph + API key | `pip install` + (KuzuDB\|Neo4j) |
+| **External deps** | None | Docker, Memgraph, LLM API | Graph DB (embedded or Docker) |
+| **Languages parsed** | 22 | 11 | 14 |
+| **Graph storage** | LanceDB + petgraph (embedded) | Memgraph (Docker) | KuzuDB/FalkorDB/Neo4j |
+| **Embeddings** | MiniLM-L6-v2 on Metal GPU (local) | UniXcoder (local) | None |
+| **LSP integration** | 37 servers, batch enrichment | None | None |
+| **MCP tools** | 5 | 10 | 17 |
+| **Business context** | Outcomes, signals, guardrails, metis | None | None |
 
 ## Architecture Trade-offs
 
-| Axis | RNA | CGR | CGC | OpenDev |
-|------|-----|-----|-----|---------|
-| **Cold start** | ~5-10s scan, ~2min embed | Index + Docker startup | Index + DB setup | Instant (no pre-processing) |
-| **Warm restart** | <1s (LanceDB cache) | Memgraph persists | DB persists | N/A |
-| **Memory** | In-process (petgraph + LanceDB) | Docker container | External or embedded DB | N/A |
-| **Query latency** | ms (in-process) | Network hop to Memgraph | Network hop or embedded | Real-time LSP calls |
-| **Offline capable** | Fully offline | Needs Docker | Depends on DB choice | Needs LLM API |
+| Axis | RNA | CGR | CGC |
+|------|-----|-----|-----|
+| **Cold start** | ~5-10s scan, ~2min embed | Index + Docker startup | Index + DB setup |
+| **Warm restart** | <1s (LanceDB cache) | Memgraph persists | DB persists |
+| **Memory** | In-process (petgraph + LanceDB) | Docker container | External or embedded DB |
+| **Query latency** | ms (in-process) | Network hop to Memgraph | Network hop or embedded |
+| **Offline capable** | Fully offline | Needs Docker | Depends on DB choice |
 
 RNA's zero-dependency design is a deliberate architectural choice. `cargo install` → works. No Docker, no external DB, no API key. This matters for air-gapped environments, CI pipelines (the `test` subcommand runs 25 checks, exits 0/1), and laptops on planes.
 
@@ -56,11 +52,11 @@ RNA's unique advantage: semantic search spans code AND business artifacts in the
 
 ## MCP Tool Philosophy
 
-**RNA: 7 focused tools** — "Do one thing per tool, document edge semantics, let the agent compose."
+**RNA: 5 focused tools** — do one thing per tool, document edge semantics, let the agent compose.
 
-**CGR: 10 tools** — Mix of read + write + admin (file editing, database wipes, project deletion).
+**CGR: 10 tools** — mix of read + write + admin (file editing, database wipes, project deletion).
 
-**CGC: 17 tools** — Broad coverage including visualization, dead code detection, complexity analysis, file watching.
+**CGC: 17 tools** — broad coverage including visualization, dead code detection, complexity analysis, file watching.
 
 RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents have their own editors.
 
@@ -78,16 +74,12 @@ RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents
 4. **Self-tuning performance** — Adaptive batch sizing, background reindexing, lock-free double-buffered embedding index.
 5. **Zero external dependencies** — Single binary, no Docker, no DB server, no API key.
 
-## If You're Choosing
+## Summary
 
-- **Need a coding agent?** → [OpenDev](https://github.com/opendev-to/opendev)
-- **Need general-purpose code RAG?** → [Code-Graph-RAG](https://github.com/vitali87/code-graph-rag)
-- **Need a code exploration toolkit with visualization?** → [CodeGraphContext](https://github.com/CodeGraphContext/CodeGraphContext)
-- **Need agents that stay aligned to business outcomes across sessions?** → RNA
+RNA does code graph queries better (more languages, LSP edges, in-process speed, no external deps) and then adds a layer the others don't have (business outcome alignment).
 
 ## Sources
 
 This comparison was developed from hands-on analysis of each project's codebase and documentation:
-- [OpenDev salvage analysis](.oh/sessions/opendev-paper-salvage.md)
-- [Code-Graph-RAG salvage analysis](.oh/sessions/cgr-salvage.md)
-- [CodeGraphContext salvage analysis](.oh/sessions/codegraphcontext-salvage.md)
+- [Code-Graph-RAG salvage analysis](../.oh/sessions/cgr-salvage.md)
+- [CodeGraphContext salvage analysis](../.oh/sessions/codegraphcontext-salvage.md)

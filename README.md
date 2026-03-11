@@ -193,9 +193,9 @@ The system compounds from here. Agents use `oh_search_context` to discover relev
 
 ```
 .oh/
-├── outcomes/        <- what we're optimizing for (YAML frontmatter + markdown)
-├── signals/         <- how we measure progress (SLO definitions + observations)
-├── guardrails/      <- constraints that shape behavior (hard/soft/candidate)
+├── outcomes/        <- what we're optimizing for
+├── signals/         <- how we measure progress
+├── guardrails/      <- constraints that shape behavior
 ├── metis/           <- learnings that compound across sessions
 ├── config.toml      <- scanner excludes, per-project tuning
 └── .cache/          <- scan state, embedding index (gitignored)
@@ -220,11 +220,7 @@ RNA builds a better code graph — more languages (22 + 37 LSP servers), compile
 | **Business context** | Outcomes, signals, guardrails, metis | None | None | None |
 | **MCP tools** | 7 (focused) | 10 (read + write + admin) | 17 (broad) | N/A (is a client) |
 
-**If you're choosing:**
-- Need a coding agent? → [OpenDev](https://github.com/opendev-to/opendev)
-- Need general-purpose code RAG? → [Code-Graph-RAG](https://github.com/vitali87/code-graph-rag)
-- Need a code exploration toolkit? → [CodeGraphContext](https://github.com/CodeGraphContext/CodeGraphContext)
-- Need agents that stay aligned to business outcomes across sessions? → RNA
+**How RNA compares** to [Code-Graph-RAG](https://github.com/vitali87/code-graph-rag) and [CodeGraphContext](https://github.com/CodeGraphContext/CodeGraphContext): RNA has more languages (22 vs 11/14), LSP-enriched edges they don't have, in-process queries (no Docker/external DB), and semantic search across code + business context. They require Docker or external databases; RNA is a single binary.
 
 ## Companion Systems
 
