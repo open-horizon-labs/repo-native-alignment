@@ -3124,4 +3124,86 @@ mod tests {
         let seg = status.footer_segment().unwrap();
         assert!(seg.contains("edges"));
     }
+
+    // ── get_graph incremental update test ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_graph_detects_file_edits() {
+        // Regression test for #134: get_graph() ran Scanner::scan() to check
+        // for changes (saving updated mtimes), then update_graph_incrementally
+        // re-scanned and saw nothing. The fix passes ScanResult through.
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Set up a minimal repo with one Rust file
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn original_function() {}\n",
+        )
+        .unwrap();
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            ..Default::default()
+        };
+
+        // First call: builds graph from scratch
+        {
+            let guard = handler.get_graph().await.unwrap();
+            let gs = guard.as_ref().expect("graph should be built");
+            assert!(
+                gs.nodes.iter().any(|n| n.id.name == "original_function"),
+                "original_function should be in graph after first build. Nodes: {:?}",
+                gs.nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+            );
+            assert!(gs.last_scan_completed_at.is_some());
+        }
+
+        // Wait for mtime granularity (macOS HFS+ has 1-second resolution)
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Edit the file: remove old function, add new one
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn replacement_function() {}\n",
+        )
+        .unwrap();
+
+        // Expire the 2-second cooldown
+        {
+            let mut last = handler.last_scan.lock().unwrap();
+            *last = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        }
+
+        // Second call: should detect the edit and update the graph
+        {
+            let guard = handler.get_graph().await.unwrap();
+            let gs = guard.as_ref().expect("graph should still exist");
+
+            let has_replacement = gs.nodes.iter().any(|n| n.id.name == "replacement_function");
+            let has_original = gs.nodes.iter().any(|n| n.id.name == "original_function");
+
+            assert!(
+                has_replacement,
+                "replacement_function should be in graph after edit. Nodes: {:?}",
+                gs.nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+            );
+            assert!(
+                !has_original,
+                "original_function should be removed from graph after edit"
+            );
+
+            // last_scan_completed_at should be recent (not the stale initial value)
+            let age = gs.last_scan_completed_at.unwrap().elapsed();
+            assert!(
+                age < std::time::Duration::from_secs(5),
+                "last_scan_completed_at should be recent, but was {:?} ago",
+                age
+            );
+        }
+    }
 }
