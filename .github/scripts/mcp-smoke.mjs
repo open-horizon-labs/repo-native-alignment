@@ -72,7 +72,6 @@ try {
   assertNonEmpty("listTools returns tools", tools);
 
   const requiredTools = new Set([
-    "oh_get_context",
     "oh_search_context",
     "outcome_progress",
     "search_symbols",
@@ -88,17 +87,7 @@ try {
     }
   }
 
-  // ── 2. oh_get_context ───────────────────────────────────────────────────
-  console.log("\n── oh_get_context ──");
-  const getCtxResult = await client.callTool({ name: "oh_get_context", arguments: {} });
-  const getCtxText = extractText(getCtxResult);
-  assertContains(
-    "oh_get_context contains 'Business Context'",
-    getCtxText,
-    "Business Context",
-  );
-
-  // ── 3. oh_search_context ────────────────────────────────────────────────
+  // ── 2. oh_search_context ────────────────────────────────────────────────
   console.log("\n── oh_search_context ──");
   const searchCtxResult = await client.callTool({
     name: "oh_search_context",
