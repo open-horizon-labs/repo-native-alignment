@@ -122,13 +122,11 @@ cargo install --locked --path .
 
 ### 1b. Connect to your MCP client
 
-The MCP server command is:
+The MCP server command is `repo-native-alignment` with `--repo` as an argument. When your MCP client asks for a command, enter `repo-native-alignment` as the command and `--repo /path/to/your/project` as args.
 
-```bash
-repo-native-alignment --repo /path/to/your/project
-```
+**Important:** `command` must be just the binary name. The `--repo` flag goes in `args`, not in `command` — MCP stdio transport doesn't do shell splitting.
 
-This runs over stdio by default. For any MCP client that asks for a command (Claude Code `/mcp add`, Cursor, Oh-My-Pi, etc.), enter the above. Example `.mcp.json` for Claude Code:
+Example `.mcp.json`:
 
 ```json
 {
