@@ -211,15 +211,15 @@ Outcomes declare `files:` patterns linking to code. Commits tag `[outcome:X]` li
 
 RNA builds a better code graph — more languages (22 + 37 LSP servers), compiler-grade edges, in-process microsecond queries — and then connects it to declared business outcomes. See the [full comparison](docs/compared-to.md) for details.
 
-| | **RNA** | **Code-Graph-RAG** | **CodeGraphContext** | **OpenDev** |
-|---|---|---|---|---|
-| **What it is** | Aim-conditioned MCP server | Code RAG system | Code graph toolkit + MCP | AI coding agent |
-| **Install** | Single binary | Docker + Memgraph + API key | pip + graph DB | pip + API key |
-| **External deps** | None | Docker, Memgraph, LLM API | Graph DB (KuzuDB/Neo4j) | LLM API |
-| **Languages** | 22 (tree-sitter) + 37 (LSP) | 11 (tree-sitter) | 14 (tree-sitter) | 37 (LSP, per-query) |
-| **Embeddings** | MiniLM-L6-v2 on Metal GPU | UniXcoder | None | None |
-| **Business context** | Outcomes, signals, guardrails, metis | None | None | None |
-| **MCP tools** | 5 (focused) | 10 (read + write + admin) | 17 (broad) | N/A (is a client) |
+| | **RNA** | **Code-Graph-RAG** | **CodeGraphContext** |
+|---|---|---|---|
+| **What it is** | Aim-conditioned MCP server | Code RAG system | Code graph toolkit + MCP |
+| **Install** | Single binary | Docker + Memgraph + API key | pip + graph DB |
+| **External deps** | None | Docker, Memgraph, LLM API | Graph DB (KuzuDB/Neo4j) |
+| **Languages** | 22 (tree-sitter) + 37 (LSP) | 11 (tree-sitter) | 14 (tree-sitter) |
+| **Embeddings** | MiniLM-L6-v2 on Metal GPU | UniXcoder | None |
+| **Business context** | Outcomes, signals, guardrails, metis | None | None |
+| **MCP tools** | 5 (focused) | 10 (read + write + admin) | 17 (broad) |
 
 **How RNA compares** to [Code-Graph-RAG](https://github.com/vitali87/code-graph-rag) and [CodeGraphContext](https://github.com/CodeGraphContext/CodeGraphContext): RNA has more languages (22 vs 11/14), LSP-enriched edges they don't have, in-process queries (no Docker/external DB), and semantic search across code + business context. They require Docker or external databases; RNA is a single binary.
 
@@ -299,7 +299,7 @@ MIT — see [LICENSE](LICENSE).
 
 ## Detailed Documentation
 
-- [Compared To](docs/compared-to.md) — RNA vs Code-Graph-RAG, CodeGraphContext, OpenDev
+- [Compared To](docs/compared-to.md) — RNA vs Code-Graph-RAG, CodeGraphContext
 - [Extractors](docs/extractors.md) — 22 language extractors, constants, synthetic literals
 - [LSP Enrichment](docs/lsp-enrichment.md) — 37 auto-detected language servers
 - [Scanner](docs/scanner.md) — incremental, event-driven, worktree-aware scanning
