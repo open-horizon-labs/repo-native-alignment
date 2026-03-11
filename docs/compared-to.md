@@ -91,6 +91,6 @@ RNA does code graph queries better (more languages, LSP edges, in-process speed,
 
 ## Sources
 
-This comparison was developed from hands-on analysis of each project's codebase and documentation:
+Sources:
 - [Code-Graph-RAG salvage analysis](../.oh/sessions/cgr-salvage.md)
 - [CodeGraphContext salvage analysis](../.oh/sessions/codegraphcontext-salvage.md)
