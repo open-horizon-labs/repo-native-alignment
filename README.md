@@ -2,17 +2,11 @@
 
 [![CI](https://github.com/open-horizon-labs/repo-native-alignment/actions/workflows/rust-main-merge.yml/badge.svg)](https://github.com/open-horizon-labs/repo-native-alignment/actions) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Aim-conditioned decision infrastructure for coding agents. Agents don't just execute — they plan and adapt conditioned on declared aims, treating repo artifacts as evidence that updates confidence in whether the current aim framing is still correct.
+Aim-conditioned decision infrastructure for coding agents. A single binary MCP server that connects business outcomes to code — so agents know *why* they're building, not just *what*.
 
-We don't build features, we build capabilities.
+No Docker. No external database. No API key. `cargo install` and go.
 
-## Platform Support
-
-| Platform | Status | Embeddings |
-|----------|--------|------------|
-| macOS Apple Silicon (ARM) | Full support | Metal GPU (fast) |
-| Linux x86_64 | Supported | CPU-only (slower semantic search) |
-| Windows | Untested | — |
+**[Quick Start](#quick-start)** | **[What Agents Can Ask](#what-agents-can-ask)** | **[MCP Tools](#rna-mcp-server--7-tools)** | **[The .oh/ Directory](#the-oh-directory)** | **[Compared To](#compared-to)** | **[Docs](#detailed-documentation)**
 
 ## How It Works
 
@@ -46,6 +40,44 @@ We don't build features, we build capabilities.
 ```
 
 **The loop:** Skills guide work → MCP tools read/write context → `.oh/` accumulates learnings → git versions everything → next session starts richer.
+
+## What Agents Can Ask
+
+Once RNA is running, agents query your codebase and business context through MCP tool calls. Here's what that looks like in practice:
+
+### Finding code
+
+- "Where is the authentication handler?" → `search_symbols("AuthHandler")` → file, line, signature, graph edges
+- "Find functions related to payment processing" → `oh_search_context("payment processing", include_code=true)` → ranked results, production code before tests, scored 0-1
+- "Show me all structs in embed.rs" → `search_symbols("", kind="struct", file="embed.rs")` → every struct with edges
+
+### Understanding impact
+
+- "What depends on the database connection pool?" → `graph_query(query="database connection pool", mode="impact")` → transitive dependents
+- "What calls AuthHandler?" → `graph_query(node_id="...:AuthHandler:struct", direction="incoming")` → callers, implementors
+- "Find all trait implementors" → `graph_query(query="Enricher trait", edge_types=["implements"])` → concrete types
+
+### Connecting code to business outcomes
+
+- "How is the agent-alignment outcome progressing?" → `outcome_progress("agent-alignment")` → tagged commits → changed files → symbols → PRs
+- "What are our constraints?" → `oh_get_context()` → all outcomes, signals, guardrails, learnings
+- "Find signals related to reliability" → `oh_search_context("reliability", artifact_types=["signal"])` → measurement definitions
+
+### Knowing when to trust results
+
+Every query includes freshness metadata so agents know what they're working with:
+
+```
+Index: 5373 symbols · last scan 2m ago · LSP: enriched (3307 edges) · schema v3
+```
+
+During cold start, semantic tools return actionable status instead of errors:
+
+```
+Embedding index: building — semantic results will appear shortly. Retry in a few seconds.
+```
+
+Agents see `LSP: pending` and know to retry for complete call graphs, or `LSP: enriched (3307 edges)` and know results are compiler-accurate.
 
 ## Quick Start
 
@@ -123,23 +155,21 @@ This explores your codebase, asks about your aims, writes `AGENTS.md`, scaffolds
 repo-native-alignment test --repo /path/to/your/project
 ```
 
-Runs 22+ checks end-to-end. Exits 0 on pass, 1 on failure. Safe to run in CI.
+Runs 25 checks end-to-end. Exits 0 on pass, 1 on failure. Safe to run in CI.
 
 ### 5. Start working
 
 The system compounds from here. Agents use `oh_search_context` to discover relevant context, `search_symbols` to explore code, and write learnings to `.oh/metis/`. Each session starts richer than the last.
 
-## RNA MCP Server — 7 tools
+## RNA MCP Server — 5 tools
 
-| Category | Tools |
-|----------|-------|
-| **Context** | `oh_get_context` — all business artifacts in one call |
-| **Search** | `oh_search_context` — semantic search over .oh/ + commits (optionally code + markdown) |
-| **Code** | `search_symbols` — multi-language symbol search with graph edges |
-| **Graph** | `graph_query` — traverse neighbors, impact analysis, reachability |
-| **History** | `oh_search_context` returns commit hash — use `git show <hash>` via Bash for diffs |
-| **Join** | `outcome_progress` — structural join: outcome → commits → symbols → PRs |
-| **Workspace** | `list_roots` — show configured workspace roots |
+| Tool | What it's for |
+|------|--------------|
+| `oh_search_context` | Find relevant context by meaning: search .oh/ artifacts, commits, code, and markdown in one query |
+| `search_symbols` | Find code symbols by name or signature, get file locations and graph edges |
+| `graph_query` | Trace code relationships: what calls this, what depends on it, what's reachable |
+| `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols |
+| `list_roots` | Show which workspace roots are configured and their scan status |
 
 ### Plugin Skills
 
@@ -156,7 +186,7 @@ The system compounds from here. Agents use `oh_search_context` to discover relev
 | `graph --node <id> --mode <mode>` | Traverse neighbors, impact analysis, or reachability |
 | `scan --path <dir>` | Full scan + extract + embed + persist |
 | `stats --repo <dir>` | Show repo stats from persisted index (no re-scan) |
-| `test --repo <dir>` | Run 22+ pipeline checks end-to-end |
+| `test --repo <dir>` | Run 25 pipeline checks end-to-end |
 | `setup --project <dir>` | Bootstrap RNA + OH MCP + skills for a project |
 
 ## The `.oh/` Directory
@@ -175,6 +205,26 @@ The system compounds from here. Agents use `oh_search_context` to discover relev
 Outcomes declare `files:` patterns linking to code. Commits tag `[outcome:X]` linking to outcomes. These structural links power `outcome_progress`.
 
 `.oh/` is a **cache**, not source of truth. `rm -rf .oh/` loses context but breaks nothing.
+
+## Compared To
+
+RNA builds a better code graph — more languages (22 + 37 LSP servers), compiler-grade edges, in-process microsecond queries — and then connects it to declared business outcomes. See the [full comparison](docs/compared-to.md) for details.
+
+| | **RNA** | **Code-Graph-RAG** | **CodeGraphContext** | **OpenDev** |
+|---|---|---|---|---|
+| **What it is** | Aim-conditioned MCP server | Code RAG system | Code graph toolkit + MCP | AI coding agent |
+| **Install** | Single binary | Docker + Memgraph + API key | pip + graph DB | pip + API key |
+| **External deps** | None | Docker, Memgraph, LLM API | Graph DB (KuzuDB/Neo4j) | LLM API |
+| **Languages** | 22 (tree-sitter) + 37 (LSP) | 11 (tree-sitter) | 14 (tree-sitter) | 37 (LSP, per-query) |
+| **Embeddings** | MiniLM-L6-v2 on Metal GPU | UniXcoder | None | None |
+| **Business context** | Outcomes, signals, guardrails, metis | None | None | None |
+| **MCP tools** | 7 (focused) | 10 (read + write + admin) | 17 (broad) | N/A (is a client) |
+
+**If you're choosing:**
+- Need a coding agent? → [OpenDev](https://github.com/opendev-to/opendev)
+- Need general-purpose code RAG? → [Code-Graph-RAG](https://github.com/vitali87/code-graph-rag)
+- Need a code exploration toolkit? → [CodeGraphContext](https://github.com/CodeGraphContext/CodeGraphContext)
+- Need agents that stay aligned to business outcomes across sessions? → RNA
 
 ## Companion Systems
 
@@ -208,8 +258,16 @@ Agent wrappers for each workflow phase (`oh-aim`, `oh-execute`, `oh-ship`, etc.)
 - Event-driven reindex — background scanner detects changes, re-extracts, re-embeds without blocking queries
 - Persistent index with <1s restarts — LanceDB cache survives process restarts
 - 22 language extractors, cross-language constant search
-- 7 MCP tools, 6 CLI subcommands, 360+ tests
+- 7 MCP tools, 6 CLI subcommands, 370+ tests
 - Ships as a Claude Code plugin with setup skill and record skill
+
+### Platform Support
+
+| Platform | Status | Embeddings |
+|----------|--------|------------|
+| macOS Apple Silicon (ARM) | Full support | Metal GPU (fast) |
+| Linux x86_64 | Supported | CPU-only (slower semantic search) |
+| Windows | Untested | — |
 
 ### Tested On
 
@@ -242,6 +300,7 @@ MIT — see [LICENSE](LICENSE).
 
 ## Detailed Documentation
 
+- [Compared To](docs/compared-to.md) — RNA vs Code-Graph-RAG, CodeGraphContext, OpenDev
 - [Extractors](docs/extractors.md) — 22 language extractors, constants, synthetic literals
 - [LSP Enrichment](docs/lsp-enrichment.md) — 37 auto-detected language servers
 - [Scanner](docs/scanner.md) — incremental, event-driven, worktree-aware scanning

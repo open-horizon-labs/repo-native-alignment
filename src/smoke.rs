@@ -19,7 +19,6 @@ use crate::embed::EmbeddingIndex;
 use crate::extract::ExtractorRegistry;
 use crate::graph::{Edge, Node};
 use crate::graph::index::GraphIndex;
-use crate::oh;
 use crate::query;
 use crate::roots::WorkspaceConfig;
 use crate::scanner::Scanner;
@@ -211,17 +210,7 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
         }
     };
 
-    // 6. oh_get_context path
-    let artifacts = oh::load_oh_artifacts(&repo).unwrap_or_default();
-    if !artifacts.is_empty() {
-        let byte_count: usize = artifacts.iter().map(|a| a.to_markdown().len()).sum();
-        checks.push(Check::pass("oh_get_context", format!("{} artifacts, ~{} bytes", artifacts.len(), byte_count)));
-    } else {
-        // Not a hard failure: repo may not have .oh/ yet (e.g., minimal fixture)
-        checks.push(Check::skip("oh_get_context", "No .oh/ artifacts found (repo may not be initialized)"));
-    }
-
-    // 7. oh_search_context path — embed search for "main"
+    // 6. oh_search_context path — embed search for "main"
     match &embed_index {
         Some(idx) => {
             match idx.search("main", None, 5).await {

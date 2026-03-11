@@ -30,13 +30,6 @@ use tokio::sync::RwLock;
 // ── Tool input structs ──────────────────────────────────────────────
 
 #[macros::mcp_tool(
-    name = "oh_get_context",
-    description = "Get project business context: outcomes (what we're aiming for), guardrails (constraints), signals (metrics), and metis (accumulated learnings). Returns a concise summary — use oh_search_context to search within these."
-)]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct OhGetContext {}
-
-#[macros::mcp_tool(
     name = "oh_search_context",
     description = "Semantic search across business context, commits, code, and markdown. Describe what you need in plain language. Returns results ranked 0-1 by relevance; test files are demoted. Enable include_code for ranked symbol search (exact name > contains > signature, production before tests), include_markdown for doc sections. For exact symbol name lookup use search_symbols instead."
 )]
@@ -2009,7 +2002,6 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
     ) -> Result<ListToolsResult, RpcError> {
         Ok(ListToolsResult {
             tools: vec![
-                OhGetContext::tool(),
                 OhSearchContext::tool(),
                 OutcomeProgress::tool(),
                 SearchSymbols::tool(),
@@ -2042,31 +2034,6 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
         };
 
         let mut result = match params.name.as_str() {
-            "oh_get_context" => {
-                // Return concise business context — not the entire repo.
-                // Use oh_search_context for discovery, search_symbols for code.
-                let artifacts = oh::load_oh_artifacts(root).unwrap_or_default();
-                let mut md = String::from("# Business Context (.oh/)\n\n");
-
-                for kind in &[OhArtifactKind::Outcome, OhArtifactKind::Signal, OhArtifactKind::Guardrail, OhArtifactKind::Metis] {
-                    let filtered: Vec<_> = artifacts.iter().filter(|a| &a.kind == kind).collect();
-                    if filtered.is_empty() { continue; }
-                    md.push_str(&format!("## {}s\n\n", kind));
-                    for a in &filtered {
-                        md.push_str(&a.to_markdown());
-                        md.push_str("\n---\n\n");
-                    }
-                }
-
-                let commit_count = git::load_commits(root, 10)
-                    .map(|c| c.len())
-                    .unwrap_or(0);
-                md.push_str(&format!("_Recent commits: {}. Use `oh_search_context` for semantic search; `git show <hash>` via Bash for diffs._\n", commit_count));
-                md.push_str("_Use `search_symbols` for code, `oh_search_context` for semantic search._\n");
-
-                Ok(text_result(md))
-            },
-
             "oh_search_context" => {
                 let args: OhSearchContext = parse_args(params.arguments)?;
                 let query = args.query.trim();
