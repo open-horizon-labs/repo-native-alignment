@@ -25,7 +25,7 @@ RNA builds a better code graph — more languages, compiler-grade edges from LSP
 | **Query latency** | ms (in-process) | Network hop to Memgraph | Network hop or embedded |
 | **Offline capable** | Fully offline | Needs Docker | Depends on DB choice |
 
-RNA's zero-dependency design is a deliberate architectural choice. `cargo install` → works. No Docker, no external DB, no API key. This matters for air-gapped environments, CI pipelines (the `test` subcommand runs 25 checks, exits 0/1), and laptops on planes.
+RNA's zero-dependency design is a deliberate architectural choice. `cargo install` → works. No Docker, no external DB, no API key.
 
 ## Graph Quality
 
