@@ -76,6 +76,15 @@ RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents
 4. **Self-tuning performance** — Adaptive batch sizing, background reindexing, lock-free double-buffered embedding index.
 5. **Zero external dependencies** — Single binary, no Docker, no DB server, no API key.
 
+## What Others Do That RNA Doesn't
+
+RNA is read-only infrastructure — it serves agents, it doesn't act as one. Things RNA deliberately doesn't do:
+
+- **File editing / code generation** — CGR has tools for writing files and wiping databases. RNA doesn't touch your code; agents have their own editors.
+- **Dead code detection, complexity analysis, visualization** — CGC has 17 tools covering these. RNA exposes the graph and lets agents reason about it themselves.
+- **Code-specific embedding model** — CGR uses UniXcoder (768-dim, trained on code). RNA uses MiniLM-L6-v2 (384-dim, general-purpose) because it needs to embed code, markdown, and business artifacts in the same space. Trade-off: slightly less code-specific precision, much broader coverage.
+- **SCIP indexing** — CGC supports Pyright, tsc, scip-go, scip-rust for compiler-grade precision in 4 languages. RNA plans to add SCIP as a third tier alongside tree-sitter and LSP.
+
 ## Summary
 
 RNA does code graph queries better (more languages, LSP edges, in-process speed, no external deps) and then adds a layer the others don't have (business outcome alignment).
