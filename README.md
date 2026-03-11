@@ -120,7 +120,31 @@ cd repo-native-alignment
 cargo install --locked --path .
 ```
 
-### 1b. Try it from the CLI
+### 1b. Connect to your MCP client
+
+The MCP server command is:
+
+```bash
+repo-native-alignment --repo /path/to/your/project
+```
+
+This runs over stdio by default. For any MCP client that asks for a command (Claude Code `/mcp add`, Cursor, Oh-My-Pi, etc.), enter the above. Example `.mcp.json` for Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "rna": {
+      "type": "stdio",
+      "command": "repo-native-alignment",
+      "args": ["--repo", "/path/to/your/project"]
+    }
+  }
+}
+```
+
+For HTTP transport: `repo-native-alignment --repo . --transport http --port 8382`
+
+### 1c. Try it from the CLI
 
 Before wiring up MCP, evaluate RNA directly from the terminal:
 
