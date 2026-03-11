@@ -6,7 +6,7 @@ Aim-conditioned decision infrastructure for coding agents. A single binary MCP s
 
 No Docker. No external database. No API key. `cargo install` and go.
 
-**[Quick Start](#quick-start)** | **[What Agents Can Ask](#what-agents-can-ask)** | **[MCP Tools](#rna-mcp-server--7-tools)** | **[The .oh/ Directory](#the-oh-directory)** | **[Compared To](#compared-to)** | **[Docs](#detailed-documentation)**
+**[Quick Start](#quick-start)** | **[What Agents Can Ask](#what-agents-can-ask)** | **[MCP Tools](#rna-mcp-server--5-tools)** | **[The .oh/ Directory](#the-oh-directory)** | **[Compared To](#compared-to)** | **[Docs](#detailed-documentation)**
 
 ## How It Works
 
@@ -48,20 +48,21 @@ Once RNA is running, agents query your codebase and business context through MCP
 ### Finding code
 
 - "Where is the authentication handler?" → `search_symbols("AuthHandler")` → file, line, signature, graph edges
-- "Find functions related to payment processing" → `oh_search_context("payment processing", include_code=true)` → ranked results, production code before tests, scored 0-1
+- "Find functions related to payment processing" → `oh_search_context("payment processing", include_code=true)` → ranked results scored 0-1, production code before tests, function bodies searched by meaning
+- "How does scanning work?" → `oh_search_context("scanning", include_code=true, include_markdown=true)` → implementation code and doc sections, not test files
 - "Show me all structs in embed.rs" → `search_symbols("", kind="struct", file="embed.rs")` → every struct with edges
 
 ### Understanding impact
 
-- "What depends on the database connection pool?" → `graph_query(query="database connection pool", mode="impact")` → transitive dependents
-- "What calls AuthHandler?" → `graph_query(node_id="...:AuthHandler:struct", direction="incoming")` → callers, implementors
-- "Find all trait implementors" → `graph_query(query="Enricher trait", edge_types=["implements"])` → concrete types
+- "What depends on the database connection pool?" → `graph_query(query="database connection pool", mode="impact")` → transitive dependents (no node_id lookup needed)
+- "What calls AuthHandler?" → `graph_query(query="AuthHandler", direction="incoming")` → callers, implementors
+- "Find all trait implementors" → `graph_query(query="Enricher trait", edge_types=["implements"])` → concrete types with compiler-grade `Implements` edges from LSP
 
 ### Connecting code to business outcomes
 
 - "How is the agent-alignment outcome progressing?" → `outcome_progress("agent-alignment")` → tagged commits → changed files → symbols → PRs
-- "What are our constraints?" → `oh_get_context()` → all outcomes, signals, guardrails, learnings
 - "Find signals related to reliability" → `oh_search_context("reliability", artifact_types=["signal"])` → measurement definitions
+- "What are our constraints?" → `oh_search_context("constraints guardrails")` → all guardrails ranked by relevance
 
 ### Knowing when to trust results
 
@@ -218,7 +219,7 @@ RNA builds a better code graph — more languages (22 + 37 LSP servers), compile
 | **Languages** | 22 (tree-sitter) + 37 (LSP) | 11 (tree-sitter) | 14 (tree-sitter) | 37 (LSP, per-query) |
 | **Embeddings** | MiniLM-L6-v2 on Metal GPU | UniXcoder | None | None |
 | **Business context** | Outcomes, signals, guardrails, metis | None | None | None |
-| **MCP tools** | 7 (focused) | 10 (read + write + admin) | 17 (broad) | N/A (is a client) |
+| **MCP tools** | 5 (focused) | 10 (read + write + admin) | 17 (broad) | N/A (is a client) |
 
 **How RNA compares** to [Code-Graph-RAG](https://github.com/vitali87/code-graph-rag) and [CodeGraphContext](https://github.com/CodeGraphContext/CodeGraphContext): RNA has more languages (22 vs 11/14), LSP-enriched edges they don't have, in-process queries (no Docker/external DB), and semantic search across code + business context. They require Docker or external databases; RNA is a single binary.
 
@@ -247,14 +248,16 @@ Agent wrappers for each workflow phase (`oh-aim`, `oh-execute`, `oh-ship`, etc.)
 
 **Working:**
 
+- Function-level semantic search — embeds function bodies (not just names), markdown sections, commits, and .oh/ artifacts in one vector space. Searches by meaning, scored 0-1 with production code ranked above tests
 - Structural outcome-to-code joins — agents scope work to declared business outcomes without re-prompting
-- Metal GPU semantic search with adaptive batch sizing — searches code by meaning, not just names; self-tunes to hardware
-- LSP-enriched call/type graph — compiler-grade call hierarchy and type relationships across 37 language servers
+- Metal GPU semantic search with adaptive batch sizing — self-tunes to hardware
+- LSP-enriched call/type graph — compiler-grade call hierarchy and Implements edges across 37 language servers
+- Semantic graph entry points — `graph_query` accepts natural language queries directly, no node_id lookup required
 - Query staleness awareness — footers show `LSP: pending` so agents know when results are incomplete
 - Event-driven reindex — background scanner detects changes, re-extracts, re-embeds without blocking queries
 - Persistent index with <1s restarts — LanceDB cache survives process restarts
 - 22 language extractors, cross-language constant search
-- 7 MCP tools, 6 CLI subcommands, 370+ tests
+- 5 MCP tools, 6 CLI subcommands, 370+ tests
 - Ships as a Claude Code plugin with setup skill and record skill
 
 ### Platform Support
@@ -285,7 +288,7 @@ MIT — see [LICENSE](LICENSE).
 | **Tree-sitter** | A parser that reads source code and produces a syntax tree — the structured representation of functions, classes, imports, etc. RNA uses it to extract symbols from 22 languages without running the code. |
 | **LSP** | Language Server Protocol. The same protocol your editor uses for go-to-definition and find-references. RNA talks to language servers to enrich the graph with type information and call hierarchies. |
 | **Graph** | A network of nodes (symbols, files, outcomes) and edges (calls, depends_on, implements). RNA builds this in memory so you can ask "what depends on this function?" or "what's the blast radius of this change?" |
-| **Embeddings** | Vector representations of text that capture meaning. RNA embeds code signatures, commit messages, and business artifacts so `oh_search_context` can find relevant results by meaning, not just keywords. Uses Metal GPU on Apple Silicon, CPU elsewhere. |
+| **Embeddings** | Vector representations of text that capture meaning. RNA embeds function bodies, markdown sections, commit messages, and business artifacts so `oh_search_context` can find relevant results by meaning, not just keywords. Uses Metal GPU on Apple Silicon, CPU elsewhere. |
 | **LanceDB** | The columnar + vector database RNA uses to store the graph and embeddings on disk. Lives in `.oh/.cache/`. |
 | **petgraph** | The in-memory graph index RNA uses for fast traversal (neighbors, impact analysis, reachability). Rebuilt from LanceDB on startup. |
 | **Outcome** | A business result you're optimizing for. Example: "Agents correctly scope work to declared aims." |
