@@ -69,7 +69,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search",
-    description = "Find code symbols and trace their relationships. Without `mode`, performs flat ranked search (by name/signature). With `mode` (neighbors/impact/reachable), performs graph traversal from matched symbols. Entry point: `query` (name or semantic search) or `node` (stable ID from previous results). Filter by kind, language, file. Sort by relevance or complexity."
+    description = "Find code symbols and trace their relationships. Without `mode`, performs flat ranked search (by name/signature). With `mode` (neighbors/impact/reachable/tests_for), performs graph traversal from matched symbols. `tests_for` finds which test functions call a symbol. Entry point: `query` (name or semantic search) or `node` (stable ID from previous results). Filter by kind, language, file. Sort by relevance or complexity."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct Search {
@@ -79,7 +79,7 @@ pub struct Search {
     /// Start from a known stable node ID (from previous search results). Takes precedence over query for graph traversal entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
-    /// Graph traversal mode: "neighbors" (direct connections), "impact" (reverse dependents), "reachable" (forward BFS). Omit for flat search.
+    /// Graph traversal mode: "neighbors" (direct connections), "impact" (reverse dependents), "reachable" (forward BFS), "tests_for" (which test functions call this symbol). Omit for flat search.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     /// Maximum traversal depth (default: 1 for neighbors, 3 for impact/reachable). Only used with mode.
@@ -2367,8 +2367,13 @@ impl RnaHandler {
                             let max_hops = args.hops.unwrap_or(3) as usize;
                             Ok(graph_state.index.reachable(node_id, max_hops, edge_filter_slice))
                         }
+                        "tests_for" => {
+                            // Walk incoming Calls edges to find callers, then filter to test files.
+                            let calls_filter = &[EdgeKind::Calls];
+                            Ok(graph_state.index.neighbors(node_id, Some(calls_filter), Direction::Incoming))
+                        }
                         other => Err(format!(
-                            "Unknown mode: \"{}\". Use \"neighbors\", \"impact\", or \"reachable\".",
+                            "Unknown mode: \"{}\". Use \"neighbors\", \"impact\", \"reachable\", or \"tests_for\".",
                             other
                         )),
                     }
@@ -2393,6 +2398,16 @@ impl RnaHandler {
                 let entry_set: std::collections::HashSet<&str> = valid_entry_ids.iter().map(|s| s.as_str()).collect();
                 all_ids.retain(|id| !entry_set.contains(id.as_str()));
 
+                // For tests_for mode, filter to only callers in test files
+                if mode == "tests_for" {
+                    all_ids.retain(|id| {
+                        graph_state.nodes.iter()
+                            .find(|n| n.stable_id() == *id)
+                            .map(|n| ranking::is_test_file(n))
+                            .unwrap_or(false)
+                    });
+                }
+
                 let entry_label = if valid_entry_ids.len() == 1 {
                     format!("`{}`", valid_entry_ids[0])
                 } else {
@@ -2412,6 +2427,7 @@ impl RnaHandler {
                         "neighbors" => format!("No {} neighbors for {}.", direction, entry_label),
                         "impact" => format!("No dependents found for {} within {} hops.", entry_label, args.hops.unwrap_or(3)),
                         "reachable" => format!("No reachable nodes from {} within {} hops.", entry_label, args.hops.unwrap_or(3)),
+                        "tests_for" => format!("No test functions found calling {}. Either no tests exist for this symbol, or the call edges haven't been extracted (check LSP status).", entry_label),
                         _ => format!("No results for {}.", entry_label),
                     };
                     Ok(text_result(format!("{}{}{}", entry_header, mode_desc, freshness)))
@@ -2429,6 +2445,10 @@ impl RnaHandler {
                         "reachable" => format!(
                             "## Reachable from {}\n\n{} node(s) within {} hop(s)\n\n",
                             entry_label, all_ids.len(), args.hops.unwrap_or(3)
+                        ),
+                        "tests_for" => format!(
+                            "## Test coverage for {}\n\n{} test function(s)\n\n",
+                            entry_label, all_ids.len()
                         ),
                         _ => String::new(),
                     };
@@ -3217,6 +3237,154 @@ mod tests {
             "unknown_future_field": true
         }));
         assert!(s.is_ok(), "extra fields should be ignored for forward compat");
+    }
+
+    // ── tests_for mode ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_search_tests_for_mode_with_node() {
+        let s = parse_search(json!({"node": "root:src/lib.rs:foo:function", "mode": "tests_for"})).unwrap();
+        assert_eq!(s.mode, Some("tests_for".to_string()));
+        assert!(s.node.is_some());
+    }
+
+    #[test]
+    fn test_search_tests_for_mode_with_query() {
+        let s = parse_search(json!({"query": "authentication handler", "mode": "tests_for"})).unwrap();
+        assert_eq!(s.mode, Some("tests_for".to_string()));
+        assert!(s.query.is_some());
+        assert!(s.node.is_none());
+    }
+
+    /// Verify the tests_for pattern: incoming Calls edges filtered to test-file callers.
+    #[test]
+    fn test_tests_for_filters_to_test_callers_only() {
+        use crate::graph::{index::GraphIndex, EdgeKind, Node, NodeId, NodeKind};
+        use petgraph::Direction;
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        let mut index = GraphIndex::new();
+
+        let test_id = NodeId {
+            root: "r".to_string(),
+            file: PathBuf::from("tests/test_auth.rs"),
+            name: "test_foo".to_string(),
+            kind: NodeKind::Function,
+        };
+        let prod_id = NodeId {
+            root: "r".to_string(),
+            file: PathBuf::from("src/auth.rs"),
+            name: "prod_bar".to_string(),
+            kind: NodeKind::Function,
+        };
+        let other_prod_id = NodeId {
+            root: "r".to_string(),
+            file: PathBuf::from("src/handler.rs"),
+            name: "prod_baz".to_string(),
+            kind: NodeKind::Function,
+        };
+
+        let test_stable = test_id.to_stable_id();
+        let prod_stable = prod_id.to_stable_id();
+        let other_stable = other_prod_id.to_stable_id();
+
+        index.add_edge(&test_stable, "function", &prod_stable, "function", EdgeKind::Calls);
+        index.add_edge(&other_stable, "function", &prod_stable, "function", EdgeKind::Calls);
+
+        // Step 1: incoming Calls neighbors of prod_bar
+        let callers = index.neighbors(&prod_stable, Some(&[EdgeKind::Calls]), Direction::Incoming);
+        assert_eq!(callers.len(), 2, "both test and prod callers returned");
+
+        // Step 2: build Node objects to test is_test_file filtering
+        let make_node = |id: NodeId| -> Node {
+            Node {
+                id: id.clone(),
+                language: "rust".to_string(),
+                signature: format!("fn {}()", id.name),
+                body: String::new(),
+                line_start: 1,
+                line_end: 10,
+                metadata: BTreeMap::new(),
+                source: crate::graph::ExtractionSource::TreeSitter,
+            }
+        };
+        let nodes = vec![
+            make_node(test_id.clone()),
+            make_node(prod_id.clone()),
+            make_node(other_prod_id.clone()),
+        ];
+
+        // Filter to test files only (mirrors handler logic)
+        let test_callers: Vec<&str> = callers.iter()
+            .filter(|id| {
+                nodes.iter()
+                    .find(|n| n.stable_id() == **id)
+                    .map(|n| ranking::is_test_file(n))
+                    .unwrap_or(false)
+            })
+            .map(|s| s.as_str())
+            .collect();
+
+        assert_eq!(test_callers.len(), 1, "only test caller should remain");
+        assert_eq!(test_callers[0], test_stable, "test_foo is the test caller");
+    }
+
+    /// Verify tests_for returns empty when no test files call the symbol.
+    #[test]
+    fn test_tests_for_no_test_callers() {
+        use crate::graph::{index::GraphIndex, EdgeKind, Node, NodeId, NodeKind};
+        use petgraph::Direction;
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        let mut index = GraphIndex::new();
+
+        let caller_id = NodeId {
+            root: "r".to_string(),
+            file: PathBuf::from("src/handler.rs"),
+            name: "handler".to_string(),
+            kind: NodeKind::Function,
+        };
+        let target_id = NodeId {
+            root: "r".to_string(),
+            file: PathBuf::from("src/auth.rs"),
+            name: "authenticate".to_string(),
+            kind: NodeKind::Function,
+        };
+
+        let caller_stable = caller_id.to_stable_id();
+        let target_stable = target_id.to_stable_id();
+
+        index.add_edge(&caller_stable, "function", &target_stable, "function", EdgeKind::Calls);
+
+        let callers = index.neighbors(&target_stable, Some(&[EdgeKind::Calls]), Direction::Incoming);
+        assert_eq!(callers.len(), 1);
+
+        let make_node = |id: NodeId| -> Node {
+            Node {
+                id: id.clone(),
+                language: "rust".to_string(),
+                signature: format!("fn {}()", id.name),
+                body: String::new(),
+                line_start: 1,
+                line_end: 10,
+                metadata: BTreeMap::new(),
+                source: crate::graph::ExtractionSource::TreeSitter,
+            }
+        };
+        let nodes = vec![make_node(caller_id), make_node(target_id)];
+
+        let test_callers: Vec<&String> = callers.iter()
+            .filter(|id| {
+                nodes.iter()
+                    .find(|n| n.stable_id() == **id)
+                    .map(|n| ranking::is_test_file(n))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        assert!(test_callers.is_empty(), "no test callers should be found");
     }
 
     // ── SearchSymbols -> Search conversion ──────────────────────────────
