@@ -103,6 +103,11 @@ pub struct ScanState {
     /// Per-file mtime at last scan (relative paths from repo root).
     #[serde(default)]
     pub file_mtimes: HashMap<PathBuf, SystemTimeWrapper>,
+    /// BLAKE3 content hashes per file (hex-encoded). Used to detect mtime
+    /// false positives: if mtime changed but content hash is identical,
+    /// the file is not truly changed and extraction can be skipped.
+    #[serde(default)]
+    pub file_content_hashes: HashMap<PathBuf, String>,
     /// Last indexed git commit SHA (if `.git` was present).
     #[serde(default)]
     pub last_commit_sha: Option<String>,
@@ -315,6 +320,58 @@ impl Scanner {
             }
         }
 
+        // ── Step 3b: BLAKE3 content hash to filter mtime false positives ──
+        let mut new_content_hashes: HashMap<PathBuf, String> = HashMap::new();
+        let pre_hash_changed_count = changed_files.len();
+
+        // Hash changed files: if content hash matches previous, it's a false positive
+        changed_files.retain(|rel_path| {
+            let abs_path = self.repo_root.join(rel_path);
+            match fs::read(&abs_path) {
+                Ok(bytes) => {
+                    let hash = blake3::hash(&bytes).to_hex().to_string();
+                    let is_truly_changed = self
+                        .state
+                        .file_content_hashes
+                        .get(rel_path)
+                        .is_none_or(|prev| *prev != hash);
+                    new_content_hashes.insert(rel_path.clone(), hash);
+                    if !is_truly_changed {
+                        tracing::debug!(
+                            "Scanner: content hash unchanged, skipping {}",
+                            rel_path.display()
+                        );
+                    }
+                    is_truly_changed
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Scanner: failed to read {} for content hash: {}",
+                        rel_path.display(),
+                        e
+                    );
+                    true // assume changed if we can't read
+                }
+            }
+        });
+
+        let hash_filtered = pre_hash_changed_count - changed_files.len();
+        if hash_filtered > 0 {
+            tracing::info!(
+                "Scanner: BLAKE3 content hash filtered {} mtime false positive(s)",
+                hash_filtered
+            );
+        }
+
+        // Hash new files for future comparisons
+        for rel_path in &new_files {
+            let abs_path = self.repo_root.join(rel_path);
+            if let Ok(bytes) = fs::read(&abs_path) {
+                let hash = blake3::hash(&bytes).to_hex().to_string();
+                new_content_hashes.insert(rel_path.clone(), hash);
+            }
+        }
+
         // ── Step 4: Detect deleted files ────────────────────────────
         let deleted_files: Vec<PathBuf> = self
             .state
@@ -338,10 +395,19 @@ impl Scanner {
         // Remove deleted files from new state
         for del in &deleted_files {
             new_file_mtimes.remove(del);
+            new_content_hashes.remove(del);
+        }
+
+        // Carry forward content hashes for unchanged files (not in changed or new)
+        for (path, hash) in &self.state.file_content_hashes {
+            if !new_content_hashes.contains_key(path) && new_file_mtimes.contains_key(path) {
+                new_content_hashes.insert(path.clone(), hash.clone());
+            }
         }
 
         self.state.dir_mtimes = new_dir_mtimes;
         self.state.file_mtimes = new_file_mtimes;
+        self.state.file_content_hashes = new_content_hashes;
         self.state.last_scan = Some(SystemTime::now().into());
 
         // Update last_commit_sha to current HEAD
@@ -357,12 +423,13 @@ impl Scanner {
 
         let scan_duration = start.elapsed();
         tracing::info!(
-            "Scanner: completed scan for {} in {:?} ({} new, {} changed, {} deleted, {} tracked files)",
+            "Scanner: completed scan for {} in {:?} ({} new, {} changed, {} deleted, {} hash-skipped, {} tracked files)",
             self.repo_root.display(),
             scan_duration,
             new_files.len(),
             changed_files.len(),
             deleted_files.len(),
+            hash_filtered,
             self.state.file_mtimes.len()
         );
 
@@ -962,6 +1029,9 @@ mod tests {
         state
             .file_mtimes
             .insert(PathBuf::from("src/main.rs"), SystemTime::now().into());
+        state
+            .file_content_hashes
+            .insert(PathBuf::from("src/main.rs"), "a".repeat(64));
         state.last_commit_sha = Some("abc123def456".to_string());
         state.last_scan = Some(SystemTime::now().into());
 
@@ -970,8 +1040,33 @@ mod tests {
 
         assert_eq!(restored.dir_mtimes.len(), 1);
         assert_eq!(restored.file_mtimes.len(), 1);
+        assert_eq!(restored.file_content_hashes.len(), 1);
         assert_eq!(restored.last_commit_sha.as_deref(), Some("abc123def456"));
         assert!(restored.last_scan.is_some());
+    }
+
+    #[test]
+    fn test_scan_state_backward_compat_no_content_hashes() {
+        // Old scan-state.json without file_content_hashes field should deserialize fine
+        let old_json = r#"{
+            "dir_mtimes": {},
+            "file_mtimes": {},
+            "last_commit_sha": "abc123",
+            "last_scan": [1700000000, 0]
+        }"#;
+        let state: ScanState = serde_json::from_str(old_json).unwrap();
+        assert!(state.file_content_hashes.is_empty());
+        assert_eq!(state.last_commit_sha.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn test_content_hash_deterministic_across_reads() {
+        // Same content always produces the same BLAKE3 hash
+        let content = b"fn main() { println!(\"hello\"); }";
+        let h1 = blake3::hash(content).to_hex().to_string();
+        let h2 = blake3::hash(content).to_hex().to_string();
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64); // 256-bit = 64 hex chars
     }
 
     // ── First scan: everything is new ───────────────────────────────
@@ -1286,5 +1381,119 @@ mod tests {
 
         let to_extract = result.files_to_extract();
         assert_eq!(to_extract.len(), 3);
+    }
+
+    // ── BLAKE3 content hash tests ───────────────────────────────────
+
+    #[test]
+    fn test_content_hash_filters_mtime_false_positive() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        create_file(root, "src/main.rs", "fn main() {}");
+        fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+
+        // First scan: file is new
+        let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
+        let result1 = scanner.scan().unwrap();
+        assert_eq!(result1.new_files.len(), 1);
+        assert!(result1.changed_files.is_empty());
+
+        // Touch the file without changing content (mtime false positive)
+        bump_mtime();
+        create_file(root, "src/main.rs", "fn main() {}"); // same content
+
+        // Second scan: mtime changed but content hash should filter it out
+        let mut scanner2 = Scanner::new(root.to_path_buf()).unwrap();
+        let result2 = scanner2.scan().unwrap();
+
+        assert!(
+            result2.changed_files.is_empty(),
+            "Content hash should filter mtime false positive. changed: {:?}",
+            result2.changed_files,
+        );
+        assert!(result2.new_files.is_empty());
+    }
+
+    #[test]
+    fn test_content_hash_allows_real_changes() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        create_file(root, "src/main.rs", "fn main() {}");
+        fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+
+        // First scan
+        let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
+        scanner.scan().unwrap();
+
+        // Modify with different content
+        bump_mtime();
+        create_file(root, "src/main.rs", "fn main() { println!(\"changed\"); }");
+
+        // Second scan: content truly changed, should appear
+        let mut scanner2 = Scanner::new(root.to_path_buf()).unwrap();
+        let result2 = scanner2.scan().unwrap();
+
+        assert!(
+            result2.changed_files.contains(&PathBuf::from("src/main.rs")),
+            "Real content change should be detected. changed: {:?}",
+            result2.changed_files,
+        );
+    }
+
+    #[test]
+    fn test_content_hash_persisted_in_state() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        create_file(root, "src/main.rs", "fn main() {}");
+        fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+
+        // First scan
+        let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
+        scanner.scan().unwrap();
+
+        // Load persisted state and check content hashes
+        let state = load_state(root).unwrap();
+        assert!(
+            state.file_content_hashes.contains_key(&PathBuf::from("src/main.rs")),
+            "Content hash should be persisted. hashes: {:?}",
+            state.file_content_hashes.keys().collect::<Vec<_>>()
+        );
+
+        // Verify it's a valid BLAKE3 hex hash (64 chars)
+        let hash = &state.file_content_hashes[&PathBuf::from("src/main.rs")];
+        assert_eq!(hash.len(), 64, "BLAKE3 hex hash should be 64 chars, got: {}", hash);
+    }
+
+    #[test]
+    fn test_content_hash_removed_for_deleted_files() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        create_file(root, "src/main.rs", "fn main() {}");
+        create_file(root, "src/old.rs", "// will delete");
+        fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+
+        // First scan
+        let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
+        scanner.scan().unwrap();
+
+        // Delete a file
+        fs::remove_file(root.join("src/old.rs")).unwrap();
+
+        // Second scan
+        let mut scanner2 = Scanner::new(root.to_path_buf()).unwrap();
+        scanner2.scan().unwrap();
+
+        // Load state — deleted file's hash should be gone
+        let state = load_state(root).unwrap();
+        assert!(
+            !state.file_content_hashes.contains_key(&PathBuf::from("src/old.rs")),
+            "Deleted file hash should be removed from state"
+        );
+        // But existing file's hash should remain
+        assert!(state.file_content_hashes.contains_key(&PathBuf::from("src/main.rs")));
     }
 }

@@ -78,6 +78,9 @@ lsp-types = "0.97"
 # URI parsing (percent-decoding for LSP file:// URIs)
 url = "2"
 
+# Content hashing (incremental extraction/embedding skip)
+blake3 = "1"
+
 # Error handling
 anyhow = "1"
 
