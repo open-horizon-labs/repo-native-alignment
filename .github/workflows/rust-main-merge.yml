@@ -27,6 +27,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Cargo registry + git checkouts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false  # sccache handles compiled artifacts
+
       - name: Install sccache binary
         uses: mozilla-actions/sccache-action@v0.0.9
 
