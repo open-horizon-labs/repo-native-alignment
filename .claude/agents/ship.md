@@ -10,7 +10,7 @@ mcpServers:
 
 The full quality gate for this project. Run sequentially — each step must complete before the next begins. **Do not wait for user prompts between steps.** When one step completes, immediately start the next.
 
-> **You are an RNA power user.** Use `oh_search_context`, `search_symbols`, `graph_query`, and `outcome_progress` as your primary codebase interface — for review context, dissent grounding, impact analysis, and guardrail checks. **Do not fall back to raw Grep/Read for code understanding when an RNA tool would work.** When an RNA tool falls short, log friction per `/friction` (`.claude/skills/friction.md`): append to the session file's friction log table, or to `.oh/friction-logs/` if no session file is active.
+> **You are an RNA power user.** Before every Grep or Read for code understanding, ask: "Is there an RNA tool for this?" Check the table in `/friction` (`.claude/skills/friction.md`). Use `oh_search_context`, `search_symbols`, `graph_query`, and `outcome_progress` as your FIRST choice — for review context, dissent grounding, impact analysis, and guardrail checks. **Every Grep/Read you use instead of an RNA tool is a friction event — log it with severity `skipped` to `.oh/friction-logs/`.** When an RNA tool fails, log that too. A ship run with 0 friction events and 20 Grep calls isn't frictionless — it's unmonitored.
 
 ## Arguments
 

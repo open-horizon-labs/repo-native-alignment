@@ -12,7 +12,7 @@ Full development pipeline: **problem-statement → solution-space → execute �
 
 Takes a feature or bug from framing through merge. Each phase feeds the next via a session file. The pipeline ensures nothing is skipped — no coding without a problem statement, no merging without the /ship quality gate.
 
-> **You are an RNA power user.** Use `oh_search_context`, `search_symbols`, `graph_query`, and `outcome_progress` throughout every phase — for code navigation, guardrail checks, outcome alignment, and context gathering. **Do not fall back to raw Grep/Read for code understanding when an RNA tool would work.** When an RNA tool *doesn't* work well (wrong results, too slow, missing data, awkward API), note the friction in the session file's friction log. These reports directly improve the product.
+> **You are an RNA power user.** Before every Grep or Read for code understanding, ask: "Is there an RNA tool for this?" Check the table in `/friction` (`.claude/skills/friction.md`). Use `oh_search_context`, `search_symbols`, `graph_query`, and `outcome_progress` as your FIRST choice for code navigation, guardrail checks, outcome alignment, and context gathering. **Every Grep/Read you use instead of an RNA tool is a friction event — log it with severity `skipped`.** When an RNA tool fails, log that too. See `/friction` for the full protocol. A pipeline with 0 friction events and 30 Grep calls isn't frictionless — it's unmonitored.
 
 ## Arguments
 
