@@ -28,9 +28,31 @@ An MCP server that gives coding agents what LSP alone can't: a cross-language co
 
 ## Why Not Just LSP?
 
-Your editor's LSP servers give agents single-symbol, single-hop, single-language queries. To answer "what's the blast radius of changing this?", an agent using LSP alone must call `callHierarchy/incomingCalls` repeatedly — one hop per request — and assemble the graph itself. There's no multi-hop primitive.
+**LSP: 4 requests to find who depends on `ConnectionPool`**
+```
+textDocument/references("ConnectionPool")     → [PoolManager, HttpServer, Worker]
+callHierarchy/incomingCalls(PoolManager)      → [AppConfig, TestHarness]
+callHierarchy/incomingCalls(HttpServer)       → [main, Router]
+callHierarchy/incomingCalls(Worker)           → [Scheduler]
+// agent must: filter test files, deduplicate, reason about the shape
+```
 
-RNA runs those same LSP servers internally, fuses their data with tree-sitter, embedded function bodies, git history, and business artifacts into a single cross-language graph. One `graph_query` call replaces N round-trips. Early testing: ~50s and ~half the tokens vs ~120s for the same structural questions with LSP alone.
+**RNA: 1 request**
+```
+graph_query(query="ConnectionPool", mode="impact", max_hops=3)
+→ PoolManager → AppConfig
+→ HttpServer → main, Router
+→ Worker → Scheduler
+// production code ranked first, test files demoted, cross-language
+```
+
+| Question | LSP alone | RNA |
+|---|---|---|
+| What breaks if I change the connection pool? | N round-trips of `incomingCalls`, agent assembles graph | `graph_query(mode="impact")` — one call, transitive |
+| Find code related to payment processing | No semantic search — agent must guess names and grep | `oh_search_context(include_code=true)` — ranked by meaning |
+| How is our reliability outcome progressing? | Not possible — LSP has no business context | `outcome_progress("reliability")` — commits → files → symbols |
+
+LSP gives agents single-symbol, single-hop, single-language queries. There's no multi-hop primitive. RNA runs those same LSP servers internally, fuses their data with tree-sitter, embedded function bodies, git history, and business artifacts into a cross-language graph. Early testing: ~50s and ~half the tokens vs ~120s for the same structural questions with LSP alone.
 
 ## Quick Start
 
