@@ -62,9 +62,66 @@ pub struct OutcomeProgress {
     pub outcome_id: String,
 }
 
+// ── Unified search tool ─────────────────────────────────────────────
+// Combines the functionality of the former `search_symbols` (flat search)
+// and `graph_query` (graph traversal) into a single tool. The old tools
+// are kept as deprecated aliases that route here.
+
+#[macros::mcp_tool(
+    name = "search",
+    description = "Find code symbols and trace their relationships. Without `mode`, performs flat ranked search (by name/signature). With `mode` (neighbors/impact/reachable), performs graph traversal from matched symbols. Entry point: `query` (name or semantic search) or `node` (stable ID from previous results). Filter by kind, language, file. Sort by relevance or complexity."
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct Search {
+    /// Search query string — matched against symbol name and signature for flat search, or used as semantic search for graph traversal entry points
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// Start from a known stable node ID (from previous search results). Takes precedence over query for graph traversal entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// Graph traversal mode: "neighbors" (direct connections), "impact" (reverse dependents), "reachable" (forward BFS). Omit for flat search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Maximum traversal depth (default: 1 for neighbors, 3 for impact/reachable). Only used with mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hops: Option<u32>,
+    /// Direction for neighbors mode: "outgoing" (default), "incoming", "both". Only used with mode="neighbors".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    /// Filter edge types: calls, depends_on, implements, defines, etc. Only used with mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_types: Option<Vec<String>>,
+    /// Filter by symbol kind (function, struct, trait, enum, module, import, etc.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Filter by language (rust, python, typescript, go, markdown)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Filter by file path substring
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Filter to a specific workspace root (by slug, e.g. "zettelkasten")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    /// Number of results (flat search, default: 10) or entry points (traversal, default: 1)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    /// Sort results by "relevance" (default) or "complexity" (descending cyclomatic)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_by: Option<String>,
+    /// Minimum cyclomatic complexity threshold. Only return functions with complexity >= this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_complexity: Option<u32>,
+    /// If true, include only synthetic (inferred) constants. If false, exclude them. If absent, return all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthetic: Option<bool>,
+}
+
+// ── Deprecated aliases (kept for one release cycle) ─────────────────
+
 #[macros::mcp_tool(
     name = "search_symbols",
-    description = "Find code symbols by name or signature across all supported languages. Returns file location, line numbers, signatures, complexity scores, and graph edges. Filter by kind (function/struct/trait/etc.), language, file path, or minimum complexity. Sort by complexity to find hotspots. Results ranked: exact name > contains > signature-only, production code before tests. Use synthetic=false for declared constants only, synthetic=true for inferred literals."
+    description = "DEPRECATED: use `search` instead. Find code symbols by name or signature. This is an alias for `search` without a `mode` parameter."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SearchSymbols {
@@ -96,9 +153,31 @@ pub struct SearchSymbols {
     pub sort: Option<String>,
 }
 
+impl SearchSymbols {
+    /// Convert deprecated SearchSymbols into the unified Search struct.
+    fn into_search(self) -> Search {
+        Search {
+            query: Some(self.query),
+            node: None,
+            mode: None,
+            hops: None,
+            direction: None,
+            edge_types: None,
+            kind: self.kind,
+            language: self.language,
+            file: self.file,
+            root: self.root,
+            top_k: self.limit,
+            sort_by: self.sort,
+            min_complexity: self.min_complexity,
+            synthetic: self.synthetic,
+        }
+    }
+}
+
 #[macros::mcp_tool(
     name = "graph_query",
-    description = "Trace code relationships from a symbol or natural language query. Modes: neighbors (direct connections), impact (what depends on this), reachable (forward BFS). Edges point from caller to callee, impl to trait, dependent to dependency. Use direction=\"incoming\" to reverse — what calls/implements/depends on this?"
+    description = "DEPRECATED: use `search` with a `mode` parameter instead. Trace code relationships from a symbol or natural language query."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GraphQuery {
@@ -123,6 +202,28 @@ pub struct GraphQuery {
     /// Maximum number of entry nodes from semantic search (default: 3). Only used with query parameter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
+}
+
+impl GraphQuery {
+    /// Convert deprecated GraphQuery into the unified Search struct.
+    fn into_search(self) -> Search {
+        Search {
+            query: self.query,
+            node: self.node_id,
+            mode: Some(self.mode),
+            hops: self.max_hops,
+            direction: self.direction,
+            edge_types: self.edge_types,
+            kind: None,
+            language: None,
+            file: None,
+            root: None,
+            top_k: self.top_k,
+            sort_by: None,
+            min_complexity: None,
+            synthetic: None,
+        }
+    }
 }
 
 fn default_graph_mode() -> String {
@@ -1928,6 +2029,413 @@ impl RnaHandler {
 
         Ok(())
     }
+
+    // ── Unified search handler ──────────────────────────────────────────
+    // Shared implementation for `search`, `search_symbols` (deprecated alias),
+    // and `graph_query` (deprecated alias). Branches on whether `mode` is set
+    // (graph traversal) or absent (flat symbol search).
+
+    async fn handle_search(&self, args: Search) -> Result<CallToolResult, CallToolError> {
+        // Normalize inputs
+        let query = args.query.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let node = args.node.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+        if args.mode.is_some() {
+            // ── Graph traversal path ──────────────────────────────────
+            self.handle_search_traversal(&args, query, node).await
+        } else {
+            // ── Flat search path ──────────────────────────────────────
+            self.handle_search_flat(&args, query).await
+        }
+    }
+
+    /// Flat symbol search (no `mode` parameter). Equivalent to the old `search_symbols`.
+    async fn handle_search_flat(
+        &self,
+        args: &Search,
+        query: Option<&str>,
+    ) -> Result<CallToolResult, CallToolError> {
+        let sort_by_complexity = args.sort_by.as_deref() == Some("complexity");
+        let has_complexity_filter = args.min_complexity.is_some();
+        let complexity_search = has_complexity_filter || sort_by_complexity;
+
+        let query_str = query.unwrap_or("");
+        if query_str.is_empty() && !complexity_search {
+            return Ok(text_result("Empty query. Please describe what you're looking for (or use min_complexity / sort_by=\"complexity\" to find complex functions).".into()));
+        }
+
+        match self.get_graph().await {
+            Ok(guard) => {
+                let graph_state = guard.as_ref().unwrap();
+                let limit = args.top_k.unwrap_or(10) as usize;
+                let query_lower = query_str.to_lowercase();
+
+                let mut matches: Vec<&Node> = graph_state
+                    .nodes
+                    .iter()
+                    .filter(|n| {
+                        // In complexity search mode, only return functions.
+                        if complexity_search && n.id.kind != NodeKind::Function {
+                            return false;
+                        }
+                        // When query is non-empty, filter by name/signature match.
+                        if !query_lower.is_empty() {
+                            let name_match = n.id.name.to_lowercase().contains(&query_lower)
+                                || n.signature.to_lowercase().contains(&query_lower);
+                            if !name_match {
+                                return false;
+                            }
+                        }
+                        if let Some(ref kind_filter) = args.kind {
+                            if n.id.kind.to_string().to_lowercase() != kind_filter.to_lowercase() {
+                                return false;
+                            }
+                        }
+                        if let Some(ref lang_filter) = args.language {
+                            if n.language.to_lowercase() != lang_filter.to_lowercase() {
+                                return false;
+                            }
+                        }
+                        if let Some(ref file_filter) = args.file {
+                            let path_str = n.id.file.to_string_lossy();
+                            if !path_str.contains(file_filter.as_str()) {
+                                return false;
+                            }
+                        }
+                        if let Some(ref root_filter) = args.root {
+                            if n.id.root.to_lowercase() != root_filter.to_lowercase() {
+                                return false;
+                            }
+                        }
+                        if let Some(synthetic_filter) = args.synthetic {
+                            let is_synthetic = n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false);
+                            if is_synthetic != synthetic_filter {
+                                return false;
+                            }
+                        }
+                        if let Some(min_cc) = args.min_complexity {
+                            let Some(cc) = n.metadata.get("cyclomatic")
+                                .and_then(|s| s.parse::<u32>().ok())
+                            else {
+                                return false;
+                            };
+                            if cc < min_cc {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .collect();
+
+                if sort_by_complexity {
+                    matches.retain(|n| {
+                        n.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).is_some()
+                    });
+                    matches.sort_by(|a, b| {
+                        let cc_a = a.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                        let cc_b = b.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                        cc_b.cmp(&cc_a)
+                    });
+                } else {
+                    ranking::sort_symbol_matches(&mut matches, &query_lower, &graph_state.index);
+                }
+                matches.truncate(limit);
+
+                let freshness = format_freshness(
+                    graph_state.nodes.len(),
+                    graph_state.last_scan_completed_at,
+                    Some(&self.lsp_status),
+                );
+                if matches.is_empty() {
+                    Ok(text_result(format!(
+                        "No symbols matching \"{}\".{}",
+                        query_str, freshness
+                    )))
+                } else {
+                    let md: String = matches
+                        .iter()
+                        .map(|n| {
+                            let stable_id = n.stable_id();
+                            let outgoing = graph_state.index.neighbors(
+                                &stable_id,
+                                None,
+                                Direction::Outgoing,
+                            );
+                            let incoming = graph_state.index.neighbors(
+                                &stable_id,
+                                None,
+                                Direction::Incoming,
+                            );
+                            let mut entry = format!(
+                                "- **{}** `{}` ({}) `{}`:{}-{}\n  ID: `{}`",
+                                n.id.kind, n.id.name, n.language,
+                                n.id.file.display(),
+                                n.line_start, n.line_end,
+                                stable_id,
+                            );
+                            if !n.signature.is_empty() {
+                                entry.push_str(&format!("\n  Sig: `{}`", n.signature));
+                            }
+                            if let Some(val) = n.metadata.get("value") {
+                                entry.push_str(&format!("\n  Value: `{}`", val));
+                            }
+                            if n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false) {
+                                entry.push_str(" *(literal)*");
+                            }
+                            if let Some(cc) = n.metadata.get("cyclomatic") {
+                                entry.push_str(&format!("\n  Complexity: {}", cc));
+                            }
+                            if !outgoing.is_empty() {
+                                entry.push_str(&format!("\n  Out: {} edge(s)", outgoing.len()));
+                            }
+                            if !incoming.is_empty() {
+                                entry.push_str(&format!("\n  In: {} edge(s)", incoming.len()));
+                            }
+                            entry
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    Ok(text_result(format!(
+                        "## Symbol search: \"{}\"\n\n{} result(s)\n\n{}{}",
+                        query_str,
+                        matches.len(),
+                        md,
+                        freshness
+                    )))
+                }
+            }
+            Err(e) => Ok(text_result(format!("Graph error: {}", e))),
+        }
+    }
+
+    /// Graph traversal search (with `mode` parameter). Equivalent to the old `graph_query`.
+    async fn handle_search_traversal(
+        &self,
+        args: &Search,
+        query: Option<&str>,
+        node: Option<&str>,
+    ) -> Result<CallToolResult, CallToolError> {
+        let mode = args.mode.as_deref().unwrap_or("neighbors");
+        let top_k = args.top_k.unwrap_or(1).clamp(1, 50) as usize;
+
+        // Reject if no entry point
+        if node.is_none() && query.is_none() {
+            return Ok(text_result(
+                "Either query or node is required. Provide a search query or a stable node ID.".to_string()
+            ));
+        }
+
+        // Resolve entry node IDs
+        let (entry_node_ids, entry_header): (Vec<String>, String) = if let Some(node_id) = node {
+            (vec![node_id.to_string()], String::new())
+        } else if let Some(query_text) = query {
+            let embed_guard = self.embed_index.load();
+            match embed_guard.as_ref() {
+                Some(embed_idx) => {
+                    match embed_idx.search(query_text, None, top_k.min(50) * 3).await {
+                        Ok(SearchOutcome::Results(results)) if !results.is_empty() => {
+                            let code_results: Vec<_> = results.into_iter()
+                                .filter(|r| r.kind.starts_with("code:"))
+                                .take(top_k)
+                                .collect();
+
+                            if code_results.is_empty() {
+                                return Ok(text_result(format!(
+                                    "No code symbols matched query \"{}\". Try a different query or use node parameter.",
+                                    query_text
+                                )));
+                            }
+
+                            let mut header = format!("### Matched entry nodes for \"{}\"\n\n", query_text);
+                            let ids: Vec<String> = code_results.iter()
+                                .map(|r| {
+                                    header.push_str(&format!(
+                                        "- `{}` -- {} (score: {:.2})\n",
+                                        r.id, r.title, r.score
+                                    ));
+                                    r.id.clone()
+                                })
+                                .collect();
+                            header.push('\n');
+                            (ids, header)
+                        }
+                        Ok(SearchOutcome::NotReady) => {
+                            return Ok(text_result(
+                                "Embedding index: building -- semantic graph queries will work shortly. Use node parameter instead, or retry in a few seconds.".to_string()
+                            ));
+                        }
+                        Ok(_) => {
+                            return Ok(text_result(format!(
+                                "No code symbols matched query \"{}\". Try a different query or use node parameter.",
+                                query_text
+                            )));
+                        }
+                        Err(e) => {
+                            return Ok(text_result(format!(
+                                "Semantic search failed: {}. Use node parameter instead.",
+                                e
+                            )));
+                        }
+                    }
+                }
+                None => {
+                    return Ok(text_result(
+                        "Embedding index not available. Use node parameter instead, or wait for the background index to build.".to_string()
+                    ));
+                }
+            }
+        } else {
+            unreachable!("both-empty case handled above");
+        };
+
+        match self.get_graph().await {
+            Ok(guard) => {
+                let graph_state = guard.as_ref().unwrap();
+
+                let valid_entry_ids: Vec<&String> = entry_node_ids.iter()
+                    .filter(|id| graph_state.index.get_node(id).is_some())
+                    .collect();
+
+                if valid_entry_ids.is_empty() {
+                    let id_list = entry_node_ids.iter()
+                        .map(|id| format!("`{}`", id))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Ok(text_result(format!(
+                        "{}No graph nodes found for {}. The node(s) may not have edges in the graph. Try search to find valid node IDs.",
+                        entry_header, id_list
+                    )));
+                }
+
+                let edge_filter = args.edge_types.as_ref().map(|types| {
+                    types
+                        .iter()
+                        .filter_map(|t| parse_edge_kind(t))
+                        .collect::<Vec<_>>()
+                });
+                let edge_filter_slice = edge_filter.as_deref();
+
+                let run_traversal = |node_id: &str| -> Result<Vec<String>, String> {
+                    match mode {
+                        "neighbors" => {
+                            let max_hops = args.hops.unwrap_or(1) as usize;
+                            let direction = args.direction.as_deref().unwrap_or("outgoing");
+
+                            match direction {
+                                "outgoing" => {
+                                    if max_hops == 1 {
+                                        Ok(graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Outgoing))
+                                    } else {
+                                        Ok(graph_state.index.reachable(node_id, max_hops, edge_filter_slice))
+                                    }
+                                }
+                                "incoming" => {
+                                    if max_hops == 1 {
+                                        Ok(graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Incoming))
+                                    } else {
+                                        Ok(graph_state.index.impact(node_id, max_hops))
+                                    }
+                                }
+                                "both" => {
+                                    let out = if max_hops == 1 {
+                                        graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Outgoing)
+                                    } else {
+                                        graph_state.index.reachable(node_id, max_hops, edge_filter_slice)
+                                    };
+                                    let inc = if max_hops == 1 {
+                                        graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Incoming)
+                                    } else {
+                                        graph_state.index.impact(node_id, max_hops)
+                                    };
+                                    let mut combined = out;
+                                    combined.extend(inc);
+                                    Ok(combined)
+                                }
+                                _ => Err(format!(
+                                    "Invalid direction: \"{}\". Use \"outgoing\", \"incoming\", or \"both\".",
+                                    direction
+                                )),
+                            }
+                        }
+                        "impact" => {
+                            let max_hops = args.hops.unwrap_or(3) as usize;
+                            Ok(graph_state.index.impact(node_id, max_hops))
+                        }
+                        "reachable" => {
+                            let max_hops = args.hops.unwrap_or(3) as usize;
+                            Ok(graph_state.index.reachable(node_id, max_hops, edge_filter_slice))
+                        }
+                        other => Err(format!(
+                            "Unknown mode: \"{}\". Use \"neighbors\", \"impact\", or \"reachable\".",
+                            other
+                        )),
+                    }
+                };
+
+                let mut all_ids: Vec<String> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+
+                for node_id in &valid_entry_ids {
+                    match run_traversal(node_id) {
+                        Ok(ids) => {
+                            for id in ids {
+                                if seen.insert(id.clone()) {
+                                    all_ids.push(id);
+                                }
+                            }
+                        }
+                        Err(msg) => return Ok(text_result(msg)),
+                    }
+                }
+
+                let entry_set: std::collections::HashSet<&str> = valid_entry_ids.iter().map(|s| s.as_str()).collect();
+                all_ids.retain(|id| !entry_set.contains(id.as_str()));
+
+                let entry_label = if valid_entry_ids.len() == 1 {
+                    format!("`{}`", valid_entry_ids[0])
+                } else {
+                    format!("{} entry nodes", valid_entry_ids.len())
+                };
+
+                let direction = args.direction.as_deref().unwrap_or("outgoing");
+
+                let freshness = format_freshness(
+                    graph_state.nodes.len(),
+                    graph_state.last_scan_completed_at,
+                    Some(&self.lsp_status),
+                );
+
+                if all_ids.is_empty() {
+                    let mode_desc = match mode {
+                        "neighbors" => format!("No {} neighbors for {}.", direction, entry_label),
+                        "impact" => format!("No dependents found for {} within {} hops.", entry_label, args.hops.unwrap_or(3)),
+                        "reachable" => format!("No reachable nodes from {} within {} hops.", entry_label, args.hops.unwrap_or(3)),
+                        _ => format!("No results for {}.", entry_label),
+                    };
+                    Ok(text_result(format!("{}{}{}", entry_header, mode_desc, freshness)))
+                } else {
+                    let md = format_neighbor_nodes(&graph_state.nodes, &all_ids);
+                    let heading = match mode {
+                        "neighbors" => format!(
+                            "## Graph neighbors ({}) of {}\n\n{} result(s)\n\n",
+                            direction, entry_label, all_ids.len()
+                        ),
+                        "impact" => format!(
+                            "## Impact analysis for {}\n\n{} dependent(s) within {} hop(s)\n\n",
+                            entry_label, all_ids.len(), args.hops.unwrap_or(3)
+                        ),
+                        "reachable" => format!(
+                            "## Reachable from {}\n\n{} node(s) within {} hop(s)\n\n",
+                            entry_label, all_ids.len(), args.hops.unwrap_or(3)
+                        ),
+                        _ => String::new(),
+                    };
+                    Ok(text_result(format!("{}{}{}{}", entry_header, heading, md, freshness)))
+                }
+            }
+            Err(e) => Ok(text_result(format!("Graph error: {}", e))),
+        }
+    }
 }
 
 fn text_result(s: String) -> CallToolResult {
@@ -2026,7 +2534,7 @@ fn build_context_preamble(root: &Path) -> String {
     }
 
     let mut out = format!("---\n# Business Context (auto-injected on first tool call)\n\n{}\n", parts.join("\n"));
-    out.push_str("**Code exploration:** use `search_symbols` (not Grep), `graph_query` (not Read), `oh_search_context` (not search_all)\n");
+    out.push_str("**Code exploration:** use `search` (not Grep/Read), `oh_search_context` (not search_all). `search_symbols` and `graph_query` are deprecated aliases for `search`.\n");
     out.push_str("---\n\n");
     out
 }
@@ -2042,8 +2550,9 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             tools: vec![
                 OhSearchContext::tool(),
                 OutcomeProgress::tool(),
-                SearchSymbols::tool(),
-                GraphQuery::tool(),
+                Search::tool(),
+                SearchSymbols::tool(),  // deprecated alias
+                GraphQuery::tool(),     // deprecated alias
                 ListRoots::tool(),
             ],
             meta: None,
@@ -2269,405 +2778,23 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 }
             }
 
+            // ── Deprecated aliases: convert to Search and fall through ──
             "search_symbols" => {
                 let args: SearchSymbols = parse_args(params.arguments)?;
-                let query = args.query.trim();
-                let sort_by_complexity_early = args.sort.as_deref() == Some("complexity");
-                let has_complexity_filter = args.min_complexity.is_some();
-                let complexity_search = has_complexity_filter || sort_by_complexity_early;
-                if query.is_empty() && !complexity_search {
-                    return Ok(text_result("Empty query. Please describe what you're looking for (or use min_complexity / sort=\"complexity\" to find complex functions).".into()));
-                }
-                match self.get_graph().await {
-                    Ok(guard) => {
-                        let graph_state = guard.as_ref().unwrap();
-                        let limit = args.limit.unwrap_or(20) as usize;
-                        let query_lower = query.to_lowercase();
-
-                        let sort_by_complexity = args.sort.as_deref() == Some("complexity");
-                        let mut matches: Vec<&Node> = graph_state
-                            .nodes
-                            .iter()
-                            .filter(|n| {
-                                // In complexity search mode, only return functions.
-                                if complexity_search && n.id.kind != NodeKind::Function {
-                                    return false;
-                                }
-                                // When query is non-empty, filter by name/signature match.
-                                if !query_lower.is_empty() {
-                                    let name_match = n.id.name.to_lowercase().contains(&query_lower)
-                                        || n.signature.to_lowercase().contains(&query_lower);
-                                    if !name_match {
-                                        return false;
-                                    }
-                                }
-                                if let Some(ref kind_filter) = args.kind {
-                                    if n.id.kind.to_string().to_lowercase() != kind_filter.to_lowercase() {
-                                        return false;
-                                    }
-                                }
-                                if let Some(ref lang_filter) = args.language {
-                                    if n.language.to_lowercase() != lang_filter.to_lowercase() {
-                                        return false;
-                                    }
-                                }
-                                if let Some(ref file_filter) = args.file {
-                                    let path_str = n.id.file.to_string_lossy();
-                                    if !path_str.contains(file_filter.as_str()) {
-                                        return false;
-                                    }
-                                }
-                                if let Some(ref root_filter) = args.root {
-                                    if n.id.root.to_lowercase() != root_filter.to_lowercase() {
-                                        return false;
-                                    }
-                                }
-                                if let Some(synthetic_filter) = args.synthetic {
-                                    let is_synthetic = n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false);
-                                    if is_synthetic != synthetic_filter {
-                                        return false;
-                                    }
-                                }
-                                if let Some(min_cc) = args.min_complexity {
-                                    let Some(cc) = n.metadata.get("cyclomatic")
-                                        .and_then(|s| s.parse::<u32>().ok())
-                                    else {
-                                        return false;
-                                    };
-                                    if cc < min_cc {
-                                        return false;
-                                    }
-                                }
-                                true
-                            })
-                            .collect();
-
-                        if sort_by_complexity {
-                            // Drop entries without a parseable cyclomatic score so
-                            // unknown-score symbols don't push real hotspots off the page.
-                            matches.retain(|n| {
-                                n.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).is_some()
-                            });
-                            // Sort by cyclomatic complexity descending.
-                            matches.sort_by(|a, b| {
-                                let cc_a = a.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-                                let cc_b = b.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-                                cc_b.cmp(&cc_a)
-                            });
-                        } else {
-                            // Rank results using the shared 5-tier cascade
-                            // (see ranking::sort_symbol_matches for tier documentation)
-                            ranking::sort_symbol_matches(&mut matches, &query_lower, &graph_state.index);
-                        }
-                        matches.truncate(limit);
-
-                        let freshness = format_freshness(
-                            graph_state.nodes.len(),
-                            graph_state.last_scan_completed_at,
-                            Some(&self.lsp_status),
-                        );
-                        if matches.is_empty() {
-                            Ok(text_result(format!(
-                                "No symbols matching \"{}\".{}",
-                                query, freshness
-                            )))
-                        } else {
-                            let md: String = matches
-                                .iter()
-                                .map(|n| {
-                                    let stable_id = n.stable_id();
-                                    // Find edges involving this node
-                                    let outgoing = graph_state.index.neighbors(
-                                        &stable_id,
-                                        None,
-                                        Direction::Outgoing,
-                                    );
-                                    let incoming = graph_state.index.neighbors(
-                                        &stable_id,
-                                        None,
-                                        Direction::Incoming,
-                                    );
-                                    let mut entry = format!(
-                                        "- **{}** `{}` ({}) `{}`:{}-{}\n  ID: `{}`",
-                                        n.id.kind, n.id.name, n.language,
-                                        n.id.file.display(),
-                                        n.line_start, n.line_end,
-                                        stable_id,
-                                    );
-                                    if !n.signature.is_empty() {
-                                        entry.push_str(&format!("\n  Sig: `{}`", n.signature));
-                                    }
-                                    if let Some(val) = n.metadata.get("value") {
-                                        entry.push_str(&format!("\n  Value: `{}`", val));
-                                    }
-                                    if n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false) {
-                                        entry.push_str(" *(literal)*");
-                                    }
-                                    if let Some(cc) = n.metadata.get("cyclomatic") {
-                                        entry.push_str(&format!("\n  Complexity: {}", cc));
-                                    }
-                                    if !outgoing.is_empty() {
-                                        entry.push_str(&format!("\n  Out: {} edge(s)", outgoing.len()));
-                                    }
-                                    if !incoming.is_empty() {
-                                        entry.push_str(&format!("\n  In: {} edge(s)", incoming.len()));
-                                    }
-                                    entry
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n\n");
-                            Ok(text_result(format!(
-                                "## Symbol search: \"{}\"\n\n{} result(s)\n\n{}{}",
-                                query,
-                                matches.len(),
-                                md,
-                                freshness
-                            )))
-                        }
-                    }
-                    Err(e) => Ok(text_result(format!("Graph error: {}", e))),
-                }
+                let search_args = args.into_search();
+                self.handle_search(search_args).await
             }
 
             "graph_query" => {
                 let args: GraphQuery = parse_args(params.arguments)?;
+                let search_args = args.into_search();
+                self.handle_search(search_args).await
+            }
 
-                // Normalize inputs: treat empty/whitespace strings as None, cap top_k
-                let node_id = args.node_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
-                let query = args.query.as_deref().map(str::trim).filter(|s| !s.is_empty());
-                let top_k = args.top_k.unwrap_or(3).clamp(1, 50) as usize;
-
-                // Reject if both are empty after normalization
-                if node_id.is_none() && query.is_none() {
-                    return Ok(text_result(
-                        "Either node_id or query is required. Provide a stable node ID (from search_symbols) or a natural language query.".to_string()
-                    ));
-                }
-
-                // Resolve entry node IDs: either from explicit node_id or semantic query
-                let (entry_node_ids, entry_header): (Vec<String>, String) = if let Some(node_id) = node_id {
-                    // Explicit node ID — backward compatible path
-                    (vec![node_id.to_string()], String::new())
-                } else if let Some(query_text) = query {
-                    // Semantic search path — find entry nodes by natural language.
-                    // Lock-free load from ArcSwap — no mutex contention.
-                    let embed_guard = self.embed_index.load();
-                    match embed_guard.as_ref() {
-                        Some(embed_idx) => {
-                            // Search without type filter, then keep only code:* kinds.
-                            // This is robust to new code kinds added to the embedding pipeline
-                            // (the pipeline already gates what gets indexed via is_embeddable()).
-                            // We over-fetch by 3x to have enough results after filtering.
-                            match embed_idx.search(query_text, None, top_k.min(50) * 3).await {
-                                Ok(SearchOutcome::Results(results)) if !results.is_empty() => {
-                                    // Filter to code symbols only and take top_k
-                                    let code_results: Vec<_> = results.into_iter()
-                                        .filter(|r| r.kind.starts_with("code:"))
-                                        .take(top_k)
-                                        .collect();
-
-                                    if code_results.is_empty() {
-                                        return Ok(text_result(format!(
-                                            "No code symbols matched query \"{}\". Try a different query or use node_id from search_symbols.",
-                                            query_text
-                                        )));
-                                    }
-
-                                    let mut header = format!("### Matched entry nodes for \"{}\"\n\n", query_text);
-                                    let ids: Vec<String> = code_results.iter()
-                                        .map(|r| {
-                                            header.push_str(&format!(
-                                                "- `{}` — {} (score: {:.2})\n",
-                                                r.id, r.title, r.score
-                                            ));
-                                            r.id.clone()
-                                        })
-                                        .collect();
-                                    header.push('\n');
-                                    (ids, header)
-                                }
-                                Ok(SearchOutcome::NotReady) => {
-                                    return Ok(text_result(
-                                        "Embedding index: building — semantic graph queries will work shortly. Use node_id from search_symbols instead, or retry in a few seconds.".to_string()
-                                    ));
-                                }
-                                Ok(_) => {
-                                    return Ok(text_result(format!(
-                                        "No code symbols matched query \"{}\". Try a different query or use node_id from search_symbols.",
-                                        query_text
-                                    )));
-                                }
-                                Err(e) => {
-                                    return Ok(text_result(format!(
-                                        "Semantic search failed: {}. Use node_id from search_symbols instead.",
-                                        e
-                                    )));
-                                }
-                            }
-                        }
-                        None => {
-                            return Ok(text_result(
-                                "Embedding index not available. Use node_id from search_symbols instead, or wait for the background index to build.".to_string()
-                            ));
-                        }
-                    }
-                } else {
-                    unreachable!("both-empty case handled above");
-                };
-
-                match self.get_graph().await {
-                    Ok(guard) => {
-                        let graph_state = guard.as_ref().unwrap();
-
-                        // Filter entry nodes to only those present in the graph
-                        let valid_entry_ids: Vec<&String> = entry_node_ids.iter()
-                            .filter(|id| graph_state.index.get_node(id).is_some())
-                            .collect();
-
-                        if valid_entry_ids.is_empty() {
-                            let id_list = entry_node_ids.iter()
-                                .map(|id| format!("`{}`", id))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            return Ok(text_result(format!(
-                                "{}No graph nodes found for {}. The node(s) may not have edges in the graph. Try search_symbols to find valid node IDs.",
-                                entry_header, id_list
-                            )));
-                        }
-
-                        let edge_filter = args.edge_types.as_ref().map(|types| {
-                            types
-                                .iter()
-                                .filter_map(|t| parse_edge_kind(t))
-                                .collect::<Vec<_>>()
-                        });
-                        let edge_filter_slice = edge_filter.as_deref();
-
-                        // Helper: run traversal from a single node and collect IDs
-                        let run_traversal = |node_id: &str| -> Result<Vec<String>, String> {
-                            match args.mode.as_str() {
-                                "neighbors" => {
-                                    let max_hops = args.max_hops.unwrap_or(1) as usize;
-                                    let direction = args.direction.as_deref().unwrap_or("outgoing");
-
-                                    match direction {
-                                        "outgoing" => {
-                                            if max_hops == 1 {
-                                                Ok(graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Outgoing))
-                                            } else {
-                                                Ok(graph_state.index.reachable(node_id, max_hops, edge_filter_slice))
-                                            }
-                                        }
-                                        "incoming" => {
-                                            if max_hops == 1 {
-                                                Ok(graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Incoming))
-                                            } else {
-                                                Ok(graph_state.index.impact(node_id, max_hops))
-                                            }
-                                        }
-                                        "both" => {
-                                            let out = if max_hops == 1 {
-                                                graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Outgoing)
-                                            } else {
-                                                graph_state.index.reachable(node_id, max_hops, edge_filter_slice)
-                                            };
-                                            let inc = if max_hops == 1 {
-                                                graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Incoming)
-                                            } else {
-                                                graph_state.index.impact(node_id, max_hops)
-                                            };
-                                            let mut combined = out;
-                                            combined.extend(inc);
-                                            Ok(combined)
-                                        }
-                                        _ => Err(format!(
-                                            "Invalid direction: \"{}\". Use \"outgoing\", \"incoming\", or \"both\".",
-                                            direction
-                                        )),
-                                    }
-                                }
-                                "impact" => {
-                                    let max_hops = args.max_hops.unwrap_or(3) as usize;
-                                    Ok(graph_state.index.impact(node_id, max_hops))
-                                }
-                                "reachable" => {
-                                    let max_hops = args.max_hops.unwrap_or(3) as usize;
-                                    Ok(graph_state.index.reachable(node_id, max_hops, edge_filter_slice))
-                                }
-                                other => Err(format!(
-                                    "Unknown mode: \"{}\". Use \"neighbors\", \"impact\", or \"reachable\".",
-                                    other
-                                )),
-                            }
-                        };
-
-                        // Run traversal from each entry node, merge and deduplicate
-                        let mut all_ids: Vec<String> = Vec::new();
-                        let mut seen = std::collections::HashSet::new();
-
-                        for node_id in &valid_entry_ids {
-                            match run_traversal(node_id) {
-                                Ok(ids) => {
-                                    for id in ids {
-                                        if seen.insert(id.clone()) {
-                                            all_ids.push(id);
-                                        }
-                                    }
-                                }
-                                Err(msg) => return Ok(text_result(msg)),
-                            }
-                        }
-
-                        // Remove entry nodes from results (they're already shown in the header)
-                        let entry_set: std::collections::HashSet<&str> = valid_entry_ids.iter().map(|s| s.as_str()).collect();
-                        all_ids.retain(|id| !entry_set.contains(id.as_str()));
-
-                        // Format the label for the entry point(s)
-                        let entry_label = if valid_entry_ids.len() == 1 {
-                            format!("`{}`", valid_entry_ids[0])
-                        } else {
-                            format!("{} entry nodes", valid_entry_ids.len())
-                        };
-
-                        let mode_label = args.mode.as_str();
-                        let direction = args.direction.as_deref().unwrap_or("outgoing");
-
-                        let freshness = format_freshness(
-                            graph_state.nodes.len(),
-                            graph_state.last_scan_completed_at,
-                            Some(&self.lsp_status),
-                        );
-
-                        if all_ids.is_empty() {
-                            let mode_desc = match mode_label {
-                                "neighbors" => format!("No {} neighbors for {}.", direction, entry_label),
-                                "impact" => format!("No dependents found for {} within {} hops.", entry_label, args.max_hops.unwrap_or(3)),
-                                "reachable" => format!("No reachable nodes from {} within {} hops.", entry_label, args.max_hops.unwrap_or(3)),
-                                _ => format!("No results for {}.", entry_label),
-                            };
-                            Ok(text_result(format!("{}{}{}", entry_header, mode_desc, freshness)))
-                        } else {
-                            let md = format_neighbor_nodes(&graph_state.nodes, &all_ids);
-                            let heading = match mode_label {
-                                "neighbors" => format!(
-                                    "## Graph neighbors ({}) of {}\n\n{} result(s)\n\n",
-                                    direction, entry_label, all_ids.len()
-                                ),
-                                "impact" => format!(
-                                    "## Impact analysis for {}\n\n{} dependent(s) within {} hop(s)\n\n",
-                                    entry_label, all_ids.len(), args.max_hops.unwrap_or(3)
-                                ),
-                                "reachable" => format!(
-                                    "## Reachable from {}\n\n{} node(s) within {} hop(s)\n\n",
-                                    entry_label, all_ids.len(), args.max_hops.unwrap_or(3)
-                                ),
-                                _ => String::new(),
-                            };
-                            Ok(text_result(format!("{}{}{}{}", entry_header, heading, md, freshness)))
-                        }
-                    }
-                    Err(e) => Ok(text_result(format!("Graph error: {}", e))),
-                }
+            // ── Unified search tool ──────────────────────────────────────
+            "search" => {
+                let args: Search = parse_args(params.arguments)?;
+                self.handle_search(args).await
             }
 
             "list_roots" => {
@@ -2948,6 +3075,200 @@ mod tests {
         assert!(gq.top_k.is_none());
         // Handler uses: args.top_k.unwrap_or(3) — verify the default
         assert_eq!(gq.top_k.unwrap_or(3), 3);
+    }
+
+    // ── Unified Search deserialization and param combinations ────────────
+
+    fn parse_search(v: serde_json::Value) -> Result<Search, serde_json::Error> {
+        serde_json::from_value(v)
+    }
+
+    #[test]
+    fn test_search_flat_query_only() {
+        // Equivalent to: search_symbols(query)
+        let s = parse_search(json!({"query": "handle_call_tool"})).unwrap();
+        assert_eq!(s.query, Some("handle_call_tool".to_string()));
+        assert!(s.mode.is_none(), "no mode = flat search");
+        assert!(s.node.is_none());
+    }
+
+    #[test]
+    fn test_search_flat_with_filters() {
+        // Equivalent to: search_symbols(query, kind, language)
+        let s = parse_search(json!({
+            "query": "handle",
+            "kind": "function",
+            "language": "rust"
+        })).unwrap();
+        assert_eq!(s.query, Some("handle".to_string()));
+        assert_eq!(s.kind, Some("function".to_string()));
+        assert_eq!(s.language, Some("rust".to_string()));
+        assert!(s.mode.is_none());
+    }
+
+    #[test]
+    fn test_search_traversal_query_neighbors() {
+        // Equivalent to: graph_query(query, mode="neighbors")
+        let s = parse_search(json!({
+            "query": "authentication handler",
+            "mode": "neighbors"
+        })).unwrap();
+        assert_eq!(s.query, Some("authentication handler".to_string()));
+        assert_eq!(s.mode, Some("neighbors".to_string()));
+    }
+
+    #[test]
+    fn test_search_traversal_with_top_k() {
+        // New capability: semantic search top 5 then traverse
+        let s = parse_search(json!({
+            "query": "error handling",
+            "mode": "neighbors",
+            "top_k": 5
+        })).unwrap();
+        assert_eq!(s.top_k, Some(5));
+        assert_eq!(s.mode, Some("neighbors".to_string()));
+    }
+
+    #[test]
+    fn test_search_traversal_from_node() {
+        // Equivalent to: graph_query(node_id, mode="neighbors")
+        let s = parse_search(json!({
+            "node": "root:src/lib.rs:foo:function",
+            "mode": "neighbors"
+        })).unwrap();
+        assert_eq!(s.node, Some("root:src/lib.rs:foo:function".to_string()));
+        assert!(s.query.is_none());
+    }
+
+    #[test]
+    fn test_search_impact_from_node() {
+        // Equivalent to: graph_query(node_id, mode="impact")
+        let s = parse_search(json!({
+            "node": "root:src/lib.rs:foo:function",
+            "mode": "impact"
+        })).unwrap();
+        assert_eq!(s.mode, Some("impact".to_string()));
+    }
+
+    #[test]
+    fn test_search_flat_sort_by_complexity() {
+        let s = parse_search(json!({
+            "query": "",
+            "sort_by": "complexity",
+            "min_complexity": 10
+        })).unwrap();
+        assert_eq!(s.sort_by, Some("complexity".to_string()));
+        assert_eq!(s.min_complexity, Some(10));
+        assert!(s.mode.is_none());
+    }
+
+    #[test]
+    fn test_search_flat_default_top_k_is_10() {
+        let s = parse_search(json!({"query": "test"})).unwrap();
+        // top_k omitted; handler defaults to 10 for flat, 1 for traversal
+        assert!(s.top_k.is_none());
+        assert_eq!(s.top_k.unwrap_or(10), 10);
+    }
+
+    #[test]
+    fn test_search_traversal_default_top_k_is_1() {
+        let s = parse_search(json!({"query": "test", "mode": "neighbors"})).unwrap();
+        assert!(s.top_k.is_none());
+        // Handler uses unwrap_or(1) for traversal mode
+        assert_eq!(s.top_k.unwrap_or(1), 1);
+    }
+
+    #[test]
+    fn test_search_all_fields_empty() {
+        // No query, no node -- should deserialize OK (validation at handler level)
+        let s = parse_search(json!({})).unwrap();
+        assert!(s.query.is_none());
+        assert!(s.node.is_none());
+        assert!(s.mode.is_none());
+    }
+
+    #[test]
+    fn test_search_hops_parameter() {
+        let s = parse_search(json!({
+            "node": "x",
+            "mode": "reachable",
+            "hops": 5
+        })).unwrap();
+        assert_eq!(s.hops, Some(5));
+    }
+
+    #[test]
+    fn test_search_edge_types_filter() {
+        let s = parse_search(json!({
+            "node": "x",
+            "mode": "neighbors",
+            "edge_types": ["calls", "implements"]
+        })).unwrap();
+        assert_eq!(s.edge_types, Some(vec!["calls".to_string(), "implements".to_string()]));
+    }
+
+    #[test]
+    fn test_search_extra_fields_ignored() {
+        // Forward compat: extra fields should not cause errors
+        let s = parse_search(json!({
+            "query": "test",
+            "unknown_future_field": true
+        }));
+        assert!(s.is_ok(), "extra fields should be ignored for forward compat");
+    }
+
+    // ── SearchSymbols -> Search conversion ──────────────────────────────
+
+    #[test]
+    fn test_search_symbols_into_search() {
+        let ss = SearchSymbols {
+            query: "foo".to_string(),
+            kind: Some("function".to_string()),
+            language: Some("rust".to_string()),
+            file: Some("server.rs".to_string()),
+            root: Some("my-root".to_string()),
+            limit: Some(20),
+            synthetic: Some(false),
+            min_complexity: Some(5),
+            sort: Some("complexity".to_string()),
+        };
+        let s = ss.into_search();
+        assert_eq!(s.query, Some("foo".to_string()));
+        assert!(s.mode.is_none(), "search_symbols is always flat");
+        assert_eq!(s.kind, Some("function".to_string()));
+        assert_eq!(s.language, Some("rust".to_string()));
+        assert_eq!(s.file, Some("server.rs".to_string()));
+        assert_eq!(s.root, Some("my-root".to_string()));
+        assert_eq!(s.top_k, Some(20)); // limit maps to top_k
+        assert_eq!(s.synthetic, Some(false));
+        assert_eq!(s.min_complexity, Some(5));
+        assert_eq!(s.sort_by, Some("complexity".to_string())); // sort maps to sort_by
+    }
+
+    // ── GraphQuery -> Search conversion ─────────────────────────────────
+
+    #[test]
+    fn test_graph_query_into_search() {
+        let gq = GraphQuery {
+            node_id: Some("root:src/lib.rs:foo:function".to_string()),
+            query: Some("test query".to_string()),
+            mode: "impact".to_string(),
+            direction: Some("incoming".to_string()),
+            edge_types: Some(vec!["calls".to_string()]),
+            max_hops: Some(3),
+            top_k: Some(5),
+        };
+        let s = gq.into_search();
+        assert_eq!(s.node, Some("root:src/lib.rs:foo:function".to_string())); // node_id -> node
+        assert_eq!(s.query, Some("test query".to_string()));
+        assert_eq!(s.mode, Some("impact".to_string()));
+        assert_eq!(s.direction, Some("incoming".to_string()));
+        assert_eq!(s.edge_types, Some(vec!["calls".to_string()]));
+        assert_eq!(s.hops, Some(3)); // max_hops -> hops
+        assert_eq!(s.top_k, Some(5));
+        // Graph query doesn't carry symbol filters
+        assert!(s.kind.is_none());
+        assert!(s.language.is_none());
     }
 
     // ── Semantic entry point: code prefix filter correctness ────────────
