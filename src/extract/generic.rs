@@ -66,6 +66,10 @@ pub struct LangConfig {
     /// Whether user-defined types must start with uppercase.
     /// false for Go (unexported types) and Python (lowercase classes).
     pub type_requires_uppercase: bool,
+    /// Tree-sitter node kinds that represent branches/decision points for
+    /// cyclomatic complexity (e.g. `["if_expression", "match_expression",
+    /// "for_expression", "while_expression"]`).
+    pub branch_node_types: &'static [&'static str],
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +202,12 @@ fn collect_nodes(
                     "name_col".to_string(),
                     name_node.start_position().column.to_string(),
                 );
+            }
+
+            // Cyclomatic complexity for functions.
+            if node_kind == NodeKind::Function && !config.branch_node_types.is_empty() {
+                let branches = count_branches(node, config.branch_node_types);
+                metadata.insert("cyclomatic".to_string(), (1 + branches).to_string());
             }
 
             // Const value extraction.
@@ -453,6 +463,22 @@ fn collect_nodes(
             collect_nodes(child, path, source, config, parent_scope, nodes, edges);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Complexity
+// ---------------------------------------------------------------------------
+
+/// Count branch/decision-point nodes in a tree-sitter subtree.
+/// Cyclomatic complexity = 1 + branch_count (the 1 is for the function itself).
+fn count_branches(node: tree_sitter::Node, branch_types: &[&str]) -> usize {
+    let mut count = if branch_types.contains(&node.kind()) { 1 } else { 0 };
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            count += count_branches(child, branch_types);
+        }
+    }
+    count
 }
 
 // ---------------------------------------------------------------------------
@@ -953,5 +979,106 @@ pub fn hello() {}
         assert_eq!(extract_user_type("int", false), None); // primitive
         assert_eq!(extract_user_type("error", false), None); // Go builtin
         assert_eq!(extract_user_type("bool", false), None); // primitive
+    }
+
+    // -----------------------------------------------------------------------
+    // Cyclomatic complexity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cyclomatic_complexity_linear_function() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+fn simple() {
+    println!("hello");
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(std::path::Path::new("test.rs"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "simple").unwrap();
+        assert_eq!(func.metadata.get("cyclomatic").map(|s| s.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn test_cyclomatic_complexity_with_branches() {
+        use crate::extract::rust::RUST_CONFIG;
+        // if + else = 2 branch nodes → complexity = 1 + 2 = 3
+        let code = r#"
+fn branchy(x: i32) -> i32 {
+    if x > 0 {
+        1
+    } else {
+        -1
+    }
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(std::path::Path::new("test.rs"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "branchy").unwrap();
+        let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+        assert!(cc > 1, "Function with if/else should have complexity > 1, got {}", cc);
+    }
+
+    #[test]
+    fn test_cyclomatic_complexity_nested() {
+        use crate::extract::rust::RUST_CONFIG;
+        // match + for + if = at least 3 branch nodes
+        let code = r#"
+fn complex(items: &[Option<i32>]) -> i32 {
+    let mut sum = 0;
+    for item in items {
+        match item {
+            Some(v) if *v > 0 => { sum += v; }
+            _ => {}
+        }
+    }
+    sum
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(std::path::Path::new("test.rs"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "complex").unwrap();
+        let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+        assert!(cc >= 3, "Function with match+for should have complexity >= 3, got {}", cc);
+    }
+
+    #[test]
+    fn test_cyclomatic_complexity_not_on_structs() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+struct Foo {
+    x: i32,
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(std::path::Path::new("test.rs"), code)
+            .unwrap();
+        let struc = result.nodes.iter().find(|n| n.id.name == "Foo").unwrap();
+        assert!(struc.metadata.get("cyclomatic").is_none(), "Structs should not have cyclomatic metadata");
+    }
+
+    #[test]
+    fn test_cyclomatic_complexity_python() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = r#"
+def process(items):
+    for item in items:
+        if item > 0:
+            yield item
+        elif item == 0:
+            continue
+        else:
+            raise ValueError("negative")
+"#;
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(std::path::Path::new("test.py"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "process").unwrap();
+        let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+        // for + if + elif + else = 4 branch nodes → cc = 5
+        assert!(cc >= 4, "Python function with for/if/elif/else should have complexity >= 4, got {}", cc);
     }
 }

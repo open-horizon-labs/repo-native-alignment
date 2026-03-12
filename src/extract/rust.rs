@@ -43,6 +43,13 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
     param_type_field: Some("type"),
     return_type_field: Some("return_type"),
     type_requires_uppercase: true,
+    branch_node_types: &[
+        "if_expression", "else_clause",
+        "match_expression",
+        "for_expression", "while_expression", "loop_expression",
+        "boolean_operator",  // && and ||
+        "try_expression",    // ?
+    ],
 };
 
 /// Rust tree-sitter extractor with topology pattern detection.
