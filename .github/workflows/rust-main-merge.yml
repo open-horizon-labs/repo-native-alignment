@@ -27,16 +27,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Setup sccache (Namespace remote cache)
-        run: |
-          eval $(nsc cache sccache setup --cache_name default)
-          echo "SCCACHE_WEBDAV_ENDPOINT=$SCCACHE_WEBDAV_ENDPOINT" >> $GITHUB_ENV
-          echo "SCCACHE_WEBDAV_TOKEN=$SCCACHE_WEBDAV_TOKEN" >> $GITHUB_ENV
-          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-
       - name: Lint — no language-specific conditionals in generic.rs
         run: |
           if grep -n 'language_name ==' src/extract/generic.rs; then
@@ -45,10 +35,14 @@ jobs:
           fi
 
       - name: Build release binary
-        run: cargo build --release --no-default-features
+        run: |
+          export $(nsc cache sccache setup --cache_name default)
+          cargo build --release --no-default-features
 
       - name: Run all tests (release profile)
-        run: cargo test --release --no-default-features
+        run: |
+          export $(nsc cache sccache setup --cache_name default)
+          cargo test --release --no-default-features
 
       - name: RNA pipeline smoke test (rna test)
         run: ./target/release/repo-native-alignment test --repo .
