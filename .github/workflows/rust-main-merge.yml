@@ -10,10 +10,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-env:
-  # PRs use fast CI profile (no LTO, 16 codegen-units); main uses full release
-  BUILD_PROFILE: ${{ github.event_name == 'push' && 'release' || 'ci' }}
-
 jobs:
   lint:
     runs-on: namespace-profile-default
@@ -91,26 +87,26 @@ jobs:
           cache-on-failure: true
           cache-targets: false
 
-      - name: Build binary
+      - name: Build debug binary
         env:
           RUSTC_WRAPPER: "sccache"
-        run: cargo build --profile ${{ env.BUILD_PROFILE }} --no-default-features
+        run: cargo build --no-default-features
 
       - name: RNA pipeline smoke test (rna test)
-        run: ./target/${{ env.BUILD_PROFILE }}/repo-native-alignment test --repo .
+        run: ./target/debug/repo-native-alignment test --repo .
         timeout-minutes: 5
 
       - name: CLI search smoke test
         run: |
-          OUTPUT=$(./target/${{ env.BUILD_PROFILE }}/repo-native-alignment search "main" --repo . --limit 3 2>/dev/null)
+          OUTPUT=$(./target/debug/repo-native-alignment search "main" --repo . --limit 3 2>/dev/null)
           echo "$OUTPUT"
           echo "$OUTPUT" | grep -q "Symbol search" || { echo "FAIL: search returned no results"; exit 1; }
 
       - name: CLI graph smoke test
         run: |
-          NODE_ID=$(./target/${{ env.BUILD_PROFILE }}/repo-native-alignment search "main" --repo . --limit 1 2>/dev/null | grep "ID:" | head -1 | sed 's/.*`\(.*\)`.*/\1/')
+          NODE_ID=$(./target/debug/repo-native-alignment search "main" --repo . --limit 1 2>/dev/null | grep "ID:" | head -1 | sed 's/.*`\(.*\)`.*/\1/')
           echo "Node: $NODE_ID"
-          OUTPUT=$(./target/${{ env.BUILD_PROFILE }}/repo-native-alignment graph --node "$NODE_ID" --mode neighbors --repo . 2>/dev/null)
+          OUTPUT=$(./target/debug/repo-native-alignment graph --node "$NODE_ID" --mode neighbors --repo . 2>/dev/null)
           echo "$OUTPUT"
           echo "$OUTPUT" | grep -q "neighbors\|No results" || { echo "FAIL: graph returned unexpected output"; exit 1; }
 
@@ -124,4 +120,4 @@ jobs:
         run: npm install --no-save @modelcontextprotocol/sdk
 
       - name: MCP stdio smoke test
-        run: node .github/scripts/mcp-smoke.mjs ./target/${{ env.BUILD_PROFILE }}/repo-native-alignment .
+        run: node .github/scripts/mcp-smoke.mjs ./target/debug/repo-native-alignment .
