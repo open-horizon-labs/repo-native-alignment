@@ -231,19 +231,19 @@ Outcomes declare `files:` patterns linking to code. Commits tag `[outcome:X]` li
 
 ## Compared To
 
-RNA builds a better code graph — more languages (22 + 37 LSP servers), compiler-grade edges, in-process microsecond queries — and then connects it to declared business outcomes. See the [full comparison](docs/compared-to.md) for details.
+RNA uses LSP internally as one enrichment source, fuses it with tree-sitter, embeddings, git history, and business artifacts into a cross-language graph, and exposes multi-hop traversal in a single call. For agents, RNA replaces the need for separate LSP plugins. See the [full comparison](docs/compared-to.md) for details (including LSP as the baseline).
 
-| | **RNA** | **Code-Graph-RAG** | **CodeGraphContext** |
-|---|---|---|---|
-| **What it is** | Aim-conditioned MCP server | Code RAG system | Code graph toolkit + MCP |
-| **Install** | Single binary | Docker + Memgraph + API key | pip + graph DB |
-| **External deps** | None | Docker, Memgraph, LLM API | Graph DB (KuzuDB/Neo4j) |
-| **Languages** | 22 (tree-sitter) + 37 (LSP) | 11 (tree-sitter) | 14 (tree-sitter) |
-| **Embeddings** | MiniLM-L6-v2 on Metal GPU | UniXcoder | None |
-| **Business context** | Outcomes, signals, guardrails, metis | None | None |
-| **MCP tools** | 5 (focused) | 10 (read + write + admin) | 17 (broad) |
+| | **LSP (baseline)** | **RNA** | **Code-Graph-RAG** | **CodeGraphContext** |
+|---|---|---|---|---|
+| **What it is** | Editor protocol | Aim-conditioned MCP server | Code RAG system | Code graph toolkit + MCP |
+| **Query model** | 1 symbol, 1 hop, 1 language | Multi-hop, cross-language | Multi-hop | Multi-hop |
+| **Install** | Editor plugin / PATH binary | Single binary | Docker + Memgraph + API key | pip + graph DB |
+| **External deps** | One server per language | None | Docker, Memgraph, LLM API | Graph DB (KuzuDB/Neo4j) |
+| **Languages** | 1 per server | 22 (tree-sitter) + 37 (LSP) | 11 (tree-sitter) | 14 (tree-sitter) |
+| **Embeddings** | None | MiniLM-L6-v2 on Metal GPU | UniXcoder | None |
+| **Business context** | None | Outcomes, signals, guardrails, metis | None | None |
 
-**How RNA compares** to [Code-Graph-RAG](https://github.com/vitali87/code-graph-rag) and [CodeGraphContext](https://github.com/CodeGraphContext/CodeGraphContext): RNA has more languages (22 vs 11/14), LSP-enriched edges they don't have, in-process queries (no Docker/external DB), and semantic search across code + business context. They require Docker or external databases; RNA is a single binary.
+LSP is the baseline — what agents get if you install nothing else. It provides single-symbol, single-hop queries; agents must make N sequential round-trips and assemble the picture themselves. Early testing: ~120s and ~2x tokens with raw LSP vs ~50s with RNA for the same structural questions.
 
 ## Companion Systems
 
@@ -308,7 +308,7 @@ MIT — see [LICENSE](LICENSE).
 | Term | What it means |
 |------|--------------|
 | **Tree-sitter** | A parser that reads source code and produces a syntax tree — the structured representation of functions, classes, imports, etc. RNA uses it to extract symbols from 22 languages without running the code. |
-| **LSP** | Language Server Protocol. The same protocol your editor uses for go-to-definition and find-references. RNA talks to language servers to enrich the graph with type information and call hierarchies. |
+| **LSP** | Language Server Protocol. The same protocol your editor uses for go-to-definition and find-references. LSP provides single-symbol, single-hop, single-language queries — no multi-hop traversal, no cross-language, no semantic search. RNA runs LSP servers internally as one enrichment source (call hierarchy, type hierarchy, implements edges) and fuses the results into a unified cross-language graph. For agents, RNA replaces the need for separate LSP plugins. |
 | **Graph** | A network of nodes (symbols, files, outcomes) and edges (calls, depends_on, implements). RNA builds this in memory so you can ask "what depends on this function?" or "what's the blast radius of this change?" |
 | **Embeddings** | Vector representations of text that capture meaning. RNA embeds function bodies, markdown sections, commit messages, and business artifacts so `oh_search_context` can find relevant results by meaning, not just keywords. Uses Metal GPU on Apple Silicon, CPU elsewhere. |
 | **LanceDB** | The columnar + vector database RNA uses to store the graph and embeddings on disk. Lives in `.oh/.cache/`. |
