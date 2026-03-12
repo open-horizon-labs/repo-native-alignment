@@ -10,11 +10,27 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-jobs:
-  verify:
-    runs-on: namespace-profile-default
-    timeout-minutes: 20
+env:
+  # PRs use fast CI profile (no LTO, 16 codegen-units); main uses full release
+  BUILD_PROFILE: ${{ github.event_name == 'push' && 'release' || 'ci' }}
 
+jobs:
+  lint:
+    runs-on: namespace-profile-default
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: No language-specific conditionals in generic.rs
+        run: |
+          if grep -n 'language_name ==' src/extract/generic.rs; then
+            echo "FAIL: language-specific logic in generic.rs — use LangConfig fields"
+            exit 1
+          fi
+
+  test:
+    runs-on: namespace-profile-default
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,43 +52,65 @@ jobs:
       - name: Cache Rust downloads
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "release-build"
+          shared-key: "rust-downloads"
           cache-all-crates: true
           cache-on-failure: true
-          cache-targets: false  # sccache handles compiled artifacts
+          cache-targets: false
 
-      - name: Lint — no language-specific conditionals in generic.rs
-        run: |
-          if grep -n 'language_name ==' src/extract/generic.rs; then
-            echo "FAIL: language-specific logic in generic.rs — use LangConfig fields"
-            exit 1
-          fi
-
-      - name: Build release binary
+      - name: Run all tests (debug profile)
         env:
           RUSTC_WRAPPER: "sccache"
-        run: cargo build --release --no-default-features
+        run: cargo test --no-default-features
 
-      - name: Run all tests (release profile)
+  build-and-smoke:
+    runs-on: namespace-profile-default
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure Namespace sccache cache
+        run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
+
+      - name: Cache Rust downloads
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rust-downloads"
+          cache-all-crates: true
+          cache-on-failure: true
+          cache-targets: false
+
+      - name: Build binary
         env:
           RUSTC_WRAPPER: "sccache"
-        run: cargo test --release --no-default-features
+        run: cargo build --profile ${{ env.BUILD_PROFILE }} --no-default-features
 
       - name: RNA pipeline smoke test (rna test)
-        run: ./target/release/repo-native-alignment test --repo .
+        run: ./target/${{ env.BUILD_PROFILE }}/repo-native-alignment test --repo .
         timeout-minutes: 5
 
       - name: CLI search smoke test
         run: |
-          OUTPUT=$(./target/release/repo-native-alignment search "main" --repo . --limit 3 2>/dev/null)
+          OUTPUT=$(./target/${{ env.BUILD_PROFILE }}/repo-native-alignment search "main" --repo . --limit 3 2>/dev/null)
           echo "$OUTPUT"
           echo "$OUTPUT" | grep -q "Symbol search" || { echo "FAIL: search returned no results"; exit 1; }
 
       - name: CLI graph smoke test
         run: |
-          NODE_ID=$(./target/release/repo-native-alignment search "main" --repo . --limit 1 2>/dev/null | grep "ID:" | head -1 | sed 's/.*`\(.*\)`.*/\1/')
+          NODE_ID=$(./target/${{ env.BUILD_PROFILE }}/repo-native-alignment search "main" --repo . --limit 1 2>/dev/null | grep "ID:" | head -1 | sed 's/.*`\(.*\)`.*/\1/')
           echo "Node: $NODE_ID"
-          OUTPUT=$(./target/release/repo-native-alignment graph --node "$NODE_ID" --mode neighbors --repo . 2>/dev/null)
+          OUTPUT=$(./target/${{ env.BUILD_PROFILE }}/repo-native-alignment graph --node "$NODE_ID" --mode neighbors --repo . 2>/dev/null)
           echo "$OUTPUT"
           echo "$OUTPUT" | grep -q "neighbors\|No results" || { echo "FAIL: graph returned unexpected output"; exit 1; }
 
@@ -86,4 +124,4 @@ jobs:
         run: npm install --no-save @modelcontextprotocol/sdk
 
       - name: MCP stdio smoke test
-        run: node .github/scripts/mcp-smoke.mjs ./target/release/repo-native-alignment .
+        run: node .github/scripts/mcp-smoke.mjs ./target/${{ env.BUILD_PROFILE }}/repo-native-alignment .
