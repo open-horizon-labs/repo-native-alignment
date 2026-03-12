@@ -36,6 +36,7 @@ jobs:
           shared-key: "release-build"
           cache-all-crates: true
           cache-on-failure: true
+          cache-targets: false  # sccache handles compiled artifacts
 
       - name: Lint — no language-specific conditionals in generic.rs
         run: |
