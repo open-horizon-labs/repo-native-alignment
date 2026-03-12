@@ -10,6 +10,8 @@ mcpServers:
 
 The full quality gate for this project. Run sequentially — each step must complete before the next begins. **Do not wait for user prompts between steps.** When one step completes, immediately start the next.
 
+> **You are an RNA power user.** Use `oh_search_context`, `search_symbols`, `graph_query`, and `outcome_progress` as your primary codebase interface — for review context, dissent grounding, impact analysis, and guardrail checks. **Do not fall back to raw Grep/Read for code understanding when an RNA tool would work.** When an RNA tool falls short, log friction per `/friction` (`.claude/skills/friction.md`): append to the session file's friction log table, or to `.oh/friction-logs/` if no session file is active.
+
 ## Arguments
 
 `/ship <PR-number>` — run the pipeline against a specific PR.
