@@ -28,27 +28,17 @@ This ensures every piece of work has a PR home before implementation begins. No 
 
 ## /ship Definition (for this project)
 
-`/ship` = the full quality gate before merge. In order:
+`/ship` = the full quality gate before merge. **11 steps, defined in `.claude/agents/oh-ship.md`.**
 
-1. **`/review`** — check implementation against acceptance criteria, AGENTS.md patterns, and open issues
-2. **`/dissent`** — seek contrary evidence; post findings as PR comments
-3. **Fix all** — address every review + dissent finding; no deferred items
-4. **Adversarial test** — dissent-seeded tests that try to break the implementation (functional > smoke > unit); post findings to PR
-5. **Merit assessment** — is this worth merging? Run real queries, compare before/after. Verdict: MERGE / MERGE WITH CAVEATS / ABANDON / NEEDS MORE WORK. Post to PR.
-6. **Resolve all TODOs** — every TODO, caveat, and "needs more work" item on the PR must be either **fixed** or **explicitly marked as not applicable with reasoning**. No silent deferrals. If it doesn't apply, say so on the PR. If it's a follow-up, file an issue and link it.
-7. **Manual verification** — run the actual feature with real data. Not unit tests — real queries, real files, real output. Post results to PR.
-8. **README** — update for any new capability, changed behavior, or new flags
-9. **Smoke test** — update `src/smoke.rs` to exercise the new code path; `cargo test` must pass
-10. **Merge** — squash or merge PR into main; tag commit with `[outcome:agent-alignment]`
+Summary: review → dissent → fix → adversarial test → merit → resolve TODOs → **manual verify → delivery verify** → README → smoke+CI → merge.
 
-No step is optional. "Merge when green" is not ship — ship is merge when reviewed, dissented, tested adversarially, merit-assessed, TODOs resolved, manually verified, and documented.
-
-Steps answer different questions — don't collapse them:
+No step is optional. "Merge when green" is not ship. Steps answer different questions — don't collapse them:
 - Review/dissent: "Is the code correct?"
 - Adversarial test: "What breaks under pressure?"
 - Merit assessment: "Does this deliver outcome value?"
 - Resolve TODOs: "Is everything accounted for?"
-- Manual verification: "Does it actually work with real data?"
+- Manual verification: "Does the computation work with real data?"
+- **Delivery verification: "Can an agent actually see this through MCP tools?"** *(added after PR #137 — see `.oh/metis/computed-but-not-delivered.md`)*
 
 **Key insight:** Enter at the altitude you need. Climb back up when you drift.
 
