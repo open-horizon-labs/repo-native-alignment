@@ -21,40 +21,40 @@ RNA uses LSP internally as one enrichment source (call hierarchy, type hierarchy
 
 ## At a Glance
 
-| | **LSP (baseline)** | **RNA** | **Code-Graph-RAG** | **CodeGraphContext** |
-|---|---|---|---|---|
-| **Install** | Editor plugin or PATH binary | `cargo install` / binary | Docker + uv + Memgraph + API key | `pip install` + (KuzuDB\|Neo4j) |
-| **External deps** | One server per language | None | Docker, Memgraph, LLM API | Graph DB (embedded or Docker) |
-| **Languages parsed** | 1 per server | 22 | 11 | 14 |
-| **Graph storage** | In-memory per session | LanceDB + petgraph (embedded) | Memgraph (Docker) | KuzuDB/FalkorDB/Neo4j |
-| **Embeddings** | None | MiniLM-L6-v2 on Metal GPU (local) | UniXcoder (local) | None |
-| **LSP integration** | Is LSP | 37 servers, batch enrichment | None | None |
-| **Query model** | Single-symbol, single-hop | Multi-hop, cross-language | Multi-hop | Multi-hop |
-| **MCP tools** | N/A (protocol, not MCP) | 5 | 10 | 17 |
-| **Business context** | None | Outcomes, signals, guardrails, metis | None | None |
+| | **LSP (baseline)** | **RNA** | **Code-Graph-RAG** | **CodeGraphContext** | **codeTree** |
+|---|---|---|---|---|---|
+| **Install** | Editor plugin or PATH binary | `cargo install` / binary | Docker + uv + Memgraph + API key | `pip install` + (KuzuDB\|Neo4j) | `pip install mcp-server-codetree` |
+| **External deps** | One server per language | None | Docker, Memgraph, LLM API | Graph DB (embedded or Docker) | None |
+| **Languages parsed** | 1 per server | 22 | 11 | 14 | 10 |
+| **Graph storage** | In-memory per session | LanceDB + petgraph (embedded) | Memgraph (Docker) | KuzuDB/FalkorDB/Neo4j | SQLite (embedded) |
+| **Embeddings** | None | MiniLM-L6-v2 on Metal GPU (local) | UniXcoder (local) | None | None |
+| **LSP integration** | Is LSP | 37 servers, batch enrichment | None | None | None |
+| **Query model** | Single-symbol, single-hop | Multi-hop, cross-language | Multi-hop | Multi-hop | Multi-hop |
+| **MCP tools** | N/A (protocol, not MCP) | 5 | 10 | 17 | 23 |
+| **Business context** | None | Outcomes, signals, guardrails, metis | None | None | None |
 
 ## Architecture Trade-offs
 
-| Axis | LSP | RNA | CGR | CGC |
-|------|-----|-----|-----|-----|
-| **Cold start** | Server init (seconds) | ~5-10s scan, ~2min embed | Index + Docker startup | Index + DB setup |
-| **Warm restart** | Server re-init | <1s (LanceDB cache) | Memgraph persists | DB persists |
-| **Memory** | Per-server process | In-process (petgraph + LanceDB) | Docker container | External or embedded DB |
-| **Query latency** | ms per hop (N round-trips) | ms total (in-process, single call) | Network hop to Memgraph | Network hop or embedded |
-| **Offline capable** | Yes | Fully offline | Needs Docker | Depends on DB choice |
+| Axis | LSP | RNA | CGR | CGC | CT |
+|------|-----|-----|-----|-----|-----|
+| **Cold start** | Server init (seconds) | ~5-10s scan, ~2min embed | Index + Docker startup | Index + DB setup | ~1s scan + SQLite index |
+| **Warm restart** | Server re-init | <1s (LanceDB cache) | Memgraph persists | DB persists | SQLite persists (mtime invalidation) |
+| **Memory** | Per-server process | In-process (petgraph + LanceDB) | Docker container | External or embedded DB | In-process (SQLite) |
+| **Query latency** | ms per hop (N round-trips) | ms total (in-process, single call) | Network hop to Memgraph | Network hop or embedded | ms (embedded SQLite) |
+| **Offline capable** | Yes | Fully offline | Needs Docker | Depends on DB choice | Fully offline |
 
 RNA's zero-dependency design is a deliberate architectural choice. `cargo install` → works. No Docker, no external DB, no API key.
 
 ## Graph Quality
 
-| Edge source | LSP | RNA | CGR | CGC |
-|-------------|-----|-----|-----|-----|
-| Tree-sitter (syntactic) | None | 22 languages | 11 languages | 14 languages |
-| LSP (semantic) | Is the source (1 lang/server) | 37 language servers, call + type hierarchy | None | None |
-| SCIP (compiler) | None | Not needed — LSP covers the same edges | None | Pyright, tsc, scip-go, scip-rust |
-| Embedding similarity | None | MiniLM-L6-v2, cosine distance | UniXcoder | None |
-| Cross-language | No (one server per language) | Yes (unified graph) | Yes | Yes |
-| Multi-hop | No (agent must loop) | Yes (single call) | Yes | Yes |
+| Edge source | LSP | RNA | CGR | CGC | CT |
+|-------------|-----|-----|-----|-----|-----|
+| Tree-sitter (syntactic) | None | 22 languages | 11 languages | 14 languages | 10 languages |
+| LSP (semantic) | Is the source (1 lang/server) | 37 language servers, call + type hierarchy | None | None | None |
+| SCIP (compiler) | None | Not needed — LSP covers the same edges | None | Pyright, tsc, scip-go, scip-rust | None |
+| Embedding similarity | None | MiniLM-L6-v2, cosine distance | UniXcoder | None | None |
+| Cross-language | No (one server per language) | Yes (unified graph) | Yes | Yes | Yes |
+| Multi-hop | No (agent must loop) | Yes (single call) | Yes | Yes | Yes |
 
 LSP provides the raw semantic data — call hierarchy, type hierarchy, references — but only for one language at a time, one hop at a time. RNA consumes LSP as one enrichment source among several, fuses the results into a cross-language graph, and exposes multi-hop traversal. CGR and CGC skip LSP entirely, relying on tree-sitter (syntactic) or SCIP (compiler) for edges. RNA's two-tier approach (tree-sitter + LSP) gives the broadest coverage with the highest accuracy. 22 languages from tree-sitter, then 37 LSP servers add compiler-grade call hierarchies and type relationships that neither CGR nor CGC have.
 
@@ -62,14 +62,14 @@ LSP provides the raw semantic data — call hierarchy, type hierarchy, reference
 
 ## Semantic Search
 
-| | LSP | RNA | CGR | CGC |
-|---|---|---|---|---|
-| **Model** | N/A | MiniLM-L6-v2 (384-dim) | UniXcoder (768-dim, code-specific) | None |
-| **Hardware** | N/A | Metal GPU on Apple Silicon, CPU fallback | CPU | N/A |
-| **What's embedded** | N/A | Function bodies, all markdown, commits | Function bodies | Nothing |
-| **Indexed together** | N/A | Code + markdown + git history | Code only | N/A |
-| **Score normalization** | N/A | 0-1 cosine, 5-tier ranking, test files demoted | Raw similarity | N/A |
-| **Markdown** | N/A | Heading-scoped chunks with hierarchy | None | None |
+| | LSP | RNA | CGR | CGC | CT |
+|---|---|---|---|---|---|
+| **Model** | N/A | MiniLM-L6-v2 (384-dim) | UniXcoder (768-dim, code-specific) | None | None |
+| **Hardware** | N/A | Metal GPU on Apple Silicon, CPU fallback | CPU | N/A | N/A |
+| **What's embedded** | N/A | Function bodies, all markdown, commits | Function bodies | Nothing | Nothing |
+| **Indexed together** | N/A | Code + markdown + git history | Code only | N/A | N/A |
+| **Score normalization** | N/A | 0-1 cosine, 5-tier ranking, test files demoted | Raw similarity | N/A | N/A |
+| **Markdown** | N/A | Heading-scoped chunks with hierarchy | None | None | None |
 
 RNA's unique advantage: semantic search spans code AND business artifacts in the same vector space. "Find functions related to our payment reliability outcome" is a query only RNA can answer. Results are ranked 0-1 with a 5-tier system: exact name > contains > signature-only, definitions before imports, production code before tests. CGR's UniXcoder is a code-specific model (better at pure code semantics), but RNA embeds function bodies, all markdown (chunked by heading), and commit messages together — breadth over specialization.
 
@@ -81,7 +81,9 @@ RNA's unique advantage: semantic search spans code AND business artifacts in the
 
 **CGC: 17 tools** — broad coverage including visualization, dead code detection, complexity analysis, file watching.
 
-RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents have their own editors.
+**codeTree: 23 tools** — breadth-first structural analysis covering graph queries, skeleton views, clone detection, taint/dataflow analysis, dead code detection, doc suggestions, change impact, and repository map.
+
+RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents have their own editors. codeTree takes the opposite approach — more tools covering more use cases (security, docs, code quality) but without embeddings, LSP enrichment, or business context.
 
 ## What RNA Does Better
 
@@ -103,7 +105,11 @@ RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents
 RNA is read-only infrastructure — it serves agents, it doesn't act as one. Things RNA deliberately doesn't do:
 
 - **File editing / code generation** — CGR has tools for writing files and wiping databases. RNA doesn't touch your code; agents have their own editors.
-- **Dead code detection, visualization** — CGC has 17 tools covering these. RNA exposes the graph and lets agents reason about it themselves. (RNA does compute cyclomatic complexity per function, surfaced via `search_symbols` with `min_complexity` / `sort="complexity"`.)
+- **Dead code detection, visualization** — CGC and codeTree both have dedicated tools for these. RNA exposes the graph and lets agents reason about it themselves. (RNA does compute cyclomatic complexity per function, surfaced via `search_symbols` with `min_complexity` / `sort="complexity"`.)
+- **Clone detection** — codeTree uses AST normalization to find structural duplicates. RNA doesn't do clone detection; code quality metrics are outside its alignment focus.
+- **Taint / dataflow analysis** — codeTree traces source-to-sink data flows with sanitizer detection. RNA is alignment infrastructure, not a security scanner.
+- **Doc suggestions** — codeTree identifies undocumented functions. RNA treats this as the agent's job, not the context server's.
+- **Repository map** — codeTree generates a compact codebase overview with entry points, hotspot files, and a suggested exploration path. RNA's tools assume you already know what to look for (though RNA's `list_roots` partially overlaps).
 - **Code-specific embedding model** — CGR uses UniXcoder (768-dim, trained on code). RNA uses MiniLM-L6-v2 (384-dim, general-purpose) because it needs to embed code, markdown, and business artifacts in the same space. Trade-off: slightly less code-specific precision, much broader coverage.
 - **SCIP indexing** — CGC supports Pyright, tsc, scip-go, scip-rust for compiler-grade precision in 4 languages. RNA spiked SCIP (#114) and concluded LSP provides the same semantic edges without requiring separate build-time indexers.
 
@@ -116,3 +122,4 @@ RNA does code graph queries better (more languages, LSP edges, in-process speed,
 Sources:
 - [Code-Graph-RAG salvage analysis](../.oh/sessions/cgr-salvage.md)
 - [CodeGraphContext salvage analysis](../.oh/sessions/codegraphcontext-salvage.md)
+- [codeTree salvage analysis](../.oh/sessions/codetree-salvage.md)
