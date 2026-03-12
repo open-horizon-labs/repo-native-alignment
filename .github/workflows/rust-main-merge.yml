@@ -27,10 +27,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Setup sccache (Namespace remote cache)
         run: |
-          export $(nsc cache sccache setup --cache_name default)
-          sccache --start-server
+          eval $(nsc cache sccache setup --cache_name default)
+          echo "SCCACHE_WEBDAV_ENDPOINT=$SCCACHE_WEBDAV_ENDPOINT" >> $GITHUB_ENV
+          echo "SCCACHE_WEBDAV_TOKEN=$SCCACHE_WEBDAV_TOKEN" >> $GITHUB_ENV
           echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
 
       - name: Lint — no language-specific conditionals in generic.rs
