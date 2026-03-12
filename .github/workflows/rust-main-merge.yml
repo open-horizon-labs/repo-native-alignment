@@ -45,13 +45,10 @@ jobs:
       - name: Configure Namespace sccache cache
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
 
-      - name: Cache Rust downloads
-        uses: Swatinem/rust-cache@v2
+      - name: Cache Rust
+        uses: namespacelabs/nscloud-cache-action@v1
         with:
-          shared-key: "rust-downloads"
-          cache-all-crates: true
-          cache-on-failure: true
-          cache-targets: false
+          cache: rust
 
       - name: Run all tests (debug profile)
         env:
@@ -80,13 +77,10 @@ jobs:
       - name: Configure Namespace sccache cache
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
 
-      - name: Cache Rust downloads
-        uses: Swatinem/rust-cache@v2
+      - name: Cache Rust
+        uses: namespacelabs/nscloud-cache-action@v1
         with:
-          shared-key: "rust-downloads"
-          cache-all-crates: true
-          cache-on-failure: true
-          cache-targets: false
+          cache: rust
 
       - name: Build release binary
         env:
