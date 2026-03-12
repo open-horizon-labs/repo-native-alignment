@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arrow_array::{Float32Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{Array as ArrowArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use lancedb::query::{ExecutableQuery, QueryBase};
 
@@ -44,6 +44,25 @@ fn truncate_chars(s: &str, max_chars: usize) -> &str {
         Some((byte_idx, _)) => &s[..byte_idx],
         None => s,
     }
+}
+
+/// Build the Arrow schema for the embedding table, including the `text_hash` column.
+fn embedding_schema(dim: usize) -> Schema {
+    Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("title", DataType::Utf8, false),
+        Field::new("body", DataType::Utf8, false),
+        Field::new("text_hash", DataType::Utf8, true),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim as i32,
+            ),
+            false,
+        ),
+    ])
 }
 
 /// Build embedding text for a code node within the MiniLM-L6-v2 token budget.
@@ -322,11 +341,26 @@ impl EmbeddingIndex {
             return Ok(0);
         }
 
-        let mut ids: Vec<String> = Vec::new();
-        let mut kinds: Vec<String> = Vec::new();
-        let mut titles: Vec<String> = Vec::new();
-        let mut bodies: Vec<String> = Vec::new();
-        let mut texts: Vec<String> = Vec::new();
+        // Open table first — if it doesn't exist, nothing to update.
+        let table = match self.db.open_table(&self.table_name).execute().await {
+            Ok(t) => t,
+            Err(_) => {
+                // Table not yet created — nothing to update.
+                return Ok(0);
+            }
+        };
+
+        // Build candidate data: id, kind, title, body, text, text_hash
+        struct Candidate {
+            id: String,
+            kind: String,
+            title: String,
+            body: String,
+            text: String,
+            text_hash: String,
+        }
+
+        let mut candidates: Vec<Candidate> = Vec::with_capacity(nodes.len());
 
         for node in nodes {
             let kind_str = match &node.id.kind {
@@ -335,6 +369,7 @@ impl EmbeddingIndex {
             };
 
             let text = build_code_embedding_text(&node.id.name, &node.body, &node.metadata);
+            let text_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
 
             let title = format!("{} {} ({})", kind_str, node.id.name, node.language);
             let body_display = format!(
@@ -344,11 +379,53 @@ impl EmbeddingIndex {
                 node.line_start
             );
 
-            ids.push(node.stable_id());
-            kinds.push(format!("code:{}", kind_str));
-            titles.push(title);
-            bodies.push(body_display);
-            texts.push(text);
+            candidates.push(Candidate {
+                id: node.stable_id(),
+                kind: format!("code:{}", kind_str),
+                title,
+                body: body_display,
+                text,
+                text_hash,
+            });
+        }
+
+        // Query existing text_hash values to skip unchanged nodes.
+        // If the column doesn't exist (old schema), embed everything.
+        let existing_hashes = self.query_text_hashes(&table, &candidates.iter().map(|c| c.id.as_str()).collect::<Vec<_>>()).await;
+
+        let (to_embed, skipped): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
+            match &existing_hashes {
+                Some(map) => map.get(&c.id).map_or(true, |h| *h != c.text_hash),
+                None => true, // no text_hash column yet — embed all
+            }
+        });
+
+        if skipped.len() > 0 {
+            tracing::info!(
+                "reindex_nodes: BLAKE3 text hash skipped {} unchanged node(s), embedding {} node(s)",
+                skipped.len(),
+                to_embed.len(),
+            );
+        }
+
+        if to_embed.is_empty() {
+            return Ok(0);
+        }
+
+        let mut ids: Vec<String> = Vec::new();
+        let mut kinds: Vec<String> = Vec::new();
+        let mut titles: Vec<String> = Vec::new();
+        let mut bodies: Vec<String> = Vec::new();
+        let mut texts: Vec<String> = Vec::new();
+        let mut text_hashes: Vec<String> = Vec::new();
+
+        for c in to_embed {
+            ids.push(c.id);
+            kinds.push(c.kind);
+            titles.push(c.title);
+            bodies.push(c.body);
+            texts.push(c.text);
+            text_hashes.push(c.text_hash);
         }
 
         let count = texts.len();
@@ -356,25 +433,13 @@ impl EmbeddingIndex {
         let dim = embeddings[0].len();
         let flat_embeddings: Vec<f32> = embeddings.into_iter().flatten().collect();
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("kind", DataType::Utf8, false),
-            Field::new("title", DataType::Utf8, false),
-            Field::new("body", DataType::Utf8, false),
-            Field::new(
-                "vector",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    dim as i32,
-                ),
-                false,
-            ),
-        ]));
+        let schema = Arc::new(embedding_schema(dim));
 
         let id_array = Arc::new(StringArray::from(ids)) as Arc<dyn arrow_array::Array>;
         let kind_array = Arc::new(StringArray::from(kinds)) as Arc<dyn arrow_array::Array>;
         let title_array = Arc::new(StringArray::from(titles)) as Arc<dyn arrow_array::Array>;
         let body_array = Arc::new(StringArray::from(bodies)) as Arc<dyn arrow_array::Array>;
+        let text_hash_array = Arc::new(StringArray::from(text_hashes)) as Arc<dyn arrow_array::Array>;
         let values = Arc::new(Float32Array::from(flat_embeddings));
         let list_field = Arc::new(Field::new("item", DataType::Float32, true));
         let vector_array = Arc::new(arrow_array::FixedSizeListArray::try_new(
@@ -383,17 +448,8 @@ impl EmbeddingIndex {
 
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![id_array, kind_array, title_array, body_array, vector_array],
+            vec![id_array, kind_array, title_array, body_array, text_hash_array, vector_array],
         )?;
-
-        // Upsert into the existing table by node id.
-        let table = match self.db.open_table(&self.table_name).execute().await {
-            Ok(t) => t,
-            Err(_) => {
-                // Table not yet created — nothing to update.
-                return Ok(0);
-            }
-        };
 
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
         let mut merge = table.merge_insert(&["id"]);
@@ -406,6 +462,68 @@ impl EmbeddingIndex {
             .context("Failed to upsert enriched node embeddings")?;
 
         Ok(count)
+    }
+
+    /// Query existing text_hash values for given node IDs from the embedding table.
+    /// Returns None if the text_hash column doesn't exist (old schema).
+    async fn query_text_hashes(
+        &self,
+        table: &lancedb::Table,
+        node_ids: &[&str],
+    ) -> Option<std::collections::HashMap<String, String>> {
+        use futures::TryStreamExt;
+
+        if node_ids.is_empty() {
+            return Some(std::collections::HashMap::new());
+        }
+
+        // Build filter: id IN ('id1', 'id2', ...)
+        let quoted: Vec<String> = node_ids.iter().map(|id| format!("'{}'", id.replace('\'', "''"))).collect();
+        let filter = format!("id IN ({})", quoted.join(", "));
+
+        let result = table
+            .query()
+            .select(lancedb::query::Select::columns(&["id", "text_hash"]))
+            .only_if(filter)
+            .execute()
+            .await;
+
+        let stream = match result {
+            Ok(s) => s,
+            Err(e) => {
+                // Column doesn't exist yet (old schema) — this is expected on first run
+                tracing::debug!("query_text_hashes: could not query text_hash column: {}", e);
+                return None;
+            }
+        };
+
+        let batches: Vec<RecordBatch> = match stream.try_collect().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!("query_text_hashes: failed to collect batches: {}", e);
+                return None;
+            }
+        };
+
+        let mut map = std::collections::HashMap::new();
+        for batch in &batches {
+            let id_col = batch
+                .column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let hash_col = batch
+                .column_by_name("text_hash")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
+            if let (Some(ids), Some(hashes)) = (id_col, hash_col) {
+                for i in 0..ids.len() {
+                    if !ids.is_null(i) && !hashes.is_null(i) {
+                        map.insert(ids.value(i).to_string(), hashes.value(i).to_string());
+                    }
+                }
+            }
+        }
+
+        Some(map)
     }
 
     async fn index_all_inner(&self, repo_root: &Path, symbols: &[crate::graph::Node]) -> Result<usize> {
@@ -576,6 +694,12 @@ impl EmbeddingIndex {
         }
 
 
+        // Compute BLAKE3 text hashes for all embedding texts
+        let text_hashes: Vec<String> = texts
+            .iter()
+            .map(|t| blake3::hash(t.as_bytes()).to_hex().to_string())
+            .collect();
+
         if texts.is_empty() {
             tracing::info!("EmbeddingIndex: no texts collected for {}", repo_root.display());
             return Ok(0);
@@ -599,20 +723,7 @@ impl EmbeddingIndex {
             embed_start.elapsed()
         );
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("kind", DataType::Utf8, false),
-            Field::new("title", DataType::Utf8, false),
-            Field::new("body", DataType::Utf8, false),
-            Field::new(
-                "vector",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    dim as i32,
-                ),
-                false,
-            ),
-        ]));
+        let schema = Arc::new(embedding_schema(dim));
 
         // Split into batches of 2048 rows to avoid lance panics on large writes (#110).
         const WRITE_BATCH_SIZE: usize = 2048;
@@ -628,12 +739,14 @@ impl EmbeddingIndex {
             let batch_kinds: Vec<String> = kinds[offset..end].to_vec();
             let batch_titles: Vec<String> = titles[offset..end].to_vec();
             let batch_bodies: Vec<String> = bodies[offset..end].to_vec();
+            let batch_text_hashes: Vec<String> = text_hashes[offset..end].to_vec();
             let batch_flat: Vec<f32> = flat_embeddings[offset * dim..end * dim].to_vec();
 
             let id_array = Arc::new(StringArray::from(batch_ids)) as Arc<dyn arrow_array::Array>;
             let kind_array = Arc::new(StringArray::from(batch_kinds)) as Arc<dyn arrow_array::Array>;
             let title_array = Arc::new(StringArray::from(batch_titles)) as Arc<dyn arrow_array::Array>;
             let body_array = Arc::new(StringArray::from(batch_bodies)) as Arc<dyn arrow_array::Array>;
+            let text_hash_array = Arc::new(StringArray::from(batch_text_hashes)) as Arc<dyn arrow_array::Array>;
             let values = Arc::new(Float32Array::from(batch_flat));
             let list_field = Arc::new(Field::new("item", DataType::Float32, true));
             let vector_array = Arc::new(arrow_array::FixedSizeListArray::try_new(
@@ -642,7 +755,7 @@ impl EmbeddingIndex {
 
             let batch = RecordBatch::try_new(
                 schema.clone(),
-                vec![id_array, kind_array, title_array, body_array, vector_array],
+                vec![id_array, kind_array, title_array, body_array, text_hash_array, vector_array],
             )?;
 
             if first {
