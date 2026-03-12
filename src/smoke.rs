@@ -912,6 +912,7 @@ async fn run_metadata_roundtrip_check() -> Check {
     let mut meta = BTreeMap::new();
     meta.insert("value".to_string(), "42".to_string());
     meta.insert("synthetic".to_string(), "false".to_string());
+    meta.insert("cyclomatic".to_string(), "7".to_string());
 
     let node = Node {
         id: NodeId {
