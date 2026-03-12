@@ -1081,4 +1081,76 @@ def process(items):
         // for + if + elif + else = 4 branch nodes → cc = 5
         assert!(cc >= 4, "Python function with for/if/elif/else should have complexity >= 4, got {}", cc);
     }
+
+    #[test]
+    fn test_cyclomatic_complexity_typescript() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let code = r#"
+function route(req: Request): string {
+    if (req.method === "GET") {
+        return "get";
+    } else {
+        return req.admin ? "admin" : "user";
+    }
+}
+"#;
+        let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
+            .run(std::path::Path::new("test.ts"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "route").unwrap();
+        let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+        // if + else + ternary = 3 branch nodes → cc = 4
+        assert!(cc > 1, "TypeScript function with if/else/ternary should have complexity > 1, got {}", cc);
+    }
+
+    #[test]
+    fn test_cyclomatic_complexity_go() {
+        use crate::extract::configs::GO_CONFIG;
+        let code = r#"
+func process(items []int) int {
+    sum := 0
+    for _, v := range items {
+        if v > 0 {
+            sum += v
+        } else {
+            sum -= v
+        }
+    }
+    return sum
+}
+"#;
+        let result = GenericExtractor::new(&GO_CONFIG)
+            .run(std::path::Path::new("test.go"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "process").unwrap();
+        let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+        // for + if + else = 3 branch nodes → cc = 4
+        assert!(cc > 1, "Go function with for/if/else should have complexity > 1, got {}", cc);
+    }
+
+    #[test]
+    fn test_cyclomatic_complexity_java() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let code = r#"
+class Handler {
+    int handle(int code) {
+        if (code > 200) {
+            return code;
+        } else {
+            for (int i = 0; i < code; i++) {
+                System.out.println(i);
+            }
+            return 0;
+        }
+    }
+}
+"#;
+        let result = GenericExtractor::new(&JAVA_CONFIG)
+            .run(std::path::Path::new("Test.java"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
+        let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+        // if + else + for = 3 branch nodes → cc = 4
+        assert!(cc > 1, "Java method with if/else/for should have complexity > 1, got {}", cc);
+    }
 }
