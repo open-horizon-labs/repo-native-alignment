@@ -27,8 +27,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache Cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-no-default"
 
       - name: Lint — no language-specific conditionals in generic.rs
         run: |
@@ -39,15 +41,9 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --no-default-features
-        env:
-          RUSTC_WRAPPER: sccache
-          SCCACHE_GHA_ENABLED: "true"
 
       - name: Run all tests (release profile)
         run: cargo test --release --no-default-features
-        env:
-          RUSTC_WRAPPER: sccache
-          SCCACHE_GHA_ENABLED: "true"
 
       - name: RNA pipeline smoke test (rna test)
         run: ./target/release/repo-native-alignment test --repo .
