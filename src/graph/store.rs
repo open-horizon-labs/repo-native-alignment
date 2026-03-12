@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search_symbols` and `oh_search_context`.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -46,6 +46,7 @@ pub fn symbols_schema() -> Schema {
         Field::new("meta_name_col", DataType::Int32, true),
         Field::new("value", DataType::Utf8, true),      // metadata["value"]
         Field::new("synthetic", DataType::Boolean, true), // metadata["synthetic"] == "true"
+        Field::new("cyclomatic", DataType::Int32, true),   // metadata["cyclomatic"] — complexity score
         // Vector column is added dynamically when embeddings are computed,
         // since the dimension depends on the model. See `symbols_schema_with_vector`.
         Field::new("updated_at", DataType::Int64, false),
@@ -72,6 +73,7 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("meta_name_col", DataType::Int32, true),
         Field::new("value", DataType::Utf8, true),
         Field::new("synthetic", DataType::Boolean, true),
+        Field::new("cyclomatic", DataType::Int32, true),
         Field::new(
             "vector",
             DataType::FixedSizeList(

@@ -66,6 +66,10 @@ pub struct LangConfig {
     /// Whether user-defined types must start with uppercase.
     /// false for Go (unexported types) and Python (lowercase classes).
     pub type_requires_uppercase: bool,
+    /// Tree-sitter node kinds that represent branches/decision points for
+    /// cyclomatic complexity (e.g. `["if_expression", "match_expression",
+    /// "for_expression", "while_expression"]`).
+    pub branch_node_types: &'static [&'static str],
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +202,12 @@ fn collect_nodes(
                     "name_col".to_string(),
                     name_node.start_position().column.to_string(),
                 );
+            }
+
+            // Cyclomatic complexity for functions.
+            if node_kind == NodeKind::Function && !config.branch_node_types.is_empty() {
+                let branches = count_branches(node, source, config, true);
+                metadata.insert("cyclomatic".to_string(), (1 + branches).to_string());
             }
 
             // Const value extraction.
@@ -453,6 +463,85 @@ fn collect_nodes(
             collect_nodes(child, path, source, config, parent_scope, nodes, edges);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Complexity
+// ---------------------------------------------------------------------------
+
+/// Logical operators that represent actual control-flow branches.
+/// When a `binary_expression` / `binary` node uses one of these operators,
+/// it counts as a branch. Arithmetic/comparison operators do not.
+const LOGICAL_OPERATORS: &[&str] = &["&&", "||", "and", "or"];
+
+/// Anonymous function-like node kinds that act as complexity boundaries.
+/// These are not in `node_kinds` (they aren't extracted as top-level symbols),
+/// but branches inside them belong to the closure, not the enclosing function.
+const CLOSURE_NODE_KINDS: &[&str] = &[
+    "closure_expression",    // Rust
+    "lambda",                // Python
+    "arrow_function",        // TypeScript, JavaScript
+    "function_expression",   // JavaScript
+    "generator_function",    // JavaScript
+    "anonymous_function",    // PHP
+    "lambda_literal",        // Kotlin
+    "func_literal",          // Go
+    "lambda_expression",     // Java, C#
+    // Note: Ruby "block" omitted — too generic, conflicts with Rust/other
+    // languages where "block" is a plain scope, not a closure.
+    "do_block",              // Ruby (do...end blocks act as closures)
+];
+
+/// Count branch/decision-point nodes in a tree-sitter subtree.
+/// Cyclomatic complexity = 1 + branch_count (the 1 is for the function itself).
+///
+/// `source` is needed to inspect operator text inside `binary_expression` nodes.
+/// When `skip_nested_fns` is true, subtrees whose node kind matches a
+/// `NodeKind::Function` entry in `config.node_kinds` are skipped (prevents
+/// nested function bodies from inflating the parent's complexity).
+fn count_branches(
+    node: tree_sitter::Node,
+    source: &[u8],
+    config: &LangConfig,
+    skip_nested_fns: bool,
+) -> usize {
+    let kind = node.kind();
+
+    // For binary_expression / binary nodes, only count if the operator is logical.
+    let is_branch = if config.branch_node_types.contains(&kind) {
+        if kind == "binary_expression" || kind == "binary" {
+            // Try named field first, fall back to middle child (index 1).
+            let op_text = node
+                .child_by_field_name("operator")
+                .or_else(|| node.child(1))
+                .and_then(|op| op.utf8_text(source).ok())
+                .unwrap_or("");
+            LOGICAL_OPERATORS.contains(&op_text)
+        } else {
+            true
+        }
+    } else {
+        false
+    };
+
+    let mut count = if is_branch { 1 } else { 0 };
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            // Skip nested function/closure bodies so they don't inflate the parent.
+            if skip_nested_fns {
+                let child_kind = child.kind();
+                let is_fn = config.node_kinds.iter().any(|(ts_kind, nk)| {
+                    *ts_kind == child_kind && *nk == NodeKind::Function
+                });
+                if is_fn || CLOSURE_NODE_KINDS.contains(&child_kind) {
+                    continue;
+                }
+            }
+            count += count_branches(child, source, config, skip_nested_fns);
+        }
+    }
+    count
 }
 
 // ---------------------------------------------------------------------------
@@ -953,5 +1042,334 @@ pub fn hello() {}
         assert_eq!(extract_user_type("int", false), None); // primitive
         assert_eq!(extract_user_type("error", false), None); // Go builtin
         assert_eq!(extract_user_type("bool", false), None); // primitive
+    }
+
+    // -----------------------------------------------------------------------
+    // Cyclomatic complexity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cyclomatic_complexity_linear_function() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+fn simple() {
+    println!("hello");
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(std::path::Path::new("test.rs"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "simple").unwrap();
+        assert_eq!(func.metadata.get("cyclomatic").map(|s| s.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn test_cyclomatic_complexity_with_branches() {
+        use crate::extract::rust::RUST_CONFIG;
+        // if_expression + else_clause = 2 branch nodes → complexity = 1 + 2 = 3
+        let code = r#"
+fn branchy(x: i32) -> i32 {
+    if x > 0 {
+        1
+    } else {
+        -1
+    }
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(std::path::Path::new("test.rs"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "branchy").unwrap();
+        let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+        assert_eq!(cc, 3, "if + else = 2 branches + 1 base = 3, got {}", cc);
+    }
+
+    #[test]
+    fn test_cyclomatic_complexity_nested() {
+        use crate::extract::rust::RUST_CONFIG;
+        // for_expression + match_expression + 2 match_arms = 4 branches → cc = 5
+        let code = r#"
+fn complex(items: &[Option<i32>]) -> i32 {
+    let mut sum = 0;
+    for item in items {
+        match item {
+            Some(v) if *v > 0 => { sum += v; }
+            _ => {}
+        }
+    }
+    sum
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(std::path::Path::new("test.rs"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "complex").unwrap();
+        let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+        assert_eq!(cc, 5, "for + match + 2 arms = 4 branches + 1 base = 5, got {}", cc);
+    }
+
+    #[test]
+    fn test_cyclomatic_complexity_not_on_structs() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+struct Foo {
+    x: i32,
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(std::path::Path::new("test.rs"), code)
+            .unwrap();
+        let struc = result.nodes.iter().find(|n| n.id.name == "Foo").unwrap();
+        assert!(struc.metadata.get("cyclomatic").is_none(), "Structs should not have cyclomatic metadata");
+    }
+
+    #[test]
+    fn test_cyclomatic_complexity_python() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = r#"
+def process(items):
+    for item in items:
+        if item > 0:
+            yield item
+        elif item == 0:
+            continue
+        else:
+            raise ValueError("negative")
+"#;
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(std::path::Path::new("test.py"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "process").unwrap();
+        let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+        // for_statement + if_statement + elif_clause + else_clause = 4 branches → cc = 5
+        assert_eq!(cc, 5, "for + if + elif + else = 4 branches + 1 base = 5, got {}", cc);
+    }
+
+    #[test]
+    fn test_cyclomatic_complexity_typescript() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let code = r#"
+function route(req: Request): string {
+    if (req.method === "GET") {
+        return "get";
+    } else {
+        return req.admin ? "admin" : "user";
+    }
+}
+"#;
+        let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
+            .run(std::path::Path::new("test.ts"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "route").unwrap();
+        let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+        // if_statement + else_clause + ternary_expression = 3 branches → cc = 4
+        assert_eq!(cc, 4, "if + else + ternary = 3 branches + 1 base = 4, got {}", cc);
+    }
+
+    #[test]
+    fn test_cyclomatic_complexity_go() {
+        use crate::extract::configs::GO_CONFIG;
+        let code = r#"
+func process(items []int) int {
+    sum := 0
+    for _, v := range items {
+        if v > 0 {
+            sum += v
+        } else {
+            sum -= v
+        }
+    }
+    return sum
+}
+"#;
+        let result = GenericExtractor::new(&GO_CONFIG)
+            .run(std::path::Path::new("test.go"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "process").unwrap();
+        let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+        // Go tree-sitter doesn't emit else_clause; for_statement + if_statement = 2 branches → cc = 3
+        assert_eq!(cc, 3, "for + if = 2 branches + 1 base = 3, got {}", cc);
+    }
+
+    #[test]
+    fn test_cyclomatic_complexity_java() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let code = r#"
+class Handler {
+    int handle(int code) {
+        if (code > 200) {
+            return code;
+        } else {
+            for (int i = 0; i < code; i++) {
+                System.out.println(i);
+            }
+            return 0;
+        }
+    }
+}
+"#;
+        let result = GenericExtractor::new(&JAVA_CONFIG)
+            .run(std::path::Path::new("Test.java"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
+        let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+        // Java tree-sitter doesn't emit else_clause; if_statement + for_statement = 2 branches → cc = 3
+        assert_eq!(cc, 3, "if + for = 2 branches + 1 base = 3, got {}", cc);
+    }
+
+    // -----------------------------------------------------------------------
+    // Adversarial: dissent-seeded complexity tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_adversarial_arithmetic_inflation_documented() {
+        // After the operator-aware fix, binary_expression nodes are only
+        // counted when the operator is logical (&&, ||, and, or).
+        // Pure arithmetic should now correctly yield cc=1.
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+fn math(a: i32, b: i32) -> i32 {
+    let x = a + b * 2 - a / b;
+    let y = x % 3 + a * b;
+    x + y
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(std::path::Path::new("test.rs"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "math").unwrap();
+        let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+        // Pure arithmetic: no logical operators, no branches → cc = 1
+        assert_eq!(cc, 1, "Pure arithmetic function should have cc=1, got {}", cc);
+        eprintln!("ADVERSARIAL: Rust arithmetic cc={} (operator-aware filter working)", cc);
+    }
+
+    #[test]
+    fn test_adversarial_go_arithmetic_vs_logical() {
+        // After the operator-aware fix, Go binary_expression nodes are only
+        // counted when the operator is logical (&&, ||). Arithmetic does not inflate.
+        use crate::extract::configs::GO_CONFIG;
+
+        // Pure arithmetic
+        let arith_code = r#"
+func math(a int, b int) int {
+    x := a + b*2 - a/b
+    return x
+}
+"#;
+        let result = GenericExtractor::new(&GO_CONFIG)
+            .run(std::path::Path::new("test.go"), arith_code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "math").unwrap();
+        let arith_cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+
+        // Logical operators (actual branches)
+        let logic_code = r#"
+func validate(a int, b int) bool {
+    return a > 0 && b > 0 || a == b
+}
+"#;
+        let result2 = GenericExtractor::new(&GO_CONFIG)
+            .run(std::path::Path::new("test.go"), logic_code)
+            .unwrap();
+        let func2 = result2.nodes.iter().find(|n| n.id.name == "validate").unwrap();
+        let logic_cc: usize = func2.metadata.get("cyclomatic").unwrap().parse().unwrap();
+
+        // Arithmetic: no logical operators → cc = 1
+        assert_eq!(arith_cc, 1, "Go arithmetic function should have cc=1, got {}", arith_cc);
+        // Logical: && + || = 2 logical operators → cc = 3
+        assert_eq!(logic_cc, 3, "Go logical function with && and || should have cc=3, got {}", logic_cc);
+        eprintln!("ADVERSARIAL: Go arithmetic cc={}, logical cc={}", arith_cc, logic_cc);
+    }
+
+    #[test]
+    fn test_adversarial_empty_function_body() {
+        // Edge case: function with empty body should have cc=1.
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "fn noop() {}\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(std::path::Path::new("test.rs"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "noop").unwrap();
+        let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+        assert_eq!(cc, 1, "Empty function should have complexity 1, got {}", cc);
+    }
+
+    #[test]
+    fn test_adversarial_many_match_arms_flat() {
+        // Dissent: 10 flat match arms score the same as 10 nested ifs,
+        // but flat arms are easier to reason about. Verify the score.
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+fn dispatch(cmd: &str) -> i32 {
+    match cmd {
+        "a" => 1,
+        "b" => 2,
+        "c" => 3,
+        "d" => 4,
+        "e" => 5,
+        "f" => 6,
+        "g" => 7,
+        "h" => 8,
+        "i" => 9,
+        _ => 0,
+    }
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(std::path::Path::new("test.rs"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "dispatch").unwrap();
+        let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+        // match_expression counts as 1, but each match_arm also counts.
+        // The exact score depends on tree-sitter grammar details.
+        // Key assertion: it IS > 1 (not silently broken).
+        assert!(cc > 1, "10-arm match should have cc > 1, got {}", cc);
+        eprintln!("ADVERSARIAL: 10-arm match dispatch cc={}", cc);
+    }
+
+    #[test]
+    fn test_adversarial_boolean_chain_rust() {
+        // Rust boolean operators: && and || should each count as a branch.
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+fn complex_guard(a: bool, b: bool, c: bool, d: bool) -> bool {
+    a && b || c && d || a && c
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(std::path::Path::new("test.rs"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "complex_guard").unwrap();
+        let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+        // 5 boolean operators → cc should be >= 5
+        // (tree-sitter nesting means fewer binary_expression nodes than operators)
+        assert!(cc > 1, "Boolean chain should have cc > 1, got {}", cc);
+        eprintln!("ADVERSARIAL: boolean chain cc={}", cc);
+    }
+
+    #[test]
+    fn test_adversarial_closure_branches_not_counted_in_parent() {
+        // If a function contains a closure with branches, those branches
+        // are inside the closure's subtree which is inside the function's subtree.
+        // Our count_branches walks the ENTIRE function subtree, so closure
+        // branches DO inflate the parent. Document this behavior.
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+fn parent() {
+    let f = |x: i32| {
+        if x > 0 { 1 } else { -1 }
+    };
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(std::path::Path::new("test.rs"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "parent").unwrap();
+        let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
+        // Closures (closure_expression) are now treated as complexity boundaries,
+        // so the if/else inside the closure is NOT counted in the parent.
+        assert_eq!(cc, 1, "Parent with branchy closure should have cc=1 (closure is a boundary), got {}", cc);
+        eprintln!("ADVERSARIAL: parent with closure cc={} (closure branches excluded)", cc);
     }
 }

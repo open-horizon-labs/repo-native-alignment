@@ -64,7 +64,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search_symbols",
-    description = "Find code symbols by name or signature across all supported languages. Returns file location, line numbers, signatures, and graph edges. Filter by kind (function/struct/trait/etc.), language, or file path. Results ranked: exact name > contains > signature-only, production code before tests. Use synthetic=false for declared constants only, synthetic=true for inferred literals."
+    description = "Find code symbols by name or signature across all supported languages. Returns file location, line numbers, signatures, complexity scores, and graph edges. Filter by kind (function/struct/trait/etc.), language, file path, or minimum complexity. Sort by complexity to find hotspots. Results ranked: exact name > contains > signature-only, production code before tests. Use synthetic=false for declared constants only, synthetic=true for inferred literals."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SearchSymbols {
@@ -88,6 +88,12 @@ pub struct SearchSymbols {
     /// If true, include only synthetic (inferred) constants. If false, exclude them. If absent, return all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synthetic: Option<bool>,
+    /// Optional: minimum cyclomatic complexity threshold. Only return functions with complexity >= this value. When set, query can be empty to search all functions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_complexity: Option<u32>,
+    /// Optional: sort results by "complexity" (descending). Default is relevance ranking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<String>,
 }
 
 #[macros::mcp_tool(
@@ -374,6 +380,9 @@ pub(crate) async fn persist_graph_to_lance(
                 None => synthetic_builder.append_null(),
             }
         }
+        let cyclomatics: Vec<Option<i32>> = nodes.iter()
+            .map(|n| n.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok()))
+            .collect();
         let updated_ats: Vec<i64> = vec![now; nodes.len()];
 
         let batch = RecordBatch::try_new(
@@ -393,6 +402,7 @@ pub(crate) async fn persist_graph_to_lance(
                 Arc::new(Int32Array::from(meta_name_cols)),
                 Arc::new(StringArray::from(values)),
                 Arc::new(synthetic_builder.finish()),
+                Arc::new(Int32Array::from(cyclomatics)),
                 Arc::new(Int64Array::from(updated_ats)),
             ],
         )?;
@@ -552,6 +562,9 @@ pub(crate) async fn persist_graph_incremental(
                     None => synthetic_builder.append_null(),
                 }
             }
+            let cyclomatics: Vec<Option<i32>> = upsert_nodes.iter()
+                .map(|n| n.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok()))
+                .collect();
             let updated_ats: Vec<i64> = vec![now; upsert_nodes.len()];
 
             let batch = RecordBatch::try_new(
@@ -571,6 +584,7 @@ pub(crate) async fn persist_graph_incremental(
                     Arc::new(Int32Array::from(meta_name_cols)),
                     Arc::new(StringArray::from(values)),
                     Arc::new(synthetic_builder.finish()),
+                    Arc::new(Int32Array::from(cyclomatics)),
                     Arc::new(Int64Array::from(updated_ats)),
                 ],
             )?;
@@ -734,6 +748,8 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             let synthetic_col = batch.column_by_name("synthetic")
                 .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
+            let cyclomatic_col = batch.column_by_name("cyclomatic")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
 
             for i in 0..batch.num_rows() {
                 let file_path = PathBuf::from(file_paths.value(i));
@@ -762,6 +778,11 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 if let Some(col) = synthetic_col {
                     if !col.is_null(i) {
                         metadata.insert("synthetic".to_string(), if col.value(i) { "true" } else { "false" }.to_string());
+                    }
+                }
+                if let Some(col) = cyclomatic_col {
+                    if !col.is_null(i) {
+                        metadata.insert("cyclomatic".to_string(), col.value(i).to_string());
                     }
                 }
                 nodes.push(Node {
@@ -2131,13 +2152,17 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                 // style so agents parsing the old format are unaffected.
                                 let md = matches.iter()
                                     .map(|n| {
-                                        format!(
+                                        let mut line = format!(
                                             "- **{} {} ({})** ({})\n  `{}`\n  ID: `{}`",
                                             n.id.kind, n.id.name, n.language,
                                             n.id.file.display(),
                                             n.signature,
                                             n.stable_id(),
-                                        )
+                                        );
+                                        if let Some(cc) = n.metadata.get("cyclomatic") {
+                                            line.push_str(&format!("\n  Complexity: {}", cc));
+                                        }
+                                        line
                                     })
                                     .collect::<Vec<_>>()
                                     .join("\n\n");
@@ -2247,8 +2272,11 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             "search_symbols" => {
                 let args: SearchSymbols = parse_args(params.arguments)?;
                 let query = args.query.trim();
-                if query.is_empty() {
-                    return Ok(text_result("Empty query. Please describe what you're looking for.".into()));
+                let sort_by_complexity_early = args.sort.as_deref() == Some("complexity");
+                let has_complexity_filter = args.min_complexity.is_some();
+                let complexity_search = has_complexity_filter || sort_by_complexity_early;
+                if query.is_empty() && !complexity_search {
+                    return Ok(text_result("Empty query. Please describe what you're looking for (or use min_complexity / sort=\"complexity\" to find complex functions).".into()));
                 }
                 match self.get_graph().await {
                     Ok(guard) => {
@@ -2256,14 +2284,22 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         let limit = args.limit.unwrap_or(20) as usize;
                         let query_lower = query.to_lowercase();
 
+                        let sort_by_complexity = args.sort.as_deref() == Some("complexity");
                         let mut matches: Vec<&Node> = graph_state
                             .nodes
                             .iter()
                             .filter(|n| {
-                                let name_match = n.id.name.to_lowercase().contains(&query_lower)
-                                    || n.signature.to_lowercase().contains(&query_lower);
-                                if !name_match {
+                                // In complexity search mode, only return functions.
+                                if complexity_search && n.id.kind != NodeKind::Function {
                                     return false;
+                                }
+                                // When query is non-empty, filter by name/signature match.
+                                if !query_lower.is_empty() {
+                                    let name_match = n.id.name.to_lowercase().contains(&query_lower)
+                                        || n.signature.to_lowercase().contains(&query_lower);
+                                    if !name_match {
+                                        return false;
+                                    }
                                 }
                                 if let Some(ref kind_filter) = args.kind {
                                     if n.id.kind.to_string().to_lowercase() != kind_filter.to_lowercase() {
@@ -2292,13 +2328,37 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                         return false;
                                     }
                                 }
+                                if let Some(min_cc) = args.min_complexity {
+                                    let Some(cc) = n.metadata.get("cyclomatic")
+                                        .and_then(|s| s.parse::<u32>().ok())
+                                    else {
+                                        return false;
+                                    };
+                                    if cc < min_cc {
+                                        return false;
+                                    }
+                                }
                                 true
                             })
                             .collect();
 
-                        // Rank results using the shared 5-tier cascade
-                        // (see ranking::sort_symbol_matches for tier documentation)
-                        ranking::sort_symbol_matches(&mut matches, &query_lower, &graph_state.index);
+                        if sort_by_complexity {
+                            // Drop entries without a parseable cyclomatic score so
+                            // unknown-score symbols don't push real hotspots off the page.
+                            matches.retain(|n| {
+                                n.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).is_some()
+                            });
+                            // Sort by cyclomatic complexity descending.
+                            matches.sort_by(|a, b| {
+                                let cc_a = a.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                                let cc_b = b.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                                cc_b.cmp(&cc_a)
+                            });
+                        } else {
+                            // Rank results using the shared 5-tier cascade
+                            // (see ranking::sort_symbol_matches for tier documentation)
+                            ranking::sort_symbol_matches(&mut matches, &query_lower, &graph_state.index);
+                        }
                         matches.truncate(limit);
 
                         let freshness = format_freshness(
@@ -2342,6 +2402,9 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                     }
                                     if n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false) {
                                         entry.push_str(" *(literal)*");
+                                    }
+                                    if let Some(cc) = n.metadata.get("cyclomatic") {
+                                        entry.push_str(&format!("\n  Complexity: {}", cc));
                                     }
                                     if !outgoing.is_empty() {
                                         entry.push_str(&format!("\n  Out: {} edge(s)", outgoing.len()));
@@ -2712,7 +2775,7 @@ fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String]) -> String {
                     graph::NodeKind::Module | graph::NodeKind::PrMerge => return None,
                     _ => {}
                 }
-                Some(format!(
+                let mut line = format!(
                     "- **{}** `{}` ({}) `{}`:{}-{}",
                     node.id.kind,
                     node.id.name,
@@ -2720,7 +2783,11 @@ fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String]) -> String {
                     node.id.file.display(),
                     node.line_start,
                     node.line_end,
-                ))
+                );
+                if let Some(cc) = node.metadata.get("cyclomatic") {
+                    line.push_str(&format!(" · complexity {}", cc));
+                }
+                Some(line)
             } else {
                 Some(format!("- `{}`", id))
             }

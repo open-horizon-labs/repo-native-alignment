@@ -11,10 +11,22 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  verify:
+  lint:
     runs-on: namespace-profile-default
-    timeout-minutes: 20
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: No language-specific conditionals in generic.rs
+        run: |
+          if grep -n 'language_name ==' src/extract/generic.rs; then
+            echo "FAIL: language-specific logic in generic.rs — use LangConfig fields"
+            exit 1
+          fi
 
+  test:
+    runs-on: namespace-profile-default
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,27 +39,59 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install sccache
+      - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Lint — no language-specific conditionals in generic.rs
-        run: |
-          if grep -n 'language_name ==' src/extract/generic.rs; then
-            echo "FAIL: language-specific logic in generic.rs — use LangConfig fields"
-            exit 1
-          fi
+      - name: Configure Namespace sccache cache
+        run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
+
+      - name: Cache Rust downloads
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rust-downloads"
+          cache-all-crates: true
+          cache-on-failure: true
+          cache-targets: false
+
+      - name: Run all tests (debug profile)
+        env:
+          RUSTC_WRAPPER: "sccache"
+        run: cargo test --no-default-features
+
+  smoke:
+    if: github.event_name == 'push'
+    runs-on: namespace-profile-default
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure Namespace sccache cache
+        run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
+
+      - name: Cache Rust downloads
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rust-downloads"
+          cache-all-crates: true
+          cache-on-failure: true
+          cache-targets: false
 
       - name: Build release binary
+        env:
+          RUSTC_WRAPPER: "sccache"
         run: cargo build --release --no-default-features
-        env:
-          RUSTC_WRAPPER: sccache
-          SCCACHE_GHA_ENABLED: "true"
-
-      - name: Run all tests (release profile)
-        run: cargo test --release --no-default-features
-        env:
-          RUSTC_WRAPPER: sccache
-          SCCACHE_GHA_ENABLED: "true"
 
       - name: RNA pipeline smoke test (rna test)
         run: ./target/release/repo-native-alignment test --repo .

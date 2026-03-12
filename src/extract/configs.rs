@@ -33,6 +33,13 @@ pub static PYTHON_CONFIG: LangConfig = LangConfig {
     param_type_field: Some("type"),
     return_type_field: Some("return_type"),
     type_requires_uppercase: false,
+    branch_node_types: &[
+        "if_statement", "elif_clause", "else_clause",
+        "for_statement", "while_statement",
+        "boolean_operator",  // and, or
+        "try_statement", "except_clause",
+        "conditional_expression",  // ternary
+    ],
 };
 
 // ---------------------------------------------------------------------------
@@ -62,6 +69,15 @@ pub static TYPESCRIPT_CONFIG: LangConfig = LangConfig {
     param_type_field: Some("type"),
     return_type_field: Some("return_type"),
     type_requires_uppercase: true,
+    branch_node_types: &[
+        "if_statement", "else_clause",
+        "switch_statement", "switch_case",
+        "for_statement", "for_in_statement", "while_statement", "do_statement",
+        "binary_expression",  // covers && and ||
+        "ternary_expression",
+        "try_statement", "catch_clause",
+        "optional_chain_expression",  // ?.
+    ],
 };
 
 // ---------------------------------------------------------------------------
@@ -88,6 +104,14 @@ pub static JAVASCRIPT_CONFIG: LangConfig = LangConfig {
     param_type_field: None,
     return_type_field: None,
     type_requires_uppercase: true,
+    branch_node_types: &[
+        "if_statement", "else_clause",
+        "switch_statement", "switch_case",
+        "for_statement", "for_in_statement", "while_statement", "do_statement",
+        "binary_expression",  // covers && and ||
+        "ternary_expression",
+        "try_statement", "catch_clause",
+    ],
 };
 
 // ---------------------------------------------------------------------------
@@ -114,6 +138,14 @@ pub static GO_CONFIG: LangConfig = LangConfig {
     param_type_field: Some("type"),
     return_type_field: Some("result"),
     type_requires_uppercase: false,
+    branch_node_types: &[
+        "if_statement", "else_clause",
+        "expression_switch_statement", "expression_case",
+        "type_switch_statement", "type_case",
+        "for_statement",  // Go's only loop
+        "select_statement", "communication_case",
+        "binary_expression",  // && and ||
+    ],
 };
 
 // ---------------------------------------------------------------------------
@@ -144,6 +176,14 @@ pub static JAVA_CONFIG: LangConfig = LangConfig {
     param_type_field: Some("type"),
     return_type_field: Some("type"),
     type_requires_uppercase: true,
+    branch_node_types: &[
+        "if_statement", "else_clause",
+        "switch_expression", "switch_block_statement_group",
+        "for_statement", "enhanced_for_statement", "while_statement", "do_statement",
+        "binary_expression",  // covers && and ||
+        "ternary_expression",
+        "try_statement", "catch_clause",
+    ],
 };
 
 // ---------------------------------------------------------------------------
@@ -173,6 +213,13 @@ pub static KOTLIN_CONFIG: LangConfig = LangConfig {
     param_type_field: None,
     return_type_field: None,
     type_requires_uppercase: true,
+    branch_node_types: &[
+        "if_expression", "else_clause",
+        "when_expression", "when_entry",
+        "for_statement", "while_statement", "do_while_statement",
+        "conjunction_expression", "disjunction_expression",  // && and ||
+        "try_expression", "catch_block",
+    ],
 };
 
 // ---------------------------------------------------------------------------
@@ -204,6 +251,14 @@ pub static CSHARP_CONFIG: LangConfig = LangConfig {
     param_type_field: Some("type"),
     return_type_field: Some("returns"),
     type_requires_uppercase: true,
+    branch_node_types: &[
+        "if_statement", "else_clause",
+        "switch_statement", "switch_section",
+        "for_statement", "for_each_statement", "while_statement", "do_statement",
+        "binary_expression",  // covers && and ||
+        "conditional_expression",  // ternary
+        "try_statement", "catch_clause",
+    ],
 };
 
 // ---------------------------------------------------------------------------
@@ -235,6 +290,13 @@ pub static SWIFT_CONFIG: LangConfig = LangConfig {
     param_type_field: None,
     return_type_field: None,
     type_requires_uppercase: true,
+    branch_node_types: &[
+        "if_statement", "else_clause",
+        "switch_statement", "case_statement",
+        "for_statement", "while_statement",
+        "guard_statement",
+        "ternary_expression",
+    ],
 };
 
 // ---------------------------------------------------------------------------
@@ -263,6 +325,13 @@ pub static ZIG_CONFIG: LangConfig = LangConfig {
     param_type_field: None,
     return_type_field: None,
     type_requires_uppercase: true,
+    branch_node_types: &[
+        "if_expression", "else_clause",
+        "switch_expression",
+        "for_expression", "while_expression",
+        "binary_expression",  // and, or
+        "try_expression",
+    ],
 };
 
 // ---------------------------------------------------------------------------
@@ -293,6 +362,14 @@ pub static CPP_CONFIG: LangConfig = LangConfig {
     param_type_field: None,
     return_type_field: Some("type"),
     type_requires_uppercase: true,
+    branch_node_types: &[
+        "if_statement", "else_clause",
+        "switch_statement", "case_statement",
+        "for_statement", "while_statement", "do_statement",
+        "binary_expression",  // covers && and ||
+        "conditional_expression",  // ternary
+        "try_statement", "catch_clause",
+    ],
 };
 
 // ---------------------------------------------------------------------------
@@ -315,6 +392,11 @@ pub static LUA_CONFIG: LangConfig = LangConfig {
     param_type_field: None,
     return_type_field: None,
     type_requires_uppercase: true,
+    branch_node_types: &[
+        "if_statement", "elseif_statement", "else_statement",
+        "for_statement", "while_statement", "repeat_statement",
+        "binary_expression",  // and, or
+    ],
 };
 
 // ---------------------------------------------------------------------------
@@ -341,6 +423,14 @@ pub static RUBY_CONFIG: LangConfig = LangConfig {
     param_type_field: None,
     return_type_field: None,
     type_requires_uppercase: true,
+    branch_node_types: &[
+        "if", "elsif", "else", "unless",
+        "case", "when",
+        "for", "while", "until",
+        "binary", // and, or, &&, ||
+        "conditional",  // ternary
+        "rescue", "ensure",
+    ],
 };
 
 // ---------------------------------------------------------------------------
@@ -363,4 +453,11 @@ pub static BASH_CONFIG: LangConfig = LangConfig {
     param_type_field: None,
     return_type_field: None,
     type_requires_uppercase: true,
+    branch_node_types: &[
+        "if_statement", "elif_clause", "else_clause",
+        "case_statement", "case_item",
+        "for_statement", "while_statement",
+        "pipeline",  // pipes as control flow
+        "binary_expression",  // && and ||
+    ],
 };
