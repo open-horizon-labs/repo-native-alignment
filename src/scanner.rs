@@ -1029,6 +1029,9 @@ mod tests {
         state
             .file_mtimes
             .insert(PathBuf::from("src/main.rs"), SystemTime::now().into());
+        state
+            .file_content_hashes
+            .insert(PathBuf::from("src/main.rs"), "a".repeat(64));
         state.last_commit_sha = Some("abc123def456".to_string());
         state.last_scan = Some(SystemTime::now().into());
 
@@ -1037,8 +1040,33 @@ mod tests {
 
         assert_eq!(restored.dir_mtimes.len(), 1);
         assert_eq!(restored.file_mtimes.len(), 1);
+        assert_eq!(restored.file_content_hashes.len(), 1);
         assert_eq!(restored.last_commit_sha.as_deref(), Some("abc123def456"));
         assert!(restored.last_scan.is_some());
+    }
+
+    #[test]
+    fn test_scan_state_backward_compat_no_content_hashes() {
+        // Old scan-state.json without file_content_hashes field should deserialize fine
+        let old_json = r#"{
+            "dir_mtimes": {},
+            "file_mtimes": {},
+            "last_commit_sha": "abc123",
+            "last_scan": [1700000000, 0]
+        }"#;
+        let state: ScanState = serde_json::from_str(old_json).unwrap();
+        assert!(state.file_content_hashes.is_empty());
+        assert_eq!(state.last_commit_sha.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn test_content_hash_deterministic_across_reads() {
+        // Same content always produces the same BLAKE3 hash
+        let content = b"fn main() { println!(\"hello\"); }";
+        let h1 = blake3::hash(content).to_hex().to_string();
+        let h2 = blake3::hash(content).to_hex().to_string();
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64); // 256-bit = 64 hex chars
     }
 
     // ── First scan: everything is new ───────────────────────────────
