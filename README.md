@@ -2,83 +2,35 @@
 
 [![CI](https://github.com/open-horizon-labs/repo-native-alignment/actions/workflows/rust-main-merge.yml/badge.svg)](https://github.com/open-horizon-labs/repo-native-alignment/actions) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Aim-conditioned decision infrastructure for coding agents. A single binary MCP server that connects business outcomes to code — so agents know *why* they're building, not just *what*.
+An MCP server that gives coding agents what LSP alone can't: a cross-language code graph, semantic search, and business outcome tracking. Single binary — no Docker, no external database, no API key.
 
-No Docker. No external database. No API key. `cargo install` and go.
+**[Quick Start](#quick-start)** | **[What Agents Can Do](#what-agents-can-do)** | **[RNA vs LSP](#why-not-just-lsp)** | **[MCP Tools](#mcp-tools)** | **[Compared To](#compared-to)** | **[Docs](#detailed-documentation)**
 
-**[Quick Start](#quick-start)** | **[What Agents Can Ask](#what-agents-can-ask)** | **[MCP Tools](#rna-mcp-server--5-tools)** | **[The .oh/ Directory](#the-oh-directory)** | **[Compared To](#compared-to)** | **[Docs](#detailed-documentation)**
+## What Agents Can Do
 
-## How It Works
+### Find code by meaning, not just by name
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  OH MCP (organizational)        RNA MCP (repo-local)        │
-│  ─ aims, missions, endeavors    ─ outcomes, signals, code   │
-│  ─ cross-project context        ─ workspace graph (petgraph)│
-│  ─ decision logs                ─ multi-lang AST + topology │
-│                                 ─ semantic search over .oh/ │
-└──────────┬──────────────────────────────┬───────────────────┘
-           │                              │
-           ▼                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│  OH Skills (cross-cutting)      OH Agents (phase-isolated)  │
-│  /review  /dissent  /salvage    oh-aim  oh-execute  oh-ship │
-│  ─ run in main session          ─ own context + scoped tools│
-│  ─ need conversation context    ─ read/write .oh/ sessions  │
-│  ─ use RNA+OH MCP when avail    ─ use RNA+OH MCP when avail │
-└─────────────────────────────────────────────────────────────┘
-           │                              │
-           ▼                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│  .oh/ directory (repo-local cache, git-versioned)           │
-│  outcomes/ ─ what we're optimizing for                      │
-│  signals/  ─ how we measure progress                        │
-│  guardrails/ ─ constraints that shape behavior              │
-│  metis/    ─ learnings that compound across sessions        │
-│  config.toml ─ scanner excludes, per-project tuning         │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**The loop:** Skills guide work → MCP tools read/write context → `.oh/` accumulates learnings → git versions everything → next session starts richer.
-
-## What Agents Can Ask
-
-Once RNA is running, agents query your codebase and business context through MCP tool calls. Here's what that looks like in practice:
-
-### Finding code
-
+- "Find functions related to payment processing" → `oh_search_context("payment processing", include_code=true)` → ranked results, production code before tests, searched by meaning across function bodies, docs, and commit history
+- "How does scanning work?" → `oh_search_context("scanning", include_code=true, include_markdown=true)` → implementation code and doc sections together
 - "Where is the authentication handler?" → `search_symbols("AuthHandler")` → file, line, signature, graph edges
-- "Find functions related to payment processing" → `oh_search_context("payment processing", include_code=true)` → ranked results scored 0-1, production code before tests, function bodies searched by meaning
-- "How does scanning work?" → `oh_search_context("scanning", include_code=true, include_markdown=true)` → implementation code and doc sections, not test files
-- "Show me all structs in embed.rs" → `search_symbols("", kind="struct", file="embed.rs")` → every struct with edges
 
-### Understanding impact
+### See the blast radius of a change
 
-- "What depends on the database connection pool?" → `graph_query(query="database connection pool", mode="impact")` → transitive dependents (no node_id lookup needed)
+- "What depends on the database connection pool?" → `graph_query(query="database connection pool", mode="impact")` → transitive dependents across languages, one call
 - "What calls AuthHandler?" → `graph_query(query="AuthHandler", direction="incoming")` → callers, implementors
-- "Find all trait implementors" → `graph_query(query="Enricher trait", edge_types=["implements"])` → concrete types with compiler-grade `Implements` edges from LSP
+- "Find all trait implementors" → `graph_query(query="Enricher trait", edge_types=["implements"])` → concrete types with compiler-grade edges
 
-### Connecting code to business outcomes
+### Connect code to business outcomes
 
 - "How is the agent-alignment outcome progressing?" → `outcome_progress("agent-alignment")` → tagged commits → changed files → symbols → PRs
 - "Find signals related to reliability" → `oh_search_context("reliability", artifact_types=["signal"])` → measurement definitions
 - "What are our constraints?" → `oh_search_context("constraints guardrails")` → all guardrails ranked by relevance
 
-### Knowing when to trust results
+## Why Not Just LSP?
 
-Every query includes freshness metadata so agents know what they're working with:
+Your editor's LSP servers give agents single-symbol, single-hop, single-language queries. To answer "what's the blast radius of changing this?", an agent using LSP alone must call `callHierarchy/incomingCalls` repeatedly — one hop per request — and assemble the graph itself. There's no multi-hop primitive.
 
-```
-Index: 5373 symbols · last scan 2m ago · LSP: enriched (3307 edges) · schema v3
-```
-
-During cold start, semantic tools return actionable status instead of errors:
-
-```
-Embedding index: building — semantic results will appear shortly. Retry in a few seconds.
-```
-
-Agents see `LSP: pending` and know to retry for complete call graphs, or `LSP: enriched (3307 edges)` and know results are compiler-accurate.
+RNA runs those same LSP servers internally, fuses their data with tree-sitter, embedded function bodies, git history, and business artifacts into a single cross-language graph. One `graph_query` call replaces N round-trips. Early testing: ~50s and ~half the tokens vs ~120s for the same structural questions with LSP alone.
 
 ## Quick Start
 
@@ -184,7 +136,7 @@ Runs 25 checks end-to-end. Exits 0 on pass, 1 on failure. Safe to run in CI.
 
 The system compounds from here. Agents use `oh_search_context` to discover relevant context, `search_symbols` to explore code, and write learnings to `.oh/metis/`. Each session starts richer than the last.
 
-## RNA MCP Server — 5 tools
+## MCP Tools
 
 | Tool | What it's for |
 |------|--------------|
@@ -224,63 +176,32 @@ The system compounds from here. Agents use `oh_search_context` to discover relev
 └── .cache/          <- scan state, embedding index (gitignored)
 ```
 
+Business artifacts (`outcomes/`, `signals/`, `guardrails/`, `metis/`) are committed to git — they're part of the project. `.cache/` is gitignored and rebuilt automatically on first query.
 
 Outcomes declare `files:` patterns linking to code. Commits tag `[outcome:X]` linking to outcomes. These structural links power `outcome_progress`.
 
-`.oh/` is a **cache**, not source of truth. `rm -rf .oh/` loses context but breaks nothing.
-
 ## Compared To
 
-RNA uses LSP internally as one enrichment source, fuses it with tree-sitter, embeddings, git history, and business artifacts into a cross-language graph, and exposes multi-hop traversal in a single call. For agents, RNA replaces the need for separate LSP plugins. See the [full comparison](docs/compared-to.md) for details (including LSP as the baseline).
+See the [full comparison](docs/compared-to.md) for details, including LSP as the baseline.
 
-| | **LSP (baseline)** | **RNA** | **Code-Graph-RAG** | **CodeGraphContext** |
-|---|---|---|---|---|
-| **What it is** | Editor protocol | Aim-conditioned MCP server | Code RAG system | Code graph toolkit + MCP |
-| **Query model** | 1 symbol, 1 hop, 1 language | Multi-hop, cross-language | Multi-hop | Multi-hop |
-| **Install** | Editor plugin / PATH binary | Single binary | Docker + Memgraph + API key | pip + graph DB |
-| **External deps** | One server per language | None | Docker, Memgraph, LLM API | Graph DB (KuzuDB/Neo4j) |
-| **Languages** | 1 per server | 22 (tree-sitter) + 37 (LSP) | 11 (tree-sitter) | 14 (tree-sitter) |
-| **Embeddings** | None | MiniLM-L6-v2 on Metal GPU | UniXcoder | None |
-| **Business context** | None | Outcomes, signals, guardrails, metis | None | None |
+| | **RNA** | **Code-Graph-RAG** | **CodeGraphContext** |
+|---|---|---|---|
+| **Install** | Single binary | Docker + Memgraph + API key | pip + graph DB |
+| **External deps** | None | Docker, Memgraph, LLM API | Graph DB (KuzuDB/Neo4j) |
+| **Languages** | Tree-sitter + LSP | Tree-sitter only | Tree-sitter only |
+| **Embeddings** | MiniLM-L6-v2 on Metal GPU | UniXcoder | None |
+| **Business context** | Outcomes, signals, guardrails, metis | None | None |
 
-LSP is the baseline — what agents get if you install nothing else. It provides single-symbol, single-hop queries; agents must make N sequential round-trips and assemble the picture themselves. Early testing: ~120s and ~2x tokens with raw LSP vs ~50s with RNA for the same structural questions.
+## Optional: Companion Systems
 
-## Companion Systems
+RNA works standalone. These add organizational context and workflow structure:
 
-### [OH MCP](https://github.com/cloud-atlas-ai/oh-mcp-server) — organizational context
-
-Missions, aims, endeavors, decision logs, cross-project context. RNA's `.oh/` is the repo-local projection of the OH graph.
-
-### [OH Skills](https://github.com/open-horizon-labs/skills) — workflow skills
-
-| Skill | What it does |
-|-------|-------------|
-| `/aim` | Frame the outcome you want |
-| `/review` | Check alignment before committing |
-| `/dissent` | Seek contrary evidence before one-way doors |
-| `/salvage` | Extract learning before restarting |
-| `/solution-space` | Evaluate approaches before committing |
-| `/execute` | Build with pre-flight checks and drift detection |
-
-### OH Phase Agents — isolated execution
-
-Agent wrappers for each workflow phase (`oh-aim`, `oh-execute`, `oh-ship`, etc.). Each runs in its own context window with scoped tools. Installed to `.claude/agents/`.
+- **[OH MCP](https://github.com/cloud-atlas-ai/oh-mcp-server)** — cross-project context: missions, aims, endeavors, decision logs
+- **[OH Skills](https://github.com/open-horizon-labs/skills)** — workflow skills: `/aim`, `/review`, `/dissent`, `/salvage`, `/solution-space`, `/execute`
 
 ## Status
 
-**Working:**
-
-- Function-level semantic search — embeds function bodies (not just names), all markdown, and commits in one vector space. Searches by meaning, scored 0-1 with production code ranked above tests
-- Structural outcome-to-code joins — agents scope work to declared business outcomes without re-prompting
-- Metal GPU semantic search with adaptive batch sizing — self-tunes to hardware
-- LSP-enriched call/type graph — compiler-grade call hierarchy and Implements edges across 37 language servers
-- Semantic graph entry points — `graph_query` accepts natural language queries directly, no node_id lookup required
-- Query staleness awareness — footers show `LSP: pending` so agents know when results are incomplete
-- Event-driven reindex — background scanner detects changes, re-extracts, re-embeds without blocking queries
-- Persistent index with <1s restarts — LanceDB cache survives process restarts
-- 22 language extractors, cross-language constant search
-- 5 MCP tools, 6 CLI subcommands, 370+ tests
-- Ships as a Claude Code plugin with setup skill and record skill
+Tree-sitter + LSP enrichment, 5 MCP tools, 6 CLI subcommands, 370+ tests. Ships as a Claude Code plugin.
 
 ### Platform Support
 
@@ -307,8 +228,8 @@ MIT — see [LICENSE](LICENSE).
 
 | Term | What it means |
 |------|--------------|
-| **Tree-sitter** | A parser that reads source code and produces a syntax tree — the structured representation of functions, classes, imports, etc. RNA uses it to extract symbols from 22 languages without running the code. |
-| **LSP** | Language Server Protocol. The same protocol your editor uses for go-to-definition and find-references. LSP provides single-symbol, single-hop, single-language queries — no multi-hop traversal, no cross-language, no semantic search. RNA runs LSP servers internally as one enrichment source (call hierarchy, type hierarchy, implements edges) and fuses the results into a unified cross-language graph. For agents, RNA replaces the need for separate LSP plugins. |
+| **Tree-sitter** | A parser that reads source code and produces a syntax tree — the structured representation of functions, classes, imports, etc. RNA uses it to extract symbols across languages without running the code. |
+| **LSP** | Language Server Protocol — the same protocol your editor uses for go-to-definition and find-references. RNA runs LSP servers internally and builds on their data. See [Why Not Just LSP?](#why-not-just-lsp) |
 | **Graph** | A network of nodes (symbols, files, outcomes) and edges (calls, depends_on, implements). RNA builds this in memory so you can ask "what depends on this function?" or "what's the blast radius of this change?" |
 | **Embeddings** | Vector representations of text that capture meaning. RNA embeds function bodies, markdown sections, commit messages, and business artifacts so `oh_search_context` can find relevant results by meaning, not just keywords. Uses Metal GPU on Apple Silicon, CPU elsewhere. |
 | **LanceDB** | The columnar + vector database RNA uses to store the graph and embeddings on disk. Lives in `.oh/.cache/`. |
@@ -322,8 +243,8 @@ MIT — see [LICENSE](LICENSE).
 ## Detailed Documentation
 
 - [Compared To](docs/compared-to.md) — RNA vs Code-Graph-RAG, CodeGraphContext
-- [Extractors](docs/extractors.md) — 22 language extractors, constants, synthetic literals
-- [LSP Enrichment](docs/lsp-enrichment.md) — 37 auto-detected language servers
+- [Extractors](docs/extractors.md) — tree-sitter language extractors, constants, synthetic literals
+- [LSP Enrichment](docs/lsp-enrichment.md) — auto-detected language servers
 - [Scanner](docs/scanner.md) — incremental, event-driven, worktree-aware scanning
 - [Graph Architecture](docs/graph.md) — LanceDB + petgraph, edge types, SourceEnvelope
 - [Source Compatibility](docs/rna-source-compatibility.md) — source-capability design for future Context Assembler integration
