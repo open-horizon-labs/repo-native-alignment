@@ -23,6 +23,7 @@ Before starting:
 2. Read `.oh/metis/computed-but-not-delivered.md` — the metis that created step 7b
 3. Identify the PR, branch, and issue being closed
 4. Read the PR description and issue acceptance criteria
+5. Check for CodeRabbit review comments on the PR (`gh api repos/{owner}/{repo}/pulls/<PR>/reviews`)
 
 ## The 11 Steps
 
@@ -90,9 +91,14 @@ EOF
 
 ### 3. Fix
 
-Address every finding from review + dissent. No deferred items.
+Address and plausibly fix ALL findings from review, dissent, AND CodeRabbit. No deferred items.
 
-If review or dissent found issues, fix them now. Commit with descriptive messages. If nothing to fix, skip.
+**Sources to check:**
+- Step 1 review findings
+- Step 2 dissent findings
+- **CodeRabbit PR review** — read all CodeRabbit comments with `gh pr view <PR> --comments` or `gh api repos/{owner}/{repo}/pulls/<PR>/comments`. CodeRabbit posts automated code review comments on every push. Treat these the same as review/dissent findings: fix, or explicitly mark N/A with reasoning.
+
+If nothing to fix across all three sources, skip. Otherwise commit with descriptive messages.
 
 ### 4. Adversarial test
 
