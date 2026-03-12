@@ -27,25 +27,15 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo registry + git checkouts
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false  # sccache handles compiled artifacts
-
-      - name: Install sccache binary
+      - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Configure sccache with Namespace remote cache
-        run: |
-          # Stop the GHA-configured server, reconfigure for Namespace backend
-          sccache --stop-server || true
-          unset SCCACHE_GHA_ENABLED
-          echo "SCCACHE_GHA_ENABLED=false" >> $GITHUB_ENV
-          export $(nsc cache sccache setup --cache_name default)
-          sccache --start-server
-          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          echo "SCCACHE_WEBDAV_ENDPOINT=$SCCACHE_WEBDAV_ENDPOINT" >> $GITHUB_ENV
-          echo "SCCACHE_WEBDAV_TOKEN=$SCCACHE_WEBDAV_TOKEN" >> $GITHUB_ENV
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-build"
+          cache-all-crates: true
+          cache-on-failure: true
 
       - name: Lint — no language-specific conditionals in generic.rs
         run: |
@@ -55,9 +45,15 @@ jobs:
           fi
 
       - name: Build release binary
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
         run: cargo build --release --no-default-features
 
       - name: Run all tests (release profile)
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
         run: cargo test --release --no-default-features
 
       - name: RNA pipeline smoke test (rna test)
