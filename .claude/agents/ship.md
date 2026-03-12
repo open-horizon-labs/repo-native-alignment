@@ -14,7 +14,8 @@ The full quality gate for this project. Run sequentially — each step must comp
 
 `/ship <PR-number>` — run the pipeline against a specific PR.
 
-If no PR number given, detect from the current branch (`gh pr list --head $(git branch --show-current)`).
+If no PR number given, detect it from the current branch:
+`gh pr list --head "$(git branch --show-current)" --json number --jq '.[0].number'`.
 
 ## Pre-flight
 
@@ -23,7 +24,7 @@ Before starting:
 2. Read `.oh/metis/computed-but-not-delivered.md` — the metis that created step 7b
 3. Identify the PR, branch, and issue being closed
 4. Read the PR description and issue acceptance criteria
-5. Check for CodeRabbit review comments on the PR (`gh api repos/{owner}/{repo}/pulls/<PR>/reviews`)
+5. Check for CodeRabbit review comments on the PR (`gh api repos/{owner}/{repo}/pulls/<PR-number>/comments`)
 
 ## The 11 Steps
 
@@ -163,7 +164,7 @@ This step exists because PR #137 taught us: computing a value is not delivering 
 
 **Checklist (for any feature that adds/changes data visible to agents):**
 
-- [ ] **Persist:** If new metadata on Node, is there a typed Arrow column in `symbols_schema()` (store.rs)?
+- [ ] **Persist:** If new metadata on Node, is there a typed Arrow column in every relevant schema constructor (`symbols_schema()` and `symbols_schema_with_vector()` in store.rs)?
 - [ ] **Write path:** Is the metadata written to the Arrow batch in BOTH construction sites in server.rs (initial + upsert)?
 - [ ] **Read path:** Is the metadata read back from Arrow into Node.metadata during load?
 - [ ] **Render:** Does the value appear in ALL relevant MCP tool outputs?
@@ -212,10 +213,12 @@ If CI is pending, wait. If CI fails, fix and re-run from step 9.
 Before merging, re-read the linked issue's acceptance criteria. Every checkbox must be checked off — either verified done or explicitly filed as a follow-up issue with a link. If any criterion is unmet and not deferred, **do not merge**. Go back to step 3 (fix).
 
 ```bash
-# Check off criteria on the issue
-gh issue edit <ISSUE> --body "$(updated body with [x] marks)"
+# Check off acceptance criteria on the issue
+CURRENT_BODY="$(gh issue view <ISSUE> --json body --jq .body)"
+UPDATED_BODY="$(printf '%s' "$CURRENT_BODY" | sed 's/- \[ \]/- [x]/g')"
+gh issue edit <ISSUE> --body "$UPDATED_BODY"
 # Then merge
-gh pr merge <PR> --squash --delete-branch
+gh pr merge <PR-number> --squash --delete-branch
 ```
 
 ## Step Questions (don't collapse steps — they answer different things)

@@ -206,7 +206,7 @@ fn collect_nodes(
 
             // Cyclomatic complexity for functions.
             if node_kind == NodeKind::Function && !config.branch_node_types.is_empty() {
-                let branches = count_branches(node, config.branch_node_types);
+                let branches = count_branches(node, source, config, true);
                 metadata.insert("cyclomatic".to_string(), (1 + branches).to_string());
             }
 
@@ -469,13 +469,58 @@ fn collect_nodes(
 // Complexity
 // ---------------------------------------------------------------------------
 
+/// Logical operators that represent actual control-flow branches.
+/// When a `binary_expression` / `binary` node uses one of these operators,
+/// it counts as a branch. Arithmetic/comparison operators do not.
+const LOGICAL_OPERATORS: &[&str] = &["&&", "||", "and", "or"];
+
 /// Count branch/decision-point nodes in a tree-sitter subtree.
 /// Cyclomatic complexity = 1 + branch_count (the 1 is for the function itself).
-fn count_branches(node: tree_sitter::Node, branch_types: &[&str]) -> usize {
-    let mut count = if branch_types.contains(&node.kind()) { 1 } else { 0 };
+///
+/// `source` is needed to inspect operator text inside `binary_expression` nodes.
+/// When `skip_nested_fns` is true, subtrees whose node kind matches a
+/// `NodeKind::Function` entry in `config.node_kinds` are skipped (prevents
+/// nested function bodies from inflating the parent's complexity).
+fn count_branches(
+    node: tree_sitter::Node,
+    source: &[u8],
+    config: &LangConfig,
+    skip_nested_fns: bool,
+) -> usize {
+    let kind = node.kind();
+
+    // For binary_expression / binary nodes, only count if the operator is logical.
+    let is_branch = if config.branch_node_types.contains(&kind) {
+        if kind == "binary_expression" || kind == "binary" {
+            // Try named field first, fall back to middle child (index 1).
+            let op_text = node
+                .child_by_field_name("operator")
+                .or_else(|| node.child(1))
+                .and_then(|op| op.utf8_text(source).ok())
+                .unwrap_or("");
+            LOGICAL_OPERATORS.contains(&op_text)
+        } else {
+            true
+        }
+    } else {
+        false
+    };
+
+    let mut count = if is_branch { 1 } else { 0 };
+
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            count += count_branches(child, branch_types);
+            // Skip nested function bodies so they don't inflate the parent.
+            if skip_nested_fns {
+                let child_kind = child.kind();
+                let is_fn = config.node_kinds.iter().any(|(ts_kind, nk)| {
+                    *ts_kind == child_kind && *nk == NodeKind::Function
+                });
+                if is_fn {
+                    continue;
+                }
+            }
+            count += count_branches(child, source, config, skip_nested_fns);
         }
     }
     count
@@ -1003,7 +1048,7 @@ fn simple() {
     #[test]
     fn test_cyclomatic_complexity_with_branches() {
         use crate::extract::rust::RUST_CONFIG;
-        // if + else = 2 branch nodes → complexity = 1 + 2 = 3
+        // if_expression + else_clause = 2 branch nodes → complexity = 1 + 2 = 3
         let code = r#"
 fn branchy(x: i32) -> i32 {
     if x > 0 {
@@ -1018,13 +1063,13 @@ fn branchy(x: i32) -> i32 {
             .unwrap();
         let func = result.nodes.iter().find(|n| n.id.name == "branchy").unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
-        assert!(cc > 1, "Function with if/else should have complexity > 1, got {}", cc);
+        assert_eq!(cc, 3, "if + else = 2 branches + 1 base = 3, got {}", cc);
     }
 
     #[test]
     fn test_cyclomatic_complexity_nested() {
         use crate::extract::rust::RUST_CONFIG;
-        // match + for + if = at least 3 branch nodes
+        // for_expression + match_expression + 2 match_arms = 4 branches → cc = 5
         let code = r#"
 fn complex(items: &[Option<i32>]) -> i32 {
     let mut sum = 0;
@@ -1042,7 +1087,7 @@ fn complex(items: &[Option<i32>]) -> i32 {
             .unwrap();
         let func = result.nodes.iter().find(|n| n.id.name == "complex").unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
-        assert!(cc >= 3, "Function with match+for should have complexity >= 3, got {}", cc);
+        assert_eq!(cc, 5, "for + match + 2 arms = 4 branches + 1 base = 5, got {}", cc);
     }
 
     #[test]
@@ -1078,8 +1123,8 @@ def process(items):
             .unwrap();
         let func = result.nodes.iter().find(|n| n.id.name == "process").unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
-        // for + if + elif + else = 4 branch nodes → cc = 5
-        assert!(cc >= 4, "Python function with for/if/elif/else should have complexity >= 4, got {}", cc);
+        // for_statement + if_statement + elif_clause + else_clause = 4 branches → cc = 5
+        assert_eq!(cc, 5, "for + if + elif + else = 4 branches + 1 base = 5, got {}", cc);
     }
 
     #[test]
@@ -1099,8 +1144,8 @@ function route(req: Request): string {
             .unwrap();
         let func = result.nodes.iter().find(|n| n.id.name == "route").unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
-        // if + else + ternary = 3 branch nodes → cc = 4
-        assert!(cc > 1, "TypeScript function with if/else/ternary should have complexity > 1, got {}", cc);
+        // if_statement + else_clause + ternary_expression = 3 branches → cc = 4
+        assert_eq!(cc, 4, "if + else + ternary = 3 branches + 1 base = 4, got {}", cc);
     }
 
     #[test]
@@ -1124,8 +1169,8 @@ func process(items []int) int {
             .unwrap();
         let func = result.nodes.iter().find(|n| n.id.name == "process").unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
-        // for + if + else = 3 branch nodes → cc = 4
-        assert!(cc > 1, "Go function with for/if/else should have complexity > 1, got {}", cc);
+        // Go tree-sitter doesn't emit else_clause; for_statement + if_statement = 2 branches → cc = 3
+        assert_eq!(cc, 3, "for + if = 2 branches + 1 base = 3, got {}", cc);
     }
 
     #[test]
@@ -1150,8 +1195,8 @@ class Handler {
             .unwrap();
         let func = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
-        // if + else + for = 3 branch nodes → cc = 4
-        assert!(cc > 1, "Java method with if/else/for should have complexity > 1, got {}", cc);
+        // Java tree-sitter doesn't emit else_clause; if_statement + for_statement = 2 branches → cc = 3
+        assert_eq!(cc, 3, "if + for = 2 branches + 1 base = 3, got {}", cc);
     }
 
     // -----------------------------------------------------------------------
@@ -1160,10 +1205,9 @@ class Handler {
 
     #[test]
     fn test_adversarial_arithmetic_inflation_documented() {
-        // Dissent risk: binary_expression covers arithmetic AND logical operators.
-        // This is a known trade-off across all languages using binary_expression
-        // (Rust, Go, TS, Java, C++, etc.). Arithmetic inflates scores.
-        // This test DOCUMENTS the behavior rather than asserting it away.
+        // After the operator-aware fix, binary_expression nodes are only
+        // counted when the operator is logical (&&, ||, and, or).
+        // Pure arithmetic should now correctly yield cc=1.
         use crate::extract::rust::RUST_CONFIG;
         let code = r#"
 fn math(a: i32, b: i32) -> i32 {
@@ -1177,19 +1221,15 @@ fn math(a: i32, b: i32) -> i32 {
             .unwrap();
         let func = result.nodes.iter().find(|n| n.id.name == "math").unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
-        // binary_expression counts arithmetic ops too — known inflation.
-        // A pure-arithmetic function will show cc > 1. This is acceptable
-        // because the alternative (not counting && and ||) is worse.
-        assert!(cc >= 1, "Arithmetic function should have cc >= 1, got {}", cc);
-        eprintln!("ADVERSARIAL: Rust arithmetic cc={} (inflated by binary_expression)", cc);
+        // Pure arithmetic: no logical operators, no branches → cc = 1
+        assert_eq!(cc, 1, "Pure arithmetic function should have cc=1, got {}", cc);
+        eprintln!("ADVERSARIAL: Rust arithmetic cc={} (operator-aware filter working)", cc);
     }
 
     #[test]
     fn test_adversarial_go_arithmetic_vs_logical() {
-        // Go uses binary_expression for BOTH arithmetic and logical operators.
-        // This is a known trade-off documented in dissent. Verify arithmetic
-        // does NOT inflate (tree-sitter-go binary_expression has an operator
-        // field, but we count the node kind not the operator).
+        // After the operator-aware fix, Go binary_expression nodes are only
+        // counted when the operator is logical (&&, ||). Arithmetic does not inflate.
         use crate::extract::configs::GO_CONFIG;
 
         // Pure arithmetic
@@ -1217,12 +1257,10 @@ func validate(a int, b int) bool {
         let func2 = result2.nodes.iter().find(|n| n.id.name == "validate").unwrap();
         let logic_cc: usize = func2.metadata.get("cyclomatic").unwrap().parse().unwrap();
 
-        // Document the behavior: Go binary_expression counts ALL binary ops.
-        // This is a known limitation. The test documents it, not asserts perfection.
-        // Arithmetic functions will show inflated scores in Go.
-        assert!(arith_cc >= 1, "Go arithmetic function should have cc >= 1, got {}", arith_cc);
-        assert!(logic_cc >= 1, "Go logical function should have cc >= 1, got {}", logic_cc);
-        // Log the actual values for visibility
+        // Arithmetic: no logical operators → cc = 1
+        assert_eq!(arith_cc, 1, "Go arithmetic function should have cc=1, got {}", arith_cc);
+        // Logical: && + || = 2 logical operators → cc = 3
+        assert_eq!(logic_cc, 3, "Go logical function with && and || should have cc=3, got {}", logic_cc);
         eprintln!("ADVERSARIAL: Go arithmetic cc={}, logical cc={}", arith_cc, logic_cc);
     }
 
@@ -1311,9 +1349,9 @@ fn parent() {
             .unwrap();
         let func = result.nodes.iter().find(|n| n.id.name == "parent").unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
-        // The if/else inside the closure IS counted in parent's subtree.
-        // This is a known trade-off: tree-sitter closure nodes are children.
-        assert!(cc > 1, "Parent with branchy closure should have cc > 1 (closure branches counted), got {}", cc);
+        // Closures are NOT function nodes in Rust config (closure_expression ≠ function_item),
+        // so skip_nested_fns does not exclude them. if_expression + else_clause = 2 → cc = 3.
+        assert_eq!(cc, 3, "Parent with branchy closure should have cc=3 (closure branches counted), got {}", cc);
         eprintln!("ADVERSARIAL: parent with closure cc={} (closure branches included)", cc);
     }
 }

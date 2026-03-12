@@ -103,7 +103,7 @@ RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents
 RNA is read-only infrastructure — it serves agents, it doesn't act as one. Things RNA deliberately doesn't do:
 
 - **File editing / code generation** — CGR has tools for writing files and wiping databases. RNA doesn't touch your code; agents have their own editors.
-- **Dead code detection, complexity analysis, visualization** — CGC has 17 tools covering these. RNA exposes the graph and lets agents reason about it themselves.
+- **Dead code detection, visualization** — CGC has 17 tools covering these. RNA exposes the graph and lets agents reason about it themselves. (RNA does compute cyclomatic complexity per function, surfaced via `search_symbols` with `min_complexity` / `sort="complexity"`.)
 - **Code-specific embedding model** — CGR uses UniXcoder (768-dim, trained on code). RNA uses MiniLM-L6-v2 (384-dim, general-purpose) because it needs to embed code, markdown, and business artifacts in the same space. Trade-off: slightly less code-specific precision, much broader coverage.
 - **SCIP indexing** — CGC supports Pyright, tsc, scip-go, scip-rust for compiler-grade precision in 4 languages. RNA spiked SCIP (#114) and concluded LSP provides the same semantic edges without requiring separate build-time indexers.
 

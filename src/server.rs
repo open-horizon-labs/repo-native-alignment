@@ -2272,9 +2272,11 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             "search_symbols" => {
                 let args: SearchSymbols = parse_args(params.arguments)?;
                 let query = args.query.trim();
+                let sort_by_complexity_early = args.sort.as_deref() == Some("complexity");
                 let has_complexity_filter = args.min_complexity.is_some();
-                if query.is_empty() && !has_complexity_filter {
-                    return Ok(text_result("Empty query. Please describe what you're looking for (or use min_complexity to find complex functions).".into()));
+                let complexity_search = has_complexity_filter || sort_by_complexity_early;
+                if query.is_empty() && !complexity_search {
+                    return Ok(text_result("Empty query. Please describe what you're looking for (or use min_complexity / sort=\"complexity\" to find complex functions).".into()));
                 }
                 match self.get_graph().await {
                     Ok(guard) => {
@@ -2287,6 +2289,10 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                             .nodes
                             .iter()
                             .filter(|n| {
+                                // In complexity search mode, only return functions.
+                                if complexity_search && n.id.kind != NodeKind::Function {
+                                    return false;
+                                }
                                 // When query is non-empty, filter by name/signature match.
                                 if !query_lower.is_empty() {
                                     let name_match = n.id.name.to_lowercase().contains(&query_lower)
@@ -2323,9 +2329,11 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                     }
                                 }
                                 if let Some(min_cc) = args.min_complexity {
-                                    let cc = n.metadata.get("cyclomatic")
+                                    let Some(cc) = n.metadata.get("cyclomatic")
                                         .and_then(|s| s.parse::<u32>().ok())
-                                        .unwrap_or(0);
+                                    else {
+                                        return false;
+                                    };
                                     if cc < min_cc {
                                         return false;
                                     }
