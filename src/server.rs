@@ -64,7 +64,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search_symbols",
-    description = "Find code symbols by name or signature across all supported languages. Returns file location, line numbers, signatures, and graph edges. Filter by kind (function/struct/trait/etc.), language, or file path. Results ranked: exact name > contains > signature-only, production code before tests. Use synthetic=false for declared constants only, synthetic=true for inferred literals."
+    description = "Find code symbols by name or signature across all supported languages. Returns file location, line numbers, signatures, complexity scores, and graph edges. Filter by kind (function/struct/trait/etc.), language, file path, or minimum complexity. Sort by complexity to find hotspots. Results ranked: exact name > contains > signature-only, production code before tests. Use synthetic=false for declared constants only, synthetic=true for inferred literals."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SearchSymbols {
@@ -88,6 +88,12 @@ pub struct SearchSymbols {
     /// If true, include only synthetic (inferred) constants. If false, exclude them. If absent, return all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synthetic: Option<bool>,
+    /// Optional: minimum cyclomatic complexity threshold. Only return functions with complexity >= this value. When set, query can be empty to search all functions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_complexity: Option<u32>,
+    /// Optional: sort results by "complexity" (descending). Default is relevance ranking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<String>,
 }
 
 #[macros::mcp_tool(
@@ -2266,8 +2272,9 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             "search_symbols" => {
                 let args: SearchSymbols = parse_args(params.arguments)?;
                 let query = args.query.trim();
-                if query.is_empty() {
-                    return Ok(text_result("Empty query. Please describe what you're looking for.".into()));
+                let has_complexity_filter = args.min_complexity.is_some();
+                if query.is_empty() && !has_complexity_filter {
+                    return Ok(text_result("Empty query. Please describe what you're looking for (or use min_complexity to find complex functions).".into()));
                 }
                 match self.get_graph().await {
                     Ok(guard) => {
@@ -2275,14 +2282,18 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         let limit = args.limit.unwrap_or(20) as usize;
                         let query_lower = query.to_lowercase();
 
+                        let sort_by_complexity = args.sort.as_deref() == Some("complexity");
                         let mut matches: Vec<&Node> = graph_state
                             .nodes
                             .iter()
                             .filter(|n| {
-                                let name_match = n.id.name.to_lowercase().contains(&query_lower)
-                                    || n.signature.to_lowercase().contains(&query_lower);
-                                if !name_match {
-                                    return false;
+                                // When query is non-empty, filter by name/signature match.
+                                if !query_lower.is_empty() {
+                                    let name_match = n.id.name.to_lowercase().contains(&query_lower)
+                                        || n.signature.to_lowercase().contains(&query_lower);
+                                    if !name_match {
+                                        return false;
+                                    }
                                 }
                                 if let Some(ref kind_filter) = args.kind {
                                     if n.id.kind.to_string().to_lowercase() != kind_filter.to_lowercase() {
@@ -2311,13 +2322,30 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                         return false;
                                     }
                                 }
+                                if let Some(min_cc) = args.min_complexity {
+                                    let cc = n.metadata.get("cyclomatic")
+                                        .and_then(|s| s.parse::<u32>().ok())
+                                        .unwrap_or(0);
+                                    if cc < min_cc {
+                                        return false;
+                                    }
+                                }
                                 true
                             })
                             .collect();
 
-                        // Rank results using the shared 5-tier cascade
-                        // (see ranking::sort_symbol_matches for tier documentation)
-                        ranking::sort_symbol_matches(&mut matches, &query_lower, &graph_state.index);
+                        if sort_by_complexity {
+                            // Sort by cyclomatic complexity descending.
+                            matches.sort_by(|a, b| {
+                                let cc_a = a.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                                let cc_b = b.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                                cc_b.cmp(&cc_a)
+                            });
+                        } else {
+                            // Rank results using the shared 5-tier cascade
+                            // (see ranking::sort_symbol_matches for tier documentation)
+                            ranking::sort_symbol_matches(&mut matches, &query_lower, &graph_state.index);
+                        }
                         matches.truncate(limit);
 
                         let freshness = format_freshness(
