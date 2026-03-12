@@ -395,12 +395,12 @@ impl EmbeddingIndex {
 
         let (to_embed, skipped): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
             match &existing_hashes {
-                Some(map) => map.get(&c.id).map_or(true, |h| *h != c.text_hash),
+                Some(map) => map.get(&c.id).is_none_or(|h| *h != c.text_hash),
                 None => true, // no text_hash column yet — embed all
             }
         });
 
-        if skipped.len() > 0 {
+        if !skipped.is_empty() {
             tracing::info!(
                 "reindex_nodes: BLAKE3 text hash skipped {} unchanged node(s), embedding {} node(s)",
                 skipped.len(),

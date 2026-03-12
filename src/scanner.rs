@@ -334,7 +334,7 @@ impl Scanner {
                         .state
                         .file_content_hashes
                         .get(rel_path)
-                        .map_or(true, |prev| *prev != hash);
+                        .is_none_or(|prev| *prev != hash);
                     new_content_hashes.insert(rel_path.clone(), hash);
                     if !is_truly_changed {
                         tracing::debug!(
