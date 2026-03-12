@@ -73,6 +73,7 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("meta_name_col", DataType::Int32, true),
         Field::new("value", DataType::Utf8, true),
         Field::new("synthetic", DataType::Boolean, true),
+        Field::new("cyclomatic", DataType::Int32, true),
         Field::new(
             "vector",
             DataType::FixedSizeList(
