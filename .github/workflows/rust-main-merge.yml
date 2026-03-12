@@ -45,10 +45,12 @@ jobs:
       - name: Configure Namespace sccache cache
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
 
-      - name: Cache Rust
+      - name: Cache Rust downloads
         uses: namespacelabs/nscloud-cache-action@v1
         with:
-          cache: rust
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
 
       - name: Run all tests (debug profile)
         env:
@@ -77,10 +79,12 @@ jobs:
       - name: Configure Namespace sccache cache
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
 
-      - name: Cache Rust
+      - name: Cache Rust downloads
         uses: namespacelabs/nscloud-cache-action@v1
         with:
-          cache: rust
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
 
       - name: Build release binary
         env:
