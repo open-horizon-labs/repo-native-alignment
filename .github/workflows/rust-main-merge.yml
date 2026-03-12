@@ -27,12 +27,16 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Setup sccache (Namespace remote cache)
+      - name: Install sccache binary
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache with Namespace remote cache
         run: |
+          # Stop the GHA-configured server, reconfigure for Namespace backend
+          sccache --stop-server || true
           export $(nsc cache sccache setup --cache_name default)
           sccache --start-server
           echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          # Persist Namespace cache credentials for subsequent steps
           env | grep ^SCCACHE_ >> $GITHUB_ENV
 
       - name: Lint — no language-specific conditionals in generic.rs
