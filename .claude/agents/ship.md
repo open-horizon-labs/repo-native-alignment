@@ -1,7 +1,9 @@
 ---
 name: ship
 description: RNA delivery pipeline. 11-step quality gate from implementation to merge, with delivery verification.
-tools: Read, Write, Edit, Grep, Glob, Bash
+tools: Read, Write, Edit, Grep, Glob, Bash, Agent
+mcpServers:
+  - rna
 ---
 
 # RNA /ship Pipeline
@@ -29,6 +31,7 @@ Before starting:
 Check implementation against acceptance criteria, AGENTS.md patterns, and guardrails.
 
 **How:** Invoke the `/review` skill (or apply its process directly):
+- **List every acceptance criterion** from the linked issue. Check each one against the implementation. If any are unmet, they become fix items for step 3.
 - Restate the original aim
 - Check: still necessary? still aligned? still sufficient? mechanism clear? changes complete?
 - Detect drift (scope, solution, goal)
@@ -133,9 +136,14 @@ If CI is pending, wait. If CI fails, fix and re-run from step 9.
 
 ### 11. Merge
 
-Squash or merge PR into main.
+**Pre-merge gate: acceptance criteria.**
+
+Before merging, re-read the linked issue's acceptance criteria. Every checkbox must be checked off — either verified done or explicitly filed as a follow-up issue with a link. If any criterion is unmet and not deferred, **do not merge**. Go back to step 3 (fix).
 
 ```bash
+# Check off criteria on the issue
+gh issue edit <ISSUE> --body "$(updated body with [x] marks)"
+# Then merge
 gh pr merge <PR> --squash --delete-branch
 ```
 
@@ -150,6 +158,7 @@ gh pr merge <PR> --squash --delete-branch
 | Manual verification | Does the computation work with real data? |
 | **Delivery verification** | **Can an agent actually see this through MCP tools?** |
 | Smoke test + CI | Does the build pass? |
+| **Merge gate** | **Are all acceptance criteria checked off?** |
 
 ## Automation Rules
 
