@@ -374,6 +374,9 @@ pub(crate) async fn persist_graph_to_lance(
                 None => synthetic_builder.append_null(),
             }
         }
+        let cyclomatics: Vec<Option<i32>> = nodes.iter()
+            .map(|n| n.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok()))
+            .collect();
         let updated_ats: Vec<i64> = vec![now; nodes.len()];
 
         let batch = RecordBatch::try_new(
@@ -393,6 +396,7 @@ pub(crate) async fn persist_graph_to_lance(
                 Arc::new(Int32Array::from(meta_name_cols)),
                 Arc::new(StringArray::from(values)),
                 Arc::new(synthetic_builder.finish()),
+                Arc::new(Int32Array::from(cyclomatics)),
                 Arc::new(Int64Array::from(updated_ats)),
             ],
         )?;
@@ -552,6 +556,9 @@ pub(crate) async fn persist_graph_incremental(
                     None => synthetic_builder.append_null(),
                 }
             }
+            let cyclomatics: Vec<Option<i32>> = upsert_nodes.iter()
+                .map(|n| n.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok()))
+                .collect();
             let updated_ats: Vec<i64> = vec![now; upsert_nodes.len()];
 
             let batch = RecordBatch::try_new(
@@ -571,6 +578,7 @@ pub(crate) async fn persist_graph_incremental(
                     Arc::new(Int32Array::from(meta_name_cols)),
                     Arc::new(StringArray::from(values)),
                     Arc::new(synthetic_builder.finish()),
+                    Arc::new(Int32Array::from(cyclomatics)),
                     Arc::new(Int64Array::from(updated_ats)),
                 ],
             )?;
@@ -734,6 +742,8 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             let synthetic_col = batch.column_by_name("synthetic")
                 .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
+            let cyclomatic_col = batch.column_by_name("cyclomatic")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
 
             for i in 0..batch.num_rows() {
                 let file_path = PathBuf::from(file_paths.value(i));
@@ -762,6 +772,11 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 if let Some(col) = synthetic_col {
                     if !col.is_null(i) {
                         metadata.insert("synthetic".to_string(), if col.value(i) { "true" } else { "false" }.to_string());
+                    }
+                }
+                if let Some(col) = cyclomatic_col {
+                    if !col.is_null(i) {
+                        metadata.insert("cyclomatic".to_string(), col.value(i).to_string());
                     }
                 }
                 nodes.push(Node {
@@ -2131,13 +2146,17 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                 // style so agents parsing the old format are unaffected.
                                 let md = matches.iter()
                                     .map(|n| {
-                                        format!(
+                                        let mut line = format!(
                                             "- **{} {} ({})** ({})\n  `{}`\n  ID: `{}`",
                                             n.id.kind, n.id.name, n.language,
                                             n.id.file.display(),
                                             n.signature,
                                             n.stable_id(),
-                                        )
+                                        );
+                                        if let Some(cc) = n.metadata.get("cyclomatic") {
+                                            line.push_str(&format!("\n  Complexity: {}", cc));
+                                        }
+                                        line
                                     })
                                     .collect::<Vec<_>>()
                                     .join("\n\n");
@@ -2342,6 +2361,9 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                     }
                                     if n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false) {
                                         entry.push_str(" *(literal)*");
+                                    }
+                                    if let Some(cc) = n.metadata.get("cyclomatic") {
+                                        entry.push_str(&format!("\n  Complexity: {}", cc));
                                     }
                                     if !outgoing.is_empty() {
                                         entry.push_str(&format!("\n  Out: {} edge(s)", outgoing.len()));
@@ -2712,7 +2734,7 @@ fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String]) -> String {
                     graph::NodeKind::Module | graph::NodeKind::PrMerge => return None,
                     _ => {}
                 }
-                Some(format!(
+                let mut line = format!(
                     "- **{}** `{}` ({}) `{}`:{}-{}",
                     node.id.kind,
                     node.id.name,
@@ -2720,7 +2742,11 @@ fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String]) -> String {
                     node.id.file.display(),
                     node.line_start,
                     node.line_end,
-                ))
+                );
+                if let Some(cc) = node.metadata.get("cyclomatic") {
+                    line.push_str(&format!(" · complexity {}", cc));
+                }
+                Some(line)
             } else {
                 Some(format!("- `{}`", id))
             }
