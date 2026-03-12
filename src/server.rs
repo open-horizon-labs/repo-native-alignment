@@ -2343,6 +2343,11 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                             .collect();
 
                         if sort_by_complexity {
+                            // Drop entries without a parseable cyclomatic score so
+                            // unknown-score symbols don't push real hotspots off the page.
+                            matches.retain(|n| {
+                                n.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).is_some()
+                            });
                             // Sort by cyclomatic complexity descending.
                             matches.sort_by(|a, b| {
                                 let cc_a = a.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);

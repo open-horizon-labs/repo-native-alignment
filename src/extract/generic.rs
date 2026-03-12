@@ -474,6 +474,24 @@ fn collect_nodes(
 /// it counts as a branch. Arithmetic/comparison operators do not.
 const LOGICAL_OPERATORS: &[&str] = &["&&", "||", "and", "or"];
 
+/// Anonymous function-like node kinds that act as complexity boundaries.
+/// These are not in `node_kinds` (they aren't extracted as top-level symbols),
+/// but branches inside them belong to the closure, not the enclosing function.
+const CLOSURE_NODE_KINDS: &[&str] = &[
+    "closure_expression",    // Rust
+    "lambda",                // Python
+    "arrow_function",        // TypeScript, JavaScript
+    "function_expression",   // JavaScript
+    "generator_function",    // JavaScript
+    "anonymous_function",    // PHP
+    "lambda_literal",        // Kotlin
+    "func_literal",          // Go
+    "lambda_expression",     // Java, C#
+    // Note: Ruby "block" omitted — too generic, conflicts with Rust/other
+    // languages where "block" is a plain scope, not a closure.
+    "do_block",              // Ruby (do...end blocks act as closures)
+];
+
 /// Count branch/decision-point nodes in a tree-sitter subtree.
 /// Cyclomatic complexity = 1 + branch_count (the 1 is for the function itself).
 ///
@@ -510,13 +528,13 @@ fn count_branches(
 
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            // Skip nested function bodies so they don't inflate the parent.
+            // Skip nested function/closure bodies so they don't inflate the parent.
             if skip_nested_fns {
                 let child_kind = child.kind();
                 let is_fn = config.node_kinds.iter().any(|(ts_kind, nk)| {
                     *ts_kind == child_kind && *nk == NodeKind::Function
                 });
-                if is_fn {
+                if is_fn || CLOSURE_NODE_KINDS.contains(&child_kind) {
                     continue;
                 }
             }
@@ -1349,9 +1367,9 @@ fn parent() {
             .unwrap();
         let func = result.nodes.iter().find(|n| n.id.name == "parent").unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
-        // Closures are NOT function nodes in Rust config (closure_expression ≠ function_item),
-        // so skip_nested_fns does not exclude them. if_expression + else_clause = 2 → cc = 3.
-        assert_eq!(cc, 3, "Parent with branchy closure should have cc=3 (closure branches counted), got {}", cc);
-        eprintln!("ADVERSARIAL: parent with closure cc={} (closure branches included)", cc);
+        // Closures (closure_expression) are now treated as complexity boundaries,
+        // so the if/else inside the closure is NOT counted in the parent.
+        assert_eq!(cc, 1, "Parent with branchy closure should have cc=1 (closure is a boundary), got {}", cc);
+        eprintln!("ADVERSARIAL: parent with closure cc={} (closure branches excluded)", cc);
     }
 }

@@ -179,11 +179,15 @@ This step exists because PR #137 taught us: computing a value is not delivering 
 ```bash
 gh pr comment <PR> --body "$(cat <<'EOF'
 ## Ship Step 7b: Delivery Verification
-- [x/blank] Persist: Arrow column in symbols_schema
-- [x/blank] Write path: both batch sites
-- [x/blank] Read path: Arrow → Node.metadata
-- [x/blank] Render: search_symbols, graph_query, oh_search_context
-- [x/blank] End-to-end: value visible in tool output after install+restart
+- [x/blank] Persist: Arrow column in `symbols_schema()` (store.rs)
+- [x/blank] Persist: Arrow column in `symbols_schema_with_vector()` (store.rs)
+- [x/blank] Write path: initial batch construction (server.rs)
+- [x/blank] Write path: upsert batch construction (server.rs)
+- [x/blank] Read path: Arrow → Node.metadata during load
+- [x/blank] Render: `search_symbols` formatting
+- [x/blank] Render: `graph_query` / `format_neighbor_nodes` formatting
+- [x/blank] Render: `oh_search_context` code results formatting
+- [x/blank] End-to-end: value visible in tool output after `cargo install --path .` + restart + rescan
 EOF
 )"
 ```
