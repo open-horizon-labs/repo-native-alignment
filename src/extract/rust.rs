@@ -45,10 +45,10 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
     type_requires_uppercase: true,
     branch_node_types: &[
         "if_expression", "else_clause",
-        "match_expression",
+        "match_expression", "match_arm",
         "for_expression", "while_expression", "loop_expression",
-        "boolean_operator",  // && and ||
-        "try_expression",    // ?
+        "binary_expression",  // covers && and || (also arithmetic — same trade-off as Go/TS/Java)
+        "try_expression",     // ?
     ],
 };
 
