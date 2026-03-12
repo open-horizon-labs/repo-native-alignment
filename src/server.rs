@@ -155,6 +155,7 @@ pub struct SearchSymbols {
 
 impl SearchSymbols {
     /// Convert deprecated SearchSymbols into the unified Search struct.
+    /// Preserves the old default limit of 20 (Search defaults to 10).
     fn into_search(self) -> Search {
         Search {
             query: Some(self.query),
@@ -167,7 +168,7 @@ impl SearchSymbols {
             language: self.language,
             file: self.file,
             root: self.root,
-            top_k: self.limit,
+            top_k: Some(self.limit.unwrap_or(20)),
             sort_by: self.sort,
             min_complexity: self.min_complexity,
             synthetic: self.synthetic,
@@ -206,6 +207,7 @@ pub struct GraphQuery {
 
 impl GraphQuery {
     /// Convert deprecated GraphQuery into the unified Search struct.
+    /// Preserves the old default top_k of 3 (Search defaults to 1 for traversal).
     fn into_search(self) -> Search {
         Search {
             query: self.query,
@@ -218,7 +220,7 @@ impl GraphQuery {
             language: None,
             file: None,
             root: None,
-            top_k: self.top_k,
+            top_k: Some(self.top_k.unwrap_or(3)),
             sort_by: None,
             min_complexity: None,
             synthetic: None,
@@ -3239,10 +3241,23 @@ mod tests {
         assert_eq!(s.language, Some("rust".to_string()));
         assert_eq!(s.file, Some("server.rs".to_string()));
         assert_eq!(s.root, Some("my-root".to_string()));
-        assert_eq!(s.top_k, Some(20)); // limit maps to top_k
+        assert_eq!(s.top_k, Some(20)); // explicit limit=20 preserved
         assert_eq!(s.synthetic, Some(false));
         assert_eq!(s.min_complexity, Some(5));
         assert_eq!(s.sort_by, Some("complexity".to_string())); // sort maps to sort_by
+    }
+
+    #[test]
+    fn test_search_symbols_into_search_preserves_default_limit() {
+        // When limit is not specified, the old default (20) should be preserved
+        let ss = SearchSymbols {
+            query: "foo".to_string(),
+            kind: None, language: None, file: None, root: None,
+            limit: None,  // not specified by caller
+            synthetic: None, min_complexity: None, sort: None,
+        };
+        let s = ss.into_search();
+        assert_eq!(s.top_k, Some(20), "search_symbols default limit of 20 should be preserved");
     }
 
     // ── GraphQuery -> Search conversion ─────────────────────────────────
@@ -3269,6 +3284,20 @@ mod tests {
         // Graph query doesn't carry symbol filters
         assert!(s.kind.is_none());
         assert!(s.language.is_none());
+    }
+
+    #[test]
+    fn test_graph_query_into_search_preserves_default_top_k() {
+        // When top_k is not specified, the old default (3) should be preserved
+        let gq = GraphQuery {
+            node_id: Some("x".to_string()),
+            query: None,
+            mode: "neighbors".to_string(),
+            direction: None, edge_types: None, max_hops: None,
+            top_k: None,  // not specified by caller
+        };
+        let s = gq.into_search();
+        assert_eq!(s.top_k, Some(3), "graph_query default top_k of 3 should be preserved");
     }
 
     // ── Semantic entry point: code prefix filter correctness ────────────
