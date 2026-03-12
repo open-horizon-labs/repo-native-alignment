@@ -1,5 +1,5 @@
 ---
-name: oh-ship
+name: ship
 description: RNA delivery pipeline. 11-step quality gate from implementation to merge, with delivery verification.
 tools: Read, Write, Edit, Grep, Glob, Bash
 ---

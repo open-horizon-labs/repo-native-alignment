@@ -28,7 +28,7 @@ This ensures every piece of work has a PR home before implementation begins. No 
 
 ## /ship Definition (for this project)
 
-`/ship` = the full quality gate before merge. **11 steps, defined in `.claude/agents/oh-ship.md`.**
+`/ship` = the full quality gate before merge. **11 steps, defined in `.claude/agents/ship.md`.**
 
 Summary: review → dissent → fix → adversarial test → merit → resolve TODOs → **manual verify → delivery verify** → README → smoke+CI → merge.
 
