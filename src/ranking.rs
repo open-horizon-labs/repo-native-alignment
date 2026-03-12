@@ -102,13 +102,19 @@ pub fn sort_symbol_matches<'a>(
             _ => {}
         }
 
-        // Tier 5: more edges = more important
-        let edge_count = |n: &Node| -> usize {
-            let sid = n.stable_id();
-            index.neighbors(&sid, None, Direction::Incoming).len()
-                + index.neighbors(&sid, None, Direction::Outgoing).len()
+        // Tier 5: higher PageRank importance = more important.
+        // Falls back to edge count if importance not yet computed.
+        let importance = |n: &Node| -> f64 {
+            n.metadata.get("importance")
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or_else(|| {
+                    // Fallback: raw edge count (pre-PageRank compat)
+                    let sid = n.stable_id();
+                    (index.neighbors(&sid, None, Direction::Incoming).len()
+                        + index.neighbors(&sid, None, Direction::Outgoing).len()) as f64
+                })
         };
-        edge_count(b).cmp(&edge_count(a))
+        importance(b).partial_cmp(&importance(a)).unwrap_or(Ordering::Equal)
     });
 }
 

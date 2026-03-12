@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use petgraph::algo::page_rank;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef as PetgraphEdgeRef;
 use petgraph::Direction;
@@ -236,6 +237,37 @@ impl GraphIndex {
             }
         }
 
+        result
+    }
+
+    /// Compute PageRank importance scores for all nodes in the graph.
+    ///
+    /// Uses the standard PageRank algorithm with the given damping factor
+    /// (typically 0.85) and number of iterations. Returns a map from
+    /// node stable ID to importance score (f64, sums to ~1.0 across all nodes).
+    ///
+    /// Scores are normalized to [0, 1] where 1.0 is the most important node.
+    /// This makes scores interpretable regardless of graph size.
+    pub fn compute_pagerank(&self, damping_factor: f64, nb_iter: usize) -> HashMap<String, f64> {
+        let raw_scores = page_rank(&self.graph, damping_factor, nb_iter);
+
+        // Find max score for normalization
+        let max_score = raw_scores
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        let mut result = HashMap::new();
+        if max_score <= 0.0 {
+            return result;
+        }
+
+        for (idx, &score) in raw_scores.iter().enumerate() {
+            let node_index = NodeIndex::new(idx);
+            if let Some(node_ref) = self.graph.node_weight(node_index) {
+                result.insert(node_ref.id.clone(), score / max_score);
+            }
+        }
         result
     }
 }
@@ -602,5 +634,69 @@ mod tests {
         assert_eq!(result.len(), 3);
         // z should be last since it comes from the second entry node
         assert_eq!(result[2], "z".to_string());
+    }
+
+    // ── PageRank tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_pagerank_empty_graph() {
+        let index = GraphIndex::new();
+        let scores = index.compute_pagerank(0.85, 20);
+        assert!(scores.is_empty());
+    }
+
+    #[test]
+    fn test_pagerank_single_node_no_edges() {
+        let mut index = GraphIndex::new();
+        index.ensure_node("a", "function");
+        let scores = index.compute_pagerank(0.85, 20);
+        assert_eq!(scores.len(), 1);
+        // Single node gets max score = 1.0 after normalization
+        assert!((scores["a"] - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_pagerank_linear_chain() {
+        // a -> b -> c: c is the sink, should have highest score
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+        assert_eq!(scores.len(), 3);
+        // c receives more incoming flow than a
+        assert!(scores["c"] > scores["a"], "sink should rank higher than source");
+    }
+
+    #[test]
+    fn test_pagerank_hub_vs_leaf() {
+        // Hub pattern: a -> d, b -> d, c -> d (d is the hub)
+        // Leaf: e -> f (isolated pair)
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "d", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "d", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "d", "fn", EdgeKind::Calls);
+        index.add_edge("e", "fn", "f", "fn", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+        // d should have higher importance than f (3 callers vs 1 caller)
+        assert!(scores["d"] > scores["f"], "hub should rank higher than leaf");
+    }
+
+    #[test]
+    fn test_pagerank_scores_normalized() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "a", "fn", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+        // Scores should be in [0, 1] range
+        for &score in scores.values() {
+            assert!(score >= 0.0 && score <= 1.0, "score {} out of [0,1] range", score);
+        }
+        // At least one node should have max score of 1.0
+        let max = scores.values().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!((max - 1.0).abs() < 0.01, "max score should be ~1.0, got {}", max);
     }
 }
