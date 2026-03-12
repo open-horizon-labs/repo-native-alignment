@@ -13,17 +13,17 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-latest
+          - os: namespace-profile-tahoe
             target: aarch64-apple-darwin
             features: ""
             artifact: repo-native-alignment-darwin-arm64
             rustflags: "-C target-cpu=apple-m1 -C link-arg=-Wl,-dead_strip"
-          - os: macos-latest
+          - os: namespace-profile-tahoe
             target: aarch64-apple-darwin
             features: ""
             artifact: repo-native-alignment-darwin-arm64-fast
             rustflags: "-C target-cpu=apple-m4 -C link-arg=-Wl,-dead_strip"
-          - os: namespace-profile-default
+          - os: namespace-profile-cached
             target: x86_64-unknown-linux-gnu
             features: "--no-default-features"
             artifact: repo-native-alignment-linux-x86_64
@@ -57,15 +57,22 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install sccache
+      - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure Namespace sccache cache
+        run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
+
+      - name: Cache Rust
+        uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: rust
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
           RUSTC_WRAPPER: sccache
-          SCCACHE_GHA_ENABLED: "true"
 
       - name: Strip and compress binary
         run: |
@@ -80,7 +87,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: namespace-profile-default
+    runs-on: namespace-profile-cached
 
     steps:
       - name: Checkout (for tag annotation)
@@ -117,7 +124,7 @@ jobs:
 
   bump-source:
     needs: release
-    runs-on: namespace-profile-default
+    runs-on: namespace-profile-cached
 
     steps:
       - name: Checkout main
