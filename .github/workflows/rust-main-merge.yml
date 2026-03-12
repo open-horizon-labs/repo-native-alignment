@@ -30,7 +30,10 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Cache Rust
+      - name: Configure Namespace sccache cache
+        run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
+
+      - name: Cache Rust downloads
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "release-build"
@@ -47,13 +50,11 @@ jobs:
 
       - name: Build release binary
         env:
-          SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
         run: cargo build --release --no-default-features
 
       - name: Run all tests (release profile)
         env:
-          SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
         run: cargo test --release --no-default-features
 
