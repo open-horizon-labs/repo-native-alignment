@@ -39,7 +39,21 @@ Check implementation against acceptance criteria, AGENTS.md patterns, and guardr
 
 **Use RNA tools:** `oh_search_context(query, artifact_types: ["guardrail"])` to check against relevant guardrails.
 
-**Post findings as PR comment.**
+**Post findings as PR comment:**
+```bash
+gh pr comment <PR> --body "$(cat <<'EOF'
+## Ship Step 1: Review
+**Verdict:** [CONTINUE/ADJUST/PAUSE/SALVAGE]
+
+### Acceptance Criteria
+- [x/blank] criterion 1
+- [x/blank] criterion 2
+
+### Alignment Check
+[findings]
+EOF
+)"
+```
 
 ### 2. /dissent
 
@@ -54,7 +68,25 @@ Seek contrary evidence. Devil's advocate pass.
 
 **Use RNA tools:** `oh_search_context("risks constraints", artifact_types: ["guardrail", "metis"])` to ground the dissent.
 
-**Post findings as PR comment.**
+**Post findings as PR comment:**
+```bash
+gh pr comment <PR> --body "$(cat <<'EOF'
+## Ship Step 2: Dissent
+**Verdict:** [PROCEED/ADJUST/RECONSIDER]
+
+### Contrary Evidence
+1. ...
+
+### Pre-Mortem
+1. ...
+
+### Hidden Assumptions
+| Assumption | Risk if Wrong |
+|------------|---------------|
+| ... | ... |
+EOF
+)"
+```
 
 ### 3. Fix
 
@@ -68,7 +100,14 @@ Dissent-seeded tests that try to break the implementation.
 
 **Seed from dissent findings** — the dissent tells you where the implementation was already challenged. Write tests that attack those specific weaknesses. Prioritize: functional > integration > unit.
 
-**Post test results as PR comment.**
+**Post test results as PR comment:**
+```bash
+gh pr comment <PR> --body "$(cat <<'EOF'
+## Ship Step 4: Adversarial Test
+[test results, seeded from dissent finding X]
+EOF
+)"
+```
 
 ### 5. Merit assessment
 
@@ -76,7 +115,15 @@ Is this worth merging? Run real queries, compare before/after.
 
 Verdict: MERGE / MERGE WITH CAVEATS / ABANDON / NEEDS MORE WORK.
 
-**Post verdict as PR comment.**
+**Post verdict as PR comment:**
+```bash
+gh pr comment <PR> --body "$(cat <<'EOF'
+## Ship Step 5: Merit Assessment
+**Verdict:** [MERGE/MERGE WITH CAVEATS/ABANDON/NEEDS MORE WORK]
+[reasoning]
+EOF
+)"
+```
 
 ### 6. Resolve TODOs
 
@@ -93,7 +140,14 @@ Run the actual feature with real data. Not unit tests — real queries, real fil
 
 **For RNA:** Use `cargo test` and write integration-style tests that parse real source files and verify the feature produces correct results.
 
-**Post results as PR comment.**
+**Post results as PR comment:**
+```bash
+gh pr comment <PR> --body "$(cat <<'EOF'
+## Ship Step 7a: Manual Verification
+[real data test results]
+EOF
+)"
+```
 
 ### 7b. Delivery verification (NEW — from computed-but-not-delivered metis)
 
@@ -114,7 +168,18 @@ This step exists because PR #137 taught us: computing a value is not delivering 
 
 **If the PR doesn't add agent-visible data, mark this step N/A.**
 
-**Post checklist results as PR comment.**
+**Post checklist results as PR comment:**
+```bash
+gh pr comment <PR> --body "$(cat <<'EOF'
+## Ship Step 7b: Delivery Verification
+- [x/blank] Persist: Arrow column in symbols_schema
+- [x/blank] Write path: both batch sites
+- [x/blank] Read path: Arrow → Node.metadata
+- [x/blank] Render: search_symbols, graph_query, oh_search_context
+- [x/blank] End-to-end: value visible in tool output after install+restart
+EOF
+)"
+```
 
 ### 8. README
 
