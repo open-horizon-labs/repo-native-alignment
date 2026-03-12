@@ -34,10 +34,13 @@ jobs:
         run: |
           # Stop the GHA-configured server, reconfigure for Namespace backend
           sccache --stop-server || true
+          unset SCCACHE_GHA_ENABLED
+          echo "SCCACHE_GHA_ENABLED=" >> $GITHUB_ENV
           export $(nsc cache sccache setup --cache_name default)
           sccache --start-server
           echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          env | grep ^SCCACHE_ >> $GITHUB_ENV
+          echo "SCCACHE_WEBDAV_ENDPOINT=$SCCACHE_WEBDAV_ENDPOINT" >> $GITHUB_ENV
+          echo "SCCACHE_WEBDAV_TOKEN=$SCCACHE_WEBDAV_TOKEN" >> $GITHUB_ENV
 
       - name: Lint — no language-specific conditionals in generic.rs
         run: |
