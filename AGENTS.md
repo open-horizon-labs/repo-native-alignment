@@ -67,7 +67,7 @@ This project IS the RNA MCP server. When working here, use its own tools.
 **7 MCP Tools (read + query only):**
 1. `oh_get_context` -- read all business context (outcomes, signals, guardrails, metis)
 2. `oh_search_context` -- semantic search (.oh/ artifacts, optionally code + markdown)
-3. `outcome_progress` -- structural join for outcome tracking
+3. `outcome_progress` -- structural join for outcome tracking (with optional `include_impact: true` for risk-classified blast radius)
 4. `search_symbols` -- graph-aware code symbol search
 5. `graph_query` -- graph traversal (neighbors, impact, reachable)
 6. `list_roots` -- workspace root management
