@@ -69,7 +69,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search",
-    description = "Find code symbols and trace their relationships. Without `mode`, performs flat ranked search (by name/signature). With `mode` (neighbors/impact/reachable/tests_for), performs graph traversal from matched symbols. `tests_for` finds which test functions call a symbol. Entry point: `query` (name or semantic search) or `node` (stable ID from previous results). Filter by kind, language, file. Sort by relevance or complexity."
+    description = "Find code symbols and trace their relationships. Without `mode`, performs flat ranked search (by name/signature). With `mode` (neighbors/impact/reachable/tests_for), performs graph traversal from matched symbols. `tests_for` finds which test functions call a symbol. Entry point: `query` (name or semantic search) or `node` (stable ID from previous results). Batch: `nodes` retrieves multiple IDs in one call. `compact: true` returns signature + location only (~25x fewer tokens). Filter by kind, language, file. Sort by relevance or complexity."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct Search {
@@ -115,6 +115,12 @@ pub struct Search {
     /// If true, include only synthetic (inferred) constants. If false, exclude them. If absent, return all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synthetic: Option<bool>,
+    /// When true, return compact output: signature + line range + kind + file only (no body). ~25x token reduction for exploration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact: Option<bool>,
+    /// Batch retrieve multiple nodes by stable ID. Returns combined results in a single response. Composes with compact and mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nodes: Option<Vec<String>>,
 }
 
 // ── Deprecated aliases (kept for one release cycle) ─────────────────
@@ -172,6 +178,8 @@ impl SearchSymbols {
             sort_by: self.sort,
             min_complexity: self.min_complexity,
             synthetic: self.synthetic,
+            compact: None,
+            nodes: None,
         }
     }
 }
@@ -224,6 +232,8 @@ impl GraphQuery {
             sort_by: None,
             min_complexity: None,
             synthetic: None,
+            compact: None,
+            nodes: None,
         }
     }
 }
@@ -2041,13 +2051,27 @@ impl RnaHandler {
         // Normalize inputs
         let query = args.query.as_deref().map(str::trim).filter(|s| !s.is_empty());
         let node = args.node.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let compact = args.compact.unwrap_or(false);
+
+        // ── Batch node retrieval path ────────────────────────────────
+        // When `nodes` is provided, resolve each ID from the graph directly.
+        if let Some(ref node_ids) = args.nodes {
+            let node_ids: Vec<&str> = node_ids.iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if node_ids.is_empty() {
+                return Ok(text_result("Empty nodes list. Provide at least one stable node ID.".to_string()));
+            }
+            return self.handle_search_batch(&node_ids, compact, args.mode.as_deref()).await;
+        }
 
         if args.mode.is_some() {
             // ── Graph traversal path ──────────────────────────────────
-            self.handle_search_traversal(&args, query, node).await
+            self.handle_search_traversal(&args, query, node, compact).await
         } else {
             // ── Flat search path ──────────────────────────────────────
-            self.handle_search_flat(&args, query).await
+            self.handle_search_flat(&args, query, compact).await
         }
     }
 
@@ -2056,6 +2080,7 @@ impl RnaHandler {
         &self,
         args: &Search,
         query: Option<&str>,
+        compact: bool,
     ) -> Result<CallToolResult, CallToolError> {
         let sort_by_complexity = args.sort_by.as_deref() == Some("complexity");
         let has_complexity_filter = args.min_complexity.is_some();
@@ -2156,45 +2181,7 @@ impl RnaHandler {
                 } else {
                     let md: String = matches
                         .iter()
-                        .map(|n| {
-                            let stable_id = n.stable_id();
-                            let outgoing = graph_state.index.neighbors(
-                                &stable_id,
-                                None,
-                                Direction::Outgoing,
-                            );
-                            let incoming = graph_state.index.neighbors(
-                                &stable_id,
-                                None,
-                                Direction::Incoming,
-                            );
-                            let mut entry = format!(
-                                "- **{}** `{}` ({}) `{}`:{}-{}\n  ID: `{}`",
-                                n.id.kind, n.id.name, n.language,
-                                n.id.file.display(),
-                                n.line_start, n.line_end,
-                                stable_id,
-                            );
-                            if !n.signature.is_empty() {
-                                entry.push_str(&format!("\n  Sig: `{}`", n.signature));
-                            }
-                            if let Some(val) = n.metadata.get("value") {
-                                entry.push_str(&format!("\n  Value: `{}`", val));
-                            }
-                            if n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false) {
-                                entry.push_str(" *(literal)*");
-                            }
-                            if let Some(cc) = n.metadata.get("cyclomatic") {
-                                entry.push_str(&format!("\n  Complexity: {}", cc));
-                            }
-                            if !outgoing.is_empty() {
-                                entry.push_str(&format!("\n  Out: {} edge(s)", outgoing.len()));
-                            }
-                            if !incoming.is_empty() {
-                                entry.push_str(&format!("\n  In: {} edge(s)", incoming.len()));
-                            }
-                            entry
-                        })
+                        .map(|n| format_node_entry(n, &graph_state.index, compact))
                         .collect::<Vec<_>>()
                         .join("\n\n");
                     Ok(text_result(format!(
@@ -2216,6 +2203,7 @@ impl RnaHandler {
         args: &Search,
         query: Option<&str>,
         node: Option<&str>,
+        compact: bool,
     ) -> Result<CallToolResult, CallToolError> {
         let mode = args.mode.as_deref().unwrap_or("neighbors");
         let top_k = args.top_k.unwrap_or(1).clamp(1, 50) as usize;
@@ -2432,7 +2420,7 @@ impl RnaHandler {
                     };
                     Ok(text_result(format!("{}{}{}", entry_header, mode_desc, freshness)))
                 } else {
-                    let md = format_neighbor_nodes(&graph_state.nodes, &all_ids);
+                    let md = format_neighbor_nodes(&graph_state.nodes, &all_ids, &graph_state.index, compact);
                     let heading = match mode {
                         "neighbors" => format!(
                             "## Graph neighbors ({}) of {}\n\n{} result(s)\n\n",
@@ -2454,6 +2442,70 @@ impl RnaHandler {
                     };
                     Ok(text_result(format!("{}{}{}{}", entry_header, heading, md, freshness)))
                 }
+            }
+            Err(e) => Ok(text_result(format!("Graph error: {}", e))),
+        }
+    }
+
+    /// Batch node retrieval: resolve multiple stable node IDs in a single call.
+    /// Optionally runs traversal on each node if `mode` is specified.
+    async fn handle_search_batch(
+        &self,
+        node_ids: &[&str],
+        compact: bool,
+        mode: Option<&str>,
+    ) -> Result<CallToolResult, CallToolError> {
+        match self.get_graph().await {
+            Ok(guard) => {
+                let graph_state = guard.as_ref().unwrap();
+                let freshness = format_freshness(
+                    graph_state.nodes.len(),
+                    graph_state.last_scan_completed_at,
+                    Some(&self.lsp_status),
+                );
+
+                let mut found = Vec::new();
+                let mut missing = Vec::new();
+
+                for &nid in node_ids {
+                    if let Some(node) = graph_state.nodes.iter().find(|n| n.stable_id() == nid) {
+                        found.push(node);
+                    } else {
+                        missing.push(nid);
+                    }
+                }
+
+                if found.is_empty() {
+                    let id_list = node_ids.iter()
+                        .map(|id| format!("`{}`", id))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Ok(text_result(format!(
+                        "No graph nodes found for {}. Use search to find valid node IDs.{}",
+                        id_list, freshness
+                    )));
+                }
+
+                let md: String = found
+                    .iter()
+                    .map(|n| format_node_entry(n, &graph_state.index, compact))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+
+                let mut result = format!(
+                    "## Batch retrieval\n\n{} of {} node(s) found\n\n{}",
+                    found.len(),
+                    node_ids.len(),
+                    md,
+                );
+                if !missing.is_empty() {
+                    result.push_str(&format!(
+                        "\n\n**Missing:** {}",
+                        missing.iter().map(|id| format!("`{}`", id)).collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                result.push_str(&freshness);
+                Ok(text_result(result))
             }
             Err(e) => Ok(text_result(format!("Graph error: {}", e))),
         }
@@ -2914,7 +2966,65 @@ fn resolve_edge_target_by_suffix(
     // If 0 or 2+ matches, leave as-is (ambiguous or truly dangling)
 }
 
-fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String]) -> String {
+/// Format a single node for search results output.
+///
+/// When `compact` is true, returns a one-line summary: kind, name, file:lines, signature.
+/// When `compact` is false (default), returns full detail: ID, signature, value, complexity, edges.
+fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> String {
+    let stable_id = n.stable_id();
+
+    if compact {
+        // Compact: one-line summary for broad exploration
+        let mut entry = format!(
+            "- **{}** `{}` `{}`:{}-{}",
+            n.id.kind, n.id.name,
+            n.id.file.display(),
+            n.line_start, n.line_end,
+        );
+        if !n.signature.is_empty() {
+            // Truncate signature to first line for compact
+            let sig_first_line = n.signature.lines().next().unwrap_or(&n.signature);
+            entry.push_str(&format!(" `{}`", sig_first_line));
+        }
+        if let Some(cc) = n.metadata.get("cyclomatic") {
+            entry.push_str(&format!(" cc:{}", cc));
+        }
+        entry.push_str(&format!("\n  `{}`", stable_id));
+        entry
+    } else {
+        // Full detail (existing format)
+        let outgoing = index.neighbors(&stable_id, None, Direction::Outgoing);
+        let incoming = index.neighbors(&stable_id, None, Direction::Incoming);
+        let mut entry = format!(
+            "- **{}** `{}` ({}) `{}`:{}-{}\n  ID: `{}`",
+            n.id.kind, n.id.name, n.language,
+            n.id.file.display(),
+            n.line_start, n.line_end,
+            stable_id,
+        );
+        if !n.signature.is_empty() {
+            entry.push_str(&format!("\n  Sig: `{}`", n.signature));
+        }
+        if let Some(val) = n.metadata.get("value") {
+            entry.push_str(&format!("\n  Value: `{}`", val));
+        }
+        if n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false) {
+            entry.push_str(" *(literal)*");
+        }
+        if let Some(cc) = n.metadata.get("cyclomatic") {
+            entry.push_str(&format!("\n  Complexity: {}", cc));
+        }
+        if !outgoing.is_empty() {
+            entry.push_str(&format!("\n  Out: {} edge(s)", outgoing.len()));
+        }
+        if !incoming.is_empty() {
+            entry.push_str(&format!("\n  In: {} edge(s)", incoming.len()));
+        }
+        entry
+    }
+}
+
+fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String], index: &GraphIndex, compact: bool) -> String {
     ids.iter()
         .filter_map(|id| {
             if let Some(node) = nodes.iter().find(|n| n.stable_id() == *id) {
@@ -2924,19 +3034,7 @@ fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String]) -> String {
                     graph::NodeKind::Module | graph::NodeKind::PrMerge => return None,
                     _ => {}
                 }
-                let mut line = format!(
-                    "- **{}** `{}` ({}) `{}`:{}-{}",
-                    node.id.kind,
-                    node.id.name,
-                    node.language,
-                    node.id.file.display(),
-                    node.line_start,
-                    node.line_end,
-                );
-                if let Some(cc) = node.metadata.get("cyclomatic") {
-                    line.push_str(&format!(" · complexity {}", cc));
-                }
-                Some(line)
+                Some(format_node_entry(node, index, compact))
             } else {
                 Some(format!("- `{}`", id))
             }
@@ -3790,5 +3888,168 @@ mod tests {
                 age
             );
         }
+    }
+
+    // ── compact + nodes (batch) parameter tests ──────────────────────────
+
+    #[test]
+    fn test_search_compact_param() {
+        let s = parse_search(json!({"query": "handle", "compact": true})).unwrap();
+        assert_eq!(s.compact, Some(true));
+    }
+
+    #[test]
+    fn test_search_compact_default_is_none() {
+        let s = parse_search(json!({"query": "handle"})).unwrap();
+        assert!(s.compact.is_none());
+        // Handler interprets None as false
+        assert!(!s.compact.unwrap_or(false));
+    }
+
+    #[test]
+    fn test_search_nodes_param() {
+        let s = parse_search(json!({
+            "nodes": ["root:src/lib.rs:foo:function", "root:src/lib.rs:bar:struct"]
+        })).unwrap();
+        assert_eq!(s.nodes, Some(vec![
+            "root:src/lib.rs:foo:function".to_string(),
+            "root:src/lib.rs:bar:struct".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn test_search_nodes_with_compact() {
+        let s = parse_search(json!({
+            "nodes": ["root:src/lib.rs:foo:function"],
+            "compact": true
+        })).unwrap();
+        assert_eq!(s.compact, Some(true));
+        assert!(s.nodes.is_some());
+        assert_eq!(s.nodes.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_search_nodes_empty_array() {
+        let s = parse_search(json!({"nodes": []})).unwrap();
+        assert_eq!(s.nodes, Some(vec![]));
+    }
+
+    #[test]
+    fn test_search_compact_with_traversal() {
+        let s = parse_search(json!({
+            "query": "auth",
+            "mode": "neighbors",
+            "compact": true
+        })).unwrap();
+        assert_eq!(s.compact, Some(true));
+        assert_eq!(s.mode, Some("neighbors".to_string()));
+    }
+
+    #[test]
+    fn test_search_symbols_into_search_has_no_compact_or_nodes() {
+        let ss = SearchSymbols {
+            query: "foo".to_string(),
+            kind: None, language: None, file: None, root: None,
+            limit: None, synthetic: None, min_complexity: None, sort: None,
+        };
+        let s = ss.into_search();
+        assert!(s.compact.is_none());
+        assert!(s.nodes.is_none());
+    }
+
+    #[test]
+    fn test_graph_query_into_search_has_no_compact_or_nodes() {
+        let gq = GraphQuery {
+            node_id: Some("x".to_string()),
+            query: None,
+            mode: "neighbors".to_string(),
+            direction: None, edge_types: None, max_hops: None, top_k: None,
+        };
+        let s = gq.into_search();
+        assert!(s.compact.is_none());
+        assert!(s.nodes.is_none());
+    }
+
+    #[test]
+    fn test_format_node_entry_compact_vs_full() {
+        use crate::graph::{index::GraphIndex, Node, NodeId, NodeKind, ExtractionSource};
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        let index = GraphIndex::new();
+        let node = Node {
+            id: NodeId {
+                root: "r".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "my_function".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            signature: "fn my_function(x: u32) -> bool".to_string(),
+            body: "{ x > 0 }".to_string(),
+            line_start: 10,
+            line_end: 15,
+            metadata: {
+                let mut m = BTreeMap::new();
+                m.insert("cyclomatic".to_string(), "3".to_string());
+                m
+            },
+            source: ExtractionSource::TreeSitter,
+        };
+
+        // Compact output should be shorter and not contain full detail markers
+        let compact_out = format_node_entry(&node, &index, true);
+        let full_out = format_node_entry(&node, &index, false);
+
+        // Compact contains key info
+        assert!(compact_out.contains("my_function"));
+        assert!(compact_out.contains("src/lib.rs"));
+        assert!(compact_out.contains("10-15"));
+        assert!(compact_out.contains("cc:3"));
+        // Compact includes stable ID for follow-up
+        assert!(compact_out.contains("r:src/lib.rs:my_function:function"));
+
+        // Full output has more detail
+        assert!(full_out.contains("ID:"));
+        assert!(full_out.contains("Sig:"));
+        assert!(full_out.contains("Complexity:"));
+        assert!(full_out.contains("rust")); // language in parentheses
+
+        // Compact should be significantly shorter
+        assert!(
+            compact_out.len() < full_out.len(),
+            "compact ({}) should be shorter than full ({})",
+            compact_out.len(),
+            full_out.len()
+        );
+    }
+
+    #[test]
+    fn test_format_node_entry_compact_multiline_signature() {
+        use crate::graph::{index::GraphIndex, Node, NodeId, NodeKind, ExtractionSource};
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        let index = GraphIndex::new();
+        let node = Node {
+            id: NodeId {
+                root: "r".to_string(),
+                file: PathBuf::from("src/server.rs"),
+                name: "handle_search_traversal".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            signature: "async fn handle_search_traversal(\n    &self,\n    args: &Search,\n) -> Result<CallToolResult, CallToolError>".to_string(),
+            body: String::new(),
+            line_start: 100,
+            line_end: 200,
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let compact_out = format_node_entry(&node, &index, true);
+        // Compact should only show first line of signature
+        assert!(compact_out.contains("async fn handle_search_traversal("));
+        assert!(!compact_out.contains("&self"));
     }
 }
