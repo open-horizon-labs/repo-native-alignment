@@ -258,11 +258,26 @@ pub fn compute_impact_risk(
         .map(|n| n.stable_id())
         .collect();
 
+    // Only follow code-dependency edges for impact traversal.
+    // Metadata edges (Modified, Serves, Affected) link PrMerge nodes to
+    // code symbols and would pollute results with synthetic merge nodes.
+    let dependency_edges = &[
+        EdgeKind::Calls,
+        EdgeKind::Implements,
+        EdgeKind::DependsOn,
+        EdgeKind::ConnectsTo,
+        EdgeKind::Defines,
+        EdgeKind::HasField,
+        EdgeKind::Evolves,
+        EdgeKind::ReferencedBy,
+        EdgeKind::TopologyBoundary,
+    ];
+
     // For each changed symbol, find what depends on it (reverse traversal)
     let mut impacted_ids: HashSet<String> = HashSet::new();
     for sym in changed_symbols {
         let sid = sym.stable_id();
-        let dependents = index.impact(&sid, max_hops);
+        let dependents = index.impact(&sid, max_hops, Some(dependency_edges));
         for dep_id in dependents {
             // Don't include the changed symbols themselves in the impact list
             if !changed_ids.contains(&dep_id) {
@@ -271,12 +286,17 @@ pub fn compute_impact_risk(
         }
     }
 
-    // Classify each impacted symbol
+    // Classify each impacted symbol, skipping non-code nodes (PrMerge, etc.)
     let mut results: Vec<ImpactedSymbol> = Vec::new();
     for imp_id in &impacted_ids {
         let Some(node) = node_by_id.get(imp_id.as_str()) else {
             continue;
         };
+
+        // Skip synthetic/metadata nodes that aren't real code symbols
+        if matches!(node.id.kind, NodeKind::PrMerge) {
+            continue;
+        }
 
         let (risk, reason) = classify_risk(node, index);
         results.push(ImpactedSymbol {
@@ -558,6 +578,60 @@ mod tests {
         assert!(
             changed_sym.is_none(),
             "Changed symbol should not appear in its own impact list"
+        );
+    }
+
+    #[test]
+    fn test_compute_impact_risk_excludes_pr_merge_nodes() {
+        // Scenario: PrMerge node has a Modified edge to changed symbol.
+        // Impact traversal should NOT include the PrMerge node in results.
+        let changed = make_node("do_work", NodeKind::Function, "src/lib.rs");
+        let caller = make_node("caller", NodeKind::Function, "src/api.rs");
+        let pr_merge = Node {
+            id: crate::graph::NodeId {
+                root: String::new(),
+                file: std::path::PathBuf::from("git:merge:abc12345"),
+                name: "abc12345".to_string(),
+                kind: NodeKind::PrMerge,
+            },
+            language: "git".to_string(),
+            line_start: 0,
+            line_end: 0,
+            signature: "Merge PR #42".to_string(),
+            body: String::new(),
+            metadata: std::collections::BTreeMap::new(),
+            source: crate::graph::ExtractionSource::Git,
+        };
+
+        let all_nodes = vec![changed.clone(), caller.clone(), pr_merge.clone()];
+        let changed_symbols = vec![changed.clone()];
+
+        let mut index = GraphIndex::new();
+        // caller calls changed (real dependency)
+        index.add_edge(
+            &caller.stable_id(),
+            "function",
+            &changed.stable_id(),
+            "function",
+            EdgeKind::Calls,
+        );
+        // pr_merge modified changed (metadata edge, NOT a dependency)
+        index.add_edge(
+            &pr_merge.stable_id(),
+            "pr_merge",
+            &changed.stable_id(),
+            "function",
+            EdgeKind::Modified,
+        );
+
+        let impacted = compute_impact_risk(&changed_symbols, &all_nodes, &index, 3);
+
+        // Should find caller but NOT pr_merge
+        assert_eq!(impacted.len(), 1, "Should find exactly 1 impacted symbol (the caller)");
+        assert_eq!(impacted[0].name, "caller");
+        assert!(
+            impacted.iter().all(|s| s.kind != NodeKind::PrMerge),
+            "PrMerge nodes must not appear in impact results"
         );
     }
 

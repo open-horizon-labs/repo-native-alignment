@@ -371,6 +371,7 @@ fn parse_node_kind(s: &str) -> NodeKind {
         "sql_table" => NodeKind::SqlTable,
         "api_endpoint" => NodeKind::ApiEndpoint,
         "macro" => NodeKind::Macro,
+        "field" => NodeKind::Field,
         "pr_merge" => NodeKind::PrMerge,
         other => NodeKind::Other(other.to_string()),
     }
@@ -2635,6 +2636,10 @@ impl RnaHandler {
                     });
                 }
 
+                // Filter hidden scaffolding kinds (Module, PrMerge) before counting,
+                // so the reported count matches what format_neighbor_nodes renders.
+                retain_displayable(&mut all_ids, &graph_state.nodes);
+
                 let entry_label = if valid_entry_ids.len() == 1 {
                     format!("`{}`", valid_entry_ids[0])
                 } else {
@@ -2766,6 +2771,10 @@ impl RnaHandler {
                                 .unwrap_or(false)
                         });
                     }
+
+                    // Filter hidden scaffolding kinds (Module, PrMerge) before counting,
+                    // so the reported count matches what format_neighbor_nodes renders.
+                    retain_displayable(&mut all_ids, &graph_state.nodes);
 
                     let freshness = format_freshness(
                         graph_state.nodes.len(),
@@ -2916,7 +2925,7 @@ fn run_traversal(
                     if max_hops == 1 {
                         Ok(index.neighbors(node_id, edge_filter, Direction::Incoming))
                     } else {
-                        Ok(index.impact(node_id, max_hops))
+                        Ok(index.impact(node_id, max_hops, edge_filter))
                     }
                 }
                 "both" => {
@@ -2928,7 +2937,7 @@ fn run_traversal(
                     let inc = if max_hops == 1 {
                         index.neighbors(node_id, edge_filter, Direction::Incoming)
                     } else {
-                        index.impact(node_id, max_hops)
+                        index.impact(node_id, max_hops, edge_filter)
                     };
                     let mut combined = out;
                     combined.extend(inc);
@@ -2942,7 +2951,7 @@ fn run_traversal(
         }
         "impact" => {
             let max_hops = hops.unwrap_or(3) as usize;
-            Ok(index.impact(node_id, max_hops))
+            Ok(index.impact(node_id, max_hops, edge_filter))
         }
         "reachable" => {
             let max_hops = hops.unwrap_or(3) as usize;
@@ -3398,7 +3407,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         // 1. Top symbols by importance (PageRank)
                         {
                             let mut symbols_with_importance: Vec<(&Node, f64)> = graph_state.nodes.iter()
-                                .filter(|n| !matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge))
+                                .filter(|n| !matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge | NodeKind::Field))
                                 .filter(|n| n.id.root != "external")
                                 .filter_map(|n| {
                                     let imp = n.metadata.get("importance")
@@ -3439,7 +3448,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         {
                             let mut file_counts: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
                             for n in &graph_state.nodes {
-                                if matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge) {
+                                if matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge | NodeKind::Field) {
                                     continue;
                                 }
                                 if n.id.root == "external" {
@@ -3737,15 +3746,31 @@ fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> Stri
     }
 }
 
+/// Node kinds that are structural scaffolding and should be hidden from traversal results.
+/// These are filtered by `format_neighbor_nodes` when rendering, so we must also filter
+/// them from the ID list before counting to keep the reported count accurate.
+fn is_hidden_traversal_kind(kind: &graph::NodeKind) -> bool {
+    matches!(kind, graph::NodeKind::Module | graph::NodeKind::PrMerge)
+}
+
+/// Remove IDs whose node kind is hidden scaffolding (Module, PrMerge) from traversal results.
+/// This ensures the count shown in headings matches the nodes actually rendered.
+fn retain_displayable(all_ids: &mut Vec<String>, nodes: &[graph::Node]) {
+    all_ids.retain(|id| {
+        nodes.iter()
+            .find(|n| n.stable_id() == *id)
+            .map(|n| !is_hidden_traversal_kind(&n.id.kind))
+            // If node not found, keep the ID (it will render as a fallback `id` line)
+            .unwrap_or(true)
+    });
+}
+
 fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String], index: &GraphIndex, compact: bool) -> String {
     ids.iter()
         .filter_map(|id| {
             if let Some(node) = nodes.iter().find(|n| n.stable_id() == *id) {
-                // Filter out module and PR-merge nodes — they're structural scaffolding,
-                // not useful for agents doing impact analysis or exploration.
-                match node.id.kind {
-                    graph::NodeKind::Module | graph::NodeKind::PrMerge => return None,
-                    _ => {}
+                if is_hidden_traversal_kind(&node.id.kind) {
+                    return None;
                 }
                 Some(format_node_entry(node, index, compact))
             } else {
@@ -5051,5 +5076,123 @@ mod tests {
             "hub node should show edges:2, got: {}",
             compact_out
         );
+    }
+
+    // ── Adversarial tests for CodeRabbit fixes ────────────────────────────
+
+    #[test]
+    fn test_parse_node_kind_field_round_trips() {
+        // NodeKind::Field serializes as "field" via Display.
+        // parse_node_kind must map it back, not fall through to Other("field").
+        let kind = parse_node_kind("field");
+        assert!(
+            matches!(kind, NodeKind::Field),
+            "parse_node_kind(\"field\") should return NodeKind::Field, got {:?}",
+            kind
+        );
+    }
+
+    #[test]
+    fn test_parse_node_kind_all_variants_round_trip() {
+        // Ensure every known variant round-trips through Display -> parse_node_kind.
+        let variants = vec![
+            NodeKind::Function,
+            NodeKind::Struct,
+            NodeKind::Trait,
+            NodeKind::Enum,
+            NodeKind::Module,
+            NodeKind::Import,
+            NodeKind::Const,
+            NodeKind::Impl,
+            NodeKind::ProtoMessage,
+            NodeKind::SqlTable,
+            NodeKind::ApiEndpoint,
+            NodeKind::Macro,
+            NodeKind::Field,
+            NodeKind::PrMerge,
+        ];
+        for variant in variants {
+            let s = format!("{}", variant);
+            let parsed = parse_node_kind(&s);
+            assert_eq!(
+                std::mem::discriminant(&variant),
+                std::mem::discriminant(&parsed),
+                "Round-trip failed for {:?}: Display=\"{}\", parsed back as {:?}",
+                variant, s, parsed
+            );
+        }
+    }
+
+    #[test]
+    fn test_retain_displayable_filters_module_and_prmerge() {
+        // retain_displayable should remove Module and PrMerge IDs but keep others.
+        let module_node = graph::Node {
+            id: graph::NodeId {
+                root: String::new(),
+                file: std::path::PathBuf::from("src/lib.rs"),
+                name: "mymod".to_string(),
+                kind: NodeKind::Module,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            body: String::new(),
+            metadata: std::collections::BTreeMap::new(),
+            source: graph::ExtractionSource::TreeSitter,
+        };
+        let func_node = graph::Node {
+            id: graph::NodeId {
+                root: String::new(),
+                file: std::path::PathBuf::from("src/lib.rs"),
+                name: "do_work".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            line_start: 5,
+            line_end: 10,
+            signature: "fn do_work()".to_string(),
+            body: String::new(),
+            metadata: std::collections::BTreeMap::new(),
+            source: graph::ExtractionSource::TreeSitter,
+        };
+        let prmerge_node = graph::Node {
+            id: graph::NodeId {
+                root: String::new(),
+                file: std::path::PathBuf::from("git:merge:abc"),
+                name: "abc".to_string(),
+                kind: NodeKind::PrMerge,
+            },
+            language: "git".to_string(),
+            line_start: 0,
+            line_end: 0,
+            signature: String::new(),
+            body: String::new(),
+            metadata: std::collections::BTreeMap::new(),
+            source: graph::ExtractionSource::Git,
+        };
+
+        let nodes = vec![module_node.clone(), func_node.clone(), prmerge_node.clone()];
+        let mut ids = vec![
+            module_node.stable_id(),
+            func_node.stable_id(),
+            prmerge_node.stable_id(),
+        ];
+
+        retain_displayable(&mut ids, &nodes);
+
+        assert_eq!(ids.len(), 1, "Should keep only the function node");
+        assert_eq!(ids[0], func_node.stable_id());
+    }
+
+    #[test]
+    fn test_retain_displayable_keeps_unknown_ids() {
+        // IDs not found in the node list should be kept (fallback rendering).
+        let nodes: Vec<graph::Node> = vec![];
+        let mut ids = vec!["unknown:id:here:function".to_string()];
+
+        retain_displayable(&mut ids, &nodes);
+
+        assert_eq!(ids.len(), 1, "Unknown IDs should be preserved");
     }
 }
