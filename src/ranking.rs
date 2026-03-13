@@ -416,16 +416,17 @@ mod tests {
 
     /// Dissent finding #1: mixed-unit comparison.
     /// A node WITH PageRank importance should always rank above a node
-    /// WITHOUT importance, even if the no-importance node has high edge count.
+    /// WITHOUT importance — the (Some(_), None) match arm ensures this
+    /// regardless of edge counts (which are only consulted when neither
+    /// node has a PageRank score).
     #[test]
-    fn test_pagerank_node_beats_high_degree_node_without_pagerank() {
+    fn test_pagerank_node_beats_node_without_pagerank() {
         // Node with low PageRank score (0.1)
         let mut with_pr = make_node("hub", NodeKind::Function, "a.rs");
         with_pr.metadata.insert("importance".to_string(), "0.1".to_string());
 
-        // Node without PageRank but would have high edge count (simulated)
+        // Node without PageRank — falls back to edge count in (None, None) arm
         let without_pr = make_node("hub", NodeKind::Function, "a.rs");
-        // No importance metadata — would fall back to edge count
 
         let index = empty_index();
         let mut matches: Vec<&Node> = vec![&without_pr, &with_pr];

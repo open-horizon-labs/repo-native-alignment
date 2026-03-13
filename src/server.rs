@@ -27,6 +27,10 @@ use arc_swap::ArcSwap;
 use petgraph::Direction;
 use tokio::sync::RwLock;
 
+/// Minimum importance score to display in tool output.
+/// Scores at or below this threshold are suppressed as noise.
+const IMPORTANCE_THRESHOLD: f64 = 0.001;
+
 // ── Tool input structs ──────────────────────────────────────────────
 
 #[macros::mcp_tool(
@@ -2943,7 +2947,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                         }
                                         if let Some(imp) = n.metadata.get("importance") {
                                             if let Ok(score) = imp.parse::<f64>() {
-                                                if score > 0.001 {
+                                                if score > IMPORTANCE_THRESHOLD {
                                                     line.push_str(&format!("\n  Importance: {:.3}", score));
                                                 }
                                             }
@@ -3126,7 +3130,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                     let imp = n.metadata.get("importance")
                                         .and_then(|s| s.parse::<f64>().ok())
                                         .unwrap_or(0.0);
-                                    if imp > 0.001 { Some((n, imp)) } else { None }
+                                    if imp > IMPORTANCE_THRESHOLD { Some((n, imp)) } else { None }
                                 })
                                 .collect();
                             symbols_with_importance.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -3213,9 +3217,9 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                             }
                         }
 
-                        // 4. Entry points (main functions, handlers)
+                        // 4. Entry points (main functions, handlers), sorted by importance
                         {
-                            let entry_points: Vec<&Node> = graph_state.nodes.iter()
+                            let mut entry_points: Vec<&Node> = graph_state.nodes.iter()
                                 .filter(|n| n.id.kind == NodeKind::Function && n.id.root != "external")
                                 .filter(|n| {
                                     let name = n.id.name.to_lowercase();
@@ -3225,8 +3229,13 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                         || name.ends_with("_handler")
                                         || name.contains("endpoint")
                                 })
-                                .take(10)
                                 .collect();
+                            entry_points.sort_by(|a, b| {
+                                let imp_a = a.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                                let imp_b = b.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                                imp_b.partial_cmp(&imp_a).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            entry_points.truncate(10);
 
                             if !entry_points.is_empty() {
                                 let md: String = entry_points.iter()
@@ -3349,7 +3358,7 @@ fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> Stri
         }
         if let Some(imp) = n.metadata.get("importance") {
             if let Ok(score) = imp.parse::<f64>() {
-                if score > 0.001 {
+                if score > IMPORTANCE_THRESHOLD {
                     entry.push_str(&format!(" imp:{:.3}", score));
                 }
             }
@@ -3386,7 +3395,7 @@ fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> Stri
         }
         if let Some(imp) = n.metadata.get("importance") {
             if let Ok(score) = imp.parse::<f64>() {
-                if score > 0.001 {
+                if score > IMPORTANCE_THRESHOLD {
                     entry.push_str(&format!("\n  Importance: {:.3}", score));
                 }
             }
