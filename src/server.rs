@@ -2063,7 +2063,7 @@ impl RnaHandler {
             if node_ids.is_empty() {
                 return Ok(text_result("Empty nodes list. Provide at least one stable node ID.".to_string()));
             }
-            return self.handle_search_batch(&node_ids, compact, args.mode.as_deref()).await;
+            return self.handle_search_batch(&node_ids, compact, &args).await;
         }
 
         if args.mode.is_some() {
@@ -2305,73 +2305,11 @@ impl RnaHandler {
                 });
                 let edge_filter_slice = edge_filter.as_deref();
 
-                let run_traversal = |node_id: &str| -> Result<Vec<String>, String> {
-                    match mode {
-                        "neighbors" => {
-                            let max_hops = args.hops.unwrap_or(1) as usize;
-                            let direction = args.direction.as_deref().unwrap_or("outgoing");
-
-                            match direction {
-                                "outgoing" => {
-                                    if max_hops == 1 {
-                                        Ok(graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Outgoing))
-                                    } else {
-                                        Ok(graph_state.index.reachable(node_id, max_hops, edge_filter_slice))
-                                    }
-                                }
-                                "incoming" => {
-                                    if max_hops == 1 {
-                                        Ok(graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Incoming))
-                                    } else {
-                                        Ok(graph_state.index.impact(node_id, max_hops))
-                                    }
-                                }
-                                "both" => {
-                                    let out = if max_hops == 1 {
-                                        graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Outgoing)
-                                    } else {
-                                        graph_state.index.reachable(node_id, max_hops, edge_filter_slice)
-                                    };
-                                    let inc = if max_hops == 1 {
-                                        graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Incoming)
-                                    } else {
-                                        graph_state.index.impact(node_id, max_hops)
-                                    };
-                                    let mut combined = out;
-                                    combined.extend(inc);
-                                    Ok(combined)
-                                }
-                                _ => Err(format!(
-                                    "Invalid direction: \"{}\". Use \"outgoing\", \"incoming\", or \"both\".",
-                                    direction
-                                )),
-                            }
-                        }
-                        "impact" => {
-                            let max_hops = args.hops.unwrap_or(3) as usize;
-                            Ok(graph_state.index.impact(node_id, max_hops))
-                        }
-                        "reachable" => {
-                            let max_hops = args.hops.unwrap_or(3) as usize;
-                            Ok(graph_state.index.reachable(node_id, max_hops, edge_filter_slice))
-                        }
-                        "tests_for" => {
-                            // Walk incoming Calls edges to find callers, then filter to test files.
-                            let calls_filter = &[EdgeKind::Calls];
-                            Ok(graph_state.index.neighbors(node_id, Some(calls_filter), Direction::Incoming))
-                        }
-                        other => Err(format!(
-                            "Unknown mode: \"{}\". Use \"neighbors\", \"impact\", \"reachable\", or \"tests_for\".",
-                            other
-                        )),
-                    }
-                };
-
                 let mut all_ids: Vec<String> = Vec::new();
                 let mut seen = std::collections::HashSet::new();
 
                 for node_id in &valid_entry_ids {
-                    match run_traversal(node_id) {
+                    match run_traversal(&graph_state.index, node_id, mode, args.hops, args.direction.as_deref(), edge_filter_slice) {
                         Ok(ids) => {
                             for id in ids {
                                 if seen.insert(id.clone()) {
@@ -2448,66 +2386,275 @@ impl RnaHandler {
     }
 
     /// Batch node retrieval: resolve multiple stable node IDs in a single call.
+    /// When `mode` is provided, runs traversal from each node (composes with hops/direction/edge_types).
+    /// When `mode` is absent, simply retrieves the nodes.
     async fn handle_search_batch(
         &self,
         node_ids: &[&str],
         compact: bool,
-        _mode: Option<&str>,
+        args: &Search,
     ) -> Result<CallToolResult, CallToolError> {
-        match self.get_graph().await {
-            Ok(guard) => {
-                let graph_state = guard.as_ref().unwrap();
-                let freshness = format_freshness(
-                    graph_state.nodes.len(),
-                    graph_state.last_scan_completed_at,
-                    Some(&self.lsp_status),
-                );
+        // If mode is provided, route each node through traversal logic
+        if args.mode.is_some() {
+            // Route through traversal logic for each seed node
+            match self.get_graph().await {
+                Ok(guard) => {
+                    let graph_state = guard.as_ref().unwrap();
+                    let mode = args.mode.as_deref().unwrap_or("neighbors");
 
-                let mut found = Vec::new();
-                let mut missing = Vec::new();
+                    let edge_filter = args.edge_types.as_ref().map(|types| {
+                        types
+                            .iter()
+                            .filter_map(|t| parse_edge_kind(t))
+                            .collect::<Vec<_>>()
+                    });
+                    let edge_filter_slice = edge_filter.as_deref();
 
-                for &nid in node_ids {
-                    if let Some(node) = graph_state.nodes.iter().find(|n| n.stable_id() == nid) {
-                        found.push(node);
+                    let mut valid_ids: Vec<&str> = Vec::new();
+                    let mut missing: Vec<&str> = Vec::new();
+                    for &nid in node_ids {
+                        if graph_state.index.get_node(nid).is_some() {
+                            valid_ids.push(nid);
+                        } else {
+                            missing.push(nid);
+                        }
+                    }
+
+                    if valid_ids.is_empty() {
+                        let freshness = format_freshness(
+                            graph_state.nodes.len(),
+                            graph_state.last_scan_completed_at,
+                            Some(&self.lsp_status),
+                        );
+                        let id_list = node_ids.iter()
+                            .map(|id| format!("`{}`", id))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Ok(text_result(format!(
+                            "No graph nodes found for {}. Use search to find valid node IDs.{}",
+                            id_list, freshness
+                        )));
+                    }
+
+                    let mut all_ids: Vec<String> = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
+
+                    for &node_id in &valid_ids {
+                        match run_traversal(&graph_state.index, node_id, mode, args.hops, args.direction.as_deref(), edge_filter_slice) {
+                            Ok(ids) => {
+                                for id in ids {
+                                    if seen.insert(id.clone()) {
+                                        all_ids.push(id);
+                                    }
+                                }
+                            }
+                            Err(msg) => return Ok(text_result(msg)),
+                        }
+                    }
+
+                    // Remove entry nodes from results
+                    let entry_set: std::collections::HashSet<&str> = valid_ids.iter().copied().collect();
+                    all_ids.retain(|id| !entry_set.contains(id.as_str()));
+
+                    // For tests_for mode, filter to only callers in test files
+                    if mode == "tests_for" {
+                        all_ids.retain(|id| {
+                            graph_state.nodes.iter()
+                                .find(|n| n.stable_id() == *id)
+                                .map(|n| ranking::is_test_file(n))
+                                .unwrap_or(false)
+                        });
+                    }
+
+                    let freshness = format_freshness(
+                        graph_state.nodes.len(),
+                        graph_state.last_scan_completed_at,
+                        Some(&self.lsp_status),
+                    );
+
+                    let direction = args.direction.as_deref().unwrap_or("outgoing");
+                    let entry_label = format!("{} batch node(s)", valid_ids.len());
+
+                    if all_ids.is_empty() {
+                        let mode_desc = match mode {
+                            "neighbors" => format!("No {} neighbors for {}.", direction, entry_label),
+                            "impact" => format!("No dependents found for {} within {} hops.", entry_label, args.hops.unwrap_or(3)),
+                            "reachable" => format!("No reachable nodes from {} within {} hops.", entry_label, args.hops.unwrap_or(3)),
+                            "tests_for" => format!("No test functions found calling {}.", entry_label),
+                            _ => format!("No results for {}.", entry_label),
+                        };
+                        let mut result = mode_desc;
+                        if !missing.is_empty() {
+                            result.push_str(&format!(
+                                "\n\n**Missing:** {}",
+                                missing.iter().map(|id| format!("`{}`", id)).collect::<Vec<_>>().join(", ")
+                            ));
+                        }
+                        result.push_str(&freshness);
+                        Ok(text_result(result))
                     } else {
-                        missing.push(nid);
+                        let md = format_neighbor_nodes(&graph_state.nodes, &all_ids, &graph_state.index, compact);
+                        let heading = match mode {
+                            "neighbors" => format!(
+                                "## Batch graph neighbors ({}) of {}\n\n{} result(s)\n\n",
+                                direction, entry_label, all_ids.len()
+                            ),
+                            "impact" => format!(
+                                "## Batch impact analysis for {}\n\n{} dependent(s) within {} hop(s)\n\n",
+                                entry_label, all_ids.len(), args.hops.unwrap_or(3)
+                            ),
+                            "reachable" => format!(
+                                "## Batch reachable from {}\n\n{} node(s) within {} hop(s)\n\n",
+                                entry_label, all_ids.len(), args.hops.unwrap_or(3)
+                            ),
+                            "tests_for" => format!(
+                                "## Batch test coverage for {}\n\n{} test function(s)\n\n",
+                                entry_label, all_ids.len()
+                            ),
+                            _ => String::new(),
+                        };
+                        let mut result = format!("{}{}", heading, md);
+                        if !missing.is_empty() {
+                            result.push_str(&format!(
+                                "\n\n**Missing:** {}",
+                                missing.iter().map(|id| format!("`{}`", id)).collect::<Vec<_>>().join(", ")
+                            ));
+                        }
+                        result.push_str(&freshness);
+                        Ok(text_result(result))
                     }
                 }
-
-                if found.is_empty() {
-                    let id_list = node_ids.iter()
-                        .map(|id| format!("`{}`", id))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Ok(text_result(format!(
-                        "No graph nodes found for {}. Use search to find valid node IDs.{}",
-                        id_list, freshness
-                    )));
-                }
-
-                let md: String = found
-                    .iter()
-                    .map(|n| format_node_entry(n, &graph_state.index, compact))
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-
-                let mut result = format!(
-                    "## Batch retrieval\n\n{} of {} node(s) found\n\n{}",
-                    found.len(),
-                    node_ids.len(),
-                    md,
-                );
-                if !missing.is_empty() {
-                    result.push_str(&format!(
-                        "\n\n**Missing:** {}",
-                        missing.iter().map(|id| format!("`{}`", id)).collect::<Vec<_>>().join(", ")
-                    ));
-                }
-                result.push_str(&freshness);
-                Ok(text_result(result))
+                Err(e) => Ok(text_result(format!("Graph error: {}", e))),
             }
-            Err(e) => Ok(text_result(format!("Graph error: {}", e))),
+        } else {
+            // No mode: simple batch retrieval (existing behavior)
+            match self.get_graph().await {
+                Ok(guard) => {
+                    let graph_state = guard.as_ref().unwrap();
+                    let freshness = format_freshness(
+                        graph_state.nodes.len(),
+                        graph_state.last_scan_completed_at,
+                        Some(&self.lsp_status),
+                    );
+
+                    let mut found = Vec::new();
+                    let mut missing = Vec::new();
+
+                    for &nid in node_ids {
+                        if let Some(node) = graph_state.nodes.iter().find(|n| n.stable_id() == nid) {
+                            found.push(node);
+                        } else {
+                            missing.push(nid);
+                        }
+                    }
+
+                    if found.is_empty() {
+                        let id_list = node_ids.iter()
+                            .map(|id| format!("`{}`", id))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Ok(text_result(format!(
+                            "No graph nodes found for {}. Use search to find valid node IDs.{}",
+                            id_list, freshness
+                        )));
+                    }
+
+                    let md: String = found
+                        .iter()
+                        .map(|n| format_node_entry(n, &graph_state.index, compact))
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+
+                    let mut result = format!(
+                        "## Batch retrieval\n\n{} of {} node(s) found\n\n{}",
+                        found.len(),
+                        node_ids.len(),
+                        md,
+                    );
+                    if !missing.is_empty() {
+                        result.push_str(&format!(
+                            "\n\n**Missing:** {}",
+                            missing.iter().map(|id| format!("`{}`", id)).collect::<Vec<_>>().join(", ")
+                        ));
+                    }
+                    result.push_str(&freshness);
+                    Ok(text_result(result))
+                }
+                Err(e) => Ok(text_result(format!("Graph error: {}", e))),
+            }
         }
+    }
+}
+
+/// Execute a single graph traversal from a given node ID.
+///
+/// Shared by `handle_search_traversal` (single-node entry) and
+/// `handle_search_batch` (multi-node entry with mode).  Keeping the logic
+/// in one place prevents the two paths from diverging.
+fn run_traversal(
+    index: &GraphIndex,
+    node_id: &str,
+    mode: &str,
+    hops: Option<u32>,
+    direction: Option<&str>,
+    edge_filter: Option<&[EdgeKind]>,
+) -> Result<Vec<String>, String> {
+    match mode {
+        "neighbors" => {
+            let max_hops = hops.unwrap_or(1) as usize;
+            let dir = direction.unwrap_or("outgoing");
+            match dir {
+                "outgoing" => {
+                    if max_hops == 1 {
+                        Ok(index.neighbors(node_id, edge_filter, Direction::Outgoing))
+                    } else {
+                        Ok(index.reachable(node_id, max_hops, edge_filter))
+                    }
+                }
+                "incoming" => {
+                    if max_hops == 1 {
+                        Ok(index.neighbors(node_id, edge_filter, Direction::Incoming))
+                    } else {
+                        Ok(index.impact(node_id, max_hops))
+                    }
+                }
+                "both" => {
+                    let out = if max_hops == 1 {
+                        index.neighbors(node_id, edge_filter, Direction::Outgoing)
+                    } else {
+                        index.reachable(node_id, max_hops, edge_filter)
+                    };
+                    let inc = if max_hops == 1 {
+                        index.neighbors(node_id, edge_filter, Direction::Incoming)
+                    } else {
+                        index.impact(node_id, max_hops)
+                    };
+                    let mut combined = out;
+                    combined.extend(inc);
+                    Ok(combined)
+                }
+                _ => Err(format!(
+                    "Invalid direction: \"{}\". Use \"outgoing\", \"incoming\", or \"both\".",
+                    dir
+                )),
+            }
+        }
+        "impact" => {
+            let max_hops = hops.unwrap_or(3) as usize;
+            Ok(index.impact(node_id, max_hops))
+        }
+        "reachable" => {
+            let max_hops = hops.unwrap_or(3) as usize;
+            Ok(index.reachable(node_id, max_hops, edge_filter))
+        }
+        "tests_for" => {
+            let calls_filter = &[EdgeKind::Calls];
+            Ok(index.neighbors(node_id, Some(calls_filter), Direction::Incoming))
+        }
+        other => Err(format!(
+            "Unknown mode: \"{}\". Use \"neighbors\", \"impact\", \"reachable\", or \"tests_for\".",
+            other
+        )),
     }
 }
 
@@ -2987,6 +3134,11 @@ fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> Stri
         }
         if let Some(cc) = n.metadata.get("cyclomatic") {
             entry.push_str(&format!(" cc:{}", cc));
+        }
+        let edge_count = index.neighbors(&stable_id, None, Direction::Outgoing).len()
+            + index.neighbors(&stable_id, None, Direction::Incoming).len();
+        if edge_count > 0 {
+            entry.push_str(&format!(" edges:{}", edge_count));
         }
         entry.push_str(&format!("\n  `{}`", stable_id));
         entry
@@ -4050,5 +4202,192 @@ mod tests {
         // Compact should only show first line of signature
         assert!(compact_out.contains("async fn handle_search_traversal("));
         assert!(!compact_out.contains("&self"));
+    }
+
+    #[test]
+    fn test_format_node_entry_compact_shows_edge_count() {
+        use crate::graph::{index::GraphIndex, Node, NodeId, NodeKind, EdgeKind, ExtractionSource};
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        let mut index = GraphIndex::new();
+
+        let node_a = Node {
+            id: NodeId {
+                root: "r".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "caller".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            signature: "fn caller()".to_string(),
+            body: String::new(),
+            line_start: 1,
+            line_end: 5,
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let node_b = Node {
+            id: NodeId {
+                root: "r".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "callee".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            signature: "fn callee()".to_string(),
+            body: String::new(),
+            line_start: 10,
+            line_end: 15,
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let id_a = node_a.stable_id();
+        let id_b = node_b.stable_id();
+        index.ensure_node(&id_a, "function");
+        index.ensure_node(&id_b, "function");
+        index.add_edge(&id_a, "function", &id_b, "function", EdgeKind::Calls);
+
+        // Compact output for node_a should show edges:1 (one outgoing)
+        let compact_out = format_node_entry(&node_a, &index, true);
+        assert!(
+            compact_out.contains("edges:1"),
+            "compact output should contain 'edges:1', got: {}",
+            compact_out
+        );
+
+        // Full output should still show Out: 1 edge(s)
+        let full_out = format_node_entry(&node_a, &index, false);
+        assert!(full_out.contains("Out: 1 edge(s)"));
+
+        // Node with no edges should NOT show edges:0
+        let isolated_node = Node {
+            id: NodeId {
+                root: "r".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "isolated".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            signature: "fn isolated()".to_string(),
+            body: String::new(),
+            line_start: 20,
+            line_end: 25,
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let id_iso = isolated_node.stable_id();
+        index.ensure_node(&id_iso, "function");
+        let isolated_compact = format_node_entry(&isolated_node, &index, true);
+        assert!(
+            !isolated_compact.contains("edges:"),
+            "isolated node compact output should not contain 'edges:', got: {}",
+            isolated_compact
+        );
+    }
+
+    #[test]
+    fn test_search_nodes_with_mode_param() {
+        // Verify that nodes + mode compose correctly at the parameter level
+        let s = parse_search(json!({
+            "nodes": ["root:src/lib.rs:foo:function"],
+            "mode": "neighbors",
+            "hops": 1,
+            "direction": "outgoing"
+        })).unwrap();
+        assert!(s.nodes.is_some());
+        assert_eq!(s.mode, Some("neighbors".to_string()));
+        assert_eq!(s.hops, Some(1));
+        assert_eq!(s.direction, Some("outgoing".to_string()));
+    }
+
+    #[test]
+    fn test_search_batch_with_all_traversal_modes() {
+        // Adversarial: verify all mode strings parse correctly with batch nodes
+        for mode in &["neighbors", "impact", "reachable", "tests_for"] {
+            let s = parse_search(json!({
+                "nodes": ["root:a.rs:foo:function", "root:b.rs:bar:function"],
+                "mode": mode,
+                "hops": 2
+            })).unwrap();
+            assert!(s.nodes.is_some());
+            assert_eq!(s.mode.as_deref(), Some(*mode));
+            assert_eq!(s.hops, Some(2));
+        }
+    }
+
+    #[test]
+    fn test_search_batch_with_direction_variants() {
+        // Adversarial: verify all direction strings compose with batch
+        for dir in &["outgoing", "incoming", "both"] {
+            let s = parse_search(json!({
+                "nodes": ["root:a.rs:foo:function"],
+                "mode": "neighbors",
+                "direction": dir
+            })).unwrap();
+            assert_eq!(s.direction.as_deref(), Some(*dir));
+        }
+    }
+
+    #[test]
+    fn test_search_batch_mode_without_hops_uses_defaults() {
+        // Adversarial: batch+mode with no hops should not panic
+        let s = parse_search(json!({
+            "nodes": ["root:a.rs:foo:function"],
+            "mode": "impact"
+        })).unwrap();
+        assert!(s.nodes.is_some());
+        assert_eq!(s.mode, Some("impact".to_string()));
+        assert!(s.hops.is_none()); // will default to 3 in handler
+    }
+
+    #[test]
+    fn test_compact_edge_count_with_bidirectional_edges() {
+        // Adversarial: node with both incoming and outgoing edges should sum correctly
+        use crate::graph::{index::GraphIndex, Node, NodeId, NodeKind, EdgeKind, ExtractionSource};
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        let mut index = GraphIndex::new();
+
+        let make_node = |name: &str| Node {
+            id: NodeId {
+                root: "r".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                name: name.to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            signature: format!("fn {}()", name),
+            body: String::new(),
+            line_start: 1,
+            line_end: 5,
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let node_a = make_node("hub");
+        let node_b = make_node("caller");
+        let node_c = make_node("callee");
+
+        let id_a = node_a.stable_id();
+        let id_b = node_b.stable_id();
+        let id_c = node_c.stable_id();
+        index.ensure_node(&id_a, "function");
+        index.ensure_node(&id_b, "function");
+        index.ensure_node(&id_c, "function");
+        // hub calls callee (outgoing), caller calls hub (incoming to hub)
+        index.add_edge(&id_a, "function", &id_c, "function", EdgeKind::Calls);
+        index.add_edge(&id_b, "function", &id_a, "function", EdgeKind::Calls);
+
+        let compact_out = format_node_entry(&node_a, &index, true);
+        // hub has 1 outgoing + 1 incoming = edges:2
+        assert!(
+            compact_out.contains("edges:2"),
+            "hub node should show edges:2, got: {}",
+            compact_out
+        );
     }
 }
