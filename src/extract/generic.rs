@@ -2622,4 +2622,104 @@ struct PlainStruct {
             "PlainStruct should NOT have a pattern_hint",
         );
     }
+
+    // -- Adversarial pattern hint tests --
+
+    #[test]
+    fn test_pattern_hint_empty_name() {
+        assert_eq!(detect_pattern_hint("", &NodeKind::Struct), None);
+    }
+
+    #[test]
+    fn test_pattern_hint_unicode_name() {
+        // Non-ASCII name should not crash, and should not match
+        assert_eq!(detect_pattern_hint("FabrikController\u{00e9}", &NodeKind::Struct), None);
+        // But ASCII suffix after unicode prefix should match
+        assert_eq!(
+            detect_pattern_hint("\u{00e9}Factory", &NodeKind::Struct),
+            Some("factory".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_overlapping_suffix() {
+        // "ServiceProvider" ends with both "provider" and, if we had "ervice", also "service".
+        // Should match "provider" because it's checked before "service" would substring-match.
+        // Actually "serviceprovider" ends with "provider" (first match in list that matches).
+        assert_eq!(
+            detect_pattern_hint("ServiceProvider", &NodeKind::Struct),
+            Some("provider".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_substring_not_suffix() {
+        // "FactoryUtil" -- "factory" is NOT a suffix here
+        assert_eq!(detect_pattern_hint("FactoryUtil", &NodeKind::Struct), None);
+        // "HandlerConfig" -- "handler" is NOT a suffix
+        assert_eq!(detect_pattern_hint("HandlerConfig", &NodeKind::Struct), None);
+    }
+
+    #[test]
+    fn test_pattern_hint_snake_case_suffix() {
+        // Snake case: "my_handler" ends with "handler"
+        assert_eq!(
+            detect_pattern_hint("my_handler", &NodeKind::Function),
+            Some("handler".to_string()),
+        );
+        // "event_observer" ends with "observer"
+        assert_eq!(
+            detect_pattern_hint("event_observer", &NodeKind::Function),
+            Some("observer".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_impl_kind_excluded() {
+        assert_eq!(detect_pattern_hint("FactoryImpl", &NodeKind::Impl), None);
+    }
+
+    #[test]
+    fn test_pattern_hint_cross_language_python() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = "class UserRepository:\n    pass\n\nclass PlainModel:\n    pass\n";
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(Path::new("models.py"), code)
+            .unwrap();
+
+        let repo = result.nodes.iter().find(|n| n.id.name == "UserRepository").unwrap();
+        assert_eq!(
+            repo.metadata.get("pattern_hint").map(|s| s.as_str()),
+            Some("repository"),
+            "Python class UserRepository should have pattern_hint=repository",
+        );
+
+        let plain = result.nodes.iter().find(|n| n.id.name == "PlainModel").unwrap();
+        assert!(
+            plain.metadata.get("pattern_hint").is_none(),
+            "PlainModel should NOT have a pattern_hint",
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_cross_language_typescript() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let code = "class AuthMiddleware {\n  handle() {}\n}\n\nclass UserDTO {\n  name: string;\n}\n";
+        let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
+            .run(Path::new("auth.ts"), code)
+            .unwrap();
+
+        let mw = result.nodes.iter().find(|n| n.id.name == "AuthMiddleware").unwrap();
+        assert_eq!(
+            mw.metadata.get("pattern_hint").map(|s| s.as_str()),
+            Some("middleware"),
+            "TypeScript class AuthMiddleware should have pattern_hint=middleware",
+        );
+
+        let dto = result.nodes.iter().find(|n| n.id.name == "UserDTO").unwrap();
+        assert!(
+            dto.metadata.get("pattern_hint").is_none(),
+            "UserDTO should NOT have a pattern_hint",
+        );
+    }
 }
