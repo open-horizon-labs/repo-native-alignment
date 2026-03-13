@@ -972,4 +972,64 @@ mod tests {
         assert!((scores["b"] - 1.0).abs() < 0.01,
             "simple IDs should not be dampened, got {}", scores["b"]);
     }
+
+    // ==================== Adversarial dampening tests ====================
+
+    /// Dissent: "0.1 penalty might not be enough with many callers"
+    /// fmt with 20 callers should still score below a real function with 2 callers.
+    #[test]
+    fn test_dampen_high_fanin_fmt_still_below_real_hub() {
+        let mut index = GraphIndex::new();
+        let fmt_id = stable_id("src/graph/mod.rs", "fmt", "function");
+        let handler_id = stable_id("src/server.rs", "handle_request", "function");
+
+        for i in 0..20 {
+            let caller = stable_id(&format!("src/type_{}.rs", i), "display_impl", "function");
+            index.add_edge(&caller, "function", &fmt_id, "function", EdgeKind::Calls);
+        }
+
+        let c1 = stable_id("src/main.rs", "main", "function");
+        let c2 = stable_id("src/router.rs", "dispatch", "function");
+        index.add_edge(&c1, "function", &handler_id, "function", EdgeKind::Calls);
+        index.add_edge(&c2, "function", &handler_id, "function", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+
+        assert!(scores[&fmt_id] < scores[&handler_id],
+            "fmt with 20 callers ({:.4}) should still score below handler with 2 ({:.4})",
+            scores[&fmt_id], scores[&handler_id]);
+    }
+
+    /// Dissent: "stable_id parsing with deep file paths"
+    #[test]
+    fn test_dampen_stable_id_parsing_deep_path() {
+        let mut index = GraphIndex::new();
+        let id = "myroot:src/deep/path/mod.rs:fmt:function";
+        let caller = "myroot:src/main.rs:main:function";
+        index.add_edge(caller, "function", id, "function", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+
+        assert!(scores[id] < scores[caller] * 0.2,
+            "fmt should be dampened even with deep file paths: fmt={:.4}, caller={:.4}",
+            scores[id], scores[caller]);
+    }
+
+    /// Dissent: "from/into dampening could be over-broad"
+    #[test]
+    fn test_dampen_from_into_are_dampened() {
+        let mut index = GraphIndex::new();
+        let from_id = stable_id("src/types.rs", "from", "function");
+        let regular_id = stable_id("src/types.rs", "convert", "function");
+        let caller = stable_id("src/main.rs", "main", "function");
+
+        index.add_edge(&caller, "function", &from_id, "function", EdgeKind::Calls);
+        index.add_edge(&caller, "function", &regular_id, "function", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+
+        assert!(scores[&from_id] < scores[&regular_id],
+            "from ({:.4}) should be dampened vs convert ({:.4})",
+            scores[&from_id], scores[&regular_id]);
+    }
 }
