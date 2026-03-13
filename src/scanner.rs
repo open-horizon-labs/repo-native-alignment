@@ -158,9 +158,14 @@ impl PatternConfig {
     /// Compute the effective suffix list: built-in defaults minus disabled,
     /// plus extra custom patterns.
     pub fn effective_suffixes(&self) -> Vec<(String, String)> {
+        // Normalize disable list once for case-insensitive comparison.
+        let disable_lower: Vec<String> = self.disable.iter()
+            .map(|d| d.to_ascii_lowercase())
+            .collect();
+
         let mut suffixes: Vec<(String, String)> = DEFAULT_PATTERN_SUFFIXES
             .iter()
-            .filter(|(_, hint)| !self.disable.iter().any(|d| d == hint))
+            .filter(|(_, hint)| !disable_lower.iter().any(|d| d == hint))
             .map(|(suffix, hint)| (suffix.to_string(), hint.to_string()))
             .collect();
 
@@ -168,7 +173,7 @@ impl PatternConfig {
             let suffix = pair[0].to_ascii_lowercase();
             let hint = pair[1].to_ascii_lowercase();
             // Skip if disabled (disable applies to extras too, not just built-ins)
-            if self.disable.iter().any(|d| *d == hint) {
+            if disable_lower.iter().any(|d| *d == hint) {
                 continue;
             }
             // Avoid duplicates: skip if suffix already present
@@ -1745,5 +1750,18 @@ exclude = ["dist/"]
         assert!(suffixes.iter().any(|(s, h)| s == "gateway" && h == "gateway"));
         // "interactor" extra should be blocked because its hint "blocked" is in disable
         assert!(!suffixes.iter().any(|(s, _)| s == "interactor"));
+    }
+
+    #[test]
+    fn test_pattern_config_disable_case_insensitive() {
+        let config = PatternConfig {
+            extra: vec![],
+            disable: vec!["Manager".to_string(), "SERVICE".to_string()],
+        };
+        let suffixes = config.effective_suffixes();
+        // Mixed-case disable should still remove lowercase built-in hints
+        assert!(!suffixes.iter().any(|(_, h)| h == "manager"));
+        assert!(!suffixes.iter().any(|(_, h)| h == "service"));
+        assert!(suffixes.iter().any(|(_, h)| h == "factory"));
     }
 }
