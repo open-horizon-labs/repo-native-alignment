@@ -499,7 +499,7 @@ const CLOSURE_NODE_KINDS: &[&str] = &[
 /// When `skip_nested_fns` is true, subtrees whose node kind matches a
 /// `NodeKind::Function` entry in `config.node_kinds` are skipped (prevents
 /// nested function bodies from inflating the parent's complexity).
-fn count_branches(
+pub(super) fn count_branches(
     node: tree_sitter::Node,
     source: &[u8],
     config: &LangConfig,
@@ -549,7 +549,7 @@ fn count_branches(
 // ---------------------------------------------------------------------------
 
 /// Extract signature: text before the first `{`, or the first line.
-fn extract_signature(body: &str) -> String {
+pub(super) fn extract_signature(body: &str) -> String {
     if let Some(pos) = body.find('{') {
         let sig = body[..pos].trim();
         if !sig.is_empty() {
@@ -569,7 +569,7 @@ fn extract_signature(body: &str) -> String {
 /// uppercase letter (convention for most languages). When false, any
 /// non-primitive identifier is accepted (needed for Go unexported types
 /// and Python lowercase classes).
-fn extract_user_type(type_text: &str, require_uppercase: bool) -> Option<String> {
+pub(super) fn extract_user_type(type_text: &str, require_uppercase: bool) -> Option<String> {
     // Strip reference prefix (e.g. "&Foo", "&mut Foo")
     // Also strip Python/TS annotation prefix `: Foo` and `-> Foo`
     let s = type_text.trim()
