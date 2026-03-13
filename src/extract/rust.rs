@@ -55,6 +55,7 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
         "binary_expression",  // covers && and || (also arithmetic — same trade-off as Go/TS/Java)
         "try_expression",     // ?
     ],
+    decorator_node_kinds: &["attribute_item"],
 };
 
 /// Rust tree-sitter extractor with topology pattern detection.
@@ -956,6 +957,42 @@ pub trait Service {
 
         let create = result.nodes.iter().find(|n| n.id.name == "create" && n.id.kind == NodeKind::Function).unwrap();
         assert_eq!(create.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "create() should be static");
+    }
+
+    #[test]
+    fn test_rust_decorator_on_function_and_struct() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub port: u16,
+}
+
+#[test]
+fn test_something() {
+    assert!(true);
+}
+
+#[cfg(feature = "mcp")]
+#[instrument(skip(self))]
+pub fn handle_request() {}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        // Struct with #[derive]
+        let config = result.nodes.iter().find(|n| n.id.name == "Config").unwrap();
+        let decorators = config.metadata.get("decorators").expect("Config should have decorators");
+        assert!(decorators.contains("#[derive(Debug, Clone)]"), "got: {}", decorators);
+
+        // Function with #[test]
+        let test_fn = result.nodes.iter().find(|n| n.id.name == "test_something").unwrap();
+        assert_eq!(test_fn.metadata.get("decorators").map(|s| s.as_str()), Some("#[test]"));
+
+        // Function with multiple attributes
+        let handle = result.nodes.iter().find(|n| n.id.name == "handle_request").unwrap();
+        let decorators = handle.metadata.get("decorators").expect("handle_request should have decorators");
+        assert!(decorators.contains("#[cfg(feature = \"mcp\")]"), "got: {}", decorators);
+        assert!(decorators.contains("#[instrument(skip(self))]"), "got: {}", decorators);
     }
 
     /// Adversarial: impl with `self` value parameter (move semantics)

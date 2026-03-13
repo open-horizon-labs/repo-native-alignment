@@ -70,6 +70,13 @@ pub struct LangConfig {
     /// cyclomatic complexity (e.g. `["if_expression", "match_expression",
     /// "for_expression", "while_expression"]`).
     pub branch_node_types: &'static [&'static str],
+    /// Tree-sitter node kinds that represent decorators/attributes/annotations.
+    /// These are collected from previous siblings (or parent wrapper nodes)
+    /// and stored as `metadata["decorators"]` on the decorated symbol.
+    ///
+    /// Examples: `["decorator"]` (Python/TS), `["attribute_item"]` (Rust),
+    /// `["annotation"]` (Java/Kotlin). Empty slice = no decorator extraction.
+    pub decorator_node_kinds: &'static [&'static str],
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +224,14 @@ fn collect_nodes(
                         "is_static".to_string(),
                         if is_static { "true" } else { "false" }.to_string(),
                     );
+                }
+            }
+
+            // Decorator/attribute collection.
+            if !config.decorator_node_kinds.is_empty() {
+                let decorators = collect_decorators(node, source, config);
+                if !decorators.is_empty() {
+                    metadata.insert("decorators".to_string(), decorators);
                 }
             }
 
@@ -714,6 +729,110 @@ fn detect_is_static_keyword(node: tree_sitter::Node, source: &[u8]) -> Option<bo
     }
     // No static keyword found -> instance method
     Some(false)
+}
+
+// ---------------------------------------------------------------------------
+// Decorator / attribute collection
+// ---------------------------------------------------------------------------
+
+/// Collect decorator/attribute/annotation text for a node.
+///
+/// Strategy varies by language:
+/// - **Python:** decorators live on a `decorated_definition` wrapper parent.
+///   The function_definition/class_definition is a child of `decorated_definition`,
+///   and the `decorator` nodes are siblings within that wrapper.
+/// - **Rust/C#/Kotlin/TypeScript:** decorators are previous siblings of the node.
+/// - **Java:** annotations live inside a `modifiers` child of the declaration.
+///
+/// Returns a comma-separated string of decorator texts, or empty string if none found.
+fn collect_decorators(
+    node: tree_sitter::Node,
+    source: &[u8],
+    config: &LangConfig,
+) -> String {
+    let mut decorators = Vec::new();
+
+    // Strategy 1: Check parent wrapper (Python `decorated_definition` pattern).
+    // In tree-sitter-python, `@decorator` + `def foo` is parsed as:
+    //   decorated_definition
+    //     decorator: @app.route("/api")
+    //     decorator: @login_required
+    //     function_definition: def foo(): ...
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "decorated_definition" {
+            for i in 0..parent.child_count() {
+                if let Some(child) = parent.child(i as u32) {
+                    if config.decorator_node_kinds.contains(&child.kind()) {
+                        if let Ok(text) = child.utf8_text(source) {
+                            decorators.push(text.trim().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Strategy 2: Previous siblings (Rust attribute_item, TS decorator, C# attribute_list, Kotlin annotation).
+    // Walk backward through siblings collecting decorator nodes.
+    if decorators.is_empty() {
+        let mut sibling = node.prev_sibling();
+        while let Some(sib) = sibling {
+            if config.decorator_node_kinds.contains(&sib.kind()) {
+                if let Ok(text) = sib.utf8_text(source) {
+                    decorators.push(text.trim().to_string());
+                }
+                sibling = sib.prev_sibling();
+            } else {
+                // Stop at the first non-decorator sibling (don't skip over code).
+                // Exception: skip comment nodes (they can appear between decorators).
+                if sib.kind() == "comment" || sib.kind() == "line_comment" || sib.kind() == "block_comment" {
+                    sibling = sib.prev_sibling();
+                } else {
+                    break;
+                }
+            }
+        }
+        // Previous-sibling walk collects in reverse order; fix to source order.
+        decorators.reverse();
+    }
+
+    // Strategy 3: Child container (Java `modifiers` pattern).
+    // In tree-sitter-java, annotations are children of the `modifiers` node
+    // which is a child of the declaration itself.
+    if decorators.is_empty() {
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i as u32) {
+                if child.kind() == "modifiers" {
+                    for j in 0..child.child_count() {
+                        if let Some(mod_child) = child.child(j as u32) {
+                            if config.decorator_node_kinds.contains(&mod_child.kind()) {
+                                if let Ok(text) = mod_child.utf8_text(source) {
+                                    decorators.push(text.trim().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Strategy 4: Direct child decorators (TypeScript pattern).
+    // In tree-sitter-typescript, decorators are direct children of the declaration
+    // node (accessible via field "decorator" or by kind match on children).
+    if decorators.is_empty() {
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i as u32) {
+                if config.decorator_node_kinds.contains(&child.kind()) {
+                    if let Ok(text) = child.utf8_text(source) {
+                        decorators.push(text.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    decorators.join(", ")
 }
 
 // ---------------------------------------------------------------------------
@@ -1672,6 +1791,310 @@ enum Color {
             red.metadata.get("parent_scope"),
             Some(&"Color".to_string()),
             "C++ enumerator should have parent_scope = Color"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Decorator / attribute extraction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_python_decorator_single() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let ext = GenericExtractor::new(&PYTHON_CONFIG);
+        let code = r#"
+@app.route("/api")
+def handle():
+    pass
+"#;
+        let result = ext.run(Path::new("app.py"), code).unwrap();
+        let handle = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
+        assert_eq!(
+            handle.metadata.get("decorators").map(|s| s.as_str()),
+            Some("@app.route(\"/api\")"),
+            "Should capture single Python decorator"
+        );
+    }
+
+    #[test]
+    fn test_python_decorator_multiple() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let ext = GenericExtractor::new(&PYTHON_CONFIG);
+        let code = r#"
+@app.route("/api")
+@login_required
+def handle():
+    pass
+"#;
+        let result = ext.run(Path::new("app.py"), code).unwrap();
+        let handle = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
+        let decorators = handle.metadata.get("decorators").expect("Should have decorators");
+        assert!(decorators.contains("@app.route"), "Should contain @app.route, got: {}", decorators);
+        assert!(decorators.contains("@login_required"), "Should contain @login_required, got: {}", decorators);
+    }
+
+    #[test]
+    fn test_python_class_decorator() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let ext = GenericExtractor::new(&PYTHON_CONFIG);
+        let code = r#"
+@dataclass
+class Config:
+    port: int
+"#;
+        let result = ext.run(Path::new("config.py"), code).unwrap();
+        let config = result.nodes.iter().find(|n| n.id.name == "Config").unwrap();
+        assert_eq!(
+            config.metadata.get("decorators").map(|s| s.as_str()),
+            Some("@dataclass"),
+            "Should capture class decorator"
+        );
+    }
+
+    #[test]
+    fn test_python_no_decorator() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let ext = GenericExtractor::new(&PYTHON_CONFIG);
+        let code = r#"
+def plain_function():
+    pass
+"#;
+        let result = ext.run(Path::new("app.py"), code).unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "plain_function").unwrap();
+        assert!(
+            func.metadata.get("decorators").is_none(),
+            "Undecorated function should not have decorators metadata"
+        );
+    }
+
+    #[test]
+    fn test_rust_attribute_single() {
+        use crate::extract::rust::RUST_CONFIG;
+        let ext = GenericExtractor::new(&RUST_CONFIG);
+        let code = r#"
+#[test]
+fn test_something() {
+    assert!(true);
+}
+"#;
+        let result = ext.run(Path::new("lib.rs"), code).unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "test_something").unwrap();
+        assert_eq!(
+            func.metadata.get("decorators").map(|s| s.as_str()),
+            Some("#[test]"),
+            "Should capture Rust #[test] attribute"
+        );
+    }
+
+    #[test]
+    fn test_rust_attribute_multiple() {
+        use crate::extract::rust::RUST_CONFIG;
+        let ext = GenericExtractor::new(&RUST_CONFIG);
+        let code = r#"
+#[derive(Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Config {
+    pub port: u16,
+}
+"#;
+        let result = ext.run(Path::new("lib.rs"), code).unwrap();
+        let config = result.nodes.iter().find(|n| n.id.name == "Config").unwrap();
+        let decorators = config.metadata.get("decorators").expect("Should have decorators");
+        assert!(decorators.contains("#[derive(Debug, Clone)]"), "Should contain derive, got: {}", decorators);
+        assert!(decorators.contains("#[serde(rename_all = \"camelCase\")]"), "Should contain serde, got: {}", decorators);
+    }
+
+    #[test]
+    fn test_rust_no_attribute() {
+        use crate::extract::rust::RUST_CONFIG;
+        let ext = GenericExtractor::new(&RUST_CONFIG);
+        let code = "pub fn plain() {}\n";
+        let result = ext.run(Path::new("lib.rs"), code).unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "plain").unwrap();
+        assert!(
+            func.metadata.get("decorators").is_none(),
+            "Unattributed function should not have decorators metadata"
+        );
+    }
+
+    #[test]
+    fn test_java_annotation() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let ext = GenericExtractor::new(&JAVA_CONFIG);
+        let code = r#"
+public class UserController {
+    @Override
+    public void handle() {
+    }
+}
+"#;
+        let result = ext.run(Path::new("UserController.java"), code).unwrap();
+        let handle = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
+        assert_eq!(
+            handle.metadata.get("decorators").map(|s| s.as_str()),
+            Some("@Override"),
+            "Should capture Java @Override annotation"
+        );
+    }
+
+    #[test]
+    fn test_java_annotation_with_args() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let ext = GenericExtractor::new(&JAVA_CONFIG);
+        let code = r#"
+public class UserController {
+    @GetMapping("/users")
+    public List<User> getUsers() {
+        return null;
+    }
+}
+"#;
+        let result = ext.run(Path::new("UserController.java"), code).unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "getUsers").unwrap();
+        let decorators = func.metadata.get("decorators").expect("Should have decorators");
+        assert!(decorators.contains("@GetMapping"), "Should contain @GetMapping, got: {}", decorators);
+    }
+
+    #[test]
+    fn test_java_class_annotations() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let ext = GenericExtractor::new(&JAVA_CONFIG);
+        let code = r#"
+@RestController
+@RequestMapping("/api")
+public class UserController {
+}
+"#;
+        let result = ext.run(Path::new("UserController.java"), code).unwrap();
+        let cls = result.nodes.iter().find(|n| n.id.name == "UserController").unwrap();
+        let decorators = cls.metadata.get("decorators").expect("Should have decorators");
+        assert!(decorators.contains("@RestController"), "Should contain @RestController, got: {}", decorators);
+        assert!(decorators.contains("@RequestMapping"), "Should contain @RequestMapping, got: {}", decorators);
+    }
+
+    #[test]
+    fn test_typescript_decorator() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let ext = GenericExtractor::new(&TYPESCRIPT_CONFIG);
+        let code = r#"
+@Controller("/api")
+class UserController {
+}
+"#;
+        let result = ext.run(Path::new("controller.ts"), code).unwrap();
+        let cls = result.nodes.iter().find(|n| n.id.name == "UserController").unwrap();
+        let decorators = cls.metadata.get("decorators").expect("Should have decorators");
+        assert!(decorators.contains("@Controller"), "Should contain @Controller, got: {}", decorators);
+    }
+
+    #[test]
+    fn test_go_no_decorators() {
+        use crate::extract::configs::GO_CONFIG;
+        let ext = GenericExtractor::new(&GO_CONFIG);
+        let code = "package main\n\nfunc hello() {}\n";
+        let result = ext.run(Path::new("main.go"), code).unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "hello").unwrap();
+        assert!(
+            func.metadata.get("decorators").is_none(),
+            "Go functions should never have decorators"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Adversarial decorator tests (seeded from dissent)
+    // -----------------------------------------------------------------------
+
+    /// Adversarial: decorator on first function must NOT bleed to the next undecorated one.
+    #[test]
+    fn test_python_decorator_no_bleed_to_next_function() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let ext = GenericExtractor::new(&PYTHON_CONFIG);
+        let code = r#"
+@app.route("/api")
+def handle():
+    pass
+
+def plain():
+    pass
+"#;
+        let result = ext.run(Path::new("app.py"), code).unwrap();
+        let handle = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
+        assert!(handle.metadata.get("decorators").is_some(), "handle should have decorators");
+
+        let plain = result.nodes.iter().find(|n| n.id.name == "plain").unwrap();
+        assert!(
+            plain.metadata.get("decorators").is_none(),
+            "Undecorated plain() should NOT inherit decorators from handle(), got: {:?}",
+            plain.metadata.get("decorators")
+        );
+    }
+
+    /// Adversarial: Rust attribute on first function must not bleed to second.
+    #[test]
+    fn test_rust_attribute_no_bleed() {
+        use crate::extract::rust::RUST_CONFIG;
+        let ext = GenericExtractor::new(&RUST_CONFIG);
+        let code = r#"
+#[test]
+fn test_thing() {}
+
+fn plain() {}
+"#;
+        let result = ext.run(Path::new("lib.rs"), code).unwrap();
+        let test_fn = result.nodes.iter().find(|n| n.id.name == "test_thing").unwrap();
+        assert_eq!(test_fn.metadata.get("decorators").map(|s| s.as_str()), Some("#[test]"));
+
+        let plain = result.nodes.iter().find(|n| n.id.name == "plain").unwrap();
+        assert!(
+            plain.metadata.get("decorators").is_none(),
+            "plain() should not inherit #[test] from test_thing(), got: {:?}",
+            plain.metadata.get("decorators")
+        );
+    }
+
+    /// Adversarial: comment between decorator and function should not break collection.
+    #[test]
+    fn test_rust_attribute_with_comment_between() {
+        use crate::extract::rust::RUST_CONFIG;
+        let ext = GenericExtractor::new(&RUST_CONFIG);
+        let code = r#"
+#[derive(Debug)]
+// This is a config struct
+pub struct Config {
+    pub port: u16,
+}
+"#;
+        let result = ext.run(Path::new("lib.rs"), code).unwrap();
+        let config = result.nodes.iter().find(|n| n.id.name == "Config").unwrap();
+        assert_eq!(
+            config.metadata.get("decorators").map(|s| s.as_str()),
+            Some("#[derive(Debug)]"),
+            "Comment between attribute and struct should not break decorator collection"
+        );
+    }
+
+    /// Adversarial: Java method with no annotations in annotated class.
+    #[test]
+    fn test_java_annotation_no_bleed_within_class() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let ext = GenericExtractor::new(&JAVA_CONFIG);
+        let code = r#"
+public class UserController {
+    @Override
+    public void handle() {}
+
+    public void plain() {}
+}
+"#;
+        let result = ext.run(Path::new("UserController.java"), code).unwrap();
+        let handle = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
+        assert!(handle.metadata.get("decorators").is_some(), "handle should have @Override");
+
+        let plain = result.nodes.iter().find(|n| n.id.name == "plain").unwrap();
+        assert!(
+            plain.metadata.get("decorators").is_none(),
+            "plain() should NOT inherit @Override from handle(), got: {:?}",
+            plain.metadata.get("decorators")
         );
     }
 }
