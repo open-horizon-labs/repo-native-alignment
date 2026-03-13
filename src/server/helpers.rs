@@ -276,7 +276,7 @@ mod tests {
         let status = LspEnrichmentStatus::default();
         status.set_running();
         let result = format_freshness(50, Some(std::time::Instant::now()), Some(&status));
-        assert!(result.contains("LSP: pending..."));
+        assert!(result.contains("LSP: pending"));
     }
 
     #[test]
@@ -284,7 +284,7 @@ mod tests {
         let status = LspEnrichmentStatus::default();
         status.set_complete(10);
         let result = format_freshness(50, Some(std::time::Instant::now()), Some(&status));
-        assert!(result.contains("LSP: enriched +10 edges"));
+        assert!(result.contains("LSP: enriched (10 edges)"));
     }
 
     #[test]
