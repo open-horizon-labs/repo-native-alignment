@@ -57,11 +57,12 @@ pub static TYPESCRIPT_CONFIG: LangConfig = LangConfig {
         ("interface_declaration",      NodeKind::Trait),
         ("enum_declaration",           NodeKind::Enum),
         ("public_field_definition",    NodeKind::Field),
+        ("method_signature",           NodeKind::Function),
         // enum variants handled as special case in typescript.rs (TS uses
         // property_identifier / enum_assignment, not a dedicated enum_member node type)
         // module-level const handled as special case in typescript.rs
     ],
-    scope_parent_kinds: &["class_declaration", "enum_declaration"],
+    scope_parent_kinds: &["class_declaration", "enum_declaration", "interface_declaration"],
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string", Some("string_fragment"))],
@@ -169,7 +170,7 @@ pub static JAVA_CONFIG: LangConfig = LangConfig {
         ("enum_constant",           NodeKind::Field),
         // static final consts handled in java.rs (text inspection)
     ],
-    scope_parent_kinds: &["class_declaration", "record_declaration", "enum_declaration"],
+    scope_parent_kinds: &["class_declaration", "record_declaration", "enum_declaration", "interface_declaration"],
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string_literal", None)],
@@ -246,7 +247,7 @@ pub static CSHARP_CONFIG: LangConfig = LangConfig {
         ("enum_member_declaration", NodeKind::Field),
         // const fields handled in csharp.rs (text inspection)
     ],
-    scope_parent_kinds: &["class_declaration", "struct_declaration", "record_declaration", "enum_declaration"],
+    scope_parent_kinds: &["class_declaration", "struct_declaration", "record_declaration", "enum_declaration", "interface_declaration"],
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string_literal", None)],
@@ -284,7 +285,7 @@ pub static SWIFT_CONFIG: LangConfig = LangConfig {
         ("enum_case_element",       NodeKind::Field),
         ("import_declaration",      NodeKind::Import),
     ],
-    scope_parent_kinds: &["class_declaration", "struct_declaration", "enum_declaration"],
+    scope_parent_kinds: &["class_declaration", "struct_declaration", "enum_declaration", "protocol_declaration"],
     const_value_field: None,
     full_text_name_kinds: &["import_declaration"],
     string_literal_kinds: &[("string_literal", Some("string_literal_segment"))],

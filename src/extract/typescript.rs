@@ -1404,4 +1404,39 @@ export type UserId = string;
             "Exported type alias should have module-level Defines edge",
         );
     }
+
+    #[test]
+    fn test_extract_ts_interface_method_signatures() {
+        let extractor = TypeScriptExtractor::new();
+        let code = r#"
+interface Service {
+    serve(port: number): void;
+    stop(): Promise<void>;
+}
+"#;
+        let result = extractor.extract(Path::new("src/service.ts"), code).unwrap();
+
+        // Interface itself should be found as Trait
+        let service = result.nodes.iter().find(|n| n.id.name == "Service" && n.id.kind == NodeKind::Trait);
+        assert!(service.is_some(), "Should find interface Service");
+
+        // Method signatures should be indexed as Function nodes
+        let serve = result.nodes.iter().find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function);
+        assert!(serve.is_some(), "Should find interface method serve");
+
+        let stop = result.nodes.iter().find(|n| n.id.name == "stop" && n.id.kind == NodeKind::Function);
+        assert!(stop.is_some(), "Should find interface method stop");
+
+        // Methods should have parent_scope pointing to the interface
+        assert_eq!(
+            serve.unwrap().metadata.get("parent_scope"),
+            Some(&"Service".to_string()),
+            "serve should have parent_scope = Service"
+        );
+        assert_eq!(
+            stop.unwrap().metadata.get("parent_scope"),
+            Some(&"Service".to_string()),
+            "stop should have parent_scope = Service"
+        );
+    }
 }

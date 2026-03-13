@@ -171,3 +171,43 @@ fn collect_java_specials(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_java_interface_methods() {
+        let extractor = JavaExtractor::new();
+        let code = r#"
+public interface Service {
+    void serve(int port);
+    String getName();
+}
+"#;
+        let result = extractor.extract(Path::new("Service.java"), code).unwrap();
+
+        // Interface itself should be found as Trait
+        let service = result.nodes.iter().find(|n| n.id.name == "Service" && n.id.kind == NodeKind::Trait);
+        assert!(service.is_some(), "Should find interface Service");
+
+        // Interface methods should be indexed as Function nodes
+        let serve = result.nodes.iter().find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function);
+        assert!(serve.is_some(), "Should find interface method serve");
+
+        let get_name = result.nodes.iter().find(|n| n.id.name == "getName" && n.id.kind == NodeKind::Function);
+        assert!(get_name.is_some(), "Should find interface method getName");
+
+        // Methods should have parent_scope pointing to the interface
+        assert_eq!(
+            serve.unwrap().metadata.get("parent_scope"),
+            Some(&"Service".to_string()),
+            "serve should have parent_scope = Service"
+        );
+        assert_eq!(
+            get_name.unwrap().metadata.get("parent_scope"),
+            Some(&"Service".to_string()),
+            "getName should have parent_scope = Service"
+        );
+    }
+}

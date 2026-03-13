@@ -33,10 +33,11 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
         ("mod_item",         NodeKind::Module),
         ("use_declaration",  NodeKind::Import),
         ("macro_definition", NodeKind::Macro),
-        ("field_declaration",NodeKind::Field),
-        ("enum_variant",     NodeKind::Field),
+        ("field_declaration",        NodeKind::Field),
+        ("enum_variant",             NodeKind::Field),
+        ("function_signature_item",  NodeKind::Function),
     ],
-    scope_parent_kinds: &["impl_item", "struct_item", "enum_item"],
+    scope_parent_kinds: &["impl_item", "struct_item", "enum_item", "trait_item"],
     const_value_field: Some("value"),
     // use_declaration: the name IS the full `use crate::foo::Bar;` text.
     full_text_name_kinds: &["use_declaration"],
@@ -787,5 +788,113 @@ static FOO: u32 = 42;
             foos.iter().any(|n| n.metadata.get("storage").is_none()),
             "At least one FOO should be a plain const without storage"
         );
+    }
+
+    #[test]
+    fn test_extract_rust_trait_method_signatures() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+pub trait Service {
+    fn serve(&self);
+    fn stop(&mut self);
+}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        // Trait itself should be found
+        let service = result.nodes.iter().find(|n| n.id.name == "Service" && n.id.kind == NodeKind::Trait);
+        assert!(service.is_some(), "Should find trait Service");
+
+        // Trait methods should be indexed as Function nodes
+        let serve = result.nodes.iter().find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function);
+        assert!(serve.is_some(), "Should find trait method serve");
+
+        let stop = result.nodes.iter().find(|n| n.id.name == "stop" && n.id.kind == NodeKind::Function);
+        assert!(stop.is_some(), "Should find trait method stop");
+
+        // Methods should have parent_scope pointing to the trait
+        assert_eq!(
+            serve.unwrap().metadata.get("parent_scope"),
+            Some(&"Service".to_string()),
+            "serve should have parent_scope = Service"
+        );
+        assert_eq!(
+            stop.unwrap().metadata.get("parent_scope"),
+            Some(&"Service".to_string()),
+            "stop should have parent_scope = Service"
+        );
+
+        // Should produce Defines edges from trait to methods
+        let defines_edges: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Defines && e.from.name == "Service")
+            .collect();
+        assert!(
+            defines_edges.iter().any(|e| e.to.name == "serve"),
+            "Should have Defines edge Service -> serve"
+        );
+        assert!(
+            defines_edges.iter().any(|e| e.to.name == "stop"),
+            "Should have Defines edge Service -> stop"
+        );
+    }
+
+    #[test]
+    fn test_trait_default_method_and_signature_coexist() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+pub trait Handler {
+    fn handle(&self, req: Request) -> Response;
+    fn name(&self) -> &str {
+        "default"
+    }
+}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        // Both signature-only and default methods should be found
+        let handle = result.nodes.iter().find(|n| n.id.name == "handle" && n.id.kind == NodeKind::Function);
+        assert!(handle.is_some(), "Should find signature-only method handle");
+
+        let name_fn = result.nodes.iter().find(|n| n.id.name == "name" && n.id.kind == NodeKind::Function);
+        assert!(name_fn.is_some(), "Should find default method name");
+
+        // Both should have parent_scope = Handler
+        assert_eq!(handle.unwrap().metadata.get("parent_scope"), Some(&"Handler".to_string()));
+        assert_eq!(name_fn.unwrap().metadata.get("parent_scope"), Some(&"Handler".to_string()));
+    }
+
+    #[test]
+    fn test_no_duplicate_trait_and_impl_methods() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+pub trait Service {
+    fn serve(&self);
+}
+
+struct MyService;
+
+impl Service for MyService {
+    fn serve(&self) {
+        println!("serving");
+    }
+}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        // There should be exactly 2 Function nodes named "serve":
+        // one from the trait (function_signature_item) and one from the impl (function_item)
+        let serves: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function)
+            .collect();
+        assert_eq!(serves.len(), 2, "Should find exactly 2 serve methods (trait + impl), got: {}", serves.len());
+
+        // One should have parent_scope = Service (trait), other = Service for MyService (impl)
+        let trait_serve = serves.iter().find(|n| n.metadata.get("parent_scope") == Some(&"Service".to_string()));
+        assert!(trait_serve.is_some(), "Should find trait serve with parent_scope=Service");
+
+        let impl_serve = serves.iter().find(|n| n.metadata.get("parent_scope") == Some(&"Service for MyService".to_string()));
+        assert!(impl_serve.is_some(), "Should find impl serve with parent_scope=Service for MyService");
     }
 }

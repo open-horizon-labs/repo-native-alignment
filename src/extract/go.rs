@@ -108,7 +108,7 @@ fn collect_go_specials(
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i as u32) {
                     if child.kind() == "type_spec" {
-                        extract_type_spec(child, path, source, nodes);
+                        extract_type_spec(child, path, source, nodes, edges);
                     }
                 }
             }
@@ -357,11 +357,14 @@ fn extract_go_var_spec(
 }
 
 /// Extract a type_spec (e.g., `Foo struct { ... }` or `Bar interface { ... }`).
+/// For interfaces, also extracts individual method_spec children as Function nodes
+/// with `parent_scope` pointing to the interface name.
 fn extract_type_spec(
     node: tree_sitter::Node,
     path: &Path,
     source: &[u8],
     nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
 ) {
     if let Some(name) = node.child_by_field_name("name") {
         let name_str = name.utf8_text(source).unwrap_or("unknown").to_string();
@@ -383,8 +386,8 @@ fn extract_type_spec(
             id: NodeId {
                 root: String::new(),
                 file: path.to_path_buf(),
-                name: name_str,
-                kind,
+                name: name_str.clone(),
+                kind: kind.clone(),
             },
             language: "go".to_string(),
             line_start: node.start_position().row + 1,
@@ -394,6 +397,80 @@ fn extract_type_spec(
             metadata: BTreeMap::new(),
             source: ExtractionSource::TreeSitter,
         });
+
+        // For interfaces, extract method_spec children as Function nodes.
+        if kind == NodeKind::Trait {
+            if let Some(type_body) = type_node {
+                extract_interface_methods(type_body, path, source, &name_str, nodes, edges);
+            }
+        }
+    }
+}
+
+/// Extract method_spec nodes from a Go interface_type body.
+fn extract_interface_methods(
+    interface_node: tree_sitter::Node,
+    path: &Path,
+    source: &[u8],
+    interface_name: &str,
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+) {
+    for i in 0..interface_node.child_count() {
+        if let Some(child) = interface_node.child(i as u32) {
+            if child.kind() == "method_elem" || child.kind() == "method_spec" {
+                let method_name = child
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                if method_name == "unknown" {
+                    continue;
+                }
+
+                let method_body = child.utf8_text(source).unwrap_or("").to_string();
+                let signature = method_body.lines().next().unwrap_or("").to_string();
+
+                let mut metadata = BTreeMap::new();
+                metadata.insert("parent_scope".to_string(), interface_name.to_string());
+
+                nodes.push(Node {
+                    id: NodeId {
+                        root: String::new(),
+                        file: path.to_path_buf(),
+                        name: method_name.clone(),
+                        kind: NodeKind::Function,
+                    },
+                    language: "go".to_string(),
+                    line_start: child.start_position().row + 1,
+                    line_end: child.end_position().row + 1,
+                    signature,
+                    body: method_body,
+                    metadata,
+                    source: ExtractionSource::TreeSitter,
+                });
+
+                // Emit structural edge from interface to method.
+                edges.push(Edge {
+                    from: NodeId {
+                        root: String::new(),
+                        file: path.to_path_buf(),
+                        name: interface_name.to_string(),
+                        kind: NodeKind::Trait,
+                    },
+                    to: NodeId {
+                        root: String::new(),
+                        file: path.to_path_buf(),
+                        name: method_name,
+                        kind: NodeKind::Function,
+                    },
+                    kind: EdgeKind::Defines,
+                    source: ExtractionSource::TreeSitter,
+                    confidence: Confidence::Detected,
+                });
+            }
+        }
     }
 }
 
@@ -886,5 +963,56 @@ func main() {
         // Both should be captured (known limitation: we don't filter by scope)
         assert!(names.contains(&"GlobalVar"), "Should find global var");
         assert!(names.contains(&"localVar"), "Function-local var also captured (known behavior)");
+    }
+
+    #[test]
+    fn test_extract_go_interface_method_specs() {
+        let extractor = GoExtractor::new();
+        let code = r#"package main
+
+type Reader interface {
+	Read(p []byte) (n int, err error)
+	Close() error
+}
+"#;
+        let result = extractor.extract(Path::new("main.go"), code).unwrap();
+
+        // Interface itself should be found as Trait
+        let reader = result.nodes.iter().find(|n| n.id.name == "Reader" && n.id.kind == NodeKind::Trait);
+        assert!(reader.is_some(), "Should find interface Reader");
+
+        // Method specs should be indexed as Function nodes
+        let read = result.nodes.iter().find(|n| n.id.name == "Read" && n.id.kind == NodeKind::Function);
+        assert!(read.is_some(), "Should find interface method Read");
+
+        let close = result.nodes.iter().find(|n| n.id.name == "Close" && n.id.kind == NodeKind::Function);
+        assert!(close.is_some(), "Should find interface method Close");
+
+        // Methods should have parent_scope pointing to the interface
+        assert_eq!(
+            read.unwrap().metadata.get("parent_scope"),
+            Some(&"Reader".to_string()),
+            "Read should have parent_scope = Reader"
+        );
+        assert_eq!(
+            close.unwrap().metadata.get("parent_scope"),
+            Some(&"Reader".to_string()),
+            "Close should have parent_scope = Reader"
+        );
+
+        // Should produce Defines edges from interface to methods
+        let defines_edges: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Defines && e.from.name == "Reader")
+            .collect();
+        assert!(
+            defines_edges.iter().any(|e| e.to.name == "Read"),
+            "Should have Defines edge Reader -> Read"
+        );
+        assert!(
+            defines_edges.iter().any(|e| e.to.name == "Close"),
+            "Should have Defines edge Reader -> Close"
+        );
     }
 }
