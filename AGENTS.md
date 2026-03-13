@@ -124,7 +124,7 @@ MCP server with a workspace-wide context engine. Incrementally scans repos, extr
 - Don't port fsPulse's 4-phase scanner wholesale — RNA needs simpler: detect changed → extract → index
 
 ## Decision Context
-Solo developer. PRs go through the full /ship pipeline (10 steps). "Done" = all TODOs resolved, manually verified with real data, tests pass, MCP client connects. Session learnings recorded as metis via MCP tools.
+Solo developer. PRs go through the full /ship pipeline (12 steps). "Done" = all TODOs resolved, manually verified with real data, tests pass, MCP client connects. Session learnings recorded as metis via MCP tools.
 
 ## Key Modules
 - `src/graph/` — unified graph model (types, LanceDB schemas, petgraph index)
