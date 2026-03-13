@@ -390,7 +390,7 @@ fn collect_ts_specials(
                                         id: NodeId {
                                             root: String::new(),
                                             file: path.to_path_buf(),
-                                            name: name_str,
+                                            name: name_str.clone(),
                                             kind: NodeKind::Const,
                                         },
                                         language: "typescript".to_string(),
@@ -401,6 +401,14 @@ fn collect_ts_specials(
                                         metadata,
                                         source: ExtractionSource::TreeSitter,
                                     });
+
+                                    // Emit module-level Defines edge for const nodes
+                                    emit_module_defines_edge(
+                                        path,
+                                        &name_str,
+                                        NodeKind::Const,
+                                        edges,
+                                    );
                                 }
                             }
                         }
@@ -443,6 +451,14 @@ fn collect_ts_specials(
                 });
             }
 
+            // Emit module-level Defines edge for import nodes
+            emit_module_defines_edge(
+                path,
+                &import_node.id.name,
+                NodeKind::Import,
+                edges,
+            );
+
             nodes.push(import_node);
         }
         "type_alias_declaration" => {
@@ -456,7 +472,7 @@ fn collect_ts_specials(
                     id: NodeId {
                         root: String::new(),
                         file: path.to_path_buf(),
-                        name: name_str,
+                        name: name_str.clone(),
                         kind: NodeKind::Other("type_alias".to_string()),
                     },
                     language: "typescript".to_string(),
@@ -467,6 +483,14 @@ fn collect_ts_specials(
                     metadata,
                     source: ExtractionSource::TreeSitter,
                 });
+
+                // Emit module-level Defines edge for type alias nodes
+                emit_module_defines_edge(
+                    path,
+                    &name_str,
+                    NodeKind::Other("type_alias".to_string()),
+                    edges,
+                );
             }
         }
         // Enum variants: `enum Direction { Up, Down = 1 }`
@@ -1110,4 +1134,146 @@ class Foo {
         );
     }
 
+    // --- Defines edge tests for imports, consts, type aliases (#168) ---
+
+    #[test]
+    fn test_const_gets_module_defines_edge() {
+        let extractor = TypeScriptExtractor::new();
+        let code = r#"
+const PORT = 3000;
+const NAME = "hello";
+"#;
+        let result = extractor.extract(Path::new("src/config.ts"), code).unwrap();
+
+        for name in &["PORT", "NAME"] {
+            let defines: Vec<_> = result
+                .edges
+                .iter()
+                .filter(|e| {
+                    e.kind == EdgeKind::Defines
+                        && e.from.kind == NodeKind::Module
+                        && e.from.name == "config"
+                        && e.to.name == *name
+                        && e.to.kind == NodeKind::Const
+                })
+                .collect();
+            assert_eq!(
+                defines.len(),
+                1,
+                "Const {} should have module-level Defines edge",
+                name,
+            );
+        }
+    }
+
+    #[test]
+    fn test_import_gets_module_defines_edge() {
+        let extractor = TypeScriptExtractor::new();
+        let code = r#"
+import { Router } from 'express';
+import path from 'path';
+"#;
+        let result = extractor.extract(Path::new("src/app.ts"), code).unwrap();
+
+        let import_defines: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Defines
+                    && e.from.kind == NodeKind::Module
+                    && e.from.name == "app"
+                    && e.to.kind == NodeKind::Import
+            })
+            .collect();
+        assert_eq!(
+            import_defines.len(),
+            2,
+            "Each import should have a module-level Defines edge",
+        );
+    }
+
+    #[test]
+    fn test_type_alias_gets_module_defines_edge() {
+        let extractor = TypeScriptExtractor::new();
+        let code = r#"
+type UserId = string;
+type Config = { port: number; host: string };
+"#;
+        let result = extractor.extract(Path::new("src/types.ts"), code).unwrap();
+
+        for name in &["UserId", "Config"] {
+            let defines: Vec<_> = result
+                .edges
+                .iter()
+                .filter(|e| {
+                    e.kind == EdgeKind::Defines
+                        && e.from.kind == NodeKind::Module
+                        && e.from.name == "types"
+                        && e.to.name == *name
+                })
+                .collect();
+            assert_eq!(
+                defines.len(),
+                1,
+                "Type alias {} should have module-level Defines edge",
+                name,
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_special_nodes_reachable_from_module() {
+        // Integration test: module graph traversal finds all special-cased nodes
+        let extractor = TypeScriptExtractor::new();
+        let code = r#"
+import { Router } from 'express';
+const PORT = 3000;
+const handler = (req: Request, res: Response) => { res.send("ok"); };
+type UserId = string;
+function regularFn() {}
+"#;
+        let result = extractor.extract(Path::new("src/app.ts"), code).unwrap();
+
+        let module_defines: Vec<String> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Defines
+                    && e.from.kind == NodeKind::Module
+                    && e.from.name == "app"
+            })
+            .map(|e| e.to.name.clone())
+            .collect();
+
+        // Import
+        assert!(
+            module_defines.iter().any(|n| n.contains("import")),
+            "Module should define import node, defines: {:?}",
+            module_defines
+        );
+        // Const
+        assert!(
+            module_defines.contains(&"PORT".to_string()),
+            "Module should define PORT const, defines: {:?}",
+            module_defines
+        );
+        // Arrow function
+        assert!(
+            module_defines.contains(&"handler".to_string()),
+            "Module should define handler arrow fn, defines: {:?}",
+            module_defines
+        );
+        // Type alias
+        assert!(
+            module_defines.contains(&"UserId".to_string()),
+            "Module should define UserId type alias, defines: {:?}",
+            module_defines
+        );
+        // Regular function (from generic extractor)
+        assert!(
+            module_defines.contains(&"regularFn".to_string()),
+            "Module should define regularFn, defines: {:?}",
+            module_defines
+        );
+    }
 }
