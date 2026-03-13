@@ -210,4 +210,50 @@ public interface Service {
             "getName should have parent_scope = Service"
         );
     }
+
+    #[test]
+    fn test_java_is_static() {
+        let extractor = JavaExtractor::new();
+        let code = r#"
+public class MyService {
+    public static MyService create() {
+        return new MyService();
+    }
+
+    public void serve() {
+        System.out.println("serving");
+    }
+
+    public static int count() {
+        return 0;
+    }
+}
+"#;
+        let result = extractor.extract(Path::new("MyService.java"), code).unwrap();
+
+        let create = result.nodes.iter().find(|n| n.id.name == "create" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(create.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "static create() should be static");
+
+        let serve = result.nodes.iter().find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(serve.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "serve() should be instance");
+
+        let count = result.nodes.iter().find(|n| n.id.name == "count" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(count.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "static count() should be static");
+    }
+
+    #[test]
+    fn test_java_top_level_no_is_static() {
+        // Java doesn't have top-level functions, but methods in classes should have is_static
+        // while constructors inside classes should also have is_static
+        let extractor = JavaExtractor::new();
+        let code = r#"
+public class Foo {
+    public Foo() {}
+}
+"#;
+        let result = extractor.extract(Path::new("Foo.java"), code).unwrap();
+
+        let ctor = result.nodes.iter().find(|n| n.id.name == "Foo" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(ctor.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "Constructor should be instance (no static keyword)");
+    }
 }

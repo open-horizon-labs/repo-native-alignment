@@ -897,4 +897,64 @@ impl Service for MyService {
         let impl_serve = serves.iter().find(|n| n.metadata.get("parent_scope") == Some(&"Service for MyService".to_string()));
         assert!(impl_serve.is_some(), "Should find impl serve with parent_scope=Service for MyService");
     }
+
+    #[test]
+    fn test_rust_is_static_instance_method() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+struct Foo;
+
+impl Foo {
+    pub fn new() -> Self { Foo }
+    pub fn instance(&self) -> i32 { 42 }
+    pub fn instance_mut(&mut self) {}
+    pub fn associated() -> String { String::new() }
+}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        // new() has no self param -> static
+        let new_fn = result.nodes.iter().find(|n| n.id.name == "new" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(new_fn.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "new() should be static");
+
+        // instance(&self) -> not static
+        let instance = result.nodes.iter().find(|n| n.id.name == "instance" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(instance.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "instance() should not be static");
+
+        // instance_mut(&mut self) -> not static
+        let instance_mut = result.nodes.iter().find(|n| n.id.name == "instance_mut" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(instance_mut.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "instance_mut() should not be static");
+
+        // associated() has no self -> static
+        let associated = result.nodes.iter().find(|n| n.id.name == "associated" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(associated.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "associated() should be static");
+    }
+
+    #[test]
+    fn test_rust_top_level_fn_no_is_static() {
+        let extractor = RustExtractor::new();
+        let code = "pub fn top_level() {}\n";
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        let func = result.nodes.iter().find(|n| n.id.name == "top_level").unwrap();
+        assert!(func.metadata.get("is_static").is_none(), "Top-level function should NOT have is_static");
+    }
+
+    #[test]
+    fn test_rust_trait_method_signatures_is_static() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+pub trait Service {
+    fn serve(&self);
+    fn create() -> Self;
+}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        let serve = result.nodes.iter().find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(serve.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "serve(&self) should be instance");
+
+        let create = result.nodes.iter().find(|n| n.id.name == "create" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(create.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "create() should be static");
+    }
 }

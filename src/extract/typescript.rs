@@ -1439,4 +1439,44 @@ interface Service {
             "stop should have parent_scope = Service"
         );
     }
+
+    #[test]
+    fn test_typescript_is_static() {
+        let extractor = TypeScriptExtractor::new();
+        let code = r#"
+class MyService {
+    static create(): MyService {
+        return new MyService();
+    }
+
+    serve(): void {
+        console.log("serving");
+    }
+
+    static count(): number {
+        return 0;
+    }
+}
+"#;
+        let result = extractor.extract(Path::new("service.ts"), code).unwrap();
+
+        let create = result.nodes.iter().find(|n| n.id.name == "create" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(create.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "static create() should be static");
+
+        let serve = result.nodes.iter().find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(serve.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "serve() should be instance");
+
+        let count = result.nodes.iter().find(|n| n.id.name == "count" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(count.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "static count() should be static");
+    }
+
+    #[test]
+    fn test_typescript_top_level_fn_no_is_static() {
+        let extractor = TypeScriptExtractor::new();
+        let code = "function topLevel(): void {}\n";
+        let result = extractor.extract(Path::new("app.ts"), code).unwrap();
+
+        let func = result.nodes.iter().find(|n| n.id.name == "topLevel").unwrap();
+        assert!(func.metadata.get("is_static").is_none(), "Top-level function should NOT have is_static");
+    }
 }

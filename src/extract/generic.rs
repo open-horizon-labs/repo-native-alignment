@@ -210,6 +210,16 @@ fn collect_nodes(
                 metadata.insert("cyclomatic".to_string(), (1 + branches).to_string());
             }
 
+            // Static vs instance method detection for functions inside a scope.
+            if node_kind == NodeKind::Function && parent_scope.is_some() {
+                if let Some(is_static) = detect_is_static(node, source, config) {
+                    metadata.insert(
+                        "is_static".to_string(),
+                        if is_static { "true" } else { "false" }.to_string(),
+                    );
+                }
+            }
+
             // Const value extraction.
             if node_kind == NodeKind::Const {
                 if let Some(value_field) = config.const_value_field {
@@ -542,6 +552,168 @@ pub(super) fn count_branches(
         }
     }
     count
+}
+
+// ---------------------------------------------------------------------------
+// Static / instance method detection
+// ---------------------------------------------------------------------------
+
+/// Detect whether a function node inside a class/struct/impl scope is a static
+/// (or associated) function vs an instance method. Returns `Some(true)` for
+/// static, `Some(false)` for instance, or `None` if detection is not applicable
+/// for this language.
+///
+/// Language-specific heuristics:
+/// - **Rust:** First param is `self`/`&self`/`&mut self` -> instance; else -> static
+/// - **Python:** Has `@staticmethod` decorator -> static; first param is `self`/`cls` -> instance
+/// - **Java/C#/TypeScript:** `static` keyword in function text -> static; else -> instance
+/// - Other languages with no `param_container_field` -> `None` (skip)
+fn detect_is_static(
+    node: tree_sitter::Node,
+    source: &[u8],
+    config: &LangConfig,
+) -> Option<bool> {
+    match config.language_name {
+        "rust" => detect_is_static_rust(node, source),
+        "python" => detect_is_static_python(node, source),
+        "java" | "csharp" | "typescript" | "javascript" => detect_is_static_keyword(node, source),
+        _ => None,
+    }
+}
+
+/// Rust: A function in an impl/trait block is an instance method if its first
+/// parameter is `self`, `&self`, `&mut self`, or `mut self`.
+fn detect_is_static_rust(node: tree_sitter::Node, source: &[u8]) -> Option<bool> {
+    if let Some(params) = node.child_by_field_name("parameters") {
+        for i in 0..params.child_count() {
+            if let Some(param) = params.child(i as u32) {
+                // In Rust tree-sitter, `self` parameters are `self_parameter` nodes.
+                if param.kind() == "self_parameter" {
+                    return Some(false); // instance method
+                }
+                // Also check for named params that might be "self" variants
+                if param.is_named() && param.kind() != "," {
+                    let text = param.utf8_text(source).unwrap_or("").trim();
+                    if text == "self" || text == "&self" || text == "&mut self" || text == "mut self" {
+                        return Some(false);
+                    }
+                    // First real parameter is not self -> static
+                    return Some(true);
+                }
+            }
+        }
+        // No parameters at all -> static (associated function)
+        Some(true)
+    } else {
+        // function_signature_item (trait methods) may not have "parameters" field;
+        // check the body text for self
+        let text = node.utf8_text(source).unwrap_or("");
+        if text.contains("&self") || text.contains("&mut self")
+            || text.contains("(self") || text.contains("( self")
+            || text.contains("(mut self")
+        {
+            Some(false)
+        } else {
+            Some(true)
+        }
+    }
+}
+
+/// Python: A method in a class is:
+/// - static if decorated with `@staticmethod`
+/// - instance if first param is `self` or `cls` (or `@classmethod`)
+/// - static if neither decorator nor self/cls first param
+fn detect_is_static_python(node: tree_sitter::Node, source: &[u8]) -> Option<bool> {
+    // Check for decorators
+    // In tree-sitter-python, decorators are sibling nodes preceding the function_definition,
+    // or the function_definition may have a "decorator" child.
+    // Actually, `decorated_definition` wraps the function. But from inside collect_nodes,
+    // `node` is the function_definition itself. Check preceding siblings for decorators.
+    let mut has_staticmethod = false;
+    let mut has_classmethod = false;
+
+    // Check if this function is wrapped in a decorated_definition
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "decorated_definition" {
+            for i in 0..parent.child_count() {
+                if let Some(child) = parent.child(i as u32) {
+                    if child.kind() == "decorator" {
+                        let dec_text = child.utf8_text(source).unwrap_or("");
+                        if dec_text.contains("staticmethod") {
+                            has_staticmethod = true;
+                        }
+                        if dec_text.contains("classmethod") {
+                            has_classmethod = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if has_staticmethod {
+        return Some(true);
+    }
+
+    // Check first parameter name
+    if let Some(params) = node.child_by_field_name("parameters") {
+        for i in 0..params.child_count() {
+            if let Some(param) = params.child(i as u32) {
+                if param.is_named() && param.kind() != "," {
+                    let param_name = param.child_by_field_name("name")
+                        .or_else(|| {
+                            // Simple identifier parameter (no type annotation)
+                            if param.kind() == "identifier" { Some(param) } else { None }
+                        })
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .unwrap_or("");
+                    if param_name == "self" || param_name == "cls" || has_classmethod {
+                        return Some(false); // instance or classmethod
+                    }
+                    // First param is something else and no @staticmethod -> static
+                    return Some(true);
+                }
+            }
+        }
+        // No parameters and no @staticmethod -> static
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Java/C#/TypeScript: A method is static if its text contains the `static` keyword
+/// before the method name/body.
+fn detect_is_static_keyword(node: tree_sitter::Node, source: &[u8]) -> Option<bool> {
+    // Check for `static` keyword among the node's children (modifiers).
+    // - Java tree-sitter: `modifiers` container node containing "static"
+    // - C# tree-sitter: individual `modifier` children with text "static"
+    // - TypeScript: direct `static` keyword child of method_definition
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            let child_kind = child.kind();
+            // Direct "static" keyword child (TypeScript method_definition)
+            if child_kind == "static" {
+                return Some(true);
+            }
+            // Java modifiers container (wraps multiple modifier keywords)
+            if child_kind == "modifiers" {
+                let mod_text = child.utf8_text(source).unwrap_or("");
+                if mod_text.contains("static") {
+                    return Some(true);
+                }
+            }
+            // C# individual modifier children
+            if child_kind == "modifier" {
+                let mod_text = child.utf8_text(source).unwrap_or("");
+                if mod_text == "static" {
+                    return Some(true);
+                }
+            }
+        }
+    }
+    // No static keyword found -> instance method
+    Some(false)
 }
 
 // ---------------------------------------------------------------------------

@@ -186,4 +186,42 @@ CamelCase = "also not a constant"
         assert_eq!(max_retries.metadata.get("value").map(|s| s.as_str()), Some("5"));
         assert_eq!(max_retries.metadata.get("synthetic").map(|s| s.as_str()), Some("false"));
     }
+
+    #[test]
+    fn test_python_is_static() {
+        let extractor = PythonExtractor::new();
+        let code = r#"
+class MyService:
+    def instance_method(self):
+        pass
+
+    @classmethod
+    def from_config(cls, config):
+        pass
+
+    @staticmethod
+    def utility():
+        pass
+"#;
+        let result = extractor.extract(Path::new("service.py"), code).unwrap();
+
+        let instance = result.nodes.iter().find(|n| n.id.name == "instance_method" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(instance.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "instance_method(self) should be instance");
+
+        let from_config = result.nodes.iter().find(|n| n.id.name == "from_config" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(from_config.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "@classmethod should be instance (not static)");
+
+        let utility = result.nodes.iter().find(|n| n.id.name == "utility" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(utility.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "@staticmethod should be static");
+    }
+
+    #[test]
+    fn test_python_top_level_fn_no_is_static() {
+        let extractor = PythonExtractor::new();
+        let code = "def top_level():\n    pass\n";
+        let result = extractor.extract(Path::new("app.py"), code).unwrap();
+
+        let func = result.nodes.iter().find(|n| n.id.name == "top_level").unwrap();
+        assert!(func.metadata.get("is_static").is_none(), "Top-level function should NOT have is_static");
+    }
 }
