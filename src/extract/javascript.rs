@@ -55,7 +55,7 @@ impl Extractor for JavaScriptExtractor {
 }
 
 /// Node kinds whose value child indicates a function binding.
-const FUNCTION_VALUE_KINDS: &[&str] = &["arrow_function", "function"];
+const FUNCTION_VALUE_KINDS: &[&str] = &["arrow_function", "function_expression", "function"];
 
 /// Check if a tree-sitter node kind represents a function expression.
 fn is_function_value(kind: &str) -> bool {
@@ -118,7 +118,7 @@ fn collect_js_specials(
             }
             return;
         }
-        "lexical_declaration" => {
+        "lexical_declaration" | "variable_declaration" => {
             let decl_text = node.utf8_text(source).unwrap_or("").trim().to_string();
 
             let decl_keyword = if decl_text.starts_with("const ") {
