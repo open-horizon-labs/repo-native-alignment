@@ -444,6 +444,15 @@ impl RnaHandler {
                                 &node.id.kind.to_string(),
                             );
                         }
+
+                        // Recompute PageRank importance scores after graph mutation.
+                        let pagerank_scores = graph_state.index.compute_pagerank(0.85, 20);
+                        for node in &mut graph_state.nodes {
+                            if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
+                                node.metadata.insert("importance".to_string(), format!("{:.6}", score));
+                            }
+                        }
+
                         tracing::info!(
                             "Background update: {} nodes, {} edges",
                             graph_state.nodes.len(),
@@ -595,17 +604,21 @@ impl RnaHandler {
                     // No changes detected -- reuse existing embedding table if present.
                     // Only rebuild if the table is missing (first run or cache cleared).
                     if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await {
-                        if idx.has_table().await {
-                            tracing::info!("Reusing existing embedding index (no changes detected)");
-                            self.embed_index.store(Arc::new(Some(idx)));
-                        } else {
-                            match idx.index_all_with_symbols(&self.repo_root, &state.nodes).await {
-                                Ok(count) => {
-                                    tracing::info!("Built embedding index: {} items (table was missing)", count);
-                                    self.embed_index.store(Arc::new(Some(idx)));
-                                }
-                                Err(e) => tracing::warn!("Failed to embed cached graph: {}", e),
+                        match idx.has_table().await {
+                            Ok(true) => {
+                                tracing::info!("Reusing existing embedding index (no changes detected)");
+                                self.embed_index.store(Arc::new(Some(idx)));
                             }
+                            Ok(false) => {
+                                match idx.index_all_with_symbols(&self.repo_root, &state.nodes).await {
+                                    Ok(count) => {
+                                        tracing::info!("Built embedding index: {} items (table was missing)", count);
+                                        self.embed_index.store(Arc::new(Some(idx)));
+                                    }
+                                    Err(e) => tracing::warn!("Failed to embed cached graph: {}", e),
+                                }
+                            }
+                            Err(e) => tracing::warn!("Failed to check embedding table: {}", e),
                         }
                     }
                     return Ok(state);
@@ -712,17 +725,23 @@ impl RnaHandler {
 
         // Also load cached external/virtual nodes (e.g., from previous LSP enrichment)
         // that don't belong to any current root.
+        // Only include nodes whose root is genuinely external/virtual — not stale
+        // worktree items that were deleted but remain in the LanceDB cache.
         if let Some(ref cached) = cached_graph {
             let current_slugs: std::collections::HashSet<&str> = scanners
                 .iter()
                 .map(|(slug, _, _, _, _)| slug.as_str())
                 .collect();
+            let non_code = self.non_code_root_slugs();
+            let is_virtual_root = |root: &str| -> bool {
+                root == "external" || non_code.contains(root)
+            };
             let external_nodes: Vec<Node> = cached.nodes.iter()
-                .filter(|n| !current_slugs.contains(n.id.root.as_str()))
+                .filter(|n| !current_slugs.contains(n.id.root.as_str()) && is_virtual_root(&n.id.root))
                 .cloned()
                 .collect();
             let external_edges: Vec<Edge> = cached.edges.iter()
-                .filter(|e| !current_slugs.contains(e.from.root.as_str()))
+                .filter(|e| !current_slugs.contains(e.from.root.as_str()) && is_virtual_root(&e.from.root))
                 .cloned()
                 .collect();
             if !external_nodes.is_empty() {
@@ -1031,6 +1050,14 @@ impl RnaHandler {
             graph
                 .index
                 .ensure_node(&node.stable_id(), &node.id.kind.to_string());
+        }
+
+        // Recompute PageRank importance scores after graph mutation.
+        let pagerank_scores = graph.index.compute_pagerank(0.85, 20);
+        for node in &mut graph.nodes {
+            if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
+                node.metadata.insert("importance".to_string(), format!("{:.6}", score));
+            }
         }
 
         // Run LSP enrichers on the updated nodes (same as cold-start, but scoped to changed files)
