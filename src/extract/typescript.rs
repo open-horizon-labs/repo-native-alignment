@@ -1276,4 +1276,101 @@ function regularFn() {}
             module_defines
         );
     }
+
+    // --- Adversarial tests seeded from dissent (#168) ---
+
+    #[test]
+    fn test_no_duplicate_defines_edges_for_const() {
+        let extractor = TypeScriptExtractor::new();
+        let code = r#"
+const PORT = 3000;
+"#;
+        let result = extractor.extract(Path::new("src/config.ts"), code).unwrap();
+
+        let defines: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Defines
+                    && e.to.name == "PORT"
+            })
+            .collect();
+        assert_eq!(
+            defines.len(),
+            1,
+            "Should have exactly 1 Defines edge for PORT, not duplicates",
+        );
+    }
+
+    #[test]
+    fn test_no_duplicate_defines_edges_for_import() {
+        let extractor = TypeScriptExtractor::new();
+        let code = r#"
+import { Router } from 'express';
+"#;
+        let result = extractor.extract(Path::new("src/app.ts"), code).unwrap();
+
+        let defines: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Defines
+                    && e.to.kind == NodeKind::Import
+            })
+            .collect();
+        assert_eq!(
+            defines.len(),
+            1,
+            "Should have exactly 1 Defines edge for import, not duplicates",
+        );
+    }
+
+    #[test]
+    fn test_exported_const_gets_defines_edge() {
+        let extractor = TypeScriptExtractor::new();
+        let code = r#"
+export const API_KEY = "secret";
+"#;
+        let result = extractor.extract(Path::new("src/config.ts"), code).unwrap();
+
+        let defines: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Defines
+                    && e.from.kind == NodeKind::Module
+                    && e.to.name == "API_KEY"
+                    && e.to.kind == NodeKind::Const
+            })
+            .collect();
+        assert_eq!(
+            defines.len(),
+            1,
+            "Exported const should have module-level Defines edge",
+        );
+    }
+
+    #[test]
+    fn test_exported_type_alias_gets_defines_edge() {
+        let extractor = TypeScriptExtractor::new();
+        let code = r#"
+export type UserId = string;
+"#;
+        let result = extractor.extract(Path::new("src/types.ts"), code).unwrap();
+
+        let defines: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Defines
+                    && e.from.kind == NodeKind::Module
+                    && e.to.name == "UserId"
+            })
+            .collect();
+        assert_eq!(
+            defines.len(),
+            1,
+            "Exported type alias should have module-level Defines edge",
+        );
+    }
 }
