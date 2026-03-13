@@ -259,6 +259,11 @@ fn collect_nodes(
                 }
             }
 
+            // Design pattern hint from naming conventions.
+            if let Some(hint) = detect_pattern_hint(&name, &node_kind) {
+                metadata.insert("pattern_hint".to_string(), hint);
+            }
+
             // Const value extraction.
             if node_kind == NodeKind::Const {
                 if let Some(value_field) = config.const_value_field {
@@ -591,6 +596,56 @@ pub(super) fn count_branches(
         }
     }
     count
+}
+
+// ---------------------------------------------------------------------------
+// Design pattern hint detection (naming conventions)
+// ---------------------------------------------------------------------------
+
+/// Known pattern suffixes mapped to their canonical hint name.
+/// Order: longest suffixes first so "Repository" matches before a hypothetical "ory".
+const PATTERN_SUFFIXES: &[(&str, &str)] = &[
+    ("factory", "factory"),
+    ("builder", "builder"),
+    ("handler", "handler"),
+    ("adapter", "adapter"),
+    ("proxy", "proxy"),
+    ("observer", "observer"),
+    ("repository", "repository"),
+    ("strategy", "strategy"),
+    ("singleton", "singleton"),
+    ("decorator", "decorator"),
+    ("middleware", "middleware"),
+    ("provider", "provider"),
+    ("service", "service"),
+    ("controller", "controller"),
+    ("manager", "manager"),
+];
+
+/// Detect a design pattern hint from a node's name using suffix matching.
+///
+/// Only applies to node kinds that carry architectural intent: Struct, Trait,
+/// Function, Enum, and Other (for Class in languages like Python/TypeScript).
+/// Returns the lowercase pattern name if the node name ends with a known
+/// pattern suffix (case-insensitive).
+fn detect_pattern_hint(name: &str, kind: &NodeKind) -> Option<String> {
+    // Only match on types/functions that carry architectural intent.
+    match kind {
+        NodeKind::Struct
+        | NodeKind::Trait
+        | NodeKind::Function
+        | NodeKind::Enum
+        | NodeKind::Other(_) => {}
+        _ => return None,
+    }
+
+    let lower = name.to_ascii_lowercase();
+    for (suffix, hint) in PATTERN_SUFFIXES {
+        if lower.ends_with(suffix) {
+            return Some(hint.to_string());
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -2385,5 +2440,286 @@ public class UserController {
         let tp = class.metadata.get("type_params").expect("Should have type_params");
         assert!(tp.contains("Comparable"), "type_params should contain Comparable bound, got: {}", tp);
         assert!(tp.contains("Serializable"), "type_params should contain Serializable bound, got: {}", tp);
+    }
+
+    // -- Design pattern hint detection tests --
+
+    #[test]
+    fn test_pattern_hint_struct_factory() {
+        assert_eq!(
+            detect_pattern_hint("ConnectionFactory", &NodeKind::Struct),
+            Some("factory".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_case_insensitive() {
+        // Mixed case should still match
+        assert_eq!(
+            detect_pattern_hint("MyCustomHANDLER", &NodeKind::Struct),
+            Some("handler".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_trait_observer() {
+        assert_eq!(
+            detect_pattern_hint("EventObserver", &NodeKind::Trait),
+            Some("observer".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_function_builder() {
+        assert_eq!(
+            detect_pattern_hint("create_query_builder", &NodeKind::Function),
+            Some("builder".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_enum_strategy() {
+        assert_eq!(
+            detect_pattern_hint("RetryStrategy", &NodeKind::Enum),
+            Some("strategy".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_single_word_matches() {
+        // A struct literally named "Factory" should still match
+        assert_eq!(
+            detect_pattern_hint("Factory", &NodeKind::Struct),
+            Some("factory".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_no_match() {
+        assert_eq!(
+            detect_pattern_hint("DatabaseConnection", &NodeKind::Struct),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_skips_import() {
+        assert_eq!(
+            detect_pattern_hint("use_factory", &NodeKind::Import),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_skips_module() {
+        assert_eq!(
+            detect_pattern_hint("handler_module", &NodeKind::Module),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_skips_field() {
+        assert_eq!(
+            detect_pattern_hint("factory_field", &NodeKind::Field),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_skips_const() {
+        assert_eq!(
+            detect_pattern_hint("DEFAULT_HANDLER", &NodeKind::Const),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_all_suffixes() {
+        let suffixes = vec![
+            ("MyFactory", "factory"),
+            ("QueryBuilder", "builder"),
+            ("RequestHandler", "handler"),
+            ("DbAdapter", "adapter"),
+            ("CacheProxy", "proxy"),
+            ("EventObserver", "observer"),
+            ("UserRepository", "repository"),
+            ("RetryStrategy", "strategy"),
+            ("AppSingleton", "singleton"),
+            ("LogDecorator", "decorator"),
+            ("AuthMiddleware", "middleware"),
+            ("ConfigProvider", "provider"),
+            ("UserService", "service"),
+            ("HomeController", "controller"),
+            ("TaskManager", "manager"),
+        ];
+        for (name, expected) in suffixes {
+            assert_eq!(
+                detect_pattern_hint(name, &NodeKind::Struct),
+                Some(expected.to_string()),
+                "Expected pattern_hint '{}' for name '{}'",
+                expected,
+                name,
+            );
+        }
+    }
+
+    #[test]
+    fn test_pattern_hint_other_kind_matches() {
+        // NodeKind::Other("class") should also match (Python/TS classes)
+        assert_eq!(
+            detect_pattern_hint("PaymentService", &NodeKind::Other("class".to_string())),
+            Some("service".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_integration_rust() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+struct ConnectionFactory {
+    pool: Vec<Connection>,
+}
+
+trait EventObserver {
+    fn on_event(&self);
+}
+
+fn create_handler() {}
+
+struct PlainStruct {
+    field: i32,
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("src/patterns.rs"), code)
+            .unwrap();
+
+        let factory = result.nodes.iter().find(|n| n.id.name == "ConnectionFactory").unwrap();
+        assert_eq!(
+            factory.metadata.get("pattern_hint").map(|s| s.as_str()),
+            Some("factory"),
+            "ConnectionFactory should have pattern_hint=factory",
+        );
+
+        let observer = result.nodes.iter().find(|n| n.id.name == "EventObserver").unwrap();
+        assert_eq!(
+            observer.metadata.get("pattern_hint").map(|s| s.as_str()),
+            Some("observer"),
+            "EventObserver should have pattern_hint=observer",
+        );
+
+        let handler_fn = result.nodes.iter().find(|n| n.id.name == "create_handler").unwrap();
+        assert_eq!(
+            handler_fn.metadata.get("pattern_hint").map(|s| s.as_str()),
+            Some("handler"),
+            "create_handler should have pattern_hint=handler",
+        );
+
+        let plain = result.nodes.iter().find(|n| n.id.name == "PlainStruct").unwrap();
+        assert!(
+            plain.metadata.get("pattern_hint").is_none(),
+            "PlainStruct should NOT have a pattern_hint",
+        );
+    }
+
+    // -- Adversarial pattern hint tests --
+
+    #[test]
+    fn test_pattern_hint_empty_name() {
+        assert_eq!(detect_pattern_hint("", &NodeKind::Struct), None);
+    }
+
+    #[test]
+    fn test_pattern_hint_unicode_name() {
+        // Non-ASCII name should not crash, and should not match
+        assert_eq!(detect_pattern_hint("FabrikController\u{00e9}", &NodeKind::Struct), None);
+        // But ASCII suffix after unicode prefix should match
+        assert_eq!(
+            detect_pattern_hint("\u{00e9}Factory", &NodeKind::Struct),
+            Some("factory".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_overlapping_suffix() {
+        // "ServiceProvider" ends with both "provider" and, if we had "ervice", also "service".
+        // Should match "provider" because it's checked before "service" would substring-match.
+        // Actually "serviceprovider" ends with "provider" (first match in list that matches).
+        assert_eq!(
+            detect_pattern_hint("ServiceProvider", &NodeKind::Struct),
+            Some("provider".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_substring_not_suffix() {
+        // "FactoryUtil" -- "factory" is NOT a suffix here
+        assert_eq!(detect_pattern_hint("FactoryUtil", &NodeKind::Struct), None);
+        // "HandlerConfig" -- "handler" is NOT a suffix
+        assert_eq!(detect_pattern_hint("HandlerConfig", &NodeKind::Struct), None);
+    }
+
+    #[test]
+    fn test_pattern_hint_snake_case_suffix() {
+        // Snake case: "my_handler" ends with "handler"
+        assert_eq!(
+            detect_pattern_hint("my_handler", &NodeKind::Function),
+            Some("handler".to_string()),
+        );
+        // "event_observer" ends with "observer"
+        assert_eq!(
+            detect_pattern_hint("event_observer", &NodeKind::Function),
+            Some("observer".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_impl_kind_excluded() {
+        assert_eq!(detect_pattern_hint("FactoryImpl", &NodeKind::Impl), None);
+    }
+
+    #[test]
+    fn test_pattern_hint_cross_language_python() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = "class UserRepository:\n    pass\n\nclass PlainModel:\n    pass\n";
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(Path::new("models.py"), code)
+            .unwrap();
+
+        let repo = result.nodes.iter().find(|n| n.id.name == "UserRepository").unwrap();
+        assert_eq!(
+            repo.metadata.get("pattern_hint").map(|s| s.as_str()),
+            Some("repository"),
+            "Python class UserRepository should have pattern_hint=repository",
+        );
+
+        let plain = result.nodes.iter().find(|n| n.id.name == "PlainModel").unwrap();
+        assert!(
+            plain.metadata.get("pattern_hint").is_none(),
+            "PlainModel should NOT have a pattern_hint",
+        );
+    }
+
+    #[test]
+    fn test_pattern_hint_cross_language_typescript() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let code = "class AuthMiddleware {\n  handle() {}\n}\n\nclass UserDTO {\n  name: string;\n}\n";
+        let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
+            .run(Path::new("auth.ts"), code)
+            .unwrap();
+
+        let mw = result.nodes.iter().find(|n| n.id.name == "AuthMiddleware").unwrap();
+        assert_eq!(
+            mw.metadata.get("pattern_hint").map(|s| s.as_str()),
+            Some("middleware"),
+            "TypeScript class AuthMiddleware should have pattern_hint=middleware",
+        );
+
+        let dto = result.nodes.iter().find(|n| n.id.name == "UserDTO").unwrap();
+        assert!(
+            dto.metadata.get("pattern_hint").is_none(),
+            "UserDTO should NOT have a pattern_hint",
+        );
     }
 }

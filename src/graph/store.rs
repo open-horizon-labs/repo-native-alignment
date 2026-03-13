@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search_symbols` and `oh_search_context`.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -27,6 +27,7 @@ pub const SCHEMA_VERSION: u32 = 8;
 /// - `meta_name_col` — LSP cursor column used for go-to-definition disambiguation
 /// - `value`         — constant value for Const nodes
 /// - `synthetic`     — true for synthetic/inferred constants (e.g. YAML scalar key-values)
+/// - `pattern_hint`  — design pattern detected from naming conventions (e.g. "factory", "observer")
 ///
 /// bump SCHEMA_VERSION in store.rs when changing this
 pub fn symbols_schema() -> Schema {
@@ -52,6 +53,7 @@ pub fn symbols_schema() -> Schema {
         Field::new("mutable", DataType::Boolean, true),      // metadata["mutable"] — true for `static mut`
         Field::new("decorators", DataType::Utf8, true),        // metadata["decorators"] — comma-separated decorator/attribute text
         Field::new("type_params", DataType::Utf8, true),       // metadata["type_params"] — generic type parameters (e.g. "<T: Clone + Send>")
+        Field::new("pattern_hint", DataType::Utf8, true),        // metadata["pattern_hint"] — design pattern from naming conventions (e.g. "factory", "observer")
         // Vector column is added dynamically when embeddings are computed,
         // since the dimension depends on the model. See `symbols_schema_with_vector`.
         Field::new("updated_at", DataType::Int64, false),
@@ -84,6 +86,7 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("mutable", DataType::Boolean, true),
         Field::new("decorators", DataType::Utf8, true),
         Field::new("type_params", DataType::Utf8, true),
+        Field::new("pattern_hint", DataType::Utf8, true),
         Field::new(
             "vector",
             DataType::FixedSizeList(
