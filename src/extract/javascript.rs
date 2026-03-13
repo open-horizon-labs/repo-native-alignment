@@ -292,7 +292,7 @@ fn collect_js_specials(
                                         id: NodeId {
                                             root: String::new(),
                                             file: path.to_path_buf(),
-                                            name: name_str,
+                                            name: name_str.clone(),
                                             kind: NodeKind::Const,
                                         },
                                         language: "javascript".to_string(),
@@ -303,6 +303,14 @@ fn collect_js_specials(
                                         metadata,
                                         source: ExtractionSource::TreeSitter,
                                     });
+
+                                    // Emit module-level Defines edge for const nodes
+                                    emit_module_defines_edge(
+                                        path,
+                                        &name_str,
+                                        NodeKind::Const,
+                                        edges,
+                                    );
                                 }
                             }
                         }
@@ -350,6 +358,14 @@ fn collect_js_specials(
                     confidence: Confidence::Detected,
                 });
             }
+
+            // Emit module-level Defines edge for import nodes
+            emit_module_defines_edge(
+                path,
+                &import_node.id.name,
+                NodeKind::Import,
+                edges,
+            );
 
             nodes.push(import_node);
             return; // don't recurse into import statements
@@ -837,6 +853,193 @@ class Foo {
             !handler.signature.contains("=>"),
             "function_expression class property should NOT have '=>' in signature, got: {}",
             handler.signature
+        );
+    }
+
+    // --- Defines edge tests for imports and consts (#168) ---
+
+    #[test]
+    fn test_const_gets_module_defines_edge() {
+        let extractor = JavaScriptExtractor::new();
+        let code = r#"
+const PORT = 3000;
+const NAME = "hello";
+"#;
+        let result = extractor.extract(Path::new("src/config.js"), code).unwrap();
+
+        for name in &["PORT", "NAME"] {
+            let defines: Vec<_> = result
+                .edges
+                .iter()
+                .filter(|e| {
+                    e.kind == EdgeKind::Defines
+                        && e.from.kind == NodeKind::Module
+                        && e.from.name == "config"
+                        && e.to.name == *name
+                        && e.to.kind == NodeKind::Const
+                })
+                .collect();
+            assert_eq!(
+                defines.len(),
+                1,
+                "Const {} should have module-level Defines edge, edges: {:?}",
+                name,
+                result.edges.iter().map(|e| format!("{:?}:{:?} -> {:?}:{:?} ({:?})", e.from.name, e.from.kind, e.to.name, e.to.kind, e.kind)).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_import_gets_module_defines_edge() {
+        let extractor = JavaScriptExtractor::new();
+        let code = r#"
+import { Router } from 'express';
+import path from 'path';
+"#;
+        let result = extractor.extract(Path::new("src/app.js"), code).unwrap();
+
+        let import_defines: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Defines
+                    && e.from.kind == NodeKind::Module
+                    && e.from.name == "app"
+                    && e.to.kind == NodeKind::Import
+            })
+            .collect();
+        assert_eq!(
+            import_defines.len(),
+            2,
+            "Each import should have a module-level Defines edge, got: {:?}",
+            import_defines
+        );
+    }
+
+    #[test]
+    fn test_all_special_nodes_reachable_from_module() {
+        // Integration test: module graph traversal finds all special-cased nodes
+        let extractor = JavaScriptExtractor::new();
+        let code = r#"
+import { Router } from 'express';
+const PORT = 3000;
+const handler = (req, res) => { res.send("ok"); };
+function regularFn() {}
+"#;
+        let result = extractor.extract(Path::new("src/app.js"), code).unwrap();
+
+        let module_defines: Vec<String> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Defines
+                    && e.from.kind == NodeKind::Module
+                    && e.from.name == "app"
+            })
+            .map(|e| e.to.name.clone())
+            .collect();
+
+        // Import
+        assert!(
+            module_defines.iter().any(|n| n.contains("import")),
+            "Module should define import node, defines: {:?}",
+            module_defines
+        );
+        // Const
+        assert!(
+            module_defines.contains(&"PORT".to_string()),
+            "Module should define PORT const, defines: {:?}",
+            module_defines
+        );
+        // Arrow function
+        assert!(
+            module_defines.contains(&"handler".to_string()),
+            "Module should define handler arrow fn, defines: {:?}",
+            module_defines
+        );
+        // Regular function (from generic extractor)
+        assert!(
+            module_defines.contains(&"regularFn".to_string()),
+            "Module should define regularFn, defines: {:?}",
+            module_defines
+        );
+    }
+
+    // --- Adversarial tests seeded from dissent (#168) ---
+
+    #[test]
+    fn test_no_duplicate_defines_edges_for_const() {
+        // Dissent: verify no duplicate Defines edges from extractor overlap
+        let extractor = JavaScriptExtractor::new();
+        let code = r#"
+const PORT = 3000;
+"#;
+        let result = extractor.extract(Path::new("src/config.js"), code).unwrap();
+
+        let defines: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Defines
+                    && e.to.name == "PORT"
+            })
+            .collect();
+        assert_eq!(
+            defines.len(),
+            1,
+            "Should have exactly 1 Defines edge for PORT, not duplicates. Got: {:?}",
+            defines.iter().map(|e| format!("{:?}:{:?} -> {:?}:{:?}", e.from.name, e.from.kind, e.to.name, e.to.kind)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_no_duplicate_defines_edges_for_import() {
+        // Dissent: verify no duplicate Defines edges for imports
+        let extractor = JavaScriptExtractor::new();
+        let code = r#"
+import { Router } from 'express';
+"#;
+        let result = extractor.extract(Path::new("src/app.js"), code).unwrap();
+
+        let defines: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Defines
+                    && e.to.kind == NodeKind::Import
+            })
+            .collect();
+        assert_eq!(
+            defines.len(),
+            1,
+            "Should have exactly 1 Defines edge for import, not duplicates. Got: {:?}",
+            defines.iter().map(|e| format!("{:?}:{:?} -> {:?}:{:?}", e.from.name, e.from.kind, e.to.name, e.to.kind)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_exported_const_gets_defines_edge() {
+        // Adversarial: exported consts go through export_statement wrapping
+        let extractor = JavaScriptExtractor::new();
+        let code = r#"
+export const API_KEY = "secret";
+"#;
+        let result = extractor.extract(Path::new("src/config.js"), code).unwrap();
+
+        let defines: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Defines
+                    && e.from.kind == NodeKind::Module
+                    && e.to.name == "API_KEY"
+                    && e.to.kind == NodeKind::Const
+            })
+            .collect();
+        assert_eq!(
+            defines.len(),
+            1,
+            "Exported const should have module-level Defines edge"
         );
     }
 }
