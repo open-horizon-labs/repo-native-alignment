@@ -743,4 +743,121 @@ mod tests {
         assert_eq!(risk, RiskTier::High, "Hub with 6 dependents should be HIGH");
         assert!(reason.contains("hub") || reason.contains("dependents"));
     }
+
+    // ==================== Adversarial tests (dissent-seeded) ====================
+
+    /// Dissent #1: Entry point heuristic -- non-conventional names miss detection.
+    /// A function called "app_route" (Python convention) should NOT be classified
+    /// as an entry point by the Rust-centric heuristic. It degrades to MEDIUM/LOW
+    /// based on other signals. This documents expected behavior, not a bug.
+    #[test]
+    fn test_non_rust_entry_point_degrades_gracefully() {
+        let python_handler = make_node("app_route", NodeKind::Function, "src/routes.py");
+        let index = GraphIndex::new();
+        let (risk, _) = classify_risk(&python_handler, &index);
+        // Not detected as entry point, falls through to LOW (leaf, no dependents)
+        assert_ne!(risk, RiskTier::Critical, "Non-conventional entry point should not be CRITICAL");
+    }
+
+    /// Dissent #2: PageRank boundary values -- test exact thresholds.
+    #[test]
+    fn test_pagerank_boundary_0_7() {
+        // Exactly 0.7 should NOT be CRITICAL (threshold is >0.7)
+        let at_boundary = make_node_with_pagerank("boundary", NodeKind::Function, "src/lib.rs", 0.7);
+        let index = GraphIndex::new();
+        let (risk, _) = classify_risk(&at_boundary, &index);
+        assert_ne!(risk, RiskTier::Critical, "PageRank exactly 0.7 should not be CRITICAL");
+        assert_eq!(risk, RiskTier::High, "PageRank 0.7 should be HIGH (>0.4)");
+    }
+
+    #[test]
+    fn test_pagerank_boundary_0_4() {
+        // Exactly 0.4 should NOT be HIGH (threshold is >0.4)
+        let at_boundary = make_node_with_pagerank("boundary", NodeKind::Function, "src/lib.rs", 0.4);
+        let index = GraphIndex::new();
+        let (risk, _) = classify_risk(&at_boundary, &index);
+        assert_ne!(risk, RiskTier::High, "PageRank exactly 0.4 should not be HIGH");
+    }
+
+    /// Dissent #3: Many changed symbols -- verify output is capped.
+    #[test]
+    fn test_impact_capped_at_max_symbols() {
+        // Create a star graph: 60 callers -> 1 changed symbol
+        let changed = make_node("hot_fn", NodeKind::Function, "src/lib.rs");
+        let callers: Vec<Node> = (0..60)
+            .map(|i| make_node(&format!("caller_{}", i), NodeKind::Function, "src/lib.rs"))
+            .collect();
+
+        let mut all_nodes = vec![changed.clone()];
+        all_nodes.extend(callers.iter().cloned());
+
+        let mut index = GraphIndex::new();
+        for caller in &callers {
+            index.add_edge(
+                &caller.stable_id(),
+                "function",
+                &changed.stable_id(),
+                "function",
+                EdgeKind::Calls,
+            );
+        }
+
+        let impacted = compute_impact_risk(&[changed], &all_nodes, &index, 1);
+        assert!(
+            impacted.len() <= MAX_IMPACT_SYMBOLS,
+            "Impact should be capped at {}, got {}",
+            MAX_IMPACT_SYMBOLS,
+            impacted.len()
+        );
+    }
+
+    /// Adversarial: changed symbol appears in all_nodes but NOT in graph index.
+    /// The impact() call should return empty (node not in petgraph), and we
+    /// should get no results without panicking.
+    #[test]
+    fn test_changed_symbol_not_in_graph_index() {
+        let changed = make_node("orphan_fn", NodeKind::Function, "src/lib.rs");
+        let all_nodes = vec![changed.clone()];
+        let index = GraphIndex::new(); // empty -- orphan_fn not indexed
+
+        let impacted = compute_impact_risk(&[changed], &all_nodes, &index, 3);
+        assert!(impacted.is_empty(), "No graph edges means no impact");
+    }
+
+    /// Adversarial: all impacted symbols are in graph but NOT in all_nodes.
+    /// The node_by_id lookup should skip them silently.
+    #[test]
+    fn test_impacted_symbol_not_in_all_nodes() {
+        let changed = make_node("target", NodeKind::Function, "src/lib.rs");
+        let phantom_caller = make_node("phantom", NodeKind::Function, "src/phantom.rs");
+
+        // Add edge in graph: phantom -> target
+        let mut index = GraphIndex::new();
+        index.add_edge(
+            &phantom_caller.stable_id(),
+            "function",
+            &changed.stable_id(),
+            "function",
+            EdgeKind::Calls,
+        );
+
+        // But phantom is NOT in all_nodes
+        let all_nodes = vec![changed.clone()];
+        let impacted = compute_impact_risk(&[changed], &all_nodes, &index, 3);
+
+        // phantom should be skipped because it's not in all_nodes
+        assert!(
+            impacted.iter().all(|s| s.name != "phantom"),
+            "Symbols not in all_nodes should be silently skipped"
+        );
+    }
+
+    /// Adversarial: RiskTier ordering matches Display strings alphabetically by coincidence.
+    /// Verify the Ord implementation gives CRITICAL < HIGH < MEDIUM < LOW.
+    #[test]
+    fn test_risk_tier_ordering() {
+        assert!(RiskTier::Critical < RiskTier::High);
+        assert!(RiskTier::High < RiskTier::Medium);
+        assert!(RiskTier::Medium < RiskTier::Low);
+    }
 }
