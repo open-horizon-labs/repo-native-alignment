@@ -542,6 +542,9 @@ pub(crate) async fn persist_graph_to_lance(
         let type_params_col: Vec<Option<String>> = nodes.iter()
             .map(|n| n.metadata.get("type_params").cloned())
             .collect();
+        let pattern_hints: Vec<Option<String>> = nodes.iter()
+            .map(|n| n.metadata.get("pattern_hint").cloned())
+            .collect();
         let updated_ats: Vec<i64> = vec![now; nodes.len()];
 
         let batch = RecordBatch::try_new(
@@ -567,6 +570,7 @@ pub(crate) async fn persist_graph_to_lance(
                 Arc::new(mutable_builder.finish()),
                 Arc::new(StringArray::from(decorators_col)),
                 Arc::new(StringArray::from(type_params_col)),
+                Arc::new(StringArray::from(pattern_hints)),
                 Arc::new(Int64Array::from(updated_ats)),
             ],
         )?;
@@ -748,6 +752,9 @@ pub(crate) async fn persist_graph_incremental(
             let type_params_col: Vec<Option<String>> = upsert_nodes.iter()
                 .map(|n| n.metadata.get("type_params").cloned())
                 .collect();
+            let pattern_hints: Vec<Option<String>> = upsert_nodes.iter()
+                .map(|n| n.metadata.get("pattern_hint").cloned())
+                .collect();
             let updated_ats: Vec<i64> = vec![now; upsert_nodes.len()];
 
             let batch = RecordBatch::try_new(
@@ -773,6 +780,7 @@ pub(crate) async fn persist_graph_incremental(
                     Arc::new(mutable_builder.finish()),
                     Arc::new(StringArray::from(decorators_col)),
                     Arc::new(StringArray::from(type_params_col)),
+                    Arc::new(StringArray::from(pattern_hints)),
                     Arc::new(Int64Array::from(updated_ats)),
                 ],
             )?;
@@ -948,6 +956,8 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             let type_params_col = batch.column_by_name("type_params")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let pattern_hint_col = batch.column_by_name("pattern_hint")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
             for i in 0..batch.num_rows() {
                 let file_path = PathBuf::from(file_paths.value(i));
@@ -1011,6 +1021,14 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("type_params".to_string(), val.to_string());
+                        }
+                    }
+                }
+                if let Some(col) = pattern_hint_col {
+                    if !col.is_null(i) {
+                        let val = col.value(i);
+                        if !val.is_empty() {
+                            metadata.insert("pattern_hint".to_string(), val.to_string());
                         }
                     }
                 }
@@ -3478,6 +3496,9 @@ fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> Stri
         if let Some(tp) = n.metadata.get("type_params") {
             entry.push_str(&format!(" {}", tp));
         }
+        if let Some(hint) = n.metadata.get("pattern_hint") {
+            entry.push_str(&format!(" ~{}", hint));
+        }
         if let Some(decorators) = n.metadata.get("decorators") {
             entry.push_str(&format!(" [{}]", decorators));
         }
@@ -3520,6 +3541,9 @@ fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> Stri
         }
         if let Some(tp) = n.metadata.get("type_params") {
             entry.push_str(&format!("\n  Type params: {}", tp));
+        }
+        if let Some(hint) = n.metadata.get("pattern_hint") {
+            entry.push_str(&format!("\n  Pattern: {}", hint));
         }
         if let Some(decorators) = n.metadata.get("decorators") {
             entry.push_str(&format!("\n  Decorators: {}", decorators));
