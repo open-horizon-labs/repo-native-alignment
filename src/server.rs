@@ -4352,4 +4352,92 @@ mod tests {
         assert_eq!(s.hops, Some(1));
         assert_eq!(s.direction, Some("outgoing".to_string()));
     }
+
+    #[test]
+    fn test_search_batch_with_all_traversal_modes() {
+        // Adversarial: verify all mode strings parse correctly with batch nodes
+        for mode in &["neighbors", "impact", "reachable", "tests_for"] {
+            let s = parse_search(json!({
+                "nodes": ["root:a.rs:foo:function", "root:b.rs:bar:function"],
+                "mode": mode,
+                "hops": 2
+            })).unwrap();
+            assert!(s.nodes.is_some());
+            assert_eq!(s.mode.as_deref(), Some(*mode));
+            assert_eq!(s.hops, Some(2));
+        }
+    }
+
+    #[test]
+    fn test_search_batch_with_direction_variants() {
+        // Adversarial: verify all direction strings compose with batch
+        for dir in &["outgoing", "incoming", "both"] {
+            let s = parse_search(json!({
+                "nodes": ["root:a.rs:foo:function"],
+                "mode": "neighbors",
+                "direction": dir
+            })).unwrap();
+            assert_eq!(s.direction.as_deref(), Some(*dir));
+        }
+    }
+
+    #[test]
+    fn test_search_batch_mode_without_hops_uses_defaults() {
+        // Adversarial: batch+mode with no hops should not panic
+        let s = parse_search(json!({
+            "nodes": ["root:a.rs:foo:function"],
+            "mode": "impact"
+        })).unwrap();
+        assert!(s.nodes.is_some());
+        assert_eq!(s.mode, Some("impact".to_string()));
+        assert!(s.hops.is_none()); // will default to 3 in handler
+    }
+
+    #[test]
+    fn test_compact_edge_count_with_bidirectional_edges() {
+        // Adversarial: node with both incoming and outgoing edges should sum correctly
+        use crate::graph::{index::GraphIndex, Node, NodeId, NodeKind, EdgeKind, ExtractionSource};
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        let mut index = GraphIndex::new();
+
+        let make_node = |name: &str| Node {
+            id: NodeId {
+                root: "r".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                name: name.to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            signature: format!("fn {}()", name),
+            body: String::new(),
+            line_start: 1,
+            line_end: 5,
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let node_a = make_node("hub");
+        let node_b = make_node("caller");
+        let node_c = make_node("callee");
+
+        let id_a = node_a.stable_id();
+        let id_b = node_b.stable_id();
+        let id_c = node_c.stable_id();
+        index.ensure_node(&id_a, "function");
+        index.ensure_node(&id_b, "function");
+        index.ensure_node(&id_c, "function");
+        // hub calls callee (outgoing), caller calls hub (incoming to hub)
+        index.add_edge(&id_a, "function", &id_c, "function", EdgeKind::Calls);
+        index.add_edge(&id_b, "function", &id_a, "function", EdgeKind::Calls);
+
+        let compact_out = format_node_entry(&node_a, &index, true);
+        // hub has 1 outgoing + 1 incoming = edges:2
+        assert!(
+            compact_out.contains("edges:2"),
+            "hub node should show edges:2, got: {}",
+            compact_out
+        );
+    }
 }
