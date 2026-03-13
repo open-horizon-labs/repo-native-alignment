@@ -32,6 +32,7 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
         ("static_item",      NodeKind::Const),
         ("mod_item",         NodeKind::Module),
         ("use_declaration",  NodeKind::Import),
+        ("macro_definition", NodeKind::Macro),
         ("field_declaration",NodeKind::Field),
         ("enum_variant",     NodeKind::Field),
     ],
@@ -648,6 +649,50 @@ static MUTEX: Mutex<HashMap<String, i32>> = Mutex::new(HashMap::new());
         let mutex = result.nodes.iter().find(|n| n.id.name == "MUTEX").expect("Should find MUTEX");
         assert!(mutex.metadata.get("value").is_none());
         assert_eq!(mutex.metadata.get("storage").map(|s| s.as_str()), Some("static"));
+    }
+
+    #[test]
+    fn test_extract_rust_macro_definition() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+macro_rules! my_vec {
+    ( $( $x:expr ),* ) => {
+        {
+            let mut v = Vec::new();
+            $(
+                v.push($x);
+            )*
+            v
+        }
+    };
+}
+
+macro_rules! simple_assert {
+    ($cond:expr) => {
+        if !$cond {
+            panic!("assertion failed");
+        }
+    };
+}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        let macros: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Macro)
+            .collect();
+        assert_eq!(macros.len(), 2, "Should find 2 macro definitions");
+
+        let names: Vec<&str> = macros.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"my_vec"), "Should find macro my_vec");
+        assert!(names.contains(&"simple_assert"), "Should find macro simple_assert");
+
+        // Macros should be embeddable
+        assert!(NodeKind::Macro.is_embeddable(), "Macro should be embeddable");
+
+        // Macros should have language = rust
+        assert_eq!(macros[0].language, "rust");
     }
 
     /// Adversarial: const and static with same name in same file (NodeId collision risk)

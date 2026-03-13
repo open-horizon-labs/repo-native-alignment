@@ -72,6 +72,8 @@ pub enum NodeKind {
     ProtoMessage,
     SqlTable,
     ApiEndpoint,
+    /// A macro definition (Rust `macro_rules!`, C/C++ `#define`, etc.).
+    Macro,
     /// A struct/class/enum field or record member.
     Field,
     /// A merged PR (branch merge to base branch). The natural unit of meaningful change.
@@ -94,6 +96,7 @@ impl fmt::Display for NodeKind {
             NodeKind::ProtoMessage => write!(f, "proto_message"),
             NodeKind::SqlTable => write!(f, "sql_table"),
             NodeKind::ApiEndpoint => write!(f, "api_endpoint"),
+            NodeKind::Macro => write!(f, "macro"),
             NodeKind::Field => write!(f, "field"),
             NodeKind::PrMerge => write!(f, "pr_merge"),
             NodeKind::Other(s) => write!(f, "{}", s),
@@ -113,6 +116,7 @@ impl NodeKind {
             | NodeKind::Trait
             | NodeKind::Enum
             | NodeKind::TypeAlias
+            | NodeKind::Macro
             | NodeKind::ProtoMessage
             | NodeKind::SqlTable
             | NodeKind::ApiEndpoint
@@ -437,6 +441,7 @@ pub fn find_node_at(
                         | NodeKind::Enum
                         | NodeKind::TypeAlias
                         | NodeKind::Const
+                        | NodeKind::Macro
                 )
             })
             .min_by_key(|n| n.line_end.saturating_sub(n.line_start))
@@ -494,6 +499,34 @@ mod tests {
             source: ExtractionSource::TreeSitter,
             confidence: Confidence::Detected,
         }
+    }
+
+    // -- Macro tests --
+
+    #[test]
+    fn test_macro_is_embeddable() {
+        assert!(NodeKind::Macro.is_embeddable(), "Macro should be embeddable");
+    }
+
+    #[test]
+    fn test_macro_display() {
+        assert_eq!(format!("{}", NodeKind::Macro), "macro");
+    }
+
+    #[test]
+    fn test_find_node_at_finds_macro() {
+        let nodes = vec![make_node(
+            "src/lib.rs",
+            "my_macro",
+            NodeKind::Macro,
+            5,
+            10,
+        )];
+        let index = build_file_line_index(&nodes);
+
+        let result = find_node_at(&index, &PathBuf::from("src/lib.rs"), 7);
+        assert!(result.is_some(), "find_node_at should find Macro nodes");
+        assert_eq!(result.unwrap().name, "my_macro");
     }
 
     // -- TypeAlias tests --

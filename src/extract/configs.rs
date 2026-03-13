@@ -353,6 +353,8 @@ pub static CPP_CONFIG: LangConfig = LangConfig {
         ("class_specifier",      NodeKind::Struct),
         ("struct_specifier",     NodeKind::Struct),
         ("enum_specifier",       NodeKind::Enum),
+        ("preproc_def",              NodeKind::Macro),
+        ("preproc_function_def",     NodeKind::Macro),
         ("field_declaration",    NodeKind::Field),
         ("enumerator",           NodeKind::Field),
         // constexpr / static const handled in cpp.rs (text inspection)

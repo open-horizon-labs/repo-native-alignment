@@ -199,3 +199,91 @@ fn collect_cpp_specials(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_extract_cpp_object_like_macro() {
+        let extractor = CppExtractor;
+        let code = r#"
+#define MAX_BUFFER_SIZE 1024
+#define VERSION "1.0.0"
+"#;
+        let result = extractor.extract(Path::new("src/config.h"), code).unwrap();
+
+        let macros: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Macro)
+            .collect();
+        assert_eq!(macros.len(), 2, "Should find 2 object-like macros, got: {:?}",
+            macros.iter().map(|n| &n.id.name).collect::<Vec<_>>());
+
+        let names: Vec<&str> = macros.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"MAX_BUFFER_SIZE"), "Should find MAX_BUFFER_SIZE macro");
+        assert!(names.contains(&"VERSION"), "Should find VERSION macro");
+    }
+
+    #[test]
+    fn test_extract_cpp_function_like_macro() {
+        let extractor = CppExtractor;
+        let code = r#"
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define SQUARE(x) ((x) * (x))
+"#;
+        let result = extractor.extract(Path::new("src/util.h"), code).unwrap();
+
+        let macros: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Macro)
+            .collect();
+        assert_eq!(macros.len(), 2, "Should find 2 function-like macros, got: {:?}",
+            macros.iter().map(|n| &n.id.name).collect::<Vec<_>>());
+
+        let names: Vec<&str> = macros.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"MIN"), "Should find MIN macro");
+        assert!(names.contains(&"SQUARE"), "Should find SQUARE macro");
+    }
+
+    #[test]
+    fn test_cpp_macro_is_embeddable() {
+        assert!(NodeKind::Macro.is_embeddable(), "Macro should be embeddable");
+    }
+
+    #[test]
+    fn test_cpp_macros_mixed_with_functions() {
+        let extractor = CppExtractor;
+        let code = r#"
+#define MAX_SIZE 100
+
+int compute(int x) {
+    return x * 2;
+}
+
+#define LOG(msg) printf("%s\n", msg)
+"#;
+        let result = extractor.extract(Path::new("src/util.c"), code).unwrap();
+
+        let macros: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Macro)
+            .collect();
+        let funcs: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Function)
+            .collect();
+
+        assert_eq!(macros.len(), 2, "Should find 2 macros");
+        assert!(!funcs.is_empty(), "Should also find function(s)");
+    }
+}
