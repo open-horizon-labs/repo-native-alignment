@@ -1577,8 +1577,9 @@ impl RnaHandler {
                         state.edges.len()
                     );
                     // Always re-index embeddings so .oh/ artifacts added since
-                    // the last full build become searchable.  BLAKE3 text-hash
-                    // skip logic makes this cheap for unchanged entries.
+                    // the last full build become searchable.  This drops and
+                    // rebuilds the table (index_all_inner) which is acceptable
+                    // at current repo scale.
                     if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await {
                         match idx.index_all_with_symbols(&self.repo_root, &state.nodes).await {
                             Ok(count) => {
@@ -1692,7 +1693,7 @@ impl RnaHandler {
 
         // Store embed index immediately so it's available for queries.
         // The background task below will always re-index (including .oh/
-        // artifacts) — BLAKE3 hashing makes this cheap for unchanged entries.
+        // artifacts) via index_all_inner which drops and rebuilds the table.
         match EmbeddingIndex::new(&self.repo_root).await {
             Ok(idx) => {
                 tracing::info!("Embedding index created — background task will re-index");
@@ -1724,8 +1725,8 @@ impl RnaHandler {
                 .cloned()
                 .collect();
             // Always re-index so .oh/ artifacts added since the last
-            // full build become searchable.  BLAKE3 text-hash skip logic
-            // makes this cheap for unchanged entries.
+            // full build become searchable.  index_all_inner drops and
+            // rebuilds the table -- acceptable at current repo scale.
             match EmbeddingIndex::new(&bg_repo_root).await {
                 Ok(idx) => {
                     match idx.index_all_with_symbols(&bg_repo_root, &embeddable_nodes).await {
