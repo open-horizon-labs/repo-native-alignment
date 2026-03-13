@@ -2201,14 +2201,16 @@ impl RnaHandler {
                     });
                 } else if sort_by_importance {
                     // Sort by PageRank importance descending.
-                    // Drop entries without importance so unknown-score symbols don't push real results off.
-                    matches.retain(|n| {
-                        n.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()).is_some()
-                    });
+                    // Symbols without importance scores sort to the bottom (not filtered out).
                     matches.sort_by(|a, b| {
-                        let imp_a = a.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-                        let imp_b = b.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-                        imp_b.partial_cmp(&imp_a).unwrap_or(std::cmp::Ordering::Equal)
+                        let imp_a = a.metadata.get("importance").and_then(|s| s.parse::<f64>().ok());
+                        let imp_b = b.metadata.get("importance").and_then(|s| s.parse::<f64>().ok());
+                        match (imp_a, imp_b) {
+                            (Some(a_val), Some(b_val)) => b_val.partial_cmp(&a_val).unwrap_or(std::cmp::Ordering::Equal),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        }
                     });
                 } else {
                     ranking::sort_symbol_matches(&mut matches, &query_lower, &graph_state.index);
@@ -3134,8 +3136,9 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                 let md: String = symbols_with_importance.iter()
                                     .map(|(n, imp)| {
                                         let mut line = format!(
-                                            "- **{}** `{}` ({}) `{}`:{}-{} -- importance: {:.3}",
+                                            "- **{}** `{}` ({}) [{}] `{}`:{}-{} -- importance: {:.3}",
                                             n.id.kind, n.id.name, n.language,
+                                            n.id.root,
                                             n.id.file.display(),
                                             n.line_start, n.line_end,
                                             imp,
@@ -3154,9 +3157,9 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                             }
                         }
 
-                        // 2. Hotspot files (most definitions)
+                        // 2. Hotspot files (most definitions), qualified by workspace root
                         {
-                            let mut file_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                            let mut file_counts: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
                             for n in &graph_state.nodes {
                                 if matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge) {
                                     continue;
@@ -3164,15 +3167,16 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                 if n.id.root == "external" {
                                     continue;
                                 }
-                                *file_counts.entry(n.id.file.display().to_string()).or_default() += 1;
+                                let key = (n.id.root.clone(), n.id.file.display().to_string());
+                                *file_counts.entry(key).or_default() += 1;
                             }
-                            let mut sorted_files: Vec<(String, usize)> = file_counts.into_iter().collect();
+                            let mut sorted_files: Vec<((String, String), usize)> = file_counts.into_iter().collect();
                             sorted_files.sort_by(|a, b| b.1.cmp(&a.1));
                             sorted_files.truncate(10);
 
                             if !sorted_files.is_empty() {
                                 let md: String = sorted_files.iter()
-                                    .map(|(f, count)| format!("- `{}` -- {} definitions", f, count))
+                                    .map(|((root, f), count)| format!("- [{}] `{}` -- {} definitions", root, f, count))
                                     .collect::<Vec<_>>()
                                     .join("\n");
                                 sections.push(format!("## Hotspot files\n\n{}", md));
@@ -3227,8 +3231,9 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                             if !entry_points.is_empty() {
                                 let md: String = entry_points.iter()
                                     .map(|n| format!(
-                                        "- **{}** `{}`:{}-{}",
+                                        "- **{}** [{}] `{}`:{}-{}",
                                         n.id.name,
+                                        n.id.root,
                                         n.id.file.display(),
                                         n.line_start, n.line_end,
                                     ))

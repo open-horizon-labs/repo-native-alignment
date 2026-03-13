@@ -103,18 +103,23 @@ pub fn sort_symbol_matches<'a>(
         }
 
         // Tier 5: higher PageRank importance = more important.
-        // Falls back to edge count if importance not yet computed.
-        let importance = |n: &Node| -> f64 {
-            n.metadata.get("importance")
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or_else(|| {
-                    // Fallback: raw edge count (pre-PageRank compat)
-                    let sid = n.stable_id();
-                    (index.neighbors(&sid, None, Direction::Incoming).len()
-                        + index.neighbors(&sid, None, Direction::Outgoing).len()) as f64
-                })
+        // Compare PageRank scores only when both nodes have them;
+        // fall back to edge count only when neither does.
+        // Never mix normalized [0,1] scores with raw degree counts.
+        let pagerank = |n: &Node| {
+            n.metadata.get("importance").and_then(|s| s.parse::<f64>().ok())
         };
-        importance(b).partial_cmp(&importance(a)).unwrap_or(Ordering::Equal)
+        let edge_count = |n: &Node| {
+            let sid = n.stable_id();
+            index.neighbors(&sid, None, Direction::Incoming).len()
+                + index.neighbors(&sid, None, Direction::Outgoing).len()
+        };
+        match (pagerank(a), pagerank(b)) {
+            (Some(ai), Some(bi)) => bi.partial_cmp(&ai).unwrap_or(Ordering::Equal),
+            (Some(_), None) => Ordering::Less,   // a has score, ranks higher
+            (None, Some(_)) => Ordering::Greater, // b has score, ranks higher
+            (None, None) => edge_count(b).cmp(&edge_count(a)),
+        }
     });
 }
 

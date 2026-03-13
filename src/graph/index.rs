@@ -244,10 +244,11 @@ impl GraphIndex {
     ///
     /// Uses the standard PageRank algorithm with the given damping factor
     /// (typically 0.85) and number of iterations. Returns a map from
-    /// node stable ID to importance score (f64, sums to ~1.0 across all nodes).
+    /// node stable ID to importance score.
     ///
-    /// Scores are normalized to [0, 1] where 1.0 is the most important node.
-    /// This makes scores interpretable regardless of graph size.
+    /// Scores are max-normalized to [0, 1] where 1.0 is the most important
+    /// node. These are relative ranks, not probabilities — they do not sum
+    /// to 1.0. This makes scores interpretable regardless of graph size.
     pub fn compute_pagerank(&self, damping_factor: f64, nb_iter: usize) -> HashMap<String, f64> {
         let raw_scores = page_rank(&self.graph, damping_factor, nb_iter);
 
