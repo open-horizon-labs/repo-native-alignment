@@ -1474,6 +1474,28 @@ impl RnaHandler {
         }
     }
 
+    /// Check whether an embedding `SearchResult` passes the root filter.
+    /// Code results (`kind` starts with "code:") are filtered by root slug
+    /// extracted from the stable ID prefix. Non-code results (commits, .oh/
+    /// artifacts) always pass through.
+    fn search_result_passes_root_filter(
+        &self,
+        result: &crate::embed::SearchResult,
+        root_filter: &Option<String>,
+        non_code_slugs: &std::collections::HashSet<String>,
+    ) -> bool {
+        if root_filter.is_none() {
+            return true; // "all" mode
+        }
+        // Non-code results (commits, oh artifacts) always pass
+        if !result.kind.starts_with("code:") {
+            return true;
+        }
+        // Extract root slug from stable ID: "root:file:name:kind"
+        let node_root = result.id.split(':').next().unwrap_or("");
+        self.node_passes_root_filter(node_root, root_filter, non_code_slugs)
+    }
+
     /// Ensure graph is built, check for file changes since last scan.
     /// Returns a read guard to the graph.
     async fn get_graph(&self) -> anyhow::Result<tokio::sync::RwLockReadGuard<'_, Option<GraphState>>> {
@@ -2689,6 +2711,15 @@ impl RnaHandler {
         let mode = args.mode.as_deref().unwrap_or("neighbors");
         let top_k = args.top_k.unwrap_or(1).clamp(1, 50) as usize;
 
+        // Root filter for entry node scoping (traversal results are unscoped —
+        // once you enter the graph, edges may cross roots).
+        let root_filter = self.effective_root_filter(args.root.as_deref());
+        let non_code_slugs = if root_filter.is_some() {
+            self.non_code_root_slugs()
+        } else {
+            std::collections::HashSet::new()
+        };
+
         // Reject if no entry point
         if node.is_none() && query.is_none() {
             return Ok(text_result(
@@ -2706,8 +2737,11 @@ impl RnaHandler {
                 Some(embed_idx) => {
                     match embed_idx.search_with_mode(query_text, None, top_k.min(50) * 3, search_mode).await {
                         Ok(SearchOutcome::Results(results)) if !results.is_empty() => {
+                            // Filter entry nodes by root scope — traversal results
+                            // are unscoped, but entry points should respect root filter.
                             let code_results: Vec<_> = results.into_iter()
                                 .filter(|r| r.kind.starts_with("code:"))
+                                .filter(|r| self.search_result_passes_root_filter(r, &root_filter, &non_code_slugs))
                                 .take(top_k)
                                 .collect();
 
@@ -3342,15 +3376,21 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         Some(index) => {
                             match index.search_with_mode(query, args.artifact_types.as_deref(), limit, search_mode).await {
                                 Ok(SearchOutcome::Results(results)) => {
-                                    if !results.is_empty() {
-                                        let md: String = results
+                                    // Filter by root: code results scoped to effective root,
+                                    // non-code (commits, .oh/ artifacts) always pass through.
+                                    let filtered: Vec<_> = results
+                                        .into_iter()
+                                        .filter(|r| self.search_result_passes_root_filter(r, &root_filter, &non_code_slugs))
+                                        .collect();
+                                    if !filtered.is_empty() {
+                                        let md: String = filtered
                                             .iter()
                                             .map(|r| r.to_markdown())
                                             .collect::<Vec<_>>()
                                             .join("\n");
                                         sections.push(format!(
                                             "### Artifacts ({} result(s))\n\n{}",
-                                            results.len(),
+                                            filtered.len(),
                                             md
                                         ));
                                     }
@@ -5914,5 +5954,104 @@ mod tests {
         };
         let search = gq.into_search();
         assert!(search.root.is_none(), "GraphQuery::into_search should set root to None");
+    }
+
+    // ── search_result_passes_root_filter tests ─────────────────────────
+
+    #[test]
+    fn test_search_result_filter_code_result_matches_root() {
+        let handler = RnaHandler::default();
+        let filter = Some("my-project".to_string());
+        let non_code = std::collections::HashSet::new();
+
+        let result = crate::embed::SearchResult {
+            id: "my-project:src/lib.rs:foo:function".to_string(),
+            kind: "code:function".to_string(),
+            title: "foo".to_string(),
+            body: String::new(),
+            score: 1.0,
+        };
+        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
+    }
+
+    #[test]
+    fn test_search_result_filter_code_result_wrong_root() {
+        let handler = RnaHandler::default();
+        let filter = Some("my-project".to_string());
+        let non_code = std::collections::HashSet::new();
+
+        let result = crate::embed::SearchResult {
+            id: "other-project:src/lib.rs:foo:function".to_string(),
+            kind: "code:function".to_string(),
+            title: "foo".to_string(),
+            body: String::new(),
+            score: 1.0,
+        };
+        assert!(!handler.search_result_passes_root_filter(&result, &filter, &non_code));
+    }
+
+    #[test]
+    fn test_search_result_filter_commit_always_passes() {
+        let handler = RnaHandler::default();
+        let filter = Some("my-project".to_string());
+        let non_code = std::collections::HashSet::new();
+
+        let result = crate::embed::SearchResult {
+            id: "abc123".to_string(),
+            kind: "commit".to_string(),
+            title: "fix: something".to_string(),
+            body: String::new(),
+            score: 0.8,
+        };
+        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
+    }
+
+    #[test]
+    fn test_search_result_filter_oh_artifact_always_passes() {
+        let handler = RnaHandler::default();
+        let filter = Some("my-project".to_string());
+        let non_code = std::collections::HashSet::new();
+
+        let result = crate::embed::SearchResult {
+            id: "outcomes/agent-alignment".to_string(),
+            kind: "outcome".to_string(),
+            title: "agent alignment".to_string(),
+            body: String::new(),
+            score: 0.9,
+        };
+        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
+    }
+
+    #[test]
+    fn test_search_result_filter_all_mode_passes_everything() {
+        let handler = RnaHandler::default();
+        let filter: Option<String> = None; // "all" mode
+        let non_code = std::collections::HashSet::new();
+
+        let result = crate::embed::SearchResult {
+            id: "other-project:src/lib.rs:foo:function".to_string(),
+            kind: "code:function".to_string(),
+            title: "foo".to_string(),
+            body: String::new(),
+            score: 1.0,
+        };
+        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
+    }
+
+    #[test]
+    fn test_search_result_filter_non_code_root_passes() {
+        let handler = RnaHandler::default();
+        let filter = Some("my-project".to_string());
+        let mut non_code = std::collections::HashSet::new();
+        non_code.insert("claude-memory".to_string());
+
+        let result = crate::embed::SearchResult {
+            id: "claude-memory:notes/todo.md:heading:section".to_string(),
+            kind: "code:section".to_string(),
+            title: "todo".to_string(),
+            body: String::new(),
+            score: 0.7,
+        };
+        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
     }
 }
