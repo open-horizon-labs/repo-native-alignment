@@ -116,6 +116,7 @@ MCP server with a workspace-wide context engine. Incrementally scans repos, extr
 - Use compiler-driven refactoring (add field, let `cargo check` find every construction site)
 - `cargo install --path .` before `/mcp` reconnect (or restart Claude Code)
 - Parallel worktree builds: `scripts/prep-worktree.sh <path> <branch>` creates a worktree with warm build cache (hardlinks `target/`). Set `CARGO_TARGET_DIR=$WORKTREE/target` before cargo commands. Enables genuinely parallel builds on M4 Max without cache thrashing.
+- **Cargo output: save to file, then grep/tail as needed.** Never pipe cargo commands through `tail` or `grep` directly — you'll miss errors and have to re-run the whole build. Instead: `cargo test 2>&1 > /tmp/cargo-out.txt; echo "exit: $?"` then grep or tail the file. Use unique filenames per agent to avoid conflicts.
 
 ## Anti-Patterns to Avoid
 - Don't search function bodies in code search (noise) — match name + signature only
