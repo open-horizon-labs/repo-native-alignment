@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search_symbols` and `oh_search_context`.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -51,6 +51,7 @@ pub fn symbols_schema() -> Schema {
         Field::new("storage", DataType::Utf8, true),         // metadata["storage"] — "static" (Rust) or "var" (Go)
         Field::new("mutable", DataType::Boolean, true),      // metadata["mutable"] — true for `static mut`
         Field::new("decorators", DataType::Utf8, true),        // metadata["decorators"] — comma-separated decorator/attribute text
+        Field::new("type_params", DataType::Utf8, true),       // metadata["type_params"] — generic type parameters (e.g. "<T: Clone + Send>")
         // Vector column is added dynamically when embeddings are computed,
         // since the dimension depends on the model. See `symbols_schema_with_vector`.
         Field::new("updated_at", DataType::Int64, false),
@@ -82,6 +83,7 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("storage", DataType::Utf8, true),
         Field::new("mutable", DataType::Boolean, true),
         Field::new("decorators", DataType::Utf8, true),
+        Field::new("type_params", DataType::Utf8, true),
         Field::new(
             "vector",
             DataType::FixedSizeList(
@@ -173,8 +175,8 @@ mod tests {
 
     #[test]
     fn test_schema_version_constant() {
-        // SCHEMA_VERSION must be at least 6 (bumped for storage/mutable columns)
-        assert!(SCHEMA_VERSION >= 6, "SCHEMA_VERSION should be >= 6");
+        // SCHEMA_VERSION must be at least 8 (bumped for type_params column)
+        assert!(SCHEMA_VERSION >= 8, "SCHEMA_VERSION should be >= 8");
     }
 
     #[test]
@@ -206,6 +208,7 @@ mod tests {
         assert!(schema.field_with_name("storage").is_ok());
         assert!(schema.field_with_name("mutable").is_ok());
         assert!(schema.field_with_name("decorators").is_ok());
+        assert!(schema.field_with_name("type_params").is_ok());
         assert!(schema.field_with_name("updated_at").is_ok());
         // no vector column in base schema
         assert!(schema.field_with_name("vector").is_err());
