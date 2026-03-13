@@ -315,7 +315,7 @@ async fn main() -> anyhow::Result<()> {
                             if max_hops == 1 {
                                 gs.index.neighbors(&args.node, edge_filter_slice, Direction::Incoming)
                             } else {
-                                gs.index.impact(&args.node, max_hops)
+                                gs.index.impact(&args.node, max_hops, edge_filter_slice)
                             }
                         }
                         "both" => {
@@ -327,7 +327,7 @@ async fn main() -> anyhow::Result<()> {
                             let inc = if max_hops == 1 {
                                 gs.index.neighbors(&args.node, edge_filter_slice, Direction::Incoming)
                             } else {
-                                gs.index.impact(&args.node, max_hops)
+                                gs.index.impact(&args.node, max_hops, edge_filter_slice)
                             };
                             ids.extend(inc);
                             ids.sort();
@@ -341,7 +341,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 "impact" => {
                     let max_hops = args.max_hops.unwrap_or(3);
-                    gs.index.impact(&args.node, max_hops)
+                    gs.index.impact(&args.node, max_hops, edge_filter_slice)
                 }
                 "reachable" => {
                     let max_hops = args.max_hops.unwrap_or(3);

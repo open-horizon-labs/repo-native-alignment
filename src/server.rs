@@ -2788,7 +2788,7 @@ fn run_traversal(
                     if max_hops == 1 {
                         Ok(index.neighbors(node_id, edge_filter, Direction::Incoming))
                     } else {
-                        Ok(index.impact(node_id, max_hops))
+                        Ok(index.impact(node_id, max_hops, edge_filter))
                     }
                 }
                 "both" => {
@@ -2800,7 +2800,7 @@ fn run_traversal(
                     let inc = if max_hops == 1 {
                         index.neighbors(node_id, edge_filter, Direction::Incoming)
                     } else {
-                        index.impact(node_id, max_hops)
+                        index.impact(node_id, max_hops, edge_filter)
                     };
                     let mut combined = out;
                     combined.extend(inc);
@@ -2814,7 +2814,7 @@ fn run_traversal(
         }
         "impact" => {
             let max_hops = hops.unwrap_or(3) as usize;
-            Ok(index.impact(node_id, max_hops))
+            Ok(index.impact(node_id, max_hops, edge_filter))
         }
         "reachable" => {
             let max_hops = hops.unwrap_or(3) as usize;
@@ -3270,7 +3270,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         // 1. Top symbols by importance (PageRank)
                         {
                             let mut symbols_with_importance: Vec<(&Node, f64)> = graph_state.nodes.iter()
-                                .filter(|n| !matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge))
+                                .filter(|n| !matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge | NodeKind::Field))
                                 .filter(|n| n.id.root != "external")
                                 .filter_map(|n| {
                                     let imp = n.metadata.get("importance")
