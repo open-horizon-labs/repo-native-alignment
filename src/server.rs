@@ -2448,12 +2448,11 @@ impl RnaHandler {
     }
 
     /// Batch node retrieval: resolve multiple stable node IDs in a single call.
-    /// Optionally runs traversal on each node if `mode` is specified.
     async fn handle_search_batch(
         &self,
         node_ids: &[&str],
         compact: bool,
-        mode: Option<&str>,
+        _mode: Option<&str>,
     ) -> Result<CallToolResult, CallToolError> {
         match self.get_graph().await {
             Ok(guard) => {
