@@ -35,7 +35,7 @@ const IMPORTANCE_THRESHOLD: f64 = 0.001;
 
 #[macros::mcp_tool(
     name = "oh_search_context",
-    description = "Semantic search across business context, commits, code, and markdown. Describe what you need in plain language. Returns results ranked 0-1 by relevance; test files are demoted. Enable include_code for ranked symbol search (exact name > contains > signature, production before tests), include_markdown for doc sections. For exact symbol name lookup use search_symbols instead. search_mode: hybrid (default, keyword+vector RRF), keyword (BM25 only), semantic (vector only)."
+    description = "Semantic search across business context, commits, code, and markdown. Describe what you need in plain language. Returns results ranked 0-1 by relevance; test files are demoted. Enable include_code for ranked symbol search (exact name > contains > signature, production before tests), include_markdown for doc sections. For exact symbol name lookup use search_symbols instead. search_mode: hybrid (default, keyword+vector RRF), keyword (BM25 only), semantic (vector only). Results default to the primary workspace root; pass root: \"all\" for cross-root search."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct OhSearchContext {
@@ -56,12 +56,15 @@ pub struct OhSearchContext {
     /// Search ranking mode: "hybrid" (default, keyword + vector RRF), "keyword" (BM25 only), "semantic" (vector only)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_mode: Option<String>,
+    /// Filter to a specific workspace root (by slug). Defaults to the primary root. Use "all" for cross-root search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
 }
 
 
 #[macros::mcp_tool(
     name = "outcome_progress",
-    description = "Track progress on a business outcome. Finds tagged commits, code symbols in changed files, and related markdown. Returns a navigable summary with stable Node IDs for use with search_symbols and graph_query. Set include_impact=true to add risk-classified blast radius showing which symbols are affected by the changes and how critical they are."
+    description = "Track progress on a business outcome. Finds tagged commits, code symbols in changed files, and related markdown. Returns a navigable summary with stable Node IDs for use with search_symbols and graph_query. Set include_impact=true to add risk-classified blast radius showing which symbols are affected by the changes and how critical they are. Results default to the primary workspace root; pass root: \"all\" for cross-root search."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct OutcomeProgress {
@@ -70,6 +73,9 @@ pub struct OutcomeProgress {
     /// When true, compute blast radius for changed symbols and classify risk as CRITICAL/HIGH/MEDIUM/LOW
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_impact: Option<bool>,
+    /// Filter to a specific workspace root (by slug). Defaults to the primary root. Use "all" for cross-root search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
 }
 
 // ── Unified search tool ─────────────────────────────────────────────
@@ -79,7 +85,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search",
-    description = "Find code symbols and trace their relationships. Without `mode`, performs flat ranked search (by name/signature). With `mode` (neighbors/impact/reachable/tests_for), performs graph traversal from matched symbols. `tests_for` finds which test functions call a symbol. Entry point: `query` (name or semantic search) or `node` (stable ID from previous results). Batch: `nodes` retrieves multiple IDs in one call. `compact: true` returns signature + location only (~25x fewer tokens). Filter by kind, language, file. Sort by relevance, complexity, or importance (PageRank)."
+    description = "Find code symbols and trace their relationships. Without `mode`, performs flat ranked search (by name/signature). With `mode` (neighbors/impact/reachable/tests_for), performs graph traversal from matched symbols. `tests_for` finds which test functions call a symbol. Entry point: `query` (name or semantic search) or `node` (stable ID from previous results). Batch: `nodes` retrieves multiple IDs in one call. `compact: true` returns signature + location only (~25x fewer tokens). Filter by kind, language, file. Sort by relevance, complexity, or importance (PageRank). Results default to the primary workspace root; pass root: \"all\" for cross-root search."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct Search {
@@ -110,7 +116,7 @@ pub struct Search {
     /// Filter by file path substring
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
-    /// Filter to a specific workspace root (by slug, e.g. "zettelkasten")
+    /// Filter to a specific workspace root (by slug). Defaults to the primary root. Use "all" for cross-root search.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
     /// Number of results (flat search, default: 10) or entry points (traversal, default: 1)
@@ -155,7 +161,7 @@ pub struct SearchSymbols {
     /// Optional: filter by file path substring
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
-    /// Optional: filter to a specific workspace root (by slug, e.g. "zettelkasten")
+    /// Optional: filter to a specific workspace root (by slug). Defaults to the primary root. Use "all" for cross-root search.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
     /// Maximum results to return (default: 20)
@@ -266,13 +272,16 @@ pub struct ListRoots {}
 
 #[macros::mcp_tool(
     name = "repo_map",
-    description = "Repository orientation for agents. Returns top symbols by PageRank importance, hotspot files (most definitions), active business outcomes, and entry points (main/handler functions). One call replaces an exploratory loop of search calls. Use this when starting work on an unfamiliar codebase."
+    description = "Repository orientation for agents. Returns top symbols by PageRank importance, hotspot files (most definitions), active business outcomes, and entry points (main/handler functions). One call replaces an exploratory loop of search calls. Use this when starting work on an unfamiliar codebase. Results default to the primary workspace root; pass root: \"all\" for cross-root search."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct RepoMap {
     /// Number of top symbols to return (default: 15)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_n: Option<u32>,
+    /// Filter to a specific workspace root (by slug). Defaults to the primary root. Use "all" for cross-root search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
 }
 
 // ── Graph persistence (LanceDB) ─────────────────────────────────────
@@ -1410,6 +1419,83 @@ impl Default for RnaHandler {
 }
 
 impl RnaHandler {
+    /// Return the slug for the primary `--repo` root.
+    fn primary_root_slug(&self) -> String {
+        crate::roots::RootConfig::code_project(self.repo_root.clone()).slug()
+    }
+
+    /// Resolve the effective root filter from a user-supplied `root` parameter.
+    ///
+    /// - `None` (caller omitted) -> scope to primary root slug (default)
+    /// - `Some("all")` -> no filter (cross-root search)
+    /// - `Some(slug)` -> use as explicit root slug
+    ///
+    /// Returns `None` when no filtering should be applied ("all" case).
+    fn effective_root_filter(&self, root_param: Option<&str>) -> Option<String> {
+        match root_param {
+            Some(v) if v.eq_ignore_ascii_case("all") => None,
+            Some(slug) => Some(slug.to_string()),
+            None => Some(self.primary_root_slug()),
+        }
+    }
+
+    /// Return the set of root slugs that correspond to non-code roots
+    /// (Notes, General, Custom). These should always be included in
+    /// query results regardless of root filtering.
+    fn non_code_root_slugs(&self) -> std::collections::HashSet<String> {
+        use crate::roots::{RootType, WorkspaceConfig};
+        let workspace = WorkspaceConfig::load()
+            .with_primary_root(self.repo_root.clone())
+            .with_worktrees(&self.repo_root)
+            .with_claude_memory(&self.repo_root);
+        workspace
+            .resolved_roots()
+            .into_iter()
+            .filter(|r| r.config.root_type != RootType::CodeProject)
+            .map(|r| r.slug)
+            .collect()
+    }
+
+    /// Check whether a node passes the root filter.
+    /// Non-code roots (Notes, General, Custom) and "external" always pass.
+    fn node_passes_root_filter(
+        &self,
+        node_root: &str,
+        root_filter: &Option<String>,
+        non_code_slugs: &std::collections::HashSet<String>,
+    ) -> bool {
+        match root_filter {
+            None => true, // "all" mode
+            Some(slug) => {
+                node_root.eq_ignore_ascii_case(slug)
+                    || node_root == "external"
+                    || non_code_slugs.contains(node_root)
+            }
+        }
+    }
+
+    /// Check whether an embedding `SearchResult` passes the root filter.
+    /// Code results (`kind` starts with "code:") are filtered by root slug
+    /// extracted from the stable ID prefix. Non-code results (commits, .oh/
+    /// artifacts) always pass through.
+    fn search_result_passes_root_filter(
+        &self,
+        result: &crate::embed::SearchResult,
+        root_filter: &Option<String>,
+        non_code_slugs: &std::collections::HashSet<String>,
+    ) -> bool {
+        if root_filter.is_none() {
+            return true; // "all" mode
+        }
+        // Non-code results (commits, oh artifacts) always pass
+        if !result.kind.starts_with("code:") {
+            return true;
+        }
+        // Extract root slug from stable ID: "root:file:name:kind"
+        let node_root = result.id.split(':').next().unwrap_or("");
+        self.node_passes_root_filter(node_root, root_filter, non_code_slugs)
+    }
+
     /// Ensure graph is built, check for file changes since last scan.
     /// Returns a read guard to the graph.
     async fn get_graph(&self) -> anyhow::Result<tokio::sync::RwLockReadGuard<'_, Option<GraphState>>> {
@@ -2486,6 +2572,15 @@ impl RnaHandler {
             return Ok(text_result("Empty query. Please describe what you're looking for (or use min_complexity / sort_by=\"complexity\" / sort_by=\"importance\").".into()));
         }
 
+        // Resolve effective root filter: default to primary root,
+        // "all" means no filter, otherwise use the explicit slug.
+        let root_filter = self.effective_root_filter(args.root.as_deref());
+        let non_code_slugs = if root_filter.is_some() {
+            self.non_code_root_slugs()
+        } else {
+            std::collections::HashSet::new()
+        };
+
         match self.get_graph().await {
             Ok(guard) => {
                 let graph_state = guard.as_ref().unwrap();
@@ -2524,10 +2619,10 @@ impl RnaHandler {
                                 return false;
                             }
                         }
-                        if let Some(ref root_filter) = args.root {
-                            if n.id.root.to_lowercase() != root_filter.to_lowercase() {
-                                return false;
-                            }
+                        // Root filter: default to primary root, "all" disables.
+                        // Non-code roots and "external" always pass.
+                        if !self.node_passes_root_filter(&n.id.root, &root_filter, &non_code_slugs) {
+                            return false;
                         }
                         if let Some(synthetic_filter) = args.synthetic {
                             let is_synthetic = n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false);
@@ -2616,6 +2711,15 @@ impl RnaHandler {
         let mode = args.mode.as_deref().unwrap_or("neighbors");
         let top_k = args.top_k.unwrap_or(1).clamp(1, 50) as usize;
 
+        // Root filter for entry node scoping (traversal results are unscoped —
+        // once you enter the graph, edges may cross roots).
+        let root_filter = self.effective_root_filter(args.root.as_deref());
+        let non_code_slugs = if root_filter.is_some() {
+            self.non_code_root_slugs()
+        } else {
+            std::collections::HashSet::new()
+        };
+
         // Reject if no entry point
         if node.is_none() && query.is_none() {
             return Ok(text_result(
@@ -2633,8 +2737,11 @@ impl RnaHandler {
                 Some(embed_idx) => {
                     match embed_idx.search_with_mode(query_text, None, top_k.min(50) * 3, search_mode).await {
                         Ok(SearchOutcome::Results(results)) if !results.is_empty() => {
+                            // Filter entry nodes by root scope — traversal results
+                            // are unscoped, but entry points should respect root filter.
                             let code_results: Vec<_> = results.into_iter()
                                 .filter(|r| r.kind.starts_with("code:"))
+                                .filter(|r| self.search_result_passes_root_filter(r, &root_filter, &non_code_slugs))
                                 .take(top_k)
                                 .collect();
 
@@ -3239,6 +3346,12 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 let include_code = args.include_code.unwrap_or(false);
                 let include_markdown = args.include_markdown.unwrap_or(false);
                 let search_mode = parse_search_mode(args.search_mode.as_deref());
+                let root_filter = self.effective_root_filter(args.root.as_deref());
+                let non_code_slugs = if root_filter.is_some() {
+                    self.non_code_root_slugs()
+                } else {
+                    std::collections::HashSet::new()
+                };
 
                 // Ensure graph is built first so symbols are embedded
                 // (get_graph builds the graph + embeds symbols in the pipeline)
@@ -3263,15 +3376,21 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         Some(index) => {
                             match index.search_with_mode(query, args.artifact_types.as_deref(), limit, search_mode).await {
                                 Ok(SearchOutcome::Results(results)) => {
-                                    if !results.is_empty() {
-                                        let md: String = results
+                                    // Filter by root: code results scoped to effective root,
+                                    // non-code (commits, .oh/ artifacts) always pass through.
+                                    let filtered: Vec<_> = results
+                                        .into_iter()
+                                        .filter(|r| self.search_result_passes_root_filter(r, &root_filter, &non_code_slugs))
+                                        .collect();
+                                    if !filtered.is_empty() {
+                                        let md: String = filtered
                                             .iter()
                                             .map(|r| r.to_markdown())
                                             .collect::<Vec<_>>()
                                             .join("\n");
                                         sections.push(format!(
                                             "### Artifacts ({} result(s))\n\n{}",
-                                            results.len(),
+                                            filtered.len(),
                                             md
                                         ));
                                     }
@@ -3293,6 +3412,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                             let query_lower = query.to_lowercase();
                             let mut matches: Vec<&Node> = gs.nodes.iter()
                                 .filter(|n| n.id.kind != NodeKind::Import && n.id.root != "external")
+                                .filter(|n| self.node_passes_root_filter(&n.id.root, &root_filter, &non_code_slugs))
                                 .filter(|n| {
                                     n.id.name.to_lowercase().contains(&query_lower)
                                         || n.signature.to_lowercase().contains(&query_lower)
@@ -3390,8 +3510,19 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             "outcome_progress" => {
                 let args: OutcomeProgress = parse_args(params.arguments)?;
                 let include_impact = args.include_impact.unwrap_or(false);
+                let root_filter = self.effective_root_filter(args.root.as_deref());
+                let non_code_slugs = if root_filter.is_some() {
+                    self.non_code_root_slugs()
+                } else {
+                    std::collections::HashSet::new()
+                };
                 let graph_nodes = if let Ok(guard) = self.get_graph().await {
-                    guard.as_ref().map(|gs| gs.nodes.clone()).unwrap_or_default()
+                    guard.as_ref()
+                        .map(|gs| gs.nodes.iter()
+                            .filter(|n| self.node_passes_root_filter(&n.id.root, &root_filter, &non_code_slugs))
+                            .cloned()
+                            .collect())
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 };
@@ -3505,6 +3636,12 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             "repo_map" => {
                 let args: RepoMap = parse_args(params.arguments)?;
                 let top_n = args.top_n.unwrap_or(15) as usize;
+                let root_filter = self.effective_root_filter(args.root.as_deref());
+                let non_code_slugs = if root_filter.is_some() {
+                    self.non_code_root_slugs()
+                } else {
+                    std::collections::HashSet::new()
+                };
 
                 match self.get_graph().await {
                     Ok(guard) => {
@@ -3518,6 +3655,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                     NodeKind::Import | NodeKind::Module | NodeKind::PrMerge | NodeKind::Field
                                 ))
                                 .filter(|n| n.id.root != "external")
+                                .filter(|n| self.node_passes_root_filter(&n.id.root, &root_filter, &non_code_slugs))
                                 .filter_map(|n| {
                                     let imp = n.metadata.get("importance")
                                         .and_then(|s| s.parse::<f64>().ok())
@@ -3563,6 +3701,9 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                     continue;
                                 }
                                 if n.id.root == "external" {
+                                    continue;
+                                }
+                                if !self.node_passes_root_filter(&n.id.root, &root_filter, &non_code_slugs) {
                                     continue;
                                 }
                                 let key = (n.id.root.clone(), n.id.file.display().to_string());
@@ -3615,6 +3756,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         {
                             let mut entry_points: Vec<&Node> = graph_state.nodes.iter()
                                 .filter(|n| n.id.kind == NodeKind::Function && n.id.root != "external")
+                                .filter(|n| self.node_passes_root_filter(&n.id.root, &root_filter, &non_code_slugs))
                                 .filter(|n| {
                                     let name = n.id.name.to_lowercase();
                                     name == "main"
@@ -5627,5 +5769,289 @@ mod tests {
             "Only live-root pr_merges rows should remain, got: {:?}",
             pr_root_ids
         );
+    }
+
+    // ── effective_root_filter / node_passes_root_filter tests ──────────
+
+    #[test]
+    fn test_effective_root_filter_none_defaults_to_primary() {
+        let handler = RnaHandler::default();
+        let primary = handler.primary_root_slug();
+        let filter = handler.effective_root_filter(None);
+        assert_eq!(filter, Some(primary));
+    }
+
+    #[test]
+    fn test_effective_root_filter_all_returns_none() {
+        let handler = RnaHandler::default();
+        assert_eq!(handler.effective_root_filter(Some("all")), None);
+        assert_eq!(handler.effective_root_filter(Some("ALL")), None);
+        assert_eq!(handler.effective_root_filter(Some("All")), None);
+    }
+
+    #[test]
+    fn test_effective_root_filter_explicit_slug() {
+        let handler = RnaHandler::default();
+        let filter = handler.effective_root_filter(Some("my-project"));
+        assert_eq!(filter, Some("my-project".to_string()));
+    }
+
+    #[test]
+    fn test_node_passes_root_filter_no_filter() {
+        let handler = RnaHandler::default();
+        let empty = std::collections::HashSet::new();
+        // When filter is None ("all"), everything passes.
+        assert!(handler.node_passes_root_filter("any-root", &None, &empty));
+    }
+
+    #[test]
+    fn test_node_passes_root_filter_matching_slug() {
+        let handler = RnaHandler::default();
+        let empty = std::collections::HashSet::new();
+        let filter = Some("my-project".to_string());
+        assert!(handler.node_passes_root_filter("my-project", &filter, &empty));
+        assert!(!handler.node_passes_root_filter("other-project", &filter, &empty));
+    }
+
+    #[test]
+    fn test_node_passes_root_filter_case_insensitive() {
+        let handler = RnaHandler::default();
+        let empty = std::collections::HashSet::new();
+        let filter = Some("My-Project".to_string());
+        assert!(handler.node_passes_root_filter("my-project", &filter, &empty));
+    }
+
+    #[test]
+    fn test_node_passes_root_filter_external_always_passes() {
+        let handler = RnaHandler::default();
+        let empty = std::collections::HashSet::new();
+        let filter = Some("my-project".to_string());
+        assert!(handler.node_passes_root_filter("external", &filter, &empty));
+    }
+
+    #[test]
+    fn test_node_passes_root_filter_non_code_root_passes() {
+        let handler = RnaHandler::default();
+        let mut non_code = std::collections::HashSet::new();
+        non_code.insert("notes-root".to_string());
+        let filter = Some("my-project".to_string());
+        // Non-code root should pass even though it doesn't match the filter slug.
+        assert!(handler.node_passes_root_filter("notes-root", &filter, &non_code));
+        // A code root that's not in the filter should still fail.
+        assert!(!handler.node_passes_root_filter("other-code", &filter, &non_code));
+    }
+
+    #[test]
+    fn test_oh_search_context_root_param_deserializes() {
+        let args: OhSearchContext = serde_json::from_value(json!({
+            "query": "test",
+            "root": "all"
+        })).unwrap();
+        assert_eq!(args.root, Some("all".to_string()));
+
+        let args: OhSearchContext = serde_json::from_value(json!({
+            "query": "test"
+        })).unwrap();
+        assert!(args.root.is_none());
+    }
+
+    #[test]
+    fn test_repo_map_root_param_deserializes() {
+        let args: RepoMap = serde_json::from_value(json!({
+            "root": "my-slug"
+        })).unwrap();
+        assert_eq!(args.root, Some("my-slug".to_string()));
+
+        let args: RepoMap = serde_json::from_value(json!({})).unwrap();
+        assert!(args.root.is_none());
+    }
+
+    #[test]
+    fn test_outcome_progress_root_param_deserializes() {
+        let args: OutcomeProgress = serde_json::from_value(json!({
+            "outcome_id": "test-outcome",
+            "root": "all"
+        })).unwrap();
+        assert_eq!(args.root, Some("all".to_string()));
+
+        let args: OutcomeProgress = serde_json::from_value(json!({
+            "outcome_id": "test-outcome"
+        })).unwrap();
+        assert!(args.root.is_none());
+    }
+
+    // ── Adversarial tests (dissent-seeded) ────────────────────────────
+
+    #[test]
+    fn test_effective_root_filter_whitespace_all_is_not_special() {
+        // Dissent: what if someone passes " all " with whitespace?
+        // It should NOT be treated as the "all" escape -- it's a literal slug.
+        let handler = RnaHandler::default();
+        let filter = handler.effective_root_filter(Some(" all "));
+        assert_eq!(filter, Some(" all ".to_string()), "Whitespace-padded 'all' should be a literal slug, not the escape hatch");
+    }
+
+    #[test]
+    fn test_effective_root_filter_empty_string_is_not_all() {
+        // Dissent: empty string should not disable filtering.
+        let handler = RnaHandler::default();
+        let filter = handler.effective_root_filter(Some(""));
+        assert_eq!(filter, Some("".to_string()), "Empty string should be a literal slug, not disable filtering");
+    }
+
+    #[test]
+    fn test_node_passes_root_filter_external_node_with_no_filter() {
+        // When "all" mode (filter=None), external still passes.
+        let handler = RnaHandler::default();
+        let empty = std::collections::HashSet::new();
+        assert!(handler.node_passes_root_filter("external", &None, &empty));
+    }
+
+    #[test]
+    fn test_node_passes_root_filter_non_code_slug_case_sensitivity() {
+        // Non-code root slugs are stored as-is in the HashSet.
+        // The filter does case-insensitive matching for the primary slug,
+        // but non-code slug lookup is case-SENSITIVE (HashSet::contains).
+        // This tests that behavior is consistent.
+        let handler = RnaHandler::default();
+        let mut non_code = std::collections::HashSet::new();
+        non_code.insert("Notes".to_string());
+        let filter = Some("my-project".to_string());
+        // Exact case matches
+        assert!(handler.node_passes_root_filter("Notes", &filter, &non_code));
+        // Different case does NOT match (HashSet is case-sensitive)
+        assert!(!handler.node_passes_root_filter("notes", &filter, &non_code));
+    }
+
+    #[test]
+    fn test_search_root_param_all_deserializes() {
+        // Verify Search struct also handles root param correctly.
+        let args: Search = serde_json::from_value(json!({
+            "query": "test",
+            "root": "all"
+        })).unwrap();
+        assert_eq!(args.root, Some("all".to_string()));
+
+        let args: Search = serde_json::from_value(json!({
+            "query": "test"
+        })).unwrap();
+        assert!(args.root.is_none());
+    }
+
+    #[test]
+    fn test_graph_query_into_search_sets_root_none() {
+        // Dissent: graph_query deprecated alias sets root: None which triggers
+        // default scoping. Verify this is intentional (traversal entry points
+        // get default scoping on flat resolution, traversal results are unscoped).
+        let gq = GraphQuery {
+            node_id: None,
+            query: Some("test".to_string()),
+            mode: "neighbors".to_string(),
+            direction: None,
+            edge_types: None,
+            max_hops: None,
+            top_k: None,
+        };
+        let search = gq.into_search();
+        assert!(search.root.is_none(), "GraphQuery::into_search should set root to None");
+    }
+
+    // ── search_result_passes_root_filter tests ─────────────────────────
+
+    #[test]
+    fn test_search_result_filter_code_result_matches_root() {
+        let handler = RnaHandler::default();
+        let filter = Some("my-project".to_string());
+        let non_code = std::collections::HashSet::new();
+
+        let result = crate::embed::SearchResult {
+            id: "my-project:src/lib.rs:foo:function".to_string(),
+            kind: "code:function".to_string(),
+            title: "foo".to_string(),
+            body: String::new(),
+            score: 1.0,
+        };
+        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
+    }
+
+    #[test]
+    fn test_search_result_filter_code_result_wrong_root() {
+        let handler = RnaHandler::default();
+        let filter = Some("my-project".to_string());
+        let non_code = std::collections::HashSet::new();
+
+        let result = crate::embed::SearchResult {
+            id: "other-project:src/lib.rs:foo:function".to_string(),
+            kind: "code:function".to_string(),
+            title: "foo".to_string(),
+            body: String::new(),
+            score: 1.0,
+        };
+        assert!(!handler.search_result_passes_root_filter(&result, &filter, &non_code));
+    }
+
+    #[test]
+    fn test_search_result_filter_commit_always_passes() {
+        let handler = RnaHandler::default();
+        let filter = Some("my-project".to_string());
+        let non_code = std::collections::HashSet::new();
+
+        let result = crate::embed::SearchResult {
+            id: "abc123".to_string(),
+            kind: "commit".to_string(),
+            title: "fix: something".to_string(),
+            body: String::new(),
+            score: 0.8,
+        };
+        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
+    }
+
+    #[test]
+    fn test_search_result_filter_oh_artifact_always_passes() {
+        let handler = RnaHandler::default();
+        let filter = Some("my-project".to_string());
+        let non_code = std::collections::HashSet::new();
+
+        let result = crate::embed::SearchResult {
+            id: "outcomes/agent-alignment".to_string(),
+            kind: "outcome".to_string(),
+            title: "agent alignment".to_string(),
+            body: String::new(),
+            score: 0.9,
+        };
+        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
+    }
+
+    #[test]
+    fn test_search_result_filter_all_mode_passes_everything() {
+        let handler = RnaHandler::default();
+        let filter: Option<String> = None; // "all" mode
+        let non_code = std::collections::HashSet::new();
+
+        let result = crate::embed::SearchResult {
+            id: "other-project:src/lib.rs:foo:function".to_string(),
+            kind: "code:function".to_string(),
+            title: "foo".to_string(),
+            body: String::new(),
+            score: 1.0,
+        };
+        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
+    }
+
+    #[test]
+    fn test_search_result_filter_non_code_root_passes() {
+        let handler = RnaHandler::default();
+        let filter = Some("my-project".to_string());
+        let mut non_code = std::collections::HashSet::new();
+        non_code.insert("claude-memory".to_string());
+
+        let result = crate::embed::SearchResult {
+            id: "claude-memory:notes/todo.md:heading:section".to_string(),
+            kind: "code:section".to_string(),
+            title: "todo".to_string(),
+            body: String::new(),
+            score: 0.7,
+        };
+        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
     }
 }
