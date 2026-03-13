@@ -19,7 +19,7 @@ use crate::extract::{ExtractorRegistry, EnricherRegistry};
 use crate::graph::{self, EdgeKind, Node, Edge, Confidence, ExtractionSource, NodeId, NodeKind};
 use crate::graph::index::GraphIndex;
 use crate::graph::store::{symbols_schema, edges_schema, schema_meta_schema, SCHEMA_VERSION};
-use crate::roots::{WorkspaceConfig, cache_state_path};
+use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
 use crate::scanner::{ScanResult, Scanner};
 use crate::types::OhArtifactKind;
 use crate::{git, markdown, oh, query, ranking};
@@ -423,8 +423,55 @@ fn parse_confidence(s: &str) -> Confidence {
     }
 }
 
-/// Delete all symbols and edges for the given root slugs from LanceDB.
-/// Called when a worktree is detected as removed during the background scan loop.
+/// Query LanceDB for all distinct `root_id` values stored in the symbols table.
+async fn get_stored_root_ids(repo_root: &Path) -> anyhow::Result<Vec<String>> {
+    use futures::TryStreamExt;
+    use lancedb::query::{ExecutableQuery, QueryBase};
+
+    let db_path = graph_lance_path(repo_root);
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let db = lancedb::connect(db_path.to_str().unwrap())
+        .execute()
+        .await
+        .context("Failed to connect to LanceDB for root discovery")?;
+
+    let tbl = match db.open_table("symbols").execute().await {
+        Ok(t) => t,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    // Select only root_id column and collect unique values.
+    let stream = tbl
+        .query()
+        .select(lancedb::query::Select::columns(&["root_id"]))
+        .execute()
+        .await
+        .context("Failed to query symbols for root_ids")?;
+    let batches: Vec<arrow_array::RecordBatch> = stream.try_collect().await?;
+
+    let mut root_ids = std::collections::HashSet::new();
+    for batch in &batches {
+        if let Some(col) = batch.column_by_name("root_id") {
+            if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        root_ids.insert(arr.value(i).to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(root_ids.into_iter().collect())
+}
+
+/// Delete all LanceDB rows for the given root slugs from all tables.
+///
+/// Called when a worktree is detected as removed (during background scan or
+/// at startup when stale roots are found in LanceDB).
 async fn delete_nodes_for_roots(repo_root: &Path, slugs: &[String]) -> anyhow::Result<()> {
     if slugs.is_empty() {
         return Ok(());
@@ -447,22 +494,21 @@ async fn delete_nodes_for_roots(repo_root: &Path, slugs: &[String]) -> anyhow::R
         .collect();
     let predicate = format!("root_id IN ({})", quoted.join(", "));
 
-    // Delete from symbols table.
-    if let Ok(tbl) = db.open_table("symbols").execute().await {
-        if let Err(e) = tbl.delete(&predicate).await {
-            tracing::warn!("Failed to delete symbols for removed worktrees: {}", e);
-        }
-    }
-
-    // Delete from edges table.
-    if let Ok(tbl) = db.open_table("edges").execute().await {
-        if let Err(e) = tbl.delete(&predicate).await {
-            tracing::warn!("Failed to delete edges for removed worktrees: {}", e);
+    // Delete from all tables that carry a root_id column.
+    for table_name in ["symbols", "edges", "file_index", "pr_merges"] {
+        if let Ok(tbl) = db.open_table(table_name).execute().await {
+            if let Err(e) = tbl.delete(&predicate).await {
+                tracing::warn!(
+                    "Failed to delete {} for removed worktrees: {}",
+                    table_name,
+                    e
+                );
+            }
         }
     }
 
     tracing::info!(
-        "Deleted LanceDB rows for removed worktrees: {}",
+        "Pruned LanceDB rows for stale roots: {}",
         slugs.join(", ")
     );
     Ok(())
@@ -1694,6 +1740,35 @@ impl RnaHandler {
             .with_claude_memory(&self.repo_root);
         let resolved_roots = workspace.resolved_roots();
 
+        // Prune stale roots: compare discovered roots against what LanceDB has stored.
+        // Worktrees removed while the server was offline leave orphaned rows that cause
+        // duplicate results (see #198).
+        let live_slugs: std::collections::HashSet<String> = resolved_roots
+            .iter()
+            .map(|r| r.slug.clone())
+            .collect();
+        match get_stored_root_ids(&self.repo_root).await {
+            Ok(stored) => {
+                let stale: Vec<String> = stored
+                    .into_iter()
+                    .filter(|s| !live_slugs.contains(s))
+                    .collect();
+                if !stale.is_empty() {
+                    tracing::info!(
+                        "Detected {} stale root(s) in LanceDB: {}",
+                        stale.len(),
+                        stale.join(", ")
+                    );
+                    if let Err(e) = delete_nodes_for_roots(&self.repo_root, &stale).await {
+                        tracing::warn!("Failed to prune stale roots at startup: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Could not query stored roots for stale pruning: {}", e);
+            }
+        }
+
         // 1. Scan all roots to detect changes (per-root tracking)
         let mut any_root_changed = false;
         let mut scanners: Vec<(String, Scanner, crate::scanner::ScanResult, PathBuf, bool)> = Vec::new();
@@ -2150,7 +2225,20 @@ impl RnaHandler {
         });
 
         // Extract new + changed files
-        let extraction = registry.extract_scan_result(&self.repo_root, &scan);
+        let mut extraction = registry.extract_scan_result(&self.repo_root, &scan);
+
+        // Set root slug on extracted nodes and edges.
+        // Extractors don't set root — the caller must assign it, matching the
+        // pattern in build_full_graph and the background scanner.
+        let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
+        for node in &mut extraction.nodes {
+            node.id.root = primary_slug.clone();
+        }
+        for edge in &mut extraction.edges {
+            edge.from.root = primary_slug.clone();
+            edge.to.root = primary_slug.clone();
+        }
+
         // Track only the delta (new/changed) for LanceDB upsert — not the full graph.
         let mut upsert_nodes: Vec<Node> = extraction.nodes.clone();
         let mut upsert_edges: Vec<Edge> = extraction.edges.clone();
@@ -4675,6 +4763,88 @@ mod tests {
         }
     }
 
+    // ── Regression test for #199: root slug must survive incremental updates ──
+
+    #[tokio::test]
+    async fn test_incremental_update_preserves_root_slug() {
+        // Regression test for #199: update_graph_with_scan() must set the root
+        // slug on extracted nodes, otherwise they get empty root prefixes which
+        // breaks the `root` filter for ~1000 symbols.
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Set up a minimal repo with one Rust file
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn initial_func() {}\n",
+        )
+        .unwrap();
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            ..Default::default()
+        };
+
+        // Compute the expected root slug for this temp directory
+        let expected_slug = RootConfig::code_project(root.to_path_buf()).slug();
+        assert!(!expected_slug.is_empty(), "root slug should not be empty");
+
+        // First call: builds graph from scratch (build_full_graph sets root slug)
+        {
+            let guard = handler.get_graph().await.unwrap();
+            let gs = guard.as_ref().expect("graph should be built");
+            let node = gs.nodes.iter().find(|n| n.id.name == "initial_func")
+                .expect("initial_func should be in graph");
+            assert_eq!(
+                node.id.root, expected_slug,
+                "Full rebuild should set root slug"
+            );
+        }
+
+        // Wait for mtime granularity
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Edit the file to trigger incremental update
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn updated_func() {}\n",
+        )
+        .unwrap();
+
+        // Expire the cooldown
+        {
+            let mut last = handler.last_scan.lock().unwrap();
+            *last = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        }
+
+        // Second call: incremental update via update_graph_with_scan
+        {
+            let guard = handler.get_graph().await.unwrap();
+            let gs = guard.as_ref().expect("graph should still exist");
+
+            let node = gs.nodes.iter().find(|n| n.id.name == "updated_func")
+                .expect("updated_func should be in graph after edit");
+            assert_eq!(
+                node.id.root, expected_slug,
+                "Incremental update must preserve root slug (was empty before #199 fix)"
+            );
+
+            // Also verify edges have root slug set
+            for edge in &gs.edges {
+                if edge.from.file == std::path::PathBuf::from("src/lib.rs") {
+                    assert_eq!(
+                        edge.from.root, expected_slug,
+                        "Edge source root should be set after incremental update"
+                    );
+                }
+            }
+        }
+    }
+
     // ── compact + nodes (batch) parameter tests ──────────────────────────
 
     #[test]
@@ -5194,5 +5364,154 @@ mod tests {
         retain_displayable(&mut ids, &nodes);
 
         assert_eq!(ids.len(), 1, "Unknown IDs should be preserved");
+    }
+
+    // ── Stale root pruning tests (#198) ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_stored_root_ids_empty_when_no_db() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        // No LanceDB directory exists yet.
+        let ids = super::get_stored_root_ids(root).await.unwrap();
+        assert!(ids.is_empty(), "Should return empty when no DB exists");
+    }
+
+    #[tokio::test]
+    async fn test_delete_nodes_for_roots_prunes_all_tables() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray, UInt32Array, BooleanArray, Float64Array};
+        use lancedb::query::ExecutableQuery;
+        use futures::TryStreamExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let db_path = graph_lance_path(root);
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        let db = lancedb::connect(db_path.to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+
+        // Insert rows into symbols table with two different root_ids.
+        let schema = graph::store::symbols_schema();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let make_symbols_batch = |root_id: &str, name: &str| -> RecordBatch {
+            RecordBatch::try_new(
+                std::sync::Arc::new(schema.clone()),
+                vec![
+                    std::sync::Arc::new(StringArray::from(vec![format!("{}:src/lib.rs:{}:function", root_id, name)])),
+                    std::sync::Arc::new(StringArray::from(vec![root_id.to_string()])),
+                    std::sync::Arc::new(StringArray::from(vec!["src/lib.rs".to_string()])),
+                    std::sync::Arc::new(StringArray::from(vec![name.to_string()])),
+                    std::sync::Arc::new(StringArray::from(vec!["function".to_string()])),
+                    std::sync::Arc::new(UInt32Array::from(vec![1u32])),
+                    std::sync::Arc::new(UInt32Array::from(vec![10u32])),
+                    std::sync::Arc::new(StringArray::from(vec!["fn()".to_string()])),
+                    std::sync::Arc::new(StringArray::from(vec!["{}".to_string()])),
+                    std::sync::Arc::new(BooleanArray::from(vec![None::<bool>])),   // meta_virtual
+                    std::sync::Arc::new(StringArray::from(vec![None::<String>])),   // meta_package
+                    std::sync::Arc::new(arrow_array::Int32Array::from(vec![None::<i32>])),  // meta_name_col
+                    std::sync::Arc::new(StringArray::from(vec![None::<String>])),   // value
+                    std::sync::Arc::new(BooleanArray::from(vec![None::<bool>])),    // synthetic
+                    std::sync::Arc::new(arrow_array::Int32Array::from(vec![None::<i32>])),  // cyclomatic
+                    std::sync::Arc::new(Float64Array::from(vec![None::<f64>])),     // importance
+                    std::sync::Arc::new(StringArray::from(vec![None::<String>])),   // storage
+                    std::sync::Arc::new(BooleanArray::from(vec![None::<bool>])),    // mutable
+                    std::sync::Arc::new(StringArray::from(vec![None::<String>])),   // decorators
+                    std::sync::Arc::new(StringArray::from(vec![None::<String>])),   // type_params
+                    std::sync::Arc::new(StringArray::from(vec![None::<String>])),   // pattern_hint
+                    std::sync::Arc::new(Int64Array::from(vec![now])),               // updated_at
+                ],
+            )
+            .unwrap()
+        };
+
+        let batch_live = make_symbols_batch("live-root", "live_fn");
+        let batch_stale = make_symbols_batch("stale-root", "stale_fn");
+
+        // Create symbols table with both batches.
+        let batches = vec![batch_live.clone(), batch_stale.clone()];
+        let reader = arrow_array::RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            std::sync::Arc::new(schema.clone()),
+        );
+        db.create_table("symbols", Box::new(reader))
+            .execute()
+            .await
+            .unwrap();
+
+        // Also create edges table with rows for both roots.
+        let edge_schema = graph::store::edges_schema();
+        let make_edge_batch = |root_id: &str| -> RecordBatch {
+            RecordBatch::try_new(
+                std::sync::Arc::new(edge_schema.clone()),
+                vec![
+                    std::sync::Arc::new(StringArray::from(vec![format!("{}-edge-1", root_id)])),
+                    std::sync::Arc::new(StringArray::from(vec!["src_id".to_string()])),
+                    std::sync::Arc::new(StringArray::from(vec!["function".to_string()])),
+                    std::sync::Arc::new(StringArray::from(vec!["tgt_id".to_string()])),
+                    std::sync::Arc::new(StringArray::from(vec!["function".to_string()])),
+                    std::sync::Arc::new(StringArray::from(vec!["calls".to_string()])),
+                    std::sync::Arc::new(StringArray::from(vec!["tree_sitter".to_string()])),
+                    std::sync::Arc::new(StringArray::from(vec!["high".to_string()])),
+                    std::sync::Arc::new(StringArray::from(vec![root_id.to_string()])),
+                    std::sync::Arc::new(Int64Array::from(vec![now])),
+                ],
+            )
+            .unwrap()
+        };
+        let edge_batches = vec![make_edge_batch("live-root"), make_edge_batch("stale-root")];
+        let edge_reader = arrow_array::RecordBatchIterator::new(
+            edge_batches.into_iter().map(Ok),
+            std::sync::Arc::new(edge_schema.clone()),
+        );
+        db.create_table("edges", Box::new(edge_reader))
+            .execute()
+            .await
+            .unwrap();
+
+        // Verify both roots are stored.
+        let stored = super::get_stored_root_ids(root).await.unwrap();
+        assert!(stored.contains(&"live-root".to_string()));
+        assert!(stored.contains(&"stale-root".to_string()));
+
+        // Prune stale root.
+        super::delete_nodes_for_roots(root, &["stale-root".to_string()])
+            .await
+            .unwrap();
+
+        // Verify only live root remains in symbols.
+        let stored_after = super::get_stored_root_ids(root).await.unwrap();
+        assert!(
+            stored_after.contains(&"live-root".to_string()),
+            "Live root should survive pruning"
+        );
+        assert!(
+            !stored_after.contains(&"stale-root".to_string()),
+            "Stale root should be pruned"
+        );
+
+        // Verify edges for stale root are also gone.
+        let edge_tbl = db.open_table("edges").execute().await.unwrap();
+        let edge_stream = edge_tbl.query().execute().await.unwrap();
+        let edge_batches: Vec<RecordBatch> = edge_stream.try_collect().await.unwrap();
+        let edge_root_ids: Vec<String> = edge_batches
+            .iter()
+            .flat_map(|b| {
+                let col = b.column_by_name("root_id").unwrap();
+                let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                (0..arr.len()).map(|i| arr.value(i).to_string()).collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            edge_root_ids.iter().all(|r| r == "live-root"),
+            "Only live-root edges should remain, got: {:?}",
+            edge_root_ids
+        );
     }
 }
