@@ -4,10 +4,23 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arrow_array::{Array as ArrowArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use lance_index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
 
 use crate::git;
 use crate::oh;
+
+/// Search mode for the embedding index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchMode {
+    /// Combine keyword (BM25) + vector scoring via LanceDB hybrid search with RRF.
+    #[default]
+    Hybrid,
+    /// Pure keyword (BM25 full-text) search only.
+    Keyword,
+    /// Pure vector (semantic embedding) search only.
+    Semantic,
+}
 
 /// Adaptive batch sizing constants (TCP slow-start style).
 /// Instead of a fixed batch size that may saturate unified memory bandwidth
@@ -313,7 +326,37 @@ impl EmbeddingIndex {
         })
     }
 
-
+    /// Create (or replace) tantivy full-text search indexes on the `title` and
+    /// `body` columns. LanceDB requires separate FTS indexes per column.
+    /// Called after bulk writes and reindex to enable hybrid search.
+    async fn create_fts_index(&self, table: &lancedb::Table) -> Result<()> {
+        let fts_start = std::time::Instant::now();
+        // Title index: symbol names, kind labels, language — best for exact keyword matches.
+        table
+            .create_index(
+                &["title"],
+                lancedb::index::Index::FTS(Default::default()),
+            )
+            .replace(true)
+            .execute()
+            .await
+            .context("Failed to create FTS index on title")?;
+        // Body index: signatures, file paths, commit messages — broader keyword coverage.
+        table
+            .create_index(
+                &["body"],
+                lancedb::index::Index::FTS(Default::default()),
+            )
+            .replace(true)
+            .execute()
+            .await
+            .context("Failed to create FTS index on body")?;
+        tracing::info!(
+            "EmbeddingIndex: FTS indexes on title+body created in {:?}",
+            fts_start.elapsed()
+        );
+        Ok(())
+    }
 
     /// Index all .oh/ artifacts, git commits, and optionally code symbols.
     /// Call with symbols from the graph to enable semantic code search.
@@ -460,6 +503,9 @@ impl EmbeddingIndex {
             .execute(Box::new(batches))
             .await
             .context("Failed to upsert enriched node embeddings")?;
+
+        // Rebuild FTS index after upsert so new/changed rows are searchable.
+        self.create_fts_index(&table).await?;
 
         Ok(count)
     }
@@ -787,10 +833,22 @@ impl EmbeddingIndex {
             index_start.elapsed()
         );
 
+        // Build FTS index for hybrid search (BM25 on title + body).
+        let table = self.db.open_table(&self.table_name).execute().await
+            .context("Failed to open table for FTS index")?;
+        self.create_fts_index(&table).await?;
+
         Ok(count)
     }
 
-    /// Semantic search over indexed artifacts.
+    /// Search over indexed artifacts using the specified mode.
+    ///
+    /// - `Hybrid` (default): combines BM25 keyword scoring + vector similarity
+    ///   via LanceDB's native RRF fusion. Falls back to pure vector if the FTS
+    ///   index isn't available.
+    /// - `Keyword`: BM25 full-text search only (no embeddings computed).
+    /// - `Semantic`: pure vector similarity search only.
+    ///
     /// Returns `SearchOutcome::NotReady` if the table hasn't been created yet,
     /// `SearchOutcome::Results(vec)` otherwise (may be empty).
     pub async fn search(
@@ -798,6 +856,17 @@ impl EmbeddingIndex {
         query: &str,
         artifact_types: Option<&[String]>,
         limit: usize,
+    ) -> Result<SearchOutcome> {
+        self.search_with_mode(query, artifact_types, limit, SearchMode::default()).await
+    }
+
+    /// Search with an explicit [`SearchMode`].
+    pub async fn search_with_mode(
+        &self,
+        query: &str,
+        artifact_types: Option<&[String]>,
+        limit: usize,
+        mode: SearchMode,
     ) -> Result<SearchOutcome> {
         let table = match self
             .db
@@ -815,29 +884,78 @@ impl EmbeddingIndex {
             }
         };
 
-        // Embed the query
-        let query_embedding = embed_texts(vec![query.to_string()]).await?;
-
-        let mut search = table
-            .vector_search(query_embedding[0].clone())
-            .context("Failed to create vector search")?;
-
-        // Cosine distance [0, 2]: 0 = identical, 2 = opposite.
-        // MiniLM embeddings are normalized, so cosine is the correct metric.
-        // Default L2 produces large distances (1.5+) even for decent matches,
-        // making the 1-distance score always negative.
-        search = search.distance_type(lancedb::DistanceType::Cosine);
-        search = search.limit(limit * 3); // over-fetch to filter by type
-
-        let results = search
-            .execute()
-            .await
-            .context("Vector search failed")?;
+        let over_fetch = limit * 3; // over-fetch to allow type filtering
 
         use futures::TryStreamExt;
-        let batches: Vec<RecordBatch> = results.try_collect().await?;
+
+        let batches: Vec<RecordBatch> = match mode {
+            SearchMode::Keyword => {
+                // Pure BM25 full-text search — no embedding needed.
+                let fts_query = FullTextSearchQuery::new(query.to_string());
+                let results = table
+                    .query()
+                    .full_text_search(fts_query)
+                    .limit(over_fetch)
+                    .execute()
+                    .await
+                    .context("FTS keyword search failed")?;
+                results.try_collect().await?
+            }
+            SearchMode::Semantic => {
+                // Pure vector search — original behavior.
+                let query_embedding = embed_texts(vec![query.to_string()]).await?;
+                let search = table
+                    .vector_search(query_embedding[0].clone())
+                    .context("Failed to create vector search")?
+                    .distance_type(lancedb::DistanceType::Cosine)
+                    .limit(over_fetch);
+                let results = search.execute().await.context("Vector search failed")?;
+                results.try_collect().await?
+            }
+            SearchMode::Hybrid => {
+                // Hybrid: BM25 + vector with RRF fusion.
+                // LanceDB automatically detects both FTS and vector on VectorQuery
+                // and routes through execute_hybrid with RRF reranking.
+                let query_embedding = embed_texts(vec![query.to_string()]).await?;
+                let fts_query = FullTextSearchQuery::new(query.to_string());
+
+                let hybrid_result = table
+                    .query()
+                    .full_text_search(fts_query)
+                    .limit(over_fetch)
+                    .nearest_to(query_embedding[0].as_slice())
+                    .context("Failed to create hybrid search")?
+                    .distance_type(lancedb::DistanceType::Cosine)
+                    .execute()
+                    .await;
+
+                match hybrid_result {
+                    Ok(stream) => stream.try_collect().await?,
+                    Err(e) => {
+                        // FTS index may not exist yet (first run before index_all
+                        // completes, or old cache). Fall back to pure vector search.
+                        tracing::warn!(
+                            "Hybrid search failed ({}), falling back to vector-only",
+                            e
+                        );
+                        let search = table
+                            .vector_search(query_embedding[0].clone())
+                            .context("Failed to create fallback vector search")?
+                            .distance_type(lancedb::DistanceType::Cosine)
+                            .limit(over_fetch);
+                        let results = search.execute().await.context("Fallback vector search failed")?;
+                        results.try_collect().await?
+                    }
+                }
+            }
+        };
 
         let mut search_results = Vec::new();
+
+        // Hybrid/FTS results use `_score` (BM25 or RRF), vector uses `_distance`.
+        // Detect which column is present and normalize to a 0..1 score.
+        let has_score_col = batches.first()
+            .is_some_and(|b| b.column_by_name("_score").is_some());
 
         for batch in &batches {
             let ids = batch
@@ -864,12 +982,6 @@ impl EmbeddingIndex {
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
-            let distances = batch
-                .column_by_name("_distance")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .unwrap();
 
             for i in 0..batch.num_rows() {
                 let kind = kinds.value(i).to_string();
@@ -881,14 +993,34 @@ impl EmbeddingIndex {
                     }
                 }
 
-                // Convert distance to similarity (1 - distance), clamp to [0, 1].
-                // Cosine distance ranges [0, 2] for normalized vectors, so
-                // scores below 0 mean "worse than orthogonal" — pure noise.
-                let raw_score = (1.0 - distances.value(i)).max(0.0);
+                let raw_score = if has_score_col {
+                    // RRF / BM25 `_score` — higher is better.
+                    // RRF scores are always < 1 (sum of 1/(k+rank_i), k=60).
+                    // BM25 scores can exceed 1.0 for highly relevant short docs,
+                    // but we clamp to [0, 1] for consistency with cosine similarity.
+                    // Ordering is preserved since we sort by score descending.
+                    let s = batch
+                        .column_by_name("_score")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .unwrap()
+                        .value(i);
+                    s.max(0.0).min(1.0)
+                } else {
+                    // Cosine distance [0, 2]: convert to similarity.
+                    let d = batch
+                        .column_by_name("_distance")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .unwrap()
+                        .value(i);
+                    (1.0 - d).max(0.0)
+                };
 
                 // Demote test files: reduce score so production code ranks above
-                // test code at similar vector distances. Uses same path conventions
-                // as ranking::is_test_file.
+                // test code at similar distances. Same conventions as ranking::is_test_file.
                 let id_str = ids.value(i).to_string();
                 let is_test = id_str.contains("/tests/")
                     || id_str.contains("/test/")
@@ -908,8 +1040,6 @@ impl EmbeddingIndex {
         }
 
         // Re-sort by adjusted score (descending) and truncate.
-        // LanceDB returns results sorted by raw distance, but our
-        // test-file demotion may reorder them.
         search_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         search_results.truncate(limit);
 
@@ -1630,5 +1760,21 @@ mod tests {
             batch_size = (batch_size * 2).min(BATCH_CEILING);
         }
         assert_eq!(batch_size, BATCH_CEILING, "should clamp at BATCH_CEILING");
+    }
+
+    // ── SearchMode tests ───────────────────────────────────────────────
+
+    use super::SearchMode;
+
+    #[test]
+    fn search_mode_default_is_hybrid() {
+        assert_eq!(SearchMode::default(), SearchMode::Hybrid);
+    }
+
+    #[test]
+    fn search_mode_equality() {
+        assert_ne!(SearchMode::Keyword, SearchMode::Semantic);
+        assert_ne!(SearchMode::Keyword, SearchMode::Hybrid);
+        assert_ne!(SearchMode::Semantic, SearchMode::Hybrid);
     }
 }

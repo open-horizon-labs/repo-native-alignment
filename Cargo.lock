@@ -5718,6 +5718,7 @@ dependencies = [
  "futures",
  "git2",
  "gray_matter",
+ "lance-index",
  "lancedb",
  "lsp-types",
  "metal-candle",
