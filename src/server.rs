@@ -2305,73 +2305,11 @@ impl RnaHandler {
                 });
                 let edge_filter_slice = edge_filter.as_deref();
 
-                let run_traversal = |node_id: &str| -> Result<Vec<String>, String> {
-                    match mode {
-                        "neighbors" => {
-                            let max_hops = args.hops.unwrap_or(1) as usize;
-                            let direction = args.direction.as_deref().unwrap_or("outgoing");
-
-                            match direction {
-                                "outgoing" => {
-                                    if max_hops == 1 {
-                                        Ok(graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Outgoing))
-                                    } else {
-                                        Ok(graph_state.index.reachable(node_id, max_hops, edge_filter_slice))
-                                    }
-                                }
-                                "incoming" => {
-                                    if max_hops == 1 {
-                                        Ok(graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Incoming))
-                                    } else {
-                                        Ok(graph_state.index.impact(node_id, max_hops))
-                                    }
-                                }
-                                "both" => {
-                                    let out = if max_hops == 1 {
-                                        graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Outgoing)
-                                    } else {
-                                        graph_state.index.reachable(node_id, max_hops, edge_filter_slice)
-                                    };
-                                    let inc = if max_hops == 1 {
-                                        graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Incoming)
-                                    } else {
-                                        graph_state.index.impact(node_id, max_hops)
-                                    };
-                                    let mut combined = out;
-                                    combined.extend(inc);
-                                    Ok(combined)
-                                }
-                                _ => Err(format!(
-                                    "Invalid direction: \"{}\". Use \"outgoing\", \"incoming\", or \"both\".",
-                                    direction
-                                )),
-                            }
-                        }
-                        "impact" => {
-                            let max_hops = args.hops.unwrap_or(3) as usize;
-                            Ok(graph_state.index.impact(node_id, max_hops))
-                        }
-                        "reachable" => {
-                            let max_hops = args.hops.unwrap_or(3) as usize;
-                            Ok(graph_state.index.reachable(node_id, max_hops, edge_filter_slice))
-                        }
-                        "tests_for" => {
-                            // Walk incoming Calls edges to find callers, then filter to test files.
-                            let calls_filter = &[EdgeKind::Calls];
-                            Ok(graph_state.index.neighbors(node_id, Some(calls_filter), Direction::Incoming))
-                        }
-                        other => Err(format!(
-                            "Unknown mode: \"{}\". Use \"neighbors\", \"impact\", \"reachable\", or \"tests_for\".",
-                            other
-                        )),
-                    }
-                };
-
                 let mut all_ids: Vec<String> = Vec::new();
                 let mut seen = std::collections::HashSet::new();
 
                 for node_id in &valid_entry_ids {
-                    match run_traversal(node_id) {
+                    match run_traversal(&graph_state.index, node_id, mode, args.hops, args.direction.as_deref(), edge_filter_slice) {
                         Ok(ids) => {
                             for id in ids {
                                 if seen.insert(id.clone()) {
@@ -2472,66 +2410,6 @@ impl RnaHandler {
                     });
                     let edge_filter_slice = edge_filter.as_deref();
 
-                    let run_traversal = |node_id: &str| -> Result<Vec<String>, String> {
-                        match mode {
-                            "neighbors" => {
-                                let max_hops = args.hops.unwrap_or(1) as usize;
-                                let direction = args.direction.as_deref().unwrap_or("outgoing");
-                                match direction {
-                                    "outgoing" => {
-                                        if max_hops == 1 {
-                                            Ok(graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Outgoing))
-                                        } else {
-                                            Ok(graph_state.index.reachable(node_id, max_hops, edge_filter_slice))
-                                        }
-                                    }
-                                    "incoming" => {
-                                        if max_hops == 1 {
-                                            Ok(graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Incoming))
-                                        } else {
-                                            Ok(graph_state.index.impact(node_id, max_hops))
-                                        }
-                                    }
-                                    "both" => {
-                                        let out = if max_hops == 1 {
-                                            graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Outgoing)
-                                        } else {
-                                            graph_state.index.reachable(node_id, max_hops, edge_filter_slice)
-                                        };
-                                        let inc = if max_hops == 1 {
-                                            graph_state.index.neighbors(node_id, edge_filter_slice, Direction::Incoming)
-                                        } else {
-                                            graph_state.index.impact(node_id, max_hops)
-                                        };
-                                        let mut combined = out;
-                                        combined.extend(inc);
-                                        Ok(combined)
-                                    }
-                                    _ => Err(format!(
-                                        "Invalid direction: \"{}\". Use \"outgoing\", \"incoming\", or \"both\".",
-                                        direction
-                                    )),
-                                }
-                            }
-                            "impact" => {
-                                let max_hops = args.hops.unwrap_or(3) as usize;
-                                Ok(graph_state.index.impact(node_id, max_hops))
-                            }
-                            "reachable" => {
-                                let max_hops = args.hops.unwrap_or(3) as usize;
-                                Ok(graph_state.index.reachable(node_id, max_hops, edge_filter_slice))
-                            }
-                            "tests_for" => {
-                                let calls_filter = &[EdgeKind::Calls];
-                                Ok(graph_state.index.neighbors(node_id, Some(calls_filter), Direction::Incoming))
-                            }
-                            other => Err(format!(
-                                "Unknown mode: \"{}\". Use \"neighbors\", \"impact\", \"reachable\", or \"tests_for\".",
-                                other
-                            )),
-                        }
-                    };
-
                     let mut valid_ids: Vec<&str> = Vec::new();
                     let mut missing: Vec<&str> = Vec::new();
                     for &nid in node_ids {
@@ -2562,7 +2440,7 @@ impl RnaHandler {
                     let mut seen = std::collections::HashSet::new();
 
                     for &node_id in &valid_ids {
-                        match run_traversal(node_id) {
+                        match run_traversal(&graph_state.index, node_id, mode, args.hops, args.direction.as_deref(), edge_filter_slice) {
                             Ok(ids) => {
                                 for id in ids {
                                     if seen.insert(id.clone()) {
@@ -2705,6 +2583,78 @@ impl RnaHandler {
                 Err(e) => Ok(text_result(format!("Graph error: {}", e))),
             }
         }
+    }
+}
+
+/// Execute a single graph traversal from a given node ID.
+///
+/// Shared by `handle_search_traversal` (single-node entry) and
+/// `handle_search_batch` (multi-node entry with mode).  Keeping the logic
+/// in one place prevents the two paths from diverging.
+fn run_traversal(
+    index: &GraphIndex,
+    node_id: &str,
+    mode: &str,
+    hops: Option<u32>,
+    direction: Option<&str>,
+    edge_filter: Option<&[EdgeKind]>,
+) -> Result<Vec<String>, String> {
+    match mode {
+        "neighbors" => {
+            let max_hops = hops.unwrap_or(1) as usize;
+            let dir = direction.unwrap_or("outgoing");
+            match dir {
+                "outgoing" => {
+                    if max_hops == 1 {
+                        Ok(index.neighbors(node_id, edge_filter, Direction::Outgoing))
+                    } else {
+                        Ok(index.reachable(node_id, max_hops, edge_filter))
+                    }
+                }
+                "incoming" => {
+                    if max_hops == 1 {
+                        Ok(index.neighbors(node_id, edge_filter, Direction::Incoming))
+                    } else {
+                        Ok(index.impact(node_id, max_hops))
+                    }
+                }
+                "both" => {
+                    let out = if max_hops == 1 {
+                        index.neighbors(node_id, edge_filter, Direction::Outgoing)
+                    } else {
+                        index.reachable(node_id, max_hops, edge_filter)
+                    };
+                    let inc = if max_hops == 1 {
+                        index.neighbors(node_id, edge_filter, Direction::Incoming)
+                    } else {
+                        index.impact(node_id, max_hops)
+                    };
+                    let mut combined = out;
+                    combined.extend(inc);
+                    Ok(combined)
+                }
+                _ => Err(format!(
+                    "Invalid direction: \"{}\". Use \"outgoing\", \"incoming\", or \"both\".",
+                    dir
+                )),
+            }
+        }
+        "impact" => {
+            let max_hops = hops.unwrap_or(3) as usize;
+            Ok(index.impact(node_id, max_hops))
+        }
+        "reachable" => {
+            let max_hops = hops.unwrap_or(3) as usize;
+            Ok(index.reachable(node_id, max_hops, edge_filter))
+        }
+        "tests_for" => {
+            let calls_filter = &[EdgeKind::Calls];
+            Ok(index.neighbors(node_id, Some(calls_filter), Direction::Incoming))
+        }
+        other => Err(format!(
+            "Unknown mode: \"{}\". Use \"neighbors\", \"impact\", \"reachable\", or \"tests_for\".",
+            other
+        )),
     }
 }
 
