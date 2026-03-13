@@ -5705,13 +5705,14 @@ checksum = "ba39f3699c378cd8970968dcbff9c43159ea4cfbd88d43c00b22f2ef10a435d2"
 
 [[package]]
 name = "repo-native-alignment"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "arc-swap",
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "blake3",
  "candle-core",
  "clap",
  "futures",
