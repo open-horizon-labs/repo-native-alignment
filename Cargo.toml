@@ -1,6 +1,6 @@
 [package]
 name = "repo-native-alignment"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "Agentic harness: business outcomes, SLO signals, constraints, and learnings as queryable repo artifacts"
 license = "MIT"
