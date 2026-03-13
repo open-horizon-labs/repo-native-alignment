@@ -326,6 +326,11 @@ impl EmbeddingIndex {
         })
     }
 
+    /// Check if the embedding table exists.
+    pub async fn has_table(&self) -> bool {
+        self.db.open_table(&self.table_name).execute().await.is_ok()
+    }
+
     /// Create (or replace) tantivy full-text search indexes on the `title` and
     /// `body` columns. LanceDB requires separate FTS indexes per column.
     /// Called after bulk writes and reindex to enable hybrid search.
@@ -1069,8 +1074,54 @@ mod tests {
     use super::{
         truncate_chars, build_code_embedding_text, CODE_EMBED_CHAR_BUDGET,
         BATCH_FLOOR, BATCH_CEILING, BATCH_YIELD_MS, BACKOFF_THRESHOLD,
+        EmbeddingIndex,
     };
     use std::collections::BTreeMap;
+
+    // ── Adversarial: has_table ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn has_table_returns_false_when_no_table_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
+        // Fresh DB with no table should return false
+        assert!(!idx.has_table().await, "has_table should be false on fresh DB");
+    }
+
+    #[tokio::test]
+    async fn has_table_returns_true_after_index_build() {
+        use crate::graph::{Node, NodeId, NodeKind, ExtractionSource};
+        use std::path::PathBuf;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        // Create .oh directory structure that index_all_with_symbols expects
+        std::fs::create_dir_all(repo_root.join(".oh")).unwrap();
+        let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
+        assert!(!idx.has_table().await, "precondition: no table yet");
+
+        // Provide a real node so the table gets created (empty texts = no table)
+        let node = Node {
+            id: NodeId {
+                root: "test".into(),
+                file: PathBuf::from("test.rs"),
+                name: "test_fn".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            signature: "fn test_fn()".into(),
+            body: "fn test_fn() { }".into(),
+            line_start: 1,
+            line_end: 1,
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let count = idx.index_all_with_symbols(&repo_root, &[node]).await.unwrap();
+        assert!(count > 0, "should have indexed at least 1 item");
+        // Table should now exist
+        assert!(idx.has_table().await, "has_table should be true after build");
+    }
 
     #[test]
     fn test_truncate_chars_ascii() {
