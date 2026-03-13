@@ -82,6 +82,27 @@ fn collect_go_specials(
             }
             return; // Don't recurse into children we already handled
         }
+        "var_declaration" => {
+            // Go var declarations: var X = 5 or var (X int; Y string = "hello")
+            // Single: var_declaration -> var_spec
+            // Grouped: var_declaration -> var_spec_list -> var_spec*
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    if child.kind() == "var_spec" {
+                        extract_go_var_spec(child, path, source, nodes);
+                    } else if child.kind() == "var_spec_list" {
+                        for j in 0..child.child_count() {
+                            if let Some(spec) = child.child(j as u32) {
+                                if spec.kind() == "var_spec" {
+                                    extract_go_var_spec(spec, path, source, nodes);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return; // Don't recurse into children we already handled
+        }
         "type_declaration" => {
             // type_declaration contains type_spec children
             for i in 0..node.child_count() {
@@ -230,6 +251,83 @@ fn extract_go_const_spec(
     for (name_str, value_opt) in names.into_iter().zip(per_name_values.into_iter()) {
         let signature = format!("const {}", body.trim());
         let mut metadata = BTreeMap::new();
+        if let Some(v) = value_opt {
+            let is_scalar = v.starts_with('"') || v.starts_with('`')
+                || v.parse::<f64>().is_ok()
+                || v == "true" || v == "false";
+            if is_scalar {
+                let stripped = v.trim_matches('"').trim_matches('`');
+                metadata.insert("value".to_string(), stripped.to_string());
+            }
+        }
+        metadata.insert("synthetic".to_string(), "false".to_string());
+        nodes.push(Node {
+            id: NodeId {
+                root: String::new(),
+                file: path.to_path_buf(),
+                name: name_str,
+                kind: NodeKind::Const,
+            },
+            language: "go".to_string(),
+            line_start: node.start_position().row + 1,
+            line_end: node.end_position().row + 1,
+            signature: signature.clone(),
+            body: body.clone(),
+            metadata,
+            source: ExtractionSource::TreeSitter,
+        });
+    }
+}
+
+/// Extract a Go var_spec node (e.g., `X int = 5` or `X, Y = 1, 2`).
+///
+/// Mirrors `extract_go_const_spec` but emits `Const` nodes with
+/// `metadata["storage"] = "var"` to distinguish package-level variables
+/// from compile-time constants.
+fn extract_go_var_spec(
+    node: tree_sitter::Node,
+    path: &Path,
+    source: &[u8],
+    nodes: &mut Vec<Node>,
+) {
+    let body = node.utf8_text(source).unwrap_or("").to_string();
+
+    // Collect all name children (handles both single and multi-name specs).
+    let mut cursor = node.walk();
+    let names: Vec<String> = node
+        .children_by_field_name("name", &mut cursor)
+        .filter(|n| n.is_named())
+        .map(|n| n.utf8_text(source).unwrap_or("unknown").trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Build a per-name value list (same logic as const_spec).
+    let per_name_values: Vec<Option<String>> = if let Some(value_node) = node.child_by_field_name("value") {
+        if value_node.kind() == "expression_list" {
+            let exprs: Vec<String> = (0..value_node.child_count())
+                .filter_map(|i| value_node.child(i as u32))
+                .filter(|c| c.kind() != "," && c.is_named())
+                .map(|c| c.utf8_text(source).unwrap_or("").trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            if exprs.len() == names.len() {
+                exprs.into_iter().map(Some).collect()
+            } else {
+                vec![None; names.len()]
+            }
+        } else {
+            let v = value_node.utf8_text(source).unwrap_or("").trim().to_string();
+            vec![Some(v); names.len()]
+        }
+    } else {
+        vec![None; names.len()]
+    };
+
+    for (name_str, value_opt) in names.into_iter().zip(per_name_values.into_iter()) {
+        let signature = format!("var {}", body.trim());
+        let mut metadata = BTreeMap::new();
+        metadata.insert("storage".to_string(), "var".to_string());
         if let Some(v) = value_opt {
             let is_scalar = v.starts_with('"') || v.starts_with('`')
                 || v.parse::<f64>().is_ok()
@@ -605,5 +703,188 @@ const (
             "A with iota should not have a scalar value, got: {:?}",
             a.metadata.get("value")
         );
+    }
+
+    #[test]
+    fn test_go_var_declaration_single() {
+        let extractor = GoExtractor::new();
+        let code = r#"package main
+
+var Debug = false
+var Version string = "1.0.0"
+"#;
+        let result = extractor.extract(Path::new("main.go"), code).unwrap();
+
+        let vars: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Const && n.metadata.get("storage").map(|s| s.as_str()) == Some("var"))
+            .collect();
+        let names: Vec<&str> = vars.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"Debug"), "Should find var Debug, got: {:?}", names);
+        assert!(names.contains(&"Version"), "Should find var Version, got: {:?}", names);
+
+        let debug = vars.iter().find(|n| n.id.name == "Debug").unwrap();
+        assert_eq!(
+            debug.metadata.get("value").map(|s| s.as_str()),
+            Some("false"),
+            "Debug should have value=false"
+        );
+        assert_eq!(
+            debug.metadata.get("synthetic").map(|s| s.as_str()),
+            Some("false"),
+            "Debug should be non-synthetic"
+        );
+
+        let version = vars.iter().find(|n| n.id.name == "Version").unwrap();
+        assert_eq!(
+            version.metadata.get("value").map(|s| s.as_str()),
+            Some("1.0.0"),
+            "Version should have value=1.0.0"
+        );
+    }
+
+    #[test]
+    fn test_go_var_declaration_grouped() {
+        let extractor = GoExtractor::new();
+        let code = r#"package main
+
+var (
+    Logger  *log.Logger
+    Verbose bool = true
+)
+"#;
+        let result = extractor.extract(Path::new("main.go"), code).unwrap();
+
+        let vars: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Const && n.metadata.get("storage").map(|s| s.as_str()) == Some("var"))
+            .collect();
+        let names: Vec<&str> = vars.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"Logger"), "Should find var Logger, got: {:?}", names);
+        assert!(names.contains(&"Verbose"), "Should find var Verbose, got: {:?}", names);
+
+        let verbose = vars.iter().find(|n| n.id.name == "Verbose").unwrap();
+        assert_eq!(
+            verbose.metadata.get("value").map(|s| s.as_str()),
+            Some("true"),
+            "Verbose should have value=true"
+        );
+    }
+
+    #[test]
+    fn test_go_var_multi_name() {
+        let extractor = GoExtractor::new();
+        let code = r#"package main
+
+var X, Y = 1, 2
+"#;
+        let result = extractor.extract(Path::new("main.go"), code).unwrap();
+
+        let vars: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Const && n.metadata.get("storage").map(|s| s.as_str()) == Some("var"))
+            .collect();
+        let names: Vec<&str> = vars.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"X"), "Should find var X, got: {:?}", names);
+        assert!(names.contains(&"Y"), "Should find var Y, got: {:?}", names);
+
+        let x = vars.iter().find(|n| n.id.name == "X").unwrap();
+        assert_eq!(x.metadata.get("value").map(|s| s.as_str()), Some("1"));
+        let y = vars.iter().find(|n| n.id.name == "Y").unwrap();
+        assert_eq!(y.metadata.get("value").map(|s| s.as_str()), Some("2"));
+    }
+
+    #[test]
+    fn test_go_var_distinguished_from_const() {
+        let extractor = GoExtractor::new();
+        let code = r#"package main
+
+const MaxRetries = 5
+var CurrentRetries = 0
+"#;
+        let result = extractor.extract(Path::new("main.go"), code).unwrap();
+
+        let max = result.nodes.iter().find(|n| n.id.name == "MaxRetries").expect("Should find MaxRetries");
+        assert!(
+            max.metadata.get("storage").is_none(),
+            "const should not have storage metadata"
+        );
+
+        let current = result.nodes.iter().find(|n| n.id.name == "CurrentRetries").expect("Should find CurrentRetries");
+        assert_eq!(
+            current.metadata.get("storage").map(|s| s.as_str()),
+            Some("var"),
+            "var should have storage=var"
+        );
+    }
+
+    #[test]
+    fn test_go_var_signature_contains_var_keyword() {
+        let extractor = GoExtractor::new();
+        let code = "package main\n\nvar Logger *log.Logger\n";
+        let result = extractor.extract(Path::new("main.go"), code).unwrap();
+
+        let logger = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Logger")
+            .expect("Should find Logger");
+        assert!(
+            logger.signature.contains("var"),
+            "Var item signature should contain 'var', got: {}",
+            logger.signature
+        );
+    }
+
+    /// Adversarial: var with no initializer (type-only declaration)
+    #[test]
+    fn test_go_var_no_initializer() {
+        let extractor = GoExtractor::new();
+        let code = r#"package main
+
+var Counter int
+var Name string
+"#;
+        let result = extractor.extract(Path::new("main.go"), code).unwrap();
+        let vars: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Const && n.metadata.get("storage").map(|s| s.as_str()) == Some("var"))
+            .collect();
+        let names: Vec<&str> = vars.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"Counter"), "Should find var Counter, got: {:?}", names);
+        assert!(names.contains(&"Name"), "Should find var Name, got: {:?}", names);
+        // No value should be extracted for type-only declarations
+        let counter = vars.iter().find(|n| n.id.name == "Counter").unwrap();
+        assert!(counter.metadata.get("value").is_none(), "Type-only var should have no value");
+    }
+
+    /// Adversarial: function-local var declarations are also captured
+    /// (Go doesn't syntactically distinguish package-level from function-local `var`)
+    #[test]
+    fn test_go_function_local_var_also_captured() {
+        let extractor = GoExtractor::new();
+        let code = r#"package main
+
+var GlobalVar = 42
+
+func main() {
+    var localVar = "hello"
+    _ = localVar
+}
+"#;
+        let result = extractor.extract(Path::new("main.go"), code).unwrap();
+        let vars: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Const && n.metadata.get("storage").map(|s| s.as_str()) == Some("var"))
+            .collect();
+        let names: Vec<&str> = vars.iter().map(|n| n.id.name.as_str()).collect();
+        // Both should be captured (known limitation: we don't filter by scope)
+        assert!(names.contains(&"GlobalVar"), "Should find global var");
+        assert!(names.contains(&"localVar"), "Function-local var also captured (known behavior)");
     }
 }
