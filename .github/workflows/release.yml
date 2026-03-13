@@ -155,4 +155,4 @@ jobs:
             --body "Auto-generated from release ${{ github.ref_name }}." \
             --base main \
             --head "$BRANCH")
-          gh pr merge "$PR_URL" --squash --auto
+          gh pr merge "$PR_URL" --squash --admin

@@ -463,7 +463,7 @@ impl RnaHandler {
 
                     // Persist incremental deltas to LanceDB for each root (lock released above).
                     for (root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove) in lance_deltas {
-                        if let Err(e) = persist_graph_incremental(
+                        match persist_graph_incremental(
                             &root_path,
                             &upsert_nodes,
                             &upsert_edges,
@@ -472,7 +472,13 @@ impl RnaHandler {
                         )
                         .await
                         {
-                            tracing::warn!("Background scan: failed to persist graph delta: {}", e);
+                            Ok(true) => {
+                                tracing::info!("Background scan: schema migrated, full persist needed on next cycle");
+                            }
+                            Err(e) => {
+                                tracing::warn!("Background scan: failed to persist graph delta: {}", e);
+                            }
+                            _ => {}
                         }
                     }
 
@@ -1206,7 +1212,7 @@ impl RnaHandler {
         // Persist updated graph incrementally — only the delta (changed/added nodes and edges).
         // Untouched rows remain in LanceDB as-is. Deleted files are removed by targeted delete.
         // merge_insert keeps tables alive; no empty-result query window.
-        if let Err(e) = persist_graph_incremental(
+        match persist_graph_incremental(
             &self.repo_root,
             &upsert_nodes,
             &upsert_edges,
@@ -1215,7 +1221,13 @@ impl RnaHandler {
         )
         .await
         {
-            tracing::warn!("Failed to persist updated graph: {}", e);
+            Ok(true) => {
+                tracing::info!("Schema migrated during incremental update; full persist needed on next cycle");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to persist updated graph: {}", e);
+            }
+            _ => {}
         }
 
         graph.last_scan_completed_at = Some(std::time::Instant::now());
@@ -1479,7 +1491,9 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                         .filter(|c| c.file_path.starts_with(&rp))
                                         .collect()
                                 } else {
-                                    chunks
+                                    // Slug didn't resolve to a known root — return
+                                    // nothing rather than leaking unscoped markdown.
+                                    Vec::new()
                                 }
                             } else {
                                 chunks
