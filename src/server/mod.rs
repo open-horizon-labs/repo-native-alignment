@@ -216,8 +216,16 @@ impl RnaHandler {
             let repo_root = self.repo_root.clone();
             tokio::spawn(async move {
                 // Track root slugs from the previous tick to detect removed worktrees.
-                let mut prev_root_slugs: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
+                // Seed from the current resolved roots so the first tick doesn't
+                // misidentify every root as "new".
+                let mut prev_root_slugs: std::collections::HashSet<String> = WorkspaceConfig::load()
+                    .with_primary_root(repo_root.clone())
+                    .with_worktrees(&repo_root)
+                    .with_claude_memory(&repo_root)
+                    .resolved_roots()
+                    .into_iter()
+                    .map(|r| r.slug)
+                    .collect();
 
                 // HEAD-change detection state.
                 let mut last_head_oid: Option<git2::Oid> = None;
@@ -436,6 +444,15 @@ impl RnaHandler {
                                 &node.id.kind.to_string(),
                             );
                         }
+
+                        // Recompute PageRank importance scores after graph mutation.
+                        let pagerank_scores = graph_state.index.compute_pagerank(0.85, 20);
+                        for node in &mut graph_state.nodes {
+                            if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
+                                node.metadata.insert("importance".to_string(), format!("{:.6}", score));
+                            }
+                        }
+
                         tracing::info!(
                             "Background update: {} nodes, {} edges",
                             graph_state.nodes.len(),
@@ -446,7 +463,7 @@ impl RnaHandler {
 
                     // Persist incremental deltas to LanceDB for each root (lock released above).
                     for (root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove) in lance_deltas {
-                        if let Err(e) = persist_graph_incremental(
+                        match persist_graph_incremental(
                             &root_path,
                             &upsert_nodes,
                             &upsert_edges,
@@ -455,7 +472,22 @@ impl RnaHandler {
                         )
                         .await
                         {
-                            tracing::warn!("Background scan: failed to persist graph delta: {}", e);
+                            Ok(true) => {
+                                tracing::info!("Background scan: schema migrated; performing full persist now");
+                                let snapshot = {
+                                    let g = graph.read().await;
+                                    g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+                                };
+                                if let Some((nodes, edges)) = snapshot {
+                                    if let Err(e) = persist_graph_to_lance(&repo_root, &nodes, &edges).await {
+                                        tracing::warn!("Background scan: full persist after migration failed: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Background scan: failed to persist graph delta: {}", e);
+                            }
+                            _ => {}
                         }
                     }
 
@@ -506,11 +538,15 @@ impl RnaHandler {
             .iter()
             .map(|r| r.slug.clone())
             .collect();
+        // Synthetic root IDs (e.g., "external" for LSP virtual nodes) are never
+        // discovered by WorkspaceConfig but are valid — skip them during stale pruning.
+        const RESERVED_ROOT_IDS: &[&str] = &["external"];
         match get_stored_root_ids(&self.repo_root).await {
             Ok(stored) => {
                 let stale: Vec<String> = stored
                     .into_iter()
                     .filter(|s| !live_slugs.contains(s))
+                    .filter(|s| !RESERVED_ROOT_IDS.contains(&s.as_str()))
                     .collect();
                 if !stale.is_empty() {
                     tracing::info!(
@@ -583,17 +619,21 @@ impl RnaHandler {
                     // No changes detected -- reuse existing embedding table if present.
                     // Only rebuild if the table is missing (first run or cache cleared).
                     if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await {
-                        if idx.has_table().await {
-                            tracing::info!("Reusing existing embedding index (no changes detected)");
-                            self.embed_index.store(Arc::new(Some(idx)));
-                        } else {
-                            match idx.index_all_with_symbols(&self.repo_root, &state.nodes).await {
-                                Ok(count) => {
-                                    tracing::info!("Built embedding index: {} items (table was missing)", count);
-                                    self.embed_index.store(Arc::new(Some(idx)));
-                                }
-                                Err(e) => tracing::warn!("Failed to embed cached graph: {}", e),
+                        match idx.has_table().await {
+                            Ok(true) => {
+                                tracing::info!("Reusing existing embedding index (no changes detected)");
+                                self.embed_index.store(Arc::new(Some(idx)));
                             }
+                            Ok(false) => {
+                                match idx.index_all_with_symbols(&self.repo_root, &state.nodes).await {
+                                    Ok(count) => {
+                                        tracing::info!("Built embedding index: {} items (table was missing)", count);
+                                        self.embed_index.store(Arc::new(Some(idx)));
+                                    }
+                                    Err(e) => tracing::warn!("Failed to embed cached graph: {}", e),
+                                }
+                            }
+                            Err(e) => tracing::warn!("Failed to check embedding table: {}", e),
                         }
                     }
                     return Ok(state);
@@ -700,17 +740,23 @@ impl RnaHandler {
 
         // Also load cached external/virtual nodes (e.g., from previous LSP enrichment)
         // that don't belong to any current root.
+        // Only include nodes whose root is genuinely external/virtual — not stale
+        // worktree items that were deleted but remain in the LanceDB cache.
         if let Some(ref cached) = cached_graph {
             let current_slugs: std::collections::HashSet<&str> = scanners
                 .iter()
                 .map(|(slug, _, _, _, _)| slug.as_str())
                 .collect();
+            let non_code = self.non_code_root_slugs();
+            let is_virtual_root = |root: &str| -> bool {
+                root == "external" || non_code.contains(root)
+            };
             let external_nodes: Vec<Node> = cached.nodes.iter()
-                .filter(|n| !current_slugs.contains(n.id.root.as_str()))
+                .filter(|n| !current_slugs.contains(n.id.root.as_str()) && is_virtual_root(&n.id.root))
                 .cloned()
                 .collect();
             let external_edges: Vec<Edge> = cached.edges.iter()
-                .filter(|e| !current_slugs.contains(e.from.root.as_str()))
+                .filter(|e| !current_slugs.contains(e.from.root.as_str()) && is_virtual_root(&e.from.root))
                 .cloned()
                 .collect();
             if !external_nodes.is_empty() {
@@ -1022,6 +1068,7 @@ impl RnaHandler {
         }
 
         // Run LSP enrichers on the updated nodes (same as cold-start, but scoped to changed files)
+        // PageRank is deferred until after enrichment so topology changes are included.
         let changed_files: std::collections::HashSet<_> = scan
             .changed_files
             .iter()
@@ -1136,6 +1183,15 @@ impl RnaHandler {
             }
         }
 
+        // Recompute PageRank importance scores after all graph mutations
+        // (extraction + LSP enrichment) are complete.
+        let pagerank_scores = graph.index.compute_pagerank(0.85, 20);
+        for node in &mut graph.nodes {
+            if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
+                node.metadata.insert("importance".to_string(), format!("{:.6}", score));
+            }
+        }
+
         // Re-embed changed-file symbols. Uses the updated graph nodes so enriched
         // metadata is included in the embedding text.
         let embed_guard2 = self.embed_index.load();
@@ -1167,7 +1223,7 @@ impl RnaHandler {
         // Persist updated graph incrementally — only the delta (changed/added nodes and edges).
         // Untouched rows remain in LanceDB as-is. Deleted files are removed by targeted delete.
         // merge_insert keeps tables alive; no empty-result query window.
-        if let Err(e) = persist_graph_incremental(
+        match persist_graph_incremental(
             &self.repo_root,
             &upsert_nodes,
             &upsert_edges,
@@ -1176,7 +1232,16 @@ impl RnaHandler {
         )
         .await
         {
-            tracing::warn!("Failed to persist updated graph: {}", e);
+            Ok(true) => {
+                tracing::info!("Schema migrated during incremental update; performing full persist now");
+                if let Err(e) = persist_graph_to_lance(&self.repo_root, &graph.nodes, &graph.edges).await {
+                    tracing::warn!("Full persist after migration failed: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to persist updated graph: {}", e);
+            }
+            _ => {}
         }
 
         graph.last_scan_completed_at = Some(std::time::Instant::now());
@@ -1276,13 +1341,19 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
     ) -> Result<CallToolResult, CallToolError> {
         let root = &self.repo_root;
 
-        // Inject business context preamble on first tool call
-        let preamble = if !self.context_injected.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        // Build business context preamble on first tool call (deferred store).
+        // We load() first to check whether injection already happened, build
+        // the preamble eagerly, then only store(true) after successfully
+        // inserting it into the response — avoiding a false-positive flag if
+        // the tool call itself errors before we can prepend.
+        let preamble = if !self.context_injected.load(std::sync::atomic::Ordering::Relaxed) {
             let ctx = build_context_preamble(root);
             if !ctx.is_empty() {
                 tracing::info!("Injecting business context preamble on first tool call");
                 Some(ctx)
             } else {
+                // Empty preamble — mark as injected so we don't retry.
+                self.context_injected.store(true, std::sync::atomic::Ordering::Relaxed);
                 None
             }
         } else {
@@ -1419,7 +1490,29 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 if include_markdown {
                     match markdown::extract_markdown_chunks(root) {
                         Ok(chunks) => {
-                            let scored = markdown::search_chunks_ranked(&chunks, query);
+                            // Filter chunks by effective root scope (same as code symbols above).
+                            let filtered_chunks: Vec<_> = if let Some(ref slug) = root_filter {
+                                let workspace = WorkspaceConfig::load()
+                                    .with_primary_root(self.repo_root.clone())
+                                    .with_worktrees(&self.repo_root)
+                                    .with_claude_memory(&self.repo_root);
+                                let root_path = workspace.resolved_roots()
+                                    .into_iter()
+                                    .find(|r| r.slug == *slug)
+                                    .map(|r| r.path);
+                                if let Some(rp) = root_path {
+                                    chunks.into_iter()
+                                        .filter(|c| c.file_path.starts_with(&rp))
+                                        .collect()
+                                } else {
+                                    // Slug didn't resolve to a known root — return
+                                    // nothing rather than leaking unscoped markdown.
+                                    Vec::new()
+                                }
+                            } else {
+                                chunks
+                            };
+                            let scored = markdown::search_chunks_ranked(&filtered_chunks, query);
                             if !scored.is_empty() {
                                 // Backward-compatible format: `- ` bullets, same header
                                 // as before. Score is appended as a parenthetical so
@@ -1516,7 +1609,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                             if include_impact && !result.code_symbols.is_empty() {
                                 let impacted = query::compute_impact_risk(
                                     &result.code_symbols,
-                                    &graph_state.nodes,
+                                    &graph_nodes,
                                     &graph_state.index,
                                     3, // max_hops for reverse traversal
                                 );
@@ -1765,12 +1858,20 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             _ => Err(CallToolError::unknown_tool(&params.name)),
         };
 
-        // Prepend business context preamble to first successful tool result
+        // Prepend business context preamble to first successful tool result.
+        // Only mark as injected after the insert succeeds (compare_exchange
+        // guards against concurrent tool calls both injecting).
         if let (Some(preamble), Ok(tool_result)) = (preamble, &mut result) {
-            tool_result.content.insert(
-                0,
-                TextContent::new(preamble, None, None).into(),
-            );
+            if self.context_injected.compare_exchange(
+                false, true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            ).is_ok() {
+                tool_result.content.insert(
+                    0,
+                    TextContent::new(preamble, None, None).into(),
+                );
+            }
         }
 
         result

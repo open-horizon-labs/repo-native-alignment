@@ -131,7 +131,7 @@ pub(crate) fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bo
         if !n.signature.is_empty() {
             // Truncate signature to first line for compact
             let sig_first_line = n.signature.lines().next().unwrap_or(&n.signature);
-            entry.push_str(&format!(" `{}`", sig_first_line));
+            entry.push_str(&format!(" {}", format_inline_code(sig_first_line)));
         }
         if let Some(tp) = n.metadata.get("type_params") {
             // Use safe inline-code formatting so angle brackets and backticks both render correctly.
@@ -178,7 +178,7 @@ pub(crate) fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bo
             stable_id,
         );
         if !n.signature.is_empty() {
-            entry.push_str(&format!("\n  Sig: `{}`", n.signature));
+            entry.push_str(&format!("\n  Sig: {}", format_inline_code(&n.signature)));
         }
         if let Some(tp) = n.metadata.get("type_params") {
             entry.push_str(&format!("\n  Type params: {}", format_inline_code(tp)));

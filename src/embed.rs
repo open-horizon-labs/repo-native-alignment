@@ -328,8 +328,15 @@ impl EmbeddingIndex {
     }
 
     /// Check if the embedding table exists.
-    pub async fn has_table(&self) -> bool {
-        self.db.open_table(&self.table_name).execute().await.is_ok()
+    ///
+    /// Returns `Ok(true)` if the table exists, `Ok(false)` if it does not,
+    /// and propagates unexpected errors instead of swallowing them.
+    pub async fn has_table(&self) -> Result<bool> {
+        match self.db.open_table(&self.table_name).execute().await {
+            Ok(_) => Ok(true),
+            Err(lancedb::Error::TableNotFound { .. }) => Ok(false),
+            Err(e) => Err(anyhow::anyhow!("Failed to check embedding table: {}", e)),
+        }
     }
 
     /// Create (or replace) tantivy full-text search indexes on the `title` and
@@ -1082,8 +1089,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().to_path_buf();
         let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
-        // Fresh DB with no table should return false
-        assert!(!idx.has_table().await, "has_table should be false on fresh DB");
+        // Fresh DB with no table should return Ok(false)
+        assert!(!idx.has_table().await.unwrap(), "has_table should be false on fresh DB");
     }
 
     #[tokio::test]
@@ -1096,7 +1103,7 @@ mod tests {
         // Create .oh directory structure that index_all_with_symbols expects
         std::fs::create_dir_all(repo_root.join(".oh")).unwrap();
         let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
-        assert!(!idx.has_table().await, "precondition: no table yet");
+        assert!(!idx.has_table().await.unwrap(), "precondition: no table yet");
 
         // Provide a real node so the table gets created (empty texts = no table)
         let node = Node {
@@ -1117,7 +1124,7 @@ mod tests {
         let count = idx.index_all_with_symbols(&repo_root, &[node]).await.unwrap();
         assert!(count > 0, "should have indexed at least 1 item");
         // Table should now exist
-        assert!(idx.has_table().await, "has_table should be true after build");
+        assert!(idx.has_table().await.unwrap(), "has_table should be true after build");
     }
 
     #[test]

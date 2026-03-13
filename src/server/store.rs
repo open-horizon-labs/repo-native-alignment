@@ -71,6 +71,11 @@ pub(crate) async fn check_and_migrate_schema(db_path: &Path) -> anyhow::Result<b
     }
 
     // Version mismatch (or missing table) — drop all tables and write new meta.
+    // Stale data exists if we had a schema version (normal case) OR if data
+    // tables exist without _schema_meta (legacy/corrupt state).
+    let had_stale_data = stored_version.is_some()
+        || db.open_table("symbols").execute().await.is_ok()
+        || db.open_table("edges").execute().await.is_ok();
     tracing::info!(
         "Schema version mismatch (stored={:?}, current={}) — dropping all LanceDB tables",
         stored_version,
@@ -92,7 +97,10 @@ pub(crate) async fn check_and_migrate_schema(db_path: &Path) -> anyhow::Result<b
         .await
         .context("check_and_migrate_schema: failed to create _schema_meta table")?;
 
-    Ok(true)
+    // Return true only when stale data existed (real migration). Fresh directories
+    // (stored_version == None) return false so incremental persist can proceed to
+    // bootstrap the tables.
+    Ok(had_stale_data)
 }
 
 /// Parse a NodeKind from its string representation.
@@ -462,13 +470,16 @@ pub(crate) async fn persist_graph_incremental(
     upsert_edges: &[Edge],
     deleted_edge_ids: &[String],
     deleted_files: &[PathBuf],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let db_path = graph_lance_path(repo_root);
     std::fs::create_dir_all(&db_path)?;
 
     // Pre-flight: ensure schema version matches before any LanceDB writes.
     if check_and_migrate_schema(&db_path).await? {
-        tracing::info!("Schema migrated to v{} during incremental update — cache rebuilt", SCHEMA_VERSION);
+        tracing::info!("Schema migrated to v{} during incremental update — cache rebuilt; caller should do a full persist", SCHEMA_VERSION);
+        // Migration dropped stale tables — incremental upsert against empty
+        // tables is incorrect. Return true so the caller does a full persist.
+        return Ok(true);
     }
 
     let db = lancedb::connect(db_path.to_str().unwrap())
@@ -687,7 +698,7 @@ pub(crate) async fn persist_graph_incremental(
         deleted_files.len(),
         deleted_edge_ids.len(),
     );
-    Ok(())
+    Ok(false)
 }
 
 /// Load graph nodes and edges from LanceDB tables.
@@ -970,6 +981,17 @@ pub(crate) fn infer_language_from_path(path: &Path) -> String {
         Some("ts") | Some("tsx") => "typescript".to_string(),
         Some("js") | Some("jsx") => "javascript".to_string(),
         Some("go") => "go".to_string(),
+        Some("java") => "java".to_string(),
+        Some("c") | Some("h") | Some("cpp") | Some("cc") | Some("cxx") | Some("hpp") | Some("hh") | Some("hxx") => "cpp".to_string(),
+        Some("cs") => "csharp".to_string(),
+        Some("rb") => "ruby".to_string(),
+        Some("kt") | Some("kts") => "kotlin".to_string(),
+        Some("swift") => "swift".to_string(),
+        Some("zig") => "zig".to_string(),
+        Some("lua") => "lua".to_string(),
+        Some("sh") | Some("bash") => "bash".to_string(),
+        Some("tf") | Some("hcl") | Some("tfvars") => "hcl".to_string(),
+        Some("json") | Some("jsonc") => "json".to_string(),
         Some("proto") => "protobuf".to_string(),
         Some("sql") => "sql".to_string(),
         Some("md") => "markdown".to_string(),

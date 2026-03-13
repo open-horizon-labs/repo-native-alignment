@@ -570,7 +570,12 @@ pub(crate) fn run_traversal(
                         index.impact(node_id, max_hops, edge_filter)
                     };
                     let mut combined = out;
-                    combined.extend(inc);
+                    let mut seen: std::collections::HashSet<String> = combined.iter().cloned().collect();
+                    for id in inc {
+                        if seen.insert(id.clone()) {
+                            combined.push(id);
+                        }
+                    }
                     Ok(combined)
                 }
                 _ => Err(format!(
@@ -580,14 +585,20 @@ pub(crate) fn run_traversal(
             }
         }
         "impact" => {
+            if edge_filter.is_some() {
+                return Err("edge_types is not supported with \"impact\" mode (it uses its own traversal strategy).".to_string());
+            }
             let max_hops = hops.unwrap_or(3) as usize;
-            Ok(index.impact(node_id, max_hops, edge_filter))
+            Ok(index.impact(node_id, max_hops, None))
         }
         "reachable" => {
             let max_hops = hops.unwrap_or(3) as usize;
             Ok(index.reachable(node_id, max_hops, edge_filter))
         }
         "tests_for" => {
+            if edge_filter.is_some() {
+                return Err("edge_types is not supported with \"tests_for\" mode (it always uses Calls edges).".to_string());
+            }
             let calls_filter = &[EdgeKind::Calls];
             Ok(index.neighbors(node_id, Some(calls_filter), Direction::Incoming))
         }
