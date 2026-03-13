@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search_symbols` and `oh_search_context`.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -50,6 +50,7 @@ pub fn symbols_schema() -> Schema {
         Field::new("importance", DataType::Float64, true),   // PageRank importance score (0.0-1.0)
         Field::new("storage", DataType::Utf8, true),         // metadata["storage"] — "static" (Rust) or "var" (Go)
         Field::new("mutable", DataType::Boolean, true),      // metadata["mutable"] — true for `static mut`
+        Field::new("decorators", DataType::Utf8, true),        // metadata["decorators"] — comma-separated decorator/attribute text
         // Vector column is added dynamically when embeddings are computed,
         // since the dimension depends on the model. See `symbols_schema_with_vector`.
         Field::new("updated_at", DataType::Int64, false),
@@ -80,6 +81,7 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("importance", DataType::Float64, true),
         Field::new("storage", DataType::Utf8, true),
         Field::new("mutable", DataType::Boolean, true),
+        Field::new("decorators", DataType::Utf8, true),
         Field::new(
             "vector",
             DataType::FixedSizeList(
@@ -203,6 +205,7 @@ mod tests {
         assert!(schema.field_with_name("importance").is_ok());
         assert!(schema.field_with_name("storage").is_ok());
         assert!(schema.field_with_name("mutable").is_ok());
+        assert!(schema.field_with_name("decorators").is_ok());
         assert!(schema.field_with_name("updated_at").is_ok());
         // no vector column in base schema
         assert!(schema.field_with_name("vector").is_err());

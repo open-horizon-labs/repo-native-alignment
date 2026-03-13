@@ -40,6 +40,7 @@ pub static PYTHON_CONFIG: LangConfig = LangConfig {
         "try_statement", "except_clause",
         "conditional_expression",  // ternary
     ],
+    decorator_node_kinds: &["decorator"],
 };
 
 // ---------------------------------------------------------------------------
@@ -81,6 +82,7 @@ pub static TYPESCRIPT_CONFIG: LangConfig = LangConfig {
         "try_statement", "catch_clause",
         "optional_chain_expression",  // ?.
     ],
+    decorator_node_kinds: &["decorator"],
 };
 
 // ---------------------------------------------------------------------------
@@ -115,6 +117,7 @@ pub static JAVASCRIPT_CONFIG: LangConfig = LangConfig {
         "ternary_expression",
         "try_statement", "catch_clause",
     ],
+    decorator_node_kinds: &["decorator"],
 };
 
 // ---------------------------------------------------------------------------
@@ -149,6 +152,7 @@ pub static GO_CONFIG: LangConfig = LangConfig {
         "select_statement", "communication_case",
         "binary_expression",  // && and ||
     ],
+    decorator_node_kinds: &[],  // Go has no decorators/attributes
 };
 
 // ---------------------------------------------------------------------------
@@ -188,6 +192,9 @@ pub static JAVA_CONFIG: LangConfig = LangConfig {
         "ternary_expression",
         "try_statement", "catch_clause",
     ],
+    // Java annotations are children of `modifiers` on the declaration node.
+    // The collect_decorators function handles this via Strategy 3 (child container).
+    decorator_node_kinds: &["annotation", "marker_annotation"],
 };
 
 // ---------------------------------------------------------------------------
@@ -225,6 +232,7 @@ pub static KOTLIN_CONFIG: LangConfig = LangConfig {
         "conjunction_expression", "disjunction_expression",  // && and ||
         "try_expression", "catch_block",
     ],
+    decorator_node_kinds: &["annotation"],
 };
 
 // ---------------------------------------------------------------------------
@@ -265,6 +273,7 @@ pub static CSHARP_CONFIG: LangConfig = LangConfig {
         "conditional_expression",  // ternary
         "try_statement", "catch_clause",
     ],
+    decorator_node_kinds: &["attribute_list"],
 };
 
 // ---------------------------------------------------------------------------
@@ -304,6 +313,7 @@ pub static SWIFT_CONFIG: LangConfig = LangConfig {
         "guard_statement",
         "ternary_expression",
     ],
+    decorator_node_kinds: &[],  // Swift attributes handled via @attribute syntax but tree-sitter-swift uses attribute nodes as children, not siblings
 };
 
 // ---------------------------------------------------------------------------
@@ -339,6 +349,7 @@ pub static ZIG_CONFIG: LangConfig = LangConfig {
         "binary_expression",  // and, or
         "try_expression",
     ],
+    decorator_node_kinds: &[],  // Zig has no decorators/attributes
 };
 
 // ---------------------------------------------------------------------------
@@ -380,6 +391,7 @@ pub static CPP_CONFIG: LangConfig = LangConfig {
         "conditional_expression",  // ternary
         "try_statement", "catch_clause",
     ],
+    decorator_node_kinds: &[],  // C/C++ has no decorators (attributes like [[nodiscard]] are different)
 };
 
 // ---------------------------------------------------------------------------
@@ -407,6 +419,7 @@ pub static LUA_CONFIG: LangConfig = LangConfig {
         "for_statement", "while_statement", "repeat_statement",
         "binary_expression",  // and, or
     ],
+    decorator_node_kinds: &[],  // Lua has no decorators
 };
 
 // ---------------------------------------------------------------------------
@@ -441,6 +454,7 @@ pub static RUBY_CONFIG: LangConfig = LangConfig {
         "conditional",  // ternary
         "rescue", "ensure",
     ],
+    decorator_node_kinds: &[],  // Ruby has no decorators (uses method calls instead)
 };
 
 // ---------------------------------------------------------------------------
@@ -470,4 +484,5 @@ pub static BASH_CONFIG: LangConfig = LangConfig {
         "pipeline",  // pipes as control flow
         "binary_expression",  // && and ||
     ],
+    decorator_node_kinds: &[],  // Bash has no decorators
 };

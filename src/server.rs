@@ -525,6 +525,9 @@ pub(crate) async fn persist_graph_to_lance(
                 None => mutable_builder.append_null(),
             }
         }
+        let decorators_col: Vec<Option<String>> = nodes.iter()
+            .map(|n| n.metadata.get("decorators").cloned())
+            .collect();
         let updated_ats: Vec<i64> = vec![now; nodes.len()];
 
         let batch = RecordBatch::try_new(
@@ -548,6 +551,7 @@ pub(crate) async fn persist_graph_to_lance(
                 Arc::new(Float64Array::from(importances)),
                 Arc::new(StringArray::from(storages)),
                 Arc::new(mutable_builder.finish()),
+                Arc::new(StringArray::from(decorators_col)),
                 Arc::new(Int64Array::from(updated_ats)),
             ],
         )?;
@@ -723,6 +727,9 @@ pub(crate) async fn persist_graph_incremental(
                     None => mutable_builder.append_null(),
                 }
             }
+            let decorators_col: Vec<Option<String>> = upsert_nodes.iter()
+                .map(|n| n.metadata.get("decorators").cloned())
+                .collect();
             let updated_ats: Vec<i64> = vec![now; upsert_nodes.len()];
 
             let batch = RecordBatch::try_new(
@@ -746,6 +753,7 @@ pub(crate) async fn persist_graph_incremental(
                     Arc::new(Float64Array::from(importances)),
                     Arc::new(StringArray::from(storages)),
                     Arc::new(mutable_builder.finish()),
+                    Arc::new(StringArray::from(decorators_col)),
                     Arc::new(Int64Array::from(updated_ats)),
                 ],
             )?;
@@ -917,6 +925,8 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             let mutable_col = batch.column_by_name("mutable")
                 .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
+            let decorators_col = batch.column_by_name("decorators")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
             for i in 0..batch.num_rows() {
                 let file_path = PathBuf::from(file_paths.value(i));
@@ -965,6 +975,14 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 if let Some(col) = mutable_col {
                     if !col.is_null(i) && col.value(i) {
                         metadata.insert("mutable".to_string(), "true".to_string());
+                    }
+                }
+                if let Some(col) = decorators_col {
+                    if !col.is_null(i) {
+                        let val = col.value(i);
+                        if !val.is_empty() {
+                            metadata.insert("decorators".to_string(), val.to_string());
+                        }
                     }
                 }
                 nodes.push(Node {
@@ -3401,6 +3419,9 @@ fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> Stri
             let sig_first_line = n.signature.lines().next().unwrap_or(&n.signature);
             entry.push_str(&format!(" `{}`", sig_first_line));
         }
+        if let Some(decorators) = n.metadata.get("decorators") {
+            entry.push_str(&format!(" [{}]", decorators));
+        }
         if let Some(storage) = n.metadata.get("storage") {
             entry.push_str(&format!(" [{}]", storage));
             if n.metadata.get("mutable").map(|s| s == "true").unwrap_or(false) {
@@ -3437,6 +3458,9 @@ fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> Stri
         );
         if !n.signature.is_empty() {
             entry.push_str(&format!("\n  Sig: `{}`", n.signature));
+        }
+        if let Some(decorators) = n.metadata.get("decorators") {
+            entry.push_str(&format!("\n  Decorators: {}", decorators));
         }
         if let Some(val) = n.metadata.get("value") {
             entry.push_str(&format!("\n  Value: `{}`", val));
