@@ -144,5 +144,9 @@ jobs:
           git add Cargo.toml .claude-plugin/marketplace.json
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --cached --quiet; then
+            echo "Version already at $VERSION; nothing to push."
+            exit 0
+          fi
           git commit -m "chore: bump version to $VERSION"
           git push origin main

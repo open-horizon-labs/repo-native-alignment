@@ -1067,15 +1067,8 @@ impl RnaHandler {
                 .ensure_node(&node.stable_id(), &node.id.kind.to_string());
         }
 
-        // Recompute PageRank importance scores after graph mutation.
-        let pagerank_scores = graph.index.compute_pagerank(0.85, 20);
-        for node in &mut graph.nodes {
-            if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
-                node.metadata.insert("importance".to_string(), format!("{:.6}", score));
-            }
-        }
-
         // Run LSP enrichers on the updated nodes (same as cold-start, but scoped to changed files)
+        // PageRank is deferred until after enrichment so topology changes are included.
         let changed_files: std::collections::HashSet<_> = scan
             .changed_files
             .iter()
@@ -1187,6 +1180,15 @@ impl RnaHandler {
 
             if enrichment.any_enricher_ran {
                 self.lsp_status.set_complete(incr_edge_count);
+            }
+        }
+
+        // Recompute PageRank importance scores after all graph mutations
+        // (extraction + LSP enrichment) are complete.
+        let pagerank_scores = graph.index.compute_pagerank(0.85, 20);
+        for node in &mut graph.nodes {
+            if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
+                node.metadata.insert("importance".to_string(), format!("{:.6}", score));
             }
         }
 
