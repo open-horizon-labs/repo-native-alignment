@@ -324,7 +324,7 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     // 24. Broken symlink check — scanner must not crash on broken symlinks
     checks.push(run_broken_symlink_check().await);
 
-    // 25. LSP status footer — verifies format_freshness renders all 3 LSP states
+    // 25. LSP status footer — verifies format_freshness renders all 4 LSP states
     checks.push(run_lsp_status_footer_check());
 
     Ok(print_and_return(args, checks))
@@ -1055,6 +1055,13 @@ fn run_lsp_status_footer_check() -> Check {
         return Check::fail("lsp_status_footer", "Footer shows LSP segment in NotStarted state");
     }
 
+    // Server found (binary on PATH, enrichment not started) → "LSP: starting..."
+    status.set_server_found();
+    let footer = format_freshness(100, Some(std::time::Instant::now()), Some(&status));
+    if !footer.contains("LSP: starting...") {
+        return Check::fail("lsp_status_footer", format!("Expected 'LSP: starting...', got: {}", footer));
+    }
+
     // Running → "LSP: pending"
     status.set_running();
     let footer = format_freshness(100, Some(std::time::Instant::now()), Some(&status));
@@ -1069,7 +1076,7 @@ fn run_lsp_status_footer_check() -> Check {
         return Check::fail("lsp_status_footer", format!("Expected 'LSP: enriched (42 edges)', got: {}", footer));
     }
 
-    Check::pass("lsp_status_footer", "Footer renders all 3 LSP states correctly")
+    Check::pass("lsp_status_footer", "Footer renders all 4 LSP states correctly")
 }
 
 /// HEAD-change detection check.
