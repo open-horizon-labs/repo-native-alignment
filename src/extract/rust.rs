@@ -695,6 +695,64 @@ macro_rules! simple_assert {
         assert_eq!(macros[0].language, "rust");
     }
 
+    // -- Adversarial macro tests (seeded from dissent) --
+
+    /// Adversarial: macro and function with same name in same file.
+    /// NodeId is (root, file, name, kind) so these should not collide.
+    #[test]
+    fn test_rust_macro_and_fn_same_name_coexist() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+macro_rules! process {
+    ($x:expr) => { $x + 1 };
+}
+
+fn process(x: i32) -> i32 {
+    x + 1
+}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        let macros: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Macro)
+            .collect();
+        let funcs: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Function && n.id.name == "process")
+            .collect();
+
+        assert_eq!(macros.len(), 1, "Should find macro 'process'");
+        assert_eq!(funcs.len(), 1, "Should find function 'process'");
+        assert_ne!(macros[0].id.kind, funcs[0].id.kind, "Different NodeKinds");
+    }
+
+    /// Adversarial: macro with multiple match arms (complex body).
+    #[test]
+    fn test_rust_complex_macro_body_captured() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+macro_rules! count {
+    () => { 0 };
+    ($x:expr) => { 1 };
+    ($x:expr, $($rest:expr),+) => { 1 + count!($($rest),+) };
+}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        let macros: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Macro)
+            .collect();
+        assert_eq!(macros.len(), 1, "Should find complex macro");
+        assert_eq!(macros[0].id.name, "count");
+        // Body should contain the macro content (for embedding)
+        assert!(!macros[0].body.is_empty(), "Macro body should be captured for embedding");
+    }
+
     /// Adversarial: const and static with same name in same file (NodeId collision risk)
     #[test]
     fn test_const_and_static_same_name_both_extracted() {
