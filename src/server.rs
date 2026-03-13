@@ -3494,7 +3494,10 @@ fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> Stri
             entry.push_str(&format!(" `{}`", sig_first_line));
         }
         if let Some(tp) = n.metadata.get("type_params") {
-            entry.push_str(&format!(" {}", tp));
+            // Wrap in backticks to prevent markdown from swallowing angle brackets
+            // (e.g. `<T: Display + Send>` would be treated as HTML tags otherwise).
+            let tp_safe = tp.replace('`', "\\`");
+            entry.push_str(&format!(" `{}`", tp_safe));
         }
         if let Some(hint) = n.metadata.get("pattern_hint") {
             entry.push_str(&format!(" ~{}", hint));
@@ -3540,7 +3543,8 @@ fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> Stri
             entry.push_str(&format!("\n  Sig: `{}`", n.signature));
         }
         if let Some(tp) = n.metadata.get("type_params") {
-            entry.push_str(&format!("\n  Type params: {}", tp));
+            let tp_safe = tp.replace('`', "\\`");
+            entry.push_str(&format!("\n  Type params: `{}`", tp_safe));
         }
         if let Some(hint) = n.metadata.get("pattern_hint") {
             entry.push_str(&format!("\n  Pattern: {}", hint));
