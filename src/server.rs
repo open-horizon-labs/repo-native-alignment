@@ -3477,6 +3477,26 @@ fn resolve_edge_target_by_suffix(
 ///
 /// When `compact` is true, returns a one-line summary: kind, name, file:lines, signature.
 /// When `compact` is false (default), returns full detail: ID, signature, value, complexity, edges.
+/// Wrap a string in CommonMark inline code using a backtick fence long enough
+/// to safely contain any backticks in the content itself.  Per the CommonMark
+/// spec, backslash escapes do not work inside code spans — the only correct
+/// approach is to use a delimiter longer than the longest contiguous backtick
+/// run in the content.
+fn format_inline_code(s: &str) -> String {
+    let mut max_run = 0usize;
+    let mut run = 0usize;
+    for ch in s.chars() {
+        if ch == '`' {
+            run += 1;
+            max_run = max_run.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let fence = "`".repeat(max_run + 1);
+    format!("{fence}{s}{fence}")
+}
+
 fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> String {
     let stable_id = n.stable_id();
 
@@ -3494,10 +3514,8 @@ fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> Stri
             entry.push_str(&format!(" `{}`", sig_first_line));
         }
         if let Some(tp) = n.metadata.get("type_params") {
-            // Wrap in backticks to prevent markdown from swallowing angle brackets
-            // (e.g. `<T: Display + Send>` would be treated as HTML tags otherwise).
-            let tp_safe = tp.replace('`', "\\`");
-            entry.push_str(&format!(" `{}`", tp_safe));
+            // Use safe inline-code formatting so angle brackets and backticks both render correctly.
+            entry.push_str(&format!(" {}", format_inline_code(tp)));
         }
         if let Some(hint) = n.metadata.get("pattern_hint") {
             entry.push_str(&format!(" ~{}", hint));
@@ -3543,8 +3561,7 @@ fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> Stri
             entry.push_str(&format!("\n  Sig: `{}`", n.signature));
         }
         if let Some(tp) = n.metadata.get("type_params") {
-            let tp_safe = tp.replace('`', "\\`");
-            entry.push_str(&format!("\n  Type params: `{}`", tp_safe));
+            entry.push_str(&format!("\n  Type params: {}", format_inline_code(tp)));
         }
         if let Some(hint) = n.metadata.get("pattern_hint") {
             entry.push_str(&format!("\n  Pattern: {}", hint));
