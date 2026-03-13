@@ -502,6 +502,17 @@ fn collect_ts_specials(
                         let body = child.utf8_text(source).unwrap_or("").to_string();
                         let mut metadata = BTreeMap::new();
                         metadata.insert("parent_scope".to_string(), enum_name.clone());
+                        // name_col for cursor positioning (consistent with generic extractor)
+                        let col = if child.kind() == "property_identifier" {
+                            child.start_position().column
+                        } else {
+                            // enum_assignment: use the property_identifier child's column
+                            child.child(0)
+                                .filter(|c| c.kind() == "property_identifier")
+                                .map(|c| c.start_position().column)
+                                .unwrap_or(child.start_position().column)
+                        };
+                        metadata.insert("name_col".to_string(), col.to_string());
 
                         nodes.push(Node {
                             id: NodeId {
