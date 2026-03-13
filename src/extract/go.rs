@@ -159,9 +159,8 @@ fn collect_go_specials(
             return; // Don't recurse
         }
         "method_declaration" => {
-            // Enrich the generic-emitted method node with receiver metadata.
-            // The generic extractor already created a Function node for this method;
-            // find it and add the receiver field.
+            // Enrich the generic-emitted method node with receiver metadata
+            // and is_static = "false" (methods with receivers are instance methods).
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name_str = name_node.utf8_text(source).unwrap_or("unknown");
                 if let Some(receiver) = node.child_by_field_name("receiver") {
@@ -174,11 +173,17 @@ fn collect_go_specials(
                             && n.line_start == line
                         {
                             n.metadata.insert("receiver".to_string(), recv_text);
+                            n.metadata.insert("is_static".to_string(), "false".to_string());
                             break;
                         }
                     }
                 }
             }
+        }
+        "function_declaration" => {
+            // Top-level Go functions are NOT methods, so they don't get is_static.
+            // But functions declared at package level that are not methods are just
+            // functions, not static methods. Skip -- no is_static for top-level.
         }
         _ => {}
     }
@@ -655,6 +660,28 @@ func (f *Foo) Bar() {}
             .find(|n| n.id.name == "Bar")
             .expect("Should find method Bar");
         assert!(method.metadata.contains_key("receiver"));
+    }
+
+    #[test]
+    fn test_go_method_is_static() {
+        let extractor = GoExtractor::new();
+        let code = r#"package main
+
+type Foo struct{}
+
+func (f *Foo) Bar() {}
+
+func hello() {}
+"#;
+        let result = extractor.extract(Path::new("main.go"), code).unwrap();
+
+        // Method with receiver should be is_static = false
+        let bar = result.nodes.iter().find(|n| n.id.name == "Bar").unwrap();
+        assert_eq!(bar.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "Method with receiver should not be static");
+
+        // Top-level function should NOT have is_static
+        let hello = result.nodes.iter().find(|n| n.id.name == "hello").unwrap();
+        assert!(hello.metadata.get("is_static").is_none(), "Top-level Go function should NOT have is_static");
     }
 
     #[test]

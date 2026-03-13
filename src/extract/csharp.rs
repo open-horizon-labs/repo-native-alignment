@@ -174,3 +174,53 @@ fn collect_csharp_specials(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_csharp_is_static() {
+        let extractor = CSharpExtractor::new();
+        let code = r#"
+public class MyService {
+    public static MyService Create() {
+        return new MyService();
+    }
+
+    public void Serve() {
+        Console.WriteLine("serving");
+    }
+
+    public static int Count() {
+        return 0;
+    }
+}
+"#;
+        let result = extractor.extract(Path::new("MyService.cs"), code).unwrap();
+
+        let create = result.nodes.iter().find(|n| n.id.name == "Create" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(create.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "static Create() should be static");
+
+        let serve = result.nodes.iter().find(|n| n.id.name == "Serve" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(serve.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "Serve() should be instance");
+
+        let count = result.nodes.iter().find(|n| n.id.name == "Count" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(count.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "static Count() should be static");
+    }
+
+    #[test]
+    fn test_csharp_constructor_is_instance() {
+        let extractor = CSharpExtractor::new();
+        let code = r#"
+public class Foo {
+    public Foo(int x) {
+    }
+}
+"#;
+        let result = extractor.extract(Path::new("Foo.cs"), code).unwrap();
+
+        let ctor = result.nodes.iter().find(|n| n.id.name == "Foo" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(ctor.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "Constructor should be instance");
+    }
+}
