@@ -61,12 +61,15 @@ pub struct OhSearchContext {
 
 #[macros::mcp_tool(
     name = "outcome_progress",
-    description = "Track progress on a business outcome. Finds tagged commits, code symbols in changed files, and related markdown. Returns a navigable summary with stable Node IDs for use with search_symbols and graph_query."
+    description = "Track progress on a business outcome. Finds tagged commits, code symbols in changed files, and related markdown. Returns a navigable summary with stable Node IDs for use with search_symbols and graph_query. Set include_impact=true to add risk-classified blast radius showing which symbols are affected by the changes and how critical they are."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct OutcomeProgress {
     /// The outcome ID (e.g. 'agent-alignment') from .oh/outcomes/
     pub outcome_id: String,
+    /// When true, compute blast radius for changed symbols and classify risk as CRITICAL/HIGH/MEDIUM/LOW
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_impact: Option<bool>,
 }
 
 // ── Unified search tool ─────────────────────────────────────────────
@@ -3118,6 +3121,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
 
             "outcome_progress" => {
                 let args: OutcomeProgress = parse_args(params.arguments)?;
+                let include_impact = args.include_impact.unwrap_or(false);
                 let graph_nodes = if let Ok(guard) = self.get_graph().await {
                     guard.as_ref().map(|gs| gs.nodes.clone()).unwrap_or_default()
                 } else {
@@ -3153,6 +3157,20 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                     "\n## PR Merges\n\n{} PR merge(s) serving this outcome\n",
                                     pr_nodes.len()
                                 ));
+                            }
+
+                            // Append change impact with risk classification
+                            if include_impact && !result.code_symbols.is_empty() {
+                                let impacted = query::compute_impact_risk(
+                                    &result.code_symbols,
+                                    &graph_state.nodes,
+                                    &graph_state.index,
+                                    3, // max_hops for reverse traversal
+                                );
+                                md.push('\n');
+                                md.push_str(&query::format_impact_markdown(&impacted));
+                            } else if include_impact && result.code_symbols.is_empty() {
+                                md.push_str("\n## Change Impact\n\nNo changed symbols found -- cannot compute blast radius.\n");
                             }
                          }
                         }
