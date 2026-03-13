@@ -3404,15 +3404,19 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         let graph_state = guard.as_ref().unwrap();
                         let mut sections: Vec<String> = Vec::new();
 
-                        // 1. Top symbols by importance (PageRank)
+                        // 1. Top symbols by importance (weighted PageRank)
                         {
                             let mut symbols_with_importance: Vec<(&Node, f64)> = graph_state.nodes.iter()
-                                .filter(|n| !matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge | NodeKind::Field))
+                                .filter(|n| !matches!(n.id.kind,
+                                    NodeKind::Import | NodeKind::Module | NodeKind::PrMerge | NodeKind::Field
+                                ))
                                 .filter(|n| n.id.root != "external")
                                 .filter_map(|n| {
                                     let imp = n.metadata.get("importance")
                                         .and_then(|s| s.parse::<f64>().ok())
                                         .unwrap_or(0.0);
+                                    // Demote test-file symbols so they don't crowd the top
+                                    let imp = if ranking::is_test_file(n) { imp * 0.1 } else { imp };
                                     if imp > IMPORTANCE_THRESHOLD { Some((n, imp)) } else { None }
                                 })
                                 .collect();

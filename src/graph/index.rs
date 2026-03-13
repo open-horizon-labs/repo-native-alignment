@@ -6,12 +6,38 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use petgraph::algo::page_rank;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef as PetgraphEdgeRef;
 use petgraph::Direction;
 
 use super::{Edge, EdgeKind};
+
+// ---------------------------------------------------------------------------
+// Edge-type weights for PageRank
+// ---------------------------------------------------------------------------
+
+/// Returns the PageRank transition weight for a given edge type.
+///
+/// Higher weights mean the edge carries more "importance" signal during
+/// the random walk. This is language-agnostic: weights are based on edge
+/// semantics (coupling strength), not symbol names or language conventions.
+fn edge_weight(kind: &EdgeKind) -> f64 {
+    match kind {
+        EdgeKind::Calls => 1.0,
+        EdgeKind::Implements => 0.8,
+        EdgeKind::DependsOn => 0.5,
+        EdgeKind::ReferencedBy => 0.5,
+        EdgeKind::ConnectsTo => 0.3,
+        EdgeKind::Defines => 0.1,
+        EdgeKind::HasField => 0.1,
+        // PR/outcome edges carry no architectural coupling signal
+        EdgeKind::Evolves
+        | EdgeKind::TopologyBoundary
+        | EdgeKind::Modified
+        | EdgeKind::Affected
+        | EdgeKind::Serves => 0.05,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Lightweight references stored in petgraph (not full Node/Edge structs)
@@ -252,25 +278,80 @@ impl GraphIndex {
         result
     }
 
-    /// Compute PageRank importance scores for all nodes in the graph.
+    /// Compute edge-type weighted PageRank importance scores.
     ///
-    /// Uses the standard PageRank algorithm with the given damping factor
-    /// (typically 0.85) and number of iterations. Returns a map from
-    /// node stable ID to importance score.
+    /// Unlike standard PageRank (which treats all edges equally), this
+    /// attenuates rank flow by edge type so that architectural coupling
+    /// signals (`Calls`, `Implements`) transfer more importance than
+    /// structural containment (`Defines`, `HasField`).
+    ///
+    /// The key insight: edge weight acts as an **attenuation factor**, not
+    /// just a proportional distribution. A `Defines` edge (weight 0.1)
+    /// only transmits 10% of the source's rank share to the target; the
+    /// other 90% is "lost" to teleportation. This means a node reachable
+    /// only via `Defines` edges accumulates far less importance than one
+    /// reachable via `Calls` edges, even with the same topology.
+    ///
+    /// This approach is fully language-agnostic: weights come from edge
+    /// semantics, not symbol names. No per-language blocklists needed.
+    ///
+    /// Edge weights (see [`edge_weight`]):
+    /// - `Calls` = 1.0, `Implements` = 0.8, `DependsOn` = 0.5
+    /// - `Defines` = 0.1, `HasField` = 0.1
     ///
     /// Scores are max-normalized to [0, 1] where 1.0 is the most important
-    /// node. These are relative ranks, not probabilities — they do not sum
-    /// to 1.0. This makes scores interpretable regardless of graph size.
-    ///
-    /// After normalization, boilerplate symbols are dampened so that
-    /// standard trait impls (`fmt`, `default`, `clone`, etc.), field nodes,
-    /// and test-file symbols don't dominate the top-N. See
-    /// [`dampen_boilerplate`] for the heuristics applied.
+    /// node. These are relative ranks, not probabilities.
     pub fn compute_pagerank(&self, damping_factor: f64, nb_iter: usize) -> HashMap<String, f64> {
-        let raw_scores = page_rank(&self.graph, damping_factor, nb_iter);
+        let n = self.graph.node_count();
+        if n == 0 {
+            return HashMap::new();
+        }
 
-        // Find max score for normalization
-        let max_score = raw_scores
+        let init = 1.0 / n as f64;
+        let mut scores = vec![init; n];
+        let mut new_scores = vec![0.0_f64; n];
+
+        for _ in 0..nb_iter {
+            // Reset new scores to the teleportation term
+            for s in new_scores.iter_mut() {
+                *s = (1.0 - damping_factor) / n as f64;
+            }
+
+            // For each node, distribute its score to neighbors.
+            // Edge weight attenuates the flow: a Defines edge (0.1) only
+            // passes 10% of the per-edge share, with the rest going to
+            // teleportation (uniform redistribution).
+            for node_idx in self.graph.node_indices() {
+                let idx = node_idx.index();
+                let current_score = scores[idx];
+
+                let out_edges: Vec<_> = self.graph.edges(node_idx).collect();
+                let out_degree = out_edges.len() as f64;
+
+                if out_degree > 0.0 {
+                    // Each edge gets an equal share of rank (1/out_degree),
+                    // then attenuated by the edge weight. The un-transferred
+                    // portion is implicitly absorbed into teleportation.
+                    let per_edge = current_score / out_degree;
+                    for e in &out_edges {
+                        let w = edge_weight(&e.weight().edge_type);
+                        let target = e.target().index();
+                        new_scores[target] += damping_factor * per_edge * w;
+                    }
+                } else {
+                    // Dangling node: distribute evenly (standard PageRank behavior)
+                    let share = damping_factor * current_score / n as f64;
+                    for s in new_scores.iter_mut() {
+                        *s += share;
+                    }
+                }
+            }
+
+            std::mem::swap(&mut scores, &mut new_scores);
+        }
+
+        // Max-normalize to [0, 1]
+        let max_score = scores
             .iter()
             .copied()
             .fold(f64::NEG_INFINITY, f64::max);
@@ -280,84 +361,12 @@ impl GraphIndex {
             return result;
         }
 
-        for (idx, &score) in raw_scores.iter().enumerate() {
-            let node_index = NodeIndex::new(idx);
-            if let Some(node_ref) = self.graph.node_weight(node_index) {
-                result.insert(node_ref.id.clone(), score / max_score);
+        for node_idx in self.graph.node_indices() {
+            if let Some(node_ref) = self.graph.node_weight(node_idx) {
+                result.insert(node_ref.id.clone(), scores[node_idx.index()] / max_score);
             }
         }
-
-        // Apply boilerplate dampening so trait impls and field nodes don't
-        // dominate architectural hubs in repo_map and importance sorting.
-        self.dampen_boilerplate(&mut result);
-
         result
-    }
-
-    /// Dampen PageRank scores for known boilerplate patterns.
-    ///
-    /// Standard trait impls (`fmt`, `default`, `clone`, `eq`, `hash`, etc.)
-    /// accumulate disproportionate PageRank because every type that derives
-    /// or implements a trait funnels edges to these functions. Similarly,
-    /// `field` nodes get high in-degree from parent struct `Defines` edges,
-    /// and test-file symbols inflate importance for smoke/test infrastructure.
-    ///
-    /// This applies a multiplicative penalty (0.1) to these categories so
-    /// they still appear in search results but don't crowd out real
-    /// architectural hubs like handlers, builders, and core data structures.
-    fn dampen_boilerplate(&self, scores: &mut HashMap<String, f64>) {
-        /// Names of functions that are standard trait implementations.
-        /// These are structurally connected (every type with the trait has one)
-        /// but not architecturally significant.
-        const BOILERPLATE_NAMES: &[&str] = &[
-            "fmt", "default", "clone", "eq", "ne", "hash",
-            "partial_cmp", "cmp", "from", "into", "drop",
-            "deref", "deref_mut", "as_ref", "as_mut",
-        ];
-
-        /// Penalty multiplier for boilerplate nodes: 0.1 means they keep
-        /// 10% of their raw importance score.
-        const BOILERPLATE_PENALTY: f64 = 0.1;
-
-        /// Test-file patterns in the file path component of stable IDs.
-        const TEST_PATH_PATTERNS: &[&str] = &[
-            "/tests/", "/test_", "_test.", "smoke.rs",
-        ];
-
-        for (stable_id, score) in scores.iter_mut() {
-            if let Some(node_ref) = self.node_lookup.get(stable_id)
-                .and_then(|&idx| self.graph.node_weight(idx))
-            {
-                // Parse the stable_id format: "root:file:name:kind"
-                // We need the file and name components.
-                let parts: Vec<&str> = stable_id.splitn(4, ':').collect();
-                if parts.len() < 4 {
-                    continue;
-                }
-                let file = parts[1];
-                let name = parts[2];
-
-                // 1. Dampen standard trait impl functions
-                if node_ref.node_type == "function"
-                    && BOILERPLATE_NAMES.contains(&name)
-                {
-                    *score *= BOILERPLATE_PENALTY;
-                    continue;
-                }
-
-                // 2. Dampen field nodes
-                if node_ref.node_type == "field" {
-                    *score *= BOILERPLATE_PENALTY;
-                    continue;
-                }
-
-                // 3. Dampen test-file symbols
-                if TEST_PATH_PATTERNS.iter().any(|pat| file.contains(pat)) {
-                    *score *= BOILERPLATE_PENALTY;
-                    continue;
-                }
-            }
-        }
     }
 }
 
@@ -888,135 +897,94 @@ mod tests {
             "sink should rank higher than source: {} vs {}", sink_score, source_score);
     }
 
-    // ==================== Boilerplate dampening tests ====================
-    // Validates that PageRank scores are dampened for known boilerplate
-    // patterns (trait impls, fields, test files) so architectural hubs
-    // dominate repo_map instead of noise.
+    // ==================== Edge-type weighted PageRank tests ====================
+    // Validates that edge-type weights produce correct importance ranking:
+    // Calls > Implements > DependsOn > Defines/HasField.
 
-    /// Helper: build a stable_id in the format "root:file:name:kind"
-    fn stable_id(file: &str, name: &str, kind: &str) -> String {
-        format!("test:{}:{}:{}", file, name, kind)
-    }
-
+    /// Core test: a node reachable via Calls edges should rank higher than
+    /// a node reachable only via Defines edges, even with the same topology.
     #[test]
-    fn test_dampen_boilerplate_fmt_function() {
-        // fmt function should be dampened vs a regular function with
-        // the same graph structure.
+    fn test_weighted_pagerank_calls_beats_defines() {
         let mut index = GraphIndex::new();
-        let fmt_id = stable_id("src/types.rs", "fmt", "function");
-        let handler_id = stable_id("src/server.rs", "handle_request", "function");
-        let caller1 = stable_id("src/a.rs", "caller1", "function");
-        let caller2 = stable_id("src/b.rs", "caller2", "function");
-
-        // Both fmt and handle_request are called by 2 callers (same structure)
-        index.add_edge(&caller1, "function", &fmt_id, "function", EdgeKind::Calls);
-        index.add_edge(&caller2, "function", &fmt_id, "function", EdgeKind::Calls);
-        index.add_edge(&caller1, "function", &handler_id, "function", EdgeKind::Calls);
-        index.add_edge(&caller2, "function", &handler_id, "function", EdgeKind::Calls);
+        // "hub_calls" receives 3 Calls edges (weight 1.0 each)
+        index.add_edge("a", "fn", "hub_calls", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "hub_calls", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "hub_calls", "fn", EdgeKind::Calls);
+        // "hub_defines" receives 3 Defines edges (weight 0.1 each)
+        index.add_edge("d", "struct", "hub_defines", "field", EdgeKind::Defines);
+        index.add_edge("e", "struct", "hub_defines", "field", EdgeKind::Defines);
+        index.add_edge("f", "struct", "hub_defines", "field", EdgeKind::Defines);
 
         let scores = index.compute_pagerank(0.85, 20);
-
-        // Both should have scores, but fmt should be dampened
-        assert!(scores[&fmt_id] < scores[&handler_id],
-            "fmt ({:.4}) should score lower than handle_request ({:.4})",
-            scores[&fmt_id], scores[&handler_id]);
-        // fmt should be roughly 10% of its undampened value
-        assert!(scores[&fmt_id] < scores[&handler_id] * 0.2,
-            "fmt should be significantly dampened");
+        assert!(
+            scores["hub_calls"] > scores["hub_defines"],
+            "Calls hub ({:.4}) should rank higher than Defines hub ({:.4})",
+            scores["hub_calls"],
+            scores["hub_defines"]
+        );
     }
 
+    /// Implements edges (weight 0.8) should produce higher scores than
+    /// HasField edges (weight 0.1) for otherwise identical topology.
     #[test]
-    fn test_dampen_boilerplate_default_and_clone() {
+    fn test_weighted_pagerank_implements_beats_has_field() {
         let mut index = GraphIndex::new();
-        let default_id = stable_id("src/types.rs", "default", "function");
-        let clone_id = stable_id("src/types.rs", "clone", "function");
-        let build_id = stable_id("src/build.rs", "build_graph", "function");
-        let caller = stable_id("src/main.rs", "main", "function");
-
-        // All called by main
-        index.add_edge(&caller, "function", &default_id, "function", EdgeKind::Calls);
-        index.add_edge(&caller, "function", &clone_id, "function", EdgeKind::Calls);
-        index.add_edge(&caller, "function", &build_id, "function", EdgeKind::Calls);
+        // "trait_hub" receives 3 Implements edges
+        index.add_edge("impl_a", "impl", "trait_hub", "trait", EdgeKind::Implements);
+        index.add_edge("impl_b", "impl", "trait_hub", "trait", EdgeKind::Implements);
+        index.add_edge("impl_c", "impl", "trait_hub", "trait", EdgeKind::Implements);
+        // "struct_hub" receives 3 HasField edges
+        index.add_edge("struct_a", "struct", "struct_hub", "field", EdgeKind::HasField);
+        index.add_edge("struct_b", "struct", "struct_hub", "field", EdgeKind::HasField);
+        index.add_edge("struct_c", "struct", "struct_hub", "field", EdgeKind::HasField);
 
         let scores = index.compute_pagerank(0.85, 20);
-
-        assert!(scores[&default_id] < scores[&build_id],
-            "default should score lower than build_graph");
-        assert!(scores[&clone_id] < scores[&build_id],
-            "clone should score lower than build_graph");
+        assert!(
+            scores["trait_hub"] > scores["struct_hub"],
+            "Implements hub ({:.4}) should rank higher than HasField hub ({:.4})",
+            scores["trait_hub"],
+            scores["struct_hub"]
+        );
     }
 
+    /// Mixed edge types: a node with 1 Calls edge should outrank a node
+    /// with 5 Defines edges. Quality of edges beats quantity.
     #[test]
-    fn test_dampen_boilerplate_field_nodes() {
+    fn test_weighted_pagerank_one_call_beats_many_defines() {
         let mut index = GraphIndex::new();
-        let field_id = stable_id("src/types.rs", "name", "field");
-        let struct_id = stable_id("src/types.rs", "Config", "struct");
-        let func_id = stable_id("src/lib.rs", "process", "function");
-
-        // struct defines field, func calls struct
-        index.add_edge(&struct_id, "struct", &field_id, "field", EdgeKind::HasField);
-        index.add_edge(&func_id, "function", &struct_id, "struct", EdgeKind::DependsOn);
-        // Give field extra incoming edges so it would normally score high
-        let caller = stable_id("src/a.rs", "reader", "function");
-        index.add_edge(&caller, "function", &field_id, "field", EdgeKind::Calls);
+        // "called_once" gets 1 Calls edge
+        index.add_edge("caller", "fn", "called_once", "fn", EdgeKind::Calls);
+        // "defined_many" gets 5 Defines edges
+        for i in 0..5 {
+            index.add_edge(
+                &format!("definer_{}", i), "struct",
+                "defined_many", "field",
+                EdgeKind::Defines,
+            );
+        }
 
         let scores = index.compute_pagerank(0.85, 20);
-
-        assert!(scores[&field_id] < scores[&struct_id],
-            "field node ({:.4}) should score lower than struct ({:.4})",
-            scores[&field_id], scores[&struct_id]);
+        assert!(
+            scores["called_once"] > scores["defined_many"],
+            "1 Calls edge ({:.4}) should outrank 5 Defines edges ({:.4})",
+            scores["called_once"],
+            scores["defined_many"]
+        );
     }
 
+    /// Verify the edge_weight function returns expected values for all edge kinds.
     #[test]
-    fn test_dampen_boilerplate_test_file_symbols() {
-        let mut index = GraphIndex::new();
-        let test_fn = stable_id("src/smoke.rs", "run_checks", "function");
-        let prod_fn = stable_id("src/server.rs", "run_server", "function");
-        let caller = stable_id("src/main.rs", "main", "function");
-
-        // Both called by main
-        index.add_edge(&caller, "function", &test_fn, "function", EdgeKind::Calls);
-        index.add_edge(&caller, "function", &prod_fn, "function", EdgeKind::Calls);
-
-        let scores = index.compute_pagerank(0.85, 20);
-
-        assert!(scores[&test_fn] < scores[&prod_fn],
-            "smoke.rs function ({:.4}) should score lower than server.rs function ({:.4})",
-            scores[&test_fn], scores[&prod_fn]);
-    }
-
-    #[test]
-    fn test_dampen_preserves_non_boilerplate_scores() {
-        // Ensure that regular functions, structs, enums are NOT dampened
-        let mut index = GraphIndex::new();
-        let func = stable_id("src/query.rs", "search_all", "function");
-        let strct = stable_id("src/graph.rs", "GraphIndex", "struct");
-        let caller = stable_id("src/main.rs", "main", "function");
-
-        index.add_edge(&caller, "function", &func, "function", EdgeKind::Calls);
-        index.add_edge(&caller, "function", &strct, "struct", EdgeKind::DependsOn);
-
-        let scores = index.compute_pagerank(0.85, 20);
-
-        // Both should have their full (undampened) scores
-        // Since they have equal structure, they should have similar scores
-        let diff = (scores[&func] - scores[&strct]).abs();
-        assert!(diff < 0.1,
-            "non-boilerplate symbols should have similar scores: {} vs {}",
-            scores[&func], scores[&strct]);
-    }
-
-    #[test]
-    fn test_dampen_existing_tests_unaffected() {
-        // Existing tests use simple IDs like "a", "b" which don't have
-        // the root:file:name:kind format. Verify they're not dampened.
-        let mut index = GraphIndex::new();
-        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
-
-        let scores = index.compute_pagerank(0.85, 20);
-
-        // "b" (sink) should still have score 1.0 (max) -- not dampened
-        assert!((scores["b"] - 1.0).abs() < 0.01,
-            "simple IDs should not be dampened, got {}", scores["b"]);
+    fn test_edge_weight_values() {
+        use super::edge_weight;
+        assert!((edge_weight(&EdgeKind::Calls) - 1.0).abs() < f64::EPSILON);
+        assert!((edge_weight(&EdgeKind::Implements) - 0.8).abs() < f64::EPSILON);
+        assert!((edge_weight(&EdgeKind::DependsOn) - 0.5).abs() < f64::EPSILON);
+        assert!((edge_weight(&EdgeKind::ReferencedBy) - 0.5).abs() < f64::EPSILON);
+        assert!((edge_weight(&EdgeKind::ConnectsTo) - 0.3).abs() < f64::EPSILON);
+        assert!((edge_weight(&EdgeKind::Defines) - 0.1).abs() < f64::EPSILON);
+        assert!((edge_weight(&EdgeKind::HasField) - 0.1).abs() < f64::EPSILON);
+        // PR/outcome edges get minimal weight
+        assert!(edge_weight(&EdgeKind::Modified) < 0.1);
+        assert!(edge_weight(&EdgeKind::Serves) < 0.1);
     }
 }
