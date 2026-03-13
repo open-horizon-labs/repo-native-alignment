@@ -69,6 +69,9 @@ serde_json = "1"
 serde_yaml = "0.9"
 toml = "0.8"
 
+# FTS types for hybrid search (FullTextSearchQuery)
+lance-index = "2.0"
+
 # Async streams (for LanceDB query results)
 futures = "0.3"
 

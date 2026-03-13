@@ -14,7 +14,7 @@ use rust_mcp_sdk::schema::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::embed::{EmbeddingIndex, SearchOutcome};
+use crate::embed::{EmbeddingIndex, SearchMode, SearchOutcome};
 use crate::extract::{ExtractorRegistry, EnricherRegistry};
 use crate::graph::{self, EdgeKind, Node, Edge, Confidence, ExtractionSource, NodeId, NodeKind};
 use crate::graph::index::GraphIndex;
@@ -35,7 +35,7 @@ const IMPORTANCE_THRESHOLD: f64 = 0.001;
 
 #[macros::mcp_tool(
     name = "oh_search_context",
-    description = "Semantic search across business context, commits, code, and markdown. Describe what you need in plain language. Returns results ranked 0-1 by relevance; test files are demoted. Enable include_code for ranked symbol search (exact name > contains > signature, production before tests), include_markdown for doc sections. For exact symbol name lookup use search_symbols instead."
+    description = "Semantic search across business context, commits, code, and markdown. Describe what you need in plain language. Returns results ranked 0-1 by relevance; test files are demoted. Enable include_code for ranked symbol search (exact name > contains > signature, production before tests), include_markdown for doc sections. For exact symbol name lookup use search_symbols instead. search_mode: hybrid (default, keyword+vector RRF), keyword (BM25 only), semantic (vector only)."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct OhSearchContext {
@@ -53,6 +53,9 @@ pub struct OhSearchContext {
     /// Also search markdown sections (default: false)
     #[serde(default)]
     pub include_markdown: Option<bool>,
+    /// Search ranking mode: "hybrid" (default, keyword + vector RRF), "keyword" (BM25 only), "semantic" (vector only)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_mode: Option<String>,
 }
 
 
@@ -125,6 +128,9 @@ pub struct Search {
     /// Batch retrieve multiple nodes by stable ID. Returns combined results in a single response. Composes with compact and mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodes: Option<Vec<String>>,
+    /// Search ranking mode for graph traversal entry-point resolution: "hybrid" (default, keyword + vector RRF), "keyword" (BM25 only), "semantic" (vector only). Only affects how entry nodes are found when using query + mode; flat search always uses name/signature matching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_mode: Option<String>,
 }
 
 // ── Deprecated aliases (kept for one release cycle) ─────────────────
@@ -184,6 +190,7 @@ impl SearchSymbols {
             synthetic: self.synthetic,
             compact: None,
             nodes: None,
+            search_mode: None,
         }
     }
 }
@@ -238,6 +245,7 @@ impl GraphQuery {
             synthetic: None,
             compact: None,
             nodes: None,
+            search_mode: None,
         }
     }
 }
@@ -2353,13 +2361,14 @@ impl RnaHandler {
         }
 
         // Resolve entry node IDs
+        let search_mode = parse_search_mode(args.search_mode.as_deref());
         let (entry_node_ids, entry_header): (Vec<String>, String) = if let Some(node_id) = node {
             (vec![node_id.to_string()], String::new())
         } else if let Some(query_text) = query {
             let embed_guard = self.embed_index.load();
             match embed_guard.as_ref() {
                 Some(embed_idx) => {
-                    match embed_idx.search(query_text, None, top_k.min(50) * 3).await {
+                    match embed_idx.search_with_mode(query_text, None, top_k.min(50) * 3, search_mode).await {
                         Ok(SearchOutcome::Results(results)) if !results.is_empty() => {
                             let code_results: Vec<_> = results.into_iter()
                                 .filter(|r| r.kind.starts_with("code:"))
@@ -2795,6 +2804,16 @@ fn run_traversal(
     }
 }
 
+/// Parse a `search_mode` string into [`SearchMode`].
+/// Returns `Hybrid` for `None` or unrecognized values.
+fn parse_search_mode(s: Option<&str>) -> SearchMode {
+    match s.map(str::to_lowercase).as_deref() {
+        Some("keyword") => SearchMode::Keyword,
+        Some("semantic") => SearchMode::Semantic,
+        _ => SearchMode::Hybrid,
+    }
+}
+
 fn text_result(s: String) -> CallToolResult {
     CallToolResult::text_content(vec![TextContent::new(s, None, None)])
 }
@@ -2948,6 +2967,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 let limit = args.limit.unwrap_or(5) as usize;
                 let include_code = args.include_code.unwrap_or(false);
                 let include_markdown = args.include_markdown.unwrap_or(false);
+                let search_mode = parse_search_mode(args.search_mode.as_deref());
 
                 // Ensure graph is built first so symbols are embedded
                 // (get_graph builds the graph + embeds symbols in the pipeline)
@@ -2970,7 +2990,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                     let embed_guard = self.embed_index.load();
                     match embed_guard.as_ref() {
                         Some(index) => {
-                            match index.search(query, args.artifact_types.as_deref(), limit).await {
+                            match index.search_with_mode(query, args.artifact_types.as_deref(), limit, search_mode).await {
                                 Ok(SearchOutcome::Results(results)) => {
                                     if !results.is_empty() {
                                         let md: String = results
@@ -4511,6 +4531,59 @@ mod tests {
         let s = gq.into_search();
         assert!(s.compact.is_none());
         assert!(s.nodes.is_none());
+    }
+
+    // ── parse_search_mode tests ──────────────────────────────────────
+
+    #[test]
+    fn test_parse_search_mode_defaults_to_hybrid() {
+        use crate::embed::SearchMode;
+        assert_eq!(parse_search_mode(None), SearchMode::Hybrid);
+        assert_eq!(parse_search_mode(Some("hybrid")), SearchMode::Hybrid);
+        assert_eq!(parse_search_mode(Some("HYBRID")), SearchMode::Hybrid);
+        assert_eq!(parse_search_mode(Some("unknown")), SearchMode::Hybrid);
+    }
+
+    #[test]
+    fn test_parse_search_mode_keyword() {
+        use crate::embed::SearchMode;
+        assert_eq!(parse_search_mode(Some("keyword")), SearchMode::Keyword);
+        assert_eq!(parse_search_mode(Some("Keyword")), SearchMode::Keyword);
+        assert_eq!(parse_search_mode(Some("KEYWORD")), SearchMode::Keyword);
+    }
+
+    #[test]
+    fn test_parse_search_mode_semantic() {
+        use crate::embed::SearchMode;
+        assert_eq!(parse_search_mode(Some("semantic")), SearchMode::Semantic);
+        assert_eq!(parse_search_mode(Some("Semantic")), SearchMode::Semantic);
+        assert_eq!(parse_search_mode(Some("SEMANTIC")), SearchMode::Semantic);
+    }
+
+    #[test]
+    fn test_search_mode_in_search_struct() {
+        let s: Search = serde_json::from_value(serde_json::json!({
+            "query": "foo",
+            "search_mode": "keyword"
+        })).unwrap();
+        assert_eq!(s.search_mode, Some("keyword".to_string()));
+    }
+
+    #[test]
+    fn test_search_mode_absent_in_search_struct() {
+        let s: Search = serde_json::from_value(serde_json::json!({
+            "query": "foo"
+        })).unwrap();
+        assert!(s.search_mode.is_none());
+    }
+
+    #[test]
+    fn test_search_mode_in_oh_search_context_struct() {
+        let s: OhSearchContext = serde_json::from_value(serde_json::json!({
+            "query": "error handling",
+            "search_mode": "semantic"
+        })).unwrap();
+        assert_eq!(s.search_mode, Some("semantic".to_string()));
     }
 
     #[test]
