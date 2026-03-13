@@ -326,6 +326,11 @@ impl EmbeddingIndex {
         })
     }
 
+    /// Check if the embedding table exists.
+    pub async fn has_table(&self) -> bool {
+        self.db.open_table(&self.table_name).execute().await.is_ok()
+    }
+
     /// Create (or replace) tantivy full-text search indexes on the `title` and
     /// `body` columns. LanceDB requires separate FTS indexes per column.
     /// Called after bulk writes and reindex to enable hybrid search.

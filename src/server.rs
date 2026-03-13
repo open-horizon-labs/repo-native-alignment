@@ -1692,17 +1692,20 @@ impl RnaHandler {
                         state.nodes.len(),
                         state.edges.len()
                     );
-                    // Always re-index embeddings so .oh/ artifacts added since
-                    // the last full build become searchable.  This drops and
-                    // rebuilds the table (index_all_inner) which is acceptable
-                    // at current repo scale.
+                    // No changes detected — reuse existing embedding table if present.
+                    // Only rebuild if the table is missing (first run or cache cleared).
                     if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await {
-                        match idx.index_all_with_symbols(&self.repo_root, &state.nodes).await {
-                            Ok(count) => {
-                                tracing::info!("Re-indexed embedding index: {} items from cached graph", count);
-                                self.embed_index.store(Arc::new(Some(idx)));
+                        if idx.has_table().await {
+                            tracing::info!("Reusing existing embedding index (no changes detected)");
+                            self.embed_index.store(Arc::new(Some(idx)));
+                        } else {
+                            match idx.index_all_with_symbols(&self.repo_root, &state.nodes).await {
+                                Ok(count) => {
+                                    tracing::info!("Built embedding index: {} items (table was missing)", count);
+                                    self.embed_index.store(Arc::new(Some(idx)));
+                                }
+                                Err(e) => tracing::warn!("Failed to embed cached graph: {}", e),
                             }
-                            Err(e) => tracing::warn!("Failed to embed cached graph: {}", e),
                         }
                     }
                     return Ok(state);
