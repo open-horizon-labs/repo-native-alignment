@@ -2159,9 +2159,17 @@ impl RnaHandler {
         for node in &mut extraction.nodes {
             node.id.root = primary_slug.clone();
         }
+        // Build file index from existing graph + new extraction for suffix matching
+        let file_index: std::collections::HashSet<String> = graph.nodes
+            .iter()
+            .chain(extraction.nodes.iter())
+            .map(|n| n.id.file.to_string_lossy().to_string())
+            .collect();
         for edge in &mut extraction.edges {
             edge.from.root = primary_slug.clone();
             edge.to.root = primary_slug.clone();
+            // Resolve dangling import edges via suffix match (same as build_full_graph)
+            resolve_edge_target_by_suffix(edge, &file_index);
         }
 
         // Track only the delta (new/changed) for LanceDB upsert — not the full graph.
