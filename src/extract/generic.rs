@@ -2304,4 +2304,86 @@ public class UserController {
         assert!(RUBY_CONFIG.type_param_node_kind.is_none());
         assert!(BASH_CONFIG.type_param_node_kind.is_none());
     }
+
+    // -- Adversarial type_params tests --
+
+    /// Adversarial: Rust lifetime parameters mixed with type params
+    #[test]
+    fn test_type_params_rust_lifetime_and_type() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "pub struct Ref<'a, T: 'a> {\n    data: &'a T,\n}\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let node = result.nodes.iter().find(|n| n.id.name == "Ref").unwrap();
+        let tp = node.metadata.get("type_params").expect("Should have type_params with lifetime");
+        assert!(tp.contains("'a"), "type_params should contain lifetime 'a, got: {}", tp);
+        assert!(tp.contains("T"), "type_params should contain type T, got: {}", tp);
+    }
+
+    /// Adversarial: Rust impl block with generics
+    #[test]
+    fn test_type_params_rust_impl_generic() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "struct Wrapper<T>(T);\nimpl<T: Clone> Wrapper<T> {\n    fn get(&self) -> T { self.0.clone() }\n}\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        // The struct should have <T>
+        let wrapper = result.nodes.iter().find(|n| n.id.name == "Wrapper" && n.id.kind == NodeKind::Struct).unwrap();
+        let tp = wrapper.metadata.get("type_params").expect("Wrapper struct should have type_params");
+        assert!(tp.contains("T"), "struct type_params should contain T, got: {}", tp);
+
+        // The impl block should have <T: Clone>
+        let impl_node = result.nodes.iter()
+            .find(|n| n.id.kind == NodeKind::Impl && n.id.name.contains("Wrapper"))
+            .unwrap();
+        let impl_tp = impl_node.metadata.get("type_params").expect("impl should have type_params");
+        assert!(impl_tp.contains("T"), "impl type_params should contain T, got: {}", impl_tp);
+        assert!(impl_tp.contains("Clone"), "impl type_params should contain Clone, got: {}", impl_tp);
+    }
+
+    /// Adversarial: deeply nested generics (e.g. HashMap<String, Vec<T>>)
+    /// Only the type_parameters node text is captured, not nested generic args in types
+    #[test]
+    fn test_type_params_rust_complex_bounds() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "pub fn transform<T: Into<String> + AsRef<str>>(input: T) -> String {\n    input.into()\n}\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "transform").unwrap();
+        let tp = func.metadata.get("type_params").expect("Should have type_params");
+        assert!(tp.contains("Into<String>"), "type_params should contain Into<String>, got: {}", tp);
+        assert!(tp.contains("AsRef<str>"), "type_params should contain AsRef<str>, got: {}", tp);
+    }
+
+    /// Adversarial: TypeScript with multiple type params and constraints
+    #[test]
+    fn test_type_params_typescript_multiple_constraints() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let code = "function merge<T extends object, U extends object>(a: T, b: U): T & U {\n    return {...a, ...b};\n}\n";
+        let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
+            .run(Path::new("test.ts"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "merge").unwrap();
+        let tp = func.metadata.get("type_params").expect("Should have type_params");
+        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
+        assert!(tp.contains("U"), "type_params should contain U, got: {}", tp);
+        assert!(tp.contains("extends"), "type_params should contain extends keyword, got: {}", tp);
+    }
+
+    /// Adversarial: Java wildcard bounds
+    #[test]
+    fn test_type_params_java_multiple_bounds() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let code = "class Sorter<T extends Comparable<T> & Serializable> {\n    void sort() {}\n}\n";
+        let result = GenericExtractor::new(&JAVA_CONFIG)
+            .run(Path::new("Sorter.java"), code)
+            .unwrap();
+        let class = result.nodes.iter().find(|n| n.id.name == "Sorter").unwrap();
+        let tp = class.metadata.get("type_params").expect("Should have type_params");
+        assert!(tp.contains("Comparable"), "type_params should contain Comparable bound, got: {}", tp);
+        assert!(tp.contains("Serializable"), "type_params should contain Serializable bound, got: {}", tp);
+    }
 }
