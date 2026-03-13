@@ -982,9 +982,11 @@ impl EmbeddingIndex {
                 }
 
                 let raw_score = if has_score_col {
-                    // RRF / BM25 `_score` — higher is better, range varies.
-                    // Normalize by clamping to [0, 1]. RRF scores are typically
-                    // small (sum of 1/(k+rank)), so we use a sigmoid-like clamp.
+                    // RRF / BM25 `_score` — higher is better.
+                    // RRF scores are always < 1 (sum of 1/(k+rank_i), k=60).
+                    // BM25 scores can exceed 1.0 for highly relevant short docs,
+                    // but we clamp to [0, 1] for consistency with cosine similarity.
+                    // Ordering is preserved since we sort by score descending.
                     let s = batch
                         .column_by_name("_score")
                         .unwrap()
