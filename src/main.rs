@@ -9,7 +9,7 @@ use rust_mcp_sdk::ToMcpServerHandler;
 
 use repo_native_alignment::server::{self, RnaHandler};
 use repo_native_alignment::setup::{self, SetupArgs};
-use repo_native_alignment::smoke::{self, TestArgs};
+use repo_native_alignment::smoke_test::{self, TestArgs};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -167,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Test(args)) => {
             init_tracing("info");
             tracing::info!("Running RNA pipeline smoke test for {}", args.repo.display());
-            let passed = smoke::run(&args).await?;
+            let passed = smoke_test::run(&args).await?;
             std::process::exit(if passed { 0 } else { 1 });
         }
         Some(Commands::Scan(args)) => {

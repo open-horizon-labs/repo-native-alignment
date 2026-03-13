@@ -31,16 +31,49 @@ pub fn kind_rank(n: &Node) -> u8 {
     }
 }
 
-/// Returns true if the node lives in a test file (by path convention).
-pub fn is_test_file(n: &Node) -> bool {
-    let p = n.id.file.to_string_lossy();
+/// Returns true if a file path looks like a test or test-adjacent file.
+///
+/// This is the shared path-based check used by both `is_test_file()` (which takes
+/// a `Node`) and `embed.rs` semantic search demotion (which operates on id strings).
+///
+/// Patterns recognised:
+/// - JS/TS: `.test.` and `.spec.` anywhere in path (e.g. `config.test.ts`)
+/// - Rust:  `_test.` and `_tests.` (e.g. `my_test.rs`, `helpers_tests.rs`)
+/// - Rust:  `_spec.` (e.g. `parser_spec.rs`)
+/// - Python: filename starts with `test_` (e.g. `test_utils.py`)
+/// - Directories: `/test/`, `/tests/`, or root `test/`/`tests/`
+/// - Test-adjacent: `smoke`, `bench`, `benchmark`, `fixture`, `fixtures` in path
+pub fn is_test_path(p: &str) -> bool {
+    let fname = p.rsplit('/').next().unwrap_or(p);
+    // JS/TS conventions
     p.contains(".test.")
         || p.contains(".spec.")
+        // Rust / general conventions (suffix before extension)
         || p.contains("_test.")
+        || p.contains("_tests.")
+        || p.contains("_spec.")
+        // Directory-based
         || p.contains("/test/")
         || p.contains("/tests/")
         || p.starts_with("test/")
         || p.starts_with("tests/")
+        // Python: test_ prefix on filename
+        || fname.starts_with("test_")
+        // Test-adjacent files: smoke tests, benchmarks, fixtures
+        || fname.contains("smoke")
+        || fname.contains("bench")
+        || p.contains("/fixtures/")
+        || p.contains("/fixture/")
+        || p.starts_with("fixtures/")
+        || p.starts_with("fixture/")
+}
+
+/// Returns true if the node lives in a test file (by path convention).
+///
+/// Thin wrapper around [`is_test_path`] that extracts the path from a `Node`.
+pub fn is_test_file(n: &Node) -> bool {
+    let p = n.id.file.to_string_lossy();
+    is_test_path(&p)
 }
 
 /// Sort code symbol nodes by a 5-tier relevance cascade.
@@ -480,5 +513,122 @@ mod tests {
         let mut matches: Vec<&Node> = vec![&a, &b];
         sort_symbol_matches(&mut matches, "hub", &index);
         assert_eq!(matches.len(), 2); // no panic, no filtering
+    }
+
+    // ==================== is_test_file broadened patterns ====================
+
+    #[test]
+    fn test_is_test_file_rust_tests_suffix() {
+        // _tests.rs (plural)
+        let node = make_node("f", NodeKind::Function, "src/helpers_tests.rs");
+        assert!(is_test_file(&node), "_tests.rs should be flagged as test file");
+    }
+
+    #[test]
+    fn test_is_test_file_rust_spec_suffix() {
+        let node = make_node("f", NodeKind::Function, "src/parser_spec.rs");
+        assert!(is_test_file(&node), "_spec.rs should be flagged as test file");
+    }
+
+    #[test]
+    fn test_is_test_file_python_test_prefix() {
+        let node = make_node("f", NodeKind::Function, "src/test_utils.py");
+        assert!(is_test_file(&node), "test_*.py should be flagged as test file");
+
+        // In subdirectory
+        let node2 = make_node("f", NodeKind::Function, "lib/test_parser.py");
+        assert!(is_test_file(&node2), "lib/test_*.py should be flagged as test file");
+    }
+
+    #[test]
+    fn test_is_test_file_python_no_false_positive() {
+        // "testimony.py" should NOT match — test_ must be prefix of filename
+        let node = make_node("f", NodeKind::Function, "src/testimony.py");
+        assert!(!is_test_file(&node), "testimony.py should not be flagged as test file");
+    }
+
+    #[test]
+    fn test_is_test_file_smoke() {
+        let node = make_node("f", NodeKind::Function, "src/smoke.rs");
+        assert!(is_test_file(&node), "smoke.rs should be flagged as test file");
+
+        let node2 = make_node("f", NodeKind::Function, "src/smoke_test.rs");
+        assert!(is_test_file(&node2), "smoke_test.rs should be flagged as test file");
+    }
+
+    #[test]
+    fn test_is_test_file_bench() {
+        let node = make_node("f", NodeKind::Function, "src/bench_ranking.rs");
+        assert!(is_test_file(&node), "bench_*.rs should be flagged as test file");
+
+        let node2 = make_node("f", NodeKind::Function, "benches/benchmark.rs");
+        assert!(is_test_file(&node2), "benchmark.rs should be flagged as test file");
+    }
+
+    #[test]
+    fn test_is_test_file_fixtures_directory() {
+        let node = make_node("f", NodeKind::Function, "tests/fixtures/helper.rs");
+        assert!(is_test_file(&node), "tests/fixtures/ should be flagged as test file");
+
+        let node2 = make_node("f", NodeKind::Function, "fixture/data.py");
+        assert!(is_test_file(&node2), "fixture/ at root should be flagged as test file");
+    }
+
+    #[test]
+    fn test_is_test_file_no_false_positive_benchmark_dir() {
+        // "benchmarks/main.rs" — bench is in filename via directory name
+        // but the directory itself is not in our dir patterns. The filename
+        // extraction would check the last component. Let's verify.
+        let node = make_node("f", NodeKind::Function, "benchmarks/main.rs");
+        // "main.rs" doesn't contain "bench" — this should NOT be flagged.
+        assert!(!is_test_file(&node), "benchmarks/main.rs should not be flagged (filename is main.rs)");
+    }
+
+    #[test]
+    fn test_is_test_file_root_test_prefix() {
+        // File at root starting with test_
+        let node = make_node("f", NodeKind::Function, "test_integration.py");
+        assert!(is_test_file(&node), "root test_*.py should be flagged as test file");
+    }
+
+    // ==================== Adversarial: is_test_path edge cases ====================
+
+    #[test]
+    fn test_is_test_path_empty_string() {
+        assert!(!is_test_path(""), "empty path should not be test file");
+    }
+
+    #[test]
+    fn test_is_test_path_no_false_positive_protest_dir() {
+        // "protest" contains "test" but not as "/test/" boundary
+        assert!(!is_test_path("protest/main.rs"), "protest/ should not be flagged");
+        assert!(!is_test_path("src/detest.rs"), "detest.rs should not be flagged");
+    }
+
+    #[test]
+    fn test_is_test_path_direct_call_matches_is_test_file() {
+        // Verify is_test_path and is_test_file agree on all cases
+        let cases = vec![
+            ("src/lib.rs", false),
+            ("tests/foo.rs", true),
+            ("src/smoke.rs", true),
+            ("src/my_test.rs", true),
+            ("src/bench_foo.rs", true),
+            ("test_utils.py", true),
+            ("attestation/lib.rs", false),
+        ];
+        for (path, expected) in cases {
+            let node = make_node("f", NodeKind::Function, path);
+            assert_eq!(
+                is_test_path(path), expected,
+                "is_test_path(\"{}\") should be {}",
+                path, expected
+            );
+            assert_eq!(
+                is_test_file(&node), expected,
+                "is_test_file for \"{}\" should be {}",
+                path, expected
+            );
+        }
     }
 }
