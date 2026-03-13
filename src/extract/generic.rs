@@ -1372,4 +1372,134 @@ fn parent() {
         assert_eq!(cc, 1, "Parent with branchy closure should have cc=1 (closure is a boundary), got {}", cc);
         eprintln!("ADVERSARIAL: parent with closure cc={} (closure branches excluded)", cc);
     }
+
+    // -----------------------------------------------------------------------
+    // Enum variant indexing tests (#154)
+    // -----------------------------------------------------------------------
+
+    /// Helper: extract nodes from a code snippet using a given config.
+    fn nodes_for(config: &'static LangConfig, path: &str, code: &str) -> Vec<Node> {
+        let ext = GenericExtractor::new(config);
+        let result = ext.run(Path::new(path), code).unwrap();
+        result.nodes
+    }
+
+    #[test]
+    fn test_enum_variants_typescript() {
+        // TS enum variants use property_identifier/enum_assignment nodes,
+        // handled in the TypeScript-specific extractor (not generic config).
+        use crate::extract::typescript::TypeScriptExtractor;
+        use crate::extract::Extractor;
+        let extractor = TypeScriptExtractor::new();
+        let code = r#"
+enum Direction {
+    Up,
+    Down,
+    Left = 3,
+    Right = 4,
+}
+"#;
+        let result = extractor.extract(Path::new("test.ts"), code).unwrap();
+        let names: Vec<&str> = result.nodes.iter().map(|n| n.id.name.as_str()).collect();
+
+        assert!(names.contains(&"Direction"), "Should find enum Direction");
+        assert!(names.contains(&"Up"), "Should find variant Up, got: {:?}", names);
+        assert!(names.contains(&"Down"), "Should find variant Down");
+        assert!(names.contains(&"Left"), "Should find initialized variant Left");
+        assert!(names.contains(&"Right"), "Should find initialized variant Right");
+
+        let up = result.nodes.iter().find(|n| n.id.name == "Up").unwrap();
+        assert_eq!(up.id.kind, NodeKind::Field, "TS variant should be Field kind");
+        assert_eq!(
+            up.metadata.get("parent_scope"),
+            Some(&"Direction".to_string()),
+            "TS variant should have parent_scope = Direction"
+        );
+
+        let has_field_edges: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::HasField)
+            .collect();
+        assert!(
+            has_field_edges.iter().any(|e| e.from.name == "Direction" && e.to.name == "Up"),
+            "Should have HasField edge Direction -> Up"
+        );
+    }
+
+    #[test]
+    fn test_enum_variants_java() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let code = r#"
+enum Color {
+    RED,
+    GREEN,
+    BLUE;
+}
+"#;
+        let nodes = nodes_for(&JAVA_CONFIG, "Test.java", code);
+        let names: Vec<&str> = nodes.iter().map(|n| n.id.name.as_str()).collect();
+
+        assert!(names.contains(&"Color"), "Should find enum Color");
+        assert!(names.contains(&"RED"), "Should find variant RED, got: {:?}", names);
+        assert!(names.contains(&"GREEN"), "Should find variant GREEN");
+
+        let red = nodes.iter().find(|n| n.id.name == "RED").unwrap();
+        assert_eq!(red.id.kind, NodeKind::Field, "Java variant should be Field kind");
+        assert_eq!(
+            red.metadata.get("parent_scope"),
+            Some(&"Color".to_string()),
+            "Java variant should have parent_scope = Color"
+        );
+    }
+
+    #[test]
+    fn test_enum_variants_csharp() {
+        use crate::extract::configs::CSHARP_CONFIG;
+        let code = r#"
+enum Status {
+    Active,
+    Inactive,
+    Pending,
+}
+"#;
+        let nodes = nodes_for(&CSHARP_CONFIG, "Test.cs", code);
+        let names: Vec<&str> = nodes.iter().map(|n| n.id.name.as_str()).collect();
+
+        assert!(names.contains(&"Status"), "Should find enum Status");
+        assert!(names.contains(&"Active"), "Should find variant Active, got: {:?}", names);
+        assert!(names.contains(&"Inactive"), "Should find variant Inactive");
+
+        let active = nodes.iter().find(|n| n.id.name == "Active").unwrap();
+        assert_eq!(active.id.kind, NodeKind::Field, "C# variant should be Field kind");
+        assert_eq!(
+            active.metadata.get("parent_scope"),
+            Some(&"Status".to_string()),
+            "C# variant should have parent_scope = Status"
+        );
+    }
+
+    #[test]
+    fn test_enum_variants_cpp() {
+        use crate::extract::configs::CPP_CONFIG;
+        let code = r#"
+enum Color {
+    RED,
+    GREEN,
+    BLUE
+};
+"#;
+        let nodes = nodes_for(&CPP_CONFIG, "test.cpp", code);
+        let names: Vec<&str> = nodes.iter().map(|n| n.id.name.as_str()).collect();
+
+        assert!(names.contains(&"Color"), "Should find enum Color");
+        assert!(names.contains(&"RED"), "Should find variant RED, got: {:?}", names);
+        assert!(names.contains(&"GREEN"), "Should find variant GREEN");
+
+        let red = nodes.iter().find(|n| n.id.name == "RED").unwrap();
+        assert_eq!(red.id.kind, NodeKind::Field, "C++ enumerator should be Field kind");
+        assert_eq!(
+            red.metadata.get("parent_scope"),
+            Some(&"Color".to_string()),
+            "C++ enumerator should have parent_scope = Color"
+        );
+    }
 }
