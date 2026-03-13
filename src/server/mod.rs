@@ -473,7 +473,16 @@ impl RnaHandler {
                         .await
                         {
                             Ok(true) => {
-                                tracing::info!("Background scan: schema migrated, full persist needed on next cycle");
+                                tracing::info!("Background scan: schema migrated; performing full persist now");
+                                let snapshot = {
+                                    let g = graph.read().await;
+                                    g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+                                };
+                                if let Some((nodes, edges)) = snapshot {
+                                    if let Err(e) = persist_graph_to_lance(&repo_root, &nodes, &edges).await {
+                                        tracing::warn!("Background scan: full persist after migration failed: {}", e);
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!("Background scan: failed to persist graph delta: {}", e);
@@ -1222,7 +1231,10 @@ impl RnaHandler {
         .await
         {
             Ok(true) => {
-                tracing::info!("Schema migrated during incremental update; full persist needed on next cycle");
+                tracing::info!("Schema migrated during incremental update; performing full persist now");
+                if let Err(e) = persist_graph_to_lance(&self.repo_root, &graph.nodes, &graph.edges).await {
+                    tracing::warn!("Full persist after migration failed: {}", e);
+                }
             }
             Err(e) => {
                 tracing::warn!("Failed to persist updated graph: {}", e);

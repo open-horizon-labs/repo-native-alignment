@@ -71,7 +71,11 @@ pub(crate) async fn check_and_migrate_schema(db_path: &Path) -> anyhow::Result<b
     }
 
     // Version mismatch (or missing table) — drop all tables and write new meta.
-    let had_stale_data = stored_version.is_some();
+    // Stale data exists if we had a schema version (normal case) OR if data
+    // tables exist without _schema_meta (legacy/corrupt state).
+    let had_stale_data = stored_version.is_some()
+        || db.open_table("symbols").execute().await.is_ok()
+        || db.open_table("edges").execute().await.is_ok();
     tracing::info!(
         "Schema version mismatch (stored={:?}, current={}) — dropping all LanceDB tables",
         stored_version,
