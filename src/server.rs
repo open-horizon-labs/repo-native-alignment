@@ -116,7 +116,7 @@ pub struct Search {
     /// Filter by file path substring
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
-    /// Filter to a specific workspace root (by slug, e.g. "zettelkasten")
+    /// Filter to a specific workspace root (by slug). Defaults to the primary root. Use "all" for cross-root search.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
     /// Number of results (flat search, default: 10) or entry points (traversal, default: 1)
@@ -161,7 +161,7 @@ pub struct SearchSymbols {
     /// Optional: filter by file path substring
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
-    /// Optional: filter to a specific workspace root (by slug, e.g. "zettelkasten")
+    /// Optional: filter to a specific workspace root (by slug). Defaults to the primary root. Use "all" for cross-root search.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
     /// Maximum results to return (default: 20)
