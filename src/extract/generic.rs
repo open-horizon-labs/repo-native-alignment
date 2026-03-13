@@ -499,7 +499,7 @@ const CLOSURE_NODE_KINDS: &[&str] = &[
 /// When `skip_nested_fns` is true, subtrees whose node kind matches a
 /// `NodeKind::Function` entry in `config.node_kinds` are skipped (prevents
 /// nested function bodies from inflating the parent's complexity).
-fn count_branches(
+pub(crate) fn count_branches(
     node: tree_sitter::Node,
     source: &[u8],
     config: &LangConfig,
@@ -549,7 +549,7 @@ fn count_branches(
 // ---------------------------------------------------------------------------
 
 /// Extract signature: text before the first `{`, or the first line.
-fn extract_signature(body: &str) -> String {
+pub(crate) fn extract_signature(body: &str) -> String {
     if let Some(pos) = body.find('{') {
         let sig = body[..pos].trim();
         if !sig.is_empty() {
