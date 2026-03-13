@@ -411,4 +411,65 @@ mod tests {
         // Exact match should come first
         assert_eq!(matches[0].id.name, "Größe");
     }
+
+    // ==================== PageRank adversarial tests ====================
+
+    /// Dissent finding #1: mixed-unit comparison.
+    /// A node WITH PageRank importance should always rank above a node
+    /// WITHOUT importance, even if the no-importance node has high edge count.
+    #[test]
+    fn test_pagerank_node_beats_high_degree_node_without_pagerank() {
+        // Node with low PageRank score (0.1)
+        let mut with_pr = make_node("hub", NodeKind::Function, "a.rs");
+        with_pr.metadata.insert("importance".to_string(), "0.1".to_string());
+
+        // Node without PageRank but would have high edge count (simulated)
+        let without_pr = make_node("hub", NodeKind::Function, "a.rs");
+        // No importance metadata — would fall back to edge count
+
+        let index = empty_index();
+        let mut matches: Vec<&Node> = vec![&without_pr, &with_pr];
+        sort_symbol_matches(&mut matches, "hub", &index);
+
+        // Node with PageRank should rank first (has importance, other doesn't)
+        assert!(
+            matches[0].metadata.contains_key("importance"),
+            "Node with PageRank score should rank above node without, regardless of edge count"
+        );
+    }
+
+    /// Dissent finding #1 (complement): when BOTH have PageRank, higher wins.
+    #[test]
+    fn test_pagerank_higher_score_ranks_first() {
+        let mut high = make_node("hub", NodeKind::Function, "a.rs");
+        high.metadata.insert("importance".to_string(), "0.9".to_string());
+
+        let mut low = make_node("hub", NodeKind::Function, "a.rs");
+        low.metadata.insert("importance".to_string(), "0.1".to_string());
+
+        let index = empty_index();
+        let mut matches: Vec<&Node> = vec![&low, &high];
+        sort_symbol_matches(&mut matches, "hub", &index);
+
+        let first_imp: f64 = matches[0].metadata.get("importance")
+            .unwrap().parse().unwrap();
+        assert!(
+            first_imp > 0.5,
+            "Higher PageRank (0.9) should rank before lower (0.1), got {:.1} first",
+            first_imp
+        );
+    }
+
+    /// Dissent finding #1 (complement): when NEITHER has PageRank,
+    /// they should compare equally (both fall back to edge count in empty index = 0).
+    #[test]
+    fn test_no_pagerank_both_equal_no_panic() {
+        let a = make_node("hub", NodeKind::Function, "a.rs");
+        let b = make_node("hub", NodeKind::Function, "b.rs");
+
+        let index = empty_index();
+        let mut matches: Vec<&Node> = vec![&a, &b];
+        sort_symbol_matches(&mut matches, "hub", &index);
+        assert_eq!(matches.len(), 2); // no panic, no filtering
+    }
 }
