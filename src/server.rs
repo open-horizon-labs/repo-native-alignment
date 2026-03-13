@@ -359,6 +359,7 @@ fn parse_node_kind(s: &str) -> NodeKind {
         "proto_message" => NodeKind::ProtoMessage,
         "sql_table" => NodeKind::SqlTable,
         "api_endpoint" => NodeKind::ApiEndpoint,
+        "macro" => NodeKind::Macro,
         "pr_merge" => NodeKind::PrMerge,
         other => NodeKind::Other(other.to_string()),
     }
@@ -4027,6 +4028,7 @@ mod tests {
             NodeKind::Enum,
             NodeKind::ProtoMessage,
             NodeKind::SqlTable,
+            NodeKind::Macro,
             NodeKind::ApiEndpoint,
             NodeKind::Other("custom_type".to_string()),
         ];
