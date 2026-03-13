@@ -87,9 +87,100 @@ impl ScanConfig {
     }
 }
 
+// ── Pattern hint configuration ──────────────────────────────────────
+
+/// Configuration for design pattern detection via naming conventions.
+///
+/// Loaded from `.oh/config.toml` under `[patterns]`. Controls which
+/// suffix/hint pairs are used by `detect_pattern_hint` to annotate
+/// symbols with `metadata["pattern_hint"]`.
+///
+/// # Example `.oh/config.toml`
+///
+/// ```toml
+/// [patterns]
+/// # Add custom suffix -> hint mappings (merged with built-in defaults)
+/// extra = [
+///   ["gateway", "gateway"],
+///   ["interactor", "interactor"],
+///   ["usecase", "use_case"],
+/// ]
+/// # Disable specific built-in patterns by hint name
+/// disable = ["manager", "service"]
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PatternConfig {
+    /// Additional suffix -> hint pairs to detect beyond the built-in defaults.
+    /// Each entry is `[suffix, hint]` where suffix is matched case-insensitively.
+    #[serde(default)]
+    pub extra: Vec<[String; 2]>,
+    /// Built-in pattern hints to disable (by hint name, e.g. "manager").
+    #[serde(default)]
+    pub disable: Vec<String>,
+}
+
+/// Built-in pattern suffixes shipped with RNA. These are the defaults
+/// from PR #184 that apply when no `.oh/config.toml` exists.
+pub const DEFAULT_PATTERN_SUFFIXES: &[(&str, &str)] = &[
+    ("factory", "factory"),
+    ("builder", "builder"),
+    ("handler", "handler"),
+    ("adapter", "adapter"),
+    ("proxy", "proxy"),
+    ("observer", "observer"),
+    ("repository", "repository"),
+    ("strategy", "strategy"),
+    ("singleton", "singleton"),
+    ("decorator", "decorator"),
+    ("middleware", "middleware"),
+    ("provider", "provider"),
+    ("service", "service"),
+    ("controller", "controller"),
+    ("manager", "manager"),
+];
+
+impl PatternConfig {
+    /// Load from `.oh/config.toml` if it exists, otherwise return defaults.
+    pub fn load(repo_root: &Path) -> Self {
+        let config_path = repo_root.join(".oh").join("config.toml");
+        match std::fs::read_to_string(&config_path) {
+            Ok(content) => match toml::from_str::<TomlConfig>(&content) {
+                Ok(parsed) => parsed.patterns.unwrap_or_default(),
+                Err(e) => {
+                    tracing::warn!("Failed to parse {}: {}", config_path.display(), e);
+                    Self::default()
+                }
+            },
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Compute the effective suffix list: built-in defaults minus disabled,
+    /// plus extra custom patterns.
+    pub fn effective_suffixes(&self) -> Vec<(String, String)> {
+        let mut suffixes: Vec<(String, String)> = DEFAULT_PATTERN_SUFFIXES
+            .iter()
+            .filter(|(_, hint)| !self.disable.iter().any(|d| d == hint))
+            .map(|(suffix, hint)| (suffix.to_string(), hint.to_string()))
+            .collect();
+
+        for pair in &self.extra {
+            let suffix = pair[0].to_ascii_lowercase();
+            let hint = pair[1].to_ascii_lowercase();
+            // Avoid duplicates: skip if suffix already present
+            if !suffixes.iter().any(|(s, _)| *s == suffix) {
+                suffixes.push((suffix, hint));
+            }
+        }
+
+        suffixes
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct TomlConfig {
     scanner: Option<ScanConfig>,
+    patterns: Option<PatternConfig>,
 }
 
 // ── Public types ────────────────────────────────────────────────────
@@ -1495,5 +1586,144 @@ mod tests {
         );
         // But existing file's hash should remain
         assert!(state.file_content_hashes.contains_key(&PathBuf::from("src/main.rs")));
+    }
+
+    // ── PatternConfig tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_pattern_config_default_has_all_builtins() {
+        let config = PatternConfig::default();
+        let suffixes = config.effective_suffixes();
+        assert_eq!(suffixes.len(), DEFAULT_PATTERN_SUFFIXES.len());
+        assert!(suffixes.iter().any(|(s, h)| s == "factory" && h == "factory"));
+        assert!(suffixes.iter().any(|(s, h)| s == "manager" && h == "manager"));
+    }
+
+    #[test]
+    fn test_pattern_config_disable_removes_patterns() {
+        let config = PatternConfig {
+            extra: vec![],
+            disable: vec!["manager".to_string(), "service".to_string()],
+        };
+        let suffixes = config.effective_suffixes();
+        assert!(!suffixes.iter().any(|(_, h)| h == "manager"));
+        assert!(!suffixes.iter().any(|(_, h)| h == "service"));
+        assert!(suffixes.iter().any(|(_, h)| h == "factory"));
+        assert_eq!(
+            suffixes.len(),
+            DEFAULT_PATTERN_SUFFIXES.len() - 2,
+        );
+    }
+
+    #[test]
+    fn test_pattern_config_extra_adds_custom_patterns() {
+        let config = PatternConfig {
+            extra: vec![
+                ["gateway".to_string(), "gateway".to_string()],
+                ["interactor".to_string(), "interactor".to_string()],
+            ],
+            disable: vec![],
+        };
+        let suffixes = config.effective_suffixes();
+        assert!(suffixes.iter().any(|(s, h)| s == "gateway" && h == "gateway"));
+        assert!(suffixes.iter().any(|(s, h)| s == "interactor" && h == "interactor"));
+        assert_eq!(
+            suffixes.len(),
+            DEFAULT_PATTERN_SUFFIXES.len() + 2,
+        );
+    }
+
+    #[test]
+    fn test_pattern_config_extra_deduplicates() {
+        let config = PatternConfig {
+            extra: vec![
+                // "factory" already exists as a built-in
+                ["factory".to_string(), "custom_factory".to_string()],
+            ],
+            disable: vec![],
+        };
+        let suffixes = config.effective_suffixes();
+        // Should NOT add a duplicate; built-in takes priority
+        let factory_count = suffixes.iter().filter(|(s, _)| s == "factory").count();
+        assert_eq!(factory_count, 1);
+        // The built-in hint is retained
+        assert!(suffixes.iter().any(|(s, h)| s == "factory" && h == "factory"));
+    }
+
+    #[test]
+    fn test_pattern_config_disable_and_extra_combined() {
+        let config = PatternConfig {
+            extra: vec![
+                ["gateway".to_string(), "gateway".to_string()],
+            ],
+            disable: vec!["manager".to_string()],
+        };
+        let suffixes = config.effective_suffixes();
+        assert!(!suffixes.iter().any(|(_, h)| h == "manager"));
+        assert!(suffixes.iter().any(|(s, h)| s == "gateway" && h == "gateway"));
+    }
+
+    #[test]
+    fn test_pattern_config_extra_normalizes_case() {
+        let config = PatternConfig {
+            extra: vec![
+                ["Gateway".to_string(), "GATEWAY".to_string()],
+            ],
+            disable: vec![],
+        };
+        let suffixes = config.effective_suffixes();
+        assert!(suffixes.iter().any(|(s, h)| s == "gateway" && h == "gateway"));
+    }
+
+    #[test]
+    fn test_pattern_config_load_from_toml() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".oh")).unwrap();
+        fs::write(
+            root.join(".oh/config.toml"),
+            r#"
+[patterns]
+extra = [["gateway", "gateway"], ["usecase", "use_case"]]
+disable = ["manager"]
+"#,
+        )
+        .unwrap();
+
+        let config = PatternConfig::load(root);
+        assert_eq!(config.extra.len(), 2);
+        assert_eq!(config.disable, vec!["manager"]);
+
+        let suffixes = config.effective_suffixes();
+        assert!(!suffixes.iter().any(|(_, h)| h == "manager"));
+        assert!(suffixes.iter().any(|(s, h)| s == "gateway" && h == "gateway"));
+        assert!(suffixes.iter().any(|(s, h)| s == "usecase" && h == "use_case"));
+    }
+
+    #[test]
+    fn test_pattern_config_load_missing_file_returns_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let config = PatternConfig::load(tmp.path());
+        assert!(config.extra.is_empty());
+        assert!(config.disable.is_empty());
+    }
+
+    #[test]
+    fn test_pattern_config_load_no_patterns_section() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".oh")).unwrap();
+        fs::write(
+            root.join(".oh/config.toml"),
+            r#"
+[scanner]
+exclude = ["dist/"]
+"#,
+        )
+        .unwrap();
+
+        let config = PatternConfig::load(root);
+        assert!(config.extra.is_empty());
+        assert!(config.disable.is_empty());
     }
 }

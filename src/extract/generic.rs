@@ -21,12 +21,45 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::Result;
 
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
+use crate::scanner::PatternConfig;
 use super::string_literals::harvest_string_literals;
 use super::{ExtractionResult, Extractor};
+
+// ── Pattern config global ───────────────────────────────────────────
+
+/// Resolved pattern suffix list, initialized from `.oh/config.toml`.
+/// Falls back to built-in defaults if `init_pattern_config` is never called.
+static PATTERN_CONFIG: OnceLock<Vec<(String, String)>> = OnceLock::new();
+
+/// Initialize the global pattern config from a repo's `.oh/config.toml`.
+/// Call once at server startup. Safe to call multiple times (only the first
+/// call takes effect, per `OnceLock` semantics).
+pub fn init_pattern_config(repo_root: &Path) {
+    let config = PatternConfig::load(repo_root);
+    let _ = PATTERN_CONFIG.set(config.effective_suffixes());
+}
+
+/// Get the effective pattern suffixes. Returns the configured list if
+/// `init_pattern_config` was called, otherwise falls back to built-in defaults.
+fn effective_pattern_suffixes() -> &'static [(String, String)] {
+    // Initialized by init_pattern_config; if not yet called, use defaults.
+    static DEFAULT_OWNED: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    PATTERN_CONFIG.get().map(|v| v.as_slice()).unwrap_or_else(|| {
+        DEFAULT_OWNED
+            .get_or_init(|| {
+                crate::scanner::DEFAULT_PATTERN_SUFFIXES
+                    .iter()
+                    .map(|(s, h)| (s.to_string(), h.to_string()))
+                    .collect()
+            })
+            .as_slice()
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -602,32 +635,14 @@ pub(super) fn count_branches(
 // Design pattern hint detection (naming conventions)
 // ---------------------------------------------------------------------------
 
-/// Known pattern suffixes mapped to their canonical hint name.
-/// Order: longest suffixes first so "Repository" matches before a hypothetical "ory".
-const PATTERN_SUFFIXES: &[(&str, &str)] = &[
-    ("factory", "factory"),
-    ("builder", "builder"),
-    ("handler", "handler"),
-    ("adapter", "adapter"),
-    ("proxy", "proxy"),
-    ("observer", "observer"),
-    ("repository", "repository"),
-    ("strategy", "strategy"),
-    ("singleton", "singleton"),
-    ("decorator", "decorator"),
-    ("middleware", "middleware"),
-    ("provider", "provider"),
-    ("service", "service"),
-    ("controller", "controller"),
-    ("manager", "manager"),
-];
-
 /// Detect a design pattern hint from a node's name using suffix matching.
 ///
-/// Only applies to node kinds that carry architectural intent: Struct, Trait,
-/// Function, Enum, and Other (for Class in languages like Python/TypeScript).
-/// Returns the lowercase pattern name if the node name ends with a known
-/// pattern suffix (case-insensitive).
+/// Uses the effective pattern suffix list (built-in defaults merged with
+/// any user configuration from `.oh/config.toml`). Only applies to node
+/// kinds that carry architectural intent: Struct, Trait, Function, Enum,
+/// and Other (for Class in languages like Python/TypeScript). Returns the
+/// lowercase pattern name if the node name ends with a known pattern
+/// suffix (case-insensitive).
 fn detect_pattern_hint(name: &str, kind: &NodeKind) -> Option<String> {
     // Only match on types/functions that carry architectural intent.
     match kind {
@@ -640,9 +655,9 @@ fn detect_pattern_hint(name: &str, kind: &NodeKind) -> Option<String> {
     }
 
     let lower = name.to_ascii_lowercase();
-    for (suffix, hint) in PATTERN_SUFFIXES {
-        if lower.ends_with(suffix) {
-            return Some(hint.to_string());
+    for (suffix, hint) in effective_pattern_suffixes() {
+        if lower.ends_with(suffix.as_str()) {
+            return Some(hint.clone());
         }
     }
     None
@@ -2720,6 +2735,25 @@ struct PlainStruct {
         assert!(
             dto.metadata.get("pattern_hint").is_none(),
             "UserDTO should NOT have a pattern_hint",
+        );
+    }
+
+    #[test]
+    fn test_effective_pattern_suffixes_returns_defaults_without_init() {
+        // Without calling init_pattern_config, effective_pattern_suffixes()
+        // should fall back to built-in defaults.
+        let suffixes = effective_pattern_suffixes();
+        assert!(
+            !suffixes.is_empty(),
+            "Should return built-in defaults when no config initialized"
+        );
+        assert!(
+            suffixes.iter().any(|(s, _)| s == "factory"),
+            "Built-in defaults should include 'factory'"
+        );
+        assert!(
+            suffixes.iter().any(|(s, _)| s == "observer"),
+            "Built-in defaults should include 'observer'"
         );
     }
 }

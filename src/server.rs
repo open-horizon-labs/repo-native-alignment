@@ -1626,6 +1626,9 @@ impl RnaHandler {
 
     /// Build the full graph from scratch. This is the original get_graph logic.
     pub async fn build_full_graph(&self) -> anyhow::Result<GraphState> {
+        // Initialize pattern config from .oh/config.toml (once, at first build).
+        crate::extract::generic::init_pattern_config(&self.repo_root);
+
         // Pre-flight: ensure schema version matches before any LanceDB reads/writes.
         let db_path = graph_lance_path(&self.repo_root);
         if check_and_migrate_schema(&db_path).await? {
