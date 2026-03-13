@@ -24,7 +24,7 @@ use petgraph::Direction;
 /// which was a bug.
 pub fn kind_rank(n: &Node) -> u8 {
     match n.id.kind {
-        NodeKind::Function | NodeKind::Struct | NodeKind::Trait | NodeKind::Enum => 0,
+        NodeKind::Function | NodeKind::Struct | NodeKind::Trait | NodeKind::Enum | NodeKind::TypeAlias => 0,
         NodeKind::Const | NodeKind::Field | NodeKind::Impl => 1,
         NodeKind::Import | NodeKind::Module => 2,
         _ => 1,
@@ -334,6 +334,7 @@ mod tests {
             NodeKind::Struct,
             NodeKind::Trait,
             NodeKind::Enum,
+            NodeKind::TypeAlias,
             NodeKind::Module,
             NodeKind::Import,
             NodeKind::Const,

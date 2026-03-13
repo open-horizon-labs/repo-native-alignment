@@ -64,6 +64,7 @@ pub enum NodeKind {
     Struct,
     Trait,
     Enum,
+    TypeAlias,
     Module,
     Import,
     Const,
@@ -85,6 +86,7 @@ impl fmt::Display for NodeKind {
             NodeKind::Struct => write!(f, "struct"),
             NodeKind::Trait => write!(f, "trait"),
             NodeKind::Enum => write!(f, "enum"),
+            NodeKind::TypeAlias => write!(f, "type_alias"),
             NodeKind::Module => write!(f, "module"),
             NodeKind::Import => write!(f, "import"),
             NodeKind::Const => write!(f, "const"),
@@ -110,6 +112,7 @@ impl NodeKind {
             | NodeKind::Struct
             | NodeKind::Trait
             | NodeKind::Enum
+            | NodeKind::TypeAlias
             | NodeKind::ProtoMessage
             | NodeKind::SqlTable
             | NodeKind::ApiEndpoint
@@ -432,6 +435,7 @@ pub fn find_node_at(
                         | NodeKind::Struct
                         | NodeKind::Trait
                         | NodeKind::Enum
+                        | NodeKind::TypeAlias
                         | NodeKind::Const
                 )
             })
@@ -490,6 +494,34 @@ mod tests {
             source: ExtractionSource::TreeSitter,
             confidence: Confidence::Detected,
         }
+    }
+
+    // -- TypeAlias tests --
+
+    #[test]
+    fn test_type_alias_is_embeddable() {
+        assert!(NodeKind::TypeAlias.is_embeddable(), "TypeAlias should be embeddable");
+    }
+
+    #[test]
+    fn test_type_alias_display() {
+        assert_eq!(format!("{}", NodeKind::TypeAlias), "type_alias");
+    }
+
+    #[test]
+    fn test_find_node_at_finds_type_alias() {
+        let nodes = vec![make_node(
+            "src/lib.rs",
+            "Result",
+            NodeKind::TypeAlias,
+            5,
+            5,
+        )];
+        let index = build_file_line_index(&nodes);
+
+        let result = find_node_at(&index, &PathBuf::from("src/lib.rs"), 5);
+        assert!(result.is_some(), "find_node_at should find TypeAlias nodes");
+        assert_eq!(result.unwrap().name, "Result");
     }
 
     // -- edge_id_set tests --

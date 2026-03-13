@@ -275,9 +275,9 @@ fn extract_type_spec(
             .map(|t| match t.kind() {
                 "struct_type" => NodeKind::Struct,
                 "interface_type" => NodeKind::Trait,
-                _ => NodeKind::Other("type".to_string()),
+                _ => NodeKind::TypeAlias,
             })
-            .unwrap_or(NodeKind::Other("type".to_string()));
+            .unwrap_or(NodeKind::TypeAlias);
 
         let signature = format!("type {} ...", name_str);
 
@@ -525,6 +525,62 @@ const A, B = 1, 2
             Some("2"),
             "B should have value 2"
         );
+    }
+
+    #[test]
+    fn test_go_type_alias_kind() {
+        let extractor = GoExtractor::new();
+        let code = r#"package main
+
+type Handler func(w http.ResponseWriter, r *http.Request)
+type Duration int64
+type Pair [2]string
+"#;
+        let result = extractor.extract(Path::new("main.go"), code).unwrap();
+
+        let handler = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Handler")
+            .expect("Should find Handler");
+        assert_eq!(handler.id.kind, NodeKind::TypeAlias, "Function type alias should be TypeAlias");
+
+        let duration = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Duration")
+            .expect("Should find Duration");
+        assert_eq!(duration.id.kind, NodeKind::TypeAlias, "Primitive type alias should be TypeAlias");
+
+        let pair = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Pair")
+            .expect("Should find Pair");
+        assert_eq!(pair.id.kind, NodeKind::TypeAlias, "Array type alias should be TypeAlias");
+    }
+
+    #[test]
+    fn test_go_struct_and_interface_still_correct() {
+        // Ensure struct and interface types are NOT affected by the TypeAlias change
+        let extractor = GoExtractor::new();
+        let code = r#"package main
+
+type Config struct {
+	Port int
+}
+
+type Service interface {
+	Serve() error
+}
+"#;
+        let result = extractor.extract(Path::new("main.go"), code).unwrap();
+
+        let config = result.nodes.iter().find(|n| n.id.name == "Config").expect("Should find Config");
+        assert_eq!(config.id.kind, NodeKind::Struct, "Struct type should still be Struct");
+
+        let service = result.nodes.iter().find(|n| n.id.name == "Service").expect("Should find Service");
+        assert_eq!(service.id.kind, NodeKind::Trait, "Interface type should still be Trait");
     }
 
     #[test]
