@@ -124,12 +124,138 @@ fn build_arrow_signature(
     }
 }
 
+/// Emit a module-level `Defines` edge: `<file_stem>:Module -> <name>:<kind>`.
+///
+/// Mirrors the edge that the generic extractor emits for top-level symbols.
+/// Arrow functions and function expressions bypass the generic path and need
+/// this edge explicitly.
+fn emit_module_defines_edge(path: &Path, name: &str, kind: NodeKind, edges: &mut Vec<Edge>) {
+    let module_id = NodeId {
+        root: String::new(),
+        file: path.to_path_buf(),
+        name: path
+            .file_stem()
+            .unwrap_or(std::ffi::OsStr::new("module"))
+            .to_string_lossy()
+            .to_string(),
+        kind: NodeKind::Module,
+    };
+    edges.push(Edge {
+        from: module_id,
+        to: NodeId {
+            root: String::new(),
+            file: path.to_path_buf(),
+            name: name.to_string(),
+            kind,
+        },
+        kind: EdgeKind::Defines,
+        source: ExtractionSource::TreeSitter,
+        confidence: Confidence::Detected,
+    });
+}
+
+/// Emit a class-level `Defines` edge: `<class_name>:Struct -> <name>:<kind>`.
+fn emit_class_defines_edge(
+    path: &Path,
+    class_name: &str,
+    member_name: &str,
+    member_kind: NodeKind,
+    edges: &mut Vec<Edge>,
+) {
+    edges.push(Edge {
+        from: NodeId {
+            root: String::new(),
+            file: path.to_path_buf(),
+            name: class_name.to_string(),
+            kind: NodeKind::Struct,
+        },
+        to: NodeId {
+            root: String::new(),
+            file: path.to_path_buf(),
+            name: member_name.to_string(),
+            kind: member_kind,
+        },
+        kind: EdgeKind::Defines,
+        source: ExtractionSource::TreeSitter,
+        confidence: Confidence::Detected,
+    });
+}
+
+/// Extract DependsOn edges for parameter types and return type from a function
+/// value node (arrow_function or function_expression) in TypeScript.
+///
+/// TypeScript has typed parameters and return types that produce DependsOn edges
+/// in the generic extractor. Arrow functions bypass that path, so we extract
+/// them here.
+fn emit_ts_type_edges(
+    path: &Path,
+    fn_name: &str,
+    value_node: tree_sitter::Node,
+    source: &[u8],
+    edges: &mut Vec<Edge>,
+) {
+    use super::generic::extract_user_type;
+
+    let fn_id = NodeId {
+        root: String::new(),
+        file: path.to_path_buf(),
+        name: fn_name.to_string(),
+        kind: NodeKind::Function,
+    };
+
+    // Parameter types: walk formal_parameters children looking for type annotations
+    if let Some(params) = value_node.child_by_field_name("parameters") {
+        for i in 0..params.child_count() {
+            if let Some(param) = params.child(i as u32) {
+                if let Some(tn) = param.child_by_field_name("type") {
+                    let type_text = tn.utf8_text(source).unwrap_or("");
+                    // type_requires_uppercase = true for TypeScript
+                    if let Some(type_name) = extract_user_type(type_text, true) {
+                        edges.push(Edge {
+                            from: fn_id.clone(),
+                            to: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: type_name,
+                                kind: NodeKind::Struct,
+                            },
+                            kind: EdgeKind::DependsOn,
+                            source: ExtractionSource::TreeSitter,
+                            confidence: Confidence::Detected,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Return type
+    if let Some(rn) = value_node.child_by_field_name("return_type") {
+        let ret_text = rn.utf8_text(source).unwrap_or("");
+        if let Some(type_name) = extract_user_type(ret_text, true) {
+            edges.push(Edge {
+                from: fn_id,
+                to: NodeId {
+                    root: String::new(),
+                    file: path.to_path_buf(),
+                    name: type_name,
+                    kind: NodeKind::Struct,
+                },
+                kind: EdgeKind::DependsOn,
+                source: ExtractionSource::TreeSitter,
+                confidence: Confidence::Detected,
+            });
+        }
+    }
+}
+
 /// Walk AST for TypeScript-specific nodes not handled by the generic extractor:
 /// `lexical_declaration` (const/let/var), `import_statement`, `type_alias_declaration`.
 ///
 /// For `lexical_declaration`: inspects variable_declarator value children to detect
 /// arrow functions and function expressions, emitting `NodeKind::Function` for those
-/// and `NodeKind::Const` for scalar values.
+/// and `NodeKind::Const` for scalar values. Also emits module-level `Defines` edges
+/// and parameter/return-type `DependsOn` edges that the generic path would normally produce.
 fn collect_ts_specials(
     node: tree_sitter::Node,
     path: &Path,
@@ -210,7 +336,7 @@ fn collect_ts_specials(
                                     id: NodeId {
                                         root: String::new(),
                                         file: path.to_path_buf(),
-                                        name: name_str,
+                                        name: name_str.clone(),
                                         kind: NodeKind::Function,
                                     },
                                     language: "typescript".to_string(),
@@ -221,6 +347,17 @@ fn collect_ts_specials(
                                     metadata,
                                     source: ExtractionSource::TreeSitter,
                                 });
+
+                                // Emit module-level Defines edge (mirrors generic extractor)
+                                emit_module_defines_edge(
+                                    path,
+                                    &name_str,
+                                    NodeKind::Function,
+                                    edges,
+                                );
+
+                                // Emit DependsOn edges for parameter/return types
+                                emit_ts_type_edges(path, &name_str, value_n, source, edges);
                             } else {
                                 // Scalar const — preserve existing behavior (only for `const`)
                                 if decl_keyword == "const" {
@@ -334,7 +471,8 @@ fn collect_ts_specials(
         }
         // Class property arrow functions: `class Foo { handler = (x) => x }`
         // The generic extractor sees `public_field_definition` as `NodeKind::Field`.
-        // We detect arrow function values and upgrade to Function.
+        // We detect arrow function values and upgrade to Function, emitting the
+        // class-level Defines edge and type DependsOn edges.
         "public_field_definition" => {
             let value_node = node.child_by_field_name("value");
             let is_fn = value_node
@@ -349,7 +487,7 @@ fn collect_ts_specials(
                         name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
                     let body = node.utf8_text(source).unwrap_or("").to_string();
 
-                    // Build signature for class property arrow function
+                    // Build signature for class property — use appropriate style
                     let params = value_n
                         .child_by_field_name("parameters")
                         .and_then(|p| p.utf8_text(source).ok())
@@ -359,7 +497,30 @@ fn collect_ts_specials(
                         .map(|c| c.kind() == "async")
                         .unwrap_or(false);
                     let async_prefix = if is_async { "async " } else { "" };
-                    let signature = format!("{} = {}{} =>", name_str, async_prefix, params);
+
+                    let return_type = value_n
+                        .child_by_field_name("return_type")
+                        .and_then(|rt| rt.utf8_text(source).ok())
+                        .map(|s| format!("{}", s.trim()))
+                        .unwrap_or_default();
+
+                    let signature = if value_n.kind() == "arrow_function" {
+                        if return_type.is_empty() {
+                            format!("{} = {}{} =>", name_str, async_prefix, params)
+                        } else {
+                            format!("{} = {}{}{} =>", name_str, async_prefix, params, return_type)
+                        }
+                    } else {
+                        // function_expression
+                        if return_type.is_empty() {
+                            format!("{} = {}function{}", name_str, async_prefix, params)
+                        } else {
+                            format!(
+                                "{} = {}function{}{}",
+                                name_str, async_prefix, params, return_type
+                            )
+                        }
+                    };
 
                     let mut metadata = BTreeMap::new();
                     metadata.insert(
@@ -374,8 +535,7 @@ fn collect_ts_specials(
                         metadata.insert("cyclomatic".to_string(), (1 + branches).to_string());
                     }
 
-                    // Determine parent scope (class name)
-                    // Walk up to find the class declaration
+                    // Determine parent scope (class name) and emit Defines edge
                     if let Some(class_node) = find_ancestor_class(node) {
                         if let Some(class_name_node) = class_node.child_by_field_name("name") {
                             if let Ok(class_name) = class_name_node.utf8_text(source) {
@@ -383,9 +543,19 @@ fn collect_ts_specials(
                                     "parent_scope".to_string(),
                                     class_name.to_string(),
                                 );
+                                emit_class_defines_edge(
+                                    path,
+                                    class_name,
+                                    &name_str,
+                                    NodeKind::Function,
+                                    edges,
+                                );
                             }
                         }
                     }
+
+                    // Emit DependsOn edges for parameter/return types
+                    emit_ts_type_edges(path, &name_str, value_n, source, edges);
 
                     nodes.push(Node {
                         id: NodeId {
@@ -735,5 +905,124 @@ class Foo {
             .find(|n| n.id.name == "onClick" && n.id.kind == NodeKind::Function)
             .expect("Should find onClick as Function");
         assert_eq!(on_click.id.kind, NodeKind::Function);
+    }
+
+    // --- Edge tests (CodeRabbit findings #2, #3, #4) ---
+
+    #[test]
+    fn test_arrow_function_gets_module_defines_edge() {
+        let extractor = TypeScriptExtractor::new();
+        let code = r#"
+const handler = (req: Request, res: Response) => {
+    res.send("hello");
+};
+"#;
+        let result = extractor.extract(Path::new("src/app.ts"), code).unwrap();
+
+        let defines_edges: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Defines
+                    && e.from.kind == NodeKind::Module
+                    && e.to.name == "handler"
+                    && e.to.kind == NodeKind::Function
+            })
+            .collect();
+        assert_eq!(
+            defines_edges.len(),
+            1,
+            "Arrow function should have module-level Defines edge"
+        );
+    }
+
+    #[test]
+    fn test_arrow_function_gets_depends_on_edges_for_types() {
+        // Finding #3: TS arrow functions should emit DependsOn edges for param/return types
+        let extractor = TypeScriptExtractor::new();
+        let code = r#"
+const handler = (req: Request, res: Response): Result => {
+    res.send("hello");
+};
+"#;
+        let result = extractor.extract(Path::new("src/app.ts"), code).unwrap();
+
+        let depends_on: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::DependsOn
+                    && e.from.name == "handler"
+                    && e.from.kind == NodeKind::Function
+            })
+            .collect();
+
+        let type_names: Vec<&str> = depends_on.iter().map(|e| e.to.name.as_str()).collect();
+        assert!(
+            type_names.contains(&"Request"),
+            "Should have DependsOn edge for Request param type, got: {:?}",
+            type_names
+        );
+        assert!(
+            type_names.contains(&"Response"),
+            "Should have DependsOn edge for Response param type, got: {:?}",
+            type_names
+        );
+    }
+
+    #[test]
+    fn test_class_property_arrow_gets_defines_edge() {
+        let extractor = TypeScriptExtractor::new();
+        let code = r#"
+class Foo {
+    handler = (x: number) => x * 2;
+}
+"#;
+        let result = extractor.extract(Path::new("src/app.ts"), code).unwrap();
+
+        let class_defines: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Defines
+                    && e.from.name == "Foo"
+                    && e.from.kind == NodeKind::Struct
+                    && e.to.name == "handler"
+                    && e.to.kind == NodeKind::Function
+            })
+            .collect();
+        assert_eq!(
+            class_defines.len(),
+            1,
+            "Class property arrow should have Defines edge from class"
+        );
+    }
+
+    #[test]
+    fn test_class_property_function_expression_signature() {
+        // Finding #4: class field with function_expression should not use arrow signature
+        let extractor = TypeScriptExtractor::new();
+        let code = r#"
+class Foo {
+    handler = function(x: number): number { return x * 2; };
+}
+"#;
+        let result = extractor.extract(Path::new("src/app.ts"), code).unwrap();
+
+        let handler = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "handler" && n.id.kind == NodeKind::Function)
+            .expect("Should find handler as Function");
+        assert!(
+            handler.signature.contains("function"),
+            "function_expression class property should have 'function' in signature, got: {}",
+            handler.signature
+        );
+        assert!(
+            !handler.signature.contains("=>"),
+            "function_expression class property should NOT have '=>' in signature, got: {}",
+            handler.signature
+        );
     }
 }

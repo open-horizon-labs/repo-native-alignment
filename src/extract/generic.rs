@@ -569,7 +569,7 @@ pub(crate) fn extract_signature(body: &str) -> String {
 /// uppercase letter (convention for most languages). When false, any
 /// non-primitive identifier is accepted (needed for Go unexported types
 /// and Python lowercase classes).
-fn extract_user_type(type_text: &str, require_uppercase: bool) -> Option<String> {
+pub(super) fn extract_user_type(type_text: &str, require_uppercase: bool) -> Option<String> {
     // Strip reference prefix (e.g. "&Foo", "&mut Foo")
     // Also strip Python/TS annotation prefix `: Foo` and `-> Foo`
     let s = type_text.trim()

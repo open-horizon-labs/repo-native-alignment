@@ -94,11 +94,75 @@ fn build_arrow_signature(
     }
 }
 
+/// Emit a module-level `Defines` edge: `<file_stem>:Module -> <name>:Function`.
+///
+/// This mirrors the edge that the generic extractor emits for top-level symbols
+/// (see `generic.rs` line ~362). Arrow functions and function expressions are
+/// handled by the special-case handler, so they bypass the generic path and need
+/// this edge explicitly.
+fn emit_module_defines_edge(path: &Path, name: &str, kind: NodeKind, edges: &mut Vec<Edge>) {
+    let module_id = NodeId {
+        root: String::new(),
+        file: path.to_path_buf(),
+        name: path
+            .file_stem()
+            .unwrap_or(std::ffi::OsStr::new("module"))
+            .to_string_lossy()
+            .to_string(),
+        kind: NodeKind::Module,
+    };
+    edges.push(Edge {
+        from: module_id,
+        to: NodeId {
+            root: String::new(),
+            file: path.to_path_buf(),
+            name: name.to_string(),
+            kind,
+        },
+        kind: EdgeKind::Defines,
+        source: ExtractionSource::TreeSitter,
+        confidence: Confidence::Detected,
+    });
+}
+
+/// Emit a class-level `Defines` edge: `<class_name>:Struct -> <name>:Function`.
+///
+/// For class property arrow functions, the generic extractor already emits a
+/// `HasField` edge for the `field_definition` node. We additionally emit a
+/// `Defines` edge so the arrow function is reachable as a class member, matching
+/// the pattern used for regular methods.
+fn emit_class_defines_edge(
+    path: &Path,
+    class_name: &str,
+    member_name: &str,
+    member_kind: NodeKind,
+    edges: &mut Vec<Edge>,
+) {
+    edges.push(Edge {
+        from: NodeId {
+            root: String::new(),
+            file: path.to_path_buf(),
+            name: class_name.to_string(),
+            kind: NodeKind::Struct,
+        },
+        to: NodeId {
+            root: String::new(),
+            file: path.to_path_buf(),
+            name: member_name.to_string(),
+            kind: member_kind,
+        },
+        kind: EdgeKind::Defines,
+        source: ExtractionSource::TreeSitter,
+        confidence: Confidence::Detected,
+    });
+}
+
 /// Walk AST for JavaScript-specific nodes not handled by the generic extractor:
 /// `lexical_declaration` (const/let/var), `import_statement`.
 ///
 /// Detects arrow functions and function expressions in variable declarations
-/// and emits `NodeKind::Function` for them.
+/// and emits `NodeKind::Function` for them, including the module-level `Defines`
+/// edges that the generic path would normally emit.
 fn collect_js_specials(
     node: tree_sitter::Node,
     path: &Path,
@@ -173,7 +237,7 @@ fn collect_js_specials(
                                     id: NodeId {
                                         root: String::new(),
                                         file: path.to_path_buf(),
-                                        name: name_str,
+                                        name: name_str.clone(),
                                         kind: NodeKind::Function,
                                     },
                                     language: "javascript".to_string(),
@@ -184,6 +248,14 @@ fn collect_js_specials(
                                     metadata,
                                     source: ExtractionSource::TreeSitter,
                                 });
+
+                                // Emit module-level Defines edge (mirrors generic extractor)
+                                emit_module_defines_edge(
+                                    path,
+                                    &name_str,
+                                    NodeKind::Function,
+                                    edges,
+                                );
                             } else {
                                 // Scalar const -- preserve existing behavior (only for `const`)
                                 if decl_keyword == "const" {
@@ -308,7 +380,14 @@ fn collect_js_specials(
                         .map(|c| c.kind() == "async")
                         .unwrap_or(false);
                     let async_prefix = if is_async { "async " } else { "" };
-                    let signature = format!("{} = {}{} =>", name_str, async_prefix, params);
+
+                    // Use appropriate signature style based on value kind
+                    let signature = if value_n.kind() == "arrow_function" {
+                        format!("{} = {}{} =>", name_str, async_prefix, params)
+                    } else {
+                        // function_expression
+                        format!("{} = {}function{}", name_str, async_prefix, params)
+                    };
 
                     let mut metadata = BTreeMap::new();
                     metadata.insert(
@@ -322,13 +401,22 @@ fn collect_js_specials(
                         metadata.insert("cyclomatic".to_string(), (1 + branches).to_string());
                     }
 
-                    // Find parent class name
+                    // Find parent class name and emit Defines edge
                     if let Some(class_node) = find_ancestor_class(node) {
                         if let Some(class_name_node) = class_node.child_by_field_name("name") {
                             if let Ok(class_name) = class_name_node.utf8_text(source) {
                                 metadata.insert(
                                     "parent_scope".to_string(),
                                     class_name.to_string(),
+                                );
+                                // Emit class -> member Defines edge (mirrors generic
+                                // extractor's parent-scope Defines for methods)
+                                emit_class_defines_edge(
+                                    path,
+                                    class_name,
+                                    &name_str,
+                                    NodeKind::Function,
+                                    edges,
                                 );
                             }
                         }
@@ -663,5 +751,92 @@ class Foo {
             .find(|n| n.id.name == "onClick" && n.id.kind == NodeKind::Function)
             .expect("Should find onClick as Function");
         assert_eq!(on_click.id.kind, NodeKind::Function);
+    }
+
+    // --- Edge tests (CodeRabbit findings #2, #4) ---
+
+    #[test]
+    fn test_arrow_function_gets_module_defines_edge() {
+        let extractor = JavaScriptExtractor::new();
+        let code = r#"
+const handler = (req, res) => {
+    res.send("hello");
+};
+"#;
+        let result = extractor.extract(Path::new("src/app.js"), code).unwrap();
+
+        let defines_edges: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Defines
+                    && e.from.kind == NodeKind::Module
+                    && e.to.name == "handler"
+                    && e.to.kind == NodeKind::Function
+            })
+            .collect();
+        assert_eq!(
+            defines_edges.len(),
+            1,
+            "Arrow function should have module-level Defines edge, got: {:?}",
+            result.edges.iter().map(|e| format!("{:?} -> {:?}", e.from.name, e.to.name)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_class_property_arrow_gets_defines_edge() {
+        let extractor = JavaScriptExtractor::new();
+        let code = r#"
+class Foo {
+    handler = (x) => x * 2;
+}
+"#;
+        let result = extractor.extract(Path::new("src/app.js"), code).unwrap();
+
+        let class_defines: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Defines
+                    && e.from.name == "Foo"
+                    && e.from.kind == NodeKind::Struct
+                    && e.to.name == "handler"
+                    && e.to.kind == NodeKind::Function
+            })
+            .collect();
+        assert_eq!(
+            class_defines.len(),
+            1,
+            "Class property arrow should have Defines edge from class, got: {:?}",
+            result.edges.iter().map(|e| format!("{:?}:{:?} -> {:?}:{:?} ({:?})", e.from.name, e.from.kind, e.to.name, e.to.kind, e.kind)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_class_property_function_expression_signature() {
+        // Finding #4: class field with function_expression should not use arrow signature
+        let extractor = JavaScriptExtractor::new();
+        let code = r#"
+class Foo {
+    handler = function(x) { return x * 2; };
+}
+"#;
+        let result = extractor.extract(Path::new("src/app.js"), code).unwrap();
+
+        let handler = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "handler" && n.id.kind == NodeKind::Function)
+            .expect("Should find handler as Function");
+        assert!(
+            handler.signature.contains("function"),
+            "function_expression class property should have 'function' in signature, got: {}",
+            handler.signature
+        );
+        assert!(
+            !handler.signature.contains("=>"),
+            "function_expression class property should NOT have '=>' in signature, got: {}",
+            handler.signature
+        );
     }
 }
