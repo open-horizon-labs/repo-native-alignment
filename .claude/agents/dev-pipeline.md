@@ -14,6 +14,8 @@ Takes a feature or bug from framing through merge. Each phase feeds the next via
 
 > **You are an RNA power user.** Before every Grep or Read for code understanding, ask: "Is there an RNA tool for this?" Check the table in `/friction` (`.claude/skills/friction.md`). Use `oh_search_context`, `search_symbols`, `graph_query`, and `outcome_progress` as your FIRST choice for code navigation, guardrail checks, outcome alignment, and context gathering. **Every Grep/Read you use instead of an RNA tool is a friction event — log it with severity `skipped`.** When an RNA tool fails, log that too. See `/friction` for the full protocol. A pipeline with 0 friction events and 30 Grep calls isn't frictionless — it's unmonitored.
 
+> **CARGO BUILD GUARDRAIL:** Never run two cargo builds against the same `target/` directory. Each pipeline gets its own worktree with its own `CARGO_TARGET_DIR` (see Phase 3 worktree setup). Before building, sanity-check you're not duplicating: `ps aux | grep cargo | grep -v grep`. A second cargo process targeting the same directory blocks silently on the file lock, hanging indefinitely. See `.oh/guardrails/no-parallel-cargo-agents.md`.
+
 ## Arguments
 
 `/dev-pipeline <issue-number-or-description>`
@@ -174,12 +176,12 @@ Launch the `/execute` process (via the `oh-execute` agent) with the session file
 
 After execution completes:
 1. Update session file with execution notes
-2. Mark the PR as ready for review: `gh pr ready <PR>`
-3. Push final commits
+2. Push final commits
+3. Keep the PR as draft; Ship Step 3b will mark it ready after review/dissent fixes
 
 ### Phase 3 output:
 - Implementation committed and pushed to the PR branch
-- PR marked ready (no longer draft)
+- PR remains draft until Ship Step 3b
 - Session file updated with execution status
 
 **Gate:** Do not proceed to Phase 4 if execution produced SALVAGE verdict. Surface the salvage to the user and stop.
@@ -203,11 +205,12 @@ Agent(subagent_type="ship", prompt="/ship <PR-number>\n\nWORKTREE: <worktree-pat
 
 > **DO NOT use Bash to run `claude` CLI commands.** Do not run `Bash(claude --agent ...)` or any variant. The Agent tool is a first-class tool available to you — use it directly. Running `claude` as a subprocess does not work and will waste time trying different CLI flags that don't exist.
 
-This launches the full 11-step pipeline as an autonomous agent:
+This launches the full 12-step pipeline as an autonomous agent:
 
 1. Review
 2. Dissent
 3. Fix
+3b. Mark ready (triggers smoke tests + CodeRabbit review)
 4. Adversarial test
 5. Merit assessment
 6. Resolve TODOs

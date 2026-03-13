@@ -329,10 +329,14 @@ impl EmbeddingIndex {
     /// Create (or replace) tantivy full-text search indexes on the `title` and
     /// `body` columns. LanceDB requires separate FTS indexes per column.
     /// Called after bulk writes and reindex to enable hybrid search.
-    async fn create_fts_index(&self, table: &lancedb::Table) -> Result<()> {
+    ///
+    /// Best-effort: FTS index failures are logged as warnings but do not fail
+    /// the embedding operation. The vector table is already usable without FTS;
+    /// hybrid search will fall back to vector-only if the index is missing.
+    async fn create_fts_index(&self, table: &lancedb::Table) {
         let fts_start = std::time::Instant::now();
         // Title index: symbol names, kind labels, language — best for exact keyword matches.
-        table
+        if let Err(e) = table
             .create_index(
                 &["title"],
                 lancedb::index::Index::FTS(Default::default()),
@@ -340,9 +344,12 @@ impl EmbeddingIndex {
             .replace(true)
             .execute()
             .await
-            .context("Failed to create FTS index on title")?;
+        {
+            tracing::warn!("FTS index on title failed (hybrid search degraded): {e:#}");
+            return;
+        }
         // Body index: signatures, file paths, commit messages — broader keyword coverage.
-        table
+        if let Err(e) = table
             .create_index(
                 &["body"],
                 lancedb::index::Index::FTS(Default::default()),
@@ -350,12 +357,14 @@ impl EmbeddingIndex {
             .replace(true)
             .execute()
             .await
-            .context("Failed to create FTS index on body")?;
+        {
+            tracing::warn!("FTS index on body failed (hybrid search degraded): {e:#}");
+            return;
+        }
         tracing::info!(
             "EmbeddingIndex: FTS indexes on title+body created in {:?}",
             fts_start.elapsed()
         );
-        Ok(())
     }
 
     /// Index all .oh/ artifacts, git commits, and optionally code symbols.
@@ -504,8 +513,11 @@ impl EmbeddingIndex {
             .await
             .context("Failed to upsert enriched node embeddings")?;
 
-        // Rebuild FTS index after upsert so new/changed rows are searchable.
-        self.create_fts_index(&table).await?;
+        // Skip FTS rebuild on incremental upsert — the full FTS index is rebuilt
+        // during index_all_inner(). Rebuilding on every small upsert defeats the
+        // purpose of targeted reindexing and hurts latency as the table grows.
+        // Hybrid search uses the last-built FTS index; new rows fall back to
+        // vector-only until the next full index run.
 
         Ok(count)
     }
@@ -834,9 +846,12 @@ impl EmbeddingIndex {
         );
 
         // Build FTS index for hybrid search (BM25 on title + body).
-        let table = self.db.open_table(&self.table_name).execute().await
-            .context("Failed to open table for FTS index")?;
-        self.create_fts_index(&table).await?;
+        // Best-effort: failure is logged but does not fail the indexing operation.
+        if let Ok(table) = self.db.open_table(&self.table_name).execute().await {
+            self.create_fts_index(&table).await;
+        } else {
+            tracing::warn!("Could not open table for FTS index creation; hybrid search will use vector-only");
+        }
 
         Ok(count)
     }
@@ -996,9 +1011,10 @@ impl EmbeddingIndex {
                 let raw_score = if has_score_col {
                     // RRF / BM25 `_score` — higher is better.
                     // RRF scores are always < 1 (sum of 1/(k+rank_i), k=60).
-                    // BM25 scores can exceed 1.0 for highly relevant short docs,
-                    // but we clamp to [0, 1] for consistency with cosine similarity.
-                    // Ordering is preserved since we sort by score descending.
+                    // BM25 scores can exceed 1.0 for highly relevant short docs.
+                    // Use monotonic s/(1+s) transform to map [0, inf) -> [0, 1)
+                    // while preserving ranking order. A hard clamp at 1.0 would
+                    // destroy differentiation among high-scoring results.
                     let s = batch
                         .column_by_name("_score")
                         .unwrap()
@@ -1006,7 +1022,8 @@ impl EmbeddingIndex {
                         .downcast_ref::<Float32Array>()
                         .unwrap()
                         .value(i);
-                    s.max(0.0).min(1.0)
+                    let s = s.max(0.0);
+                    s / (1.0 + s)
                 } else {
                     // Cosine distance [0, 2]: convert to similarity.
                     let d = batch
