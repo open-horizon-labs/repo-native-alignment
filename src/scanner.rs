@@ -167,6 +167,10 @@ impl PatternConfig {
         for pair in &self.extra {
             let suffix = pair[0].to_ascii_lowercase();
             let hint = pair[1].to_ascii_lowercase();
+            // Skip if disabled (disable applies to extras too, not just built-ins)
+            if self.disable.iter().any(|d| *d == hint) {
+                continue;
+            }
             // Avoid duplicates: skip if suffix already present
             if !suffixes.iter().any(|(s, _)| *s == suffix) {
                 suffixes.push((suffix, hint));
@@ -1725,5 +1729,21 @@ exclude = ["dist/"]
         let config = PatternConfig::load(root);
         assert!(config.extra.is_empty());
         assert!(config.disable.is_empty());
+    }
+
+    #[test]
+    fn test_pattern_config_disable_applies_to_extras_too() {
+        let config = PatternConfig {
+            extra: vec![
+                ["gateway".to_string(), "gateway".to_string()],
+                ["interactor".to_string(), "blocked".to_string()],
+            ],
+            disable: vec!["blocked".to_string()],
+        };
+        let suffixes = config.effective_suffixes();
+        // "gateway" extra should be present
+        assert!(suffixes.iter().any(|(s, h)| s == "gateway" && h == "gateway"));
+        // "interactor" extra should be blocked because its hint "blocked" is in disable
+        assert!(!suffixes.iter().any(|(s, _)| s == "interactor"));
     }
 }
