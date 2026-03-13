@@ -570,7 +570,12 @@ pub(crate) fn run_traversal(
                         index.impact(node_id, max_hops, edge_filter)
                     };
                     let mut combined = out;
-                    combined.extend(inc);
+                    let mut seen: std::collections::HashSet<String> = combined.iter().cloned().collect();
+                    for id in inc {
+                        if seen.insert(id.clone()) {
+                            combined.push(id);
+                        }
+                    }
                     Ok(combined)
                 }
                 _ => Err(format!(

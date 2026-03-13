@@ -468,7 +468,11 @@ pub(crate) async fn persist_graph_incremental(
 
     // Pre-flight: ensure schema version matches before any LanceDB writes.
     if check_and_migrate_schema(&db_path).await? {
-        tracing::info!("Schema migrated to v{} during incremental update — cache rebuilt", SCHEMA_VERSION);
+        tracing::info!("Schema migrated to v{} during incremental update — cache rebuilt; caller should do a full persist", SCHEMA_VERSION);
+        // Migration dropped and recreated tables — incremental upsert on empty
+        // tables is incorrect. Return early so the caller falls back to a full
+        // persist on the next scan cycle.
+        return Ok(());
     }
 
     let db = lancedb::connect(db_path.to_str().unwrap())
@@ -970,6 +974,17 @@ pub(crate) fn infer_language_from_path(path: &Path) -> String {
         Some("ts") | Some("tsx") => "typescript".to_string(),
         Some("js") | Some("jsx") => "javascript".to_string(),
         Some("go") => "go".to_string(),
+        Some("java") => "java".to_string(),
+        Some("c") | Some("h") | Some("cpp") | Some("cc") | Some("cxx") | Some("hpp") | Some("hh") | Some("hxx") => "cpp".to_string(),
+        Some("cs") => "csharp".to_string(),
+        Some("rb") => "ruby".to_string(),
+        Some("kt") | Some("kts") => "kotlin".to_string(),
+        Some("swift") => "swift".to_string(),
+        Some("zig") => "zig".to_string(),
+        Some("lua") => "lua".to_string(),
+        Some("sh") | Some("bash") => "bash".to_string(),
+        Some("tf") | Some("hcl") | Some("tfvars") => "hcl".to_string(),
+        Some("json") | Some("jsonc") => "json".to_string(),
         Some("proto") => "protobuf".to_string(),
         Some("sql") => "sql".to_string(),
         Some("md") => "markdown".to_string(),

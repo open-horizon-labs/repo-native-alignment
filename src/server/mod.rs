@@ -216,8 +216,16 @@ impl RnaHandler {
             let repo_root = self.repo_root.clone();
             tokio::spawn(async move {
                 // Track root slugs from the previous tick to detect removed worktrees.
-                let mut prev_root_slugs: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
+                // Seed from the current resolved roots so the first tick doesn't
+                // misidentify every root as "new".
+                let mut prev_root_slugs: std::collections::HashSet<String> = WorkspaceConfig::load()
+                    .with_primary_root(repo_root.clone())
+                    .with_worktrees(&repo_root)
+                    .with_claude_memory(&repo_root)
+                    .resolved_roots()
+                    .into_iter()
+                    .map(|r| r.slug)
+                    .collect();
 
                 // HEAD-change detection state.
                 let mut last_head_oid: Option<git2::Oid> = None;
@@ -506,11 +514,15 @@ impl RnaHandler {
             .iter()
             .map(|r| r.slug.clone())
             .collect();
+        // Synthetic root IDs (e.g., "external" for LSP virtual nodes) are never
+        // discovered by WorkspaceConfig but are valid — skip them during stale pruning.
+        const RESERVED_ROOT_IDS: &[&str] = &["external"];
         match get_stored_root_ids(&self.repo_root).await {
             Ok(stored) => {
                 let stale: Vec<String> = stored
                     .into_iter()
                     .filter(|s| !live_slugs.contains(s))
+                    .filter(|s| !RESERVED_ROOT_IDS.contains(&s.as_str()))
                     .collect();
                 if !stale.is_empty() {
                     tracing::info!(
@@ -1276,13 +1288,19 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
     ) -> Result<CallToolResult, CallToolError> {
         let root = &self.repo_root;
 
-        // Inject business context preamble on first tool call
-        let preamble = if !self.context_injected.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        // Build business context preamble on first tool call (deferred store).
+        // We load() first to check whether injection already happened, build
+        // the preamble eagerly, then only store(true) after successfully
+        // inserting it into the response — avoiding a false-positive flag if
+        // the tool call itself errors before we can prepend.
+        let preamble = if !self.context_injected.load(std::sync::atomic::Ordering::Relaxed) {
             let ctx = build_context_preamble(root);
             if !ctx.is_empty() {
                 tracing::info!("Injecting business context preamble on first tool call");
                 Some(ctx)
             } else {
+                // Empty preamble — mark as injected so we don't retry.
+                self.context_injected.store(true, std::sync::atomic::Ordering::Relaxed);
                 None
             }
         } else {
@@ -1419,7 +1437,27 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 if include_markdown {
                     match markdown::extract_markdown_chunks(root) {
                         Ok(chunks) => {
-                            let scored = markdown::search_chunks_ranked(&chunks, query);
+                            // Filter chunks by effective root scope (same as code symbols above).
+                            let filtered_chunks: Vec<_> = if let Some(ref slug) = root_filter {
+                                let workspace = WorkspaceConfig::load()
+                                    .with_primary_root(self.repo_root.clone())
+                                    .with_worktrees(&self.repo_root)
+                                    .with_claude_memory(&self.repo_root);
+                                let root_path = workspace.resolved_roots()
+                                    .into_iter()
+                                    .find(|r| r.slug == *slug)
+                                    .map(|r| r.path);
+                                if let Some(rp) = root_path {
+                                    chunks.into_iter()
+                                        .filter(|c| c.file_path.starts_with(&rp))
+                                        .collect()
+                                } else {
+                                    chunks
+                                }
+                            } else {
+                                chunks
+                            };
+                            let scored = markdown::search_chunks_ranked(&filtered_chunks, query);
                             if !scored.is_empty() {
                                 // Backward-compatible format: `- ` bullets, same header
                                 // as before. Score is appended as a parenthetical so
@@ -1516,7 +1554,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                             if include_impact && !result.code_symbols.is_empty() {
                                 let impacted = query::compute_impact_risk(
                                     &result.code_symbols,
-                                    &graph_state.nodes,
+                                    &graph_nodes,
                                     &graph_state.index,
                                     3, // max_hops for reverse traversal
                                 );
@@ -1765,12 +1803,20 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             _ => Err(CallToolError::unknown_tool(&params.name)),
         };
 
-        // Prepend business context preamble to first successful tool result
+        // Prepend business context preamble to first successful tool result.
+        // Only mark as injected after the insert succeeds (compare_exchange
+        // guards against concurrent tool calls both injecting).
         if let (Some(preamble), Ok(tool_result)) = (preamble, &mut result) {
-            tool_result.content.insert(
-                0,
-                TextContent::new(preamble, None, None).into(),
-            );
+            if self.context_injected.compare_exchange(
+                false, true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            ).is_ok() {
+                tool_result.content.insert(
+                    0,
+                    TextContent::new(preamble, None, None).into(),
+                );
+            }
         }
 
         result
