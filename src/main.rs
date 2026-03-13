@@ -14,6 +14,7 @@ use repo_native_alignment::smoke::{self, TestArgs};
 #[derive(Parser, Debug)]
 #[command(
     name = "repo-native-alignment",
+    version,
     about = "Repo-Native Alignment MCP Server",
     long_about = None,
 )]
