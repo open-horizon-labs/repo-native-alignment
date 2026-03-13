@@ -1,3 +1,9 @@
+---
+title: "Default Search Results to Caller's Worktree Root"
+issue: 194
+phase: solution-space
+---
+
 # Issue #194: Default Search Results to Caller's Worktree Root
 
 ## Problem
