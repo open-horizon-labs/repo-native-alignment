@@ -957,4 +957,50 @@ pub trait Service {
         let create = result.nodes.iter().find(|n| n.id.name == "create" && n.id.kind == NodeKind::Function).unwrap();
         assert_eq!(create.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "create() should be static");
     }
+
+    /// Adversarial: impl with `self` value parameter (move semantics)
+    #[test]
+    fn test_rust_is_static_self_by_value() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+struct Builder;
+
+impl Builder {
+    fn build(self) -> String { String::new() }
+    fn consume(mut self) {}
+}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        let build = result.nodes.iter().find(|n| n.id.name == "build" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(build.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "build(self) should be instance (self by value)");
+
+        let consume = result.nodes.iter().find(|n| n.id.name == "consume" && n.id.kind == NodeKind::Function).unwrap();
+        assert_eq!(consume.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "consume(mut self) should be instance");
+    }
+
+    /// Adversarial: trait impl method with self param
+    #[test]
+    fn test_rust_is_static_trait_impl() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+trait Display {
+    fn fmt(&self) -> String;
+}
+
+struct Foo;
+
+impl Display for Foo {
+    fn fmt(&self) -> String { String::new() }
+}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        // Both the trait signature and impl method should be instance
+        let fmts: Vec<_> = result.nodes.iter().filter(|n| n.id.name == "fmt" && n.id.kind == NodeKind::Function).collect();
+        assert_eq!(fmts.len(), 2, "Should find 2 fmt methods");
+        for f in &fmts {
+            assert_eq!(f.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "fmt(&self) should be instance: parent_scope={:?}", f.metadata.get("parent_scope"));
+        }
+    }
 }
