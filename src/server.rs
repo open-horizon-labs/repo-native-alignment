@@ -4949,4 +4949,122 @@ mod tests {
             compact_out
         );
     }
+
+    // ── Adversarial tests for CodeRabbit fixes ────────────────────────────
+
+    #[test]
+    fn test_parse_node_kind_field_round_trips() {
+        // NodeKind::Field serializes as "field" via Display.
+        // parse_node_kind must map it back, not fall through to Other("field").
+        let kind = parse_node_kind("field");
+        assert!(
+            matches!(kind, NodeKind::Field),
+            "parse_node_kind(\"field\") should return NodeKind::Field, got {:?}",
+            kind
+        );
+    }
+
+    #[test]
+    fn test_parse_node_kind_all_variants_round_trip() {
+        // Ensure every known variant round-trips through Display -> parse_node_kind.
+        let variants = vec![
+            NodeKind::Function,
+            NodeKind::Struct,
+            NodeKind::Trait,
+            NodeKind::Enum,
+            NodeKind::Module,
+            NodeKind::Import,
+            NodeKind::Const,
+            NodeKind::Impl,
+            NodeKind::ProtoMessage,
+            NodeKind::SqlTable,
+            NodeKind::ApiEndpoint,
+            NodeKind::Macro,
+            NodeKind::Field,
+            NodeKind::PrMerge,
+        ];
+        for variant in variants {
+            let s = format!("{}", variant);
+            let parsed = parse_node_kind(&s);
+            assert_eq!(
+                std::mem::discriminant(&variant),
+                std::mem::discriminant(&parsed),
+                "Round-trip failed for {:?}: Display=\"{}\", parsed back as {:?}",
+                variant, s, parsed
+            );
+        }
+    }
+
+    #[test]
+    fn test_retain_displayable_filters_module_and_prmerge() {
+        // retain_displayable should remove Module and PrMerge IDs but keep others.
+        let module_node = graph::Node {
+            id: graph::NodeId {
+                root: String::new(),
+                file: std::path::PathBuf::from("src/lib.rs"),
+                name: "mymod".to_string(),
+                kind: NodeKind::Module,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            body: String::new(),
+            metadata: std::collections::BTreeMap::new(),
+            source: graph::ExtractionSource::TreeSitter,
+        };
+        let func_node = graph::Node {
+            id: graph::NodeId {
+                root: String::new(),
+                file: std::path::PathBuf::from("src/lib.rs"),
+                name: "do_work".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            line_start: 5,
+            line_end: 10,
+            signature: "fn do_work()".to_string(),
+            body: String::new(),
+            metadata: std::collections::BTreeMap::new(),
+            source: graph::ExtractionSource::TreeSitter,
+        };
+        let prmerge_node = graph::Node {
+            id: graph::NodeId {
+                root: String::new(),
+                file: std::path::PathBuf::from("git:merge:abc"),
+                name: "abc".to_string(),
+                kind: NodeKind::PrMerge,
+            },
+            language: "git".to_string(),
+            line_start: 0,
+            line_end: 0,
+            signature: String::new(),
+            body: String::new(),
+            metadata: std::collections::BTreeMap::new(),
+            source: graph::ExtractionSource::Git,
+        };
+
+        let nodes = vec![module_node.clone(), func_node.clone(), prmerge_node.clone()];
+        let mut ids = vec![
+            module_node.stable_id(),
+            func_node.stable_id(),
+            prmerge_node.stable_id(),
+        ];
+
+        retain_displayable(&mut ids, &nodes);
+
+        assert_eq!(ids.len(), 1, "Should keep only the function node");
+        assert_eq!(ids[0], func_node.stable_id());
+    }
+
+    #[test]
+    fn test_retain_displayable_keeps_unknown_ids() {
+        // IDs not found in the node list should be kept (fallback rendering).
+        let nodes: Vec<graph::Node> = vec![];
+        let mut ids = vec!["unknown:id:here:function".to_string()];
+
+        retain_displayable(&mut ids, &nodes);
+
+        assert_eq!(ids.len(), 1, "Unknown IDs should be preserved");
+    }
 }
