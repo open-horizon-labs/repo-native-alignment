@@ -423,7 +423,10 @@ fn parse_confidence(s: &str) -> Confidence {
     }
 }
 
-/// Query LanceDB for all distinct `root_id` values stored in the symbols table.
+/// Query LanceDB for all distinct `root_id` values stored across all tables.
+///
+/// Scans the same set of tables that `delete_nodes_for_roots` prunes so that
+/// stale roots present in any table are discovered (not just symbols).
 async fn get_stored_root_ids(repo_root: &Path) -> anyhow::Result<Vec<String>> {
     use futures::TryStreamExt;
     use lancedb::query::{ExecutableQuery, QueryBase};
@@ -438,27 +441,35 @@ async fn get_stored_root_ids(repo_root: &Path) -> anyhow::Result<Vec<String>> {
         .await
         .context("Failed to connect to LanceDB for root discovery")?;
 
-    let tbl = match db.open_table("symbols").execute().await {
-        Ok(t) => t,
-        Err(_) => return Ok(Vec::new()),
-    };
-
-    // Select only root_id column and collect unique values.
-    let stream = tbl
-        .query()
-        .select(lancedb::query::Select::columns(&["root_id"]))
-        .execute()
-        .await
-        .context("Failed to query symbols for root_ids")?;
-    let batches: Vec<arrow_array::RecordBatch> = stream.try_collect().await?;
-
     let mut root_ids = std::collections::HashSet::new();
-    for batch in &batches {
-        if let Some(col) = batch.column_by_name("root_id") {
-            if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
-                for i in 0..arr.len() {
-                    if !arr.is_null(i) {
-                        root_ids.insert(arr.value(i).to_string());
+
+    for table_name in ["symbols", "edges", "file_index", "pr_merges"] {
+        let tbl = match db.open_table(table_name).execute().await {
+            Ok(t) => t,
+            Err(_) => continue, // table doesn't exist yet -- skip
+        };
+
+        let stream = match tbl
+            .query()
+            .select(lancedb::query::Select::columns(&["root_id"]))
+            .execute()
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("Could not query root_ids from {}: {}", table_name, e);
+                continue;
+            }
+        };
+        let batches: Vec<arrow_array::RecordBatch> = stream.try_collect().await?;
+
+        for batch in &batches {
+            if let Some(col) = batch.column_by_name("root_id") {
+                if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            root_ids.insert(arr.value(i).to_string());
+                        }
                     }
                 }
             }
@@ -5475,6 +5486,63 @@ mod tests {
             .await
             .unwrap();
 
+        // Also create file_index table with rows for both roots.
+        let fi_schema = graph::store::file_index_schema();
+        let make_fi_batch = |root_id: &str| -> RecordBatch {
+            RecordBatch::try_new(
+                std::sync::Arc::new(fi_schema.clone()),
+                vec![
+                    std::sync::Arc::new(StringArray::from(vec!["src/lib.rs".to_string()])),
+                    std::sync::Arc::new(StringArray::from(vec![root_id.to_string()])),
+                    std::sync::Arc::new(Int64Array::from(vec![now])),
+                    std::sync::Arc::new(arrow_array::UInt64Array::from(vec![100u64])),
+                    std::sync::Arc::new(Int64Array::from(vec![now])),
+                    std::sync::Arc::new(StringArray::from(vec!["tree_sitter".to_string()])),
+                ],
+            )
+            .unwrap()
+        };
+        let fi_batches = vec![make_fi_batch("live-root"), make_fi_batch("stale-root")];
+        let fi_reader = arrow_array::RecordBatchIterator::new(
+            fi_batches.into_iter().map(Ok),
+            std::sync::Arc::new(fi_schema.clone()),
+        );
+        db.create_table("file_index", Box::new(fi_reader))
+            .execute()
+            .await
+            .unwrap();
+
+        // Also create pr_merges table with rows for both roots.
+        let pr_schema = graph::store::pr_merges_schema();
+        let make_pr_batch = |root_id: &str| -> RecordBatch {
+            RecordBatch::try_new(
+                std::sync::Arc::new(pr_schema.clone()),
+                vec![
+                    std::sync::Arc::new(StringArray::from(vec![format!("{}:abc123", root_id)])),
+                    std::sync::Arc::new(StringArray::from(vec![root_id.to_string()])),
+                    std::sync::Arc::new(StringArray::from(vec!["abc123".to_string()])),
+                    std::sync::Arc::new(StringArray::from(vec![Some("feature-branch")])),
+                    std::sync::Arc::new(StringArray::from(vec!["Merge PR".to_string()])),
+                    std::sync::Arc::new(StringArray::from(vec![None::<String>])),
+                    std::sync::Arc::new(StringArray::from(vec!["author".to_string()])),
+                    std::sync::Arc::new(Int64Array::from(vec![now])),
+                    std::sync::Arc::new(UInt32Array::from(vec![1u32])),
+                    std::sync::Arc::new(StringArray::from(vec!["[\"src/lib.rs\"]".to_string()])),
+                    std::sync::Arc::new(Int64Array::from(vec![now])),
+                ],
+            )
+            .unwrap()
+        };
+        let pr_batches = vec![make_pr_batch("live-root"), make_pr_batch("stale-root")];
+        let pr_reader = arrow_array::RecordBatchIterator::new(
+            pr_batches.into_iter().map(Ok),
+            std::sync::Arc::new(pr_schema.clone()),
+        );
+        db.create_table("pr_merges", Box::new(pr_reader))
+            .execute()
+            .await
+            .unwrap();
+
         // Verify both roots are stored.
         let stored = super::get_stored_root_ids(root).await.unwrap();
         assert!(stored.contains(&"live-root".to_string()));
@@ -5512,6 +5580,40 @@ mod tests {
             edge_root_ids.iter().all(|r| r == "live-root"),
             "Only live-root edges should remain, got: {:?}",
             edge_root_ids
+        );
+
+        // Helper to collect root_ids from a table.
+        let collect_root_ids = |batches: Vec<RecordBatch>| -> Vec<String> {
+            batches
+                .iter()
+                .flat_map(|b| {
+                    let col = b.column_by_name("root_id").unwrap();
+                    let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                    (0..arr.len()).map(|i| arr.value(i).to_string()).collect::<Vec<_>>()
+                })
+                .collect()
+        };
+
+        // Verify file_index for stale root is also gone.
+        let fi_tbl = db.open_table("file_index").execute().await.unwrap();
+        let fi_stream = fi_tbl.query().execute().await.unwrap();
+        let fi_batches: Vec<RecordBatch> = fi_stream.try_collect().await.unwrap();
+        let fi_root_ids = collect_root_ids(fi_batches);
+        assert!(
+            fi_root_ids.iter().all(|r| r == "live-root"),
+            "Only live-root file_index rows should remain, got: {:?}",
+            fi_root_ids
+        );
+
+        // Verify pr_merges for stale root is also gone.
+        let pr_tbl = db.open_table("pr_merges").execute().await.unwrap();
+        let pr_stream = pr_tbl.query().execute().await.unwrap();
+        let pr_batches: Vec<RecordBatch> = pr_stream.try_collect().await.unwrap();
+        let pr_root_ids = collect_root_ids(pr_batches);
+        assert!(
+            pr_root_ids.iter().all(|r| r == "live-root"),
+            "Only live-root pr_merges rows should remain, got: {:?}",
+            pr_root_ids
         );
     }
 }
