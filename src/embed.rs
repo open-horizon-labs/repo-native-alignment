@@ -326,21 +326,33 @@ impl EmbeddingIndex {
         })
     }
 
-    /// Create (or replace) a tantivy full-text search index on `title` + `body`
-    /// columns. Called after bulk writes and reindex to enable hybrid search.
+    /// Create (or replace) tantivy full-text search indexes on the `title` and
+    /// `body` columns. LanceDB requires separate FTS indexes per column.
+    /// Called after bulk writes and reindex to enable hybrid search.
     async fn create_fts_index(&self, table: &lancedb::Table) -> Result<()> {
         let fts_start = std::time::Instant::now();
+        // Title index: symbol names, kind labels, language — best for exact keyword matches.
         table
             .create_index(
-                &["title", "body"],
+                &["title"],
                 lancedb::index::Index::FTS(Default::default()),
             )
             .replace(true)
             .execute()
             .await
-            .context("Failed to create FTS index on title+body")?;
+            .context("Failed to create FTS index on title")?;
+        // Body index: signatures, file paths, commit messages — broader keyword coverage.
+        table
+            .create_index(
+                &["body"],
+                lancedb::index::Index::FTS(Default::default()),
+            )
+            .replace(true)
+            .execute()
+            .await
+            .context("Failed to create FTS index on body")?;
         tracing::info!(
-            "EmbeddingIndex: FTS index on title+body created in {:?}",
+            "EmbeddingIndex: FTS indexes on title+body created in {:?}",
             fts_start.elapsed()
         );
         Ok(())
