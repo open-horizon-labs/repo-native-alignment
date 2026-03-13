@@ -542,6 +542,101 @@ const ENABLED = true;
         }
     }
 
+    // --- Adversarial tests (seeded from dissent) ---
+
+    #[test]
+    fn test_destructuring_not_indexed_as_function() {
+        // Dissent: destructuring patterns should be skipped, not crash
+        let extractor = JavaScriptExtractor::new();
+        let code = r#"
+const { foo, bar } = require('baz');
+const [a, b] = [1, 2];
+"#;
+        let result = extractor.extract(Path::new("src/app.js"), code).unwrap();
+
+        // Destructuring should not produce named function nodes
+        let fns: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Function)
+            .collect();
+        assert!(fns.is_empty(), "Destructuring should not produce Function nodes, got {:?}",
+            fns.iter().map(|n| &n.id.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_object_value_not_indexed_as_function() {
+        // Dissent: complex non-function values should stay Const
+        let extractor = JavaScriptExtractor::new();
+        let code = r#"
+const config = { port: 3000, host: "localhost" };
+const items = [1, 2, 3];
+const regex = /foo/g;
+"#;
+        let result = extractor.extract(Path::new("src/app.js"), code).unwrap();
+
+        for name in &["config", "items", "regex"] {
+            let node = result
+                .nodes
+                .iter()
+                .find(|n| n.id.name == *name);
+            if let Some(n) = node {
+                assert_ne!(
+                    n.id.kind,
+                    NodeKind::Function,
+                    "{} should not be classified as Function",
+                    name
+                );
+            }
+            // It's also fine if these aren't indexed at all (non-scalar, non-function)
+        }
+    }
+
+    #[test]
+    fn test_no_duplicate_with_generic_extractor() {
+        // Dissent: arrow functions are in CLOSURE_NODE_KINDS, so generic extractor
+        // should NOT also pick them up as top-level functions
+        let extractor = JavaScriptExtractor::new();
+        let code = r#"
+const handler = (req, res) => {
+    res.send("hello");
+};
+"#;
+        let result = extractor.extract(Path::new("src/app.js"), code).unwrap();
+
+        let handler_fns: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.name == "handler" && n.id.kind == NodeKind::Function)
+            .collect();
+        assert_eq!(
+            handler_fns.len(),
+            1,
+            "Should have exactly 1 Function node for handler, not duplicates. Got {}",
+            handler_fns.len()
+        );
+    }
+
+    #[test]
+    fn test_iife_not_indexed() {
+        // Adversarial: IIFEs don't have a variable binding
+        let extractor = JavaScriptExtractor::new();
+        let code = r#"
+(function() { console.log("iife"); })();
+(() => { console.log("arrow iife"); })();
+"#;
+        let result = extractor.extract(Path::new("src/app.js"), code).unwrap();
+
+        // IIFEs should not produce named Function nodes in the special handler
+        let fns: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Function)
+            .collect();
+        assert!(fns.is_empty(), "IIFEs should not produce named Function nodes, got {:?}",
+            fns.iter().map(|n| &n.id.name).collect::<Vec<_>>());
+    }
+
     #[test]
     fn test_class_property_arrow_function() {
         let extractor = JavaScriptExtractor::new();
