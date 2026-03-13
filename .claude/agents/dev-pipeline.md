@@ -195,11 +195,13 @@ After execution completes:
 >
 > See `.oh/metis/ship-steps-must-be-visible.md` for the full learning.
 
-Spawn the **`ship` agent** (`.claude/agents/ship.md`) with the PR number:
+Spawn the **`ship` agent** using the **Agent tool** with the PR number:
 
 ```
-Agent(subagent_type="ship", prompt="/ship <PR-number>")
+Agent(subagent_type="ship", prompt="/ship <PR-number>\n\nWORKTREE: <worktree-path>\nCARGO_TARGET_DIR: <worktree-path>/target\n\n<any additional context about CodeRabbit findings, blocking issues, etc.>")
 ```
+
+> **DO NOT use Bash to run `claude` CLI commands.** Do not run `Bash(claude --agent ...)` or any variant. The Agent tool is a first-class tool available to you — use it directly. Running `claude` as a subprocess does not work and will waste time trying different CLI flags that don't exist.
 
 This launches the full 11-step pipeline as an autonomous agent:
 

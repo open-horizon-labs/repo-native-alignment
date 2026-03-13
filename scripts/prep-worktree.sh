@@ -28,10 +28,17 @@ git worktree add "$WORKTREE_PATH" "$BRANCH"
 
 # Warm the build cache via hardlinks (instant, no disk space cost).
 # Falls back to regular copy if hardlinks aren't supported (cross-device).
+#
+# IMPORTANT: After hardlinking, we remove cargo's lock file (.cargo-lock)
+# so each worktree gets its own lock. Hardlinked locks cause all worktrees
+# to serialize behind one cargo process — defeating parallel builds.
 if [ -d "$REPO_ROOT/target" ]; then
     echo "Warming build cache via hardlinks..."
     cp -al "$REPO_ROOT/target" "$WORKTREE_PATH/target" 2>/dev/null \
         || cp -a "$REPO_ROOT/target" "$WORKTREE_PATH/target"
+    # Break the hardlink on cargo's lock file so parallel builds don't fight.
+    rm -f "$WORKTREE_PATH/target/.cargo-lock"
+    rm -f "$WORKTREE_PATH/target/.package-cache"
     echo "Done. Set CARGO_TARGET_DIR=$WORKTREE_PATH/target before building."
 else
     echo "No target/ directory to copy — cold build."
