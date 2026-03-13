@@ -198,7 +198,7 @@ The system compounds from here. Agents use `oh_search_context` to discover relev
 ├── signals/         <- how we measure progress
 ├── guardrails/      <- constraints that shape behavior
 ├── metis/           <- learnings that compound across sessions
-├── config.toml      <- scanner excludes, per-project tuning
+├── config.toml      <- scanner excludes, pattern detection, per-project tuning
 └── .cache/          <- scan state, embedding index (gitignored)
 ```
 
