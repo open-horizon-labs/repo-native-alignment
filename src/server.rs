@@ -371,6 +371,7 @@ fn parse_node_kind(s: &str) -> NodeKind {
         "sql_table" => NodeKind::SqlTable,
         "api_endpoint" => NodeKind::ApiEndpoint,
         "macro" => NodeKind::Macro,
+        "field" => NodeKind::Field,
         "pr_merge" => NodeKind::PrMerge,
         other => NodeKind::Other(other.to_string()),
     }
@@ -2507,6 +2508,10 @@ impl RnaHandler {
                     });
                 }
 
+                // Filter hidden scaffolding kinds (Module, PrMerge) before counting,
+                // so the reported count matches what format_neighbor_nodes renders.
+                retain_displayable(&mut all_ids, &graph_state.nodes);
+
                 let entry_label = if valid_entry_ids.len() == 1 {
                     format!("`{}`", valid_entry_ids[0])
                 } else {
@@ -2638,6 +2643,10 @@ impl RnaHandler {
                                 .unwrap_or(false)
                         });
                     }
+
+                    // Filter hidden scaffolding kinds (Module, PrMerge) before counting,
+                    // so the reported count matches what format_neighbor_nodes renders.
+                    retain_displayable(&mut all_ids, &graph_state.nodes);
 
                     let freshness = format_freshness(
                         graph_state.nodes.len(),
@@ -3311,7 +3320,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         {
                             let mut file_counts: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
                             for n in &graph_state.nodes {
-                                if matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge) {
+                                if matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge | NodeKind::Field) {
                                     continue;
                                 }
                                 if n.id.root == "external" {
@@ -3609,15 +3618,31 @@ fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> Stri
     }
 }
 
+/// Node kinds that are structural scaffolding and should be hidden from traversal results.
+/// These are filtered by `format_neighbor_nodes` when rendering, so we must also filter
+/// them from the ID list before counting to keep the reported count accurate.
+fn is_hidden_traversal_kind(kind: &graph::NodeKind) -> bool {
+    matches!(kind, graph::NodeKind::Module | graph::NodeKind::PrMerge)
+}
+
+/// Remove IDs whose node kind is hidden scaffolding (Module, PrMerge) from traversal results.
+/// This ensures the count shown in headings matches the nodes actually rendered.
+fn retain_displayable(all_ids: &mut Vec<String>, nodes: &[graph::Node]) {
+    all_ids.retain(|id| {
+        nodes.iter()
+            .find(|n| n.stable_id() == *id)
+            .map(|n| !is_hidden_traversal_kind(&n.id.kind))
+            // If node not found, keep the ID (it will render as a fallback `id` line)
+            .unwrap_or(true)
+    });
+}
+
 fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String], index: &GraphIndex, compact: bool) -> String {
     ids.iter()
         .filter_map(|id| {
             if let Some(node) = nodes.iter().find(|n| n.stable_id() == *id) {
-                // Filter out module and PR-merge nodes — they're structural scaffolding,
-                // not useful for agents doing impact analysis or exploration.
-                match node.id.kind {
-                    graph::NodeKind::Module | graph::NodeKind::PrMerge => return None,
-                    _ => {}
+                if is_hidden_traversal_kind(&node.id.kind) {
+                    return None;
                 }
                 Some(format_node_entry(node, index, compact))
             } else {
