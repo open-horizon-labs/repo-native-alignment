@@ -1576,22 +1576,17 @@ impl RnaHandler {
                         state.nodes.len(),
                         state.edges.len()
                     );
-                    // Warm embed index from cached LanceDB table
+                    // Always re-index embeddings so .oh/ artifacts added since
+                    // the last full build become searchable.  This drops and
+                    // rebuilds the table (index_all_inner) which is acceptable
+                    // at current repo scale.
                     if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await {
-                        match idx.search("_probe_", None, 1).await {
-                            Ok(SearchOutcome::Results(_)) => {
-                                tracing::info!("Loaded existing embedding index from cache");
+                        match idx.index_all_with_symbols(&self.repo_root, &state.nodes).await {
+                            Ok(count) => {
+                                tracing::info!("Re-indexed embedding index: {} items from cached graph", count);
                                 self.embed_index.store(Arc::new(Some(idx)));
                             }
-                            Ok(SearchOutcome::NotReady) | Err(_) => {
-                                match idx.index_all_with_symbols(&self.repo_root, &state.nodes).await {
-                                    Ok(count) => {
-                                        tracing::info!("Rebuilt embedding index: {} items from cached graph", count);
-                                        self.embed_index.store(Arc::new(Some(idx)));
-                                    }
-                                    Err(e) => tracing::warn!("Failed to embed cached graph: {}", e),
-                                }
-                            }
+                            Err(e) => tracing::warn!("Failed to embed cached graph: {}", e),
                         }
                     }
                     return Ok(state);
@@ -1696,19 +1691,13 @@ impl RnaHandler {
         // Embedding and LSP enrichment run in background via the shared graph lock.
         let symbols_ready_at = std::time::Instant::now();
 
-        // Try to reuse existing embedding table (fast path for warm starts)
+        // Store embed index immediately so it's available for queries.
+        // The background task below will always re-index (including .oh/
+        // artifacts) via index_all_inner which drops and rebuilds the table.
         match EmbeddingIndex::new(&self.repo_root).await {
             Ok(idx) => {
-                match idx.search("_probe_", None, 1).await {
-                    Ok(SearchOutcome::Results(_)) => {
-                        tracing::info!("Reusing persisted embedding index (skipping rebuild)");
-                        self.embed_index.store(Arc::new(Some(idx)));
-                    }
-                    Ok(SearchOutcome::NotReady) | Err(_) => {
-                        tracing::info!("Embedding index empty — will rebuild in background");
-                        self.embed_index.store(Arc::new(Some(idx)));
-                    }
-                }
+                tracing::info!("Embedding index created — background task will re-index");
+                self.embed_index.store(Arc::new(Some(idx)));
             }
             Err(e) => {
                 tracing::warn!("Failed to create embed index: {}", e);
@@ -1735,22 +1724,18 @@ impl RnaHandler {
                 .filter(|n| n.id.root != "external")
                 .cloned()
                 .collect();
+            // Always re-index so .oh/ artifacts added since the last
+            // full build become searchable.  index_all_inner drops and
+            // rebuilds the table -- acceptable at current repo scale.
             match EmbeddingIndex::new(&bg_repo_root).await {
                 Ok(idx) => {
-                    // Only rebuild if not already populated
-                    let needs_rebuild = match idx.search("_probe_", None, 1).await {
-                        Ok(SearchOutcome::Results(_)) => false,
-                        Ok(SearchOutcome::NotReady) | Err(_) => true,
-                    };
-                    if needs_rebuild {
-                        match idx.index_all_with_symbols(&bg_repo_root, &embeddable_nodes).await {
-                            Ok(count) => {
-                                tracing::info!("[background] Embedded {} items", count);
-                                // Atomic store — no mutex needed
-                                bg_embed_index.store(Arc::new(Some(idx)));
-                            }
-                            Err(e) => tracing::warn!("[background] Embedding failed: {}", e),
+                    match idx.index_all_with_symbols(&bg_repo_root, &embeddable_nodes).await {
+                        Ok(count) => {
+                            tracing::info!("[background] Embedded {} items", count);
+                            // Atomic store — no mutex needed
+                            bg_embed_index.store(Arc::new(Some(idx)));
                         }
+                        Err(e) => tracing::warn!("[background] Embedding failed: {}", e),
                     }
                 }
                 Err(e) => tracing::warn!("[background] EmbeddingIndex init failed: {}", e),
