@@ -1224,6 +1224,8 @@ impl LspEnrichmentStatus {
     const RUNNING: u8 = 1;
     const COMPLETE: u8 = 2;
     const UNAVAILABLE: u8 = 3;
+    /// Server binary found on PATH but enrichment hasn't started yet.
+    const SERVER_FOUND: u8 = 4;
 
     pub fn set_running(&self) {
         self.state.store(Self::RUNNING, std::sync::atomic::Ordering::Release);
@@ -1241,10 +1243,57 @@ impl LspEnrichmentStatus {
         self.state.store(Self::UNAVAILABLE, std::sync::atomic::Ordering::Release);
     }
 
+    /// Mark that at least one LSP server binary was found on PATH.
+    /// Called synchronously at startup before async enrichment begins.
+    pub fn set_server_found(&self) {
+        // Only transition from NOT_STARTED -- don't regress from RUNNING/COMPLETE.
+        let _ = self.state.compare_exchange(
+            Self::NOT_STARTED,
+            Self::SERVER_FOUND,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Synchronously probe for known LSP server binaries on PATH.
+    /// Fast (just `which` calls, no process spawning). Call at handler construction
+    /// to distinguish "server exists but pending" from "no server available."
+    pub fn probe_for_servers() -> Self {
+        let status = Self::default();
+
+        // Check for common LSP servers. We only need ONE hit to know
+        // LSP enrichment will likely succeed.
+        let known_servers = [
+            "rust-analyzer",
+            "pyright-langserver",
+            "typescript-language-server",
+            "gopls",
+            "clangd",
+        ];
+
+        for server in &known_servers {
+            let found = std::process::Command::new("which")
+                .arg(server)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if found {
+                tracing::info!("LSP probe: found '{}' on PATH", server);
+                status.set_server_found();
+                break;
+            }
+        }
+
+        status
+    }
+
     /// Render a short footer segment, or `None` if nothing useful to show.
     pub fn footer_segment(&self) -> Option<String> {
         match self.state.load(std::sync::atomic::Ordering::Acquire) {
             Self::NOT_STARTED => None,
+            Self::SERVER_FOUND => Some("LSP: starting...".to_string()),
             Self::RUNNING => Some("LSP: pending".to_string()),
             Self::COMPLETE => {
                 let guard = self.completed_at.lock().unwrap();
@@ -1297,7 +1346,7 @@ impl Default for RnaHandler {
                 std::time::Instant::now() - std::time::Duration::from_secs(10),
             ),
             background_scanner_started: std::sync::atomic::AtomicBool::new(false),
-            lsp_status: Arc::new(LspEnrichmentStatus::default()),
+            lsp_status: Arc::new(LspEnrichmentStatus::probe_for_servers()),
         }
     }
 }
@@ -1644,9 +1693,9 @@ impl RnaHandler {
             .with_claude_memory(&self.repo_root);
         let resolved_roots = workspace.resolved_roots();
 
-        // 1. Scan all roots to detect changes
-        let mut has_changes = false;
-        let mut scanners: Vec<(String, Scanner, crate::scanner::ScanResult, PathBuf)> = Vec::new();
+        // 1. Scan all roots to detect changes (per-root tracking)
+        let mut any_root_changed = false;
+        let mut scanners: Vec<(String, Scanner, crate::scanner::ScanResult, PathBuf, bool)> = Vec::new();
 
         for resolved_root in &resolved_roots {
             let root_slug = &resolved_root.slug;
@@ -1676,18 +1725,19 @@ impl RnaHandler {
                 scan_result.scan_duration
             );
 
-            if !scan_result.new_files.is_empty()
+            let root_has_changes = !scan_result.new_files.is_empty()
                 || !scan_result.changed_files.is_empty()
-                || !scan_result.deleted_files.is_empty()
-            {
-                has_changes = true;
+                || !scan_result.deleted_files.is_empty();
+
+            if root_has_changes {
+                any_root_changed = true;
             }
 
-            scanners.push((root_slug.clone(), scanner, scan_result, root_path.clone()));
+            scanners.push((root_slug.clone(), scanner, scan_result, root_path.clone(), root_has_changes));
         }
 
-        // 2. If no changes, try loading from LanceDB
-        if !has_changes {
+        // 2. If no changes anywhere, try loading full graph from LanceDB
+        if !any_root_changed {
             match load_graph_from_lance(&self.repo_root).await {
                 Ok(state) => {
                     tracing::info!(
@@ -1695,7 +1745,7 @@ impl RnaHandler {
                         state.nodes.len(),
                         state.edges.len()
                     );
-                    // No changes detected — reuse existing embedding table if present.
+                    // No changes detected -- reuse existing embedding table if present.
                     // Only rebuild if the table is missing (first run or cache cleared).
                     if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await {
                         if idx.has_table().await {
@@ -1719,12 +1769,63 @@ impl RnaHandler {
             }
         }
 
-        // 3. Full rebuild
+        // 3. Per-root rebuild: only re-extract dirty roots, load clean roots from cache.
+        // This preserves LSP edges for unchanged roots and avoids re-extracting
+        // unchanged worktrees. The background scanner already does per-root updates
+        // (lines 1502-1573); this brings the same pattern to the cold-start path.
         let registry = ExtractorRegistry::with_builtins();
         let mut all_nodes: Vec<Node> = Vec::new();
         let mut all_edges: Vec<Edge> = Vec::new();
 
-        for (root_slug, scanner, _scan_result, root_path) in &scanners {
+        // Try loading cached graph for clean-root reuse.
+        let cached_graph = match load_graph_from_lance(&self.repo_root).await {
+            Ok(state) => {
+                tracing::info!(
+                    "Loaded cached graph for clean-root reuse: {} nodes, {} edges",
+                    state.nodes.len(),
+                    state.edges.len()
+                );
+                Some(state)
+            }
+            Err(e) => {
+                tracing::debug!("No cached graph available for clean-root reuse: {}", e);
+                None
+            }
+        };
+
+        for (root_slug, scanner, _scan_result, root_path, root_changed) in &scanners {
+            if !root_changed {
+                // Clean root: load from LanceDB cache if available, otherwise extract.
+                if let Some(ref cached) = cached_graph {
+                    let cached_nodes: Vec<Node> = cached.nodes.iter()
+                        .filter(|n| n.id.root == *root_slug)
+                        .cloned()
+                        .collect();
+                    let cached_edges: Vec<Edge> = cached.edges.iter()
+                        .filter(|e| e.from.root == *root_slug)
+                        .cloned()
+                        .collect();
+
+                    if !cached_nodes.is_empty() {
+                        tracing::info!(
+                            "Clean root '{}': loaded {} nodes, {} edges from cache (preserving LSP edges)",
+                            root_slug,
+                            cached_nodes.len(),
+                            cached_edges.len()
+                        );
+                        all_nodes.extend(cached_nodes);
+                        all_edges.extend(cached_edges);
+                        continue;
+                    }
+                    // Fall through to full extract if cache had no nodes for this root
+                    tracing::info!(
+                        "Clean root '{}': no cached nodes found, extracting fresh",
+                        root_slug
+                    );
+                }
+            }
+
+            // Dirty root (or clean root with no cache): full extract
             let all_files = scanner.all_known_files();
             let full_scan = crate::scanner::ScanResult {
                 changed_files: Vec::new(),
@@ -1751,14 +1852,41 @@ impl RnaHandler {
             }
 
             tracing::info!(
-                "Extracted from '{}': {} nodes, {} edges",
+                "Extracted from '{}'{}: {} nodes, {} edges",
                 root_slug,
+                if *root_changed { " (dirty)" } else { " (no cache)" },
                 extraction.nodes.len(),
                 extraction.edges.len()
             );
 
             all_nodes.extend(extraction.nodes);
             all_edges.extend(extraction.edges);
+        }
+
+        // Also load cached external/virtual nodes (e.g., from previous LSP enrichment)
+        // that don't belong to any current root.
+        if let Some(ref cached) = cached_graph {
+            let current_slugs: std::collections::HashSet<&str> = scanners
+                .iter()
+                .map(|(slug, _, _, _, _)| slug.as_str())
+                .collect();
+            let external_nodes: Vec<Node> = cached.nodes.iter()
+                .filter(|n| !current_slugs.contains(n.id.root.as_str()))
+                .cloned()
+                .collect();
+            let external_edges: Vec<Edge> = cached.edges.iter()
+                .filter(|e| !current_slugs.contains(e.from.root.as_str()))
+                .cloned()
+                .collect();
+            if !external_nodes.is_empty() {
+                tracing::info!(
+                    "Loaded {} external/virtual nodes, {} edges from cache",
+                    external_nodes.len(),
+                    external_edges.len()
+                );
+                all_nodes.extend(external_nodes);
+                all_edges.extend(external_edges);
+            }
         }
 
         // 4. Extract PR merges from git history
