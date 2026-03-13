@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search_symbols` and `oh_search_context`.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -47,6 +47,7 @@ pub fn symbols_schema() -> Schema {
         Field::new("value", DataType::Utf8, true),      // metadata["value"]
         Field::new("synthetic", DataType::Boolean, true), // metadata["synthetic"] == "true"
         Field::new("cyclomatic", DataType::Int32, true),   // metadata["cyclomatic"] — complexity score
+        Field::new("importance", DataType::Float64, true),   // PageRank importance score (0.0-1.0)
         // Vector column is added dynamically when embeddings are computed,
         // since the dimension depends on the model. See `symbols_schema_with_vector`.
         Field::new("updated_at", DataType::Int64, false),
@@ -74,6 +75,7 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("value", DataType::Utf8, true),
         Field::new("synthetic", DataType::Boolean, true),
         Field::new("cyclomatic", DataType::Int32, true),
+        Field::new("importance", DataType::Float64, true),
         Field::new(
             "vector",
             DataType::FixedSizeList(
@@ -165,8 +167,8 @@ mod tests {
 
     #[test]
     fn test_schema_version_constant() {
-        // SCHEMA_VERSION must be at least 2 (bumped when _schema_meta table was introduced)
-        assert!(SCHEMA_VERSION >= 2, "SCHEMA_VERSION should be >= 2");
+        // SCHEMA_VERSION must be at least 5 (bumped for importance column)
+        assert!(SCHEMA_VERSION >= 5, "SCHEMA_VERSION should be >= 5");
     }
 
     #[test]
@@ -194,6 +196,7 @@ mod tests {
         assert!(schema.field_with_name("meta_name_col").is_ok());
         assert!(schema.field_with_name("value").is_ok());
         assert!(schema.field_with_name("synthetic").is_ok());
+        assert!(schema.field_with_name("importance").is_ok());
         assert!(schema.field_with_name("updated_at").is_ok());
         // no vector column in base schema
         assert!(schema.field_with_name("vector").is_err());

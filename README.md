@@ -14,6 +14,8 @@ An MCP server that gives coding agents what LSP alone can't: a cross-language co
 - "How does scanning work?" → `oh_search_context("scanning", include_code=true, include_markdown=true)` → implementation code and doc sections together
 - "Where is the authentication handler?" → `search_symbols("AuthHandler")` → file, line, signature, complexity, graph edges
 - "What are the riskiest functions?" → `search_symbols(query="", min_complexity=20, sort="complexity")` → hotspots ranked by cyclomatic complexity
+- "What are the most important symbols?" → `search(sort_by="importance")` → top symbols ranked by PageRank
+- "Give me a map of this repo" → `repo_map()` → top symbols, hotspot files, active outcomes, entry points
 
 ### See the blast radius of a change
 
@@ -164,8 +166,9 @@ The system compounds from here. Agents use `oh_search_context` to discover relev
 | Tool | What it's for |
 |------|--------------|
 | `oh_search_context` | Find relevant context by meaning: search .oh/ artifacts, commits, code, and markdown in one query |
-| `search_symbols` | Find code symbols by name, signature, or complexity. Filter by kind, language, file, min_complexity. Sort by complexity to find hotspots |
+| `search_symbols` | Find code symbols by name, signature, or complexity. Filter by kind, language, file, min_complexity. Sort by relevance, complexity, or importance (PageRank) |
 | `graph_query` | Trace code relationships: what calls this, what depends on it, what's reachable |
+| `repo_map` | Repository orientation: top symbols by PageRank importance, hotspot files, active outcomes, entry points |
 | `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols |
 | `list_roots` | Show which workspace roots are configured and their scan status |
 

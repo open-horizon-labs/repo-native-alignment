@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use petgraph::algo::page_rank;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef as PetgraphEdgeRef;
 use petgraph::Direction;
@@ -236,6 +237,38 @@ impl GraphIndex {
             }
         }
 
+        result
+    }
+
+    /// Compute PageRank importance scores for all nodes in the graph.
+    ///
+    /// Uses the standard PageRank algorithm with the given damping factor
+    /// (typically 0.85) and number of iterations. Returns a map from
+    /// node stable ID to importance score.
+    ///
+    /// Scores are max-normalized to [0, 1] where 1.0 is the most important
+    /// node. These are relative ranks, not probabilities — they do not sum
+    /// to 1.0. This makes scores interpretable regardless of graph size.
+    pub fn compute_pagerank(&self, damping_factor: f64, nb_iter: usize) -> HashMap<String, f64> {
+        let raw_scores = page_rank(&self.graph, damping_factor, nb_iter);
+
+        // Find max score for normalization
+        let max_score = raw_scores
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        let mut result = HashMap::new();
+        if max_score <= 0.0 {
+            return result;
+        }
+
+        for (idx, &score) in raw_scores.iter().enumerate() {
+            let node_index = NodeIndex::new(idx);
+            if let Some(node_ref) = self.graph.node_weight(node_index) {
+                result.insert(node_ref.id.clone(), score / max_score);
+            }
+        }
         result
     }
 }
@@ -602,5 +635,149 @@ mod tests {
         assert_eq!(result.len(), 3);
         // z should be last since it comes from the second entry node
         assert_eq!(result[2], "z".to_string());
+    }
+
+    // ── PageRank tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_pagerank_empty_graph() {
+        let index = GraphIndex::new();
+        let scores = index.compute_pagerank(0.85, 20);
+        assert!(scores.is_empty());
+    }
+
+    #[test]
+    fn test_pagerank_single_node_no_edges() {
+        let mut index = GraphIndex::new();
+        index.ensure_node("a", "function");
+        let scores = index.compute_pagerank(0.85, 20);
+        assert_eq!(scores.len(), 1);
+        // Single node gets max score = 1.0 after normalization
+        assert!((scores["a"] - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_pagerank_linear_chain() {
+        // a -> b -> c: c is the sink, should have highest score
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+        assert_eq!(scores.len(), 3);
+        // c receives more incoming flow than a
+        assert!(scores["c"] > scores["a"], "sink should rank higher than source");
+    }
+
+    #[test]
+    fn test_pagerank_hub_vs_leaf() {
+        // Hub pattern: a -> d, b -> d, c -> d (d is the hub)
+        // Leaf: e -> f (isolated pair)
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "d", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "d", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "d", "fn", EdgeKind::Calls);
+        index.add_edge("e", "fn", "f", "fn", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+        // d should have higher importance than f (3 callers vs 1 caller)
+        assert!(scores["d"] > scores["f"], "hub should rank higher than leaf");
+    }
+
+    #[test]
+    fn test_pagerank_scores_normalized() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "a", "fn", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+        // Scores should be in [0, 1] range
+        for &score in scores.values() {
+            assert!(score >= 0.0 && score <= 1.0, "score {} out of [0,1] range", score);
+        }
+        // At least one node should have max score of 1.0
+        let max = scores.values().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!((max - 1.0).abs() < 0.01, "max score should be ~1.0, got {}", max);
+    }
+
+    // ==================== Adversarial PageRank tests ====================
+    // Seeded from dissent: disconnected components, near-uniform graphs, NaN safety.
+
+    /// Dissent finding: disconnected components may produce 0 or NaN scores.
+    /// Two disconnected subgraphs should both have scores in [0, 1] with
+    /// at least one node at 1.0 (the global max).
+    #[test]
+    fn test_pagerank_disconnected_components() {
+        let mut index = GraphIndex::new();
+        // Component 1: a -> b -> c
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+        // Component 2: x -> y (completely disconnected)
+        index.add_edge("x", "fn", "y", "fn", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+        assert_eq!(scores.len(), 5, "all 5 nodes should have scores");
+        for (id, &score) in &scores {
+            assert!(score >= 0.0 && score <= 1.0,
+                "node {} has out-of-range score {}", id, score);
+            assert!(!score.is_nan(), "node {} has NaN score", id);
+        }
+        let max = scores.values().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!((max - 1.0).abs() < 0.01, "max score should be ~1.0, got {}", max);
+    }
+
+    /// Dissent finding: near-uniform distribution on small symmetric graphs.
+    /// A 3-node clique where every node calls every other — scores should
+    /// be near-equal after max-normalization (all ~1.0). This isn't a bug,
+    /// it's expected behavior: all nodes are equally important in a clique.
+    #[test]
+    fn test_pagerank_small_clique_near_uniform() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("a", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "a", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "a", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "b", "fn", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+        // In a complete clique, all nodes should have similar scores
+        let vals: Vec<f64> = scores.values().copied().collect();
+        let min = vals.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        // After max-normalization, max is 1.0 and min should be very close
+        assert!((max - 1.0).abs() < 0.01);
+        assert!(min > 0.9, "in a clique, min should be near max, got {}", min);
+    }
+
+    /// Dissent finding: 20 iterations may not converge on deep chains.
+    /// A chain of 50 nodes: a0 -> a1 -> ... -> a49. The sink (a49) should
+    /// have the highest score, and all scores should be valid.
+    #[test]
+    fn test_pagerank_deep_chain_convergence() {
+        let mut index = GraphIndex::new();
+        for i in 0..49 {
+            index.add_edge(
+                &format!("a{}", i), "fn",
+                &format!("a{}", i + 1), "fn",
+                EdgeKind::Calls,
+            );
+        }
+
+        let scores = index.compute_pagerank(0.85, 20);
+        assert_eq!(scores.len(), 50);
+
+        // All scores valid
+        for (id, &score) in &scores {
+            assert!(score >= 0.0 && score <= 1.0 && !score.is_nan(),
+                "node {} has invalid score {}", id, score);
+        }
+
+        // Sink (a49) should have the highest score
+        let sink_score = scores[&format!("a49")];
+        let source_score = scores[&format!("a0")];
+        assert!(sink_score > source_score,
+            "sink should rank higher than source: {} vs {}", sink_score, source_score);
     }
 }

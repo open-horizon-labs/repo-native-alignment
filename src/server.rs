@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
-use arrow_array::{Array, BooleanArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array, Int64Array};
+use arrow_array::{Array, BooleanArray, Float64Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array, Int64Array};
 use arrow_array::builder::BooleanBuilder;
 use async_trait::async_trait;
 use rust_mcp_sdk::macros::{self, JsonSchema};
@@ -26,6 +26,10 @@ use crate::{git, markdown, oh, query, ranking};
 use arc_swap::ArcSwap;
 use petgraph::Direction;
 use tokio::sync::RwLock;
+
+/// Minimum importance score to display in tool output.
+/// Scores at or below this threshold are suppressed as noise.
+const IMPORTANCE_THRESHOLD: f64 = 0.001;
 
 // ── Tool input structs ──────────────────────────────────────────────
 
@@ -69,7 +73,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search",
-    description = "Find code symbols and trace their relationships. Without `mode`, performs flat ranked search (by name/signature). With `mode` (neighbors/impact/reachable/tests_for), performs graph traversal from matched symbols. `tests_for` finds which test functions call a symbol. Entry point: `query` (name or semantic search) or `node` (stable ID from previous results). Batch: `nodes` retrieves multiple IDs in one call. `compact: true` returns signature + location only (~25x fewer tokens). Filter by kind, language, file. Sort by relevance or complexity."
+    description = "Find code symbols and trace their relationships. Without `mode`, performs flat ranked search (by name/signature). With `mode` (neighbors/impact/reachable/tests_for), performs graph traversal from matched symbols. `tests_for` finds which test functions call a symbol. Entry point: `query` (name or semantic search) or `node` (stable ID from previous results). Batch: `nodes` retrieves multiple IDs in one call. `compact: true` returns signature + location only (~25x fewer tokens). Filter by kind, language, file. Sort by relevance, complexity, or importance (PageRank)."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct Search {
@@ -106,7 +110,7 @@ pub struct Search {
     /// Number of results (flat search, default: 10) or entry points (traversal, default: 1)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
-    /// Sort results by "relevance" (default) or "complexity" (descending cyclomatic)
+    /// Sort results by "relevance" (default), "complexity" (descending cyclomatic), or "importance" (descending PageRank)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_by: Option<String>,
     /// Minimum cyclomatic complexity threshold. Only return functions with complexity >= this value.
@@ -248,6 +252,17 @@ fn default_graph_mode() -> String {
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ListRoots {}
+
+#[macros::mcp_tool(
+    name = "repo_map",
+    description = "Repository orientation for agents. Returns top symbols by PageRank importance, hotspot files (most definitions), active business outcomes, and entry points (main/handler functions). One call replaces an exploratory loop of search calls. Use this when starting work on an unfamiliar codebase."
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct RepoMap {
+    /// Number of top symbols to return (default: 15)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<u32>,
+}
 
 // ── Graph persistence (LanceDB) ─────────────────────────────────────
 
@@ -496,6 +511,9 @@ pub(crate) async fn persist_graph_to_lance(
         let cyclomatics: Vec<Option<i32>> = nodes.iter()
             .map(|n| n.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok()))
             .collect();
+        let importances: Vec<Option<f64>> = nodes.iter()
+            .map(|n| n.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()))
+            .collect();
         let updated_ats: Vec<i64> = vec![now; nodes.len()];
 
         let batch = RecordBatch::try_new(
@@ -516,6 +534,7 @@ pub(crate) async fn persist_graph_to_lance(
                 Arc::new(StringArray::from(values)),
                 Arc::new(synthetic_builder.finish()),
                 Arc::new(Int32Array::from(cyclomatics)),
+                Arc::new(Float64Array::from(importances)),
                 Arc::new(Int64Array::from(updated_ats)),
             ],
         )?;
@@ -678,6 +697,9 @@ pub(crate) async fn persist_graph_incremental(
             let cyclomatics: Vec<Option<i32>> = upsert_nodes.iter()
                 .map(|n| n.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok()))
                 .collect();
+            let importances: Vec<Option<f64>> = upsert_nodes.iter()
+                .map(|n| n.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()))
+                .collect();
             let updated_ats: Vec<i64> = vec![now; upsert_nodes.len()];
 
             let batch = RecordBatch::try_new(
@@ -698,6 +720,7 @@ pub(crate) async fn persist_graph_incremental(
                     Arc::new(StringArray::from(values)),
                     Arc::new(synthetic_builder.finish()),
                     Arc::new(Int32Array::from(cyclomatics)),
+                    Arc::new(Float64Array::from(importances)),
                     Arc::new(Int64Array::from(updated_ats)),
                 ],
             )?;
@@ -863,6 +886,8 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
             let cyclomatic_col = batch.column_by_name("cyclomatic")
                 .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+            let importance_col = batch.column_by_name("importance")
+                .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
 
             for i in 0..batch.num_rows() {
                 let file_path = PathBuf::from(file_paths.value(i));
@@ -896,6 +921,11 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 if let Some(col) = cyclomatic_col {
                     if !col.is_null(i) {
                         metadata.insert("cyclomatic".to_string(), col.value(i).to_string());
+                    }
+                }
+                if let Some(col) = importance_col {
+                    if !col.is_null(i) {
+                        metadata.insert("importance".to_string(), format!("{:.6}", col.value(i)));
                     }
                 }
                 nodes.push(Node {
@@ -1648,6 +1678,15 @@ impl RnaHandler {
             resolved_roots.len()
         );
 
+        // 6. Compute PageRank importance scores
+        let pagerank_scores = index.compute_pagerank(0.85, 20);
+        for node in &mut all_nodes {
+            if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
+                node.metadata.insert("importance".to_string(), format!("{:.6}", score));
+            }
+        }
+        tracing::info!("Computed PageRank importance for {} nodes", pagerank_scores.len());
+
         // 7. Persist graph to LanceDB
         if let Err(e) = persist_graph_to_lance(&self.repo_root, &all_nodes, &all_edges).await {
             tracing::warn!("Failed to persist graph to LanceDB: {}", e);
@@ -2083,12 +2122,13 @@ impl RnaHandler {
         compact: bool,
     ) -> Result<CallToolResult, CallToolError> {
         let sort_by_complexity = args.sort_by.as_deref() == Some("complexity");
+        let sort_by_importance = args.sort_by.as_deref() == Some("importance");
         let has_complexity_filter = args.min_complexity.is_some();
         let complexity_search = has_complexity_filter || sort_by_complexity;
 
         let query_str = query.unwrap_or("");
-        if query_str.is_empty() && !complexity_search {
-            return Ok(text_result("Empty query. Please describe what you're looking for (or use min_complexity / sort_by=\"complexity\" to find complex functions).".into()));
+        if query_str.is_empty() && !complexity_search && !sort_by_importance {
+            return Ok(text_result("Empty query. Please describe what you're looking for (or use min_complexity / sort_by=\"complexity\" / sort_by=\"importance\").".into()));
         }
 
         match self.get_graph().await {
@@ -2162,6 +2202,19 @@ impl RnaHandler {
                         let cc_a = a.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
                         let cc_b = b.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
                         cc_b.cmp(&cc_a)
+                    });
+                } else if sort_by_importance {
+                    // Sort by PageRank importance descending.
+                    // Symbols without importance scores sort to the bottom (not filtered out).
+                    matches.sort_by(|a, b| {
+                        let imp_a = a.metadata.get("importance").and_then(|s| s.parse::<f64>().ok());
+                        let imp_b = b.metadata.get("importance").and_then(|s| s.parse::<f64>().ok());
+                        match (imp_a, imp_b) {
+                            (Some(a_val), Some(b_val)) => b_val.partial_cmp(&a_val).unwrap_or(std::cmp::Ordering::Equal),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        }
                     });
                 } else {
                     ranking::sort_symbol_matches(&mut matches, &query_lower, &graph_state.index);
@@ -2774,6 +2827,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 SearchSymbols::tool(),  // deprecated alias
                 GraphQuery::tool(),     // deprecated alias
                 ListRoots::tool(),
+                RepoMap::tool(),
             ],
             meta: None,
             next_cursor: None,
@@ -2890,6 +2944,13 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                                         );
                                         if let Some(cc) = n.metadata.get("cyclomatic") {
                                             line.push_str(&format!("\n  Complexity: {}", cc));
+                                        }
+                                        if let Some(imp) = n.metadata.get("importance") {
+                                            if let Ok(score) = imp.parse::<f64>() {
+                                                if score > IMPORTANCE_THRESHOLD {
+                                                    line.push_str(&format!("\n  Importance: {:.3}", score));
+                                                }
+                                            }
                                         }
                                         line
                                     })
@@ -3051,6 +3112,166 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 }
             }
 
+            "repo_map" => {
+                let args: RepoMap = parse_args(params.arguments)?;
+                let top_n = args.top_n.unwrap_or(15) as usize;
+
+                match self.get_graph().await {
+                    Ok(guard) => {
+                        let graph_state = guard.as_ref().unwrap();
+                        let mut sections: Vec<String> = Vec::new();
+
+                        // 1. Top symbols by importance (PageRank)
+                        {
+                            let mut symbols_with_importance: Vec<(&Node, f64)> = graph_state.nodes.iter()
+                                .filter(|n| !matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge))
+                                .filter(|n| n.id.root != "external")
+                                .filter_map(|n| {
+                                    let imp = n.metadata.get("importance")
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                        .unwrap_or(0.0);
+                                    if imp > IMPORTANCE_THRESHOLD { Some((n, imp)) } else { None }
+                                })
+                                .collect();
+                            symbols_with_importance.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                            symbols_with_importance.truncate(top_n);
+
+                            if !symbols_with_importance.is_empty() {
+                                let md: String = symbols_with_importance.iter()
+                                    .map(|(n, imp)| {
+                                        let mut line = format!(
+                                            "- **{}** `{}` ({}) [{}] `{}`:{}-{} -- importance: {:.3}",
+                                            n.id.kind, n.id.name, n.language,
+                                            n.id.root,
+                                            n.id.file.display(),
+                                            n.line_start, n.line_end,
+                                            imp,
+                                        );
+                                        if let Some(cc) = n.metadata.get("cyclomatic") {
+                                            line.push_str(&format!(", complexity: {}", cc));
+                                        }
+                                        line
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                sections.push(format!(
+                                    "## Top {} symbols by importance\n\n{}",
+                                    symbols_with_importance.len(), md
+                                ));
+                            }
+                        }
+
+                        // 2. Hotspot files (most definitions), qualified by workspace root
+                        {
+                            let mut file_counts: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+                            for n in &graph_state.nodes {
+                                if matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge) {
+                                    continue;
+                                }
+                                if n.id.root == "external" {
+                                    continue;
+                                }
+                                let key = (n.id.root.clone(), n.id.file.display().to_string());
+                                *file_counts.entry(key).or_default() += 1;
+                            }
+                            let mut sorted_files: Vec<((String, String), usize)> = file_counts.into_iter().collect();
+                            sorted_files.sort_by(|a, b| b.1.cmp(&a.1));
+                            sorted_files.truncate(10);
+
+                            if !sorted_files.is_empty() {
+                                let md: String = sorted_files.iter()
+                                    .map(|((root, f), count)| format!("- [{}] `{}` -- {} definitions", root, f, count))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                sections.push(format!("## Hotspot files\n\n{}", md));
+                            }
+                        }
+
+                        // 3. Active outcomes
+                        {
+                            let outcomes = oh::load_oh_artifacts(root)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|a| a.kind == OhArtifactKind::Outcome)
+                                .collect::<Vec<_>>();
+                            if !outcomes.is_empty() {
+                                let md: String = outcomes.iter()
+                                    .map(|o| {
+                                        let files: Vec<String> = o.frontmatter
+                                            .get("files")
+                                            .and_then(|v| v.as_sequence())
+                                            .map(|seq| seq.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect())
+                                            .unwrap_or_default();
+                                        let files_str = if files.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(" (files: {})", files.join(", "))
+                                        };
+                                        format!("- **{}**{}", o.id(), files_str)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                sections.push(format!("## Active outcomes\n\n{}", md));
+                            }
+                        }
+
+                        // 4. Entry points (main functions, handlers), sorted by importance
+                        {
+                            let mut entry_points: Vec<&Node> = graph_state.nodes.iter()
+                                .filter(|n| n.id.kind == NodeKind::Function && n.id.root != "external")
+                                .filter(|n| {
+                                    let name = n.id.name.to_lowercase();
+                                    name == "main"
+                                        || name.starts_with("handle_")
+                                        || name.starts_with("handler")
+                                        || name.ends_with("_handler")
+                                        || name.contains("endpoint")
+                                })
+                                .collect();
+                            entry_points.sort_by(|a, b| {
+                                let imp_a = a.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                                let imp_b = b.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                                imp_b.partial_cmp(&imp_a).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            entry_points.truncate(10);
+
+                            if !entry_points.is_empty() {
+                                let md: String = entry_points.iter()
+                                    .map(|n| format!(
+                                        "- **{}** [{}] `{}`:{}-{}",
+                                        n.id.name,
+                                        n.id.root,
+                                        n.id.file.display(),
+                                        n.line_start, n.line_end,
+                                    ))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                sections.push(format!("## Entry points\n\n{}", md));
+                            }
+                        }
+
+                        let freshness = format_freshness(
+                            graph_state.nodes.len(),
+                            graph_state.last_scan_completed_at,
+                            Some(&self.lsp_status),
+                        );
+
+                        if sections.is_empty() {
+                            Ok(text_result(format!("No repository data available yet.{}", freshness)))
+                        } else {
+                            Ok(text_result(format!(
+                                "# Repository Map\n\n{}{}",
+                                sections.join("\n\n"),
+                                freshness
+                            )))
+                        }
+                    }
+                    Err(e) => Ok(text_result(format!("Graph error: {}", e))),
+                }
+            }
+
             _ => Err(CallToolError::unknown_tool(&params.name)),
         };
 
@@ -3135,6 +3356,13 @@ fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> Stri
         if let Some(cc) = n.metadata.get("cyclomatic") {
             entry.push_str(&format!(" cc:{}", cc));
         }
+        if let Some(imp) = n.metadata.get("importance") {
+            if let Ok(score) = imp.parse::<f64>() {
+                if score > IMPORTANCE_THRESHOLD {
+                    entry.push_str(&format!(" imp:{:.3}", score));
+                }
+            }
+        }
         let edge_count = index.neighbors(&stable_id, None, Direction::Outgoing).len()
             + index.neighbors(&stable_id, None, Direction::Incoming).len();
         if edge_count > 0 {
@@ -3164,6 +3392,13 @@ fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> Stri
         }
         if let Some(cc) = n.metadata.get("cyclomatic") {
             entry.push_str(&format!("\n  Complexity: {}", cc));
+        }
+        if let Some(imp) = n.metadata.get("importance") {
+            if let Ok(score) = imp.parse::<f64>() {
+                if score > IMPORTANCE_THRESHOLD {
+                    entry.push_str(&format!("\n  Importance: {:.3}", score));
+                }
+            }
         }
         if !outgoing.is_empty() {
             entry.push_str(&format!("\n  Out: {} edge(s)", outgoing.len()));
