@@ -838,4 +838,53 @@ var CurrentRetries = 0
             logger.signature
         );
     }
+
+    /// Adversarial: var with no initializer (type-only declaration)
+    #[test]
+    fn test_go_var_no_initializer() {
+        let extractor = GoExtractor::new();
+        let code = r#"package main
+
+var Counter int
+var Name string
+"#;
+        let result = extractor.extract(Path::new("main.go"), code).unwrap();
+        let vars: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Const && n.metadata.get("storage").map(|s| s.as_str()) == Some("var"))
+            .collect();
+        let names: Vec<&str> = vars.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"Counter"), "Should find var Counter, got: {:?}", names);
+        assert!(names.contains(&"Name"), "Should find var Name, got: {:?}", names);
+        // No value should be extracted for type-only declarations
+        let counter = vars.iter().find(|n| n.id.name == "Counter").unwrap();
+        assert!(counter.metadata.get("value").is_none(), "Type-only var should have no value");
+    }
+
+    /// Adversarial: function-local var declarations are also captured
+    /// (Go doesn't syntactically distinguish package-level from function-local `var`)
+    #[test]
+    fn test_go_function_local_var_also_captured() {
+        let extractor = GoExtractor::new();
+        let code = r#"package main
+
+var GlobalVar = 42
+
+func main() {
+    var localVar = "hello"
+    _ = localVar
+}
+"#;
+        let result = extractor.extract(Path::new("main.go"), code).unwrap();
+        let vars: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Const && n.metadata.get("storage").map(|s| s.as_str()) == Some("var"))
+            .collect();
+        let names: Vec<&str> = vars.iter().map(|n| n.id.name.as_str()).collect();
+        // Both should be captured (known limitation: we don't filter by scope)
+        assert!(names.contains(&"GlobalVar"), "Should find global var");
+        assert!(names.contains(&"localVar"), "Function-local var also captured (known behavior)");
+    }
 }

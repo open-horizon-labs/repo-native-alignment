@@ -626,4 +626,63 @@ pub const MAX_SIZE: usize = 1024;
             logger.signature
         );
     }
+
+    /// Adversarial: static with complex initializer should not extract a scalar value
+    #[test]
+    fn test_static_complex_initializer_no_value() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+static POOL: OnceLock<Vec<String>> = OnceLock::new();
+static MUTEX: Mutex<HashMap<String, i32>> = Mutex::new(HashMap::new());
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        let pool = result.nodes.iter().find(|n| n.id.name == "POOL").expect("Should find POOL");
+        assert!(
+            pool.metadata.get("value").is_none(),
+            "Complex initializer should not have scalar value, got: {:?}",
+            pool.metadata.get("value")
+        );
+        assert_eq!(pool.metadata.get("storage").map(|s| s.as_str()), Some("static"));
+
+        let mutex = result.nodes.iter().find(|n| n.id.name == "MUTEX").expect("Should find MUTEX");
+        assert!(mutex.metadata.get("value").is_none());
+        assert_eq!(mutex.metadata.get("storage").map(|s| s.as_str()), Some("static"));
+    }
+
+    /// Adversarial: const and static with same name in same file (NodeId collision risk)
+    #[test]
+    fn test_const_and_static_same_name_both_extracted() {
+        let extractor = RustExtractor::new();
+        // This is unusual Rust code but syntactically valid
+        let code = r#"
+const FOO: u32 = 42;
+static FOO: u32 = 42;
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        let foos: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.name == "FOO" && n.id.kind == NodeKind::Const
+                && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("false"))
+            .collect();
+        // Both should be extracted even though they'll have same NodeId
+        // (this is the pre-existing #119 issue)
+        assert!(
+            foos.len() >= 2,
+            "Should extract both const FOO and static FOO, got: {}",
+            foos.len()
+        );
+        // At least one should have storage=static
+        assert!(
+            foos.iter().any(|n| n.metadata.get("storage").map(|s| s.as_str()) == Some("static")),
+            "At least one FOO should have storage=static"
+        );
+        // At least one should NOT have storage metadata (the const)
+        assert!(
+            foos.iter().any(|n| n.metadata.get("storage").is_none()),
+            "At least one FOO should be a plain const without storage"
+        );
+    }
 }
