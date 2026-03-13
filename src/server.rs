@@ -1119,6 +1119,7 @@ impl LspEnrichmentStatus {
     const NOT_STARTED: u8 = 0;
     const RUNNING: u8 = 1;
     const COMPLETE: u8 = 2;
+    const UNAVAILABLE: u8 = 3;
 
     pub fn set_running(&self) {
         self.state.store(Self::RUNNING, std::sync::atomic::Ordering::Release);
@@ -1128,6 +1129,12 @@ impl LspEnrichmentStatus {
         self.edge_count.store(edge_count, std::sync::atomic::Ordering::Release);
         *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
         self.state.store(Self::COMPLETE, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Mark that no LSP server was available for any of the detected languages.
+    pub fn set_unavailable(&self) {
+        *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
+        self.state.store(Self::UNAVAILABLE, std::sync::atomic::Ordering::Release);
     }
 
     /// Render a short footer segment, or `None` if nothing useful to show.
@@ -1147,6 +1154,11 @@ impl LspEnrichmentStatus {
                 } else {
                     None
                 }
+            }
+            Self::UNAVAILABLE => {
+                // Always show unavailable status (no 30s auto-hide) so agents
+                // know LSP enrichment didn't run and why.
+                Some("LSP: no server detected".to_string())
             }
             _ => None,
         }
@@ -1756,6 +1768,12 @@ impl RnaHandler {
                 }
             };
 
+            if !enrichment.any_enricher_ran {
+                tracing::info!("[background] LSP enrichment: no server available");
+                bg_lsp_status.set_unavailable();
+                return;
+            }
+
             if enrichment.new_nodes.is_empty()
                 && enrichment.added_edges.is_empty()
                 && enrichment.updated_nodes.is_empty()
@@ -1936,6 +1954,10 @@ impl RnaHandler {
                 .enrich_all(&changed_nodes, &graph.index, &languages, &self.repo_root)
                 .await;
 
+            if !enrichment.any_enricher_ran {
+                self.lsp_status.set_unavailable();
+            }
+
             let incr_edge_count = enrichment.added_edges.len();
 
             // Add virtual nodes synthesized for external symbols.
@@ -2015,7 +2037,9 @@ impl RnaHandler {
                 }
             }
 
-            self.lsp_status.set_complete(incr_edge_count);
+            if enrichment.any_enricher_ran {
+                self.lsp_status.set_complete(incr_edge_count);
+            }
         }
 
         // Re-embed changed-file symbols. Uses the updated graph nodes so enriched
@@ -4090,6 +4114,29 @@ mod tests {
     }
 
     #[test]
+    fn test_lsp_status_unavailable_shows_no_server() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_unavailable();
+        assert_eq!(
+            status.footer_segment().unwrap(),
+            "LSP: no server detected"
+        );
+    }
+
+    #[test]
+    fn test_lsp_status_unavailable_no_auto_hide() {
+        // UNAVAILABLE should always show, unlike COMPLETE which hides after 30s.
+        let status = LspEnrichmentStatus::default();
+        status.set_unavailable();
+        // Even without set_running first, should show.
+        assert_eq!(
+            status.footer_segment().unwrap(),
+            "LSP: no server detected"
+        );
+    }
+
+    #[test]
     fn test_format_freshness_without_lsp_status() {
         let result = format_freshness(100, Some(std::time::Instant::now()), None);
         assert!(result.contains("100 symbols"));
@@ -4112,6 +4159,15 @@ mod tests {
         status.set_complete(1247);
         let result = format_freshness(100, Some(std::time::Instant::now()), Some(&status));
         assert!(result.contains("LSP: enriched (1247 edges)"));
+    }
+
+    #[test]
+    fn test_format_freshness_with_unavailable_lsp() {
+        let status = LspEnrichmentStatus::default();
+        status.set_unavailable();
+        let result = format_freshness(100, Some(std::time::Instant::now()), Some(&status));
+        assert!(result.contains("LSP: no server detected"));
+        assert!(result.contains("100 symbols"));
     }
 
     // ── Adversarial LspEnrichmentStatus tests ─────────────────────────
@@ -4145,6 +4201,20 @@ mod tests {
         assert_eq!(status.footer_segment().unwrap(), "LSP: pending");
         status.set_complete(150);
         assert!(status.footer_segment().unwrap().contains("150 edges"));
+    }
+
+    #[test]
+    fn test_lsp_status_unavailable_then_running_then_complete() {
+        // Simulates: first scan finds no server, second scan (after install) finds one
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_unavailable();
+        assert_eq!(status.footer_segment().unwrap(), "LSP: no server detected");
+        // Server installed, new scan starts
+        status.set_running();
+        assert_eq!(status.footer_segment().unwrap(), "LSP: pending");
+        status.set_complete(50);
+        assert!(status.footer_segment().unwrap().contains("50 edges"));
     }
 
     #[test]

@@ -105,6 +105,10 @@ pub struct EnrichmentResult {
     /// Virtual nodes synthesized for external symbols (e.g., tokio::spawn).
     /// These have `root = "external"` and no body — they must NOT be embedded.
     pub new_nodes: Vec<Node>,
+    /// Whether any enricher actually ran (server was available and initialized).
+    /// When false, all matching enrichers were skipped (server not on PATH, init failed, etc.).
+    /// Callers use this to distinguish "no server available" from "server ran, found nothing."
+    pub any_enricher_ran: bool,
 }
 
 /// Phase 2: Asynchronous enrichment after initial extraction.
@@ -422,6 +426,8 @@ impl EnricherRegistry {
 
             match enricher.enrich(nodes, index, repo_root).await {
                 Ok(enrichment) => {
+                    // If enrich() returned Ok, the server was available and ran.
+                    result.any_enricher_ran = true;
                     tracing::info!(
                         "Enricher {}: {} edges, {} node patches, {} virtual nodes",
                         enricher.name(),

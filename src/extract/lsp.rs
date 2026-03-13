@@ -963,7 +963,7 @@ impl Enricher for LspEnricher {
         // Try to initialize the language server using the repo root from --repo
         if let Err(e) = self.ensure_initialized(repo_root).await {
             tracing::debug!("LSP enrichment skipped for {}: {}", self.language, e);
-            return Ok(result);
+            return Err(e);
         }
 
         let mut state = self.state.lock().await;
