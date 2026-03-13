@@ -19,7 +19,7 @@ use crate::extract::{ExtractorRegistry, EnricherRegistry};
 use crate::graph::{self, EdgeKind, Node, Edge, Confidence, ExtractionSource, NodeId, NodeKind};
 use crate::graph::index::GraphIndex;
 use crate::graph::store::{symbols_schema, edges_schema, schema_meta_schema, SCHEMA_VERSION};
-use crate::roots::{WorkspaceConfig, cache_state_path};
+use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
 use crate::scanner::{ScanResult, Scanner};
 use crate::types::OhArtifactKind;
 use crate::{git, markdown, oh, query, ranking};
@@ -2150,7 +2150,28 @@ impl RnaHandler {
         });
 
         // Extract new + changed files
-        let extraction = registry.extract_scan_result(&self.repo_root, &scan);
+        let mut extraction = registry.extract_scan_result(&self.repo_root, &scan);
+
+        // Set root slug on extracted nodes and edges.
+        // Extractors don't set root — the caller must assign it, matching the
+        // pattern in build_full_graph and the background scanner.
+        let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
+        for node in &mut extraction.nodes {
+            node.id.root = primary_slug.clone();
+        }
+        // Build file index from existing graph + new extraction for suffix matching
+        let file_index: std::collections::HashSet<String> = graph.nodes
+            .iter()
+            .chain(extraction.nodes.iter())
+            .map(|n| n.id.file.to_string_lossy().to_string())
+            .collect();
+        for edge in &mut extraction.edges {
+            edge.from.root = primary_slug.clone();
+            edge.to.root = primary_slug.clone();
+            // Resolve dangling import edges via suffix match (same as build_full_graph)
+            resolve_edge_target_by_suffix(edge, &file_index);
+        }
+
         // Track only the delta (new/changed) for LanceDB upsert — not the full graph.
         let mut upsert_nodes: Vec<Node> = extraction.nodes.clone();
         let mut upsert_edges: Vec<Edge> = extraction.edges.clone();
@@ -4676,6 +4697,88 @@ mod tests {
                 "last_scan_completed_at should be recent, but was {:?} ago",
                 age
             );
+        }
+    }
+
+    // ── Regression test for #199: root slug must survive incremental updates ──
+
+    #[tokio::test]
+    async fn test_incremental_update_preserves_root_slug() {
+        // Regression test for #199: update_graph_with_scan() must set the root
+        // slug on extracted nodes, otherwise they get empty root prefixes which
+        // breaks the `root` filter for ~1000 symbols.
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Set up a minimal repo with one Rust file
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn initial_func() {}\n",
+        )
+        .unwrap();
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            ..Default::default()
+        };
+
+        // Compute the expected root slug for this temp directory
+        let expected_slug = RootConfig::code_project(root.to_path_buf()).slug();
+        assert!(!expected_slug.is_empty(), "root slug should not be empty");
+
+        // First call: builds graph from scratch (build_full_graph sets root slug)
+        {
+            let guard = handler.get_graph().await.unwrap();
+            let gs = guard.as_ref().expect("graph should be built");
+            let node = gs.nodes.iter().find(|n| n.id.name == "initial_func")
+                .expect("initial_func should be in graph");
+            assert_eq!(
+                node.id.root, expected_slug,
+                "Full rebuild should set root slug"
+            );
+        }
+
+        // Wait for mtime granularity
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Edit the file to trigger incremental update
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn updated_func() {}\n",
+        )
+        .unwrap();
+
+        // Expire the cooldown
+        {
+            let mut last = handler.last_scan.lock().unwrap();
+            *last = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        }
+
+        // Second call: incremental update via update_graph_with_scan
+        {
+            let guard = handler.get_graph().await.unwrap();
+            let gs = guard.as_ref().expect("graph should still exist");
+
+            let node = gs.nodes.iter().find(|n| n.id.name == "updated_func")
+                .expect("updated_func should be in graph after edit");
+            assert_eq!(
+                node.id.root, expected_slug,
+                "Incremental update must preserve root slug (was empty before #199 fix)"
+            );
+
+            // Also verify edges have root slug set
+            for edge in &gs.edges {
+                if edge.from.file == std::path::PathBuf::from("src/lib.rs") {
+                    assert_eq!(
+                        edge.from.root, expected_slug,
+                        "Edge source root should be set after incremental update"
+                    );
+                }
+            }
         }
     }
 
