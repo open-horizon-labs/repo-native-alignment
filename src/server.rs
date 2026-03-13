@@ -3270,7 +3270,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                         // 1. Top symbols by importance (PageRank)
                         {
                             let mut symbols_with_importance: Vec<(&Node, f64)> = graph_state.nodes.iter()
-                                .filter(|n| !matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge))
+                                .filter(|n| !matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge | NodeKind::Field))
                                 .filter(|n| n.id.root != "external")
                                 .filter_map(|n| {
                                     let imp = n.metadata.get("importance")

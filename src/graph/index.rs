@@ -249,6 +249,11 @@ impl GraphIndex {
     /// Scores are max-normalized to [0, 1] where 1.0 is the most important
     /// node. These are relative ranks, not probabilities — they do not sum
     /// to 1.0. This makes scores interpretable regardless of graph size.
+    ///
+    /// After normalization, boilerplate symbols are dampened so that
+    /// standard trait impls (`fmt`, `default`, `clone`, etc.), field nodes,
+    /// and test-file symbols don't dominate the top-N. See
+    /// [`GraphIndex::dampen_boilerplate`] for the heuristics applied.
     pub fn compute_pagerank(&self, damping_factor: f64, nb_iter: usize) -> HashMap<String, f64> {
         let raw_scores = page_rank(&self.graph, damping_factor, nb_iter);
 
@@ -269,7 +274,78 @@ impl GraphIndex {
                 result.insert(node_ref.id.clone(), score / max_score);
             }
         }
+
+        // Apply boilerplate dampening so trait impls and field nodes don't
+        // dominate architectural hubs in repo_map and importance sorting.
+        self.dampen_boilerplate(&mut result);
+
         result
+    }
+
+    /// Dampen PageRank scores for known boilerplate patterns.
+    ///
+    /// Standard trait impls (`fmt`, `default`, `clone`, `eq`, `hash`, etc.)
+    /// accumulate disproportionate PageRank because every type that derives
+    /// or implements a trait funnels edges to these functions. Similarly,
+    /// `field` nodes get high in-degree from parent struct `Defines` edges,
+    /// and test-file symbols inflate importance for smoke/test infrastructure.
+    ///
+    /// This applies a multiplicative penalty (0.1) to these categories so
+    /// they still appear in search results but don't crowd out real
+    /// architectural hubs like handlers, builders, and core data structures.
+    fn dampen_boilerplate(&self, scores: &mut HashMap<String, f64>) {
+        /// Names of functions that are standard trait implementations.
+        /// These are structurally connected (every type with the trait has one)
+        /// but not architecturally significant.
+        const BOILERPLATE_NAMES: &[&str] = &[
+            "fmt", "default", "clone", "eq", "ne", "hash",
+            "partial_cmp", "cmp", "from", "into", "drop",
+            "deref", "deref_mut", "as_ref", "as_mut",
+        ];
+
+        /// Penalty multiplier for boilerplate nodes: 0.1 means they keep
+        /// 10% of their raw importance score.
+        const BOILERPLATE_PENALTY: f64 = 0.1;
+
+        /// Test-file patterns in the file path component of stable IDs.
+        const TEST_PATH_PATTERNS: &[&str] = &[
+            "/tests/", "/test_", "_test.", "smoke.rs",
+        ];
+
+        for (stable_id, score) in scores.iter_mut() {
+            if let Some(node_ref) = self.node_lookup.get(stable_id)
+                .and_then(|&idx| self.graph.node_weight(idx))
+            {
+                // Parse the stable_id format: "root:file:name:kind"
+                // We need the file and name components.
+                let parts: Vec<&str> = stable_id.splitn(4, ':').collect();
+                if parts.len() < 4 {
+                    continue;
+                }
+                let file = parts[1];
+                let name = parts[2];
+
+                // 1. Dampen standard trait impl functions
+                if node_ref.node_type == "function"
+                    && BOILERPLATE_NAMES.contains(&name)
+                {
+                    *score *= BOILERPLATE_PENALTY;
+                    continue;
+                }
+
+                // 2. Dampen field nodes
+                if node_ref.node_type == "field" {
+                    *score *= BOILERPLATE_PENALTY;
+                    continue;
+                }
+
+                // 3. Dampen test-file symbols
+                if TEST_PATH_PATTERNS.iter().any(|pat| file.contains(pat)) {
+                    *score *= BOILERPLATE_PENALTY;
+                    continue;
+                }
+            }
+        }
     }
 }
 
@@ -779,5 +855,121 @@ mod tests {
         let source_score = scores[&format!("a0")];
         assert!(sink_score > source_score,
             "sink should rank higher than source: {} vs {}", sink_score, source_score);
+    }
+
+    // ==================== Boilerplate dampening tests ====================
+
+    /// Helper: build a stable_id in the format "root:file:name:kind"
+    fn stable_id(file: &str, name: &str, kind: &str) -> String {
+        format!("test:{}:{}:{}", file, name, kind)
+    }
+
+    #[test]
+    fn test_dampen_boilerplate_fmt_function() {
+        let mut index = GraphIndex::new();
+        let fmt_id = stable_id("src/types.rs", "fmt", "function");
+        let handler_id = stable_id("src/server.rs", "handle_request", "function");
+        let caller1 = stable_id("src/a.rs", "caller1", "function");
+        let caller2 = stable_id("src/b.rs", "caller2", "function");
+
+        // Both fmt and handle_request are called by 2 callers (same structure)
+        index.add_edge(&caller1, "function", &fmt_id, "function", EdgeKind::Calls);
+        index.add_edge(&caller2, "function", &fmt_id, "function", EdgeKind::Calls);
+        index.add_edge(&caller1, "function", &handler_id, "function", EdgeKind::Calls);
+        index.add_edge(&caller2, "function", &handler_id, "function", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+
+        assert!(scores[&fmt_id] < scores[&handler_id],
+            "fmt ({:.4}) should score lower than handle_request ({:.4})",
+            scores[&fmt_id], scores[&handler_id]);
+        assert!(scores[&fmt_id] < scores[&handler_id] * 0.2,
+            "fmt should be significantly dampened");
+    }
+
+    #[test]
+    fn test_dampen_boilerplate_default_and_clone() {
+        let mut index = GraphIndex::new();
+        let default_id = stable_id("src/types.rs", "default", "function");
+        let clone_id = stable_id("src/types.rs", "clone", "function");
+        let build_id = stable_id("src/build.rs", "build_graph", "function");
+        let caller = stable_id("src/main.rs", "main", "function");
+
+        index.add_edge(&caller, "function", &default_id, "function", EdgeKind::Calls);
+        index.add_edge(&caller, "function", &clone_id, "function", EdgeKind::Calls);
+        index.add_edge(&caller, "function", &build_id, "function", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+
+        assert!(scores[&default_id] < scores[&build_id],
+            "default should score lower than build_graph");
+        assert!(scores[&clone_id] < scores[&build_id],
+            "clone should score lower than build_graph");
+    }
+
+    #[test]
+    fn test_dampen_boilerplate_field_nodes() {
+        let mut index = GraphIndex::new();
+        let field_id = stable_id("src/types.rs", "name", "field");
+        let struct_id = stable_id("src/types.rs", "Config", "struct");
+        let func_id = stable_id("src/lib.rs", "process", "function");
+
+        index.add_edge(&struct_id, "struct", &field_id, "field", EdgeKind::HasField);
+        index.add_edge(&func_id, "function", &struct_id, "struct", EdgeKind::DependsOn);
+        let caller = stable_id("src/a.rs", "reader", "function");
+        index.add_edge(&caller, "function", &field_id, "field", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+
+        assert!(scores[&field_id] < scores[&struct_id],
+            "field node ({:.4}) should score lower than struct ({:.4})",
+            scores[&field_id], scores[&struct_id]);
+    }
+
+    #[test]
+    fn test_dampen_boilerplate_test_file_symbols() {
+        let mut index = GraphIndex::new();
+        let test_fn = stable_id("src/smoke.rs", "run_checks", "function");
+        let prod_fn = stable_id("src/server.rs", "run_server", "function");
+        let caller = stable_id("src/main.rs", "main", "function");
+
+        index.add_edge(&caller, "function", &test_fn, "function", EdgeKind::Calls);
+        index.add_edge(&caller, "function", &prod_fn, "function", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+
+        assert!(scores[&test_fn] < scores[&prod_fn],
+            "smoke.rs function ({:.4}) should score lower than server.rs function ({:.4})",
+            scores[&test_fn], scores[&prod_fn]);
+    }
+
+    #[test]
+    fn test_dampen_preserves_non_boilerplate_scores() {
+        let mut index = GraphIndex::new();
+        let func = stable_id("src/query.rs", "search_all", "function");
+        let strct = stable_id("src/graph.rs", "GraphIndex", "struct");
+        let caller = stable_id("src/main.rs", "main", "function");
+
+        index.add_edge(&caller, "function", &func, "function", EdgeKind::Calls);
+        index.add_edge(&caller, "function", &strct, "struct", EdgeKind::DependsOn);
+
+        let scores = index.compute_pagerank(0.85, 20);
+
+        let diff = (scores[&func] - scores[&strct]).abs();
+        assert!(diff < 0.1,
+            "non-boilerplate symbols should have similar scores: {} vs {}",
+            scores[&func], scores[&strct]);
+    }
+
+    #[test]
+    fn test_dampen_existing_tests_unaffected() {
+        // Simple IDs without root:file:name:kind format are not dampened
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+
+        assert!((scores["b"] - 1.0).abs() < 0.01,
+            "simple IDs should not be dampened, got {}", scores["b"]);
     }
 }
