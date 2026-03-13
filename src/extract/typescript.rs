@@ -473,7 +473,7 @@ fn collect_ts_specials(
                         root: String::new(),
                         file: path.to_path_buf(),
                         name: name_str.clone(),
-                        kind: NodeKind::Other("type_alias".to_string()),
+                        kind: NodeKind::TypeAlias,
                     },
                     language: "typescript".to_string(),
                     line_start: node.start_position().row + 1,
@@ -488,7 +488,7 @@ fn collect_ts_specials(
                 emit_module_defines_edge(
                     path,
                     &name_str,
-                    NodeKind::Other("type_alias".to_string()),
+                    NodeKind::TypeAlias,
                     edges,
                 );
             }
@@ -1190,6 +1190,37 @@ import path from 'path';
             2,
             "Each import should have a module-level Defines edge",
         );
+    }
+
+    #[test]
+    fn test_type_alias_uses_first_class_kind() {
+        let extractor = TypeScriptExtractor::new();
+        let code = r#"
+type UserId = string;
+type Config = { port: number; host: string };
+type Handler = (req: Request) => Response;
+"#;
+        let result = extractor.extract(Path::new("src/types.ts"), code).unwrap();
+
+        let type_aliases: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::TypeAlias)
+            .collect();
+        assert_eq!(type_aliases.len(), 3, "Should find 3 type aliases");
+
+        let names: Vec<&str> = type_aliases.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"UserId"), "Should find type alias UserId");
+        assert!(names.contains(&"Config"), "Should find type alias Config");
+        assert!(names.contains(&"Handler"), "Should find type alias Handler");
+
+        // Verify they are NOT using Other("type_alias")
+        let others: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| matches!(&n.id.kind, NodeKind::Other(s) if s == "type_alias"))
+            .collect();
+        assert!(others.is_empty(), "Should not use Other(\"type_alias\") anymore");
     }
 
     #[test]

@@ -27,6 +27,7 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
         ("trait_item",       NodeKind::Trait),
         ("impl_item",        NodeKind::Impl),
         ("enum_item",        NodeKind::Enum),
+        ("type_item",        NodeKind::TypeAlias),
         ("const_item",       NodeKind::Const),
         ("mod_item",         NodeKind::Module),
         ("use_declaration",  NodeKind::Import),
@@ -402,6 +403,30 @@ async fn orchestrate() {
         let code = "pub fn hello() {}\n";
         let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
         assert_eq!(result.nodes[0].language, "rust");
+    }
+
+    #[test]
+    fn test_extract_rust_type_alias() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+pub type Result<T> = std::result::Result<T, MyError>;
+type Callback = Box<dyn Fn(i32) -> bool>;
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        let type_aliases: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::TypeAlias)
+            .collect();
+        assert_eq!(type_aliases.len(), 2, "Should find 2 type aliases");
+
+        let names: Vec<&str> = type_aliases.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"Result"), "Should find type alias Result");
+        assert!(names.contains(&"Callback"), "Should find type alias Callback");
+
+        // Type aliases should be embeddable
+        assert!(NodeKind::TypeAlias.is_embeddable(), "TypeAlias should be embeddable");
     }
 
     #[test]
