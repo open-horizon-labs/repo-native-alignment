@@ -5839,4 +5839,80 @@ mod tests {
         })).unwrap();
         assert!(args.root.is_none());
     }
+
+    // ── Adversarial tests (dissent-seeded) ────────────────────────────
+
+    #[test]
+    fn test_effective_root_filter_whitespace_all_is_not_special() {
+        // Dissent: what if someone passes " all " with whitespace?
+        // It should NOT be treated as the "all" escape -- it's a literal slug.
+        let handler = RnaHandler::default();
+        let filter = handler.effective_root_filter(Some(" all "));
+        assert_eq!(filter, Some(" all ".to_string()), "Whitespace-padded 'all' should be a literal slug, not the escape hatch");
+    }
+
+    #[test]
+    fn test_effective_root_filter_empty_string_is_not_all() {
+        // Dissent: empty string should not disable filtering.
+        let handler = RnaHandler::default();
+        let filter = handler.effective_root_filter(Some(""));
+        assert_eq!(filter, Some("".to_string()), "Empty string should be a literal slug, not disable filtering");
+    }
+
+    #[test]
+    fn test_node_passes_root_filter_external_node_with_no_filter() {
+        // When "all" mode (filter=None), external still passes.
+        let handler = RnaHandler::default();
+        let empty = std::collections::HashSet::new();
+        assert!(handler.node_passes_root_filter("external", &None, &empty));
+    }
+
+    #[test]
+    fn test_node_passes_root_filter_non_code_slug_case_sensitivity() {
+        // Non-code root slugs are stored as-is in the HashSet.
+        // The filter does case-insensitive matching for the primary slug,
+        // but non-code slug lookup is case-SENSITIVE (HashSet::contains).
+        // This tests that behavior is consistent.
+        let handler = RnaHandler::default();
+        let mut non_code = std::collections::HashSet::new();
+        non_code.insert("Notes".to_string());
+        let filter = Some("my-project".to_string());
+        // Exact case matches
+        assert!(handler.node_passes_root_filter("Notes", &filter, &non_code));
+        // Different case does NOT match (HashSet is case-sensitive)
+        assert!(!handler.node_passes_root_filter("notes", &filter, &non_code));
+    }
+
+    #[test]
+    fn test_search_root_param_all_deserializes() {
+        // Verify Search struct also handles root param correctly.
+        let args: Search = serde_json::from_value(json!({
+            "query": "test",
+            "root": "all"
+        })).unwrap();
+        assert_eq!(args.root, Some("all".to_string()));
+
+        let args: Search = serde_json::from_value(json!({
+            "query": "test"
+        })).unwrap();
+        assert!(args.root.is_none());
+    }
+
+    #[test]
+    fn test_graph_query_into_search_sets_root_none() {
+        // Dissent: graph_query deprecated alias sets root: None which triggers
+        // default scoping. Verify this is intentional (traversal entry points
+        // get default scoping on flat resolution, traversal results are unscoped).
+        let gq = GraphQuery {
+            node_id: None,
+            query: Some("test".to_string()),
+            mode: "neighbors".to_string(),
+            direction: None,
+            edge_types: None,
+            max_hops: None,
+            top_k: None,
+        };
+        let search = gq.into_search();
+        assert!(search.root.is_none(), "GraphQuery::into_search should set root to None");
+    }
 }
