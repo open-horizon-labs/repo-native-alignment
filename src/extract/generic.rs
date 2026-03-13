@@ -1999,4 +1999,102 @@ class UserController {
             "Go functions should never have decorators"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Adversarial decorator tests (seeded from dissent)
+    // -----------------------------------------------------------------------
+
+    /// Adversarial: decorator on first function must NOT bleed to the next undecorated one.
+    #[test]
+    fn test_python_decorator_no_bleed_to_next_function() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let ext = GenericExtractor::new(&PYTHON_CONFIG);
+        let code = r#"
+@app.route("/api")
+def handle():
+    pass
+
+def plain():
+    pass
+"#;
+        let result = ext.run(Path::new("app.py"), code).unwrap();
+        let handle = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
+        assert!(handle.metadata.get("decorators").is_some(), "handle should have decorators");
+
+        let plain = result.nodes.iter().find(|n| n.id.name == "plain").unwrap();
+        assert!(
+            plain.metadata.get("decorators").is_none(),
+            "Undecorated plain() should NOT inherit decorators from handle(), got: {:?}",
+            plain.metadata.get("decorators")
+        );
+    }
+
+    /// Adversarial: Rust attribute on first function must not bleed to second.
+    #[test]
+    fn test_rust_attribute_no_bleed() {
+        use crate::extract::rust::RUST_CONFIG;
+        let ext = GenericExtractor::new(&RUST_CONFIG);
+        let code = r#"
+#[test]
+fn test_thing() {}
+
+fn plain() {}
+"#;
+        let result = ext.run(Path::new("lib.rs"), code).unwrap();
+        let test_fn = result.nodes.iter().find(|n| n.id.name == "test_thing").unwrap();
+        assert_eq!(test_fn.metadata.get("decorators").map(|s| s.as_str()), Some("#[test]"));
+
+        let plain = result.nodes.iter().find(|n| n.id.name == "plain").unwrap();
+        assert!(
+            plain.metadata.get("decorators").is_none(),
+            "plain() should not inherit #[test] from test_thing(), got: {:?}",
+            plain.metadata.get("decorators")
+        );
+    }
+
+    /// Adversarial: comment between decorator and function should not break collection.
+    #[test]
+    fn test_rust_attribute_with_comment_between() {
+        use crate::extract::rust::RUST_CONFIG;
+        let ext = GenericExtractor::new(&RUST_CONFIG);
+        let code = r#"
+#[derive(Debug)]
+// This is a config struct
+pub struct Config {
+    pub port: u16,
+}
+"#;
+        let result = ext.run(Path::new("lib.rs"), code).unwrap();
+        let config = result.nodes.iter().find(|n| n.id.name == "Config").unwrap();
+        assert_eq!(
+            config.metadata.get("decorators").map(|s| s.as_str()),
+            Some("#[derive(Debug)]"),
+            "Comment between attribute and struct should not break decorator collection"
+        );
+    }
+
+    /// Adversarial: Java method with no annotations in annotated class.
+    #[test]
+    fn test_java_annotation_no_bleed_within_class() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let ext = GenericExtractor::new(&JAVA_CONFIG);
+        let code = r#"
+public class UserController {
+    @Override
+    public void handle() {}
+
+    public void plain() {}
+}
+"#;
+        let result = ext.run(Path::new("UserController.java"), code).unwrap();
+        let handle = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
+        assert!(handle.metadata.get("decorators").is_some(), "handle should have @Override");
+
+        let plain = result.nodes.iter().find(|n| n.id.name == "plain").unwrap();
+        assert!(
+            plain.metadata.get("decorators").is_none(),
+            "plain() should NOT inherit @Override from handle(), got: {:?}",
+            plain.metadata.get("decorators")
+        );
+    }
 }
