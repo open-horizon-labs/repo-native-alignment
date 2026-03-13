@@ -93,6 +93,17 @@ gray_matter = "0.3.2"
 default = ["metal"]
 metal = ["candle-core/metal", "candle-core/accelerate", "metal-candle/custom-metal"]
 
+# Dev: fastest possible compile, no optimization on own code
+[profile.dev]
+opt-level = 0
+# Note: split-debuginfo = "unpacked" conflicts with sccache (can't zip unpacked files)
+# Default debuginfo is fine — sccache is the bigger win
+
+# But optimize dependencies — they cache well and run faster
+# (tree-sitter grammars, LanceDB, candle are painful at opt-level 0)
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.release]
 opt-level = 3
 lto = "thin"
