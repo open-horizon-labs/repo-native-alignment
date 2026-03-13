@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search_symbols` and `oh_search_context`.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -48,6 +48,8 @@ pub fn symbols_schema() -> Schema {
         Field::new("synthetic", DataType::Boolean, true), // metadata["synthetic"] == "true"
         Field::new("cyclomatic", DataType::Int32, true),   // metadata["cyclomatic"] — complexity score
         Field::new("importance", DataType::Float64, true),   // PageRank importance score (0.0-1.0)
+        Field::new("storage", DataType::Utf8, true),         // metadata["storage"] — "static" (Rust) or "var" (Go)
+        Field::new("mutable", DataType::Boolean, true),      // metadata["mutable"] — true for `static mut`
         // Vector column is added dynamically when embeddings are computed,
         // since the dimension depends on the model. See `symbols_schema_with_vector`.
         Field::new("updated_at", DataType::Int64, false),
@@ -76,6 +78,8 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("synthetic", DataType::Boolean, true),
         Field::new("cyclomatic", DataType::Int32, true),
         Field::new("importance", DataType::Float64, true),
+        Field::new("storage", DataType::Utf8, true),
+        Field::new("mutable", DataType::Boolean, true),
         Field::new(
             "vector",
             DataType::FixedSizeList(
@@ -167,8 +171,8 @@ mod tests {
 
     #[test]
     fn test_schema_version_constant() {
-        // SCHEMA_VERSION must be at least 5 (bumped for importance column)
-        assert!(SCHEMA_VERSION >= 5, "SCHEMA_VERSION should be >= 5");
+        // SCHEMA_VERSION must be at least 6 (bumped for storage/mutable columns)
+        assert!(SCHEMA_VERSION >= 6, "SCHEMA_VERSION should be >= 6");
     }
 
     #[test]
@@ -197,6 +201,8 @@ mod tests {
         assert!(schema.field_with_name("value").is_ok());
         assert!(schema.field_with_name("synthetic").is_ok());
         assert!(schema.field_with_name("importance").is_ok());
+        assert!(schema.field_with_name("storage").is_ok());
+        assert!(schema.field_with_name("mutable").is_ok());
         assert!(schema.field_with_name("updated_at").is_ok());
         // no vector column in base schema
         assert!(schema.field_with_name("vector").is_err());
