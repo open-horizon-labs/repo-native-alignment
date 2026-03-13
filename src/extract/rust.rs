@@ -29,6 +29,7 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
         ("enum_item",        NodeKind::Enum),
         ("type_item",        NodeKind::TypeAlias),
         ("const_item",       NodeKind::Const),
+        ("static_item",      NodeKind::Const),
         ("mod_item",         NodeKind::Module),
         ("use_declaration",  NodeKind::Import),
         ("field_declaration",NodeKind::Field),
@@ -78,17 +79,69 @@ impl Extractor for RustExtractor {
         // Generic pass: function/struct/field/const/import/etc. + string literals.
         let mut result = GenericExtractor::new(&RUST_CONFIG).run(path, content)?;
 
-        // Rust-specific: topology pattern detection (subprocess, network, async).
+        // Rust-specific: topology pattern detection (subprocess, network, async)
+        // and static item metadata enrichment.
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
         if let Some(tree) = parser.parse(content, None) {
             detect_topology_patterns(tree.root_node(), path, content.as_bytes(), &mut result.edges);
+            enrich_static_metadata(tree.root_node(), content.as_bytes(), &mut result.nodes);
         }
 
         Ok(result)
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Static item metadata enrichment
+// ---------------------------------------------------------------------------
+
+/// Walk the AST to find `static_item` nodes and enrich the corresponding
+/// graph nodes (already emitted by the generic extractor as `Const`) with
+/// `metadata["storage"] = "static"`. For `static mut`, also sets
+/// `metadata["mutable"] = "true"`.
+fn enrich_static_metadata(
+    node: tree_sitter::Node,
+    source: &[u8],
+    nodes: &mut [crate::graph::Node],
+) {
+    if node.kind() == "static_item" {
+        let line = node.start_position().row + 1;
+        let name = node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+            .unwrap_or("");
+
+        // Check for `mut` keyword among children
+        let is_mutable = (0..node.child_count())
+            .filter_map(|i| node.child(i as u32))
+            .any(|c| c.kind() == "mutable_specifier");
+
+        // Find the matching node emitted by the generic extractor
+        for n in nodes.iter_mut() {
+            if n.id.name == name
+                && n.id.kind == NodeKind::Const
+                && n.line_start == line
+            {
+                n.metadata
+                    .insert("storage".to_string(), "static".to_string());
+                if is_mutable {
+                    n.metadata
+                        .insert("mutable".to_string(), "true".to_string());
+                }
+                break;
+            }
+        }
+    }
+
+    // Recurse
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            enrich_static_metadata(child, source, nodes);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Topology pattern detection
@@ -486,6 +539,91 @@ pub enum Color {
         assert!(
             has_field_edges.iter().any(|e| e.from.name == "Status" && e.to.name == "Active"),
             "Should have HasField edge Status -> Active"
+        );
+    }
+
+    #[test]
+    fn test_extract_rust_static_items() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+use std::sync::OnceLock;
+
+static LOGGER: OnceLock<String> = OnceLock::new();
+static mut COUNTER: u32 = 0;
+pub static VERSION: &str = "1.0.0";
+pub const MAX_SIZE: usize = 1024;
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        let consts: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Const && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("false"))
+            .collect();
+        let names: Vec<&str> = consts.iter().map(|n| n.id.name.as_str()).collect();
+
+        // All four should be found as Const nodes
+        assert!(names.contains(&"LOGGER"), "Should find static LOGGER, got: {:?}", names);
+        assert!(names.contains(&"COUNTER"), "Should find static mut COUNTER, got: {:?}", names);
+        assert!(names.contains(&"VERSION"), "Should find static VERSION, got: {:?}", names);
+        assert!(names.contains(&"MAX_SIZE"), "Should find const MAX_SIZE, got: {:?}", names);
+
+        // LOGGER should have storage=static, no mutable
+        let logger = consts.iter().find(|n| n.id.name == "LOGGER").unwrap();
+        assert_eq!(
+            logger.metadata.get("storage").map(|s| s.as_str()),
+            Some("static"),
+            "LOGGER should have storage=static"
+        );
+        assert!(
+            logger.metadata.get("mutable").is_none(),
+            "LOGGER should not have mutable metadata"
+        );
+
+        // COUNTER should have storage=static AND mutable=true
+        let counter = consts.iter().find(|n| n.id.name == "COUNTER").unwrap();
+        assert_eq!(
+            counter.metadata.get("storage").map(|s| s.as_str()),
+            Some("static"),
+            "COUNTER should have storage=static"
+        );
+        assert_eq!(
+            counter.metadata.get("mutable").map(|s| s.as_str()),
+            Some("true"),
+            "COUNTER should have mutable=true"
+        );
+
+        // VERSION should have storage=static, value extracted
+        let version = consts.iter().find(|n| n.id.name == "VERSION").unwrap();
+        assert_eq!(
+            version.metadata.get("storage").map(|s| s.as_str()),
+            Some("static"),
+            "VERSION should have storage=static"
+        );
+
+        // MAX_SIZE is a regular const, should NOT have storage metadata
+        let max_size = consts.iter().find(|n| n.id.name == "MAX_SIZE").unwrap();
+        assert!(
+            max_size.metadata.get("storage").is_none(),
+            "MAX_SIZE (const) should not have storage metadata"
+        );
+    }
+
+    #[test]
+    fn test_static_signature_contains_static_keyword() {
+        let extractor = RustExtractor::new();
+        let code = "static LOGGER: OnceLock<String> = OnceLock::new();\n";
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        let logger = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "LOGGER")
+            .expect("Should find LOGGER");
+        assert!(
+            logger.signature.contains("static"),
+            "Static item signature should contain 'static', got: {}",
+            logger.signature
         );
     }
 }
