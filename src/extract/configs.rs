@@ -57,9 +57,11 @@ pub static TYPESCRIPT_CONFIG: LangConfig = LangConfig {
         ("interface_declaration",      NodeKind::Trait),
         ("enum_declaration",           NodeKind::Enum),
         ("public_field_definition",    NodeKind::Field),
+        // enum variants handled as special case in typescript.rs (TS uses
+        // property_identifier / enum_assignment, not a dedicated enum_member node type)
         // module-level const handled as special case in typescript.rs
     ],
-    scope_parent_kinds: &["class_declaration"],
+    scope_parent_kinds: &["class_declaration", "enum_declaration"],
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string", Some("string_fragment"))],
@@ -164,6 +166,7 @@ pub static JAVA_CONFIG: LangConfig = LangConfig {
         ("method_declaration",      NodeKind::Function),
         ("constructor_declaration", NodeKind::Function),
         ("field_declaration",       NodeKind::Field),
+        ("enum_constant",           NodeKind::Field),
         // static final consts handled in java.rs (text inspection)
     ],
     scope_parent_kinds: &["class_declaration", "record_declaration", "enum_declaration"],
@@ -200,6 +203,7 @@ pub static KOTLIN_CONFIG: LangConfig = LangConfig {
         ("object_declaration",      NodeKind::Struct),
         ("enum_class_body",         NodeKind::Enum),
         ("property_declaration",    NodeKind::Field),
+        ("enum_entry",              NodeKind::Field),
         // const val / companion object consts handled in kotlin.rs
     ],
     scope_parent_kinds: &["class_declaration", "object_declaration"],
@@ -239,9 +243,10 @@ pub static CSHARP_CONFIG: LangConfig = LangConfig {
         ("method_declaration",      NodeKind::Function),
         ("constructor_declaration", NodeKind::Function),
         ("field_declaration",       NodeKind::Field),
+        ("enum_member_declaration", NodeKind::Field),
         // const fields handled in csharp.rs (text inspection)
     ],
-    scope_parent_kinds: &["class_declaration", "struct_declaration", "record_declaration"],
+    scope_parent_kinds: &["class_declaration", "struct_declaration", "record_declaration", "enum_declaration"],
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("string_literal", None)],
@@ -276,6 +281,7 @@ pub static SWIFT_CONFIG: LangConfig = LangConfig {
         ("enum_declaration",        NodeKind::Enum),
         ("protocol_declaration",    NodeKind::Trait),
         ("property_declaration",    NodeKind::Field),
+        ("enum_case_element",       NodeKind::Field),
         ("import_declaration",      NodeKind::Import),
     ],
     scope_parent_kinds: &["class_declaration", "struct_declaration", "enum_declaration"],
@@ -348,6 +354,7 @@ pub static CPP_CONFIG: LangConfig = LangConfig {
         ("struct_specifier",     NodeKind::Struct),
         ("enum_specifier",       NodeKind::Enum),
         ("field_declaration",    NodeKind::Field),
+        ("enumerator",           NodeKind::Field),
         // constexpr / static const handled in cpp.rs (text inspection)
     ],
     scope_parent_kinds: &["class_specifier", "struct_specifier", "enum_specifier"],

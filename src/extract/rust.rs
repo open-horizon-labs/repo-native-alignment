@@ -31,6 +31,7 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
         ("mod_item",         NodeKind::Module),
         ("use_declaration",  NodeKind::Import),
         ("field_declaration",NodeKind::Field),
+        ("enum_variant",     NodeKind::Field),
     ],
     scope_parent_kinds: &["impl_item", "struct_item", "enum_item"],
     const_value_field: Some("value"),
@@ -401,5 +402,65 @@ async fn orchestrate() {
         let code = "pub fn hello() {}\n";
         let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
         assert_eq!(result.nodes[0].language, "rust");
+    }
+
+    #[test]
+    fn test_extract_rust_enum_variants() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+pub enum Status {
+    Active,
+    Inactive,
+}
+
+pub enum Color {
+    Red,
+    Green,
+    Blue,
+}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+
+        let names: Vec<&str> = result.nodes.iter().map(|n| n.id.name.as_str()).collect();
+
+        // Enum declarations should still be found
+        assert!(names.contains(&"Status"), "Should find enum Status");
+        assert!(names.contains(&"Color"), "Should find enum Color");
+
+        // Enum variants should be indexed as Field nodes
+        assert!(names.contains(&"Active"), "Should find variant Active");
+        assert!(names.contains(&"Inactive"), "Should find variant Inactive");
+        assert!(names.contains(&"Red"), "Should find variant Red");
+        assert!(names.contains(&"Green"), "Should find variant Green");
+        assert!(names.contains(&"Blue"), "Should find variant Blue");
+
+        // Variants should have kind Field
+        let active = result.nodes.iter().find(|n| n.id.name == "Active").unwrap();
+        assert_eq!(active.id.kind, NodeKind::Field, "Variant should be Field kind");
+
+        // Variants should have parent_scope pointing to the enum
+        assert_eq!(
+            active.metadata.get("parent_scope"),
+            Some(&"Status".to_string()),
+            "Variant should have parent_scope = Status"
+        );
+
+        let red = result.nodes.iter().find(|n| n.id.name == "Red").unwrap();
+        assert_eq!(
+            red.metadata.get("parent_scope"),
+            Some(&"Color".to_string()),
+            "Variant should have parent_scope = Color"
+        );
+
+        // Should produce HasField edges from enum to variant
+        let has_field_edges: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::HasField)
+            .collect();
+        assert!(
+            has_field_edges.iter().any(|e| e.from.name == "Status" && e.to.name == "Active"),
+            "Should have HasField edge Status -> Active"
+        );
     }
 }

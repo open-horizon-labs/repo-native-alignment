@@ -469,6 +469,90 @@ fn collect_ts_specials(
                 });
             }
         }
+        // Enum variants: `enum Direction { Up, Down = 1 }`
+        // TS tree-sitter uses `property_identifier` for plain members and
+        // `enum_assignment` for initialized members (which contain a `property_identifier`).
+        // The generic extractor doesn't handle these because `property_identifier` is too
+        // generic to add to node_kinds.
+        "enum_body" => {
+            // Find the parent enum_declaration to get the enum name
+            let enum_name = node.parent()
+                .and_then(|p| p.child_by_field_name("name"))
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("unknown")
+                .to_string();
+
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    let variant_name = match child.kind() {
+                        "property_identifier" => {
+                            child.utf8_text(source).ok().map(|s| s.to_string())
+                        }
+                        "enum_assignment" => {
+                            // The name is the first `property_identifier` child
+                            child.child(0)
+                                .filter(|c| c.kind() == "property_identifier")
+                                .and_then(|c| c.utf8_text(source).ok())
+                                .map(|s| s.to_string())
+                        }
+                        _ => None,
+                    };
+
+                    if let Some(name) = variant_name {
+                        let body = child.utf8_text(source).unwrap_or("").to_string();
+                        let mut metadata = BTreeMap::new();
+                        metadata.insert("parent_scope".to_string(), enum_name.clone());
+                        // name_col for cursor positioning (consistent with generic extractor)
+                        let col = if child.kind() == "property_identifier" {
+                            child.start_position().column
+                        } else {
+                            // enum_assignment: use the property_identifier child's column
+                            child.child(0)
+                                .filter(|c| c.kind() == "property_identifier")
+                                .map(|c| c.start_position().column)
+                                .unwrap_or(child.start_position().column)
+                        };
+                        metadata.insert("name_col".to_string(), col.to_string());
+
+                        nodes.push(Node {
+                            id: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: name.clone(),
+                                kind: NodeKind::Field,
+                            },
+                            language: "typescript".to_string(),
+                            line_start: child.start_position().row + 1,
+                            line_end: child.end_position().row + 1,
+                            signature: body.clone(),
+                            body,
+                            metadata,
+                            source: ExtractionSource::TreeSitter,
+                        });
+
+                        // Emit HasField edge: Direction:Enum -> Up:Field
+                        edges.push(Edge {
+                            from: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: enum_name.clone(),
+                                kind: NodeKind::Enum,
+                            },
+                            to: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name,
+                                kind: NodeKind::Field,
+                            },
+                            kind: EdgeKind::HasField,
+                            source: ExtractionSource::TreeSitter,
+                            confidence: Confidence::Detected,
+                        });
+                    }
+                }
+            }
+            return; // don't recurse further into enum_body
+        }
         // Class property arrow functions: `class Foo { handler = (x) => x }`
         // The generic extractor sees `public_field_definition` as `NodeKind::Field`.
         // We detect arrow function values and upgrade to Function, emitting the
@@ -1025,4 +1109,5 @@ class Foo {
             handler.signature
         );
     }
+
 }
