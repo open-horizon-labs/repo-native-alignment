@@ -31,7 +31,10 @@ pub fn kind_rank(n: &Node) -> u8 {
     }
 }
 
-/// Returns true if the node lives in a test file (by path convention).
+/// Returns true if a file path looks like a test or test-adjacent file.
+///
+/// This is the shared path-based check used by both `is_test_file()` (which takes
+/// a `Node`) and `embed.rs` semantic search demotion (which operates on id strings).
 ///
 /// Patterns recognised:
 /// - JS/TS: `.test.` and `.spec.` anywhere in path (e.g. `config.test.ts`)
@@ -40,8 +43,8 @@ pub fn kind_rank(n: &Node) -> u8 {
 /// - Python: filename starts with `test_` (e.g. `test_utils.py`)
 /// - Directories: `/test/`, `/tests/`, or root `test/`/`tests/`
 /// - Test-adjacent: `smoke`, `bench`, `benchmark`, `fixture`, `fixtures` in path
-pub fn is_test_file(n: &Node) -> bool {
-    let p = n.id.file.to_string_lossy();
+pub fn is_test_path(p: &str) -> bool {
+    let fname = p.rsplit('/').next().unwrap_or(p);
     // JS/TS conventions
     p.contains(".test.")
         || p.contains(".spec.")
@@ -55,28 +58,22 @@ pub fn is_test_file(n: &Node) -> bool {
         || p.starts_with("test/")
         || p.starts_with("tests/")
         // Python: test_ prefix on filename
-        || file_name_starts_with(&p, "test_")
+        || fname.starts_with("test_")
         // Test-adjacent files: smoke tests, benchmarks, fixtures
-        || file_name_contains(&p, "smoke")
-        || file_name_contains(&p, "bench")
+        || fname.contains("smoke")
+        || fname.contains("bench")
         || p.contains("/fixtures/")
         || p.contains("/fixture/")
         || p.starts_with("fixtures/")
         || p.starts_with("fixture/")
 }
 
-/// Check if the filename component starts with a given prefix.
-fn file_name_starts_with(path: &str, prefix: &str) -> bool {
-    path.rsplit('/')
-        .next()
-        .is_some_and(|f| f.starts_with(prefix))
-}
-
-/// Check if the filename component contains a given substring.
-fn file_name_contains(path: &str, substr: &str) -> bool {
-    path.rsplit('/')
-        .next()
-        .is_some_and(|f| f.contains(substr))
+/// Returns true if the node lives in a test file (by path convention).
+///
+/// Thin wrapper around [`is_test_path`] that extracts the path from a `Node`.
+pub fn is_test_file(n: &Node) -> bool {
+    let p = n.id.file.to_string_lossy();
+    is_test_path(&p)
 }
 
 /// Sort code symbol nodes by a 5-tier relevance cascade.

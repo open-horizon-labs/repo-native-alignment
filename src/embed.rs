@@ -9,6 +9,7 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 
 use crate::git;
 use crate::oh;
+use crate::ranking;
 
 /// Search mode for the embedding index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1042,28 +1043,9 @@ impl EmbeddingIndex {
                 };
 
                 // Demote test files: reduce score so production code ranks above
-                // test code at similar distances. Uses the same logic as
-                // ranking::is_test_file but operates on the id string directly
-                // (we don't have a Node here).
+                // test code at similar distances.
                 let id_str = ids.value(i).to_string();
-                let is_test = {
-                    let p = &id_str;
-                    let fname = p.rsplit('/').next().unwrap_or(p);
-                    p.contains("/tests/")
-                        || p.contains("/test/")
-                        || p.contains("_test.")
-                        || p.contains("_tests.")
-                        || p.contains("_spec.")
-                        || p.contains(".test.")
-                        || p.contains(".spec.")
-                        || p.starts_with("test/")
-                        || p.starts_with("tests/")
-                        || fname.starts_with("test_")
-                        || fname.contains("smoke")
-                        || fname.contains("bench")
-                        || p.contains("/fixtures/")
-                        || p.contains("/fixture/")
-                };
+                let is_test = ranking::is_test_path(&id_str);
                 let score = if is_test { raw_score * 0.7 } else { raw_score };
 
                 search_results.push(SearchResult {
