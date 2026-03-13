@@ -700,4 +700,84 @@ mod tests {
         let max = scores.values().copied().fold(f64::NEG_INFINITY, f64::max);
         assert!((max - 1.0).abs() < 0.01, "max score should be ~1.0, got {}", max);
     }
+
+    // ==================== Adversarial PageRank tests ====================
+    // Seeded from dissent: disconnected components, near-uniform graphs, NaN safety.
+
+    /// Dissent finding: disconnected components may produce 0 or NaN scores.
+    /// Two disconnected subgraphs should both have scores in [0, 1] with
+    /// at least one node at 1.0 (the global max).
+    #[test]
+    fn test_pagerank_disconnected_components() {
+        let mut index = GraphIndex::new();
+        // Component 1: a -> b -> c
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+        // Component 2: x -> y (completely disconnected)
+        index.add_edge("x", "fn", "y", "fn", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+        assert_eq!(scores.len(), 5, "all 5 nodes should have scores");
+        for (id, &score) in &scores {
+            assert!(score >= 0.0 && score <= 1.0,
+                "node {} has out-of-range score {}", id, score);
+            assert!(!score.is_nan(), "node {} has NaN score", id);
+        }
+        let max = scores.values().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!((max - 1.0).abs() < 0.01, "max score should be ~1.0, got {}", max);
+    }
+
+    /// Dissent finding: near-uniform distribution on small symmetric graphs.
+    /// A 3-node clique where every node calls every other — scores should
+    /// be near-equal after max-normalization (all ~1.0). This isn't a bug,
+    /// it's expected behavior: all nodes are equally important in a clique.
+    #[test]
+    fn test_pagerank_small_clique_near_uniform() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("a", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "a", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "a", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "b", "fn", EdgeKind::Calls);
+
+        let scores = index.compute_pagerank(0.85, 20);
+        // In a complete clique, all nodes should have similar scores
+        let vals: Vec<f64> = scores.values().copied().collect();
+        let min = vals.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        // After max-normalization, max is 1.0 and min should be very close
+        assert!((max - 1.0).abs() < 0.01);
+        assert!(min > 0.9, "in a clique, min should be near max, got {}", min);
+    }
+
+    /// Dissent finding: 20 iterations may not converge on deep chains.
+    /// A chain of 50 nodes: a0 -> a1 -> ... -> a49. The sink (a49) should
+    /// have the highest score, and all scores should be valid.
+    #[test]
+    fn test_pagerank_deep_chain_convergence() {
+        let mut index = GraphIndex::new();
+        for i in 0..49 {
+            index.add_edge(
+                &format!("a{}", i), "fn",
+                &format!("a{}", i + 1), "fn",
+                EdgeKind::Calls,
+            );
+        }
+
+        let scores = index.compute_pagerank(0.85, 20);
+        assert_eq!(scores.len(), 50);
+
+        // All scores valid
+        for (id, &score) in &scores {
+            assert!(score >= 0.0 && score <= 1.0 && !score.is_nan(),
+                "node {} has invalid score {}", id, score);
+        }
+
+        // Sink (a49) should have the highest score
+        let sink_score = scores[&format!("a49")];
+        let source_score = scores[&format!("a0")];
+        assert!(sink_score > source_score,
+            "sink should rank higher than source: {} vs {}", sink_score, source_score);
+    }
 }
