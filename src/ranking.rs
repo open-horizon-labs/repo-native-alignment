@@ -590,4 +590,45 @@ mod tests {
         let node = make_node("f", NodeKind::Function, "test_integration.py");
         assert!(is_test_file(&node), "root test_*.py should be flagged as test file");
     }
+
+    // ==================== Adversarial: is_test_path edge cases ====================
+
+    #[test]
+    fn test_is_test_path_empty_string() {
+        assert!(!is_test_path(""), "empty path should not be test file");
+    }
+
+    #[test]
+    fn test_is_test_path_no_false_positive_protest_dir() {
+        // "protest" contains "test" but not as "/test/" boundary
+        assert!(!is_test_path("protest/main.rs"), "protest/ should not be flagged");
+        assert!(!is_test_path("src/detest.rs"), "detest.rs should not be flagged");
+    }
+
+    #[test]
+    fn test_is_test_path_direct_call_matches_is_test_file() {
+        // Verify is_test_path and is_test_file agree on all cases
+        let cases = vec![
+            ("src/lib.rs", false),
+            ("tests/foo.rs", true),
+            ("src/smoke.rs", true),
+            ("src/my_test.rs", true),
+            ("src/bench_foo.rs", true),
+            ("test_utils.py", true),
+            ("attestation/lib.rs", false),
+        ];
+        for (path, expected) in cases {
+            let node = make_node("f", NodeKind::Function, path);
+            assert_eq!(
+                is_test_path(path), expected,
+                "is_test_path(\"{}\") should be {}",
+                path, expected
+            );
+            assert_eq!(
+                is_test_file(&node), expected,
+                "is_test_file for \"{}\" should be {}",
+                path, expected
+            );
+        }
+    }
 }
