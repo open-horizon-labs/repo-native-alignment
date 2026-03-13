@@ -28,9 +28,11 @@ This ensures every piece of work has a PR home before implementation begins. No 
 
 ## /ship Definition (for this project)
 
-`/ship` = the full quality gate before merge. **11 steps, defined in `.claude/agents/ship.md`.**
+`/ship` = the full quality gate before merge. **12 steps, defined in `.claude/agents/ship.md`.**
 
-Summary: review → dissent → fix → adversarial test → merit → resolve TODOs → **manual verify → delivery verify** → README → smoke+CI → merge.
+Summary: review → dissent → fix → **mark ready** → adversarial test → merit → resolve TODOs → **manual verify → delivery verify** → README → smoke+CI → merge.
+
+Step 3b (mark ready) converts the draft PR to ready-for-review, which triggers smoke tests and CodeRabbit review in CI. Both are gated behind `draft == false` so they skip during the draft phase when code is still being iterated on.
 
 No step is optional. "Merge when green" is not ship. Steps answer different questions — don't collapse them:
 - Review/dissent: "Is the code correct?"

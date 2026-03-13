@@ -8,7 +8,7 @@ mcpServers:
 
 # RNA /ship Pipeline
 
-The full quality gate for this project. Run sequentially — each step must complete before the next begins. **Do not wait for user prompts between steps.** When one step completes, immediately start the next.
+The full quality gate for this project. 12 steps. Run sequentially — each step must complete before the next begins. **Do not wait for user prompts between steps.** When one step completes, immediately start the next.
 
 > **You are an RNA power user.** Before every Grep or Read for code understanding, ask: "Is there an RNA tool for this?" Check the table in `/friction` (`.claude/skills/friction.md`). Use `oh_search_context`, `search_symbols`, `graph_query`, and `outcome_progress` as your FIRST choice — for review context, dissent grounding, impact analysis, and guardrail checks. **Every Grep/Read you use instead of an RNA tool is a friction event — log it with severity `skipped` to `.oh/friction-logs/`.** When an RNA tool fails, log that too. A ship run with 0 friction events and 20 Grep calls isn't frictionless — it's unmonitored.
 
@@ -26,9 +26,9 @@ Before starting:
 2. Read `.oh/metis/computed-but-not-delivered.md` — the metis that created step 7b
 3. Identify the PR, branch, and issue being closed
 4. Read the PR description and issue acceptance criteria
-5. Check for CodeRabbit review comments on the PR (`gh api repos/{owner}/{repo}/pulls/<PR-number>/comments`)
+5. Check for CodeRabbit review comments on the PR (`gh api repos/{owner}/{repo}/pulls/<PR-number>/comments`). Note: CodeRabbit only reviews non-draft PRs, so comments may not exist yet during pre-flight if the PR is still a draft.
 
-## The 11 Steps
+## The 12 Steps
 
 ### 1. /review
 
@@ -102,6 +102,16 @@ Address and plausibly fix ALL findings from review, dissent, AND CodeRabbit. No 
 - **CodeRabbit PR review** — read all CodeRabbit comments with `gh pr view <PR> --comments` or `gh api repos/{owner}/{repo}/pulls/<PR>/comments`. CodeRabbit posts automated code review comments on every push. Treat these the same as review/dissent findings: fix, or explicitly mark N/A with reasoning.
 
 If nothing to fix across all three sources, skip. Otherwise commit with descriptive messages.
+
+### 3b. Mark PR ready for review
+
+After fixing all findings, mark the PR as ready for review. This triggers smoke tests and CodeRabbit review in CI (both are gated behind `draft == false`).
+
+```bash
+gh pr ready <PR>
+```
+
+Wait briefly for CodeRabbit to start its review, then continue with the remaining steps. CodeRabbit findings will be addressed in step 6 (Resolve TODOs) if any arrive during the pipeline run.
 
 ### 4. Adversarial test
 
@@ -232,6 +242,7 @@ gh pr merge <PR-number> --squash --delete-branch
 | Step | Question |
 |------|----------|
 | Review + Dissent | Is the code correct? |
+| Mark ready | Trigger smoke tests + CodeRabbit review |
 | Adversarial test | What breaks under pressure? |
 | Merit assessment | Does this deliver outcome value? |
 | Resolve TODOs | Is everything accounted for? |
