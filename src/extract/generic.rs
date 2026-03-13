@@ -77,6 +77,10 @@ pub struct LangConfig {
     /// Examples: `["decorator"]` (Python/TS), `["attribute_item"]` (Rust),
     /// `["annotation"]` (Java/Kotlin). Empty slice = no decorator extraction.
     pub decorator_node_kinds: &'static [&'static str],
+    /// Tree-sitter node kind for generic type parameters (e.g. `<T: Display>`).
+    /// Most languages use `"type_parameters"`, Go uses `"type_parameter_list"`.
+    /// None = skip type parameter extraction for this language.
+    pub type_param_node_kind: Option<&'static str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +236,26 @@ fn collect_nodes(
                 let decorators = collect_decorators(node, source, config);
                 if !decorators.is_empty() {
                     metadata.insert("decorators".to_string(), decorators);
+                }
+            }
+
+            // Generic type parameter extraction.
+            if let Some(tp_kind) = config.type_param_node_kind {
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i as u32) {
+                        if child.kind() == tp_kind {
+                            if let Ok(text) = child.utf8_text(source) {
+                                let text = text.trim();
+                                if !text.is_empty() {
+                                    metadata.insert(
+                                        "type_params".to_string(),
+                                        text.to_string(),
+                                    );
+                                }
+                            }
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -2096,5 +2120,188 @@ public class UserController {
             "plain() should NOT inherit @Override from handle(), got: {:?}",
             plain.metadata.get("decorators")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Type parameters extraction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_type_params_rust_generic_struct() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "pub struct Container<T: Clone + Send> {\n    value: T,\n}\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let container = result.nodes.iter().find(|n| n.id.name == "Container").unwrap();
+        let tp = container.metadata.get("type_params").expect("Should have type_params");
+        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
+        assert!(tp.contains("Clone"), "type_params should contain Clone bound, got: {}", tp);
+        assert!(tp.contains("Send"), "type_params should contain Send bound, got: {}", tp);
+    }
+
+    #[test]
+    fn test_type_params_rust_generic_function() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "pub fn process<T: Display + Send>(item: T) -> String {\n    item.to_string()\n}\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "process").unwrap();
+        let tp = func.metadata.get("type_params").expect("Should have type_params");
+        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
+        assert!(tp.contains("Display"), "type_params should contain Display bound, got: {}", tp);
+        assert!(tp.contains("Send"), "type_params should contain Send bound, got: {}", tp);
+    }
+
+    #[test]
+    fn test_type_params_rust_multiple_params() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "pub fn merge<K: Ord, V: Clone>(a: Map<K, V>, b: Map<K, V>) -> Map<K, V> {\n    a\n}\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "merge").unwrap();
+        let tp = func.metadata.get("type_params").expect("Should have type_params");
+        assert!(tp.contains("K"), "type_params should contain K, got: {}", tp);
+        assert!(tp.contains("V"), "type_params should contain V, got: {}", tp);
+        assert!(tp.contains("Ord"), "type_params should contain Ord, got: {}", tp);
+    }
+
+    #[test]
+    fn test_type_params_rust_no_generics() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "pub fn plain(x: i32) -> i32 {\n    x\n}\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "plain").unwrap();
+        assert!(
+            func.metadata.get("type_params").is_none(),
+            "Non-generic function should not have type_params"
+        );
+    }
+
+    #[test]
+    fn test_type_params_rust_trait() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "pub trait Converter<From, To> {\n    fn convert(&self, input: From) -> To;\n}\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let trait_node = result.nodes.iter().find(|n| n.id.name == "Converter").unwrap();
+        let tp = trait_node.metadata.get("type_params").expect("Should have type_params");
+        assert!(tp.contains("From"), "type_params should contain From, got: {}", tp);
+        assert!(tp.contains("To"), "type_params should contain To, got: {}", tp);
+    }
+
+    #[test]
+    fn test_type_params_rust_enum() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "pub enum Result<T, E> {\n    Ok(T),\n    Err(E),\n}\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let enum_node = result.nodes.iter().find(|n| n.id.name == "Result").unwrap();
+        let tp = enum_node.metadata.get("type_params").expect("Should have type_params");
+        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
+        assert!(tp.contains("E"), "type_params should contain E, got: {}", tp);
+    }
+
+    #[test]
+    fn test_type_params_rust_type_alias() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "pub type Result<T> = std::result::Result<T, MyError>;\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let alias = result.nodes.iter().find(|n| n.id.name == "Result").unwrap();
+        let tp = alias.metadata.get("type_params").expect("Should have type_params");
+        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
+    }
+
+    #[test]
+    fn test_type_params_typescript_generic_function() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let code = "function identity<T>(arg: T): T {\n    return arg;\n}\n";
+        let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
+            .run(Path::new("test.ts"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "identity").unwrap();
+        let tp = func.metadata.get("type_params").expect("TS function should have type_params");
+        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
+    }
+
+    #[test]
+    fn test_type_params_typescript_generic_interface() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let code = "interface Repository<T extends Entity> {\n    find(id: string): T;\n}\n";
+        let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
+            .run(Path::new("test.ts"), code)
+            .unwrap();
+        let iface = result.nodes.iter().find(|n| n.id.name == "Repository").unwrap();
+        let tp = iface.metadata.get("type_params").expect("TS interface should have type_params");
+        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
+        assert!(tp.contains("Entity"), "type_params should contain extends Entity, got: {}", tp);
+    }
+
+    #[test]
+    fn test_type_params_typescript_generic_class() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let code = "class Box<T> {\n    value: T;\n}\n";
+        let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
+            .run(Path::new("test.ts"), code)
+            .unwrap();
+        let class = result.nodes.iter().find(|n| n.id.name == "Box").unwrap();
+        let tp = class.metadata.get("type_params").expect("TS class should have type_params");
+        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
+    }
+
+    #[test]
+    fn test_type_params_java_generic_class() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let code = "class Container<T extends Comparable<T>> {\n    T value;\n}\n";
+        let result = GenericExtractor::new(&JAVA_CONFIG)
+            .run(Path::new("Test.java"), code)
+            .unwrap();
+        let class = result.nodes.iter().find(|n| n.id.name == "Container").unwrap();
+        let tp = class.metadata.get("type_params").expect("Java class should have type_params");
+        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
+        assert!(tp.contains("Comparable"), "type_params should contain bound Comparable, got: {}", tp);
+    }
+
+    #[test]
+    fn test_type_params_java_generic_method() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let code = "class Util {\n    <T> T identity(T item) {\n        return item;\n    }\n}\n";
+        let result = GenericExtractor::new(&JAVA_CONFIG)
+            .run(Path::new("Util.java"), code)
+            .unwrap();
+        let method = result.nodes.iter().find(|n| n.id.name == "identity").unwrap();
+        let tp = method.metadata.get("type_params").expect("Java method should have type_params");
+        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
+    }
+
+    #[test]
+    fn test_type_params_go_generic_function() {
+        use crate::extract::configs::GO_CONFIG;
+        let code = "package main\n\nfunc Map[T any, U any](items []T, f func(T) U) []U {\n    return nil\n}\n";
+        let result = GenericExtractor::new(&GO_CONFIG)
+            .run(Path::new("test.go"), code)
+            .unwrap();
+        let func = result.nodes.iter().find(|n| n.id.name == "Map").unwrap();
+        let tp = func.metadata.get("type_params").expect("Go function should have type_params");
+        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
+        assert!(tp.contains("U"), "type_params should contain U, got: {}", tp);
+    }
+
+    #[test]
+    fn test_type_params_no_generics_languages() {
+        // Languages without generics should have type_param_node_kind = None
+        use crate::extract::configs::{JAVASCRIPT_CONFIG, LUA_CONFIG, RUBY_CONFIG, BASH_CONFIG};
+        assert!(JAVASCRIPT_CONFIG.type_param_node_kind.is_none());
+        assert!(LUA_CONFIG.type_param_node_kind.is_none());
+        assert!(RUBY_CONFIG.type_param_node_kind.is_none());
+        assert!(BASH_CONFIG.type_param_node_kind.is_none());
     }
 }

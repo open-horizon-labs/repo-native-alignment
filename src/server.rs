@@ -3419,6 +3419,9 @@ fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> Stri
             let sig_first_line = n.signature.lines().next().unwrap_or(&n.signature);
             entry.push_str(&format!(" `{}`", sig_first_line));
         }
+        if let Some(tp) = n.metadata.get("type_params") {
+            entry.push_str(&format!(" {}", tp));
+        }
         if let Some(decorators) = n.metadata.get("decorators") {
             entry.push_str(&format!(" [{}]", decorators));
         }
@@ -3458,6 +3461,9 @@ fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> Stri
         );
         if !n.signature.is_empty() {
             entry.push_str(&format!("\n  Sig: `{}`", n.signature));
+        }
+        if let Some(tp) = n.metadata.get("type_params") {
+            entry.push_str(&format!("\n  Type params: {}", tp));
         }
         if let Some(decorators) = n.metadata.get("decorators") {
             entry.push_str(&format!("\n  Decorators: {}", decorators));
