@@ -12,16 +12,16 @@ An MCP server that gives coding agents what LSP alone can't: a cross-language co
 
 - "Find functions related to payment processing" → `oh_search_context("payment processing", include_code=true)` → ranked results, production code before tests, searched by meaning across function bodies, docs, and commit history
 - "How does scanning work?" → `oh_search_context("scanning", include_code=true, include_markdown=true)` → implementation code and doc sections together
-- "Where is the authentication handler?" → `search_symbols("AuthHandler")` → file, line, signature, complexity, graph edges
-- "What are the riskiest functions?" → `search_symbols(query="", min_complexity=20, sort="complexity")` → hotspots ranked by cyclomatic complexity
+- "Where is the authentication handler?" → `search("AuthHandler")` → file, line, signature, complexity, graph edges
+- "What are the riskiest functions?" → `search(query="", min_complexity=20, sort_by="complexity")` → hotspots ranked by cyclomatic complexity
 - "What are the most important symbols?" → `search(sort_by="importance")` → top symbols ranked by PageRank
 - "Give me a map of this repo" → `repo_map()` → top symbols, hotspot files, active outcomes, entry points
 
 ### See the blast radius of a change
 
-- "What depends on the database connection pool?" → `graph_query(query="database connection pool", mode="impact")` → transitive dependents across languages, one call
-- "What calls AuthHandler?" → `graph_query(query="AuthHandler", direction="incoming")` → callers, implementors
-- "Find all trait implementors" → `graph_query(query="Enricher trait", edge_types=["implements"])` → concrete types with compiler-grade edges
+- "What depends on the database connection pool?" → `search(query="database connection pool", mode="impact")` → transitive dependents across languages, one call
+- "What calls AuthHandler?" → `search(query="AuthHandler", mode="neighbors", direction="incoming")` → callers, implementors
+- "Find all trait implementors" → `search(query="Enricher trait", mode="neighbors", edge_types=["implements"])` → concrete types with compiler-grade edges
 
 ### Connect code to business outcomes
 
@@ -42,7 +42,7 @@ callHierarchy/incomingCalls(Worker)           → [Scheduler]
 
 **RNA: 1 request**
 ```
-graph_query(query="ConnectionPool", mode="impact", max_hops=3)
+search(query="ConnectionPool", mode="impact", max_hops=3)
 → PoolManager → AppConfig
 → HttpServer → main, Router
 → Worker → Scheduler
@@ -51,11 +51,11 @@ graph_query(query="ConnectionPool", mode="impact", max_hops=3)
 
 | Question | LSP alone | RNA |
 |---|---|---|
-| What breaks if I change the connection pool? | N round-trips of `incomingCalls`, agent assembles graph | `graph_query(mode="impact")` — one call, transitive |
+| What breaks if I change the connection pool? | N round-trips of `incomingCalls`, agent assembles graph | `search(mode="impact")` — one call, transitive |
 | Find code related to payment processing | No semantic search — agent must guess names and grep | `oh_search_context(include_code=true)` — ranked by meaning |
 | How is our reliability outcome progressing? | Not possible — LSP has no business context | `outcome_progress("reliability")` — commits → files → symbols |
 
-LSP gives agents single-symbol, single-hop, single-language queries. There's no multi-hop primitive. RNA runs those same LSP servers internally, fuses their data with tree-sitter, embedded function bodies, git history, and business artifacts into a cross-language graph. Early testing: ~50s and ~half the tokens vs ~120s for the same structural questions with LSP alone.
+LSP gives agents single-symbol, single-hop, single-language queries. There's no multi-hop primitive. RNA runs those same LSP servers internally, fuses their data with tree-sitter, embedded function bodies, git history, and business artifacts into a cross-language graph.
 
 ## Quick Start
 
@@ -124,9 +124,9 @@ For HTTP transport: `repo-native-alignment --repo . --transport http --port 8382
 Before wiring up MCP, evaluate RNA directly from the terminal:
 
 ```bash
-repo-native-alignment search "auth" --repo /path/to/your/project
+repo-native-alignment scan --repo /path/to/your/project --full   # build full index
+repo-native-alignment search "auth" --repo /path/to/your/project  # search symbols
 repo-native-alignment graph --node "<stable-id-from-search>" --mode impact --repo .
-repo-native-alignment scan --path /path/to/your/project
 ```
 
 ### 2. Set up a project
@@ -149,7 +149,15 @@ Install OH Skills ([see instructions](https://github.com/open-horizon-labs/skill
 
 This explores your codebase, asks about your aims, writes `AGENTS.md`, scaffolds `.oh/` with outcomes and constraints, and installs phase agents. RNA tools are automatically detected and used during exploration if installed.
 
-### 4. Verify the pipeline
+### 4. Build the index
+
+```bash
+repo-native-alignment scan --repo /path/to/your/project --full
+```
+
+Runs the complete pipeline with visible output: scan → extract → embed → LSP enrich → graph. Shows timing and edge counts for each phase. Recommended before first MCP session so agents start with a warm index including LSP call edges.
+
+### 5. Verify the pipeline
 
 ```bash
 repo-native-alignment test --repo /path/to/your/project
@@ -157,29 +165,47 @@ repo-native-alignment test --repo /path/to/your/project
 
 Runs 25 checks end-to-end. Exits 0 on pass, 1 on failure. Safe to run in CI.
 
-### 5. Start working
+### 6. Start working
 
-The system compounds from here. Agents use `oh_search_context` to discover relevant context, `search_symbols` to explore code, and write learnings to `.oh/metis/`. Each session starts richer than the last.
+The system compounds from here. Agents use `oh_search_context` to discover relevant context, `search` to explore code and traverse the graph, and write learnings to `.oh/metis/`. Each session starts richer than the last.
 
 ## MCP Tools
 
 | Tool | What it's for |
 |------|--------------|
-| `oh_search_context` | Find relevant context by meaning: search .oh/ artifacts, commits, code, and markdown in one query |
-| `search_symbols` | Find code symbols by name, signature, or complexity. Filter by kind, language, file, min_complexity. Sort by relevance, complexity, or importance (PageRank) |
-| `graph_query` | Trace code relationships: what calls this, what depends on it, what's reachable |
-| `repo_map` | Repository orientation: top symbols by PageRank importance, hotspot files, active outcomes, entry points |
-| `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols |
+| `search` | Unified code search + graph traversal. Flat search by name/signature, or graph traversal with `mode` (neighbors, impact, reachable, tests_for). Supports `compact: true` (~25x fewer tokens), batch retrieval via `nodes: [...]`, and sorting by relevance, complexity, or importance (PageRank). |
+| `oh_search_context` | Find relevant context by meaning: search .oh/ artifacts, commits, code, and markdown in one query. Hybrid BM25 + vector scoring. |
+| `repo_map` | Repository orientation: top symbols by PageRank importance, hotspot files, active outcomes, entry points. One call replaces an exploratory loop. |
+| `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols. Optional `include_impact: true` for risk-classified blast radius. |
 | `list_roots` | Show which workspace roots are configured and their scan status |
+
+> **Note:** `search_symbols` and `graph_query` still work as deprecated aliases for `search`.
 
 **Root scoping:** All query tools default to the primary workspace root (`--repo`). Pass `root: "all"` for cross-root search, or `root: "<slug>"` for a specific root. Non-code roots (.oh/ artifacts, commits, Notes) always pass through regardless of root filter.
 
-### Plugin Skills
+### CLI ↔ MCP Equivalence
 
-| Skill | What it does |
-|-------|-------------|
-| `/rna-mcp:setup` | Download binary, configure MCP, update AGENTS.md |
-| `/rna-mcp:record` | Record business artifacts (metis, signals, guardrails, outcome updates) with frontmatter templates |
+CLI and MCP share the same index. Run `scan --full` from the CLI to build the complete graph (including LSP call edges), then query via either interface. A pre-built index means the MCP server starts with warm data — no cold-start delay.
+
+```bash
+# Build the full index (visible, verifiable)
+rna scan --repo . --full
+
+# Then query via CLI...
+rna search "auth" --repo .
+rna graph --node "<id>" --mode impact --repo .
+
+# ...or via MCP (same data, same results)
+search(query="auth")
+search(node="<id>", mode="impact")
+```
+
+| CLI | MCP | What it does |
+|-----|-----|-------------|
+| `search "auth"` | `search(query="auth")` | Find symbols by name |
+| `graph --node <id> --mode neighbors` | `search(node="<id>", mode="neighbors")` | Graph traversal |
+| `scan --full` | *(runs automatically on first query)* | Full pipeline: scan → extract → embed → LSP → graph |
+| `test` | — | 25 pipeline checks end-to-end |
 
 ### CLI Subcommands
 
@@ -187,13 +213,18 @@ The system compounds from here. Agents use `oh_search_context` to discover relev
 |---------|-------------|
 | `search <query>` | Search symbols by name/signature, filter by kind/language/file |
 | `graph --node <id> --mode <mode>` | Traverse neighbors, impact analysis, or reachability |
-| `scan --repo <dir>` | Scan + extract + persist (fast, no LSP) |
-| `scan --repo <dir> --full` | Full pipeline: scan + extract + embed + LSP enrich + graph |
+| `scan --repo <dir>` | Scan + extract + embed + persist |
+| `scan --repo <dir> --full` | Full pipeline including LSP enrichment, with visible phase-by-phase output |
 | `stats --repo <dir>` | Show repo stats from persisted index (no re-scan) |
 | `test --repo <dir>` | Run 25 pipeline checks end-to-end |
 | `setup --project <dir>` | Bootstrap RNA + OH MCP + skills for a project |
 
-**Logging:** Add `--log-path <file>` or set `RNA_LOG_FILE` to write logs to a file (in addition to stderr). Useful for MCP server mode where stderr is the transport channel.
+### Plugin Skills
+
+| Skill | What it does |
+|-------|-------------|
+| `/rna-mcp:setup` | Download binary, configure MCP, update AGENTS.md |
+| `/rna-mcp:record` | Record business artifacts (metis, signals, guardrails, outcome updates) with frontmatter templates |
 
 ## The `.oh/` Directory
 
@@ -232,7 +263,7 @@ RNA works standalone. These add organizational context and workflow structure:
 
 ## Status
 
-Tree-sitter + LSP enrichment, 5 MCP tools, 6 CLI subcommands, 370+ tests. Ships as a Claude Code plugin.
+Tree-sitter + pipelined LSP enrichment, 5 MCP tools, 7 CLI subcommands, 690+ tests. Ships as a Claude Code plugin. CLI and MCP share the same index — `scan --full` builds it visibly, MCP serves it to agents.
 
 ### Platform Support
 
