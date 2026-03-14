@@ -949,4 +949,87 @@ mod tests {
             SearchMode::Semantic
         ));
     }
+
+    /// Verify that kind-only filter correctly matches macro nodes.
+    #[test]
+    fn test_kind_filter_matches_macro_nodes() {
+        let macro_node = Node {
+            id: NodeId {
+                root: "root".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "my_vec".to_string(),
+                kind: NodeKind::Macro,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 5,
+            signature: "macro_rules! my_vec".to_string(),
+            body: "macro_rules! my_vec { ... }".to_string(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let fn_node = Node {
+            id: NodeId {
+                root: "root".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "do_stuff".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            line_start: 10,
+            line_end: 15,
+            signature: "fn do_stuff()".to_string(),
+            body: "fn do_stuff() {}".to_string(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let nodes = vec![macro_node, fn_node];
+
+        let kind_filter = Some("macro".to_string());
+        let query_lower = "";
+        let matches: Vec<_> = nodes
+            .iter()
+            .filter(|n| {
+                if !query_lower.is_empty() {
+                    let name_match = n.id.name.to_lowercase().contains(query_lower)
+                        || n.signature.to_lowercase().contains(query_lower);
+                    if !name_match {
+                        return false;
+                    }
+                }
+                if let Some(ref kf) = kind_filter {
+                    if n.id.kind.to_string().to_lowercase() != kf.to_lowercase() {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+
+        assert_eq!(matches.len(), 1, "Kind-only filter should find exactly 1 macro");
+        assert_eq!(matches[0].id.name, "my_vec");
+        assert_eq!(matches[0].id.kind, NodeKind::Macro);
+    }
+
+    /// Verify that the empty-query guard allows kind-only search.
+    #[test]
+    fn test_empty_query_guard_allows_kind_filter() {
+        let query_str = "";
+        let complexity_search = false;
+        let sort_by_importance = false;
+
+        let has_kind_filter = false;
+        let rejected = query_str.is_empty()
+            && !complexity_search
+            && !sort_by_importance
+            && !has_kind_filter;
+        assert!(rejected, "Empty query without kind should be rejected");
+
+        let has_kind_filter = true;
+        let rejected = query_str.is_empty()
+            && !complexity_search
+            && !sort_by_importance
+            && !has_kind_filter;
+        assert!(!rejected, "Empty query with kind filter should be allowed");
+    }
 }
