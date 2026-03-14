@@ -28,7 +28,9 @@ use rust_mcp_sdk::schema::{
 
 use crate::embed::EmbeddingIndex;
 use crate::extract::{ExtractorRegistry, EnricherRegistry};
-use crate::graph::{Edge, Node, NodeKind};
+#[cfg(test)]
+use crate::graph::NodeKind;
+use crate::graph::{Edge, Node};
 use crate::graph::index::GraphIndex;
 use crate::graph::store::SCHEMA_VERSION;
 use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
@@ -38,9 +40,7 @@ use crate::{git, oh};
 use arc_swap::ArcSwap;
 use tokio::sync::RwLock;
 
-use helpers::{
-    parse_args, text_result,
-};
+use helpers::parse_args;
 use store::{
     delete_nodes_for_roots, get_stored_root_ids,
 };
@@ -128,21 +128,14 @@ impl RnaHandler {
     }
 
     /// Check whether a node passes the root filter.
-    /// Non-code roots (Notes, General, Custom) and "external" always pass.
+    /// Delegates to the canonical implementation in `crate::service`.
     pub(crate) fn node_passes_root_filter(
         &self,
         node_root: &str,
         root_filter: &Option<String>,
         non_code_slugs: &std::collections::HashSet<String>,
     ) -> bool {
-        match root_filter {
-            None => true, // "all" mode
-            Some(slug) => {
-                node_root.eq_ignore_ascii_case(slug)
-                    || node_root == "external"
-                    || non_code_slugs.contains(node_root)
-            }
-        }
+        crate::service::node_passes_root_filter(node_root, root_filter, non_code_slugs)
     }
 
     /// Ensure graph is built, check for file changes since last scan.
