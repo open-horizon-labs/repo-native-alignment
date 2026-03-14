@@ -187,10 +187,13 @@ The system compounds from here. Agents use `oh_search_context` to discover relev
 |---------|-------------|
 | `search <query>` | Search symbols by name/signature, filter by kind/language/file |
 | `graph --node <id> --mode <mode>` | Traverse neighbors, impact analysis, or reachability |
-| `scan --path <dir>` | Full scan + extract + embed + persist |
+| `scan --repo <dir>` | Scan + extract + persist (fast, no LSP) |
+| `scan --repo <dir> --full` | Full pipeline: scan + extract + embed + LSP enrich + graph |
 | `stats --repo <dir>` | Show repo stats from persisted index (no re-scan) |
 | `test --repo <dir>` | Run 25 pipeline checks end-to-end |
 | `setup --project <dir>` | Bootstrap RNA + OH MCP + skills for a project |
+
+**Logging:** Add `--log-path <file>` or set `RNA_LOG_FILE` to write logs to a file (in addition to stderr). Useful for MCP server mode where stderr is the transport channel.
 
 ## The `.oh/` Directory
 
