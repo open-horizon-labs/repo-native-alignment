@@ -6,6 +6,7 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -125,7 +126,7 @@ jobs:
   # M4-optimized build runs first (this is what developers install).
   # Warms sccache for the M1 baseline build that follows.
   build-release-fast:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: namespace-profile-tahoe
     timeout-minutes: 60
 
