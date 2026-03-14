@@ -1632,30 +1632,9 @@ impl RnaHandler {
             }
         }
 
-        // Re-embed .oh/ artifacts on every incremental update.
-        // reindex_nodes only handles code graph nodes; artifact embeddings
-        // (outcomes, signals, guardrails, metis) are loaded separately via
-        // load_oh_artifacts and need their own upsert path.
-        // Always call reindex_artifacts() -- the BLAKE3 content hash check
-        // inside ensures unchanged artifacts are skipped cheaply.
-        {
-            let embed_guard3 = self.embed_index.load();
-            if let Some(ref embed_idx) = **embed_guard3 {
-                match embed_idx.reindex_artifacts(&self.repo_root).await {
-                    Ok(count) => {
-                        if count > 0 {
-                            tracing::info!(
-                                "Re-embedded {} .oh/ artifact(s) after incremental update",
-                                count
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to re-embed .oh/ artifacts: {}", e);
-                    }
-                }
-            }
-        }
+        // .oh/ artifacts are now graph nodes (markdown_section with oh_kind metadata).
+        // They're re-embedded through the same reindex_nodes path as code symbols
+        // when their files change -- no separate reindex_artifacts call needed.
 
         // Persist updated graph incrementally -- only the delta (changed/added nodes and edges).
         // Untouched rows remain in LanceDB as-is. Deleted files are removed by targeted delete.
