@@ -96,12 +96,12 @@ The `skipped` count and adoption rate are the most important metrics. A pipeline
 
 | Need | RNA tool to try FIRST | Grep/Read is friction if... |
 |------|----------------------|---------------------------|
-| Find code by intent | `oh_search_context(query)` | You Grep for keywords instead |
+| Find code by intent | `search(query)` | You Grep for keywords instead |
 | Find symbols by name/kind | `search_symbols(query, kind, ...)` | You Grep for `fn `, `struct `, `impl ` |
 | Trace dependencies | `graph_query(node, mode: "neighbors")` | You Read imports manually |
 | Assess blast radius | `graph_query(node, mode: "impact")` | You guess from file structure |
 | Check outcome alignment | `outcome_progress(outcome_id)` | You Read `.oh/outcomes/` manually |
-| Find guardrails | `oh_search_context(query, artifact_types: ["guardrail"])` | You Grep `.oh/guardrails/` |
+| Find guardrails | `search(query, artifact_types=["guardrail"])` | You Grep `.oh/guardrails/` |
 | Understand a function's role | `graph_query(node, mode: "neighbors")` | You Read the file and scan context |
 
 **The rule:** Try the RNA tool first. If it doesn't work, use whatever does — but log why. If you don't try it, log why not.

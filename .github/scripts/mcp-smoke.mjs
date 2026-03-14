@@ -72,8 +72,8 @@ try {
   assertNonEmpty("listTools returns tools", tools);
 
   const requiredTools = new Set([
-    "oh_search_context",
     "outcome_progress",
+    "search",
     "search_symbols",
     "graph_query",
     "list_roots",
@@ -86,25 +86,31 @@ try {
       pass(`required tool present: ${name}`);
     }
   }
+  // Verify oh_search_context is removed
+  if (seen.has("oh_search_context")) {
+    fail("oh_search_context should be removed", "tool still present in listTools");
+  } else {
+    pass("oh_search_context correctly removed from tool list");
+  }
 
-  // ── 2. oh_search_context ────────────────────────────────────────────────
-  console.log("\n── oh_search_context ──");
+  // ── 2. search (with artifacts) ──────────────────────────────────────────
+  console.log("\n── search (artifacts) ──");
   const searchCtxResult = await client.callTool({
-    name: "oh_search_context",
-    arguments: { query: "agent alignment", limit: 3 },
+    name: "search",
+    arguments: { query: "agent alignment", include_artifacts: true, include_markdown: false, top_k: 3 },
   });
   const searchCtxText = extractText(searchCtxResult);
   // At least one result section should appear; accept empty gracefully only if
   // the repo has no .oh/ artifacts at all.
-  if (searchCtxText.includes("No results found")) {
+  if (searchCtxText.includes("No results matching")) {
     // Tolerate empty result on a minimal fixture, but log it.
-    console.log("  [SKIP] oh_search_context: no results (repo may lack .oh/ artifacts)");
+    console.log("  [SKIP] search (artifacts): no results (repo may lack .oh/ artifacts)");
   } else {
     assertNonEmpty(
-      "oh_search_context returns content",
+      "search (artifacts) returns content",
       searchCtxText.length > 0 ? [searchCtxText] : [],
     );
-    pass("oh_search_context returned non-empty response");
+    pass("search (artifacts) returned non-empty response");
   }
 
   // ── 4. search_symbols ───────────────────────────────────────────────────

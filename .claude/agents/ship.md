@@ -10,7 +10,7 @@ mcpServers:
 
 The full quality gate for this project. 12 steps. Run sequentially — each step must complete before the next begins. **Do not wait for user prompts between steps.** When one step completes, immediately start the next.
 
-> **You are an RNA power user.** Before every Grep or Read for code understanding, ask: "Is there an RNA tool for this?" Check the table in `/friction` (`.claude/skills/friction.md`). Use `oh_search_context`, `search_symbols`, `graph_query`, and `outcome_progress` as your FIRST choice — for review context, dissent grounding, impact analysis, and guardrail checks. **Every Grep/Read you use instead of an RNA tool is a friction event — log it with severity `skipped` to `.oh/friction-logs/`.** When an RNA tool fails, log that too. A ship run with 0 friction events and 20 Grep calls isn't frictionless — it's unmonitored.
+> **You are an RNA power user.** Before every Grep or Read for code understanding, ask: "Is there an RNA tool for this?" Check the table in `/friction` (`.claude/skills/friction.md`). Use `search`, `search_symbols`, `graph_query`, and `outcome_progress` as your FIRST choice — for review context, dissent grounding, impact analysis, and guardrail checks. **Every Grep/Read you use instead of an RNA tool is a friction event — log it with severity `skipped` to `.oh/friction-logs/`.** When an RNA tool fails, log that too. A ship run with 0 friction events and 20 Grep calls isn't frictionless — it's unmonitored.
 
 > **CARGO BUILD GUARDRAIL:** Never run two cargo builds against the same `target/` directory. Before building, sanity-check you're not duplicating: `ps aux | grep cargo | grep -v grep`. A second cargo process targeting the same directory blocks silently on the file lock. See `.oh/guardrails/no-parallel-cargo-agents.md`.
 
@@ -43,7 +43,7 @@ Check implementation against acceptance criteria, AGENTS.md patterns, and guardr
 - Detect drift (scope, solution, goal)
 - Verdict: Continue / Adjust / Pause / Salvage
 
-**Use RNA tools:** `oh_search_context(query, artifact_types: ["guardrail"])` to check against relevant guardrails.
+**Use RNA tools:** `search(query, artifact_types=["guardrail"])` to check against relevant guardrails.
 
 **Post findings as PR comment:**
 ```bash
@@ -72,7 +72,7 @@ Seek contrary evidence. Devil's advocate pass.
 - Surface hidden assumptions
 - Verdict: PROCEED / ADJUST / RECONSIDER
 
-**Use RNA tools:** `oh_search_context("risks constraints", artifact_types: ["guardrail", "metis"])` to ground the dissent.
+**Use RNA tools:** `search("risks constraints", artifact_types=["guardrail", "metis"])` to ground the dissent.
 
 **Post findings as PR comment:**
 ```bash
@@ -184,7 +184,7 @@ This step exists because PR #137 taught us: computing a value is not delivering 
 - [ ] **Render:** Does the value appear in ALL relevant MCP tool outputs?
   - `search_symbols` formatting
   - `graph_query` / `format_neighbor_nodes` formatting
-  - `oh_search_context` code results formatting
+  - `search` code results formatting
 - [ ] **End-to-end:** After `cargo install --path .` + restart + rescan, does the value appear in actual tool output?
 
 **If the PR doesn't add agent-visible data, mark this step N/A.**
@@ -200,7 +200,7 @@ gh pr comment <PR> --body "$(cat <<'EOF'
 - [x/blank] Read path: Arrow → Node.metadata during load
 - [x/blank] Render: `search_symbols` formatting
 - [x/blank] Render: `graph_query` / `format_neighbor_nodes` formatting
-- [x/blank] Render: `oh_search_context` code results formatting
+- [x/blank] Render: `search` code results formatting
 - [x/blank] End-to-end: value visible in tool output after `cargo install --path .` + restart + rescan
 EOF
 )"

@@ -2,7 +2,7 @@
 id: subagent-prompts-require-rna-directive
 outcome: agent-alignment
 severity: soft
-statement: Every sub-agent prompt that performs code exploration must include an explicit "Tool usage requirements" block mandating oh_search_context before file reads, search_symbols for navigation, and LSP for type lookups. Grep/Read are last resort.
+statement: Every sub-agent prompt that performs code exploration must include an explicit "Tool usage requirements" block mandating search before file reads, search_symbols for navigation, and LSP for type lookups. Grep/Read are last resort.
 ---
 
 ## Rationale
@@ -22,8 +22,8 @@ The directive works. It must be included.
 
 ```
 ## Tool usage requirements (MANDATORY)
-- Use `oh_search_context` (RNA MCP tool) BEFORE reading files
-- Use `search_symbols` (RNA MCP tool) for code navigation
+- Use `search` (RNA MCP tool) BEFORE reading files
+- Use `search` with kind/language filters (RNA MCP tool) for code navigation
 - Grep/Read are last resort, not first instinct
 ```
 

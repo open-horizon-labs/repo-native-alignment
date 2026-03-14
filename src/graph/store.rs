@@ -13,7 +13,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// Bump this whenever ANY schema changes (symbols, edges, pr_merges, file_index).
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
-/// Also surfaced in the index freshness footer on `search_symbols` and `oh_search_context`.
+/// Also surfaced in the index freshness footer on `search`.
 pub const SCHEMA_VERSION: u32 = 9;
 
 /// Arrow schema for the `symbols` table.

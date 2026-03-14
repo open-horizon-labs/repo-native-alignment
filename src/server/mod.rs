@@ -26,7 +26,7 @@ use rust_mcp_sdk::schema::{
     PaginatedRequestParams, RpcError, TextContent,
 };
 
-use crate::embed::{EmbeddingIndex, SearchOutcome};
+use crate::embed::EmbeddingIndex;
 use crate::extract::{ExtractorRegistry, EnricherRegistry};
 use crate::graph::{Edge, Node, NodeKind};
 use crate::graph::index::GraphIndex;
@@ -34,7 +34,7 @@ use crate::graph::store::SCHEMA_VERSION;
 use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
 use crate::scanner::{ScanResult, Scanner};
 use crate::types::OhArtifactKind;
-use crate::{git, markdown, oh, query, ranking};
+use crate::{git, oh, query, ranking};
 use arc_swap::ArcSwap;
 use tokio::sync::RwLock;
 
@@ -42,7 +42,6 @@ use helpers::{
     IMPORTANCE_THRESHOLD,
     parse_args, text_result,
 };
-use handlers::parse_search_mode;
 use store::{
     delete_nodes_for_roots, get_stored_root_ids,
 };
@@ -1681,7 +1680,7 @@ fn build_context_preamble(root: &Path) -> String {
     }
 
     let mut out = format!("---\n# Business Context (auto-injected on first tool call)\n\n{}\n", parts.join("\n"));
-    out.push_str("**Code exploration:** use `search` (not Grep/Read), `oh_search_context` (not search_all). `search_symbols` and `graph_query` are deprecated aliases for `search`.\n");
+    out.push_str("**Code exploration:** use `search` (not Grep/Read) for code symbols, artifacts, commits, and markdown in one call. `search_symbols` and `graph_query` are deprecated aliases for `search`.\n");
     out.push_str("---\n\n");
     out
 }
@@ -1695,7 +1694,6 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
     ) -> Result<ListToolsResult, RpcError> {
         Ok(ListToolsResult {
             tools: vec![
-                OhSearchContext::tool(),
                 OutcomeProgress::tool(),
                 Search::tool(),
                 SearchSymbols::tool(),  // deprecated alias
@@ -1735,199 +1733,6 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
         };
 
         let mut result = match params.name.as_str() {
-            "oh_search_context" => {
-                let args: OhSearchContext = parse_args(params.arguments)?;
-                let query = args.query.trim();
-                if query.is_empty() {
-                    return Ok(text_result("Empty query. Please describe what you're looking for.".into()));
-                }
-                let limit = args.limit.unwrap_or(5) as usize;
-                let include_code = args.include_code.unwrap_or(false);
-                let include_markdown = args.include_markdown.unwrap_or(false);
-                let search_mode = parse_search_mode(args.search_mode.as_deref());
-                let root_filter = self.effective_root_filter(args.root.as_deref());
-                let non_code_slugs = if root_filter.is_some() {
-                    self.non_code_root_slugs()
-                } else {
-                    std::collections::HashSet::new()
-                };
-
-                // Ensure graph is built first so symbols are embedded
-                // (get_graph builds the graph + embeds symbols in the pipeline)
-                let (graph_node_count, graph_last_scan) = match self.get_graph().await {
-                    Ok(guard) => {
-                        if let Some(gs) = guard.as_ref() {
-                            (gs.nodes.len(), gs.last_scan_completed_at)
-                        } else {
-                            (0, None)
-                        }
-                    }
-                    Err(_) => (0, None),
-                };
-
-                let mut sections: Vec<String> = Vec::new();
-
-                // Search .oh/ artifacts + symbols via embedding index.
-                // Lock-free load from ArcSwap — no mutex contention with graph writes.
-                {
-                    let embed_guard = self.embed_index.load();
-                    match embed_guard.as_ref() {
-                        Some(index) => {
-                            match index.search_with_mode(query, args.artifact_types.as_deref(), limit, search_mode).await {
-                                Ok(SearchOutcome::Results(results)) => {
-                                    // Filter by root: code results scoped to effective root,
-                                    // non-code (commits, .oh/ artifacts) always pass through.
-                                    let filtered: Vec<_> = results
-                                        .into_iter()
-                                        .filter(|r| self.search_result_passes_root_filter(r, &root_filter, &non_code_slugs))
-                                        .collect();
-                                    if !filtered.is_empty() {
-                                        let md: String = filtered
-                                            .iter()
-                                            .map(|r| r.to_markdown())
-                                            .collect::<Vec<_>>()
-                                            .join("\n");
-                                        sections.push(format!(
-                                            "### Artifacts ({} result(s))\n\n{}",
-                                            filtered.len(),
-                                            md
-                                        ));
-                                    }
-                                }
-                                Ok(SearchOutcome::NotReady) => {
-                                    sections.push("Embedding index: building — semantic results will appear shortly. Retry in a few seconds.".to_string());
-                                }
-                                Err(e) => sections.push(format!("Artifact search error: {}", e)),
-                            }
-                        }
-                        None => sections.push("Embedding index not yet available".to_string()),
-                    }
-                }
-
-                // Optionally search code symbols from the graph (with 5-tier ranking)
-                if include_code {
-                    if let Ok(guard) = self.get_graph().await {
-                        if let Some(gs) = guard.as_ref() {
-                            let query_lower = query.to_lowercase();
-                            let mut matches: Vec<&Node> = gs.nodes.iter()
-                                .filter(|n| n.id.kind != NodeKind::Import && n.id.root != "external")
-                                .filter(|n| self.node_passes_root_filter(&n.id.root, &root_filter, &non_code_slugs))
-                                .filter(|n| {
-                                    n.id.name.to_lowercase().contains(&query_lower)
-                                        || n.signature.to_lowercase().contains(&query_lower)
-                                })
-                                .collect();
-
-                            // Rank using the shared 5-tier cascade (same logic as search_symbols)
-                            ranking::sort_symbol_matches(&mut matches, &query_lower, &gs.index);
-                            matches.truncate(limit);
-
-                            if !matches.is_empty() {
-                                // Output format intentionally matches search_symbols
-                                // (unordered list with `- **`) for backward compatibility.
-                                // Results are sorted by relevance but use the same bullet
-                                // style so agents parsing the old format are unaffected.
-                                let md = matches.iter()
-                                    .map(|n| {
-                                        let mut line = format!(
-                                            "- **{} {} ({})** ({})\n  `{}`\n  ID: `{}`",
-                                            n.id.kind, n.id.name, n.language,
-                                            n.id.file.display(),
-                                            n.signature,
-                                            n.stable_id(),
-                                        );
-                                        if let Some(cc) = n.metadata.get("cyclomatic") {
-                                            line.push_str(&format!("\n  Complexity: {}", cc));
-                                        }
-                                        if let Some(imp) = n.metadata.get("importance") {
-                                            if let Ok(score) = imp.parse::<f64>() {
-                                                if score > IMPORTANCE_THRESHOLD {
-                                                    line.push_str(&format!("\n  Importance: {:.3}", score));
-                                                }
-                                            }
-                                        }
-                                        line
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n\n");
-                                sections.push(format!(
-                                    "### Code symbols ({} result(s))\n\n{}",
-                                    matches.len(),
-                                    md
-                                ));
-                            }
-                        }
-                    }
-                }
-
-                // Optionally search markdown (with relevance scoring)
-                if include_markdown {
-                    match markdown::extract_markdown_chunks(root) {
-                        Ok(chunks) => {
-                            // Filter chunks by effective root scope (same as code symbols above).
-                            let filtered_chunks: Vec<_> = if let Some(ref slug) = root_filter {
-                                let workspace = WorkspaceConfig::load()
-                                    .with_primary_root(self.repo_root.clone())
-                                    .with_worktrees(&self.repo_root)
-                                    .with_claude_memory(&self.repo_root);
-                                let root_path = workspace.resolved_roots()
-                                    .into_iter()
-                                    .find(|r| r.slug == *slug)
-                                    .map(|r| r.path);
-                                if let Some(rp) = root_path {
-                                    chunks.into_iter()
-                                        .filter(|c| c.file_path.starts_with(&rp))
-                                        .collect()
-                                } else {
-                                    // Slug didn't resolve to a known root — return
-                                    // nothing rather than leaking unscoped markdown.
-                                    Vec::new()
-                                }
-                            } else {
-                                chunks
-                            };
-                            let scored = markdown::search_chunks_ranked(&filtered_chunks, query);
-                            if !scored.is_empty() {
-                                // Backward-compatible format: `- ` bullets, same header
-                                // as before. Score is appended as a parenthetical so
-                                // agents that ignore it are unaffected.
-                                let md = scored
-                                    .iter()
-                                    .take(limit)
-                                    .map(|sc| {
-                                        format!(
-                                            "- (score: {:.2}) {}", sc.score, sc.chunk.to_markdown()
-                                        )
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n\n---\n\n");
-                                sections.push(format!(
-                                    "### Markdown ({} result(s))\n\n{}",
-                                    scored.len().min(limit),
-                                    md
-                                ));
-                            }
-                        }
-                        Err(e) => sections.push(format!("Markdown search error: {}", e)),
-                    }
-                }
-
-                let freshness = format_freshness(graph_node_count, graph_last_scan, Some(&self.lsp_status));
-                if sections.is_empty() {
-                    Ok(text_result(format!(
-                        "No results found matching \"{}\".{}",
-                        query, freshness
-                    )))
-                } else {
-                    Ok(text_result(format!(
-                        "## Semantic search: \"{}\"\n\n{}{}",
-                        query,
-                        sections.join("\n\n"),
-                        freshness
-                    )))
-                }
-            }
-
             "outcome_progress" => {
                 let args: OutcomeProgress = parse_args(params.arguments)?;
                 let include_impact = args.include_impact.unwrap_or(false);

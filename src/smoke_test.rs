@@ -210,26 +210,26 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
         }
     };
 
-    // 6. oh_search_context path — embed search for "main"
+    // 6. search (artifact path) — embed search for "main"
     match &embed_index {
         Some(idx) => {
             match idx.search("main", None, 5).await {
                 Ok(crate::embed::SearchOutcome::Results(results)) if !results.is_empty() => {
-                    checks.push(Check::pass("oh_search_context", format!("{} results for query \"main\"", results.len())));
+                    checks.push(Check::pass("search_artifacts", format!("{} results for query \"main\"", results.len())));
                 }
                 Ok(crate::embed::SearchOutcome::NotReady) => {
-                    checks.push(Check::skip("oh_search_context", "Embedding table not built yet"));
+                    checks.push(Check::skip("search_artifacts", "Embedding table not built yet"));
                 }
                 Ok(_) => {
-                    checks.push(Check::fail("oh_search_context", "Query \"main\" returned 0 results"));
+                    checks.push(Check::fail("search_artifacts", "Query \"main\" returned 0 results"));
                 }
                 Err(e) => {
-                    checks.push(Check::fail("oh_search_context", format!("search() error: {}", e)));
+                    checks.push(Check::fail("search_artifacts", format!("search() error: {}", e)));
                 }
             }
         }
         None => {
-            checks.push(Check::skip("oh_search_context", "Skipped (no embedding index)"));
+            checks.push(Check::skip("search_artifacts", "Skipped (no embedding index)"));
         }
     }
 
@@ -338,8 +338,8 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     // 21. graph_query -- verifies GraphIndex has edges and neighbors() is callable
     checks.push(run_graph_query_check(&index, &all_nodes));
 
-    // 22. oh_search_context (semantic) -- searches for "alignment" in embedding index
-    checks.push(run_oh_search_context_check(&embed_index).await);
+    // 22. search (semantic/artifact) -- searches for "alignment" in embedding index
+    checks.push(run_search_artifact_semantic_check(&embed_index).await);
 
     // 23. Schema version check — write stale version, verify migration, verify no-op on re-check
     checks.push(run_schema_version_check().await);
@@ -1235,14 +1235,14 @@ fn run_head_change_detection_check() -> Check {
     )
 }
 
-/// oh_search_context (semantic) check: searches the embedding index for "alignment"
+/// search (semantic/artifact) check: searches the embedding index for "alignment"
 /// and verifies at least one result is returned from the .oh/ artifacts.
-async fn run_oh_search_context_check(embed_index: &Option<EmbeddingIndex>) -> Check {
+async fn run_search_artifact_semantic_check(embed_index: &Option<EmbeddingIndex>) -> Check {
     let index = match embed_index {
         Some(i) => i,
         None => {
             return Check::skip(
-                "oh_search_context",
+                "search_artifacts_semantic",
                 "EmbeddingIndex not available (fastembed may not be compiled in)",
             );
         }
@@ -1250,17 +1250,17 @@ async fn run_oh_search_context_check(embed_index: &Option<EmbeddingIndex>) -> Ch
 
     match index.search("alignment", None, 5).await {
         Ok(crate::embed::SearchOutcome::NotReady) => {
-            Check::skip("oh_search_context", "Embedding table not built yet — index is still building")
+            Check::skip("search_artifacts_semantic", "Embedding table not built yet — index is still building")
         }
         Ok(crate::embed::SearchOutcome::Results(results)) => {
             if results.is_empty() {
                 Check::skip(
-                    "oh_search_context",
+                    "search_artifacts_semantic",
                     "Semantic search for 'alignment' returned 0 results (index may be empty)",
                 )
             } else {
                 Check::pass(
-                    "oh_search_context",
+                    "search_artifacts_semantic",
                     format!(
                         "Semantic search for 'alignment' returned {} result(s); top: '{}' (score: {:.2})",
                         results.len(),
@@ -1271,7 +1271,7 @@ async fn run_oh_search_context_check(embed_index: &Option<EmbeddingIndex>) -> Ch
             }
         }
         Err(e) => {
-            Check::fail("oh_search_context", format!("Semantic search failed: {}", e))
+            Check::fail("search_artifacts_semantic", format!("Semantic search failed: {}", e))
         }
     }
 }

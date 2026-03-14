@@ -55,30 +55,30 @@ This project IS the RNA MCP server. When working here, use its own tools.
 | `Grep` for symbol names | `search_symbols(query, kind, language, file)` |
 | `Read` to trace function calls | `graph_query(node_id, mode: "neighbors")` |
 | `Grep` for "who calls X" | `graph_query(node_id, mode: "impact")` |
-| `Read` to find .oh/ artifacts | `oh_search_context(query)` |
-| `Bash` with `grep -rn` | `search_symbols` or `oh_search_context` |
+| `Read` to find .oh/ artifacts | `search(query, include_artifacts=true)` |
+| `Bash` with `grep -rn` | `search(query)` — searches code, artifacts, and markdown |
 | Recording learnings/signals | Write to `.oh/metis/`, `.oh/signals/`, `.oh/guardrails/` (YAML frontmatter + markdown) |
-| Searching git history | `git_history(query)` or `git_history(file)` |
+| Searching git history | `search(query)` — returns commits; use `git show <hash>` via Bash for diffs |
 
 **If RNA returns empty results — diagnose before falling back:**
-- Empty `search_symbols` means the symbol isn't indexed OR the query is wrong — try a broader query, different `kind`, or no filters first
-- Empty `oh_search_context` means the index hasn't built yet OR the query is too specific — try simpler terms
+- Empty `search` means the symbol isn't indexed OR the query is wrong — try a broader query, different `kind`, or no filters first
+- Empty artifact results means the embedding index hasn't built yet OR the query is too specific — try simpler terms
 - Do NOT silently fall back to Grep/Read on empty RNA results — that defeats the purpose
 - If the index is genuinely stale, say so explicitly rather than substituting file reads
 
-**7 MCP Tools (read + query only):**
-1. `oh_get_context` -- read all business context (outcomes, signals, guardrails, metis)
-2. `oh_search_context` -- semantic search (.oh/ artifacts, optionally code + markdown)
-3. `outcome_progress` -- structural join for outcome tracking (with optional `include_impact: true` for risk-classified blast radius)
-4. `search_symbols` -- graph-aware code symbol search
-5. `graph_query` -- graph traversal (neighbors, impact, reachable)
-6. `list_roots` -- workspace root management
+**6 MCP Tools (read + query only):**
+1. `search` -- all-in-one: code symbols, .oh/ artifacts, commits, markdown, and graph traversal
+2. `outcome_progress` -- structural join for outcome tracking (with optional `include_impact: true` for risk-classified blast radius)
+3. `search_symbols` -- DEPRECATED alias for `search` (flat mode)
+4. `graph_query` -- DEPRECATED alias for `search` (with mode)
+5. `list_roots` -- workspace root management
+6. `repo_map` -- repository orientation (top symbols, hotspots, outcomes, entry points)
 
 **Writing business artifacts:** Write directly to `.oh/` using the Write tool. See `.oh/metis/`, `.oh/signals/`, `.oh/guardrails/` for frontmatter templates.
 
 **Workflow:**
-- Before starting work: call `oh_get_context` (business context auto-injected on first tool call)
-- Explore code: `search_symbols` -> `graph_query(mode: "neighbors")` -> `graph_query(mode: "impact")`
+- Before starting work: business context is auto-injected on first tool call
+- Explore code: `search("query")` -> `search(query, mode="neighbors")` -> `search(query, mode="impact")`
 - After completing work: write learnings to `.oh/metis/<slug>.md`
 - When checking progress: call `outcome_progress` with `agent-alignment`
 - When discovering constraints: write to `.oh/guardrails/<slug>.md`
