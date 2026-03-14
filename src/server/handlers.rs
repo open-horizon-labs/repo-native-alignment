@@ -44,11 +44,6 @@ impl RnaHandler {
         if args.mode.is_some() {
             // ── Graph traversal path ──────────────────────────────────
             self.handle_search_traversal(&args, query, node, compact).await
-        } else if query.is_none() && node.is_some() {
-            // ── Node lookup path ────────────────────────────────────
-            // `node` without `mode` or `query` → treat as single-node batch retrieval.
-            let node_ids = vec![node.unwrap()];
-            self.handle_search_batch(&node_ids, compact, &args).await
         } else {
             // ── Flat search path ──────────────────────────────────────
             self.handle_search_flat(&args, query, compact).await
