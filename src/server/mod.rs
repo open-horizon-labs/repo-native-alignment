@@ -28,20 +28,19 @@ use rust_mcp_sdk::schema::{
 
 use crate::embed::EmbeddingIndex;
 use crate::extract::{ExtractorRegistry, EnricherRegistry};
-use crate::graph::{Edge, Node, NodeKind};
+#[cfg(test)]
+use crate::graph::NodeKind;
+use crate::graph::{Edge, Node};
 use crate::graph::index::GraphIndex;
 use crate::graph::store::SCHEMA_VERSION;
 use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
 use crate::scanner::{ScanResult, Scanner};
 use crate::types::OhArtifactKind;
-use crate::{git, oh, query, ranking};
+use crate::{git, oh};
 use arc_swap::ArcSwap;
 use tokio::sync::RwLock;
 
-use helpers::{
-    IMPORTANCE_THRESHOLD,
-    parse_args, text_result,
-};
+use helpers::parse_args;
 use store::{
     delete_nodes_for_roots, get_stored_root_ids,
 };
@@ -129,43 +128,14 @@ impl RnaHandler {
     }
 
     /// Check whether a node passes the root filter.
-    /// Non-code roots (Notes, General, Custom) and "external" always pass.
+    /// Delegates to the canonical implementation in `crate::service`.
     pub(crate) fn node_passes_root_filter(
         &self,
         node_root: &str,
         root_filter: &Option<String>,
         non_code_slugs: &std::collections::HashSet<String>,
     ) -> bool {
-        match root_filter {
-            None => true, // "all" mode
-            Some(slug) => {
-                node_root.eq_ignore_ascii_case(slug)
-                    || node_root == "external"
-                    || non_code_slugs.contains(node_root)
-            }
-        }
-    }
-
-    /// Check whether an embedding `SearchResult` passes the root filter.
-    /// Code results (`kind` starts with "code:") are filtered by root slug
-    /// extracted from the stable ID prefix. Non-code results (commits, .oh/
-    /// artifacts) always pass through.
-    pub(crate) fn search_result_passes_root_filter(
-        &self,
-        result: &crate::embed::SearchResult,
-        root_filter: &Option<String>,
-        non_code_slugs: &std::collections::HashSet<String>,
-    ) -> bool {
-        if root_filter.is_none() {
-            return true; // "all" mode
-        }
-        // Non-code results (commits, oh artifacts) always pass
-        if !result.kind.starts_with("code:") {
-            return true;
-        }
-        // Extract root slug from stable ID: "root:file:name:kind"
-        let node_root = result.id.split(':').next().unwrap_or("");
-        self.node_passes_root_filter(node_root, root_filter, non_code_slugs)
+        crate::service::node_passes_root_filter(node_root, root_filter, non_code_slugs)
     }
 
     /// Ensure graph is built, check for file changes since last scan.
@@ -1840,303 +1810,33 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
         let mut result = match params.name.as_str() {
             "outcome_progress" => {
                 let args: OutcomeProgress = parse_args(params.arguments)?;
-                let include_impact = args.include_impact.unwrap_or(false);
-                let root_filter = self.effective_root_filter(args.root.as_deref());
-                let non_code_slugs = if root_filter.is_some() {
-                    self.non_code_root_slugs()
-                } else {
-                    std::collections::HashSet::new()
-                };
-                let graph_nodes = if let Ok(guard) = self.get_graph().await {
-                    guard.as_ref()
-                        .map(|gs| gs.nodes.iter()
-                            .filter(|n| self.node_passes_root_filter(&n.id.root, &root_filter, &non_code_slugs))
-                            .cloned()
-                            .collect())
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                match query::outcome_progress(root, &args.outcome_id, &graph_nodes) {
-                    Ok(result) => {
-                        let mut md = result.to_summary_markdown();
-
-                        // Append PR merge count from the graph
-                        if let Ok(guard) = self.get_graph().await {
-                         if let Some(graph_state) = guard.as_ref() {
-                            let file_patterns: Vec<String> = result
-                                .outcomes
-                                .first()
-                                .and_then(|o| o.frontmatter.get("files"))
-                                .and_then(|v| v.as_sequence())
-                                .map(|seq| {
-                                    seq.iter()
-                                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-
-                            let pr_nodes = query::find_pr_merges_for_outcome(
-                                &graph_state.nodes,
-                                &graph_state.edges,
-                                &args.outcome_id,
-                                &file_patterns,
-                            );
-                            if !pr_nodes.is_empty() {
-                                md.push_str(&format!(
-                                    "\n## PR Merges\n\n{} PR merge(s) serving this outcome\n",
-                                    pr_nodes.len()
-                                ));
-                            }
-
-                            // Append change impact with risk classification
-                            if include_impact && !result.code_symbols.is_empty() {
-                                let impacted = query::compute_impact_risk(
-                                    &result.code_symbols,
-                                    &graph_nodes,
-                                    &graph_state.index,
-                                    3, // max_hops for reverse traversal
-                                );
-                                md.push('\n');
-                                md.push_str(&query::format_impact_markdown(&impacted));
-                            } else if include_impact && result.code_symbols.is_empty() {
-                                md.push_str("\n## Change Impact\n\nNo changed symbols found -- cannot compute blast radius.\n");
-                            }
-                         }
-                        }
-
-                        Ok(text_result(md))
-                    }
-                    Err(e) => Ok(text_result(format!("Error: {}", e))),
-                }
+                self.handle_outcome_progress(args).await
             }
 
-            // ── Deprecated aliases: convert to Search and fall through ──
+            // -- Deprecated aliases --
             "search_symbols" => {
                 let args: SearchSymbols = parse_args(params.arguments)?;
-                let search_args = args.into_search();
-                self.handle_search(search_args).await
+                self.handle_search(args.into_search()).await
             }
-
             "graph_query" => {
                 let args: GraphQuery = parse_args(params.arguments)?;
-                let search_args = args.into_search();
-                self.handle_search(search_args).await
+                self.handle_search(args.into_search()).await
             }
 
-            // ── Unified search tool ──────────────────────────────────────
+            // -- Unified search --
             "search" => {
                 let args: Search = parse_args(params.arguments)?;
                 self.handle_search(args).await
             }
 
             "list_roots" => {
-                let workspace = WorkspaceConfig::load()
-                    .with_primary_root(self.repo_root.clone())
-                    .with_worktrees(&self.repo_root)
-                    .with_claude_memory(&self.repo_root);
-                let resolved = workspace.resolved_roots();
-
-                if resolved.is_empty() {
-                    Ok(text_result("No workspace roots configured.".to_string()))
-                } else {
-                    let md: String = resolved
-                        .iter()
-                        .enumerate()
-                        .map(|(i, r)| {
-                            let primary = if i == 0 { " (primary)" } else { "" };
-                            format!(
-                                "- **{}**{}: `{}` (type: {}, git: {})",
-                                r.slug,
-                                primary,
-                                r.path.display(),
-                                r.config.root_type,
-                                r.config.git_aware,
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    Ok(text_result(format!(
-                        "## Workspace Roots\n\n{} root(s)\n\n{}",
-                        resolved.len(),
-                        md
-                    )))
-                }
+                let _args: ListRoots = parse_args(params.arguments)?;
+                self.handle_list_roots()
             }
 
             "repo_map" => {
                 let args: RepoMap = parse_args(params.arguments)?;
-                let top_n = args.top_n.unwrap_or(15) as usize;
-                let root_filter = self.effective_root_filter(args.root.as_deref());
-                let non_code_slugs = if root_filter.is_some() {
-                    self.non_code_root_slugs()
-                } else {
-                    std::collections::HashSet::new()
-                };
-
-                match self.get_graph().await {
-                    Ok(guard) => {
-                        let graph_state = guard.as_ref().unwrap();
-                        let mut sections: Vec<String> = Vec::new();
-
-                        // 1. Top symbols by importance (weighted PageRank)
-                        {
-                            let mut symbols_with_importance: Vec<(&Node, f64)> = graph_state.nodes.iter()
-                                .filter(|n| !matches!(n.id.kind,
-                                    NodeKind::Import | NodeKind::Module | NodeKind::PrMerge | NodeKind::Field
-                                ))
-                                .filter(|n| n.id.root != "external")
-                                .filter(|n| self.node_passes_root_filter(&n.id.root, &root_filter, &non_code_slugs))
-                                .filter_map(|n| {
-                                    let imp = n.metadata.get("importance")
-                                        .and_then(|s| s.parse::<f64>().ok())
-                                        .unwrap_or(0.0);
-                                    // Demote test-file symbols so they don't crowd the top
-                                    let imp = if ranking::is_test_file(n) { imp * 0.1 } else { imp };
-                                    if imp > IMPORTANCE_THRESHOLD { Some((n, imp)) } else { None }
-                                })
-                                .collect();
-                            symbols_with_importance.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                            symbols_with_importance.truncate(top_n);
-
-                            if !symbols_with_importance.is_empty() {
-                                let md: String = symbols_with_importance.iter()
-                                    .map(|(n, imp)| {
-                                        let mut line = format!(
-                                            "- **{}** `{}` ({}) [{}] `{}`:{}-{} -- importance: {:.3}",
-                                            n.id.kind, n.id.name, n.language,
-                                            n.id.root,
-                                            n.id.file.display(),
-                                            n.line_start, n.line_end,
-                                            imp,
-                                        );
-                                        if let Some(cc) = n.metadata.get("cyclomatic") {
-                                            line.push_str(&format!(", complexity: {}", cc));
-                                        }
-                                        line
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                sections.push(format!(
-                                    "## Top {} symbols by importance\n\n{}",
-                                    symbols_with_importance.len(), md
-                                ));
-                            }
-                        }
-
-                        // 2. Hotspot files (most definitions), qualified by workspace root
-                        {
-                            let mut file_counts: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
-                            for n in &graph_state.nodes {
-                                if matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge | NodeKind::Field) {
-                                    continue;
-                                }
-                                if n.id.root == "external" {
-                                    continue;
-                                }
-                                if !self.node_passes_root_filter(&n.id.root, &root_filter, &non_code_slugs) {
-                                    continue;
-                                }
-                                let key = (n.id.root.clone(), n.id.file.display().to_string());
-                                *file_counts.entry(key).or_default() += 1;
-                            }
-                            let mut sorted_files: Vec<((String, String), usize)> = file_counts.into_iter().collect();
-                            sorted_files.sort_by(|a, b| b.1.cmp(&a.1));
-                            sorted_files.truncate(10);
-
-                            if !sorted_files.is_empty() {
-                                let md: String = sorted_files.iter()
-                                    .map(|((root, f), count)| format!("- [{}] `{}` -- {} definitions", root, f, count))
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                sections.push(format!("## Hotspot files\n\n{}", md));
-                            }
-                        }
-
-                        // 3. Active outcomes
-                        {
-                            let outcomes = oh::load_oh_artifacts(root)
-                                .unwrap_or_default()
-                                .into_iter()
-                                .filter(|a| a.kind == OhArtifactKind::Outcome)
-                                .collect::<Vec<_>>();
-                            if !outcomes.is_empty() {
-                                let md: String = outcomes.iter()
-                                    .map(|o| {
-                                        let files: Vec<String> = o.frontmatter
-                                            .get("files")
-                                            .and_then(|v| v.as_sequence())
-                                            .map(|seq| seq.iter()
-                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                                .collect())
-                                            .unwrap_or_default();
-                                        let files_str = if files.is_empty() {
-                                            String::new()
-                                        } else {
-                                            format!(" (files: {})", files.join(", "))
-                                        };
-                                        format!("- **{}**{}", o.id(), files_str)
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                sections.push(format!("## Active outcomes\n\n{}", md));
-                            }
-                        }
-
-                        // 4. Entry points (main functions, handlers), sorted by importance
-                        {
-                            let mut entry_points: Vec<&Node> = graph_state.nodes.iter()
-                                .filter(|n| n.id.kind == NodeKind::Function && n.id.root != "external")
-                                .filter(|n| self.node_passes_root_filter(&n.id.root, &root_filter, &non_code_slugs))
-                                .filter(|n| {
-                                    let name = n.id.name.to_lowercase();
-                                    name == "main"
-                                        || name.starts_with("handle_")
-                                        || name.starts_with("handler")
-                                        || name.ends_with("_handler")
-                                        || name.contains("endpoint")
-                                })
-                                .collect();
-                            entry_points.sort_by(|a, b| {
-                                let imp_a = a.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-                                let imp_b = b.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-                                imp_b.partial_cmp(&imp_a).unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            entry_points.truncate(10);
-
-                            if !entry_points.is_empty() {
-                                let md: String = entry_points.iter()
-                                    .map(|n| format!(
-                                        "- **{}** [{}] `{}`:{}-{}",
-                                        n.id.name,
-                                        n.id.root,
-                                        n.id.file.display(),
-                                        n.line_start, n.line_end,
-                                    ))
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                sections.push(format!("## Entry points\n\n{}", md));
-                            }
-                        }
-
-                        let freshness = format_freshness(
-                            graph_state.nodes.len(),
-                            graph_state.last_scan_completed_at,
-                            Some(&self.lsp_status),
-                        );
-
-                        if sections.is_empty() {
-                            Ok(text_result(format!("No repository data available yet.{}", freshness)))
-                        } else {
-                            Ok(text_result(format!(
-                                "# Repository Map\n\n{}{}",
-                                sections.join("\n\n"),
-                                freshness
-                            )))
-                        }
-                    }
-                    Err(e) => Ok(text_result(format!("Graph error: {}", e))),
-                }
+                self.handle_repo_map(args).await
             }
 
             _ => Err(CallToolError::unknown_tool(&params.name)),
@@ -2388,7 +2088,6 @@ mod tests {
 
     #[test]
     fn test_search_result_filter_code_result_matches_root() {
-        let handler = RnaHandler::default();
         let filter = Some("my-project".to_string());
         let non_code = std::collections::HashSet::new();
         let result = crate::embed::SearchResult {
@@ -2398,12 +2097,11 @@ mod tests {
             body: String::new(),
             score: 1.0,
         };
-        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
+        assert!(crate::service::search_result_passes_root_filter(&result, &filter, &non_code));
     }
 
     #[test]
     fn test_search_result_filter_code_result_wrong_root() {
-        let handler = RnaHandler::default();
         let filter = Some("my-project".to_string());
         let non_code = std::collections::HashSet::new();
         let result = crate::embed::SearchResult {
@@ -2413,12 +2111,11 @@ mod tests {
             body: String::new(),
             score: 1.0,
         };
-        assert!(!handler.search_result_passes_root_filter(&result, &filter, &non_code));
+        assert!(!crate::service::search_result_passes_root_filter(&result, &filter, &non_code));
     }
 
     #[test]
     fn test_search_result_filter_commit_always_passes() {
-        let handler = RnaHandler::default();
         let filter = Some("my-project".to_string());
         let non_code = std::collections::HashSet::new();
         let result = crate::embed::SearchResult {
@@ -2428,12 +2125,11 @@ mod tests {
             body: String::new(),
             score: 0.8,
         };
-        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
+        assert!(crate::service::search_result_passes_root_filter(&result, &filter, &non_code));
     }
 
     #[test]
     fn test_search_result_filter_all_mode_passes_everything() {
-        let handler = RnaHandler::default();
         let filter: Option<String> = None;
         let non_code = std::collections::HashSet::new();
         let result = crate::embed::SearchResult {
@@ -2443,12 +2139,11 @@ mod tests {
             body: String::new(),
             score: 1.0,
         };
-        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
+        assert!(crate::service::search_result_passes_root_filter(&result, &filter, &non_code));
     }
 
     #[test]
     fn test_search_result_filter_non_code_root_passes() {
-        let handler = RnaHandler::default();
         let filter = Some("my-project".to_string());
         let mut non_code = std::collections::HashSet::new();
         non_code.insert("claude-memory".to_string());
@@ -2459,7 +2154,7 @@ mod tests {
             body: String::new(),
             score: 0.7,
         };
-        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
+        assert!(crate::service::search_result_passes_root_filter(&result, &filter, &non_code));
     }
 
     // ── Stale root pruning tests (#198) ────────────────────────────────
