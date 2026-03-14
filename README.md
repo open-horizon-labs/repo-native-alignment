@@ -262,7 +262,7 @@ RNA works standalone. These add organizational context and workflow structure:
 
 ## Status
 
-Tree-sitter + pipelined LSP enrichment, 5 MCP tools, 7 CLI subcommands, 690+ tests. Ships as a Claude Code plugin. CLI and MCP share the same index — `scan --full` builds it visibly, MCP serves it to agents.
+Tree-sitter + pipelined LSP enrichment, 5 MCP tools, 10 CLI subcommands, 710+ tests. Ships as a Claude Code plugin. CLI and MCP share a service layer — adding a parameter to the service automatically makes it available in both interfaces.
 
 ### Platform Support
 
