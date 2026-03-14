@@ -126,7 +126,6 @@ jobs:
   # Warms sccache for the M1 baseline build that follows.
   build-release-fast:
     if: github.event_name == 'push'
-    needs: [test, smoke]
     runs-on: namespace-profile-tahoe
     timeout-minutes: 60
 
@@ -176,7 +175,7 @@ jobs:
   # M1 baseline + Linux builds run after M4, sharing sccache warmth.
   build-release:
     if: github.event_name == 'push'
-    needs: [build-release-fast]
+    needs: build-release-fast
     strategy:
       matrix:
         include:
