@@ -621,6 +621,8 @@ impl RnaHandler {
                     if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await {
                         match idx.has_table().await {
                             Ok(true) => {
+                                // Ensure FTS indexes exist — table may predate hybrid search.
+                                idx.ensure_fts_index().await;
                                 tracing::info!("Reusing existing embedding index (no changes detected)");
                                 self.embed_index.store(Arc::new(Some(idx)));
                             }
