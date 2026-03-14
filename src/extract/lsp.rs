@@ -334,6 +334,23 @@ impl LspEnricher {
         self
     }
 
+    /// Check if an `experimental/serverStatus` notification indicates readiness.
+    ///
+    /// rust-analyzer sends `quiescent: true` when it has finished all background
+    /// work (indexing, proc-macro loading, etc.).  Combined with `health: "ok"`,
+    /// this means the server is ready to answer queries.
+    fn server_status_is_ready(msg: &serde_json::Value) -> bool {
+        let health = msg
+            .pointer("/params/health")
+            .and_then(|h| h.as_str())
+            .unwrap_or("");
+        let quiescent = msg
+            .pointer("/params/quiescent")
+            .and_then(|q| q.as_bool())
+            .unwrap_or(true);
+        health == "ok" && quiescent
+    }
+
     /// Check if the server binary is available on PATH.
     fn is_server_available(&self) -> bool {
         std::process::Command::new("which")
@@ -465,7 +482,7 @@ impl LspEnricher {
         //
         // rust-analyzer uses `experimental/serverStatus` with:
         //   health: "ok" | "warning" | "error"
-        //   quiescent: bool (false = no pending background work)
+        //   quiescent: bool (true = fully ready, no pending background work)
         //
         // Other LSP servers may not send this — for those, we fall back
         // to a timeout after `$/progress` tokens complete.
@@ -487,8 +504,8 @@ impl LspEnricher {
                                 let quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(true);
                                 tracing::info!("{} serverStatus: health={}, quiescent={}", self.server_command, health, quiescent);
 
-                                if health == "ok" && !quiescent {
-                                    tracing::info!("{} ready (serverStatus: ok, not quiescent)", self.server_command);
+                                if Self::server_status_is_ready(&msg) {
+                                    tracing::info!("{} ready (serverStatus: ok, quiescent)", self.server_command);
                                     server_ready = true;
                                     break;
                                 }
@@ -1972,5 +1989,44 @@ mod tests {
         // This may succeed or fail depending on whether we're in a Cargo project.
         // Either way, it should not panic.
         let _result = enricher.enrich(&nodes, &index, std::path::Path::new(".")).await;
+    }
+
+    /// Verify that the quiescent readiness condition matches the rust-analyzer
+    /// specification: `quiescent: true` means the server is fully ready (no
+    /// pending background work).  This is a regression test for the inverted
+    /// check fixed in PR #226 / issue #215.
+    #[test]
+    fn test_server_status_quiescent_means_ready() {
+        // Simulate serverStatus notifications as serde_json::Value
+        let make_status = |health: &str, quiescent: bool| -> serde_json::Value {
+            serde_json::json!({
+                "method": "experimental/serverStatus",
+                "params": { "health": health, "quiescent": quiescent }
+            })
+        };
+
+        // quiescent: true, health: ok => READY (server finished background work)
+        assert!(LspEnricher::server_status_is_ready(&make_status("ok", true)),
+            "quiescent: true + health: ok should be ready");
+
+        // quiescent: false, health: ok => NOT READY (still indexing)
+        assert!(!LspEnricher::server_status_is_ready(&make_status("ok", false)),
+            "quiescent: false + health: ok should NOT be ready");
+
+        // quiescent: true, health: warning => NOT READY (unhealthy)
+        assert!(!LspEnricher::server_status_is_ready(&make_status("warning", true)),
+            "health: warning should NOT be ready regardless of quiescent");
+
+        // quiescent: true, health: error => NOT READY (unhealthy)
+        assert!(!LspEnricher::server_status_is_ready(&make_status("error", true)),
+            "health: error should NOT be ready regardless of quiescent");
+
+        // Missing quiescent field defaults to true (ready)
+        let no_quiescent = serde_json::json!({
+            "method": "experimental/serverStatus",
+            "params": { "health": "ok" }
+        });
+        assert!(LspEnricher::server_status_is_ready(&no_quiescent),
+            "missing quiescent should default to true (ready)");
     }
 }

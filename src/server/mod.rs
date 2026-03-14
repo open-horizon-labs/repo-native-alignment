@@ -851,6 +851,10 @@ impl RnaHandler {
             .into_iter()
             .collect();
 
+        // Mark LSP as running BEFORE spawning the background task so
+        // status is visible immediately, not blocked behind embedding.
+        bg_lsp_status.set_running();
+
         tokio::spawn(async move {
             // Phase 1: Embed
             let embeddable_nodes: Vec<Node> = bg_nodes.iter()
@@ -875,7 +879,6 @@ impl RnaHandler {
             }
 
             // Phase 2: LSP enrichment
-            bg_lsp_status.set_running();
             let enricher_registry = EnricherRegistry::with_builtins();
             let enrichment = {
                 let guard = bg_graph.read().await;
