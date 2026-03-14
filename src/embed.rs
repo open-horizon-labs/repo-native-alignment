@@ -380,6 +380,16 @@ impl EmbeddingIndex {
         );
     }
 
+    /// Ensure FTS indexes exist on an existing embedding table.
+    /// No-op if the indexes already exist (LanceDB replace=true is idempotent).
+    /// Called when reusing a cached table that may predate FTS support.
+    pub async fn ensure_fts_index(&self) {
+        match self.db.open_table(&self.table_name).execute().await {
+            Ok(table) => self.create_fts_index(&table).await,
+            Err(_) => {} // No table to index
+        }
+    }
+
     /// Index all .oh/ artifacts, git commits, and optionally code symbols.
     /// Call with symbols from the graph to enable semantic code search.
     pub async fn index_all_with_symbols(

@@ -233,6 +233,29 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
         }
     }
 
+    // 6b. Keyword (BM25) search — verifies FTS index is present and functional
+    match &embed_index {
+        Some(idx) => {
+            match idx.search_with_mode("main", None, 5, crate::embed::SearchMode::Keyword).await {
+                Ok(crate::embed::SearchOutcome::Results(results)) if !results.is_empty() => {
+                    checks.push(Check::pass("keyword_search", format!("{} result(s) for keyword query \"main\"", results.len())));
+                }
+                Ok(crate::embed::SearchOutcome::NotReady) => {
+                    checks.push(Check::skip("keyword_search", "Embedding table not built yet"));
+                }
+                Ok(_) => {
+                    checks.push(Check::fail("keyword_search", "Keyword query \"main\" returned 0 results — FTS index may be missing"));
+                }
+                Err(e) => {
+                    checks.push(Check::fail("keyword_search", format!("Keyword search error: {}", e)));
+                }
+            }
+        }
+        None => {
+            checks.push(Check::skip("keyword_search", "Skipped (no embedding index)"));
+        }
+    }
+
     // 8. search_symbols path — substring search on extracted nodes
     let query_lower = "main";
     let symbol_matches: Vec<_> = all_nodes.iter()
