@@ -334,6 +334,23 @@ impl LspEnricher {
         self
     }
 
+    /// Check if an `experimental/serverStatus` notification indicates readiness.
+    ///
+    /// rust-analyzer sends `quiescent: true` when it has finished all background
+    /// work (indexing, proc-macro loading, etc.).  Combined with `health: "ok"`,
+    /// this means the server is ready to answer queries.
+    fn server_status_is_ready(msg: &serde_json::Value) -> bool {
+        let health = msg
+            .pointer("/params/health")
+            .and_then(|h| h.as_str())
+            .unwrap_or("");
+        let quiescent = msg
+            .pointer("/params/quiescent")
+            .and_then(|q| q.as_bool())
+            .unwrap_or(true);
+        health == "ok" && quiescent
+    }
+
     /// Check if the server binary is available on PATH.
     fn is_server_available(&self) -> bool {
         std::process::Command::new("which")
@@ -487,7 +504,7 @@ impl LspEnricher {
                                 let quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(true);
                                 tracing::info!("{} serverStatus: health={}, quiescent={}", self.server_command, health, quiescent);
 
-                                if health == "ok" && quiescent {
+                                if Self::server_status_is_ready(&msg) {
                                     tracing::info!("{} ready (serverStatus: ok, quiescent)", self.server_command);
                                     server_ready = true;
                                     break;
@@ -1988,27 +2005,20 @@ mod tests {
             })
         };
 
-        // Helper that mirrors the parsing logic in wait_for_server_ready
-        let is_ready = |msg: &serde_json::Value| -> bool {
-            let health = msg.pointer("/params/health").and_then(|h| h.as_str()).unwrap_or("");
-            let quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(true);
-            health == "ok" && quiescent
-        };
-
         // quiescent: true, health: ok => READY (server finished background work)
-        assert!(is_ready(&make_status("ok", true)),
+        assert!(LspEnricher::server_status_is_ready(&make_status("ok", true)),
             "quiescent: true + health: ok should be ready");
 
         // quiescent: false, health: ok => NOT READY (still indexing)
-        assert!(!is_ready(&make_status("ok", false)),
+        assert!(!LspEnricher::server_status_is_ready(&make_status("ok", false)),
             "quiescent: false + health: ok should NOT be ready");
 
         // quiescent: true, health: warning => NOT READY (unhealthy)
-        assert!(!is_ready(&make_status("warning", true)),
+        assert!(!LspEnricher::server_status_is_ready(&make_status("warning", true)),
             "health: warning should NOT be ready regardless of quiescent");
 
         // quiescent: true, health: error => NOT READY (unhealthy)
-        assert!(!is_ready(&make_status("error", true)),
+        assert!(!LspEnricher::server_status_is_ready(&make_status("error", true)),
             "health: error should NOT be ready regardless of quiescent");
 
         // Missing quiescent field defaults to true (ready)
@@ -2016,7 +2026,7 @@ mod tests {
             "method": "experimental/serverStatus",
             "params": { "health": "ok" }
         });
-        assert!(is_ready(&no_quiescent),
+        assert!(LspEnricher::server_status_is_ready(&no_quiescent),
             "missing quiescent should default to true (ready)");
     }
 }
