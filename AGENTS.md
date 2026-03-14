@@ -92,16 +92,27 @@ This project IS the RNA MCP server. When working here, use its own tools.
 MCP server with a workspace-wide context engine. Incrementally scans repos, extracts a multi-language code graph (symbols, topology, schemas, PR history), and makes business outcomes, code structure, markdown, and git history queryable as one system. Agents stay aligned to declared intent because that intent lives in the repo as structured, queryable artifacts.
 
 ## Current Aims
-- **agent-alignment** (active): Agents scope work to declared outcomes without user re-prompting. Mechanism: 9 intent-based MCP tools + OH Skills integration + outcome_progress structural joins.
-- **workspace-context-engine** (active): Agents see context across the full workspace. Mechanism: incremental scanner + pluggable extractors (tree-sitter, LSP, markdown, schema) + unified graph (LanceDB + petgraph).
+- **context-assembly** (active): Agents get the fractal, local knowledge they need for a given task without manual context loading. Mechanism: incremental scanning, pluggable extraction, unified code graph, semantic search, structural joins, auto-injection.
+- **agent-alignment** (maintenance): Work stays connected to declared outcomes. Architecture settled, feedback loop exists. Remaining work: bug fixes, tool cleanup, adoption.
+- **human-led-curation** (proposed): LLM-assisted corpus curation. Deferred until manual /distill sessions prove insufficient.
 
 ## Key Constraints
-- **repo-native** (hard): No external store. `.oh/` in the repo, git-versioned. `rm -rf .oh/` loses context but breaks nothing.
-- **lightweight** (hard): Adding an outcome = writing a markdown file. If heavier than a CLAUDE.md section, adoption fails.
-- **git-is-optimization-not-requirement** (hard): Scanner works on any directory. Git adds precision when `.git` present.
-- **extractors-are-pluggable** (soft): Don't hardcode extraction strategy per file type. tree-sitter, LSP, schema, markdown are all pluggable extractors behind the same trait.
-- **name-tools-honestly** (soft): Tool names describe current behavior, not aspirations.
-- **test-with-real-mcp-client** (candidate): Test MCP changes with TypeScript SDK or Claude Code, not curl.
+
+### Hard guardrails
+- **repo-native**: No external store; `.oh/` in the repo, git-versioned. [Details](.oh/guardrails/repo-native.md)
+- **lightweight**: Adding an outcome = writing a markdown file. [Details](.oh/guardrails/lightweight.md)
+- **git-is-optimization-not-requirement**: Scanner works on any directory; git adds precision when present. [Details](.oh/guardrails/git-is-optimization-not-requirement.md)
+- **no-language-conditionals-in-generic**: All per-language behavior goes through LangConfig, never `if language ==` in generic.rs. [Details](.oh/guardrails/no-language-conditionals-in-generic.md)
+- **no-parallel-cargo-agents**: One cargo build per target directory; use worktrees for parallel builds. [Details](.oh/guardrails/no-parallel-cargo-agents.md)
+- **computed-but-not-delivered**: New metadata must wire through 3 layers — extraction, LanceDB schema, MCP rendering. [Details](.oh/guardrails/computed-but-not-delivered.md)
+
+### Soft guardrails
+- **extractors-are-pluggable**: Don't hardcode extraction strategy per file type. [Details](.oh/guardrails/extractors-are-pluggable.md)
+- **test-with-real-mcp-client**: Test MCP changes with real clients, not just curl. [Details](.oh/guardrails/test-with-real-mcp-client.md)
+- **extract-fully-at-parse-time**: Capture all AST-available metadata during extraction; the AST is only available once. [Details](.oh/guardrails/extract-fully-at-parse-time.md)
+- **subagent-prompts-require-rna-directive**: Sub-agent prompts must include RNA tool usage requirements. [Details](.oh/guardrails/subagent-prompts-require-rna-directive.md)
+- **metis-curation-requires-human-judgment**: LLMs surface candidates; humans judge. No auto-promotion or indiscriminate application. [Details](.oh/guardrails/metis-curation-requires-human-judgment.md)
+- **ship-steps-visible-on-pr**: Ship pipeline findings must be posted as PR comments. [Details](.oh/guardrails/ship-steps-visible-on-pr.md)
 
 ## Patterns to Follow
 - `[outcome:X]` in commit messages to link work to outcomes

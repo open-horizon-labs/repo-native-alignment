@@ -2,19 +2,11 @@
 id: human-led-curation
 status: proposed
 mechanism: |-
-  Two MCP tools that assist human judgment without replacing it:
+  LLM-assisted tools that reduce the cognitive load of finding signal in an accumulating
+  corpus of metis and guardrails. LLMs surface candidates; humans judge what matters.
 
-  **oh_propose_themes:** Given accumulated metis entries (optionally filtered by outcome,
-  phase, or tag), extract recurring patterns and propose candidates for promotion to
-  guardrails or compaction. Returns a ranked list of themes with supporting metis IDs.
-  Human reviews, selects what to promote, discards the rest.
-
-  **oh_propose_relevant:** Given current task description, phase, and active outcome,
-  rank and filter the metis+guardrails corpus by likely relevance. Returns a short
-  candidate list with reasoning. Human selects what to load into context.
-
-  Neither tool makes decisions. Both reduce the cognitive load of finding signal in
-  an accumulating corpus — which is exactly where LLMs have leverage without needing judgment.
+  Deferred until manual curation (via /distill sessions) proves insufficient at the
+  current corpus growth rate. Solo developer context bounds the accumulation rate.
 files:
 - src/query.rs
 - .oh/metis/*

@@ -1,7 +1,7 @@
 ---
 id: test-with-real-mcp-client
 outcome: agent-alignment
-severity: candidate
+severity: soft
 statement: Test MCP server changes with the official TypeScript SDK client or Claude Code, not just curl/pipe tests
 ---
 
