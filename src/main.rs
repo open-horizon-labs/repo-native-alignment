@@ -39,19 +39,24 @@ struct Cli {
     /// Port to bind to (http mode only)
     #[arg(long, default_value_t = 8382)]
     port: u16,
+
+    /// Write logs to a file (in addition to stderr). Also settable via RNA_LOG_FILE env var.
+    #[arg(long)]
+    log_path: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Bootstrap RNA + OH MCP setup for a project
     Setup(SetupArgs),
-    /// Run the full pipeline smoke test (scan → extract → embed → index → query).
+    /// Run the full pipeline smoke test (scan -> extract -> embed -> index -> query).
     ///
     /// Exits 0 on pass, 1 on any failure. Runnable in CI with no extra dependencies.
     Test(TestArgs),
     /// Scan, extract, embed, and persist the full graph for a repo.
     ///
     /// Runs the same pipeline as MCP server startup but standalone, with timing output.
+    /// Use --full to also run embedding and LSP enrichment synchronously.
     Scan(ScanArgs),
     /// Search code symbols by name or signature.
     ///
@@ -77,6 +82,15 @@ struct ScanArgs {
     /// Repository root path to scan (default: current directory or --repo)
     #[arg(long)]
     path: Option<PathBuf>,
+
+    /// Run the COMPLETE pipeline: scan + extract + embed + LSP enrich + graph.
+    /// Without this flag, only scan + extract + persist runs (no LSP, no foreground embed).
+    #[arg(long)]
+    full: bool,
+
+    /// Repository root path (default: current directory)
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
 }
 
 #[derive(clap::Args, Debug)]
@@ -147,12 +161,59 @@ fn server_details() -> InitializeResult {
     }
 }
 
-fn init_tracing(default_filter: &str) {
+/// Initialize tracing with optional file logging.
+///
+/// When `log_path` is Some, logs are written to both stderr and the file.
+/// The RNA_LOG_FILE env var is checked as a fallback if `log_path` is None.
+fn init_tracing(default_filter: &str, log_path: Option<&std::path::Path>) {
+    use tracing_subscriber::prelude::*;
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| default_filter.into());
+
+    // Resolve log file: CLI flag takes precedence, then env var
+    let effective_log_path = log_path
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::var("RNA_LOG_FILE").ok().map(PathBuf::from));
+
+    if let Some(ref file_path) = effective_log_path {
+        // Ensure parent directory exists
+        if let Some(parent) = file_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file_path)
+        {
+            Ok(file) => {
+                let file_layer = tracing_subscriber::fmt::layer()
+                    .with_writer(std::sync::Mutex::new(file))
+                    .with_ansi(false);
+
+                let stderr_layer = tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr);
+
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(stderr_layer)
+                    .with(file_layer)
+                    .init();
+
+                tracing::info!("Logging to file: {}", file_path.display());
+                return;
+            }
+            Err(e) => {
+                eprintln!("Warning: could not open log file {}: {}", file_path.display(), e);
+                // Fall through to stderr-only logging
+            }
+        }
+    }
+
+    // Default: stderr only
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| default_filter.into()),
-        )
+        .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
         .init();
 }
@@ -160,19 +221,35 @@ fn init_tracing(default_filter: &str) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let log_path = cli.log_path.clone();
 
     // ── subcommands ──────────────────────────────────────────────────────────
     match cli.command {
         Some(Commands::Setup(args)) => return setup::run(&args),
         Some(Commands::Test(args)) => {
-            init_tracing("info");
+            init_tracing("info", log_path.as_deref());
             tracing::info!("Running RNA pipeline smoke test for {}", args.repo.display());
             let passed = smoke_test::run(&args).await?;
             std::process::exit(if passed { 0 } else { 1 });
         }
         Some(Commands::Scan(args)) => {
-            init_tracing("info");
-            let repo_root = args.path.unwrap_or_else(|| cli.repo.clone()).canonicalize()?;
+            init_tracing("info", log_path.as_deref());
+            let repo_root = args.path.unwrap_or_else(|| args.repo.clone()).canonicalize()?;
+
+            if args.full {
+                // --full: run the complete pipeline synchronously with progress output
+                eprintln!("Full pipeline scan: {}", repo_root.display());
+                let handler = RnaHandler {
+                    repo_root: repo_root.clone(),
+                    ..Default::default()
+                };
+                let _result = handler.run_pipeline_foreground(|msg| {
+                    eprintln!("{}", msg);
+                }).await?;
+                return Ok(());
+            }
+
+            // Default scan: extract + persist only (no LSP, no foreground embed)
             eprintln!("Scanning: {}", repo_root.display());
             let t0 = std::time::Instant::now();
             let handler = RnaHandler {
@@ -184,8 +261,6 @@ async fn main() -> anyhow::Result<()> {
             // build_full_graph spawns embedding as a background task (for MCP server).
             // For the CLI scan command, run embedding in the foreground so it completes
             // before the process exits (avoids lance panic from cancelled tokio tasks).
-            // build_full_graph spawns embedding as a background task.
-            // Wait for it by polling the embedding index until it's populated.
             let embed_count = match repo_native_alignment::embed::EmbeddingIndex::new(&repo_root).await {
                 Ok(idx) => {
                     eprintln!("  Embedding {} symbols...", graph.nodes.iter().filter(|n| n.id.root != "external").count());
@@ -215,7 +290,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some(Commands::Search(args)) => {
-            init_tracing("warn");
+            init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?;
             eprintln!("Scanning {}...", repo_root.display());
             let handler = RnaHandler {
@@ -285,7 +360,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some(Commands::Graph(args)) => {
-            init_tracing("warn");
+            init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?;
             eprintln!("Scanning {}...", repo_root.display());
             let handler = RnaHandler {
@@ -383,7 +458,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some(Commands::Stats(args)) => {
-            init_tracing("warn");
+            init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?;
 
             let lance_path = repo_root.join(".oh").join(".cache").join("lance");
@@ -456,7 +531,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.transport.as_str() {
         "stdio" => {
             // Logging to stderr only — stdout is the MCP channel
-            init_tracing("warn");
+            init_tracing("warn", log_path.as_deref());
 
             tracing::info!(
                 "Starting RNA MCP server (stdio) for repo at {}",
@@ -479,7 +554,7 @@ async fn main() -> anyhow::Result<()> {
             server.start().await.map_err(|e| anyhow::anyhow!("{:?}", e))?;
         }
         "http" => {
-            init_tracing("info");
+            init_tracing("info", log_path.as_deref());
 
             tracing::info!(
                 "Starting RNA MCP server on {}:{} for repo at {}",
