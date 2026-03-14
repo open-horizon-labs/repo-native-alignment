@@ -1,7 +1,7 @@
 ---
 id: extract-fully-at-parse-time
 outcome: agent-alignment
-severity: candidate
+severity: soft
 statement: Capture all AST-available metadata during the extraction pass. The AST is only available once. Don't re-derive position, visibility, or structural information from file contents at enrichment time.
 ---
 
