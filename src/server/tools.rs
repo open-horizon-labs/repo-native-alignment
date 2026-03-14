@@ -735,4 +735,62 @@ mod tests {
         let s = gq.into_search();
         assert_eq!(s.top_k, Some(3));
     }
+
+    // ── Adversarial: deprecated aliases must NOT enable artifacts ────────
+
+    #[test]
+    fn test_search_symbols_into_search_disables_artifacts() {
+        let ss: SearchSymbols = serde_json::from_value(json!({"query": "test"})).unwrap();
+        let s = ss.into_search();
+        assert_eq!(s.include_artifacts, Some(false));
+        assert_eq!(s.include_markdown, Some(false));
+        assert!(s.artifact_types.is_none());
+    }
+
+    #[test]
+    fn test_graph_query_into_search_disables_artifacts() {
+        let gq: GraphQuery = serde_json::from_value(json!({"query": "test"})).unwrap();
+        let s = gq.into_search();
+        assert_eq!(s.include_artifacts, Some(false));
+        assert_eq!(s.include_markdown, Some(false));
+        assert!(s.artifact_types.is_none());
+    }
+
+    #[test]
+    fn test_search_include_artifacts_null_becomes_none() {
+        let s = parse_search(json!({"query": "test", "include_artifacts": null})).unwrap();
+        assert_eq!(s.include_artifacts, None);
+    }
+
+    #[test]
+    fn test_search_artifact_types_with_artifacts_disabled() {
+        let s = parse_search(json!({
+            "query": "test",
+            "include_artifacts": false,
+            "artifact_types": ["commit"]
+        })).unwrap();
+        assert_eq!(s.include_artifacts, Some(false));
+        assert_eq!(s.artifact_types, Some(vec!["commit".to_string()]));
+    }
+
+    #[test]
+    fn test_search_mode_with_flat_search_and_artifacts() {
+        let s = parse_search(json!({
+            "query": "test",
+            "search_mode": "keyword",
+            "include_artifacts": true
+        })).unwrap();
+        assert_eq!(s.search_mode, Some("keyword".to_string()));
+        assert_eq!(s.include_artifacts, Some(true));
+        assert!(s.mode.is_none());
+    }
+
+    #[test]
+    fn test_search_empty_artifact_types_array() {
+        let s = parse_search(json!({
+            "query": "test",
+            "artifact_types": []
+        })).unwrap();
+        assert_eq!(s.artifact_types, Some(vec![]));
+    }
 }
