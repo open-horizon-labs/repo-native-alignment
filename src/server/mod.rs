@@ -523,7 +523,16 @@ impl RnaHandler {
     }
 
     /// Build the full graph from scratch. This is the original get_graph logic.
+    ///
+    /// When `spawn_background` is true (default for MCP server), embedding and
+    /// LSP enrichment are spawned as background tasks so the graph is queryable
+    /// immediately. When false (used by `run_pipeline_foreground`), no background
+    /// tasks are spawned -- the caller handles embed+LSP itself.
     pub async fn build_full_graph(&self) -> anyhow::Result<GraphState> {
+        self.build_full_graph_inner(true).await
+    }
+
+    async fn build_full_graph_inner(&self, spawn_background: bool) -> anyhow::Result<GraphState> {
         // Initialize pattern config from .oh/config.toml (once, at first build).
         crate::extract::generic::init_pattern_config(&self.repo_root);
 
@@ -653,24 +662,27 @@ impl RnaHandler {
                     // FIX(#215): The early return here previously skipped LSP
                     // enrichment entirely, leaving status stuck at SERVER_FOUND.
                     // Check if the cached graph already has call edges; if not,
-                    // spawn background LSP enrichment.
-                    let has_call_edges = state.edges.iter().any(|e| {
-                        matches!(e.kind, crate::graph::EdgeKind::Calls)
-                    });
-                    if !has_call_edges {
-                        tracing::info!(
-                            "Cached graph has no call edges — spawning LSP enrichment"
-                        );
-                        self.spawn_lsp_enrichment(&state.nodes);
-                    } else {
-                        tracing::info!(
-                            "Cached graph already has call edges — skipping LSP enrichment"
-                        );
-                        // Mark LSP as complete since we have cached edges
-                        let call_count = state.edges.iter()
-                            .filter(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
-                            .count();
-                        self.lsp_status.set_complete(call_count);
+                    // spawn background LSP enrichment (only in background mode --
+                    // foreground callers handle LSP themselves).
+                    if spawn_background {
+                        let has_call_edges = state.edges.iter().any(|e| {
+                            matches!(e.kind, crate::graph::EdgeKind::Calls)
+                        });
+                        if !has_call_edges {
+                            tracing::info!(
+                                "Cached graph has no call edges — spawning LSP enrichment"
+                            );
+                            self.spawn_lsp_enrichment(&state.nodes);
+                        } else {
+                            tracing::info!(
+                                "Cached graph already has call edges — skipping LSP enrichment"
+                            );
+                            // Mark LSP as complete since we have cached edges
+                            let call_count = state.edges.iter()
+                                .filter(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
+                                .count();
+                            self.lsp_status.set_complete(call_count);
+                        }
                     }
 
                     return Ok(state);
@@ -872,139 +884,145 @@ impl RnaHandler {
             }
         };
 
-        // Spawn background task for embedding + LSP enrichment.
-        // The graph is queryable NOW — these improve quality progressively.
-        let bg_repo_root = self.repo_root.clone();
-        let bg_graph = self.graph.clone();
-        let bg_embed_index = self.embed_index.clone();
-        let bg_lsp_status = self.lsp_status.clone();
-        let bg_nodes = all_nodes.clone();
-        let bg_languages: Vec<String> = all_nodes
-            .iter()
-            .map(|n| n.language.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        // Mark LSP as running BEFORE spawning the background task so
-        // status is visible immediately, not blocked behind embedding.
-        bg_lsp_status.set_running();
-
-        tokio::spawn(async move {
-            // Embed + LSP enrichment run concurrently — they use independent
-            // data stores (embedding table vs graph edges).
-            let embeddable_nodes: Vec<Node> = bg_nodes.iter()
-                .filter(|n| n.id.root != "external")
-                .cloned()
+        if spawn_background {
+            // Spawn background task for embedding + LSP enrichment.
+            // The graph is queryable NOW — these improve quality progressively.
+            let bg_repo_root = self.repo_root.clone();
+            let bg_graph = self.graph.clone();
+            let bg_embed_index = self.embed_index.clone();
+            let bg_lsp_status = self.lsp_status.clone();
+            let bg_nodes = all_nodes.clone();
+            let bg_languages: Vec<String> = all_nodes
+                .iter()
+                .map(|n| n.language.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
                 .collect();
 
-            let embed_repo_root = bg_repo_root.clone();
-            let embed_index_ref = bg_embed_index.clone();
-            let embed_fut = async move {
-                // Always re-index so .oh/ artifacts added since the last
-                // full build become searchable.  index_all_inner drops and
-                // rebuilds the table -- acceptable at current repo scale.
-                match EmbeddingIndex::new(&embed_repo_root).await {
-                    Ok(idx) => {
-                        match idx.index_all_with_symbols(&embed_repo_root, &embeddable_nodes).await {
-                            Ok(count) => {
-                                tracing::info!("[background] Embedded {} items", count);
-                                // Atomic store — no mutex needed
-                                embed_index_ref.store(Arc::new(Some(idx)));
-                            }
-                            Err(e) => tracing::warn!("[background] Embedding failed: {}", e),
-                        }
-                    }
-                    Err(e) => tracing::warn!("[background] EmbeddingIndex init failed: {}", e),
-                }
-            };
+            // Mark LSP as running BEFORE spawning the background task so
+            // status is visible immediately, not blocked behind embedding.
+            bg_lsp_status.set_running();
 
-            let lsp_repo_root = bg_repo_root.clone();
-            let lsp_fut = async {
-                let enricher_registry = EnricherRegistry::with_builtins();
-                let enrichment = {
-                    let guard = bg_graph.read().await;
-                    if let Some(ref gs) = *guard {
-                        enricher_registry
-                            .enrich_all(&gs.nodes, &gs.index, &bg_languages, &lsp_repo_root)
-                            .await
-                    } else {
-                        bg_lsp_status.set_complete(0);
-                        return;
+            tokio::spawn(async move {
+                // Embed + LSP enrichment run concurrently — they use independent
+                // data stores (embedding table vs graph edges).
+                let embeddable_nodes: Vec<Node> = bg_nodes.iter()
+                    .filter(|n| n.id.root != "external")
+                    .cloned()
+                    .collect();
+
+                let embed_repo_root = bg_repo_root.clone();
+                let embed_index_ref = bg_embed_index.clone();
+                let embed_fut = async move {
+                    // Always re-index so .oh/ artifacts added since the last
+                    // full build become searchable.  index_all_inner drops and
+                    // rebuilds the table -- acceptable at current repo scale.
+                    match EmbeddingIndex::new(&embed_repo_root).await {
+                        Ok(idx) => {
+                            match idx.index_all_with_symbols(&embed_repo_root, &embeddable_nodes).await {
+                                Ok(count) => {
+                                    tracing::info!("[background] Embedded {} items", count);
+                                    // Atomic store — no mutex needed
+                                    embed_index_ref.store(Arc::new(Some(idx)));
+                                }
+                                Err(e) => tracing::warn!("[background] Embedding failed: {}", e),
+                            }
+                        }
+                        Err(e) => tracing::warn!("[background] EmbeddingIndex init failed: {}", e),
                     }
                 };
 
-                if !enrichment.any_enricher_ran {
-                    tracing::info!("[background] LSP enrichment: no server available");
-                    bg_lsp_status.set_unavailable();
-                    return;
-                }
+                let lsp_repo_root = bg_repo_root.clone();
+                let lsp_fut = async {
+                    // Snapshot graph data under lock, then release before the slow
+                    // enrich_all call so write-side graph updates aren't blocked.
+                    let (enrich_nodes, enrich_index) = {
+                        let guard = bg_graph.read().await;
+                        if let Some(ref gs) = *guard {
+                            (gs.nodes.clone(), gs.index.clone())
+                        } else {
+                            bg_lsp_status.set_complete(0);
+                            return;
+                        }
+                    };
 
-                if enrichment.new_nodes.is_empty()
-                    && enrichment.added_edges.is_empty()
-                    && enrichment.updated_nodes.is_empty()
-                {
-                    tracing::info!("[background] LSP enrichment: no changes");
-                    bg_lsp_status.set_complete(0);
-                    return;
-                }
+                    let enricher_registry = EnricherRegistry::with_builtins();
+                    let enrichment = enricher_registry
+                        .enrich_all(&enrich_nodes, &enrich_index, &bg_languages, &lsp_repo_root)
+                        .await;
 
-                tracing::info!(
-                    "[background] LSP enrichment: {} virtual nodes, {} edges, {} patches",
-                    enrichment.new_nodes.len(),
-                    enrichment.added_edges.len(),
-                    enrichment.updated_nodes.len()
-                );
-
-                // Apply enrichment to shared graph
-                let mut guard = bg_graph.write().await;
-                if let Some(ref mut gs) = *guard {
-                    for vnode in &enrichment.new_nodes {
-                        gs.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
+                    if !enrichment.any_enricher_ran {
+                        tracing::info!("[background] LSP enrichment: no server available");
+                        bg_lsp_status.set_unavailable();
+                        return;
                     }
-                    gs.nodes.extend(enrichment.new_nodes);
 
-                    let persist_edges = enrichment.added_edges.clone();
-                    for edge in &enrichment.added_edges {
-                        let from_id = edge.from.to_stable_id();
-                        let to_id = edge.to.to_stable_id();
-                        gs.index.add_edge(
-                            &from_id,
-                            &edge.from.kind.to_string(),
-                            &to_id,
-                            &edge.to.kind.to_string(),
-                            edge.kind.clone(),
-                        );
+                    if enrichment.new_nodes.is_empty()
+                        && enrichment.added_edges.is_empty()
+                        && enrichment.updated_nodes.is_empty()
+                    {
+                        tracing::info!("[background] LSP enrichment: no changes");
+                        bg_lsp_status.set_complete(0);
+                        return;
                     }
-                    gs.edges.extend(enrichment.added_edges);
 
-                    let enriched_node_ids: Vec<String> = enrichment.updated_nodes.iter()
-                        .map(|(id, _)| id.clone())
-                        .collect();
-                    for (node_id, patches) in &enrichment.updated_nodes {
-                        if let Some(node) = gs.nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
-                            for (key, value) in patches {
-                                node.metadata.insert(key.clone(), value.clone());
+                    tracing::info!(
+                        "[background] LSP enrichment: {} virtual nodes, {} edges, {} patches",
+                        enrichment.new_nodes.len(),
+                        enrichment.added_edges.len(),
+                        enrichment.updated_nodes.len()
+                    );
+
+                    // Apply enrichment to shared graph
+                    let mut guard = bg_graph.write().await;
+                    if let Some(ref mut gs) = *guard {
+                        for vnode in &enrichment.new_nodes {
+                            gs.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
+                        }
+                        gs.nodes.extend(enrichment.new_nodes);
+
+                        let persist_edges = enrichment.added_edges.clone();
+                        for edge in &enrichment.added_edges {
+                            let from_id = edge.from.to_stable_id();
+                            let to_id = edge.to.to_stable_id();
+                            gs.index.add_edge(
+                                &from_id,
+                                &edge.from.kind.to_string(),
+                                &to_id,
+                                &edge.to.kind.to_string(),
+                                edge.kind.clone(),
+                            );
+                        }
+                        gs.edges.extend(enrichment.added_edges);
+
+                        let enriched_node_ids: Vec<String> = enrichment.updated_nodes.iter()
+                            .map(|(id, _)| id.clone())
+                            .collect();
+                        for (node_id, patches) in &enrichment.updated_nodes {
+                            if let Some(node) = gs.nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
+                                for (key, value) in patches {
+                                    node.metadata.insert(key.clone(), value.clone());
+                                }
                             }
                         }
+
+                        // Persist enrichment incrementally
+                        let upsert_nodes: Vec<Node> = gs.nodes.iter()
+                            .filter(|n| enriched_node_ids.contains(&n.stable_id()))
+                            .cloned()
+                            .collect();
+                        let edge_count = persist_edges.len();
+                        drop(guard); // release lock before async persist
+                        let _ = persist_graph_incremental(
+                            &lsp_repo_root, &upsert_nodes, &persist_edges, &[], &[],
+                        ).await;
+                        bg_lsp_status.set_complete(edge_count);
                     }
+                };
 
-                    // Persist enrichment incrementally
-                    let upsert_nodes: Vec<Node> = gs.nodes.iter()
-                        .filter(|n| enriched_node_ids.contains(&n.stable_id()))
-                        .cloned()
-                        .collect();
-                    let edge_count = persist_edges.len();
-                    drop(guard); // release lock before async persist
-                    let _ = persist_graph_incremental(
-                        &lsp_repo_root, &upsert_nodes, &persist_edges, &[], &[],
-                    ).await;
-                    bg_lsp_status.set_complete(edge_count);
-                }
-            };
-
-            tokio::join!(embed_fut, lsp_fut);
-        });
+                tokio::join!(embed_fut, lsp_fut);
+            });
+        }
 
         Ok(GraphState {
             nodes: all_nodes,
@@ -1031,21 +1049,21 @@ impl RnaHandler {
         bg_lsp_status.set_running();
 
         tokio::spawn(async move {
-            let enricher_registry = EnricherRegistry::with_builtins();
-            let enrichment = {
+            // Snapshot graph data under lock, then release before the slow
+            // enrich_all call so write-side graph updates aren't blocked.
+            let (enrich_nodes, enrich_index) = {
                 let guard = bg_graph.read().await;
                 if let Some(ref gs) = *guard {
-                    enricher_registry
-                        .enrich_all(&gs.nodes, &gs.index, &bg_languages, &bg_repo_root)
-                        .await
+                    (gs.nodes.clone(), gs.index.clone())
                 } else {
-                    // Graph disappeared — use the snapshot we have
-                    let index = crate::graph::index::GraphIndex::new();
-                    enricher_registry
-                        .enrich_all(&bg_nodes, &index, &bg_languages, &bg_repo_root)
-                        .await
+                    (bg_nodes, crate::graph::index::GraphIndex::new())
                 }
             };
+
+            let enricher_registry = EnricherRegistry::with_builtins();
+            let enrichment = enricher_registry
+                .enrich_all(&enrich_nodes, &enrich_index, &bg_languages, &bg_repo_root)
+                .await;
 
             if !enrichment.any_enricher_ran {
                 tracing::info!("[background] LSP enrichment: no server available");
@@ -1133,9 +1151,9 @@ impl RnaHandler {
     {
         let pipeline_start = std::time::Instant::now();
 
-        // Phase 1: Scan + Extract (reuses build_full_graph)
+        // Phase 1: Scan + Extract (reuses build_full_graph without background tasks)
         let t0 = std::time::Instant::now();
-        let graph_state = self.build_full_graph().await?;
+        let graph_state = self.build_full_graph_inner(false).await?;
         let scan_extract_time = t0.elapsed();
 
         let file_count = graph_state.nodes.iter()

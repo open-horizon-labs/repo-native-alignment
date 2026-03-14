@@ -201,17 +201,25 @@ impl LspEnrichmentStatus {
         }
         let elapsed = self.elapsed_since_last_transition();
         if elapsed > std::time::Duration::from_secs(300) {
-            // 5 minute timeout
-            *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
-            let prev = LspState::from_u8(
-                self.state.swap(Self::UNAVAILABLE, std::sync::atomic::Ordering::AcqRel)
+            // 5 minute timeout — use compare_exchange to avoid overwriting
+            // a newer state (RUNNING/COMPLETE) that raced with this check.
+            let result = self.state.compare_exchange(
+                Self::SERVER_FOUND,
+                Self::UNAVAILABLE,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
             );
-            self.log_transition(
-                prev,
-                LspState::Unavailable,
-                "SERVER_FOUND timed out after 5 min — enrichment never started",
-            );
-            return true;
+            if result.is_ok() {
+                *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
+                self.log_transition(
+                    LspState::ServerFound,
+                    LspState::Unavailable,
+                    "SERVER_FOUND timed out after 5 min — enrichment never started",
+                );
+                return true;
+            }
+            // Another thread already transitioned the state -- don't regress.
+            return false;
         }
         false
     }
