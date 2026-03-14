@@ -1662,14 +1662,13 @@ impl RnaHandler {
             }
         }
 
-        // Re-embed .oh/ artifacts if any changed/new files are under .oh/.
+        // Re-embed .oh/ artifacts on every incremental update.
         // reindex_nodes only handles code graph nodes; artifact embeddings
         // (outcomes, signals, guardrails, metis) are loaded separately via
         // load_oh_artifacts and need their own upsert path.
-        let has_oh_changes = changed_files.iter().any(|f| {
-            f.components().any(|c| c.as_os_str() == ".oh")
-        });
-        if has_oh_changes {
+        // Always call reindex_artifacts() -- the BLAKE3 content hash check
+        // inside ensures unchanged artifacts are skipped cheaply.
+        {
             let embed_guard3 = self.embed_index.load();
             if let Some(ref embed_idx) = **embed_guard3 {
                 match embed_idx.reindex_artifacts(&self.repo_root).await {
