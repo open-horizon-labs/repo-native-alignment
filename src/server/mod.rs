@@ -171,8 +171,10 @@ impl RnaHandler {
     /// Ensure graph is built, check for file changes since last scan.
     /// Returns a read guard to the graph.
     pub(crate) async fn get_graph(&self) -> anyhow::Result<tokio::sync::RwLockReadGuard<'_, Option<GraphState>>> {
-        // Fast path: graph exists and scan cooldown hasn't expired
-        let pending_scan: Option<ScanResult> = {
+        // Fast path: graph exists and scan cooldown hasn't expired.
+        // We carry both the scan result AND the scanner forward so the caller
+        // can commit scanner state only after successful graph processing.
+        let pending: Option<(ScanResult, Scanner)> = {
             let guard = self.graph.read().await;
             if guard.is_some() {
                 let skip_scan = {
@@ -190,13 +192,15 @@ impl RnaHandler {
                     && scan.new_files.is_empty()
                     && scan.deleted_files.is_empty()
                 {
+                    // No changes -- safe to commit state (records current mtimes)
+                    scanner.commit_state()?;
                     // Update cooldown timestamp
                     *self.last_scan.lock().unwrap() = std::time::Instant::now();
                     return Ok(guard);
                 }
-                // Changes detected — carry the scan result forward
+                // Changes detected -- carry scan + scanner forward
                 drop(guard);
-                Some(scan)
+                Some((scan, scanner))
             } else {
                 drop(guard);
                 None
@@ -207,13 +211,21 @@ impl RnaHandler {
         {
             let mut guard = self.graph.write().await;
             if guard.is_none() {
-                // First build — full pipeline
+                // First build -- full pipeline
                 *guard = Some(self.build_full_graph().await?);
             } else {
-                // Incremental update — pass the already-completed scan so we
-                // don't re-scan (the first scan already saved updated state).
+                // Incremental update -- pass the already-completed scan so we
+                // don't re-scan. Scanner state is committed only after success.
+                let (scan, scanner) = match pending {
+                    Some(p) => (Some(p.0), Some(p.1)),
+                    None => (None, None),
+                };
                 let graph = guard.as_mut().unwrap();
-                self.update_graph_with_scan(graph, pending_scan).await?;
+                self.update_graph_with_scan(graph, scan).await?;
+                // Graph update succeeded -- now persist scanner state
+                if let Some(scanner) = scanner {
+                    scanner.commit_state()?;
+                }
             }
         }
 
@@ -304,8 +316,10 @@ impl RnaHandler {
                         .collect();
 
                     // Scan every live root for file-level changes.
+                    // We carry scanners forward so we can commit state only after
+                    // the graph update + LanceDB persist succeeds.
                     let mut has_changes = false;
-                    let mut per_root_scans: Vec<(String, crate::scanner::ScanResult, PathBuf)> =
+                    let mut per_root_scans: Vec<(String, crate::scanner::ScanResult, PathBuf, Scanner)> =
                         Vec::new();
                     for resolved_root in &resolved_roots {
                         let root_slug = resolved_root.slug.clone();
@@ -338,7 +352,7 @@ impl RnaHandler {
                         {
                             has_changes = true;
                         }
-                        per_root_scans.push((root_slug, scan, root_path));
+                        per_root_scans.push((root_slug, scan, root_path, scanner));
                     }
 
                     if !has_changes && removed_slugs.is_empty() {
@@ -350,6 +364,7 @@ impl RnaHandler {
                     // persist_graph_incremental can run without holding the lock).
                     // Structure: (root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove)
                     let mut lance_deltas: Vec<(
+                        String,   // root_slug
                         PathBuf,
                         Vec<Node>,
                         Vec<Edge>,
@@ -372,7 +387,7 @@ impl RnaHandler {
                         }
 
                         // Apply file-level changes per root.
-                        for (root_slug, scan, root_path) in &per_root_scans {
+                        for (root_slug, scan, root_path, _scanner) in &per_root_scans {
                             if scan.changed_files.is_empty()
                                 && scan.new_files.is_empty()
                                 && scan.deleted_files.is_empty()
@@ -437,6 +452,7 @@ impl RnaHandler {
                             graph_state.edges.extend(extraction.edges);
 
                             lance_deltas.push((
+                                root_slug.clone(),
                                 root_path.clone(),
                                 upsert_nodes,
                                 upsert_edges,
@@ -472,7 +488,9 @@ impl RnaHandler {
                     drop(guard);
 
                     // Persist incremental deltas to LanceDB for each root (lock released above).
-                    for (root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove) in lance_deltas {
+                    // Track which roots persisted successfully so we can commit scanner state.
+                    let mut persisted_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    for (slug, root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove) in lance_deltas {
                         match persist_graph_incremental(
                             &root_path,
                             &upsert_nodes,
@@ -490,14 +508,36 @@ impl RnaHandler {
                                 };
                                 if let Some((nodes, edges)) = snapshot {
                                     if let Err(e) = persist_graph_to_lance(&repo_root, &nodes, &edges).await {
-                                        tracing::warn!("Background scan: full persist after migration failed: {}", e);
+                                        tracing::error!("Background scan: full persist after migration failed: {}", e);
+                                        continue; // Don't commit scanner state for this root
                                     }
                                 }
+                                persisted_slugs.insert(slug);
+                            }
+                            Ok(false) => {
+                                persisted_slugs.insert(slug);
                             }
                             Err(e) => {
-                                tracing::warn!("Background scan: failed to persist graph delta: {}", e);
+                                tracing::error!("Background scan: failed to persist graph delta for '{}': {}", slug, e);
+                                // Don't commit scanner state -- next scan will re-detect changes
                             }
-                            _ => {}
+                        }
+                    }
+
+                    // Commit scanner state only for roots that persisted successfully.
+                    for (root_slug, _scan, _root_path, scanner) in &per_root_scans {
+                        if persisted_slugs.contains(root_slug) {
+                            if let Err(e) = scanner.commit_state() {
+                                tracing::error!("Background scan: failed to commit scanner state for '{}': {}", root_slug, e);
+                            }
+                        }
+                    }
+
+                    // Update freshness timestamp if any root persisted successfully.
+                    if !persisted_slugs.is_empty() {
+                        let mut guard = graph.write().await;
+                        if let Some(ref mut gs) = *guard {
+                            gs.last_scan_completed_at = Some(std::time::Instant::now());
                         }
                     }
 
@@ -684,6 +724,13 @@ impl RnaHandler {
                         }
                     }
 
+                    // No changes detected -- safe to commit scanner state
+                    for (_slug, scanner, _scan, _path, _changed) in &scanners {
+                        if let Err(e) = scanner.commit_state() {
+                            tracing::error!("Failed to commit scanner state: {}", e);
+                        }
+                    }
+
                     return Ok(state);
                 }
                 Err(e) => {
@@ -863,10 +910,19 @@ impl RnaHandler {
 
         // 7. Persist graph to LanceDB
         if let Err(e) = persist_graph_to_lance(&self.repo_root, &all_nodes, &all_edges).await {
-            tracing::warn!("Failed to persist graph to LanceDB: {}", e);
+            tracing::error!("Failed to persist graph to LanceDB: {}", e);
+            return Err(e.context("LanceDB full persist failed during graph build"));
         }
 
-        // Graph is persisted — return immediately so agents can query.
+        // Persist succeeded -- commit scanner state for all roots so the
+        // next scan doesn't re-process the same files.
+        for (_slug, scanner, _scan, _path, _changed) in &scanners {
+            if let Err(e) = scanner.commit_state() {
+                tracing::error!("Failed to commit scanner state: {}", e);
+            }
+        }
+
+        // Graph is persisted -- return immediately so agents can query.
         // Embedding and LSP enrichment run in background via the shared graph lock.
         let symbols_ready_at = std::time::Instant::now();
 
@@ -1012,9 +1068,11 @@ impl RnaHandler {
                             .collect();
                         let edge_count = persist_edges.len();
                         drop(guard); // release lock before async persist
-                        let _ = persist_graph_incremental(
+                        if let Err(e) = persist_graph_incremental(
                             &lsp_repo_root, &upsert_nodes, &persist_edges, &[], &[],
-                        ).await;
+                        ).await {
+                            tracing::error!("Background LSP enrichment persist failed: {}", e);
+                        }
                         bg_lsp_status.set_complete(edge_count);
                     }
                 };
@@ -1125,9 +1183,11 @@ impl RnaHandler {
                     .collect();
                 let edge_count = persist_edges.len();
                 drop(guard);
-                let _ = persist_graph_incremental(
+                if let Err(e) = persist_graph_incremental(
                     &bg_repo_root, &upsert_nodes, &persist_edges, &[], &[],
-                ).await;
+                ).await {
+                    tracing::error!("Background LSP enrichment persist failed: {}", e);
+                }
                 bg_lsp_status.set_complete(edge_count);
             }
         });
@@ -1303,9 +1363,11 @@ impl RnaHandler {
                     .cloned()
                     .collect();
                 drop(guard);
-                let _ = persist_graph_incremental(
+                if let Err(e) = persist_graph_incremental(
                     &self.repo_root, &upsert_nodes, &persist_edges, &[], &[],
-                ).await;
+                ).await {
+                    tracing::error!("Foreground LSP enrichment persist failed: {}", e);
+                }
             }
             self.lsp_status.set_complete(lsp_edge_count);
         }
@@ -1340,19 +1402,26 @@ impl RnaHandler {
     /// Incrementally update the graph, accepting an optional pre-computed scan.
     ///
     /// When `pending_scan` is `Some`, the caller already ran the scanner and
-    /// saved state — we reuse that result instead of scanning again (which
-    /// would see zero changes because state was already updated).
+    /// will commit state after this method returns successfully.
+    ///
+    /// When `pending_scan` is `None`, this method creates its own scanner and
+    /// commits state only after the graph update succeeds.
     async fn update_graph_with_scan(
         &self,
         graph: &mut GraphState,
         pending_scan: Option<ScanResult>,
     ) -> anyhow::Result<()> {
+        // If no pre-computed scan, create a fresh scanner. We hold it so we
+        // can commit state after successful processing.
+        let mut fallback_scanner: Option<Scanner> = None;
         let scan = match pending_scan {
             Some(s) => s,
             None => {
                 // Fallback: scan fresh (used by background scanner path)
                 let mut scanner = Scanner::new(self.repo_root.clone())?;
-                scanner.scan()?
+                let result = scanner.scan()?;
+                fallback_scanner = Some(scanner);
+                result
             }
         };
 
@@ -1593,9 +1662,13 @@ impl RnaHandler {
             }
         }
 
-        // Persist updated graph incrementally — only the delta (changed/added nodes and edges).
+        // Persist updated graph incrementally -- only the delta (changed/added nodes and edges).
         // Untouched rows remain in LanceDB as-is. Deleted files are removed by targeted delete.
         // merge_insert keeps tables alive; no empty-result query window.
+        //
+        // Persist failures are propagated as errors (not warnings) so the caller
+        // knows not to commit scanner state -- ensuring the next scan re-detects
+        // the same changes instead of silently losing them.
         match persist_graph_incremental(
             &self.repo_root,
             &upsert_nodes,
@@ -1608,13 +1681,20 @@ impl RnaHandler {
             Ok(true) => {
                 tracing::info!("Schema migrated during incremental update; performing full persist now");
                 if let Err(e) = persist_graph_to_lance(&self.repo_root, &graph.nodes, &graph.edges).await {
-                    tracing::warn!("Full persist after migration failed: {}", e);
+                    tracing::error!("Full persist after migration failed: {}", e);
+                    return Err(e.context("LanceDB full persist after migration failed"));
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to persist updated graph: {}", e);
+                tracing::error!("Failed to persist updated graph: {}", e);
+                return Err(e.context("LanceDB incremental persist failed"));
             }
             _ => {}
+        }
+
+        // Commit fallback scanner state only after successful persist.
+        if let Some(scanner) = fallback_scanner {
+            scanner.commit_state()?;
         }
 
         graph.last_scan_completed_at = Some(std::time::Instant::now());

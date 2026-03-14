@@ -638,6 +638,10 @@ excludes = ["*.iso", "*.dmg"]
             "Notes root should find files"
         );
 
+        // Commit scanner state (scan no longer auto-persists)
+        code_scanner.commit_state().unwrap();
+        notes_scanner.commit_state().unwrap();
+
         // Verify state was persisted at the custom path
         assert!(notes_state.exists(), "Notes scan state should be persisted at custom path");
     }
