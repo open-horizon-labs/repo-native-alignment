@@ -2256,7 +2256,6 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[tokio::test]
     async fn test_get_graph_detects_file_edits() {
