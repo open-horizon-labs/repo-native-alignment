@@ -211,7 +211,7 @@ impl WorkspaceConfig {
     /// Claude Code stores per-project memory at
     /// `~/.claude/projects/-{path-with-slashes-as-dashes}/memory/`.
     /// If that directory exists it is added as a Notes root so
-    /// `oh_search_context` can surface operational knowledge.
+    /// `search` can surface operational knowledge.
     pub fn with_claude_memory(mut self, repo_root: &Path) -> Self {
         if let Some(memory_dir) = claude_memory_dir(repo_root) {
             // Skip if already present (e.g. user added it in roots.toml).

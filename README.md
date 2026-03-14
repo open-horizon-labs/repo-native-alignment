@@ -10,8 +10,8 @@ An MCP server that gives coding agents what LSP alone can't: a cross-language co
 
 ### Find code by meaning, not just by name
 
-- "Find functions related to payment processing" → `oh_search_context("payment processing", include_code=true)` → ranked results, production code before tests, searched by meaning across function bodies, docs, and commit history
-- "How does scanning work?" → `oh_search_context("scanning", include_code=true, include_markdown=true)` → implementation code and doc sections together
+- "Find functions related to payment processing" → `search("payment processing")` → ranked results across code symbols, artifacts, commits, and markdown in one call
+- "How does scanning work?" → `search("scanning")` → implementation code, doc sections, and related artifacts together
 - "Where is the authentication handler?" → `search("AuthHandler")` → file, line, signature, complexity, graph edges
 - "What are the riskiest functions?" → `search(query="", min_complexity=20, sort_by="complexity")` → hotspots ranked by cyclomatic complexity
 - "What are the most important symbols?" → `search(sort_by="importance")` → top symbols ranked by PageRank
@@ -26,8 +26,8 @@ An MCP server that gives coding agents what LSP alone can't: a cross-language co
 ### Connect code to business outcomes
 
 - "How is the agent-alignment outcome progressing?" → `outcome_progress("agent-alignment")` → tagged commits → changed files → symbols → PRs
-- "Find signals related to reliability" → `oh_search_context("reliability", artifact_types=["signal"])` → measurement definitions
-- "What are our constraints?" → `oh_search_context("constraints guardrails")` → all guardrails ranked by relevance
+- "Find signals related to reliability" → `search("reliability", artifact_types=["signal"])` → measurement definitions
+- "What are our constraints?" → `search("constraints guardrails")` → all guardrails ranked by relevance
 
 ## Why Not Just LSP?
 
@@ -52,7 +52,7 @@ search(query="ConnectionPool", mode="impact", max_hops=3)
 | Question | LSP alone | RNA |
 |---|---|---|
 | What breaks if I change the connection pool? | N round-trips of `incomingCalls`, agent assembles graph | `search(mode="impact")` — one call, transitive |
-| Find code related to payment processing | No semantic search — agent must guess names and grep | `oh_search_context(include_code=true)` — ranked by meaning |
+| Find code related to payment processing | No semantic search — agent must guess names and grep | `search("payment processing")` — ranked by meaning across code, artifacts, and markdown |
 | How is our reliability outcome progressing? | Not possible — LSP has no business context | `outcome_progress("reliability")` — commits → files → symbols |
 
 LSP gives agents single-symbol, single-hop, single-language queries. There's no multi-hop primitive. RNA runs those same LSP servers internally, fuses their data with tree-sitter, embedded function bodies, git history, and business artifacts into a cross-language graph.
@@ -167,14 +167,13 @@ Runs 25 checks end-to-end. Exits 0 on pass, 1 on failure. Safe to run in CI.
 
 ### 6. Start working
 
-The system compounds from here. Agents use `oh_search_context` to discover relevant context, `search` to explore code and traverse the graph, and write learnings to `.oh/metis/`. Each session starts richer than the last.
+The system compounds from here. Agents use `search` to discover relevant context across code, artifacts, commits, and markdown, and write learnings to `.oh/metis/`. Each session starts richer than the last.
 
 ## MCP Tools
 
 | Tool | What it's for |
 |------|--------------|
-| `search` | Unified code search + graph traversal. Flat search by name/signature, or graph traversal with `mode` (neighbors, impact, reachable, tests_for). Supports `compact: true` (~25x fewer tokens), batch retrieval via `nodes: [...]`, and sorting by relevance, complexity, or importance (PageRank). |
-| `oh_search_context` | Find relevant context by meaning: search .oh/ artifacts, commits, code, and markdown in one query. Hybrid BM25 + vector scoring. |
+| `search` | All-in-one search: code symbols by name/signature, .oh/ artifacts and commits via embedding index, markdown sections, and graph traversal with `mode` (neighbors, impact, reachable, tests_for). Supports `include_artifacts` and `include_markdown` (both default true), `artifact_types` filter, `compact: true` (~25x fewer tokens), batch retrieval via `nodes: [...]`, sorting by relevance/complexity/importance, and `search_mode` (hybrid/keyword/semantic). |
 | `repo_map` | Repository orientation: top symbols by PageRank importance, hotspot files, active outcomes, entry points. One call replaces an exploratory loop. |
 | `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols. Optional `include_impact: true` for risk-classified blast radius. |
 | `list_roots` | Show which workspace roots are configured and their scan status |
@@ -293,7 +292,7 @@ MIT — see [LICENSE](LICENSE).
 | **Tree-sitter** | A parser that reads source code and produces a syntax tree — the structured representation of functions, classes, imports, etc. RNA uses it to extract symbols across languages without running the code. |
 | **LSP** | Language Server Protocol — the same protocol your editor uses for go-to-definition and find-references. RNA runs LSP servers internally and builds on their data. See [Why Not Just LSP?](#why-not-just-lsp) |
 | **Graph** | A network of nodes (symbols, files, outcomes) and edges (calls, depends_on, implements). RNA builds this in memory so you can ask "what depends on this function?" or "what's the blast radius of this change?" |
-| **Embeddings** | Vector representations of text that capture meaning. RNA embeds function bodies, markdown sections, commit messages, and business artifacts so `oh_search_context` can find relevant results by meaning, not just keywords. Uses Metal GPU on Apple Silicon, CPU elsewhere. |
+| **Embeddings** | Vector representations of text that capture meaning. RNA embeds function bodies, markdown sections, commit messages, and business artifacts so `search` can find relevant results by meaning, not just keywords. Uses Metal GPU on Apple Silicon, CPU elsewhere. |
 | **LanceDB** | The columnar + vector database RNA uses to store the graph and embeddings on disk. Lives in `.oh/.cache/`. |
 | **petgraph** | The in-memory graph index RNA uses for fast traversal (neighbors, impact analysis, reachability). Rebuilt from LanceDB on startup. |
 | **Outcome** | A business result you're optimizing for. Example: "Agents correctly scope work to declared aims." |

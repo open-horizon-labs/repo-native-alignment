@@ -660,10 +660,10 @@ const MCP_GUIDANCE_BLOCK: &str = r#"
 | `Grep` for symbol names | `search_symbols(query, kind, language, file)` |
 | `Read` to trace function calls | `graph_query(node_id, mode: "neighbors")` |
 | `Grep` for "who calls X" | `graph_query(node_id, mode: "impact")` |
-| `Read` to find .oh/ artifacts | `oh_search_context(query)` |
-| `Bash` with `grep -rn` | `search_symbols` or `oh_search_context` |
+| `Read` to find .oh/ artifacts | `search(query, include_artifacts=true)` |
+| `Bash` with `grep -rn` | `search(query)` — searches code, artifacts, and markdown |
 | Recording learnings/signals | Write to `.oh/metis/`, `.oh/signals/`, `.oh/guardrails/` (YAML frontmatter + markdown) |
-| Searching git history | `oh_search_context(query)` — returns hash; use `git show <hash>` via Bash for diffs |
+| Searching git history | `search(query)` — returns commits; use `git show <hash>` via Bash for diffs |
 <!-- end RNA MCP tool guidance -->
 "#;
 

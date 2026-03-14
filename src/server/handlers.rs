@@ -1,4 +1,4 @@
-//! MCP tool handlers: search (flat/traversal/batch), repo_map, oh_search_context, outcome_progress.
+//! MCP tool handlers: search (flat/traversal/batch), repo_map, outcome_progress.
 
 use petgraph::Direction;
 use rust_mcp_sdk::schema::{CallToolError, CallToolResult};
@@ -55,7 +55,9 @@ impl RnaHandler {
         }
     }
 
-    /// Flat symbol search (no `mode` parameter). Equivalent to the old `search_symbols`.
+    /// Flat symbol search (no `mode` parameter) plus optional artifact and markdown search.
+    /// Combines the old `search_symbols` (code) and `oh_search_context` (artifacts/markdown)
+    /// into a single unified search path.
     async fn handle_search_flat(
         &self,
         args: &Search,
@@ -66,6 +68,9 @@ impl RnaHandler {
         let sort_by_importance = args.sort_by.as_deref() == Some("importance");
         let has_complexity_filter = args.min_complexity.is_some();
         let complexity_search = has_complexity_filter || sort_by_complexity;
+
+        let include_artifacts = args.include_artifacts.unwrap_or(true);
+        let include_markdown = args.include_markdown.unwrap_or(true);
 
         let query_str = query.unwrap_or("");
         if query_str.is_empty() && !complexity_search && !sort_by_importance {
@@ -81,10 +86,20 @@ impl RnaHandler {
             std::collections::HashSet::new()
         };
 
+        let search_mode = parse_search_mode(args.search_mode.as_deref());
+        let limit = args.top_k.unwrap_or(10) as usize;
+
+        // Collect all output sections (code symbols, artifacts, markdown).
+        let mut sections: Vec<String> = Vec::new();
+        let mut graph_node_count = 0usize;
+        let mut graph_last_scan = None;
+
+        // ── Code symbol search ──────────────────────────────────────────
         match self.get_graph().await {
             Ok(guard) => {
                 let graph_state = guard.as_ref().unwrap();
-                let limit = args.top_k.unwrap_or(10) as usize;
+                graph_node_count = graph_state.nodes.len();
+                graph_last_scan = graph_state.last_scan_completed_at;
                 let query_lower = query_str.to_lowercase();
 
                 let mut matches: Vec<&Node> = graph_state
@@ -154,8 +169,6 @@ impl RnaHandler {
                         cc_b.cmp(&cc_a)
                     });
                 } else if sort_by_importance {
-                    // Sort by PageRank importance descending.
-                    // Symbols without importance scores sort to the bottom (not filtered out).
                     matches.sort_by(|a, b| {
                         let imp_a = a.metadata.get("importance").and_then(|s| s.parse::<f64>().ok());
                         let imp_b = b.metadata.get("importance").and_then(|s| s.parse::<f64>().ok());
@@ -171,32 +184,128 @@ impl RnaHandler {
                 }
                 matches.truncate(limit);
 
-                let freshness = format_freshness(
-                    graph_state.nodes.len(),
-                    graph_state.last_scan_completed_at,
-                    Some(&self.lsp_status),
-                );
-                if matches.is_empty() {
-                    Ok(text_result(format!(
-                        "No symbols matching \"{}\".{}",
-                        query_str, freshness
-                    )))
-                } else {
+                if !matches.is_empty() {
                     let md: String = matches
                         .iter()
                         .map(|n| format_node_entry(n, &graph_state.index, compact))
                         .collect::<Vec<_>>()
                         .join("\n\n");
-                    Ok(text_result(format!(
-                        "## Symbol search: \"{}\"\n\n{} result(s)\n\n{}{}",
-                        query_str,
+                    sections.push(format!(
+                        "### Code symbols ({} result(s))\n\n{}",
                         matches.len(),
-                        md,
-                        freshness
-                    )))
+                        md
+                    ));
                 }
             }
-            Err(e) => Ok(text_result(format!("Graph error: {}", e))),
+            Err(e) => sections.push(format!("Graph error: {}", e)),
+        }
+
+        // ── Artifact search (embedding index) ───────────────────────────
+        if include_artifacts && !query_str.is_empty() {
+            let embed_guard = self.embed_index.load();
+            match embed_guard.as_ref() {
+                Some(index) => {
+                    match index.search_with_mode(query_str, args.artifact_types.as_deref(), limit, search_mode).await {
+                        Ok(SearchOutcome::Results(results)) => {
+                            let filtered: Vec<_> = results
+                                .into_iter()
+                                .filter(|r| self.search_result_passes_root_filter(r, &root_filter, &non_code_slugs))
+                                .collect();
+                            if !filtered.is_empty() {
+                                let md: String = filtered
+                                    .iter()
+                                    .map(|r| r.to_markdown())
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                sections.push(format!(
+                                    "### Artifacts ({} result(s))\n\n{}",
+                                    filtered.len(),
+                                    md
+                                ));
+                            }
+                        }
+                        Ok(SearchOutcome::NotReady) => {
+                            sections.push("Embedding index: building -- artifact results will appear shortly. Retry in a few seconds.".to_string());
+                        }
+                        Err(e) => sections.push(format!("Artifact search error: {}", e)),
+                    }
+                }
+                None => {
+                    // Embedding index not available yet — skip silently unless
+                    // artifacts were the only search path requested.
+                    if args.kind.is_some() || !query_str.is_empty() {
+                        // Code search was attempted; no need to warn about embeddings.
+                    } else {
+                        sections.push("Embedding index not yet available".to_string());
+                    }
+                }
+            }
+        }
+
+        // ── Markdown section search ─────────────────────────────────────
+        if include_markdown && !query_str.is_empty() {
+            match crate::markdown::extract_markdown_chunks(&self.repo_root) {
+                Ok(chunks) => {
+                    let filtered_chunks: Vec<_> = if let Some(ref slug) = root_filter {
+                        let workspace = crate::roots::WorkspaceConfig::load()
+                            .with_primary_root(self.repo_root.clone())
+                            .with_worktrees(&self.repo_root)
+                            .with_claude_memory(&self.repo_root);
+                        let root_path = workspace.resolved_roots()
+                            .into_iter()
+                            .find(|r| r.slug == *slug)
+                            .map(|r| r.path);
+                        if let Some(rp) = root_path {
+                            chunks.into_iter()
+                                .filter(|c| c.file_path.starts_with(&rp))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        chunks
+                    };
+                    let scored = crate::markdown::search_chunks_ranked(&filtered_chunks, query_str);
+                    if !scored.is_empty() {
+                        let md = scored
+                            .iter()
+                            .take(limit)
+                            .map(|sc| {
+                                format!(
+                                    "- (score: {:.2}) {}", sc.score, sc.chunk.to_markdown()
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n\n---\n\n");
+                        sections.push(format!(
+                            "### Markdown ({} result(s))\n\n{}",
+                            scored.len().min(limit),
+                            md
+                        ));
+                    }
+                }
+                Err(e) => sections.push(format!("Markdown search error: {}", e)),
+            }
+        }
+
+        let freshness = format_freshness(
+            graph_node_count,
+            graph_last_scan,
+            Some(&self.lsp_status),
+        );
+
+        if sections.is_empty() {
+            Ok(text_result(format!(
+                "No results matching \"{}\".{}",
+                query_str, freshness
+            )))
+        } else {
+            Ok(text_result(format!(
+                "## Search: \"{}\"\n\n{}{}",
+                query_str,
+                sections.join("\n\n"),
+                freshness
+            )))
         }
     }
 

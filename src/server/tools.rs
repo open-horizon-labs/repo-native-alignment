@@ -6,35 +6,6 @@ use serde::{Deserialize, Serialize};
 // ── Tool input structs ──────────────────────────────────────────────
 
 #[macros::mcp_tool(
-    name = "oh_search_context",
-    description = "Semantic search across business context, commits, code, and markdown. Describe what you need in plain language. Returns results ranked 0-1 by relevance; test files are demoted. Enable include_code for ranked symbol search (exact name > contains > signature, production before tests), include_markdown for doc sections. For exact symbol name lookup use search_symbols instead. search_mode: hybrid (default, keyword+vector RRF), keyword (BM25 only), semantic (vector only). Results default to the primary workspace root; pass root: \"all\" for cross-root search."
-)]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct OhSearchContext {
-    /// Natural language description of what you're looking for
-    pub query: String,
-    /// Optional: filter by artifact type (outcome, signal, guardrail, metis, commit)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact_types: Option<Vec<String>>,
-    /// Maximum results to return (default: 5)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u64>,
-    /// Also search code symbols by name/signature (default: false)
-    #[serde(default)]
-    pub include_code: Option<bool>,
-    /// Also search markdown sections (default: false)
-    #[serde(default)]
-    pub include_markdown: Option<bool>,
-    /// Search ranking mode: "hybrid" (default, keyword + vector RRF), "keyword" (BM25 only), "semantic" (vector only)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub search_mode: Option<String>,
-    /// Filter to a specific workspace root (by slug). Defaults to the primary root. Use "all" for cross-root search.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root: Option<String>,
-}
-
-
-#[macros::mcp_tool(
     name = "outcome_progress",
     description = "Track progress on a business outcome. Finds tagged commits, code symbols in changed files, and related markdown. Returns a navigable summary with stable Node IDs for use with search_symbols and graph_query. Set include_impact=true to add risk-classified blast radius showing which symbols are affected by the changes and how critical they are. Results default to the primary workspace root; pass root: \"all\" for cross-root search."
 )]
@@ -57,7 +28,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search",
-    description = "Find code symbols and trace their relationships. Without `mode`, performs flat ranked search (by name/signature). With `mode` (neighbors/impact/reachable/tests_for), performs graph traversal from matched symbols. `tests_for` finds which test functions call a symbol. Entry point: `query` (name or semantic search) or `node` (stable ID from previous results). Batch: `nodes` retrieves multiple IDs in one call. `compact: true` returns signature + location only (~25x fewer tokens). Filter by kind, language, file. Sort by relevance, complexity, or importance (PageRank). Results default to the primary workspace root; pass root: \"all\" for cross-root search."
+    description = "All-in-one search: code symbols, business artifacts (.oh/), commits, and markdown. Without `mode`, performs flat ranked search by name/signature plus optional artifact/markdown results (enabled by default via `include_artifacts` and `include_markdown`). With `mode` (neighbors/impact/reachable/tests_for), performs graph traversal from matched symbols. `tests_for` finds which test functions call a symbol. Entry point: `query` (name or semantic search) or `node` (stable ID from previous results). Batch: `nodes` retrieves multiple IDs in one call. `compact: true` returns signature + location only (~25x fewer tokens). Filter by kind, language, file. Sort by relevance, complexity, or importance (PageRank). search_mode: hybrid (default, keyword+vector RRF), keyword (BM25 only), semantic (vector only) — applies to both artifact and graph entry-point search. Results default to the primary workspace root; pass root: \"all\" for cross-root search."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct Search {
@@ -109,9 +80,22 @@ pub struct Search {
     /// Batch retrieve multiple nodes by stable ID. Returns combined results in a single response. Composes with compact and mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodes: Option<Vec<String>>,
-    /// Search ranking mode for graph traversal entry-point resolution: "hybrid" (default, keyword + vector RRF), "keyword" (BM25 only), "semantic" (vector only). Only affects how entry nodes are found when using query + mode; flat search always uses name/signature matching.
+    /// Search ranking mode: "hybrid" (default, keyword + vector RRF), "keyword" (BM25 only), "semantic" (vector only). Applies to artifact search and graph traversal entry-point resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_mode: Option<String>,
+    /// Search .oh/ artifacts and commits via embedding index (default: true). Set to false for code-only search.
+    #[serde(default = "default_true")]
+    pub include_artifacts: Option<bool>,
+    /// Search markdown sections (default: true). Set to false to exclude doc sections.
+    #[serde(default = "default_true")]
+    pub include_markdown: Option<bool>,
+    /// Filter artifact types: outcome, signal, guardrail, metis, commit. Only used when include_artifacts is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_types: Option<Vec<String>>,
+}
+
+fn default_true() -> Option<bool> {
+    Some(true)
 }
 
 // ── Deprecated aliases (kept for one release cycle) ─────────────────
@@ -172,6 +156,9 @@ impl SearchSymbols {
             compact: None,
             nodes: None,
             search_mode: None,
+            include_artifacts: Some(false),
+            include_markdown: Some(false),
+            artifact_types: None,
         }
     }
 }
@@ -227,6 +214,9 @@ impl GraphQuery {
             compact: None,
             nodes: None,
             search_mode: None,
+            include_artifacts: Some(false),
+            include_markdown: Some(false),
+            artifact_types: None,
         }
     }
 }
@@ -629,12 +619,53 @@ mod tests {
     }
 
     #[test]
-    fn test_search_mode_in_oh_search_context_struct() {
-        let ctx: OhSearchContext = serde_json::from_value(json!({
+    fn test_search_include_artifacts_default_true() {
+        let s = parse_search(json!({"query": "test"})).unwrap();
+        assert_eq!(s.include_artifacts, Some(true));
+    }
+
+    #[test]
+    fn test_search_include_artifacts_explicit_false() {
+        let s = parse_search(json!({"query": "test", "include_artifacts": false})).unwrap();
+        assert_eq!(s.include_artifacts, Some(false));
+    }
+
+    #[test]
+    fn test_search_include_markdown_default_true() {
+        let s = parse_search(json!({"query": "test"})).unwrap();
+        assert_eq!(s.include_markdown, Some(true));
+    }
+
+    #[test]
+    fn test_search_include_markdown_explicit_false() {
+        let s = parse_search(json!({"query": "test", "include_markdown": false})).unwrap();
+        assert_eq!(s.include_markdown, Some(false));
+    }
+
+    #[test]
+    fn test_search_artifact_types_filter() {
+        let s = parse_search(json!({
             "query": "test",
-            "search_mode": "semantic"
+            "artifact_types": ["commit", "outcome"]
         })).unwrap();
-        assert_eq!(ctx.search_mode, Some("semantic".to_string()));
+        assert_eq!(s.artifact_types, Some(vec!["commit".to_string(), "outcome".to_string()]));
+    }
+
+    #[test]
+    fn test_search_artifact_types_absent() {
+        let s = parse_search(json!({"query": "test"})).unwrap();
+        assert!(s.artifact_types.is_none());
+    }
+
+    #[test]
+    fn test_search_code_only_mode() {
+        let s = parse_search(json!({
+            "query": "handler",
+            "include_artifacts": false,
+            "include_markdown": false
+        })).unwrap();
+        assert_eq!(s.include_artifacts, Some(false));
+        assert_eq!(s.include_markdown, Some(false));
     }
 
     // ── Deprecated alias conversion ─────────────────────────────────────
