@@ -2574,9 +2574,10 @@ mod tests {
     fn test_parse_node_kind_all_variants_round_trip() {
         let variants = vec![
             NodeKind::Function, NodeKind::Struct, NodeKind::Trait,
-            NodeKind::Enum, NodeKind::Module, NodeKind::Import,
-            NodeKind::Const, NodeKind::Impl, NodeKind::ProtoMessage,
-            NodeKind::SqlTable, NodeKind::ApiEndpoint, NodeKind::Macro,
+            NodeKind::Enum, NodeKind::TypeAlias, NodeKind::Module,
+            NodeKind::Import, NodeKind::Const, NodeKind::Impl,
+            NodeKind::ProtoMessage, NodeKind::SqlTable,
+            NodeKind::ApiEndpoint, NodeKind::Macro,
             NodeKind::Field, NodeKind::PrMerge,
         ];
         for variant in variants {

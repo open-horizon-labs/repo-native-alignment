@@ -117,6 +117,7 @@ pub(crate) fn parse_node_kind(s: &str) -> NodeKind {
         "proto_message" => NodeKind::ProtoMessage,
         "sql_table" => NodeKind::SqlTable,
         "api_endpoint" => NodeKind::ApiEndpoint,
+        "type_alias" => NodeKind::TypeAlias,
         "macro" => NodeKind::Macro,
         "field" => NodeKind::Field,
         "pr_merge" => NodeKind::PrMerge,
