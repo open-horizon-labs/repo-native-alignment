@@ -40,7 +40,7 @@ No step is optional. "Merge when green" is not ship. Steps answer different ques
 - Merit assessment: "Does this deliver outcome value?"
 - Resolve TODOs: "Is everything accounted for?"
 - Manual verification: "Does the computation work with real data?"
-- **Delivery verification: "Can an agent actually see this through MCP tools?"** *(added after PR #137 — see `.oh/metis/computed-but-not-delivered.md`)*
+- **Delivery verification: "Can an agent actually see this through MCP tools?"** *(see guardrail: computed-but-not-delivered)*
 
 **Key insight:** Enter at the altitude you need. Climb back up when you drift.
 
@@ -48,31 +48,30 @@ No step is optional. "Merge when green" is not ship. Steps answer different ques
 
 This project IS the RNA MCP server. When working here, use its own tools.
 
-**IMPORTANT: Use MCP tools for code exploration, NOT grep/Read/Bash.**
+**IMPORTANT: Use RNA MCP tools for code exploration, NOT Grep/Read/Bash. This project IS the RNA MCP server — dogfood it.**
 
-| Instead of... | Use this MCP tool |
+| Instead of... | Use RNA MCP |
 |---|---|
-| `Grep` for symbol names | `search_symbols(query, kind, language, file)` |
-| `Read` to trace function calls | `graph_query(node_id, mode: "neighbors")` |
-| `Grep` for "who calls X" | `graph_query(node_id, mode: "impact")` |
+| `Grep` for symbol names | `search(query, kind, language, file)` |
+| `Read` to trace function calls | `search(node, mode: "neighbors")` |
+| `Grep` for "who calls X" | `search(node, mode: "impact")` |
 | `Read` to find .oh/ artifacts | `search(query, include_artifacts=true)` |
 | `Bash` with `grep -rn` | `search(query)` — searches code, artifacts, and markdown |
 | Recording learnings/signals | Write to `.oh/metis/`, `.oh/signals/`, `.oh/guardrails/` (YAML frontmatter + markdown) |
 | Searching git history | `search(query)` — returns commits; use `git show <hash>` via Bash for diffs |
 
 **If RNA returns empty results — diagnose before falling back:**
-- Empty `search` means the symbol isn't indexed OR the query is wrong — try a broader query, different `kind`, or no filters first
-- Empty artifact results means the embedding index hasn't built yet OR the query is too specific — try simpler terms
-- Do NOT silently fall back to Grep/Read on empty RNA results — that defeats the purpose
+- Try a broader query, different `kind`, or no filters first
+- Do NOT silently fall back to Grep/Read — that defeats the purpose
 - If the index is genuinely stale, say so explicitly rather than substituting file reads
 
-**6 MCP Tools (read + query only):**
+**Every Grep/Read used instead of an RNA tool is a friction event.** Log it in the session's friction log table. A session with 0 friction events and 30 Grep calls isn't frictionless — it's unmonitored.
+
+**MCP Tools:**
 1. `search` -- all-in-one: code symbols, .oh/ artifacts, commits, markdown, and graph traversal
-2. `outcome_progress` -- structural join for outcome tracking (with optional `include_impact: true` for risk-classified blast radius)
-3. `search_symbols` -- DEPRECATED alias for `search` (flat mode)
-4. `graph_query` -- DEPRECATED alias for `search` (with mode)
-5. `list_roots` -- workspace root management
-6. `repo_map` -- repository orientation (top symbols, hotspots, outcomes, entry points)
+2. `outcome_progress` -- structural join for outcome tracking
+3. `list_roots` -- workspace root management
+4. `repo_map` -- repository orientation (top symbols, hotspots, outcomes, entry points)
 
 **Writing business artifacts:** Write directly to `.oh/` using the Write tool. See `.oh/metis/`, `.oh/signals/`, `.oh/guardrails/` for frontmatter templates.
 
@@ -105,6 +104,7 @@ MCP server with a workspace-wide context engine. Incrementally scans repos, extr
 - **no-language-conditionals-in-generic**: All per-language behavior goes through LangConfig, never `if language ==` in generic.rs. [Details](.oh/guardrails/no-language-conditionals-in-generic.md)
 - **no-parallel-cargo-agents**: One cargo build per target directory; use worktrees for parallel builds. [Details](.oh/guardrails/no-parallel-cargo-agents.md)
 - **computed-but-not-delivered**: New metadata must wire through 3 layers — extraction, LanceDB schema, MCP rendering. [Details](.oh/guardrails/computed-but-not-delivered.md)
+- **dogfood-rna-tools**: Use RNA's own tools for code exploration; every Grep/Read fallback is a friction event to log. [Details](.oh/guardrails/dogfood-rna-tools.md)
 
 ### Soft guardrails
 - **extractors-are-pluggable**: Don't hardcode extraction strategy per file type. [Details](.oh/guardrails/extractors-are-pluggable.md)
@@ -139,11 +139,11 @@ MCP server with a workspace-wide context engine. Incrementally scans repos, extr
 Solo developer. PRs go through the full /ship pipeline (12 steps). "Done" = all TODOs resolved, manually verified with real data, tests pass, MCP client connects. Session learnings recorded as metis via MCP tools.
 
 ## Key Modules
+- `src/service.rs` — shared service layer (CLI and MCP both delegate here — no capability drift)
 - `src/graph/` — unified graph model (types, LanceDB schemas, petgraph index)
 - `src/scanner.rs` — incremental file scanner (mtime + git + configurable excludes)
 - `src/extract/` — pluggable extractors (Extractor trait + Enricher trait)
-- `src/extract/{rust,python,typescript,go,markdown}.rs` — language-specific extractors
-- `src/server.rs` — MCP server (9 intent-based tools)
+- `src/server/` — MCP server (thin adapters to service layer)
 - `src/embed.rs` — semantic search (fastembed + LanceDB)
 - `src/query.rs` — outcome_progress structural joins
 

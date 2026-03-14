@@ -12,7 +12,7 @@ Full development pipeline: **problem-statement → solution-space → execute �
 
 Takes a feature or bug from framing through merge. Each phase feeds the next via a session file. The pipeline ensures nothing is skipped — no coding without a problem statement, no merging without the /ship quality gate.
 
-> **You are an RNA power user.** Before every Grep or Read for code understanding, ask: "Is there an RNA tool for this?" Check the table in `/friction` (`.claude/skills/friction.md`). Use `search`, `search_symbols`, `graph_query`, and `outcome_progress` as your FIRST choice for code navigation, guardrail checks, outcome alignment, and context gathering. **Every Grep/Read you use instead of an RNA tool is a friction event — log it with severity `skipped`.** When an RNA tool fails, log that too. See `/friction` for the full protocol. A pipeline with 0 friction events and 30 Grep calls isn't frictionless — it's unmonitored.
+> **Friction logging:** When an RNA tool falls short or you fall back to Grep/Read, append to the session file's `## RNA Tool Friction Log` table. See guardrail: `dogfood-rna-tools`.
 
 > **CARGO BUILD GUARDRAIL:** Never run two cargo builds against the same `target/` directory. Each pipeline gets its own worktree with its own `CARGO_TARGET_DIR` (see Phase 3 worktree setup). Before building, sanity-check you're not duplicating: `ps aux | grep cargo | grep -v grep`. A second cargo process targeting the same directory blocks silently on the file lock, hanging indefinitely. See `.oh/guardrails/no-parallel-cargo-agents.md`.
 
@@ -195,7 +195,7 @@ After execution completes:
 > **CRITICAL: You MUST spawn the ship agent. Do NOT inline the ship steps yourself.**
 > The ship agent posts each step's findings as PR comments — review, dissent, adversarial test results, merit assessment, etc. These comments are the auditable quality record. If you simulate the ship steps in your own context instead of spawning the agent, the findings exist only in the session file and are invisible on the PR. This is a process failure — a quality gate that isn't visible is no gate at all.
 >
-> See `.oh/metis/ship-steps-must-be-visible.md` for the full learning.
+> See guardrail: `ship-steps-visible-on-pr`.
 
 Spawn the **`ship` agent** using the **Agent tool** with the PR number:
 
@@ -238,13 +238,11 @@ The ship agent runs autonomously — do not wait for user prompts between steps.
   - Phase 4 produces ABANDON/RECONSIDER verdict or CI fails after 2 fix attempts
 - **Record metis** if any phase surfaces a new learning: write to `.oh/metis/<slug>.md`
 
-## RNA Tool Usage & Friction Reporting
+## Friction Reporting
 
-**Use RNA MCP tools as your primary codebase interface.** See the `/friction` skill (`.claude/skills/friction.md`) for the full tool reference table and logging format.
+When an RNA tool falls short — wrong results, missing data, too slow, or you fell back to Grep/Read — append to the session file's `## RNA Tool Friction Log` table.
 
-When an RNA tool falls short — wrong results, missing data, awkward API, too slow, or you fell back to Grep/Read — log friction per `/friction`: append to the session file's `## RNA Tool Friction Log` table.
-
-**At pipeline end**, run `/friction summary` to produce a friction summary with recommendations (file issue, update existing issue, or note as known limitation).
+**At pipeline end**, summarize friction events with recommendations (file issue, update existing issue, or note as known limitation).
 
 ## Position in Framework
 
