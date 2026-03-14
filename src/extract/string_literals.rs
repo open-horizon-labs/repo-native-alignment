@@ -2,7 +2,7 @@
 //!
 //! Captures string literals appearing in source code as synthetic Const nodes.
 //! This surfaces cross-language literal values (e.g. `"application/json"`) so that
-//! `search_symbols` can find all places a given string is used — even across language
+//! `search` can find all places a given string is used — even across language
 //! boundaries.
 
 use std::collections::BTreeMap;

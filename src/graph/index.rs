@@ -630,7 +630,7 @@ mod tests {
     // ── Multi-entry traversal tests (PR #113 semantic graph entry) ──────
 
     /// Helper: simulate the multi-entry traversal + dedup pattern from the
-    /// graph_query handler. Returns (all_ids_deduped, entry_nodes_stripped).
+    /// graph traversal handler. Returns (all_ids_deduped, entry_nodes_stripped).
     fn multi_entry_neighbors(
         index: &GraphIndex,
         entry_ids: &[&str],

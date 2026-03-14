@@ -353,7 +353,7 @@ impl QueryResult {
             }
 
             out.push_str(
-                "Use `search_symbols` to explore further, `graph_query` with any ID above for impact/neighbors\n\n",
+                "Use `search` to explore further, `search(node: \"<id>\", mode: \"neighbors\")` with any ID above for impact/neighbors\n\n",
             );
         }
 

@@ -56,8 +56,7 @@ impl RnaHandler {
     }
 
     /// Flat symbol search (no `mode` parameter) plus optional artifact and markdown search.
-    /// Combines the old `search_symbols` (code) and `oh_search_context` (artifacts/markdown)
-    /// into a single unified search path.
+    /// Unified search path for code symbols, artifacts, and markdown.
     async fn handle_search_flat(
         &self,
         args: &Search,
@@ -308,7 +307,7 @@ impl RnaHandler {
         }
     }
 
-    /// Graph traversal search (with `mode` parameter). Equivalent to the old `graph_query`.
+    /// Graph traversal search (with `mode` parameter).
     async fn handle_search_traversal(
         &self,
         args: &Search,
