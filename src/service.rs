@@ -390,3 +390,101 @@ mod tests {
     #[test] fn test_node_passes_root_filter_external() { assert!(node_passes_root_filter("external", &Some("my-root".into()), &HashSet::new())); }
     #[test] fn test_node_passes_root_filter_reject() { assert!(!node_passes_root_filter("other", &Some("my-root".into()), &HashSet::new())); }
 }
+
+// ── Outcome progress ───────────────────────────────────────────────
+
+#[derive(Debug)]
+pub struct OutcomeProgressParams {
+    pub outcome_id: String,
+    pub include_impact: bool,
+    pub root_filter: Option<String>,
+    pub non_code_slugs: HashSet<String>,
+}
+
+pub struct OutcomeProgressContext<'a> {
+    pub graph_state: &'a crate::server::state::GraphState,
+    pub repo_root: &'a Path,
+}
+
+pub fn outcome_progress(params: &OutcomeProgressParams, ctx: &OutcomeProgressContext<'_>) -> String {
+    let graph_nodes: Vec<crate::graph::Node> = ctx.graph_state.nodes.iter()
+        .filter(|n| node_passes_root_filter(&n.id.root, &params.root_filter, &params.non_code_slugs))
+        .cloned().collect();
+    match crate::query::outcome_progress(ctx.repo_root, &params.outcome_id, &graph_nodes) {
+        Ok(result) => {
+            let mut md = result.to_summary_markdown();
+            let file_patterns: Vec<String> = result.outcomes.first()
+                .and_then(|o| o.frontmatter.get("files")).and_then(|v| v.as_sequence())
+                .map(|seq| seq.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
+            let pr_nodes = crate::query::find_pr_merges_for_outcome(&ctx.graph_state.nodes, &ctx.graph_state.edges, &params.outcome_id, &file_patterns);
+            if !pr_nodes.is_empty() { md.push_str(&format!("\n## PR Merges\n\n{} PR merge(s) serving this outcome\n", pr_nodes.len())); }
+            if params.include_impact && !result.code_symbols.is_empty() {
+                let impacted = crate::query::compute_impact_risk(&result.code_symbols, &graph_nodes, &ctx.graph_state.index, 3);
+                md.push('\n'); md.push_str(&crate::query::format_impact_markdown(&impacted));
+            } else if params.include_impact && result.code_symbols.is_empty() {
+                md.push_str("\n## Change Impact\n\nNo changed symbols found -- cannot compute blast radius.\n");
+            }
+            md
+        }
+        Err(e) => format!("Error: {}", e),
+    }
+}
+
+// ── List roots ──────────────────────────────────────────────────────
+
+pub fn list_roots(repo_root: &Path) -> String {
+    let workspace = crate::roots::WorkspaceConfig::load().with_primary_root(repo_root.to_path_buf()).with_worktrees(repo_root).with_claude_memory(repo_root);
+    let resolved = workspace.resolved_roots();
+    if resolved.is_empty() { return "No workspace roots configured.".to_string(); }
+    let md: String = resolved.iter().enumerate()
+        .map(|(i, r)| { let primary = if i == 0 { " (primary)" } else { "" }; format!("- **{}**{}: `{}` (type: {}, git: {})", r.slug, primary, r.path.display(), r.config.root_type, r.config.git_aware) })
+        .collect::<Vec<_>>().join("\n");
+    format!("## Workspace Roots\n\n{} root(s)\n\n{}", resolved.len(), md)
+}
+
+// ── Repo map ────────────────────────────────────────────────────────
+
+const IMPORTANCE_THRESHOLD: f64 = 0.001;
+
+#[derive(Debug)]
+pub struct RepoMapParams { pub top_n: usize, pub root_filter: Option<String>, pub non_code_slugs: HashSet<String> }
+pub struct RepoMapContext<'a> { pub graph_state: &'a crate::server::state::GraphState, pub repo_root: &'a Path, pub lsp_status: Option<&'a LspEnrichmentStatus> }
+
+pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
+    let graph_state = ctx.graph_state;
+    let mut sections: Vec<String> = Vec::new();
+    {
+        let mut swi: Vec<(&Node, f64)> = graph_state.nodes.iter()
+            .filter(|n| !matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge | NodeKind::Field))
+            .filter(|n| n.id.root != "external")
+            .filter(|n| node_passes_root_filter(&n.id.root, &params.root_filter, &params.non_code_slugs))
+            .filter_map(|n| { let imp = n.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                let imp = if ranking::is_test_file(n) { imp * 0.1 } else { imp };
+                if imp > IMPORTANCE_THRESHOLD { Some((n, imp)) } else { None } }).collect();
+        swi.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        swi.truncate(params.top_n);
+        if !swi.is_empty() {
+            let md: String = swi.iter().map(|(n, imp)| { let mut line = format!("- **{}** `{}` ({}) [{}] `{}`:{}-{} -- importance: {:.3}", n.id.kind, n.id.name, n.language, n.id.root, n.id.file.display(), n.line_start, n.line_end, imp);
+                if let Some(cc) = n.metadata.get("cyclomatic") { line.push_str(&format!(", complexity: {}", cc)); } line }).collect::<Vec<_>>().join("\n");
+            sections.push(format!("## Top {} symbols by importance\n\n{}", swi.len(), md));
+        }
+    }
+    { let mut fc: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+        for n in &graph_state.nodes { if matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge | NodeKind::Field) { continue; }
+            if n.id.root == "external" { continue; }
+            if !node_passes_root_filter(&n.id.root, &params.root_filter, &params.non_code_slugs) { continue; }
+            *fc.entry((n.id.root.clone(), n.id.file.display().to_string())).or_default() += 1; }
+        let mut sf: Vec<_> = fc.into_iter().collect(); sf.sort_by(|a, b| b.1.cmp(&a.1)); sf.truncate(10);
+        if !sf.is_empty() { let md: String = sf.iter().map(|((root, f), count)| format!("- [{}] `{}` -- {} definitions", root, f, count)).collect::<Vec<_>>().join("\n"); sections.push(format!("## Hotspot files\n\n{}", md)); } }
+    { let outcomes = crate::oh::load_oh_artifacts(ctx.repo_root).unwrap_or_default().into_iter().filter(|a| a.kind == crate::types::OhArtifactKind::Outcome).collect::<Vec<_>>();
+        if !outcomes.is_empty() { let md: String = outcomes.iter().map(|o| { let files: Vec<String> = o.frontmatter.get("files").and_then(|v| v.as_sequence()).map(|seq| seq.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
+            let fs = if files.is_empty() { String::new() } else { format!(" (files: {})", files.join(", ")) }; format!("- **{}**{}", o.id(), fs) }).collect::<Vec<_>>().join("\n"); sections.push(format!("## Active outcomes\n\n{}", md)); } }
+    { let mut ep: Vec<&Node> = graph_state.nodes.iter().filter(|n| n.id.kind == NodeKind::Function && n.id.root != "external")
+            .filter(|n| node_passes_root_filter(&n.id.root, &params.root_filter, &params.non_code_slugs))
+            .filter(|n| { let name = n.id.name.to_lowercase(); name == "main" || name.starts_with("handle_") || name.starts_with("handler") || name.ends_with("_handler") || name.contains("endpoint") }).collect();
+        ep.sort_by(|a, b| { let ia = a.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0); let ib = b.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0); ib.partial_cmp(&ia).unwrap_or(std::cmp::Ordering::Equal) });
+        ep.truncate(10);
+        if !ep.is_empty() { let md: String = ep.iter().map(|n| format!("- **{}** [{}] `{}`:{}-{}", n.id.name, n.id.root, n.id.file.display(), n.line_start, n.line_end)).collect::<Vec<_>>().join("\n"); sections.push(format!("## Entry points\n\n{}", md)); } }
+    let freshness = format_freshness(graph_state.nodes.len(), graph_state.last_scan_completed_at, ctx.lsp_status);
+    if sections.is_empty() { format!("No repository data available yet.{}", freshness) } else { format!("# Repository Map\n\n{}{}", sections.join("\n\n"), freshness) }
+}
