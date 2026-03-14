@@ -487,8 +487,8 @@ impl LspEnricher {
                                 let quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(true);
                                 tracing::info!("{} serverStatus: health={}, quiescent={}", self.server_command, health, quiescent);
 
-                                if health == "ok" && !quiescent {
-                                    tracing::info!("{} ready (serverStatus: ok, not quiescent)", self.server_command);
+                                if health == "ok" && quiescent {
+                                    tracing::info!("{} ready (serverStatus: ok, quiescent)", self.server_command);
                                     server_ready = true;
                                     break;
                                 }
