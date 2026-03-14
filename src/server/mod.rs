@@ -146,28 +146,6 @@ impl RnaHandler {
         }
     }
 
-    /// Check whether an embedding `SearchResult` passes the root filter.
-    /// Code results (`kind` starts with "code:") are filtered by root slug
-    /// extracted from the stable ID prefix. Non-code results (commits, .oh/
-    /// artifacts) always pass through.
-    pub(crate) fn search_result_passes_root_filter(
-        &self,
-        result: &crate::embed::SearchResult,
-        root_filter: &Option<String>,
-        non_code_slugs: &std::collections::HashSet<String>,
-    ) -> bool {
-        if root_filter.is_none() {
-            return true; // "all" mode
-        }
-        // Non-code results (commits, oh artifacts) always pass
-        if !result.kind.starts_with("code:") {
-            return true;
-        }
-        // Extract root slug from stable ID: "root:file:name:kind"
-        let node_root = result.id.split(':').next().unwrap_or("");
-        self.node_passes_root_filter(node_root, root_filter, non_code_slugs)
-    }
-
     /// Ensure graph is built, check for file changes since last scan.
     /// Returns a read guard to the graph.
     pub(crate) async fn get_graph(&self) -> anyhow::Result<tokio::sync::RwLockReadGuard<'_, Option<GraphState>>> {
@@ -2363,7 +2341,6 @@ mod tests {
 
     #[test]
     fn test_search_result_filter_code_result_matches_root() {
-        let handler = RnaHandler::default();
         let filter = Some("my-project".to_string());
         let non_code = std::collections::HashSet::new();
         let result = crate::embed::SearchResult {
@@ -2373,12 +2350,11 @@ mod tests {
             body: String::new(),
             score: 1.0,
         };
-        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
+        assert!(crate::service::search_result_passes_root_filter(&result, &filter, &non_code));
     }
 
     #[test]
     fn test_search_result_filter_code_result_wrong_root() {
-        let handler = RnaHandler::default();
         let filter = Some("my-project".to_string());
         let non_code = std::collections::HashSet::new();
         let result = crate::embed::SearchResult {
@@ -2388,12 +2364,11 @@ mod tests {
             body: String::new(),
             score: 1.0,
         };
-        assert!(!handler.search_result_passes_root_filter(&result, &filter, &non_code));
+        assert!(!crate::service::search_result_passes_root_filter(&result, &filter, &non_code));
     }
 
     #[test]
     fn test_search_result_filter_commit_always_passes() {
-        let handler = RnaHandler::default();
         let filter = Some("my-project".to_string());
         let non_code = std::collections::HashSet::new();
         let result = crate::embed::SearchResult {
@@ -2403,12 +2378,11 @@ mod tests {
             body: String::new(),
             score: 0.8,
         };
-        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
+        assert!(crate::service::search_result_passes_root_filter(&result, &filter, &non_code));
     }
 
     #[test]
     fn test_search_result_filter_all_mode_passes_everything() {
-        let handler = RnaHandler::default();
         let filter: Option<String> = None;
         let non_code = std::collections::HashSet::new();
         let result = crate::embed::SearchResult {
@@ -2418,12 +2392,11 @@ mod tests {
             body: String::new(),
             score: 1.0,
         };
-        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
+        assert!(crate::service::search_result_passes_root_filter(&result, &filter, &non_code));
     }
 
     #[test]
     fn test_search_result_filter_non_code_root_passes() {
-        let handler = RnaHandler::default();
         let filter = Some("my-project".to_string());
         let mut non_code = std::collections::HashSet::new();
         non_code.insert("claude-memory".to_string());
@@ -2434,7 +2407,7 @@ mod tests {
             body: String::new(),
             score: 0.7,
         };
-        assert!(handler.search_result_passes_root_filter(&result, &filter, &non_code));
+        assert!(crate::service::search_result_passes_root_filter(&result, &filter, &non_code));
     }
 
     // ── Stale root pruning tests (#198) ────────────────────────────────
