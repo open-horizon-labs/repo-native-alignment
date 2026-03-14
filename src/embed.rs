@@ -386,7 +386,15 @@ impl EmbeddingIndex {
     pub async fn ensure_fts_index(&self) {
         match self.db.open_table(&self.table_name).execute().await {
             Ok(table) => self.create_fts_index(&table).await,
-            Err(_) => {} // No table to index
+            Err(lancedb::Error::TableNotFound { .. }) => {
+                // No table to index yet.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "EmbeddingIndex: failed to open table '{}' for FTS ensure: {e:#}",
+                    self.table_name
+                );
+            }
         }
     }
 
