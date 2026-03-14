@@ -9,7 +9,67 @@ permissions:
   pull-requests: write
 
 jobs:
+  # M4-optimized build first — warms sccache for M1 baseline
+  build-fast:
+    runs-on: namespace-profile-tahoe
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Patch version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$OSTYPE" == darwin* ]]; then
+            sed -i '' 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
+            sed -i '' 's/"version": "[^"]*"/"version": "'"$VERSION"'"/g' .claude-plugin/marketplace.json
+          else
+            sed -i 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
+            sed -i 's/"version": "[^"]*"/"version": "'"$VERSION"'"/g' .claude-plugin/marketplace.json
+          fi
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure Namespace sccache cache
+        run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
+
+      - name: Cache Rust
+        uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: rust
+
+      - name: Build release binary
+        run: cargo build --release --target aarch64-apple-darwin
+        env:
+          RUSTFLAGS: "-C target-cpu=apple-m4 -C link-arg=-Wl,-dead_strip"
+          RUSTC_WRAPPER: sccache
+
+      - name: Strip and compress binary
+        run: |
+          strip target/aarch64-apple-darwin/release/repo-native-alignment
+          tar czf repo-native-alignment-darwin-arm64-fast.tar.gz -C target/aarch64-apple-darwin/release repo-native-alignment
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-native-alignment-darwin-arm64-fast
+          path: repo-native-alignment-darwin-arm64-fast.tar.gz
+
+  # M1 baseline + Linux after M4, sharing sccache warmth
   build:
+    needs: build-fast
     strategy:
       matrix:
         include:
@@ -18,11 +78,6 @@ jobs:
             features: ""
             artifact: repo-native-alignment-darwin-arm64
             rustflags: "-C target-cpu=apple-m1 -C link-arg=-Wl,-dead_strip"
-          - os: namespace-profile-tahoe
-            target: aarch64-apple-darwin
-            features: ""
-            artifact: repo-native-alignment-darwin-arm64-fast
-            rustflags: "-C target-cpu=apple-m4 -C link-arg=-Wl,-dead_strip"
           - os: namespace-profile-cached
             target: x86_64-unknown-linux-gnu
             features: "--no-default-features"
@@ -86,7 +141,7 @@ jobs:
           path: ${{ matrix.artifact }}.tar.gz
 
   release:
-    needs: build
+    needs: [build-fast, build]
     runs-on: namespace-profile-cached
 
     steps:
