@@ -335,7 +335,27 @@ impl Scanner {
         self.state.file_mtimes.keys().cloned().collect()
     }
 
+    /// Persist the scanner's in-memory state to disk.
+    ///
+    /// Call this **after** the caller has successfully processed the scan results
+    /// (e.g., graph update + LanceDB persist). This ensures that if processing
+    /// fails, the next scan will re-detect the same changes instead of silently
+    /// losing them.
+    pub fn commit_state(&self) -> Result<()> {
+        if let Some(ref custom_path) = self.custom_state_path {
+            save_state_to_path(custom_path, &self.state)?;
+        } else {
+            save_state(&self.repo_root, &self.state)?;
+        }
+        Ok(())
+    }
+
     /// Perform an incremental scan. Returns changed/new/deleted file lists.
+    ///
+    /// The scan updates internal state (mtimes, hashes) in memory but does
+    /// **not** persist to disk. The caller must call [`commit_state()`] after
+    /// successfully processing the results to persist the state. This ensures
+    /// that if processing fails, the next scan re-detects the same changes.
     ///
     /// Flow:
     /// 1. Load state (already done in constructor)
@@ -343,8 +363,7 @@ impl Scanner {
     ///    get precise changed files via git2
     /// 3. mtime walk: compare directory mtimes, skip unchanged subtrees
     /// 4. Detect deleted files (in state but not on disk)
-    /// 5. Save updated state
-    /// 6. Return ScanResult
+    /// 5. Return ScanResult (state NOT persisted -- caller must commit)
     pub fn scan(&mut self) -> Result<ScanResult> {
         let start = Instant::now();
 
@@ -515,11 +534,9 @@ impl Scanner {
             self.state.last_commit_sha = Some(sha);
         }
 
-        if let Some(ref custom_path) = self.custom_state_path {
-            save_state_to_path(custom_path, &self.state)?;
-        } else {
-            save_state(&self.repo_root, &self.state)?;
-        }
+        // NOTE: State is NOT persisted here. The caller must call
+        // `commit_state()` after successfully processing the scan results.
+        // This prevents silent data loss if graph update fails.
 
         let scan_duration = start.elapsed();
         tracing::info!(
@@ -1197,7 +1214,8 @@ mod tests {
         );
         assert!(result.deleted_files.is_empty());
 
-        // State should be persisted
+        // State should be persisted after commit
+        scanner.commit_state().unwrap();
         assert!(state_path(root).exists());
     }
 
@@ -1216,6 +1234,7 @@ mod tests {
         let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
         let result = scanner.scan().unwrap();
         assert_eq!(result.new_files.len(), 2);
+        scanner.commit_state().unwrap();
 
         // Wait for mtime granularity, then modify a file
         bump_mtime();
@@ -1249,6 +1268,7 @@ mod tests {
         // First scan
         let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
         scanner.scan().unwrap();
+        scanner.commit_state().unwrap();
 
         // Add a new file
         bump_mtime();
@@ -1279,6 +1299,7 @@ mod tests {
         // First scan
         let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
         scanner.scan().unwrap();
+        scanner.commit_state().unwrap();
 
         // Delete a file
         fs::remove_file(root.join("src/old.rs")).unwrap();
@@ -1376,6 +1397,7 @@ mod tests {
         let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
         let result1 = scanner.scan().unwrap();
         assert_eq!(result1.new_files.len(), 2);
+        scanner.commit_state().unwrap();
 
         // Second scan without any changes: nothing should appear
         let mut scanner2 = Scanner::new(root.to_path_buf()).unwrap();
@@ -1423,6 +1445,7 @@ mod tests {
         let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
         let result1 = scanner.scan().unwrap();
         assert_eq!(result1.new_files.len(), 1);
+        scanner.commit_state().unwrap();
 
         // Make a new commit with a new file
         bump_mtime();
@@ -1466,6 +1489,7 @@ mod tests {
 
         let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
         scanner.scan().unwrap();
+        scanner.commit_state().unwrap();
 
         assert!(root.join(".oh/.cache/scan-state.json").exists());
     }
@@ -1498,6 +1522,7 @@ mod tests {
         let result1 = scanner.scan().unwrap();
         assert_eq!(result1.new_files.len(), 1);
         assert!(result1.changed_files.is_empty());
+        scanner.commit_state().unwrap();
 
         // Touch the file without changing content (mtime false positive)
         bump_mtime();
@@ -1526,6 +1551,7 @@ mod tests {
         // First scan
         let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
         scanner.scan().unwrap();
+        scanner.commit_state().unwrap();
 
         // Modify with different content
         bump_mtime();
@@ -1553,6 +1579,7 @@ mod tests {
         // First scan
         let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
         scanner.scan().unwrap();
+        scanner.commit_state().unwrap();
 
         // Load persisted state and check content hashes
         let state = load_state(root).unwrap();
@@ -1579,6 +1606,7 @@ mod tests {
         // First scan
         let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
         scanner.scan().unwrap();
+        scanner.commit_state().unwrap();
 
         // Delete a file
         fs::remove_file(root.join("src/old.rs")).unwrap();
@@ -1586,6 +1614,7 @@ mod tests {
         // Second scan
         let mut scanner2 = Scanner::new(root.to_path_buf()).unwrap();
         scanner2.scan().unwrap();
+        scanner2.commit_state().unwrap();
 
         // Load state — deleted file's hash should be gone
         let state = load_state(root).unwrap();
@@ -1595,6 +1624,62 @@ mod tests {
         );
         // But existing file's hash should remain
         assert!(state.file_content_hashes.contains_key(&PathBuf::from("src/main.rs")));
+    }
+
+    // ── Deferred commit tests ─────────────────────────────────────
+
+    #[test]
+    fn test_uncommitted_scan_state_is_re_detected() {
+        // Core correctness property: if commit_state() is NOT called after
+        // scan(), the next scan must re-detect the same files. This prevents
+        // silent data loss when graph update fails.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        create_file(root, "src/main.rs", "fn main() {}");
+        fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+
+        // First scan -- do NOT commit state
+        let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
+        let result1 = scanner.scan().unwrap();
+        assert_eq!(result1.new_files.len(), 1);
+        // Intentionally skip: scanner.commit_state().unwrap();
+
+        // Second scan from fresh scanner -- should re-detect the same file
+        let mut scanner2 = Scanner::new(root.to_path_buf()).unwrap();
+        let result2 = scanner2.scan().unwrap();
+        assert_eq!(
+            result2.new_files.len(),
+            1,
+            "Uncommitted scan state should cause re-detection. new: {:?}",
+            result2.new_files,
+        );
+    }
+
+    #[test]
+    fn test_committed_scan_state_is_not_re_detected() {
+        // When commit_state() IS called, the next scan should see no changes.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        create_file(root, "src/main.rs", "fn main() {}");
+        fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+
+        // First scan -- commit state
+        let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
+        let result1 = scanner.scan().unwrap();
+        assert_eq!(result1.new_files.len(), 1);
+        scanner.commit_state().unwrap();
+
+        // Second scan -- should see no changes
+        let mut scanner2 = Scanner::new(root.to_path_buf()).unwrap();
+        let result2 = scanner2.scan().unwrap();
+        assert!(
+            result2.new_files.is_empty() && result2.changed_files.is_empty(),
+            "Committed scan state should prevent re-detection. new: {:?}, changed: {:?}",
+            result2.new_files,
+            result2.changed_files,
+        );
     }
 
     // ── PatternConfig tests ─────────────────────────────────────────
