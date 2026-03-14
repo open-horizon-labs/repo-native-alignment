@@ -1682,6 +1682,93 @@ mod tests {
         );
     }
 
+    // ── Adversarial deferred-commit tests ────────────────────────────
+
+    #[test]
+    fn test_uncommitted_modified_files_re_detected() {
+        // Adversarial (dissent: in-memory graph diverges from LanceDB on persist failure):
+        // Modify after commit, scan without committing, verify re-detection.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        create_file(root, "src/main.rs", "fn main() {}");
+        fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+
+        let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
+        scanner.scan().unwrap();
+        scanner.commit_state().unwrap();
+
+        bump_mtime();
+        create_file(root, "src/main.rs", "fn main() { changed(); }");
+
+        let mut scanner2 = Scanner::new(root.to_path_buf()).unwrap();
+        let result2 = scanner2.scan().unwrap();
+        assert!(result2.changed_files.contains(&PathBuf::from("src/main.rs")));
+        // Intentionally skip commit (simulates failed graph update)
+
+        let mut scanner3 = Scanner::new(root.to_path_buf()).unwrap();
+        let result3 = scanner3.scan().unwrap();
+        assert!(
+            result3.changed_files.contains(&PathBuf::from("src/main.rs")),
+            "Uncommitted modified file must be re-detected. changed: {:?}, new: {:?}",
+            result3.changed_files, result3.new_files,
+        );
+    }
+
+    #[test]
+    fn test_uncommitted_deleted_files_re_detected() {
+        // Adversarial (dissent: partial commit on multi-root failure):
+        // Delete after commit, scan without committing, verify re-detection.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        create_file(root, "src/main.rs", "fn main() {}");
+        create_file(root, "src/lib.rs", "pub fn lib() {}");
+        fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+
+        let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
+        scanner.scan().unwrap();
+        scanner.commit_state().unwrap();
+
+        fs::remove_file(root.join("src/lib.rs")).unwrap();
+
+        let mut scanner2 = Scanner::new(root.to_path_buf()).unwrap();
+        let result2 = scanner2.scan().unwrap();
+        assert!(result2.deleted_files.contains(&PathBuf::from("src/lib.rs")));
+        // Intentionally skip commit
+
+        let mut scanner3 = Scanner::new(root.to_path_buf()).unwrap();
+        let result3 = scanner3.scan().unwrap();
+        assert!(
+            result3.deleted_files.contains(&PathBuf::from("src/lib.rs")),
+            "Uncommitted deletion must be re-detected. deleted: {:?}",
+            result3.deleted_files,
+        );
+    }
+
+    #[test]
+    fn test_uncommitted_new_files_across_multiple_scans() {
+        // Adversarial (dissent: commit_state fails after successful persist):
+        // Add files in waves, never committing. Must see all files.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+
+        create_file(root, "src/a.rs", "fn a() {}");
+        let mut scanner1 = Scanner::new(root.to_path_buf()).unwrap();
+        let result1 = scanner1.scan().unwrap();
+        assert_eq!(result1.new_files.len(), 1);
+
+        bump_mtime();
+        create_file(root, "src/b.rs", "fn b() {}");
+        let mut scanner2 = Scanner::new(root.to_path_buf()).unwrap();
+        let result2 = scanner2.scan().unwrap();
+        assert_eq!(
+            result2.new_files.len(), 2,
+            "Both uncommitted new files must be detected. new: {:?}",
+            result2.new_files,
+        );
+    }
+
     // ── PatternConfig tests ─────────────────────────────────────────
 
     #[test]
