@@ -2027,4 +2027,123 @@ mod tests {
         assert_ne!(SearchMode::Keyword, SearchMode::Hybrid);
         assert_ne!(SearchMode::Semantic, SearchMode::Hybrid);
     }
+
+    // ── Adversarial: reindex_artifacts ──────────────────────────────
+
+    #[tokio::test]
+    async fn reindex_artifacts_returns_zero_when_no_table() {
+        // Dissent finding: reindex_artifacts should handle missing table gracefully.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_root.join(".oh/metis")).unwrap();
+        std::fs::write(
+            repo_root.join(".oh/metis/test.md"),
+            "---\ntitle: test\n---\ntest body",
+        )
+        .unwrap();
+
+        let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
+        // No table exists yet -- should return 0 without error.
+        let count = idx.reindex_artifacts(&repo_root).await.unwrap();
+        assert_eq!(count, 0, "should return 0 when embedding table doesn't exist");
+    }
+
+    #[tokio::test]
+    async fn reindex_artifacts_embeds_new_artifacts() {
+        use crate::graph::{Node, NodeId, NodeKind, ExtractionSource};
+        use std::path::PathBuf;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_root.join(".oh/metis")).unwrap();
+        std::fs::create_dir_all(repo_root.join(".git")).unwrap();
+
+        // First, build the table with a code node so the table exists.
+        let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
+        let node = Node {
+            id: NodeId {
+                root: "test".into(),
+                file: PathBuf::from("test.rs"),
+                name: "dummy_fn".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            signature: "fn dummy_fn()".into(),
+            body: "fn dummy_fn() { }".into(),
+            line_start: 1,
+            line_end: 1,
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let initial_count = idx.index_all_with_symbols(&repo_root, &[node]).await.unwrap();
+        assert!(initial_count > 0, "should have indexed initial items");
+
+        // Now create a new .oh/ artifact and call reindex_artifacts.
+        std::fs::write(
+            repo_root.join(".oh/metis/canary.md"),
+            "---\ntitle: canary artifact\n---\nThis is a test canary for adversarial testing.",
+        )
+        .unwrap();
+
+        let count = idx.reindex_artifacts(&repo_root).await.unwrap();
+        assert!(count > 0, "should have embedded the new canary artifact");
+    }
+
+    #[tokio::test]
+    async fn reindex_artifacts_skips_unchanged_on_second_call() {
+        use crate::graph::{Node, NodeId, NodeKind, ExtractionSource};
+        use std::path::PathBuf;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_root.join(".oh/metis")).unwrap();
+        std::fs::create_dir_all(repo_root.join(".git")).unwrap();
+
+        // Build table with a code node.
+        let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
+        let node = Node {
+            id: NodeId {
+                root: "test".into(),
+                file: PathBuf::from("test.rs"),
+                name: "dummy_fn".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            signature: "fn dummy_fn()".into(),
+            body: "fn dummy_fn() { }".into(),
+            line_start: 1,
+            line_end: 1,
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        idx.index_all_with_symbols(&repo_root, &[node]).await.unwrap();
+
+        // Create artifact.
+        std::fs::write(
+            repo_root.join(".oh/metis/stable.md"),
+            "---\ntitle: stable artifact\n---\nThis content does not change.",
+        )
+        .unwrap();
+
+        // First call should embed it.
+        let first_count = idx.reindex_artifacts(&repo_root).await.unwrap();
+        assert!(first_count > 0, "first call should embed the artifact");
+
+        // Second call with same content should skip (BLAKE3 hash match).
+        let second_count = idx.reindex_artifacts(&repo_root).await.unwrap();
+        assert_eq!(second_count, 0, "second call should skip unchanged artifact (BLAKE3 dedup)");
+    }
+
+    #[tokio::test]
+    async fn reindex_artifacts_no_oh_directory() {
+        // Dissent finding: what happens when .oh/ doesn't exist at all?
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        // No .oh/ directory created.
+
+        let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
+        // Should return 0 -- no artifacts to load, no table to open.
+        let count = idx.reindex_artifacts(&repo_root).await.unwrap();
+        assert_eq!(count, 0, "should return 0 when no .oh/ directory exists");
+    }
 }
