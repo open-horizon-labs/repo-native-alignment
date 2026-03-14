@@ -500,6 +500,89 @@ mod tests {
         assert_eq!(status.server_name(), Some("rust-analyzer".to_string()));
     }
 
+    /// Adversarial: concurrent set_running vs check_server_found_timeout.
+    /// If set_running wins, timeout must NOT overwrite RUNNING with UNAVAILABLE.
+    #[test]
+    fn test_adversarial_timeout_does_not_overwrite_running() {
+        use std::sync::Arc;
+
+        let status = Arc::new(LspEnrichmentStatus::default());
+        status.set_server_found();
+        // Simulate: enrichment starts (set_running) while timeout check races.
+        // set_running should win — the compare_exchange in timeout should fail.
+        status.set_running();
+
+        // Now call timeout — it should see RUNNING, not SERVER_FOUND, and return false.
+        let timed_out = status.check_server_found_timeout();
+        assert!(!timed_out, "timeout should not fire when state is RUNNING");
+        assert_eq!(
+            status.current_state(),
+            LspState::Running,
+            "state should remain RUNNING, not regress to UNAVAILABLE"
+        );
+    }
+
+    /// Adversarial: concurrent set_complete vs check_server_found_timeout.
+    #[test]
+    fn test_adversarial_timeout_does_not_overwrite_complete() {
+        let status = LspEnrichmentStatus::default();
+        status.set_server_found();
+        status.set_running();
+        status.set_complete(42);
+
+        let timed_out = status.check_server_found_timeout();
+        assert!(!timed_out);
+        assert_eq!(status.current_state(), LspState::Complete);
+    }
+
+    /// Adversarial: hammer the state machine from 10 threads concurrently.
+    /// No panics, no undefined states — the final state must be valid.
+    #[test]
+    fn test_adversarial_concurrent_state_transitions() {
+        use std::sync::Arc;
+
+        let status = Arc::new(LspEnrichmentStatus::default());
+
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let s = Arc::clone(&status);
+                std::thread::spawn(move || {
+                    match i % 4 {
+                        0 => s.set_server_found(),
+                        1 => s.set_running(),
+                        2 => s.set_complete(i * 10),
+                        3 => { let _ = s.check_server_found_timeout(); }
+                        _ => unreachable!(),
+                    }
+                    // All reads must produce a valid state
+                    let state = s.current_state();
+                    assert!(matches!(
+                        state,
+                        LspState::NotStarted
+                            | LspState::Running
+                            | LspState::Complete
+                            | LspState::Unavailable
+                            | LspState::ServerFound
+                    ));
+                    let _footer = s.footer_segment(); // must not panic
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    /// Adversarial: from_u8 with invalid value must not panic.
+    #[test]
+    fn test_adversarial_invalid_state_u8() {
+        // Values beyond the enum range should fall back to NotStarted
+        assert_eq!(LspState::from_u8(255), LspState::NotStarted);
+        assert_eq!(LspState::from_u8(5), LspState::NotStarted);
+        assert_eq!(LspState::from_u8(100), LspState::NotStarted);
+    }
+
     #[test]
     fn test_lsp_server_found_footer_includes_server_name() {
         let status = LspEnrichmentStatus::default();
