@@ -13,9 +13,11 @@
 //! - If the server binary is not installed, logs info and skips gracefully
 //! - 60-second timeout per LSP request
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -248,6 +250,207 @@ impl LspTransport {
 }
 
 // ---------------------------------------------------------------------------
+// Pipelined LSP transport (concurrent JSON-RPC requests)
+// ---------------------------------------------------------------------------
+
+/// A pipelined LSP transport that supports multiple concurrent in-flight
+/// requests. Uses a background reader task to dispatch responses by ID.
+///
+/// JSON-RPC 2.0 natively supports concurrent requests identified by ID.
+/// This transport exploits that: `request()` takes `&self`, sends a request,
+/// and returns a future that resolves when the matching response arrives.
+struct PipelinedTransport {
+    /// Writer half (stdin), protected by a mutex for serialized writes.
+    writer: Mutex<tokio::process::ChildStdin>,
+    /// Monotonically increasing request ID counter.
+    next_id: AtomicI64,
+    /// Map of pending request IDs to their response channels.
+    /// Uses std::sync::Mutex (not tokio) because the critical section is
+    /// non-async (just HashMap insert/remove) and we want minimal overhead
+    /// under high concurrency.
+    pending: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>>,
+    /// Handle to the background reader task (for cleanup).
+    _reader_handle: tokio::task::JoinHandle<()>,
+    /// The child process (kept alive; kill_on_drop).
+    _child: Arc<Mutex<Child>>,
+}
+
+impl PipelinedTransport {
+    /// Convert a sequential `LspTransport` into a pipelined one.
+    /// This consumes the transport and spawns a background reader task.
+    fn from_sequential(mut transport: LspTransport) -> Self {
+        let stdin = transport.child.stdin.take().expect("stdin already taken");
+        let reader = transport.reader;
+        let next_id = transport.next_id;
+
+        let pending: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let pending_clone = Arc::clone(&pending);
+        let reader_handle = tokio::spawn(async move {
+            Self::reader_loop(reader, pending_clone).await;
+        });
+
+        Self {
+            writer: Mutex::new(stdin),
+            next_id: AtomicI64::new(next_id),
+            pending,
+            _reader_handle: reader_handle,
+            _child: Arc::new(Mutex::new(transport.child)),
+        }
+    }
+
+    /// Background reader loop: reads messages from the LSP server and
+    /// dispatches responses to waiting callers by request ID.
+    async fn reader_loop(
+        mut reader: BufReader<tokio::process::ChildStdout>,
+        pending: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>>,
+    ) {
+        loop {
+            // Read a single Content-Length framed message
+            let msg = match Self::read_message(&mut reader).await {
+                Ok(msg) => msg,
+                Err(e) => {
+                    tracing::debug!("PipelinedTransport reader loop ended: {}", e);
+                    // Notify all pending requests that the transport is dead
+                    let mut map = pending.lock().unwrap();
+                    for (id, sender) in map.drain() {
+                        let _ = sender.send(Err(anyhow::anyhow!(
+                            "LSP transport closed while waiting for response {}", id
+                        )));
+                    }
+                    break;
+                }
+            };
+
+            // Check if this is a response (has "id" field and no "method" field)
+            if let Some(id) = msg.get("id").and_then(|v| v.as_i64()) {
+                if msg.get("method").is_none() {
+                    // This is a response — dispatch to waiting caller
+                    let mut map = pending.lock().unwrap();
+                    if let Some(sender) = map.remove(&id) {
+                        let result = if let Some(error) = msg.get("error") {
+                            Err(anyhow::anyhow!("LSP error: {}", error))
+                        } else {
+                            Ok(msg.get("result").cloned().unwrap_or(serde_json::Value::Null))
+                        };
+                        let _ = sender.send(result);
+                    }
+                    continue;
+                }
+                // It has both "id" and "method" — it's a server-to-client *request*
+                // (e.g. window/workDoneProgress/create). We need to respond.
+                if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+                    if method == "window/workDoneProgress/create" {
+                        // We can't write back from the reader loop without the writer.
+                        // These are non-critical during enrichment; log and skip.
+                        tracing::debug!("PipelinedTransport: ignoring server request {} (id={})", method, id);
+                    }
+                }
+            }
+
+            // Notifications: log progress, ignore the rest
+            if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+                match method {
+                    "$/progress" => {
+                        let kind = msg.pointer("/params/value/kind").and_then(|k| k.as_str()).unwrap_or("");
+                        let title = msg.pointer("/params/value/title").and_then(|t| t.as_str()).unwrap_or("");
+                        if kind == "begin" || kind == "end" {
+                            tracing::debug!("PipelinedTransport progress {}: {}", kind, title);
+                        }
+                    }
+                    "experimental/serverStatus" => {
+                        let health = msg.pointer("/params/health").and_then(|h| h.as_str()).unwrap_or("");
+                        let quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(true);
+                        tracing::debug!("PipelinedTransport serverStatus: health={}, quiescent={}", health, quiescent);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Read a single Content-Length framed LSP message.
+    async fn read_message(reader: &mut BufReader<tokio::process::ChildStdout>) -> Result<serde_json::Value> {
+        let mut content_length: Option<usize> = None;
+
+        // Read headers
+        loop {
+            let mut line = String::new();
+            let bytes_read = reader.read_line(&mut line).await?;
+            if bytes_read == 0 {
+                return Err(anyhow::anyhow!("LSP stdout closed (EOF)"));
+            }
+            let line = line.trim();
+
+            if line.is_empty() {
+                break; // End of headers
+            }
+
+            if let Some(len_str) = line.strip_prefix("Content-Length: ") {
+                content_length = Some(len_str.parse()?);
+            }
+        }
+
+        let length = content_length.context("Missing Content-Length header")?;
+        let mut body = vec![0u8; length];
+        reader.read_exact(&mut body).await?;
+
+        let msg: serde_json::Value = serde_json::from_slice(&body)?;
+        Ok(msg)
+    }
+
+    /// Send a JSON-RPC request and return a future that resolves with the response.
+    /// This is `&self` — multiple concurrent requests are supported.
+    async fn request<P: serde::Serialize>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> Result<serde_json::Value> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+
+        // Register the pending response channel BEFORE sending (avoids race)
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut map = self.pending.lock().unwrap();
+            map.insert(id, tx);
+        }
+
+        // Send the request
+        {
+            let body = serde_json::to_string(&request)?;
+            let header = format!("Content-Length: {}\r\n\r\n", body.len());
+            let mut writer = self.writer.lock().await;
+            writer.write_all(header.as_bytes()).await?;
+            writer.write_all(body.as_bytes()).await?;
+            writer.flush().await?;
+        }
+
+        // Wait for the response with timeout.
+        // 5s timeout for pipelined enrichment requests (vs 60s for sequential init).
+        // Functions that can't be resolved in 5s are likely stale or broken.
+        let timeout = tokio::time::Duration::from_secs(5);
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(anyhow::anyhow!("LSP response channel closed for {} (id={})", method, id)),
+            Err(_) => {
+                // Remove the pending entry on timeout
+                let mut map = self.pending.lock().unwrap();
+                map.remove(&id);
+                Err(anyhow::anyhow!("LSP request {} timed out after 5s (id={})", method, id))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LspEnricher
 // ---------------------------------------------------------------------------
 
@@ -279,7 +482,10 @@ pub struct LspEnricher {
 }
 
 struct LspState {
+    /// Sequential transport used during initialization only.
     transport: Option<LspTransport>,
+    /// Pipelined transport used during enrichment (concurrent requests).
+    pipelined: Option<Arc<PipelinedTransport>>,
     /// Cached root path from initialization.
     root_path: Option<PathBuf>,
     /// Whether we already tried and failed to start the language server.
@@ -318,6 +524,7 @@ impl LspEnricher {
             ready: AtomicBool::new(false),
             state: Mutex::new(LspState {
                 transport: None,
+                pipelined: None,
                 root_path: None,
                 init_failed: false,
                 has_type_hierarchy: false,
@@ -366,7 +573,7 @@ impl LspEnricher {
     async fn ensure_initialized(&self, repo_root: &Path) -> Result<()> {
         let mut state = self.state.lock().await;
 
-        if state.transport.is_some() {
+        if state.pipelined.is_some() || state.transport.is_some() {
             return Ok(());
         }
 
@@ -550,14 +757,22 @@ impl LspEnricher {
         }
 
         tracing::info!("{} ready for {}", self.server_command, self.language);
+
+        // Convert to pipelined transport for concurrent request support
+        if let Some(transport) = state.transport.take() {
+            let pipelined = PipelinedTransport::from_sequential(transport);
+            tracing::info!("{} converted to pipelined transport", self.server_command);
+            state.pipelined = Some(Arc::new(pipelined));
+        }
+
         self.ready.store(true, Ordering::SeqCst);
 
         Ok(())
     }
 
-    /// Prepare call hierarchy at a position. Returns the CallHierarchyItem if found.
-    async fn prepare_call_hierarchy(
-        transport: &mut LspTransport,
+    /// Prepare call hierarchy at a position (pipelined). Returns the CallHierarchyItem if found.
+    async fn prepare_call_hierarchy_p(
+        transport: &PipelinedTransport,
         file_uri: &Uri,
         line: u32,
         character: u32,
@@ -575,7 +790,6 @@ impl LspEnricher {
             return Ok(None);
         }
 
-        // Returns an array of CallHierarchyItem — take the first
         if let Some(items) = result.as_array() {
             Ok(items.first().cloned())
         } else {
@@ -583,74 +797,54 @@ impl LspEnricher {
         }
     }
 
-    /// Find outgoing calls (callees) for a CallHierarchyItem.
-    async fn outgoing_calls(
-        transport: &mut LspTransport,
+    /// Find outgoing calls (pipelined).
+    async fn outgoing_calls_p(
+        transport: &PipelinedTransport,
         item: &serde_json::Value,
     ) -> Result<Vec<serde_json::Value>> {
-        let params = serde_json::json!({
-            "item": item
-        });
-
+        let params = serde_json::json!({ "item": item });
         let result: serde_json::Value = transport
             .request("callHierarchy/outgoingCalls", &params)
             .await?;
-
-        if result.is_null() {
-            return Ok(Vec::new());
-        }
-
+        if result.is_null() { return Ok(Vec::new()); }
         Ok(result.as_array().cloned().unwrap_or_default())
     }
 
-    /// Find incoming calls (callers) for a CallHierarchyItem.
-    async fn incoming_calls(
-        transport: &mut LspTransport,
+    /// Find incoming calls (pipelined).
+    async fn incoming_calls_p(
+        transport: &PipelinedTransport,
         item: &serde_json::Value,
     ) -> Result<Vec<serde_json::Value>> {
-        let params = serde_json::json!({
-            "item": item
-        });
-
+        let params = serde_json::json!({ "item": item });
         let result: serde_json::Value = transport
             .request("callHierarchy/incomingCalls", &params)
             .await?;
-
-        if result.is_null() {
-            return Ok(Vec::new());
-        }
-
+        if result.is_null() { return Ok(Vec::new()); }
         Ok(result.as_array().cloned().unwrap_or_default())
     }
 
-    /// Get document links (cross-references, wiki-links) for a file.
-    async fn document_links(
-        transport: &mut LspTransport,
+    /// Get document links (pipelined).
+    async fn document_links_p(
+        transport: &PipelinedTransport,
         file_uri: &Uri,
     ) -> Result<Vec<serde_json::Value>> {
         let params = serde_json::json!({
             "textDocument": { "uri": file_uri.as_str() }
         });
-
         let result: serde_json::Value = transport
             .request("textDocument/documentLink", &params)
             .await?;
-
-        if result.is_null() {
-            return Ok(Vec::new());
-        }
-
+        if result.is_null() { return Ok(Vec::new()); }
         Ok(result.as_array().cloned().unwrap_or_default())
     }
 
-    /// Find implementations of a trait/interface at the given position.
-    async fn find_implementations(
-        transport: &mut LspTransport,
+    /// Find implementations of a trait/interface (pipelined).
+    async fn find_implementations_p(
+        transport: &PipelinedTransport,
         file_uri: &Uri,
         line: u32,
         character: u32,
     ) -> Result<Vec<Location>> {
-        // GotoImplementationParams is a type alias for GotoDefinitionParams
         let params = GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier {
@@ -670,8 +864,6 @@ impl LspEnricher {
             return Ok(Vec::new());
         }
 
-        // Implementation can return Location, Vec<Location>, or Vec<LocationLink>
-        // GotoDefinitionResponse handles all variants via #[serde(untagged)]
         let locations: Vec<Location> =
             match serde_json::from_value::<GotoDefinitionResponse>(result) {
                 Ok(GotoDefinitionResponse::Scalar(loc)) => vec![loc],
@@ -754,8 +946,8 @@ impl LspEnricher {
     ///
     /// Returns `true` if the prepare call succeeded, `false` if it failed (used for
     /// strike counting).
-    async fn enrich_type_hierarchy(
-        transport: &mut LspTransport,
+    async fn enrich_type_hierarchy_p(
+        transport: &PipelinedTransport,
         file_uri: &Uri,
         line: u32,
         character: u32,
@@ -764,7 +956,7 @@ impl LspEnricher {
         root: &Path,
         result: &mut EnrichmentResult,
     ) -> bool {
-        let items = match Self::prepare_type_hierarchy(transport, file_uri, line, character).await {
+        let items = match Self::prepare_type_hierarchy_p(transport, file_uri, line, character).await {
             Ok(items) if !items.is_empty() => items,
             Ok(_) => return true, // No type hierarchy item — not a failure
             Err(e) => {
@@ -775,7 +967,7 @@ impl LspEnricher {
 
         for item in &items {
             // Supertypes: this node implements/inherits from each supertype
-            match Self::type_hierarchy_supertypes(transport, item).await {
+            match Self::type_hierarchy_supertypes_p(transport, item).await {
                 Ok(supertypes) => {
                     for supertype in &supertypes {
                         if let Some(target_id) = Self::resolve_type_hierarchy_item(
@@ -898,9 +1090,9 @@ impl LspEnricher {
             .map(|n| n.id.clone())
     }
 
-    /// Prepare type hierarchy at a position. Returns the TypeHierarchyItem(s) if found.
-    async fn prepare_type_hierarchy(
-        transport: &mut LspTransport,
+    /// Prepare type hierarchy at a position (pipelined).
+    async fn prepare_type_hierarchy_p(
+        transport: &PipelinedTransport,
         file_uri: &Uri,
         line: u32,
         character: u32,
@@ -921,23 +1113,16 @@ impl LspEnricher {
         Ok(result.as_array().cloned().unwrap_or_default())
     }
 
-    /// Find supertypes for a TypeHierarchyItem.
-    async fn type_hierarchy_supertypes(
-        transport: &mut LspTransport,
+    /// Find supertypes for a TypeHierarchyItem (pipelined).
+    async fn type_hierarchy_supertypes_p(
+        transport: &PipelinedTransport,
         item: &serde_json::Value,
     ) -> Result<Vec<serde_json::Value>> {
-        let params = serde_json::json!({
-            "item": item
-        });
-
+        let params = serde_json::json!({ "item": item });
         let result: serde_json::Value = transport
             .request("typeHierarchy/supertypes", &params)
             .await?;
-
-        if result.is_null() {
-            return Ok(Vec::new());
-        }
-
+        if result.is_null() { return Ok(Vec::new()); }
         Ok(result.as_array().cloned().unwrap_or_default())
     }
 
@@ -983,41 +1168,120 @@ impl Enricher for LspEnricher {
             return Err(e);
         }
 
-        let mut state = self.state.lock().await;
-        let root = state
-            .root_path
-            .clone()
-            .unwrap_or_else(|| repo_root.to_path_buf());
-        let mut has_type_hierarchy = state.has_type_hierarchy;
-        let mut type_hierarchy_strikes = state.type_hierarchy_strikes;
-        let transport = match state.transport.as_mut() {
-            Some(t) => t,
-            None => return Ok(result),
+        // Extract state under lock, then release the lock for concurrent work
+        let (transport, root, has_type_hierarchy, type_hierarchy_strikes) = {
+            let state = self.state.lock().await;
+            let root = state
+                .root_path
+                .clone()
+                .unwrap_or_else(|| repo_root.to_path_buf());
+            let transport = match &state.pipelined {
+                Some(t) => Arc::clone(t),
+                None => return Ok(result),
+            };
+            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes)
         };
+        // State lock is released here — concurrent tasks can proceed
+
+        // Share matching_nodes across concurrent tasks via Arc<Vec<Node>> (owned copies)
+        let matching_nodes_owned: Arc<Vec<Node>> = Arc::new(
+            matching_nodes.iter().map(|n| (*n).clone()).collect()
+        );
+        let language = self.language.clone();
 
         // ------------------------------------------------------------------
         // Pass 1: call hierarchy, find_implementations, and document links.
-        // These are the primary enrichment requests — one per node.
+        // Pipelined with adaptive concurrency (TCP slow-start).
         // ------------------------------------------------------------------
-        let mut attempted = 0u32;
-        let mut errors = 0u32;
-        for node in &matching_nodes {
-            let abs_path = root.join(&node.id.file);
-            let file_uri = match path_to_uri(&abs_path) {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
+        let pass1_start = std::time::Instant::now();
 
-            let (line, col) = Self::node_lsp_position(node);
+        // Filter to only nodes that need LSP requests:
+        // Functions (call hierarchy), Traits (implementations), and Other (document links).
+        // Skip test functions — they don't have meaningful cross-file callers
+        // and halve the total RPC count.
+        let enrichable_nodes: Vec<&Node> = matching_nodes.iter()
+            .filter(|n| matches!(n.id.kind,
+                NodeKind::Function | NodeKind::Trait | NodeKind::Other(_)))
+            .filter(|n| {
+                // Skip test functions (have #[test] or #[tokio::test] decorator)
+                if n.id.kind == NodeKind::Function {
+                    if let Some(decorators) = n.metadata.get("decorators") {
+                        if decorators.contains("#[test]") || decorators.contains("#[tokio::test]") {
+                            return false;
+                        }
+                    }
+                    // Also skip functions in test files
+                    if crate::ranking::is_test_file(n) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .copied()
+            .collect();
 
-            match node.id.kind {
-                NodeKind::Function => {
-                    attempted += 1;
-                    // Use callHierarchy to find callers
-                    match Self::prepare_call_hierarchy(transport, &file_uri, line, col).await {
-                        Ok(Some(item)) => {
-                            match Self::incoming_calls(transport, &item).await {
-                                Ok(calls) => {
+        tracing::info!(
+            "LSP pipeline: {} enrichable nodes out of {} total ({}f, {}t, {}o)",
+            enrichable_nodes.len(), matching_nodes.len(),
+            enrichable_nodes.iter().filter(|n| n.id.kind == NodeKind::Function).count(),
+            enrichable_nodes.iter().filter(|n| n.id.kind == NodeKind::Trait).count(),
+            enrichable_nodes.iter().filter(|n| matches!(n.id.kind, NodeKind::Other(_))).count(),
+        );
+
+        // Concurrency control: TCP slow-start from 4 to 64.
+        // Start conservatively to let the LSP server warm its caches,
+        // then ramp up quickly once it's handling requests smoothly.
+        const PIPELINE_MAX_CONCURRENCY: usize = 64;
+        let concurrency_limit = Arc::new(tokio::sync::Semaphore::new(4));
+        let mut join_set = tokio::task::JoinSet::new();
+
+        let completed = Arc::new(AtomicI64::new(0));
+        let error_count = Arc::new(AtomicI64::new(0));
+        let ramped_up = Arc::new(AtomicBool::new(false));
+
+        for node in &enrichable_nodes {
+            let node = (*node).clone();
+            let transport = Arc::clone(&transport);
+            let root = root.clone();
+            let matching_owned = Arc::clone(&matching_nodes_owned);
+            let language = language.clone();
+            let sem = Arc::clone(&concurrency_limit);
+            let completed = Arc::clone(&completed);
+            let error_count = Arc::clone(&error_count);
+
+            let ramped_up = Arc::clone(&ramped_up);
+
+            join_set.spawn(async move {
+                // Acquire semaphore permit — limits concurrency
+                let _permit = sem.acquire().await.unwrap();
+
+                let abs_path = root.join(&node.id.file);
+                let file_uri = match path_to_uri(&abs_path) {
+                    Ok(u) => u,
+                    Err(_) => {
+                        completed.fetch_add(1, Ordering::Relaxed);
+                        return (Vec::new(), Vec::new(), false);
+                    }
+                };
+
+                let (line, col) = Self::node_lsp_position(&node);
+                let mut edges = Vec::new();
+                let mut new_nodes = Vec::new();
+                let mut had_error = false;
+
+                match node.id.kind {
+                    NodeKind::Function => {
+                        match Self::prepare_call_hierarchy_p(&transport, &file_uri, line, col).await {
+                            Ok(Some(item)) => {
+                                // Run incoming and outgoing calls concurrently
+                                let (incoming_result, outgoing_result) = tokio::join!(
+                                    Self::incoming_calls_p(&transport, &item),
+                                    Self::outgoing_calls_p(&transport, &item),
+                                );
+
+                                // Process incoming calls
+                                if let Ok(calls) = incoming_result {
+                                    let matching_refs: Vec<&Node> = matching_owned.iter().collect();
                                     for call in &calls {
                                         let caller_uri = &call["from"]["uri"];
                                         let caller_name = call["from"]["name"].as_str().unwrap_or("");
@@ -1031,26 +1295,22 @@ impl Enricher for LspEnricher {
                                                 continue;
                                             };
 
-                                            // Skip external crate callers
                                             if caller_path.to_string_lossy().contains(".cargo") {
                                                 continue;
                                             }
 
-                                            // Find the caller in our graph nodes
-                                            let caller_id = matching_nodes.iter()
+                                            let caller_id = matching_refs.iter()
                                                 .filter(|n| n.id.file == caller_path)
                                                 .filter(|n| n.id.name == caller_name)
                                                 .next()
                                                 .map(|n| n.id.clone())
-                                                .or_else(|| find_enclosing_symbol(&matching_nodes, &caller_path, caller_line));
+                                                .or_else(|| find_enclosing_symbol(&matching_refs, &caller_path, caller_line));
 
                                             if let Some(caller) = caller_id {
-                                                // Skip self-calls
                                                 if caller.name == node.id.name && caller.file == node.id.file {
                                                     continue;
                                                 }
-                                                tracing::debug!("Calls edge: {} -> {}", caller.name, node.id.name);
-                                                result.added_edges.push(Edge {
+                                                edges.push(Edge {
                                                     from: caller,
                                                     to: node.id.clone(),
                                                     kind: EdgeKind::Calls,
@@ -1061,14 +1321,10 @@ impl Enricher for LspEnricher {
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::debug!("incomingCalls failed for {}: {}", node.id.name, e);
-                                }
-                            }
 
-                            // Outgoing calls: what does this function call?
-                            match Self::outgoing_calls(transport, &item).await {
-                                Ok(calls) => {
+                                // Process outgoing calls
+                                if let Ok(calls) = outgoing_result {
+                                    let matching_refs: Vec<&Node> = matching_owned.iter().collect();
                                     for call in &calls {
                                         let callee_uri = &call["to"]["uri"];
                                         let callee_name = call["to"]["name"].as_str().unwrap_or("");
@@ -1083,10 +1339,6 @@ impl Enricher for LspEnricher {
                                             };
 
                                             if callee_path.to_string_lossy().contains(".cargo") {
-                                                // External crate symbol — synthesize a virtual node.
-                                                // rust-analyzer populates call["to"]["detail"] with the
-                                                // fully-qualified path (e.g. "tokio::runtime::Runtime::new").
-                                                // Fall back to the bare name if detail is absent.
                                                 let fqn = call["to"]["detail"]
                                                     .as_str()
                                                     .filter(|s| !s.is_empty())
@@ -1096,7 +1348,6 @@ impl Enricher for LspEnricher {
                                                     continue;
                                                 }
 
-                                                // Derive package from the first path segment of the FQN.
                                                 let package = fqn.split("::").next().unwrap_or(fqn).to_string();
 
                                                 let virtual_id = NodeId {
@@ -1106,28 +1357,21 @@ impl Enricher for LspEnricher {
                                                     kind: NodeKind::Function,
                                                 };
 
-                                                // Deduplicate: only add if not already synthesized this run.
-                                                if !result.new_nodes.iter().any(|n| n.id == virtual_id) {
-                                                    let mut meta = std::collections::BTreeMap::new();
-                                                    meta.insert("package".to_string(), package.clone());
-                                                    meta.insert("virtual".to_string(), "true".to_string());
-                                                    result.new_nodes.push(Node {
-                                                        id: virtual_id.clone(),
-                                                        language: self.language.clone(),
-                                                        line_start: 0,
-                                                        line_end: 0,
-                                                        signature: fqn.to_string(),
-                                                        body: String::new(), // no body — must not be embedded
-                                                        metadata: meta,
-                                                        source: ExtractionSource::Lsp,
-                                                    });
-                                                    tracing::debug!(
-                                                        "Synthesized virtual node: {} (package: {})",
-                                                        fqn, package
-                                                    );
-                                                }
+                                                let mut meta = std::collections::BTreeMap::new();
+                                                meta.insert("package".to_string(), package.clone());
+                                                meta.insert("virtual".to_string(), "true".to_string());
+                                                new_nodes.push(Node {
+                                                    id: virtual_id.clone(),
+                                                    language: language.clone(),
+                                                    line_start: 0,
+                                                    line_end: 0,
+                                                    signature: fqn.to_string(),
+                                                    body: String::new(),
+                                                    metadata: meta,
+                                                    source: ExtractionSource::Lsp,
+                                                });
 
-                                                result.added_edges.push(Edge {
+                                                edges.push(Edge {
                                                     from: node.id.clone(),
                                                     to: virtual_id,
                                                     kind: EdgeKind::Calls,
@@ -1137,18 +1381,18 @@ impl Enricher for LspEnricher {
                                                 continue;
                                             }
 
-                                            let callee_id = matching_nodes.iter()
+                                            let callee_id = matching_refs.iter()
                                                 .filter(|n| n.id.file == callee_path)
                                                 .filter(|n| n.id.name == callee_name)
                                                 .next()
                                                 .map(|n| n.id.clone())
-                                                .or_else(|| find_enclosing_symbol(&matching_nodes, &callee_path, callee_line));
+                                                .or_else(|| find_enclosing_symbol(&matching_refs, &callee_path, callee_line));
 
                                             if let Some(callee) = callee_id {
                                                 if callee.name == node.id.name && callee.file == node.id.file {
                                                     continue;
                                                 }
-                                                result.added_edges.push(Edge {
+                                                edges.push(Edge {
                                                     from: node.id.clone(),
                                                     to: callee,
                                                     kind: EdgeKind::Calls,
@@ -1159,76 +1403,63 @@ impl Enricher for LspEnricher {
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::debug!("outgoingCalls failed for {}: {}", node.id.name, e);
-                                }
+                            }
+                            Ok(None) => {} // No call hierarchy item
+                            Err(e) => {
+                                had_error = true;
+                                error_count.fetch_add(1, Ordering::Relaxed);
+                                tracing::debug!("prepareCallHierarchy failed for {}: {}", node.id.name, e);
                             }
                         }
-                        Ok(None) => {} // No call hierarchy item — function not recognized
-                        Err(e) => {
-                            errors += 1;
-                            tracing::debug!("prepareCallHierarchy failed for {}: {}", node.id.name, e);
-                        }
                     }
-                }
-                NodeKind::Trait => {
-                    // Find implementations for traits/interfaces
-                    match Self::find_implementations(transport, &file_uri, line, col).await {
-                        Ok(locations) => {
-                            for loc in locations {
-                                let impl_path = uri_to_relative_path(&loc.uri, &root);
-                                let impl_line = loc.range.start.line as usize + 1;
+                    NodeKind::Trait => {
+                        match Self::find_implementations_p(&transport, &file_uri, line, col).await {
+                            Ok(locations) => {
+                                let matching_refs: Vec<&Node> = matching_owned.iter().collect();
+                                for loc in locations {
+                                    let impl_path = uri_to_relative_path(&loc.uri, &root);
+                                    let impl_line = loc.range.start.line as usize + 1;
 
-                                if impl_path.to_string_lossy().contains(".cargo") {
-                                    continue;
-                                }
+                                    if impl_path.to_string_lossy().contains(".cargo") {
+                                        continue;
+                                    }
 
-                                // Resolve to actual enclosing symbol
-                                let impl_id = matching_nodes.iter()
-                                    .filter(|n| n.id.file == impl_path)
-                                    .filter(|n| matches!(n.id.kind, NodeKind::Impl | NodeKind::Struct))
-                                    .filter(|n| n.line_start <= impl_line && n.line_end >= impl_line)
-                                    .min_by_key(|n| n.line_end - n.line_start)
-                                    .map(|n| n.id.clone());
+                                    let impl_id = matching_refs.iter()
+                                        .filter(|n| n.id.file == impl_path)
+                                        .filter(|n| matches!(n.id.kind, NodeKind::Impl | NodeKind::Struct))
+                                        .filter(|n| n.line_start <= impl_line && n.line_end >= impl_line)
+                                        .min_by_key(|n| n.line_end - n.line_start)
+                                        .map(|n| n.id.clone());
 
-                                if let Some(implementor) = impl_id {
-                                    result.added_edges.push(Edge {
-                                        from: implementor,
-                                        to: node.id.clone(),
-                                        kind: EdgeKind::Implements,
-                                        source: ExtractionSource::Lsp,
-                                        confidence: Confidence::Confirmed,
-                                    });
+                                    if let Some(implementor) = impl_id {
+                                        edges.push(Edge {
+                                            from: implementor,
+                                            to: node.id.clone(),
+                                            kind: EdgeKind::Implements,
+                                            source: ExtractionSource::Lsp,
+                                            confidence: Confidence::Confirmed,
+                                        });
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                "Implementation lookup failed for {}: {}",
-                                node.id.name,
-                                e
-                            );
+                            Err(e) => {
+                                tracing::debug!("Implementation lookup failed for {}: {}", node.id.name, e);
+                            }
                         }
                     }
-                }
-                _ => {
-                    // For non-code nodes (markdown sections, etc.), try documentLink
-                    // to find cross-document references and links.
-                    if matches!(node.id.kind, NodeKind::Other(_)) {
-                        match Self::document_links(transport, &file_uri).await {
-                            Ok(links) => {
+                    _ => {
+                        if matches!(node.id.kind, NodeKind::Other(_)) {
+                            if let Ok(links) = Self::document_links_p(&transport, &file_uri).await {
                                 for link in &links {
                                     if let Some(target) = link.get("target").and_then(|t| t.as_str()) {
                                         if let Some(target_path) = target.strip_prefix("file://") {
                                             let rel_target = PathBuf::from(target_path);
                                             let rel_target = rel_target.strip_prefix(&root).unwrap_or(&rel_target).to_path_buf();
 
-                                            // Skip external links
                                             if rel_target.to_string_lossy().starts_with("http") {
                                                 continue;
                                             }
 
-                                            // Create a DependsOn edge from this section to the linked document
                                             let target_id = NodeId {
                                                 root: node.id.root.clone(),
                                                 file: rel_target.clone(),
@@ -1239,7 +1470,7 @@ impl Enricher for LspEnricher {
                                                 kind: NodeKind::Module,
                                             };
 
-                                            result.added_edges.push(Edge {
+                                            edges.push(Edge {
                                                 from: node.id.clone(),
                                                 to: target_id,
                                                 kind: EdgeKind::DependsOn,
@@ -1250,27 +1481,68 @@ impl Enricher for LspEnricher {
                                     }
                                 }
                             }
-                            Err(_) => {} // documentLink not supported — fine
                         }
                     }
                 }
+
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                // Ramp up after 4 successful completions (TCP slow-start exit)
+                if done >= 4 && !had_error && !ramped_up.swap(true, Ordering::Relaxed) {
+                    let added = PIPELINE_MAX_CONCURRENCY - 4;
+                    sem.add_permits(added);
+                    tracing::info!("LSP pipeline: ramp-up to {} concurrent", PIPELINE_MAX_CONCURRENCY);
+                }
+                (edges, new_nodes, had_error)
+            });
+        }
+
+        // Collect results from all concurrent tasks
+        let mut attempted = 0u32;
+        let mut errors = 0u32;
+        let mut seen_virtual_ids = std::collections::HashSet::new();
+
+        while let Some(task_result) = join_set.join_next().await {
+            match task_result {
+                Ok((edges, new_nodes, had_error)) => {
+                    attempted += 1;
+                    if had_error {
+                        errors += 1;
+                    }
+                    result.added_edges.extend(edges);
+                    for vnode in new_nodes {
+                        if seen_virtual_ids.insert(vnode.id.clone()) {
+                            result.new_nodes.push(vnode);
+                        }
+                    }
+                }
+                Err(e) => {
+                    errors += 1;
+                    tracing::debug!("LSP enrichment task panicked: {}", e);
+                }
+            }
+
+            // Log progress every 500 completions
+            let done = completed.load(Ordering::Relaxed);
+            if done % 500 == 0 && done > 0 {
+                tracing::info!(
+                    "LSP enrichment progress: {}/{} nodes, {} edges so far",
+                    done, enrichable_nodes.len(), result.added_edges.len(),
+                );
             }
         }
 
+        tracing::info!(
+            "LSP Pass 1 complete in {:?}: {} edges from {} nodes ({} errors)",
+            pass1_start.elapsed(), result.added_edges.len(), attempted, errors,
+        );
+
         // ------------------------------------------------------------------
-        // Pass 2: type hierarchy — batch all Trait/Struct/Enum nodes.
-        //
-        // Separated from pass 1 so type hierarchy requests are not interleaved
-        // with call hierarchy requests. This makes the request pattern cleaner
-        // and positions the code for future concurrent batching.
-        //
-        // NOTE: true concurrent batching requires refactoring LspTransport to
-        // use `&self` (e.g. via interior mutability or a request-ID multiplexer).
-        // JSON-RPC 2.0 supports multiplexed request IDs, but the current
-        // transport takes `&mut self`, so requests remain sequential here.
+        // Pass 2: type hierarchy (sequential — strike counting needs order)
         // ------------------------------------------------------------------
+        let mut has_type_hierarchy = has_type_hierarchy;
+        let mut type_hierarchy_strikes = type_hierarchy_strikes;
+
         if has_type_hierarchy {
-            // Collect type-hierarchy-eligible nodes up front
             let type_nodes: Vec<&Node> = matching_nodes
                 .iter()
                 .filter(|n| matches!(n.id.kind, NodeKind::Trait | NodeKind::Struct | NodeKind::Enum))
@@ -1292,8 +1564,8 @@ impl Enricher for LspEnricher {
                 };
                 let (line, col) = Self::node_lsp_position(node);
 
-                let ok = Self::enrich_type_hierarchy(
-                    transport, &file_uri, line, col,
+                let ok = Self::enrich_type_hierarchy_p(
+                    &transport, &file_uri, line, col,
                     node, &matching_nodes, &root, &mut result,
                 ).await;
 
@@ -1303,16 +1575,18 @@ impl Enricher for LspEnricher {
                     &mut has_type_hierarchy,
                 );
 
-                // Early exit: no point continuing the batch if strikes disabled it
                 if !has_type_hierarchy {
                     break;
                 }
             }
         }
 
-        // Persist strike counter back to state for the next enrich() call
-        state.type_hierarchy_strikes = type_hierarchy_strikes;
-        state.has_type_hierarchy = has_type_hierarchy;
+        // Persist strike counter back to state
+        {
+            let mut state = self.state.lock().await;
+            state.type_hierarchy_strikes = type_hierarchy_strikes;
+            state.has_type_hierarchy = has_type_hierarchy;
+        }
 
         tracing::info!(
             "LSP enrichment complete for {}: {} edges added ({} attempted, {} errors)",

@@ -68,6 +68,7 @@ pub struct EdgeRef {
 /// This is a derived cache rebuilt from LanceDB edge data. If it drifts,
 /// rebuild it. The design intentionally keeps petgraph as a throwaway index
 /// rather than a source of truth.
+#[derive(Clone)]
 pub struct GraphIndex {
     graph: DiGraph<NodeRef, EdgeRef>,
     node_lookup: HashMap<String, NodeIndex>,

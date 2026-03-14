@@ -20,61 +20,208 @@ pub struct GraphState {
 
 // ── LSP enrichment status ────────────────────────────────────────────
 
+/// Named states for the LSP enrichment state machine.
+/// Each transition is logged with elapsed time since the previous transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LspState {
+    NotStarted = 0,
+    Running = 1,
+    Complete = 2,
+    Unavailable = 3,
+    /// Server binary found on PATH but enrichment hasn't started yet.
+    ServerFound = 4,
+}
+
+impl LspState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::NotStarted,
+            1 => Self::Running,
+            2 => Self::Complete,
+            3 => Self::Unavailable,
+            4 => Self::ServerFound,
+            _ => Self::NotStarted,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotStarted => "NOT_STARTED",
+            Self::Running => "RUNNING",
+            Self::Complete => "COMPLETE",
+            Self::Unavailable => "UNAVAILABLE",
+            Self::ServerFound => "SERVER_FOUND",
+        }
+    }
+}
+
+impl std::fmt::Display for LspState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 /// Tracks whether background LSP enrichment has run, so query footers
 /// can tell the agent "results may be incomplete" vs "enrichment done."
+///
+/// Every state transition is logged with the previous state, new state,
+/// and elapsed time since the last transition.
 pub struct LspEnrichmentStatus {
-    /// 0 = not started, 1 = running, 2 = complete
     state: std::sync::atomic::AtomicU8,
     /// Number of edges added by the most recent enrichment pass.
     edge_count: std::sync::atomic::AtomicUsize,
     /// When enrichment last completed (for auto-hide after 30 s).
     completed_at: std::sync::Mutex<Option<std::time::Instant>>,
+    /// When the status was created (for elapsed time in transitions).
+    created_at: std::time::Instant,
+    /// When the last state transition occurred.
+    last_transition_at: std::sync::Mutex<std::time::Instant>,
+    /// Name of the server found during probe (for diagnostics).
+    server_name: std::sync::Mutex<Option<String>>,
 }
 
 impl Default for LspEnrichmentStatus {
     fn default() -> Self {
+        let now = std::time::Instant::now();
         Self {
             state: std::sync::atomic::AtomicU8::new(0),
             edge_count: std::sync::atomic::AtomicUsize::new(0),
             completed_at: std::sync::Mutex::new(None),
+            created_at: now,
+            last_transition_at: std::sync::Mutex::new(now),
+            server_name: std::sync::Mutex::new(None),
         }
     }
 }
 
 impl LspEnrichmentStatus {
-    const NOT_STARTED: u8 = 0;
-    const RUNNING: u8 = 1;
-    const COMPLETE: u8 = 2;
-    const UNAVAILABLE: u8 = 3;
-    /// Server binary found on PATH but enrichment hasn't started yet.
-    const SERVER_FOUND: u8 = 4;
+    // Keep numeric constants for backward compatibility with any external code.
+    const NOT_STARTED: u8 = LspState::NotStarted as u8;
+    const RUNNING: u8 = LspState::Running as u8;
+    const COMPLETE: u8 = LspState::Complete as u8;
+    const UNAVAILABLE: u8 = LspState::Unavailable as u8;
+    const SERVER_FOUND: u8 = LspState::ServerFound as u8;
+
+    /// Log a state transition with elapsed time.
+    fn log_transition(&self, from: LspState, to: LspState, detail: &str) {
+        let mut last = self.last_transition_at.lock().unwrap();
+        let since_last = last.elapsed();
+        let since_created = self.created_at.elapsed();
+        *last = std::time::Instant::now();
+
+        if detail.is_empty() {
+            tracing::info!(
+                "LSP state: {} -> {} (step: {:.1}s, total: {:.1}s)",
+                from, to,
+                since_last.as_secs_f64(),
+                since_created.as_secs_f64(),
+            );
+        } else {
+            tracing::info!(
+                "LSP state: {} -> {} — {} (step: {:.1}s, total: {:.1}s)",
+                from, to, detail,
+                since_last.as_secs_f64(),
+                since_created.as_secs_f64(),
+            );
+        }
+    }
+
+    /// Get the current state as a typed enum.
+    pub fn current_state(&self) -> LspState {
+        LspState::from_u8(self.state.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Elapsed time since the status was created.
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.created_at.elapsed()
+    }
+
+    /// Elapsed time since the last state transition.
+    pub fn elapsed_since_last_transition(&self) -> std::time::Duration {
+        self.last_transition_at.lock().unwrap().elapsed()
+    }
 
     pub fn set_running(&self) {
-        self.state.store(Self::RUNNING, std::sync::atomic::Ordering::Release);
+        let prev = LspState::from_u8(
+            self.state.swap(Self::RUNNING, std::sync::atomic::Ordering::AcqRel)
+        );
+        self.log_transition(prev, LspState::Running, "");
     }
 
     pub fn set_complete(&self, edge_count: usize) {
         self.edge_count.store(edge_count, std::sync::atomic::Ordering::Release);
         *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
-        self.state.store(Self::COMPLETE, std::sync::atomic::Ordering::Release);
+        let prev = LspState::from_u8(
+            self.state.swap(Self::COMPLETE, std::sync::atomic::Ordering::AcqRel)
+        );
+        self.log_transition(prev, LspState::Complete, &format!("{} edges", edge_count));
     }
 
     /// Mark that no LSP server was available for any of the detected languages.
     pub fn set_unavailable(&self) {
         *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
-        self.state.store(Self::UNAVAILABLE, std::sync::atomic::Ordering::Release);
+        let prev = LspState::from_u8(
+            self.state.swap(Self::UNAVAILABLE, std::sync::atomic::Ordering::AcqRel)
+        );
+        self.log_transition(prev, LspState::Unavailable, "no server detected");
     }
 
     /// Mark that at least one LSP server binary was found on PATH.
     /// Called synchronously at startup before async enrichment begins.
     pub fn set_server_found(&self) {
         // Only transition from NOT_STARTED -- don't regress from RUNNING/COMPLETE.
-        let _ = self.state.compare_exchange(
+        let result = self.state.compare_exchange(
             Self::NOT_STARTED,
             Self::SERVER_FOUND,
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Relaxed,
         );
+        if result.is_ok() {
+            self.log_transition(LspState::NotStarted, LspState::ServerFound, "");
+        }
+    }
+
+    /// Record which server was found during probe.
+    pub fn set_server_name(&self, name: &str) {
+        *self.server_name.lock().unwrap() = Some(name.to_string());
+    }
+
+    /// Get the server name found during probe, if any.
+    pub fn server_name(&self) -> Option<String> {
+        self.server_name.lock().unwrap().clone()
+    }
+
+    /// Check if the SERVER_FOUND state has timed out (stuck for > 5 min).
+    /// Returns true if timed out (and transitions to UNAVAILABLE).
+    pub fn check_server_found_timeout(&self) -> bool {
+        let current = self.current_state();
+        if current != LspState::ServerFound {
+            return false;
+        }
+        let elapsed = self.elapsed_since_last_transition();
+        if elapsed > std::time::Duration::from_secs(300) {
+            // 5 minute timeout — use compare_exchange to avoid overwriting
+            // a newer state (RUNNING/COMPLETE) that raced with this check.
+            let result = self.state.compare_exchange(
+                Self::SERVER_FOUND,
+                Self::UNAVAILABLE,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+            if result.is_ok() {
+                *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
+                self.log_transition(
+                    LspState::ServerFound,
+                    LspState::Unavailable,
+                    "SERVER_FOUND timed out after 5 min — enrichment never started",
+                );
+                return true;
+            }
+            // Another thread already transitioned the state -- don't regress.
+            return false;
+        }
+        false
     }
 
     /// Synchronously probe for known LSP server binaries on PATH.
@@ -103,6 +250,7 @@ impl LspEnrichmentStatus {
                 .unwrap_or(false);
             if found {
                 tracing::info!("LSP probe: found '{}' on PATH", server);
+                status.set_server_name(server);
                 status.set_server_found();
                 return status;
             }
@@ -116,17 +264,39 @@ impl LspEnrichmentStatus {
     }
 
     /// Render a short footer segment, or `None` if nothing useful to show.
+    ///
+    /// Includes elapsed time for in-progress states so agents can see how
+    /// long LSP enrichment has been running.
     pub fn footer_segment(&self) -> Option<String> {
+        // Check for SERVER_FOUND timeout before rendering
+        self.check_server_found_timeout();
+
         match self.state.load(std::sync::atomic::Ordering::Acquire) {
             Self::NOT_STARTED => None,
-            Self::SERVER_FOUND => Some("LSP: starting...".to_string()),
-            Self::RUNNING => Some("LSP: pending".to_string()),
+            Self::SERVER_FOUND => {
+                let elapsed = self.elapsed_since_last_transition();
+                let server = self.server_name().unwrap_or_else(|| "unknown".to_string());
+                Some(format!(
+                    "LSP: {} found, waiting to start ({:.0}s)",
+                    server,
+                    elapsed.as_secs_f64(),
+                ))
+            }
+            Self::RUNNING => {
+                let elapsed = self.elapsed_since_last_transition();
+                Some(format!("LSP: enriching ({:.0}s)", elapsed.as_secs_f64()))
+            }
             Self::COMPLETE => {
                 let guard = self.completed_at.lock().unwrap();
                 if let Some(t) = *guard {
                     if t.elapsed().as_secs() < 30 {
                         let count = self.edge_count.load(std::sync::atomic::Ordering::Acquire);
-                        Some(format!("LSP: enriched ({} edges)", count))
+                        let total = self.elapsed();
+                        Some(format!(
+                            "LSP: enriched ({} edges in {:.1}s)",
+                            count,
+                            total.as_secs_f64(),
+                        ))
                     } else {
                         None
                     }
@@ -149,23 +319,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_lsp_state_label() {
+        assert_eq!(LspState::NotStarted.label(), "NOT_STARTED");
+        assert_eq!(LspState::Running.label(), "RUNNING");
+        assert_eq!(LspState::Complete.label(), "COMPLETE");
+        assert_eq!(LspState::Unavailable.label(), "UNAVAILABLE");
+        assert_eq!(LspState::ServerFound.label(), "SERVER_FOUND");
+    }
+
+    #[test]
+    fn test_lsp_state_roundtrip() {
+        for state in [
+            LspState::NotStarted,
+            LspState::Running,
+            LspState::Complete,
+            LspState::Unavailable,
+            LspState::ServerFound,
+        ] {
+            assert_eq!(LspState::from_u8(state as u8), state);
+        }
+    }
+
+    #[test]
     fn test_lsp_status_not_started_no_footer() {
         let status = LspEnrichmentStatus::default();
         assert!(status.footer_segment().is_none());
     }
 
     #[test]
-    fn test_lsp_status_server_found_shows_starting() {
+    fn test_lsp_status_server_found_shows_waiting() {
         let status = LspEnrichmentStatus::default();
         status.set_server_found();
-        assert_eq!(status.footer_segment(), Some("LSP: starting...".to_string()));
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("found, waiting to start"), "got: {}", footer);
     }
 
     #[test]
-    fn test_lsp_status_running_shows_pending() {
+    fn test_lsp_status_running_shows_enriching() {
         let status = LspEnrichmentStatus::default();
         status.set_running();
-        assert_eq!(status.footer_segment(), Some("LSP: pending".to_string()));
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.starts_with("LSP: enriching"), "got: {}", footer);
     }
 
     #[test]
@@ -173,7 +367,8 @@ mod tests {
         let status = LspEnrichmentStatus::default();
         status.set_running();
         status.set_complete(42);
-        assert_eq!(status.footer_segment(), Some("LSP: enriched (42 edges)".to_string()));
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("42 edges"), "got: {}", footer);
     }
 
     #[test]
@@ -181,7 +376,8 @@ mod tests {
         let status = LspEnrichmentStatus::default();
         status.set_running();
         status.set_complete(0);
-        assert_eq!(status.footer_segment(), Some("LSP: enriched (0 edges)".to_string()));
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("0 edges"), "got: {}", footer);
     }
 
     #[test]
@@ -199,8 +395,6 @@ mod tests {
         let status = LspEnrichmentStatus::default();
         status.set_unavailable();
         // "Unavailable" should always be shown (no auto-hide).
-        // We can't easily test the 30s auto-hide for complete without sleeping,
-        // but we can verify that unavailable is always Some.
         assert!(status.footer_segment().is_some());
     }
 
@@ -208,7 +402,8 @@ mod tests {
     fn test_lsp_status_set_complete_without_set_running() {
         let status = LspEnrichmentStatus::default();
         status.set_complete(10);
-        assert_eq!(status.footer_segment(), Some("LSP: enriched (10 edges)".to_string()));
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("10 edges"), "got: {}", footer);
     }
 
     #[test]
@@ -216,7 +411,8 @@ mod tests {
         let status = LspEnrichmentStatus::default();
         status.set_running();
         status.set_running();
-        assert_eq!(status.footer_segment(), Some("LSP: pending".to_string()));
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.starts_with("LSP: enriching"), "got: {}", footer);
     }
 
     #[test]
@@ -224,10 +420,12 @@ mod tests {
         let status = LspEnrichmentStatus::default();
         status.set_running();
         status.set_complete(5);
-        assert_eq!(status.footer_segment(), Some("LSP: enriched (5 edges)".to_string()));
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("5 edges"), "got: {}", footer);
         // Simulate a second enrichment pass
         status.set_running();
-        assert_eq!(status.footer_segment(), Some("LSP: pending".to_string()));
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.starts_with("LSP: enriching"), "got: {}", footer);
     }
 
     #[test]
@@ -237,9 +435,11 @@ mod tests {
         assert_eq!(status.footer_segment(), Some("LSP: no server detected".to_string()));
         // If a server becomes available later
         status.set_running();
-        assert_eq!(status.footer_segment(), Some("LSP: pending".to_string()));
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.starts_with("LSP: enriching"), "got: {}", footer);
         status.set_complete(3);
-        assert_eq!(status.footer_segment(), Some("LSP: enriched (3 edges)".to_string()));
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("3 edges"), "got: {}", footer);
     }
 
     #[test]
@@ -247,7 +447,8 @@ mod tests {
         let status = LspEnrichmentStatus::default();
         status.set_running();
         status.set_server_found(); // should not regress from RUNNING to SERVER_FOUND
-        assert_eq!(status.footer_segment(), Some("LSP: pending".to_string()));
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.starts_with("LSP: enriching"), "got: {}", footer);
     }
 
     #[test]
@@ -277,9 +478,117 @@ mod tests {
         let status = LspEnrichmentStatus::default();
         status.set_running();
         status.set_complete(1_000_000);
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("1000000 edges"), "got: {}", footer);
+    }
+
+    #[test]
+    fn test_lsp_state_current_state() {
+        let status = LspEnrichmentStatus::default();
+        assert_eq!(status.current_state(), LspState::NotStarted);
+        status.set_running();
+        assert_eq!(status.current_state(), LspState::Running);
+        status.set_complete(5);
+        assert_eq!(status.current_state(), LspState::Complete);
+    }
+
+    #[test]
+    fn test_lsp_server_name_tracking() {
+        let status = LspEnrichmentStatus::default();
+        assert!(status.server_name().is_none());
+        status.set_server_name("rust-analyzer");
+        assert_eq!(status.server_name(), Some("rust-analyzer".to_string()));
+    }
+
+    /// Adversarial: concurrent set_running vs check_server_found_timeout.
+    /// If set_running wins, timeout must NOT overwrite RUNNING with UNAVAILABLE.
+    #[test]
+    fn test_adversarial_timeout_does_not_overwrite_running() {
+        use std::sync::Arc;
+
+        let status = Arc::new(LspEnrichmentStatus::default());
+        status.set_server_found();
+        // Simulate: enrichment starts (set_running) while timeout check races.
+        // set_running should win — the compare_exchange in timeout should fail.
+        status.set_running();
+
+        // Now call timeout — it should see RUNNING, not SERVER_FOUND, and return false.
+        let timed_out = status.check_server_found_timeout();
+        assert!(!timed_out, "timeout should not fire when state is RUNNING");
         assert_eq!(
-            status.footer_segment(),
-            Some("LSP: enriched (1000000 edges)".to_string())
+            status.current_state(),
+            LspState::Running,
+            "state should remain RUNNING, not regress to UNAVAILABLE"
         );
+    }
+
+    /// Adversarial: concurrent set_complete vs check_server_found_timeout.
+    #[test]
+    fn test_adversarial_timeout_does_not_overwrite_complete() {
+        let status = LspEnrichmentStatus::default();
+        status.set_server_found();
+        status.set_running();
+        status.set_complete(42);
+
+        let timed_out = status.check_server_found_timeout();
+        assert!(!timed_out);
+        assert_eq!(status.current_state(), LspState::Complete);
+    }
+
+    /// Adversarial: hammer the state machine from 10 threads concurrently.
+    /// No panics, no undefined states — the final state must be valid.
+    #[test]
+    fn test_adversarial_concurrent_state_transitions() {
+        use std::sync::Arc;
+
+        let status = Arc::new(LspEnrichmentStatus::default());
+
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let s = Arc::clone(&status);
+                std::thread::spawn(move || {
+                    match i % 4 {
+                        0 => s.set_server_found(),
+                        1 => s.set_running(),
+                        2 => s.set_complete(i * 10),
+                        3 => { let _ = s.check_server_found_timeout(); }
+                        _ => unreachable!(),
+                    }
+                    // All reads must produce a valid state
+                    let state = s.current_state();
+                    assert!(matches!(
+                        state,
+                        LspState::NotStarted
+                            | LspState::Running
+                            | LspState::Complete
+                            | LspState::Unavailable
+                            | LspState::ServerFound
+                    ));
+                    let _footer = s.footer_segment(); // must not panic
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    /// Adversarial: from_u8 with invalid value must not panic.
+    #[test]
+    fn test_adversarial_invalid_state_u8() {
+        // Values beyond the enum range should fall back to NotStarted
+        assert_eq!(LspState::from_u8(255), LspState::NotStarted);
+        assert_eq!(LspState::from_u8(5), LspState::NotStarted);
+        assert_eq!(LspState::from_u8(100), LspState::NotStarted);
+    }
+
+    #[test]
+    fn test_lsp_server_found_footer_includes_server_name() {
+        let status = LspEnrichmentStatus::default();
+        status.set_server_name("rust-analyzer");
+        status.set_server_found();
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("rust-analyzer"), "got: {}", footer);
     }
 }

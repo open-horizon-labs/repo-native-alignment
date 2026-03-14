@@ -629,7 +629,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use crate::graph::{Node, NodeId, NodeKind, Edge, EdgeKind, ExtractionSource, Confidence};
+    use crate::graph::{Node, NodeId, NodeKind, EdgeKind, ExtractionSource};
     use crate::graph::index::GraphIndex;
 
     /// Verify the tests_for pattern: incoming Calls edges filtered to test-file callers.
