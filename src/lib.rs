@@ -11,6 +11,7 @@ pub mod ranking;
 pub mod roots;
 pub mod scanner;
 pub mod server;
+pub mod service;
 pub mod smoke_test;
 pub mod types;
 pub mod walk;

@@ -2,12 +2,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use petgraph::Direction;
 use rust_mcp_sdk::McpServer;
 use rust_mcp_sdk::schema::{Implementation, InitializeResult, ServerCapabilities};
 use rust_mcp_sdk::ToMcpServerHandler;
 
 use repo_native_alignment::server::{self, RnaHandler};
+use repo_native_alignment::service::{self, SearchContext, SearchParams, GraphParams};
 use repo_native_alignment::setup::{self, SetupArgs};
 use repo_native_alignment::smoke_test::{self, TestArgs};
 
@@ -96,22 +96,28 @@ struct ScanArgs {
 #[derive(clap::Args, Debug)]
 struct SearchArgs {
     /// Search query (matched against symbol name and signature)
+    #[arg(default_value = "")]
     query: String,
-    /// Repository root path (default: current directory)
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
-    /// Filter by symbol kind: function, struct, trait, enum, module, import, const
-    #[arg(long)]
-    kind: Option<String>,
-    /// Filter by language: rust, python, typescript, go, etc.
-    #[arg(long)]
-    language: Option<String>,
-    /// Filter by file path substring
-    #[arg(long)]
-    file: Option<String>,
-    /// Maximum results (default: 20)
-    #[arg(long, default_value_t = 20)]
-    limit: usize,
+    #[arg(long, default_value = ".")] repo: PathBuf,
+    #[arg(long)] kind: Option<String>,
+    #[arg(long)] language: Option<String>,
+    #[arg(long)] file: Option<String>,
+    #[arg(long, default_value_t = 20)] limit: usize,
+    #[arg(long)] node: Option<String>,
+    #[arg(long)] mode: Option<String>,
+    #[arg(long)] hops: Option<u32>,
+    #[arg(long)] direction: Option<String>,
+    #[arg(long)] edge_types: Option<String>,
+    #[arg(long)] sort_by: Option<String>,
+    #[arg(long)] min_complexity: Option<u32>,
+    #[arg(long)] synthetic: Option<bool>,
+    #[arg(long)] compact: bool,
+    #[arg(long)] nodes: Option<String>,
+    #[arg(long)] search_mode: Option<String>,
+    #[arg(long, default_value_t = true)] include_artifacts: bool,
+    #[arg(long, default_value_t = true)] include_markdown: bool,
+    #[arg(long)] artifact_types: Option<String>,
+    #[arg(long)] root: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -293,165 +299,44 @@ async fn main() -> anyhow::Result<()> {
             init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?;
             eprintln!("Scanning {}...", repo_root.display());
-            let handler = RnaHandler {
-                repo_root: repo_root.clone(),
-                ..Default::default()
-            };
+            let handler = RnaHandler { repo_root: repo_root.clone(), ..Default::default() };
             let gs = handler.build_full_graph().await?;
-            let query_lower = args.query.to_lowercase();
-
-            let mut matches: Vec<_> = gs.nodes.iter()
-                .filter(|n| {
-                    let name_match = n.id.name.to_lowercase().contains(&query_lower)
-                        || n.signature.to_lowercase().contains(&query_lower);
-                    if !name_match { return false; }
-                    if let Some(ref k) = args.kind {
-                        if n.id.kind.to_string().to_lowercase() != k.to_lowercase() {
-                            return false;
-                        }
-                    }
-                    if let Some(ref l) = args.language {
-                        if n.language.to_lowercase() != l.to_lowercase() {
-                            return false;
-                        }
-                    }
-                    if let Some(ref f) = args.file {
-                        if !n.id.file.to_string_lossy().contains(f.as_str()) {
-                            return false;
-                        }
-                    }
-                    true
-                })
-                .collect();
-
-            matches.truncate(args.limit);
-
-            if matches.is_empty() {
-                println!("No symbols matching \"{}\".", args.query);
-            } else {
-                println!("## Symbol search: \"{}\"\n\n{} result(s)\n", args.query, matches.len());
-                for n in &matches {
-                    let stable_id = n.stable_id();
-                    let outgoing = gs.index.neighbors(&stable_id, None, Direction::Outgoing);
-                    let incoming = gs.index.neighbors(&stable_id, None, Direction::Incoming);
-                    println!(
-                        "- **{}** `{}` ({}) `{}`:{}-{}",
-                        n.id.kind, n.id.name, n.language,
-                        n.id.file.display(), n.line_start, n.line_end,
-                    );
-                    println!("  ID: `{}`", stable_id);
-                    if !n.signature.is_empty() {
-                        println!("  Sig: `{}`", n.signature);
-                    }
-                    if let Some(val) = n.metadata.get("value") {
-                        println!("  Value: `{}`", val);
-                    }
-                    if !outgoing.is_empty() {
-                        println!("  Out: {} edge(s)", outgoing.len());
-                    }
-                    if !incoming.is_empty() {
-                        println!("  In: {} edge(s)", incoming.len());
-                    }
-                    println!();
-                }
-            }
-            let freshness = server::format_freshness(gs.nodes.len(), gs.last_scan_completed_at, None);
-            eprintln!("{}", freshness);
+            let params = SearchParams {
+                query: if args.query.is_empty() { None } else { Some(args.query.clone()) },
+                node: args.node.clone(), mode: args.mode.clone(), hops: args.hops,
+                direction: args.direction.clone(),
+                edge_types: args.edge_types.as_ref().map(|s| s.split(',').map(|t| t.trim().to_string()).collect()),
+                kind: args.kind.clone(), language: args.language.clone(), file: args.file.clone(),
+                limit: Some(args.limit), sort_by: args.sort_by.clone(), min_complexity: args.min_complexity,
+                synthetic: args.synthetic, compact: args.compact,
+                nodes: args.nodes.as_ref().map(|s| s.split(',').map(|t| t.trim().to_string()).collect()),
+                search_mode: args.search_mode.clone(),
+                include_artifacts: args.include_artifacts, include_markdown: args.include_markdown,
+                artifact_types: args.artifact_types.as_ref().map(|s| s.split(',').map(|t| t.trim().to_string()).collect()),
+            };
+            let root_slug = repo_native_alignment::roots::RootConfig::code_project(repo_root.clone()).slug();
+            let root_filter = args.root.as_deref()
+                .map(|v| if v.eq_ignore_ascii_case("all") { None } else { Some(v.to_string()) })
+                .unwrap_or_else(|| Some(root_slug));
+            let ctx = SearchContext { graph_state: &gs, embed_index: None, repo_root: &repo_root, lsp_status: None, root_filter, non_code_slugs: std::collections::HashSet::new() };
+            let result = service::search(&params, &ctx).await;
+            println!("{}", result);
             return Ok(());
         }
         Some(Commands::Graph(args)) => {
             init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?;
             eprintln!("Scanning {}...", repo_root.display());
-            let handler = RnaHandler {
-                repo_root: repo_root.clone(),
-                ..Default::default()
-            };
+            let handler = RnaHandler { repo_root: repo_root.clone(), ..Default::default() };
             let gs = handler.build_full_graph().await?;
-
-            let edge_filter = args.edge_types.as_ref().map(|types| {
-                types.split(',')
-                    .filter_map(|t| server::parse_edge_kind(t.trim()))
-                    .collect::<Vec<_>>()
-            });
-            let edge_filter_slice = edge_filter.as_deref();
-
-            let result_ids = match args.mode.as_str() {
-                "neighbors" => {
-                    let max_hops = args.max_hops.unwrap_or(1);
-                    match args.direction.as_str() {
-                        "outgoing" => {
-                            if max_hops == 1 {
-                                gs.index.neighbors(&args.node, edge_filter_slice, Direction::Outgoing)
-                            } else {
-                                gs.index.reachable(&args.node, max_hops, edge_filter_slice)
-                            }
-                        }
-                        "incoming" => {
-                            if max_hops == 1 {
-                                gs.index.neighbors(&args.node, edge_filter_slice, Direction::Incoming)
-                            } else {
-                                gs.index.impact(&args.node, max_hops, edge_filter_slice)
-                            }
-                        }
-                        "both" => {
-                            let mut ids = if max_hops == 1 {
-                                gs.index.neighbors(&args.node, edge_filter_slice, Direction::Outgoing)
-                            } else {
-                                gs.index.reachable(&args.node, max_hops, edge_filter_slice)
-                            };
-                            let inc = if max_hops == 1 {
-                                gs.index.neighbors(&args.node, edge_filter_slice, Direction::Incoming)
-                            } else {
-                                gs.index.impact(&args.node, max_hops, edge_filter_slice)
-                            };
-                            ids.extend(inc);
-                            ids.sort();
-                            ids.dedup();
-                            ids
-                        }
-                        other => {
-                            anyhow::bail!("Invalid direction: \"{}\". Use outgoing, incoming, or both.", other);
-                        }
-                    }
-                }
-                "impact" => {
-                    let max_hops = args.max_hops.unwrap_or(3);
-                    gs.index.impact(&args.node, max_hops, edge_filter_slice)
-                }
-                "reachable" => {
-                    let max_hops = args.max_hops.unwrap_or(3);
-                    gs.index.reachable(&args.node, max_hops, edge_filter_slice)
-                }
-                other => {
-                    anyhow::bail!("Invalid mode: \"{}\". Use neighbors, impact, or reachable.", other);
-                }
+            let gp = GraphParams {
+                node: args.node.clone(), mode: args.mode.clone(), direction: args.direction.clone(),
+                edge_types: args.edge_types.as_ref().map(|s| s.split(',').map(|t| t.trim().to_string()).collect()),
+                max_hops: args.max_hops,
             };
-
-            if result_ids.is_empty() {
-                println!("No results for `{}` ({}).", args.node, args.mode);
-            } else {
-                println!("## {} `{}`\n\n{} result(s)\n", args.mode, args.node, result_ids.len());
-                for id in &result_ids {
-                    if let Some(node) = gs.nodes.iter().find(|n| n.stable_id() == *id) {
-                        // Filter out module and PR-merge noise
-                        match node.id.kind {
-                            repo_native_alignment::graph::NodeKind::Module
-                            | repo_native_alignment::graph::NodeKind::PrMerge => continue,
-                            _ => {}
-                        }
-                        println!(
-                            "- **{}** `{}` ({}) `{}`:{}-{}",
-                            node.id.kind, node.id.name, node.language,
-                            node.id.file.display(), node.line_start, node.line_end,
-                        );
-                        if !node.signature.is_empty() {
-                            println!("  Sig: `{}`", node.signature);
-                        }
-                    } else {
-                        println!("- `{}`", id);
-                    }
-                }
+            match service::graph_query(&gp, &gs) {
+                Ok(output) => println!("{}", output),
+                Err(msg) => { eprintln!("Error: {}", msg); std::process::exit(1); }
             }
             let freshness = server::format_freshness(gs.nodes.len(), gs.last_scan_completed_at, None);
             eprintln!("{}", freshness);
@@ -460,60 +345,18 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Stats(args)) => {
             init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?;
-
             let lance_path = repo_root.join(".oh").join(".cache").join("lance");
-            if !lance_path.exists() {
-                eprintln!("No index found. Run `repo-native-alignment scan --path .` first.");
-                std::process::exit(1);
-            }
-
-            let last_scan = std::fs::metadata(&lance_path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                .map(|d| {
-                    let secs_ago = std::time::SystemTime::now()
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() - d.as_secs();
-                    if secs_ago < 60 { "just now".to_string() }
-                    else if secs_ago < 3600 { format!("{}m ago", secs_ago / 60) }
-                    else if secs_ago < 86400 { format!("{}h ago", secs_ago / 3600) }
-                    else { format!("{}d ago", secs_ago / 86400) }
-                })
-                .unwrap_or_else(|| "unknown".to_string());
-
+            if !lance_path.exists() { eprintln!("No index found. Run `repo-native-alignment scan --path .` first."); std::process::exit(1); }
             let gs = server::load_graph_from_lance(&repo_root).await?;
-
-            let mut langs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-            for n in &gs.nodes {
-                if !n.language.is_empty() && n.language != "unknown" {
-                    langs.insert(n.language.clone());
-                }
-            }
-
-            let artifacts = repo_native_alignment::oh::load_oh_artifacts(&repo_root).unwrap_or_default();
-            let outcomes = artifacts.iter().filter(|a| a.kind == repo_native_alignment::types::OhArtifactKind::Outcome).count();
-            let signals = artifacts.iter().filter(|a| a.kind == repo_native_alignment::types::OhArtifactKind::Signal).count();
-            let guardrails = artifacts.iter().filter(|a| a.kind == repo_native_alignment::types::OhArtifactKind::Guardrail).count();
-            let metis = artifacts.iter().filter(|a| a.kind == repo_native_alignment::types::OhArtifactKind::Metis).count();
-
-            let embed_str = match repo_native_alignment::embed::EmbeddingIndex::new(&repo_root).await {
-                Ok(idx) => match idx.search("_probe_", None, 1).await {
-                    Ok(repo_native_alignment::embed::SearchOutcome::Results(_)) => "yes",
-                    _ => "no",
-                },
-                Err(_) => "no",
-            };
-
+            let st = service::stats(&repo_root, &gs).await;
             println!("── Repo Stats ──────────────────────────");
-            println!("  Symbols:    {}", gs.nodes.len());
-            println!("  Edges:      {}", gs.edges.len());
-            println!("  Embeddings: {}", embed_str);
-            println!("  Languages:  {}", if langs.is_empty() { "none".to_string() } else { langs.into_iter().collect::<Vec<_>>().join(", ") });
-            println!("  Last scan:  {}", last_scan);
+            println!("  Symbols:    {}", st.node_count);
+            println!("  Edges:      {}", st.edge_count);
+            println!("  Embeddings: {}", if st.embeddings_available { "yes" } else { "no" });
+            println!("  Languages:  {}", if st.languages.is_empty() { "none".to_string() } else { st.languages.join(", ") });
+            println!("  Last scan:  {}", st.last_scan_age);
             println!("  .oh/:       {} artifacts ({} outcomes, {} signals, {} guardrails, {} metis)",
-                artifacts.len(), outcomes, signals, guardrails, metis);
+                st.artifact_count, st.outcome_count, st.signal_count, st.guardrail_count, st.metis_count);
             println!("───────────────────────────────────────────");
             return Ok(());
         }
