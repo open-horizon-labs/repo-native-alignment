@@ -1760,7 +1760,7 @@ fn build_context_preamble(root: &Path) -> String {
     }
 
     let mut out = format!("---\n# Business Context (auto-injected on first tool call)\n\n{}\n", parts.join("\n"));
-    out.push_str("**Code exploration:** use `search` (not Grep/Read) for code symbols, artifacts, commits, and markdown in one call. `search_symbols` and `graph_query` are deprecated aliases for `search`.\n");
+    out.push_str("**Code exploration:** use `search` (not Grep/Read) for code symbols, artifacts, commits, and markdown in one call. Use `search(node: \"<id>\", mode: \"neighbors\")` for graph traversal.\n");
     out.push_str("---\n\n");
     out
 }

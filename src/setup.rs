@@ -657,9 +657,9 @@ const MCP_GUIDANCE_BLOCK: &str = r#"
 
 | Instead of... | Use this MCP tool |
 |---|---|
-| `Grep` for symbol names | `search_symbols(query, kind, language, file)` |
-| `Read` to trace function calls | `graph_query(node_id, mode: "neighbors")` |
-| `Grep` for "who calls X" | `graph_query(node_id, mode: "impact")` |
+| `Grep` for symbol names | `search(query, kind, language, file)` |
+| `Read` to trace function calls | `search(node: "<id>", mode: "neighbors")` |
+| `Grep` for "who calls X" | `search(node: "<id>", mode: "impact")` |
 | `Read` to find .oh/ artifacts | `search(query, include_artifacts=true)` |
 | `Bash` with `grep -rn` | `search(query)` — searches code, artifacts, and markdown |
 | Recording learnings/signals | Write to `.oh/metis/`, `.oh/signals/`, `.oh/guardrails/` (YAML frontmatter + markdown) |

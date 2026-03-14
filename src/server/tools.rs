@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 #[macros::mcp_tool(
     name = "outcome_progress",
-    description = "Track progress on a business outcome. Finds tagged commits, code symbols in changed files, and related markdown. Returns a navigable summary with stable Node IDs for use with search_symbols and graph_query. Set include_impact=true to add risk-classified blast radius showing which symbols are affected by the changes and how critical they are. Results default to the primary workspace root; pass root: \"all\" for cross-root search."
+    description = "Track progress on a business outcome. Finds tagged commits, code symbols in changed files, and related markdown. Returns a navigable summary with stable Node IDs for use with search. Use search(node: \"<id>\", mode: \"neighbors\") for graph traversal. Set include_impact=true to add risk-classified blast radius showing which symbols are affected by the changes and how critical they are. Results default to the primary workspace root; pass root: \"all\" for cross-root search."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct OutcomeProgress {
@@ -22,9 +22,9 @@ pub struct OutcomeProgress {
 }
 
 // ── Unified search tool ─────────────────────────────────────────────
-// Combines the functionality of the former `search_symbols` (flat search)
-// and `graph_query` (graph traversal) into a single tool. The old tools
-// are kept as deprecated aliases that route here.
+// Unified search tool combining flat symbol search and graph traversal.
+// Deprecated aliases (`search_symbols`, `graph_query`) are kept below
+// and route here.
 
 #[macros::mcp_tool(
     name = "search",
@@ -169,7 +169,7 @@ impl SearchSymbols {
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GraphQuery {
-    /// Stable ID from search_symbols results. Takes precedence over query if both provided.
+    /// Stable ID from search results. Takes precedence over query if both provided.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
     /// Natural language query to find entry nodes via semantic search (e.g. "authentication handler", "database connection pool"). Used when node_id is not provided.

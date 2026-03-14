@@ -1,6 +1,6 @@
 //! Shared ranking logic for code symbol search results.
 //!
-//! Both `search` (flat mode) and deprecated `search_symbols` rank code nodes using the same
+//! Both `search` (flat mode) and its deprecated aliases rank code nodes using the same
 //! 5-tier cascade. This module extracts that logic into a single function so
 //! ranking changes propagate to all call sites without copy-paste drift.
 
