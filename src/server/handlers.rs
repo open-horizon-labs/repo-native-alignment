@@ -207,8 +207,11 @@ impl RnaHandler {
                 Some(index) => {
                     match index.search_with_mode(query_str, args.artifact_types.as_deref(), limit, search_mode).await {
                         Ok(SearchOutcome::Results(results)) => {
+                            // Filter out code: results — those are already shown
+                            // in the "Code symbols" section via graph search.
                             let filtered: Vec<_> = results
                                 .into_iter()
+                                .filter(|r| !r.kind.starts_with("code:"))
                                 .filter(|r| self.search_result_passes_root_filter(r, &root_filter, &non_code_slugs))
                                 .collect();
                             if !filtered.is_empty() {
@@ -231,13 +234,9 @@ impl RnaHandler {
                     }
                 }
                 None => {
-                    // Embedding index not available yet — skip silently unless
-                    // artifacts were the only search path requested.
-                    if args.kind.is_some() || !query_str.is_empty() {
-                        // Code search was attempted; no need to warn about embeddings.
-                    } else {
-                        sections.push("Embedding index not yet available".to_string());
-                    }
+                    // Embedding index not available yet. This branch is only
+                    // reached when include_artifacts && !query_str.is_empty(),
+                    // so code search was also attempted — skip silently.
                 }
             }
         }
