@@ -1078,25 +1078,25 @@ fn run_lsp_status_footer_check() -> Check {
         return Check::fail("lsp_status_footer", "Footer shows LSP segment in NotStarted state");
     }
 
-    // Server found (binary on PATH, enrichment not started) → "LSP: starting..."
+    // Server found (binary on PATH, enrichment not started) → "LSP: {name} found, waiting to start"
     status.set_server_found();
     let footer = format_freshness(100, Some(std::time::Instant::now()), Some(&status));
-    if !footer.contains("LSP: starting...") {
-        return Check::fail("lsp_status_footer", format!("Expected 'LSP: starting...', got: {}", footer));
+    if !footer.contains("found, waiting to start") {
+        return Check::fail("lsp_status_footer", format!("Expected 'found, waiting to start', got: {}", footer));
     }
 
-    // Running → "LSP: pending"
+    // Running → "LSP: enriching"
     status.set_running();
     let footer = format_freshness(100, Some(std::time::Instant::now()), Some(&status));
-    if !footer.contains("LSP: pending") {
-        return Check::fail("lsp_status_footer", format!("Expected 'LSP: pending', got: {}", footer));
+    if !footer.contains("LSP: enriching") {
+        return Check::fail("lsp_status_footer", format!("Expected 'LSP: enriching', got: {}", footer));
     }
 
-    // Complete → "LSP: enriched (N edges)"
+    // Complete → "LSP: enriched (N edges in Xs)"
     status.set_complete(42);
     let footer = format_freshness(100, Some(std::time::Instant::now()), Some(&status));
-    if !footer.contains("LSP: enriched (42 edges)") {
-        return Check::fail("lsp_status_footer", format!("Expected 'LSP: enriched (42 edges)', got: {}", footer));
+    if !footer.contains("42 edges") {
+        return Check::fail("lsp_status_footer", format!("Expected '42 edges', got: {}", footer));
     }
 
     Check::pass("lsp_status_footer", "Footer renders all 4 LSP states correctly")
