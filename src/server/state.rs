@@ -35,7 +35,7 @@ impl GraphState {
         id: &str,
         index_map: &std::collections::HashMap<String, usize>,
     ) -> Option<&'a Node> {
-        index_map.get(id).map(|&i| &self.nodes[i])
+        index_map.get(id).and_then(|&i| self.nodes.get(i))
     }
 }
 

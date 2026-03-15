@@ -390,9 +390,14 @@ impl RnaHandler {
                                 // Table exists -- use incremental reindex with BLAKE3 hash-skipping
                                 idx.reindex_nodes(&embeddable_nodes).await
                             }
-                            _ => {
+                            Ok(false) => {
                                 // Table missing -- full build needed
                                 idx.index_all_with_symbols(&embed_repo_root, &embeddable_nodes).await
+                            }
+                            Err(e) => {
+                                tracing::warn!("[background] Embedding table check failed: {}", e);
+                                embed_status.set_complete(0);
+                                return;
                             }
                         };
                         match result {

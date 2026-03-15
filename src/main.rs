@@ -152,7 +152,14 @@ async fn async_main() -> anyhow::Result<()> {
                 Ok(idx) => {
                     match idx.has_table().await {
                         Ok(true) => Some(idx),
-                        _ => { eprintln!("No embedding index found. Run `repo-native-alignment scan --path .` first."); None }
+                        Ok(false) => {
+                            eprintln!("No embedding index found. Run `repo-native-alignment scan --path .` first.");
+                            None
+                        }
+                        Err(e) => {
+                            eprintln!("Embedding index check failed: {}. Semantic search will be disabled.", e);
+                            None
+                        }
                     }
                 }
                 Err(e) => { tracing::warn!("EmbeddingIndex init failed; semantic search may degrade: {}", e); None }
