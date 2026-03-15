@@ -19,6 +19,19 @@ use fastembed::{RerankerModel, RerankResult, TextRerank};
 /// so we use `Mutex` for safe concurrent access.
 static RERANKER: Mutex<Option<TextRerank>> = Mutex::new(None);
 
+/// Return the model cache directory.
+/// Precedence: `FASTEMBED_CACHE_DIR` env var > `~/.cache/rna/models/` > fastembed default.
+fn rna_cache_dir() -> std::path::PathBuf {
+    if let Some(explicit) = std::env::var("FASTEMBED_CACHE_DIR").ok().filter(|v| !v.is_empty()) {
+        return std::path::PathBuf::from(explicit);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        std::path::PathBuf::from(home).join(".cache").join("rna").join("models")
+    } else {
+        std::path::PathBuf::from(fastembed::get_cache_dir())
+    }
+}
+
 /// Default model: Jina Reranker V1 Turbo (English).
 /// Smaller and faster than BGE-Reranker-Base while maintaining good quality.
 const DEFAULT_MODEL: RerankerModel = RerankerModel::JINARerankerV1TurboEn;
@@ -68,7 +81,14 @@ pub fn rerank_results(
         let start = std::time::Instant::now();
         tracing::info!("Reranker: loading {:?} (first use, one-time cost)", DEFAULT_MODEL);
 
-        match TextRerank::try_new(fastembed::RerankInitOptions::new(DEFAULT_MODEL)) {
+        let cache_dir = rna_cache_dir();
+        std::fs::create_dir_all(&cache_dir)
+            .context(format!("Failed to create reranker cache dir: {}", cache_dir.display()))?;
+        tracing::info!("Reranker: cache dir = {}", cache_dir.display());
+
+        let init_opts = fastembed::RerankInitOptions::new(DEFAULT_MODEL)
+            .with_cache_dir(cache_dir);
+        match TextRerank::try_new(init_opts) {
             Ok(reranker) => {
                 tracing::info!("Reranker: ready in {:?}", start.elapsed());
                 *guard = Some(reranker);
@@ -110,7 +130,7 @@ pub fn rerank_results(
         })?;
         results.push(RerankedResult {
             original_index: candidate.original_index,
-            score: r.score as f32,
+            score: r.score,
         });
     }
 
@@ -123,6 +143,23 @@ pub fn rerank_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_rna_cache_dir_uses_home() {
+        // Skip if FASTEMBED_CACHE_DIR is explicitly set -- rna_cache_dir()
+        // correctly prioritizes that over HOME, so the assertions below
+        // would not hold.
+        if std::env::var("FASTEMBED_CACHE_DIR").is_ok() {
+            return;
+        }
+        let dir = rna_cache_dir();
+        let dir_str = dir.to_string_lossy();
+        // When HOME is set (typical in tests), cache dir should be under ~/.cache/rna/models
+        if std::env::var("HOME").is_ok() {
+            assert!(dir_str.contains(".cache/rna/models"), "Expected ~/.cache/rna/models, got: {}", dir_str);
+            assert!(!dir_str.contains(".fastembed_cache"), "Should not use .fastembed_cache: {}", dir_str);
+        }
+    }
 
     #[test]
     fn test_rerank_empty_candidates() {
