@@ -8,6 +8,7 @@ pub mod oh;
 pub mod process;
 pub mod query;
 pub mod ranking;
+pub mod rerank;
 pub mod roots;
 pub mod scanner;
 pub mod server;

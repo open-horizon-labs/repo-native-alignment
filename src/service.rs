@@ -36,6 +36,7 @@ pub struct SearchParams {
     pub compact: bool,
     pub nodes: Option<Vec<String>>,
     pub search_mode: Option<String>,
+    pub rerank: bool,
     pub include_artifacts: bool,
     pub include_markdown: bool,
     pub artifact_types: Option<Vec<String>>,
@@ -61,6 +62,7 @@ impl SearchParams {
             compact: args.compact.unwrap_or(false),
             nodes: args.nodes.clone(),
             search_mode: args.search_mode.clone(),
+            rerank: args.rerank.unwrap_or(false),
             include_artifacts: args.include_artifacts.unwrap_or(true),
             include_markdown: args.include_markdown.unwrap_or(true),
             artifact_types: args.artifact_types.clone(),
@@ -205,12 +207,16 @@ async fn flat_code_symbol_search<'a>(
         true
     };
 
+    // When reranking is requested, over-fetch more candidates so the
+    // cross-encoder has a wider pool to re-score.
+    let rerank_over_fetch = if params.rerank { limit.max(20) } else { limit };
+
     // Try embed-ranked search for code symbols when query is non-empty.
     let mut used_embed = false;
     let mut matches: Vec<&Node> = if !query_str.is_empty() {
         if let Some(embed_idx) = ctx.embed_index {
-            // Over-fetch to allow for post-filtering.
-            let over_fetch = limit * 3;
+            // Over-fetch to allow for post-filtering (and reranking).
+            let over_fetch = rerank_over_fetch * 3;
             match embed_idx.search_with_mode(query_str, None, over_fetch, search_mode).await {
                 Ok(SearchOutcome::Results(results)) => {
                     used_embed = true;
@@ -219,7 +225,7 @@ async fn flat_code_symbol_search<'a>(
                         .filter(|r| r.kind.starts_with("code:"))
                         .filter_map(|r| graph_state.nodes.iter().find(|n| n.stable_id() == r.id))
                         .filter(|n| node_passes_filters(n))
-                        .take(limit)
+                        .take(rerank_over_fetch)
                         .collect()
                 }
                 // Embedding index not ready -- fall through to name/signature fallback.
@@ -269,6 +275,71 @@ async fn flat_code_symbol_search<'a>(
         // are already ranked by the embedding index.
         ranking::sort_symbol_matches(&mut matches, &query_lower, &graph_state.index);
     }
+
+    // Cross-encoder reranking: re-score the top candidates using a cross-encoder
+    // model that attends to (query, document) pairs jointly. This produces more
+    // precise relevance scores than bi-encoder similarity alone.
+    // Skip reranking when an explicit sort_by mode is active (complexity,
+    // importance) -- the caller's sort request takes precedence.
+    let use_relevance_sort = !sort_by_complexity && !sort_by_importance;
+    if params.rerank && use_relevance_sort && !query_str.is_empty() && matches.len() > 1 {
+        use crate::rerank::{RerankCandidate, rerank_results};
+
+        let candidates: Vec<RerankCandidate> = matches
+            .iter()
+            .enumerate()
+            .map(|(i, node)| {
+                // Build reranking text from signature + body (the full context
+                // the cross-encoder should attend to).
+                let text = if node.body.is_empty() {
+                    node.signature.clone()
+                } else {
+                    format!("{}\n{}", node.signature, node.body)
+                };
+                RerankCandidate {
+                    text,
+                    original_index: i,
+                }
+            })
+            .collect();
+
+        // Run reranking on a blocking thread to avoid blocking the Tokio
+        // executor during ONNX model inference (and possible first-time
+        // model download/initialization).
+        let query_owned = query_str.to_string();
+        let rerank_result = tokio::task::spawn_blocking(move || {
+            rerank_results(&query_owned, &candidates)
+        }).await;
+
+        match rerank_result {
+            Ok(Ok(reranked)) => {
+                let original_matches = matches.clone();
+                matches = reranked
+                    .iter()
+                    .filter_map(|r| original_matches.get(r.original_index).copied())
+                    .collect();
+                tracing::debug!(
+                    "Reranked {} candidates for query \"{}\"",
+                    reranked.len(),
+                    query_str
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "Cross-encoder reranking failed, using original order: {}",
+                    e
+                );
+                // Fall through with original ordering -- reranking is best-effort.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Reranking task panicked, using original order: {}",
+                    e
+                );
+            }
+        }
+    }
+
     matches.truncate(limit);
     matches
 }
@@ -480,7 +551,7 @@ mod tests {
         }
     }
 
-    #[test] fn test_search_params_default() { let p = SearchParams::default(); assert!(p.query.is_none()); assert!(!p.compact); }
+    #[test] fn test_search_params_default() { let p = SearchParams::default(); assert!(p.query.is_none()); assert!(!p.compact); assert!(!p.rerank); }
     #[test] fn test_node_passes_root_filter_all() { assert!(node_passes_root_filter("any", &None, &HashSet::new())); }
     #[test] fn test_node_passes_root_filter_match() { assert!(node_passes_root_filter("my-root", &Some("my-root".into()), &HashSet::new())); }
     #[test] fn test_node_passes_root_filter_external() { assert!(node_passes_root_filter("external", &Some("my-root".into()), &HashSet::new())); }
@@ -829,6 +900,57 @@ mod tests {
         ).await;
         assert_eq!(results2.len(), 1);
         assert_eq!(results2[0].id.name, "real_fn");
+    }
+
+    // ── Adversarial: rerank parameter ──────────────────────────────────
+
+    /// Rerank=true with fallback (no embed index): should work without
+    /// crashing. The reranking path requires actual model loading, which
+    /// we skip in unit tests. But the over-fetch logic and parameter
+    /// plumbing should not panic.
+    #[tokio::test]
+    async fn test_flat_search_rerank_true_no_embed() {
+        let nodes = vec![
+            make_node("auth_handler", NodeKind::Function, "src/auth.rs"),
+            make_node("auth_config", NodeKind::Function, "src/config.rs"),
+        ];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("auth".into()),
+            rerank: true,
+            ..Default::default()
+        };
+
+        // Without embed index, falls back to name matching.
+        // Reranking will attempt to load the model, which may fail in CI,
+        // but the graceful fallback should still return results.
+        let results = flat_code_symbol_search(
+            "auth", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+        // Should find both nodes regardless of whether reranking succeeds
+        assert!(!results.is_empty(), "Rerank=true should not prevent results from appearing");
+    }
+
+    /// Rerank=false should not trigger any reranking code path.
+    #[tokio::test]
+    async fn test_flat_search_rerank_false_default() {
+        let nodes = vec![make_node("foo", NodeKind::Function, "src/lib.rs")];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("foo".into()),
+            rerank: false,
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "foo", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.name, "foo");
     }
 }
 
