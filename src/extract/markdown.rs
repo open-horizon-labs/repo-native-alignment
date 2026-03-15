@@ -235,6 +235,7 @@ fn emit_frontmatter_ref_edges(
             "outcome" => "outcomes",
             "signal" => "signals",
             "guardrail" => "guardrails",
+            "endeavor" => "metis",
             _ => continue,
         };
 
@@ -302,11 +303,15 @@ fn emit_link_edges(
                 PathBuf::from(dest_path_str)
             };
 
-            // Only emit edges to markdown files (md/mdx)
-            let is_markdown_target = matches!(
-                target_path.extension().and_then(|ext| ext.to_str()),
-                Some("md") | Some("mdx")
-            );
+            // Only emit edges to markdown files (md/mdx), case-insensitive
+            let is_markdown_target = target_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| {
+                    let lower = ext.to_ascii_lowercase();
+                    lower == "md" || lower == "mdx"
+                })
+                .unwrap_or(false);
             if !is_markdown_target {
                 continue;
             }
