@@ -884,6 +884,57 @@ mod tests {
         assert_eq!(results2.len(), 1);
         assert_eq!(results2[0].id.name, "real_fn");
     }
+
+    // ── Adversarial: rerank parameter ──────────────────────────────────
+
+    /// Rerank=true with fallback (no embed index): should work without
+    /// crashing. The reranking path requires actual model loading, which
+    /// we skip in unit tests. But the over-fetch logic and parameter
+    /// plumbing should not panic.
+    #[tokio::test]
+    async fn test_flat_search_rerank_true_no_embed() {
+        let nodes = vec![
+            make_node("auth_handler", NodeKind::Function, "src/auth.rs"),
+            make_node("auth_config", NodeKind::Function, "src/config.rs"),
+        ];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("auth".into()),
+            rerank: true,
+            ..Default::default()
+        };
+
+        // Without embed index, falls back to name matching.
+        // Reranking will attempt to load the model, which may fail in CI,
+        // but the graceful fallback should still return results.
+        let results = flat_code_symbol_search(
+            "auth", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+        // Should find both nodes regardless of whether reranking succeeds
+        assert!(!results.is_empty(), "Rerank=true should not prevent results from appearing");
+    }
+
+    /// Rerank=false should not trigger any reranking code path.
+    #[tokio::test]
+    async fn test_flat_search_rerank_false_default() {
+        let nodes = vec![make_node("foo", NodeKind::Function, "src/lib.rs")];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("foo".into()),
+            rerank: false,
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "foo", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.name, "foo");
+    }
 }
 
 // ── Outcome progress ───────────────────────────────────────────────
