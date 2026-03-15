@@ -625,8 +625,17 @@ mod tests {
         let status = LspEnrichmentStatus::default();
         status.set_running();
         status.set_complete_persist_failed(10);
-        // persist_failed footer should always be shown (no 30s auto-hide)
-        assert!(status.footer_segment().is_some());
+        // Backdate completed_at past the 30s auto-hide window to prove
+        // persist_failed footers are never hidden (unlike normal complete).
+        *status.completed_at.lock().unwrap() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+        // persist_failed footer should still be shown after the normal auto-hide window
+        let footer = status.footer_segment();
+        assert!(footer.is_some(), "persist_failed footer should not auto-hide");
+        assert!(
+            footer.unwrap().contains("persist failed"),
+            "footer should indicate persist failure"
+        );
     }
 
     #[test]
