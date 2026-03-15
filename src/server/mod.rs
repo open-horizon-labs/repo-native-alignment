@@ -32,13 +32,6 @@ use crate::extract::{ExtractorRegistry, EnricherRegistry};
 use crate::graph::NodeKind;
 use crate::graph::{Edge, Node};
 use crate::graph::index::GraphIndex;
-
-/// Languages that benefit from LSP enrichment (produce meaningful edges).
-/// Non-code languages like markdown, yaml, json, toml produce no LSP edges
-/// and should be skipped to avoid wasting time spawning language servers.
-fn is_lsp_worthy_language(lang: &str) -> bool {
-    !matches!(lang, "markdown" | "yaml" | "json" | "toml" | "text" | "unknown" | "")
-}
 use crate::graph::store::SCHEMA_VERSION;
 use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
 use crate::scanner::{ScanResult, Scanner};
@@ -927,7 +920,6 @@ impl RnaHandler {
             let bg_languages: Vec<String> = all_nodes
                 .iter()
                 .map(|n| n.language.clone())
-                .filter(|lang| is_lsp_worthy_language(lang))
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
                 .collect();
@@ -1488,7 +1480,9 @@ impl RnaHandler {
         }
 
         // Run LSP enrichers on the updated nodes (same as cold-start, but scoped to changed files).
-        // Only code-language nodes benefit from LSP — markdown, yaml, json, toml produce no edges.
+        // Only enrichers matching the languages of changed files are invoked — if only .rs
+        // changed, only rust-analyzer runs (not pyright, marksman, etc.). This scoping is
+        // handled by `enrich_all` which filters enrichers by the `languages` vec.
         // LSP enrichment runs in a background task (matching the full-build pattern) so the
         // write lock is released quickly and tool calls aren't blocked.
         let changed_files: std::collections::HashSet<_> = scan
@@ -1496,16 +1490,15 @@ impl RnaHandler {
             .iter()
             .chain(scan.new_files.iter())
             .collect();
-        let code_changed_nodes: Vec<_> = graph
+        let changed_nodes: Vec<_> = graph
             .nodes
             .iter()
             .filter(|n| changed_files.iter().any(|f| n.id.file == **f))
-            .filter(|n| is_lsp_worthy_language(&n.language))
             .cloned()
             .collect();
 
-        if !code_changed_nodes.is_empty() {
-            let languages: Vec<String> = code_changed_nodes
+        if !changed_nodes.is_empty() {
+            let languages: Vec<String> = changed_nodes
                 .iter()
                 .map(|n| n.language.clone())
                 .collect::<std::collections::HashSet<_>>()
@@ -1513,9 +1506,10 @@ impl RnaHandler {
                 .collect();
 
             tracing::info!(
-                "Spawning background incremental LSP enrichment for {} code nodes ({} languages)",
-                code_changed_nodes.len(),
-                languages.len()
+                "Spawning background incremental LSP enrichment for {} nodes ({} languages: [{}])",
+                changed_nodes.len(),
+                languages.len(),
+                languages.join(", ")
             );
 
             // Snapshot what we need for the background task, then release the write lock.
@@ -1530,7 +1524,7 @@ impl RnaHandler {
             tokio::spawn(async move {
                 let enricher_registry = EnricherRegistry::with_builtins();
                 let enrichment = enricher_registry
-                    .enrich_all(&code_changed_nodes, &bg_index, &languages, &bg_repo_root)
+                    .enrich_all(&changed_nodes, &bg_index, &languages, &bg_repo_root)
                     .await;
 
                 if !enrichment.any_enricher_ran {
@@ -2205,53 +2199,22 @@ mod tests {
     }
 
     #[test]
-    fn test_is_lsp_worthy_language() {
-        // Code languages should be LSP-worthy
-        assert!(is_lsp_worthy_language("rust"));
-        assert!(is_lsp_worthy_language("python"));
-        assert!(is_lsp_worthy_language("typescript"));
-        assert!(is_lsp_worthy_language("go"));
-        assert!(is_lsp_worthy_language("java"));
-        assert!(is_lsp_worthy_language("c-cpp"));
-
-        // Non-code languages should NOT be LSP-worthy
-        assert!(!is_lsp_worthy_language("markdown"));
-        assert!(!is_lsp_worthy_language("yaml"));
-        assert!(!is_lsp_worthy_language("json"));
-        assert!(!is_lsp_worthy_language("toml"));
-        assert!(!is_lsp_worthy_language("text"));
-        assert!(!is_lsp_worthy_language("unknown"));
-        assert!(!is_lsp_worthy_language(""));
-    }
-
-    #[test]
-    fn test_is_lsp_worthy_language_covers_all_registered_lsp_servers() {
-        // Every language registered in EnricherRegistry::with_builtins() that is
-        // non-code should be filtered out. Verify the known non-code ones are excluded
-        // and all tier 1/2 code languages are included.
-        let code_langs = vec![
-            "rust", "python", "typescript", "go", "c-cpp", "java", "ruby",
-            "csharp", "swift", "kotlin", "lua", "zig", "elixir", "haskell",
-            "ocaml", "scala", "dart", "r", "julia", "php", "css", "html",
-            "terraform", "nix", "vue", "svelte", "erlang", "gleam", "nim",
-            "clojure", "deno", "protobuf", "latex", "typst",
-        ];
-        for lang in code_langs {
-            assert!(
-                is_lsp_worthy_language(lang),
-                "{} should be LSP-worthy",
-                lang,
-            );
-        }
-    }
-
-    #[test]
-    fn test_is_lsp_worthy_language_edge_cases() {
-        // Case sensitivity: language strings are lowercase by convention
-        assert!(is_lsp_worthy_language("Rust")); // Not in denylist (case-sensitive match)
-        assert!(is_lsp_worthy_language("MARKDOWN")); // Not in denylist
-        // Whitespace: should not match
-        assert!(is_lsp_worthy_language(" markdown"));
-        assert!(is_lsp_worthy_language("markdown "));
+    fn test_enricher_registry_includes_markdown() {
+        // Verify that EnricherRegistry::with_builtins() registers enrichers for
+        // markdown (marksman) — this confirms we must NOT blanket-skip markdown
+        // from LSP enrichment. Language scoping is handled by enrich_all which
+        // only invokes enrichers matching the languages of changed files.
+        let registry = EnricherRegistry::with_builtins();
+        let supported = registry.supported_languages();
+        assert!(
+            supported.contains("markdown"),
+            "Expected markdown in registered enricher languages: {:?}",
+            supported
+        );
+        assert!(
+            supported.contains("rust"),
+            "Expected rust in registered enricher languages: {:?}",
+            supported
+        );
     }
 }

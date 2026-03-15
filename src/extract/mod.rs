@@ -318,6 +318,14 @@ impl EnricherRegistry {
         }
     }
 
+    /// Return the set of all languages supported by registered enrichers.
+    pub fn supported_languages(&self) -> std::collections::HashSet<String> {
+        self.enrichers
+            .iter()
+            .flat_map(|e| e.languages().iter().map(|s| s.to_string()))
+            .collect()
+    }
+
     /// Create a registry pre-loaded with all built-in enrichers.
     ///
     /// Registers LSP enrichers for all languages that have tree-sitter extractors:
