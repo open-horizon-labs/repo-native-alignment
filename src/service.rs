@@ -714,6 +714,122 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id.name, "complex");
     }
+
+    // ── Adversarial tests (seeded from dissent) ──────────────────────
+
+    /// Dissent #1: Multiple filters stacked -- kind + language + file should
+    /// all compose correctly in fallback path.
+    #[tokio::test]
+    async fn test_flat_search_stacked_filters() {
+        let mut target = make_node("handler", NodeKind::Function, "src/api/handler.rs");
+        target.language = "rust".to_string();
+        let mut wrong_kind = make_node("handler", NodeKind::Struct, "src/api/handler.rs");
+        wrong_kind.language = "rust".to_string();
+        let mut wrong_lang = make_node("handler", NodeKind::Function, "src/api/handler.py");
+        wrong_lang.language = "python".to_string();
+        let wrong_file = make_node("handler", NodeKind::Function, "src/db/handler.rs");
+        let gs = make_graph_state(vec![target, wrong_kind, wrong_lang, wrong_file]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("handler".into()),
+            kind: Some("function".into()),
+            language: Some("rust".into()),
+            file: Some("api".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 1, "Only one node should pass all three filters");
+        assert_eq!(results[0].id.name, "handler");
+        assert!(results[0].id.file.to_string_lossy().contains("api"));
+    }
+
+    /// Dissent #2: Limit respected when more results available.
+    #[tokio::test]
+    async fn test_flat_search_limit_respected() {
+        let nodes: Vec<Node> = (0..20)
+            .map(|i| make_node(&format!("fn_{}", i), NodeKind::Function, "src/lib.rs"))
+            .collect();
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("fn".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "fn", SearchMode::Hybrid, 5, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 5, "Should respect limit of 5 even with 20 matches");
+    }
+
+    /// Dissent #3: Root filter rejects non-matching roots in fallback.
+    #[tokio::test]
+    async fn test_flat_search_root_filter_fallback() {
+        let mut local = make_node("handler", NodeKind::Function, "src/handler.rs");
+        local.id.root = "my-project".to_string();
+        let mut other = make_node("handler", NodeKind::Function, "src/handler.rs");
+        other.id.root = "other-project".to_string();
+        let gs = make_graph_state(vec![local, other]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = SearchContext {
+            graph_state: &gs, embed_index: None, repo_root: &repo_root,
+            lsp_status: None, root_filter: Some("my-project".into()),
+            non_code_slugs: HashSet::new(),
+        };
+        let params = SearchParams {
+            query: Some("handler".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 1, "Should only return nodes from matching root");
+        assert_eq!(results[0].id.root, "my-project");
+    }
+
+    /// Dissent #3: synthetic filter works correctly.
+    #[tokio::test]
+    async fn test_flat_search_synthetic_filter() {
+        let mut synth = make_node("CONSTANT", NodeKind::Const, "src/lib.rs");
+        synth.metadata.insert("synthetic".into(), "true".into());
+        let real = make_node("real_fn", NodeKind::Function, "src/lib.rs");
+        let gs = make_graph_state(vec![synth, real]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+
+        // Only synthetic
+        let params = SearchParams {
+            kind: Some("const".into()),
+            synthetic: Some(true),
+            ..Default::default()
+        };
+        let results = flat_code_symbol_search(
+            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.name, "CONSTANT");
+
+        // Only non-synthetic
+        let params2 = SearchParams {
+            synthetic: Some(false),
+            kind: Some("function".into()),
+            ..Default::default()
+        };
+        let results2 = flat_code_symbol_search(
+            "", SearchMode::Hybrid, 10, &params2, &gs, &ctx, false, false,
+        ).await;
+        assert_eq!(results2.len(), 1);
+        assert_eq!(results2[0].id.name, "real_fn");
+    }
 }
 
 // ── Outcome progress ───────────────────────────────────────────────
