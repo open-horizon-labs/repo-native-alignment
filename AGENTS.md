@@ -88,10 +88,10 @@ This project IS the RNA MCP server. When working here, use its own tools.
 # Project Context
 
 ## Purpose
-MCP server with a workspace-wide context engine. Incrementally scans repos, extracts a multi-language code graph (symbols, topology, schemas, PR history), and makes business outcomes, code structure, markdown, and git history queryable as one system. Agents stay aligned to declared intent because that intent lives in the repo as structured, queryable artifacts.
+Local context discovery and alignment tool for coding agents. Makes the fractal, local knowledge in a codebase — the stuff not in training data — discoverable and queryable. If an agent can't find something through RNA, RNA is broken.
 
 ## Current Aims
-- **context-assembly** (active): Agents get the fractal, local knowledge they need for a given task without manual context loading. Mechanism: incremental scanning, pluggable extraction, unified code graph, semantic search, structural joins, auto-injection.
+- **context-assembly** (active): Agents discover and navigate code, business artifacts, and structural relationships through RNA — no grep fallback needed. If something exists and RNA can't find it, that's a bug.
 - **agent-alignment** (maintenance): Work stays connected to declared outcomes. Architecture settled, feedback loop exists. Remaining work: bug fixes, tool cleanup, adoption.
 - **human-led-curation** (proposed): LLM-assisted corpus curation. Deferred until manual /distill sessions prove insufficient.
 
