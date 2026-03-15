@@ -11,10 +11,11 @@ use crate::embed::{EmbeddingIndex, SearchMode, SearchOutcome};
 use crate::graph::{Node, NodeKind};
 use crate::ranking;
 use crate::server::helpers::{
-    format_freshness, format_neighbors_grouped, format_node_entry,
+    format_freshness_full, format_neighbors_grouped_with_root,
+    format_node_entry_with_root, strip_root_prefix,
 };
 use crate::server::handlers::{parse_search_mode, run_traversal};
-use crate::server::state::{GraphState, LspEnrichmentStatus};
+use crate::server::state::{EmbeddingStatus, GraphState, LspEnrichmentStatus};
 use crate::server::store::parse_edge_kind;
 
 /// Interface-agnostic search parameters.
@@ -76,6 +77,7 @@ pub struct SearchContext<'a> {
     pub embed_index: Option<&'a EmbeddingIndex>,
     pub repo_root: &'a Path,
     pub lsp_status: Option<&'a LspEnrichmentStatus>,
+    pub embed_status: Option<&'a EmbeddingStatus>,
     pub root_filter: Option<String>,
     pub non_code_slugs: HashSet<String>,
 }
@@ -126,7 +128,8 @@ async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchCon
     ).await;
 
     if !matches.is_empty() {
-        let md: String = matches.iter().map(|n| format_node_entry(n, &graph_state.index, params.compact)).collect::<Vec<_>>().join("\n\n");
+        let strip = ctx.root_filter.as_deref();
+        let md: String = matches.iter().map(|n| format_node_entry_with_root(n, &graph_state.index, params.compact, strip)).collect::<Vec<_>>().join("\n\n");
         sections.push(format!("### Code symbols ({} result(s))\n\n{}", matches.len(), md));
     }
 
@@ -164,7 +167,7 @@ async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchCon
         }
     }
 
-    let freshness = format_freshness(graph_state.nodes.len(), graph_state.last_scan_completed_at, ctx.lsp_status);
+    let freshness = format_freshness_full(graph_state.nodes.len(), graph_state.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
     if sections.is_empty() { format!("No results matching \"{}\".{}", query_str, freshness) }
     else { format!("## Search: \"{}\"\n\n{}{}", query_str, sections.join("\n\n"), freshness) }
 }
@@ -362,7 +365,8 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
                     let code_results: Vec<_> = results.into_iter().filter(|r| r.kind.starts_with("code:")).filter(|r| search_result_passes_root_filter(r, &ctx.root_filter, &ctx.non_code_slugs)).take(top_k).collect();
                     if code_results.is_empty() { return format!("No code symbols matched query \"{}\". Try a different query or use node parameter.", query_text); }
                     let mut header = format!("### Matched entry nodes for \"{}\"\n\n", query_text);
-                    let ids: Vec<String> = code_results.iter().map(|r| { header.push_str(&format!("- `{}` -- {} (score: {:.2})\n", r.id, r.title, r.score)); r.id.clone() }).collect();
+                    let strip = ctx.root_filter.as_deref();
+                    let ids: Vec<String> = code_results.iter().map(|r| { let display = strip_root_prefix(&r.id, strip); header.push_str(&format!("- `{}` -- {} (score: {:.2})\n", display, r.title, r.score)); r.id.clone() }).collect();
                     header.push('\n');
                     (ids, header)
                 }
@@ -426,9 +430,10 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         }).count()
     }).sum();
 
-    let entry_label = if valid_entry_ids.len() == 1 { format!("`{}`", valid_entry_ids[0]) } else { format!("{} entry nodes", valid_entry_ids.len()) };
+    let strip = ctx.root_filter.as_deref();
+    let entry_label = if valid_entry_ids.len() == 1 { format!("`{}`", strip_root_prefix(valid_entry_ids[0], strip)) } else { format!("{} entry nodes", valid_entry_ids.len()) };
     let direction = params.direction.as_deref().unwrap_or("outgoing");
-    let freshness = format_freshness(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status);
+    let freshness = format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
 
     if total_count == 0 {
         let mode_desc = match mode {
@@ -440,7 +445,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         };
         format!("{}{}{}", entry_header, mode_desc, freshness)
     } else {
-        let md = format_neighbors_grouped(&gs.nodes, &merged_groups, &gs.index, params.compact);
+        let md = format_neighbors_grouped_with_root(&gs.nodes, &merged_groups, &gs.index, params.compact, strip);
         let heading = match mode {
             "neighbors" => format!("## Graph neighbors ({}) of {}\n\n{} result(s)\n\n", direction, entry_label, total_count),
             "impact" => format!("## Impact analysis for {}\n\n{} dependent(s) within {} hop(s)\n\n", entry_label, total_count, params.hops.unwrap_or(3)),
@@ -455,14 +460,16 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
 fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_>) -> String {
     use crate::server::handlers::run_traversal_grouped;
     let gs = ctx.graph_state;
-    let freshness = format_freshness(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status);
+    let freshness = format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
     if params.mode.is_some() {
         let mode = params.mode.as_deref().unwrap_or("neighbors");
         let edge_filter = params.edge_types.as_ref().map(|types| types.iter().filter_map(|t| parse_edge_kind(t)).collect::<Vec<_>>());
         let edge_filter_slice = edge_filter.as_deref();
         let mut sections: Vec<String> = Vec::new();
+        let strip = ctx.root_filter.as_deref();
         for &nid in node_ids {
-            if gs.index.get_node(nid).is_none() { sections.push(format!("### `{}`\n\nNode not found in graph.", nid)); continue; }
+            let display_nid = strip_root_prefix(nid, strip);
+            if gs.index.get_node(nid).is_none() { sections.push(format!("### `{}`\n\nNode not found in graph.", display_nid)); continue; }
             match run_traversal_grouped(&gs.index, nid, mode, params.hops, params.direction.as_deref(), edge_filter_slice) {
                 Ok(mut groups) => {
                     // Remove self-references
@@ -482,10 +489,10 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
                                 .unwrap_or(true)
                         }).count()
                     }).sum();
-                    if total == 0 { sections.push(format!("### `{}`\n\nNo {} results.", nid, mode)); }
-                    else { let md = format_neighbors_grouped(&gs.nodes, &groups, &gs.index, params.compact); sections.push(format!("### `{}`\n\n{} result(s)\n\n{}", nid, total, md)); }
+                    if total == 0 { sections.push(format!("### `{}`\n\nNo {} results.", display_nid, mode)); }
+                    else { let md = format_neighbors_grouped_with_root(&gs.nodes, &groups, &gs.index, params.compact, strip); sections.push(format!("### `{}`\n\n{} result(s)\n\n{}", display_nid, total, md)); }
                 }
-                Err(msg) => sections.push(format!("### `{}`\n\n{}", nid, msg)),
+                Err(msg) => sections.push(format!("### `{}`\n\n{}", display_nid, msg)),
             }
         }
         format!("## Batch {} for {} node(s)\n\n{}{}", mode, node_ids.len(), sections.join("\n\n"), freshness)
@@ -493,10 +500,11 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
         let mut found = Vec::new();
         let mut missing = Vec::new();
         for &nid in node_ids { if let Some(node) = gs.nodes.iter().find(|n| n.stable_id() == nid) { found.push(node); } else { missing.push(nid); } }
-        if found.is_empty() { return format!("No nodes found for {}. Try search to find valid node IDs.{}", node_ids.iter().map(|id| format!("`{}`", id)).collect::<Vec<_>>().join(", "), freshness); }
-        let md: String = found.iter().map(|n| format_node_entry(n, &gs.index, params.compact)).collect::<Vec<_>>().join("\n\n");
+        let strip = ctx.root_filter.as_deref();
+        if found.is_empty() { return format!("No nodes found for {}. Try search to find valid node IDs.{}", node_ids.iter().map(|id| format!("`{}`", strip_root_prefix(id, strip))).collect::<Vec<_>>().join(", "), freshness); }
+        let md: String = found.iter().map(|n| format_node_entry_with_root(n, &gs.index, params.compact, strip)).collect::<Vec<_>>().join("\n\n");
         let mut result = format!("## Batch retrieve: {} found\n\n{}", found.len(), md);
-        if !missing.is_empty() { result.push_str(&format!("\n\n**Missing:** {}", missing.iter().map(|id| format!("`{}`", id)).collect::<Vec<_>>().join(", "))); }
+        if !missing.is_empty() { result.push_str(&format!("\n\n**Missing:** {}", missing.iter().map(|id| format!("`{}`", strip_root_prefix(id, strip))).collect::<Vec<_>>().join(", "))); }
         result.push_str(&freshness);
         result
     }
@@ -591,7 +599,7 @@ mod tests {
     fn make_search_context<'a>(graph_state: &'a GraphState, repo_root: &'a Path) -> SearchContext<'a> {
         SearchContext {
             graph_state, embed_index: None, repo_root,
-            lsp_status: None, root_filter: None, non_code_slugs: HashSet::new(),
+            lsp_status: None, embed_status: None, root_filter: None, non_code_slugs: HashSet::new(),
         }
     }
 
@@ -895,7 +903,7 @@ mod tests {
         let repo_root = PathBuf::from("/tmp/test");
         let ctx = SearchContext {
             graph_state: &gs, embed_index: None, repo_root: &repo_root,
-            lsp_status: None, root_filter: Some("my-project".into()),
+            lsp_status: None, embed_status: None, root_filter: Some("my-project".into()),
             non_code_slugs: HashSet::new(),
         };
         let params = SearchParams {
@@ -1053,7 +1061,7 @@ const IMPORTANCE_THRESHOLD: f64 = 0.001;
 
 #[derive(Debug)]
 pub struct RepoMapParams { pub top_n: usize, pub root_filter: Option<String>, pub non_code_slugs: HashSet<String> }
-pub struct RepoMapContext<'a> { pub graph_state: &'a crate::server::state::GraphState, pub repo_root: &'a Path, pub lsp_status: Option<&'a LspEnrichmentStatus> }
+pub struct RepoMapContext<'a> { pub graph_state: &'a crate::server::state::GraphState, pub repo_root: &'a Path, pub lsp_status: Option<&'a LspEnrichmentStatus>, pub embed_status: Option<&'a EmbeddingStatus> }
 
 pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
     let graph_state = ctx.graph_state;
@@ -1063,6 +1071,7 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
             .filter(|n| !matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge | NodeKind::Field))
             .filter(|n| n.id.root != "external")
             .filter(|n| node_passes_root_filter(&n.id.root, &params.root_filter, &params.non_code_slugs))
+            .filter(|n| !ranking::is_trait_impl_method(n))
             .filter_map(|n| { let imp = n.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
                 let imp = if ranking::is_test_file(n) { imp * 0.1 } else { imp };
                 if imp > IMPORTANCE_THRESHOLD { Some((n, imp)) } else { None } }).collect();
@@ -1086,10 +1095,11 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
             let fs = if files.is_empty() { String::new() } else { format!(" (files: {})", files.join(", ")) }; format!("- **{}**{}", o.id(), fs) }).collect::<Vec<_>>().join("\n"); sections.push(format!("## Active outcomes\n\n{}", md)); } }
     { let mut ep: Vec<&Node> = graph_state.nodes.iter().filter(|n| n.id.kind == NodeKind::Function && n.id.root != "external")
             .filter(|n| node_passes_root_filter(&n.id.root, &params.root_filter, &params.non_code_slugs))
+            .filter(|n| !ranking::is_test_function(n))
             .filter(|n| { let name = n.id.name.to_lowercase(); name == "main" || name.starts_with("handle_") || name.starts_with("handler") || name.ends_with("_handler") || name.contains("endpoint") }).collect();
         ep.sort_by(|a, b| { let ia = a.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0); let ib = b.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0); ib.partial_cmp(&ia).unwrap_or(std::cmp::Ordering::Equal) });
         ep.truncate(10);
         if !ep.is_empty() { let md: String = ep.iter().map(|n| format!("- **{}** [{}] `{}`:{}-{}", n.id.name, n.id.root, n.id.file.display(), n.line_start, n.line_end)).collect::<Vec<_>>().join("\n"); sections.push(format!("## Entry points\n\n{}", md)); } }
-    let freshness = format_freshness(graph_state.nodes.len(), graph_state.last_scan_completed_at, ctx.lsp_status);
+    let freshness = format_freshness_full(graph_state.nodes.len(), graph_state.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
     if sections.is_empty() { format!("No repository data available yet.{}", freshness) } else { format!("# Repository Map\n\n{}{}", sections.join("\n\n"), freshness) }
 }
