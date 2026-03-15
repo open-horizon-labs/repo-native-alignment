@@ -144,14 +144,12 @@ mod tests {
 
     // ==================== Adversarial tests (dissent-seeded) ====================
 
-    /// Dissent #1: Empty query string. The cross-encoder should still produce
-    /// results (or at least not panic). Empty queries are valid inputs that
-    /// arrive from the service layer.
+    /// Dissent #1: Empty query string with empty candidates.
+    /// Tests the same early-return path as test_rerank_empty_candidates.
+    /// Testing empty query with non-empty candidates requires model loading
+    /// and is covered by the ignored integration test.
     #[test]
     fn test_rerank_empty_query() {
-        // Empty query with candidates should return Ok (empty candidates path)
-        // or succeed if the model is loaded. Since we don't load the model
-        // in unit tests, we test the empty-candidates shortcut.
         let results = rerank_results("", &[]).unwrap();
         assert!(results.is_empty());
     }
