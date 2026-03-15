@@ -473,12 +473,32 @@ impl RnaHandler {
                         .collect();
                     let edge_count = persist_edges.len();
                     drop(guard); // release lock before async persist
-                    if let Err(e) = persist_graph_incremental(
+                    match persist_graph_incremental(
                         &lsp_repo_root, &upsert_nodes, &persist_edges, &[], &[],
                     ).await {
-                        tracing::error!("Background LSP enrichment persist failed: {}", e);
+                        Ok(true) => {
+                            tracing::info!("[background] LSP enrichment: schema migrated; performing full persist");
+                            let snapshot = {
+                                let g = bg_graph.read().await;
+                                g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+                            };
+                            if let Some((nodes, edges)) = snapshot {
+                                if let Err(e) = persist_graph_to_lance(&lsp_repo_root, &nodes, &edges).await {
+                                    tracing::error!("[background] LSP enrichment: full persist after migration failed: {}", e);
+                                    bg_lsp_status.set_complete_persist_failed(edge_count);
+                                } else {
+                                    bg_lsp_status.set_complete(edge_count);
+                                }
+                            } else {
+                                bg_lsp_status.set_complete(edge_count);
+                            }
+                        }
+                        Ok(false) => bg_lsp_status.set_complete(edge_count),
+                        Err(e) => {
+                            tracing::error!("Background LSP enrichment persist failed: {}", e);
+                            bg_lsp_status.set_complete_persist_failed(edge_count);
+                        }
                     }
-                    bg_lsp_status.set_complete(edge_count);
                 }
             };
 
@@ -580,12 +600,32 @@ impl RnaHandler {
                     .collect();
                 let edge_count = persist_edges.len();
                 drop(guard);
-                if let Err(e) = persist_graph_incremental(
+                match persist_graph_incremental(
                     &bg_repo_root, &upsert_nodes, &persist_edges, &[], &[],
                 ).await {
-                    tracing::error!("Background LSP enrichment persist failed: {}", e);
+                    Ok(true) => {
+                        tracing::info!("[background] LSP enrichment: schema migrated; performing full persist");
+                        let snapshot = {
+                            let g = bg_graph.read().await;
+                            g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+                        };
+                        if let Some((nodes, edges)) = snapshot {
+                            if let Err(e) = persist_graph_to_lance(&bg_repo_root, &nodes, &edges).await {
+                                tracing::error!("[background] LSP enrichment: full persist after migration failed: {}", e);
+                                bg_lsp_status.set_complete_persist_failed(edge_count);
+                            } else {
+                                bg_lsp_status.set_complete(edge_count);
+                            }
+                        } else {
+                            bg_lsp_status.set_complete(edge_count);
+                        }
+                    }
+                    Ok(false) => bg_lsp_status.set_complete(edge_count),
+                    Err(e) => {
+                        tracing::error!("Background LSP enrichment persist failed: {}", e);
+                        bg_lsp_status.set_complete_persist_failed(edge_count);
+                    }
                 }
-                bg_lsp_status.set_complete(edge_count);
             }
         });
     }
@@ -719,12 +759,32 @@ impl RnaHandler {
                 }
 
                 // Persist to LanceDB (slow -- outside the lock).
-                if let Err(e) = persist_graph_incremental(
+                match persist_graph_incremental(
                     &bg_repo_root, &all_upsert_nodes, &persist_edges, &[], &[],
                 ).await {
-                    tracing::error!("[incremental-bg] LSP enrichment persist failed: {}", e);
+                    Ok(true) => {
+                        tracing::info!("[incremental-bg] LSP enrichment: schema migrated; performing full persist");
+                        let snapshot = {
+                            let g = bg_graph.read().await;
+                            g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+                        };
+                        if let Some((nodes, edges)) = snapshot {
+                            if let Err(e) = persist_graph_to_lance(&bg_repo_root, &nodes, &edges).await {
+                                tracing::error!("[incremental-bg] Full persist after migration failed: {}", e);
+                                bg_lsp_status.set_complete_persist_failed(edge_count);
+                            } else {
+                                bg_lsp_status.set_complete(edge_count);
+                            }
+                        } else {
+                            bg_lsp_status.set_complete(edge_count);
+                        }
+                    }
+                    Ok(false) => bg_lsp_status.set_complete(edge_count),
+                    Err(e) => {
+                        tracing::error!("[incremental-bg] LSP enrichment persist failed: {}", e);
+                        bg_lsp_status.set_complete_persist_failed(edge_count);
+                    }
                 }
-                bg_lsp_status.set_complete(edge_count);
             }
         });
     }
@@ -899,10 +959,29 @@ impl RnaHandler {
                     .cloned()
                     .collect();
                 drop(guard);
-                if let Err(e) = persist_graph_incremental(
+                match persist_graph_incremental(
                     &self.repo_root, &upsert_nodes, &persist_edges, &[], &[],
                 ).await {
-                    tracing::error!("Foreground LSP enrichment persist failed: {}", e);
+                    Ok(true) => {
+                        tracing::info!("Foreground LSP enrichment: schema migrated; performing full persist");
+                        let snapshot = {
+                            let g = self.graph.read().await;
+                            g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+                        };
+                        if let Some((nodes, edges)) = snapshot {
+                            if let Err(e) = persist_graph_to_lance(&self.repo_root, &nodes, &edges).await {
+                                tracing::error!("Foreground LSP enrichment: full persist after migration failed: {}", e);
+                                self.lsp_status.set_complete_persist_failed(lsp_edge_count);
+                                return Err(e.context("LSP enrichment full persist after migration failed"));
+                            }
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!("Foreground LSP enrichment persist failed: {}", e);
+                        self.lsp_status.set_complete_persist_failed(lsp_edge_count);
+                        return Err(e.context("LSP enrichment persist failed during foreground pipeline"));
+                    }
                 }
             }
             self.lsp_status.set_complete(lsp_edge_count);
