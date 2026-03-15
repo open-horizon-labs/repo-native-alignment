@@ -97,13 +97,22 @@ pub fn rerank_results(
     );
 
     // Map fastembed results back to our candidates using the index field.
-    let mut results: Vec<RerankedResult> = rerank_results
-        .into_iter()
-        .map(|r| RerankedResult {
-            original_index: candidates[r.index].original_index,
+    // Use checked access: fastembed does not guarantee indices are in bounds
+    // when `return_documents = false`.
+    let mut results: Vec<RerankedResult> = Vec::with_capacity(rerank_results.len());
+    for r in rerank_results {
+        let candidate = candidates.get(r.index).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Reranker returned invalid index {} (candidates={})",
+                r.index,
+                candidates.len()
+            )
+        })?;
+        results.push(RerankedResult {
+            original_index: candidate.original_index,
             score: r.score as f32,
-        })
-        .collect();
+        });
+    }
 
     // Sort by score descending (fastembed may already do this, but be explicit).
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
