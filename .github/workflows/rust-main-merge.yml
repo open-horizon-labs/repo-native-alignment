@@ -114,6 +114,10 @@ jobs:
         run: ./target/release/repo-native-alignment test --repo .
         timeout-minutes: 5
 
+      - name: Build index for CLI smoke tests
+        run: ./target/release/repo-native-alignment scan --path .
+        timeout-minutes: 5
+
       - name: CLI search smoke test
         run: |
           OUTPUT=$(./target/release/repo-native-alignment search "main" --repo . --limit 3 2>/dev/null)

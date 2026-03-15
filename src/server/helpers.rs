@@ -335,6 +335,13 @@ pub(crate) fn format_neighbors_grouped_with_root(
     compact: bool,
     strip_root: Option<&str>,
 ) -> String {
+    // Build O(1) lookup map: stable_id -> index into nodes vec.
+    let node_map: std::collections::HashMap<String, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.stable_id(), i))
+        .collect();
+
     let mut sections: Vec<String> = Vec::new();
 
     for (edge_kind, ids) in groups {
@@ -342,10 +349,8 @@ pub(crate) fn format_neighbors_grouped_with_root(
         let displayable_ids: Vec<&String> = ids
             .iter()
             .filter(|id| {
-                nodes
-                    .iter()
-                    .find(|n| n.stable_id() == **id)
-                    .map(|n| !is_hidden_traversal_kind(&n.id.kind))
+                node_map.get(id.as_str())
+                    .map(|&i| !is_hidden_traversal_kind(&nodes[i].id.kind))
                     .unwrap_or(true)
             })
             .collect();
@@ -357,8 +362,8 @@ pub(crate) fn format_neighbors_grouped_with_root(
         let entries: Vec<String> = displayable_ids
             .iter()
             .map(|id| {
-                if let Some(node) = nodes.iter().find(|n| n.stable_id() == **id) {
-                    format_node_entry_with_root(node, index, compact, strip_root)
+                if let Some(&i) = node_map.get(id.as_str()) {
+                    format_node_entry_with_root(&nodes[i], index, compact, strip_root)
                 } else {
                     format_unresolved_id(id, strip_root)
                 }
@@ -396,13 +401,20 @@ fn capitalize_first(s: &str) -> String {
 /// where edge-type grouping is not needed (e.g., outcome_progress display).
 #[allow(dead_code)]
 pub(crate) fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String], index: &GraphIndex, compact: bool) -> String {
+    // Build O(1) lookup map: stable_id -> index into nodes vec.
+    let node_map: std::collections::HashMap<String, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.stable_id(), i))
+        .collect();
+
     ids.iter()
         .filter_map(|id| {
-            if let Some(node) = nodes.iter().find(|n| n.stable_id() == *id) {
-                if is_hidden_traversal_kind(&node.id.kind) {
+            if let Some(&i) = node_map.get(id.as_str()) {
+                if is_hidden_traversal_kind(&nodes[i].id.kind) {
                     return None;
                 }
-                Some(format_node_entry(node, index, compact))
+                Some(format_node_entry(&nodes[i], index, compact))
             } else {
                 Some(format!("- `{}`", id))
             }
