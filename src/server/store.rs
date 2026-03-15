@@ -379,6 +379,13 @@ pub(crate) async fn persist_graph_to_lance(
         let pattern_hints: Vec<Option<String>> = nodes.iter()
             .map(|n| n.metadata.get("pattern_hint").cloned())
             .collect();
+        let mut is_static_builder = BooleanBuilder::new();
+        for n in nodes.iter() {
+            match n.metadata.get("is_static") {
+                Some(v) => is_static_builder.append_value(v == "true"),
+                None => is_static_builder.append_null(),
+            }
+        }
         let updated_ats: Vec<i64> = vec![now; nodes.len()];
 
         let batch = RecordBatch::try_new(
@@ -405,6 +412,7 @@ pub(crate) async fn persist_graph_to_lance(
                 Arc::new(StringArray::from(decorators_col)),
                 Arc::new(StringArray::from(type_params_col)),
                 Arc::new(StringArray::from(pattern_hints)),
+                Arc::new(is_static_builder.finish()),
                 Arc::new(Int64Array::from(updated_ats)),
             ],
         )?;
@@ -592,6 +600,13 @@ pub(crate) async fn persist_graph_incremental(
             let pattern_hints: Vec<Option<String>> = upsert_nodes.iter()
                 .map(|n| n.metadata.get("pattern_hint").cloned())
                 .collect();
+            let mut is_static_builder = BooleanBuilder::new();
+            for n in upsert_nodes.iter() {
+                match n.metadata.get("is_static") {
+                    Some(v) => is_static_builder.append_value(v == "true"),
+                    None => is_static_builder.append_null(),
+                }
+            }
             let updated_ats: Vec<i64> = vec![now; upsert_nodes.len()];
 
             let batch = RecordBatch::try_new(
@@ -618,6 +633,7 @@ pub(crate) async fn persist_graph_incremental(
                     Arc::new(StringArray::from(decorators_col)),
                     Arc::new(StringArray::from(type_params_col)),
                     Arc::new(StringArray::from(pattern_hints)),
+                    Arc::new(is_static_builder.finish()),
                     Arc::new(Int64Array::from(updated_ats)),
                 ],
             )?;
@@ -795,6 +811,8 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             let pattern_hint_col = batch.column_by_name("pattern_hint")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let is_static_col = batch.column_by_name("is_static")
+                .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
 
             for i in 0..batch.num_rows() {
                 let file_path = PathBuf::from(file_paths.value(i));
@@ -867,6 +885,11 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                         if !val.is_empty() {
                             metadata.insert("pattern_hint".to_string(), val.to_string());
                         }
+                    }
+                }
+                if let Some(col) = is_static_col {
+                    if !col.is_null(i) {
+                        metadata.insert("is_static".to_string(), if col.value(i) { "true" } else { "false" }.to_string());
                     }
                 }
                 nodes.push(Node {

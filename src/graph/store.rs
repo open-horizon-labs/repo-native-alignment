@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search`.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -54,6 +54,7 @@ pub fn symbols_schema() -> Schema {
         Field::new("decorators", DataType::Utf8, true),        // metadata["decorators"] — comma-separated decorator/attribute text
         Field::new("type_params", DataType::Utf8, true),       // metadata["type_params"] — generic type parameters (e.g. "<T: Clone + Send>")
         Field::new("pattern_hint", DataType::Utf8, true),        // metadata["pattern_hint"] — design pattern from naming conventions (e.g. "factory", "observer")
+        Field::new("is_static", DataType::Boolean, true),           // metadata["is_static"] — true for static/associated methods, false for instance methods
         // Vector column is added dynamically when embeddings are computed,
         // since the dimension depends on the model. See `symbols_schema_with_vector`.
         Field::new("updated_at", DataType::Int64, false),
@@ -87,6 +88,7 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("decorators", DataType::Utf8, true),
         Field::new("type_params", DataType::Utf8, true),
         Field::new("pattern_hint", DataType::Utf8, true),
+        Field::new("is_static", DataType::Boolean, true),
         Field::new(
             "vector",
             DataType::FixedSizeList(
@@ -193,6 +195,7 @@ mod tests {
         assert!(schema.field_with_name("mutable").is_ok());
         assert!(schema.field_with_name("decorators").is_ok());
         assert!(schema.field_with_name("type_params").is_ok());
+        assert!(schema.field_with_name("is_static").is_ok());
         assert!(schema.field_with_name("updated_at").is_ok());
         // no vector column in base schema
         assert!(schema.field_with_name("vector").is_err());
@@ -207,6 +210,20 @@ mod tests {
             DataType::FixedSizeList(_, dim) => assert_eq!(*dim, 384),
             other => panic!("Expected FixedSizeList, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_is_static_column_type_and_nullability() {
+        // Adversarial: verify is_static is Boolean and nullable in both schemas
+        let schema = symbols_schema();
+        let field = schema.field_with_name("is_static").expect("is_static missing from symbols_schema");
+        assert_eq!(*field.data_type(), DataType::Boolean, "is_static should be Boolean");
+        assert!(field.is_nullable(), "is_static should be nullable (top-level functions have no is_static)");
+
+        let vec_schema = symbols_schema_with_vector(384);
+        let vec_field = vec_schema.field_with_name("is_static").expect("is_static missing from symbols_schema_with_vector");
+        assert_eq!(*vec_field.data_type(), DataType::Boolean, "is_static should be Boolean in vector schema");
+        assert!(vec_field.is_nullable(), "is_static should be nullable in vector schema");
     }
 
     #[test]
