@@ -265,6 +265,10 @@ async fn flat_code_symbol_search<'a>(
         // Embed search was used -- supplement with name/signature matches
         // that the embedding missed. Deduplicate by stable_id so embed-ranked
         // results keep their position; supplements are appended at the end.
+        //
+        // Cap supplements to avoid blowing up the reranker candidate pool
+        // and reserve slots so supplements survive the downstream truncate.
+        let supplement_budget = limit.min(10);
         let seen: std::collections::HashSet<String> = matches.iter()
             .map(|n| n.stable_id())
             .collect();
@@ -276,9 +280,16 @@ async fn flat_code_symbol_search<'a>(
             node_passes_filters(n)
         }).collect();
         if !name_supplements.is_empty() {
-            // Sort supplements by name-match quality before appending.
+            // Sort supplements by name-match quality, then cap to budget.
             let mut sorted_supplements = name_supplements;
             ranking::sort_symbol_matches(&mut sorted_supplements, &query_lower, &graph_state.index);
+            sorted_supplements.truncate(supplement_budget);
+            // Evict tail embed results to make room so supplements survive
+            // the final truncate(limit).
+            let reserved = sorted_supplements.len();
+            if matches.len() + reserved > limit {
+                matches.truncate(limit.saturating_sub(reserved));
+            }
             matches.extend(sorted_supplements);
         }
     }
