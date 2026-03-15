@@ -36,6 +36,7 @@ pub struct SearchParams {
     pub compact: bool,
     pub nodes: Option<Vec<String>>,
     pub search_mode: Option<String>,
+    pub rerank: bool,
     pub include_artifacts: bool,
     pub include_markdown: bool,
     pub artifact_types: Option<Vec<String>>,
@@ -61,6 +62,7 @@ impl SearchParams {
             compact: args.compact.unwrap_or(false),
             nodes: args.nodes.clone(),
             search_mode: args.search_mode.clone(),
+            rerank: args.rerank.unwrap_or(false),
             include_artifacts: args.include_artifacts.unwrap_or(true),
             include_markdown: args.include_markdown.unwrap_or(true),
             artifact_types: args.artifact_types.clone(),
@@ -205,12 +207,16 @@ async fn flat_code_symbol_search<'a>(
         true
     };
 
+    // When reranking is requested, over-fetch more candidates so the
+    // cross-encoder has a wider pool to re-score.
+    let rerank_over_fetch = if params.rerank { limit.max(20) } else { limit };
+
     // Try embed-ranked search for code symbols when query is non-empty.
     let mut used_embed = false;
     let mut matches: Vec<&Node> = if !query_str.is_empty() {
         if let Some(embed_idx) = ctx.embed_index {
-            // Over-fetch to allow for post-filtering.
-            let over_fetch = limit * 3;
+            // Over-fetch to allow for post-filtering (and reranking).
+            let over_fetch = rerank_over_fetch * 3;
             match embed_idx.search_with_mode(query_str, None, over_fetch, search_mode).await {
                 Ok(SearchOutcome::Results(results)) => {
                     used_embed = true;
@@ -219,7 +225,7 @@ async fn flat_code_symbol_search<'a>(
                         .filter(|r| r.kind.starts_with("code:"))
                         .filter_map(|r| graph_state.nodes.iter().find(|n| n.stable_id() == r.id))
                         .filter(|n| node_passes_filters(n))
-                        .take(limit)
+                        .take(rerank_over_fetch)
                         .collect()
                 }
                 // Embedding index not ready -- fall through to name/signature fallback.
@@ -269,6 +275,54 @@ async fn flat_code_symbol_search<'a>(
         // are already ranked by the embedding index.
         ranking::sort_symbol_matches(&mut matches, &query_lower, &graph_state.index);
     }
+
+    // Cross-encoder reranking: re-score the top candidates using a cross-encoder
+    // model that attends to (query, document) pairs jointly. This produces more
+    // precise relevance scores than bi-encoder similarity alone.
+    if params.rerank && !query_str.is_empty() && matches.len() > 1 {
+        use crate::rerank::{RerankCandidate, rerank_results};
+
+        let candidates: Vec<RerankCandidate> = matches
+            .iter()
+            .enumerate()
+            .map(|(i, node)| {
+                // Build reranking text from signature + body (the full context
+                // the cross-encoder should attend to).
+                let text = if node.body.is_empty() {
+                    node.signature.clone()
+                } else {
+                    format!("{}\n{}", node.signature, node.body)
+                };
+                RerankCandidate {
+                    text,
+                    original_index: i,
+                }
+            })
+            .collect();
+
+        match rerank_results(query_str, &candidates) {
+            Ok(reranked) => {
+                let original_matches = matches.clone();
+                matches = reranked
+                    .iter()
+                    .filter_map(|r| original_matches.get(r.original_index).copied())
+                    .collect();
+                tracing::debug!(
+                    "Reranked {} candidates for query \"{}\"",
+                    candidates.len(),
+                    query_str
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Cross-encoder reranking failed, using original order: {}",
+                    e
+                );
+                // Fall through with original ordering -- reranking is best-effort.
+            }
+        }
+    }
+
     matches.truncate(limit);
     matches
 }
@@ -480,7 +534,7 @@ mod tests {
         }
     }
 
-    #[test] fn test_search_params_default() { let p = SearchParams::default(); assert!(p.query.is_none()); assert!(!p.compact); }
+    #[test] fn test_search_params_default() { let p = SearchParams::default(); assert!(p.query.is_none()); assert!(!p.compact); assert!(!p.rerank); }
     #[test] fn test_node_passes_root_filter_all() { assert!(node_passes_root_filter("any", &None, &HashSet::new())); }
     #[test] fn test_node_passes_root_filter_match() { assert!(node_passes_root_filter("my-root", &Some("my-root".into()), &HashSet::new())); }
     #[test] fn test_node_passes_root_filter_external() { assert!(node_passes_root_filter("external", &Some("my-root".into()), &HashSet::new())); }
