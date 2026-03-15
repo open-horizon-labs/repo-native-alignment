@@ -146,6 +146,12 @@ mod tests {
 
     #[test]
     fn test_rna_cache_dir_uses_home() {
+        // Skip if FASTEMBED_CACHE_DIR is explicitly set -- rna_cache_dir()
+        // correctly prioritizes that over HOME, so the assertions below
+        // would not hold.
+        if std::env::var("FASTEMBED_CACHE_DIR").is_ok() {
+            return;
+        }
         let dir = rna_cache_dir();
         let dir_str = dir.to_string_lossy();
         // When HOME is set (typical in tests), cache dir should be under ~/.cache/rna/models
