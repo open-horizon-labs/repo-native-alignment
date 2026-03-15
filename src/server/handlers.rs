@@ -186,7 +186,20 @@ fn group_by_first_hop(
         }
     }
 
-    // For each result in flat_ids, determine its first-hop edge type
+    // For each result in flat_ids, determine its first-hop edge type.
+    // Pre-compute reachability sets per first-hop neighbor to avoid O(N^2).
+    let mut reachability_cache: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for (_kind, fh_ids) in &first_hop {
+        for fh_id in fh_ids {
+            reachability_cache.entry(fh_id.clone()).or_insert_with(|| {
+                index.reachable(fh_id, 10, edge_filter)
+                    .into_iter()
+                    .collect()
+            });
+        }
+    }
+
     let flat_set: std::collections::HashSet<&str> = flat_ids.iter().map(|s| s.as_str()).collect();
     let mut groups: std::collections::BTreeMap<EdgeKind, Vec<String>> = std::collections::BTreeMap::new();
 
@@ -196,17 +209,15 @@ fn group_by_first_hop(
             groups.entry(kind.clone()).or_default().push(id.clone());
         } else {
             // Multi-hop: find which first-hop edge type leads here.
-            // Check each first-hop neighbor to see if this ID is reachable from it.
-            // Use the first matching first-hop neighbor's edge type.
             let mut assigned = false;
             for (kind, fh_ids) in &first_hop {
                 for fh_id in fh_ids {
-                    // Quick check: is the target reachable from this first-hop neighbor?
-                    let reachable = index.reachable(fh_id, 10, edge_filter);
-                    if reachable.iter().any(|r| r == id) {
-                        groups.entry(kind.clone()).or_default().push(id.clone());
-                        assigned = true;
-                        break;
+                    if let Some(reachable_set) = reachability_cache.get(fh_id) {
+                        if reachable_set.contains(id) {
+                            groups.entry(kind.clone()).or_default().push(id.clone());
+                            assigned = true;
+                            break;
+                        }
                     }
                 }
                 if assigned { break; }

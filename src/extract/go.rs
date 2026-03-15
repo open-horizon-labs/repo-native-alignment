@@ -62,11 +62,31 @@ impl Extractor for GoExtractor {
 /// `const_declaration`, `type_declaration`, `import_declaration`, and
 /// method receiver metadata enrichment on `method_declaration`.
 fn collect_go_specials(
+    root: tree_sitter::Node,
+    path: &Path,
+    source: &[u8],
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+) {
+    // Build a HashMap for O(1) lookup by (name, line) for method receiver enrichment.
+    let mut node_index: std::collections::HashMap<(String, usize), usize> =
+        std::collections::HashMap::new();
+    for (i, n) in nodes.iter().enumerate() {
+        if n.id.kind == NodeKind::Function {
+            node_index.insert((n.id.name.clone(), n.line_start), i);
+        }
+    }
+
+    collect_go_specials_walk(root, path, source, nodes, edges, &node_index);
+}
+
+fn collect_go_specials_walk(
     node: tree_sitter::Node,
     path: &Path,
     source: &[u8],
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
+    node_index: &std::collections::HashMap<(String, usize), usize>,
 ) {
     let kind_str = node.kind();
 
@@ -166,16 +186,10 @@ fn collect_go_specials(
                 if let Some(receiver) = node.child_by_field_name("receiver") {
                     let recv_text = receiver.utf8_text(source).unwrap_or("").to_string();
                     let line = node.start_position().row + 1;
-                    // Find the matching node emitted by generic extractor
-                    for n in nodes.iter_mut() {
-                        if n.id.name == name_str
-                            && n.id.kind == NodeKind::Function
-                            && n.line_start == line
-                        {
-                            n.metadata.insert("receiver".to_string(), recv_text);
-                            n.metadata.insert("is_static".to_string(), "false".to_string());
-                            break;
-                        }
+                    // Find the matching node via HashMap lookup
+                    if let Some(&idx) = node_index.get(&(name_str.to_string(), line)) {
+                        nodes[idx].metadata.insert("receiver".to_string(), recv_text);
+                        nodes[idx].metadata.insert("is_static".to_string(), "false".to_string());
                     }
                 }
             }
@@ -191,7 +205,7 @@ fn collect_go_specials(
     // Recurse into children
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            collect_go_specials(child, path, source, nodes, edges);
+            collect_go_specials_walk(child, path, source, nodes, edges, node_index);
         }
     }
 }
