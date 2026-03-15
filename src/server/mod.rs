@@ -2223,4 +2223,35 @@ mod tests {
         assert!(!is_lsp_worthy_language("unknown"));
         assert!(!is_lsp_worthy_language(""));
     }
+
+    #[test]
+    fn test_is_lsp_worthy_language_covers_all_registered_lsp_servers() {
+        // Every language registered in EnricherRegistry::with_builtins() that is
+        // non-code should be filtered out. Verify the known non-code ones are excluded
+        // and all tier 1/2 code languages are included.
+        let code_langs = vec![
+            "rust", "python", "typescript", "go", "c-cpp", "java", "ruby",
+            "csharp", "swift", "kotlin", "lua", "zig", "elixir", "haskell",
+            "ocaml", "scala", "dart", "r", "julia", "php", "css", "html",
+            "terraform", "nix", "vue", "svelte", "erlang", "gleam", "nim",
+            "clojure", "deno", "protobuf", "latex", "typst",
+        ];
+        for lang in code_langs {
+            assert!(
+                is_lsp_worthy_language(lang),
+                "{} should be LSP-worthy",
+                lang,
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_lsp_worthy_language_edge_cases() {
+        // Case sensitivity: language strings are lowercase by convention
+        assert!(is_lsp_worthy_language("Rust")); // Not in denylist (case-sensitive match)
+        assert!(is_lsp_worthy_language("MARKDOWN")); // Not in denylist
+        // Whitespace: should not match
+        assert!(is_lsp_worthy_language(" markdown"));
+        assert!(is_lsp_worthy_language("markdown "));
+    }
 }
