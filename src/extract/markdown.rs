@@ -777,4 +777,59 @@ mod tests {
         assert_eq!(normalize_path(Path::new("a/./b")), PathBuf::from("a/b"));
         assert_eq!(normalize_path(Path::new("./a/b")), PathBuf::from("a/b"));
     }
+
+    // --- Adversarial tests ---
+
+    #[test]
+    fn test_empty_markdown_no_edges() {
+        let extractor = MarkdownExtractor::new();
+        let result = extractor.extract(Path::new("empty.md"), "").unwrap();
+        assert!(result.edges.is_empty(), "Empty markdown should produce no edges");
+    }
+
+    #[test]
+    fn test_frontmatter_only_no_hierarchy_edges() {
+        let extractor = MarkdownExtractor::new();
+        let content = "---\nid: test\nstatus: active\n---\n";
+        let result = extractor.extract(Path::new("fm.md"), content).unwrap();
+        let defines: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Defines)
+            .collect();
+        assert_eq!(defines.len(), 0, "Frontmatter-only doc has no heading hierarchy");
+    }
+
+    #[test]
+    fn test_multiple_links_in_one_section() {
+        let extractor = MarkdownExtractor::new();
+        let content = "# Links\n\nSee [a](./a.md), [b](./b.md), and [c](https://ext.com).\n";
+        let result = extractor.extract(Path::new("doc.md"), content).unwrap();
+        let refs: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::References)
+            .collect();
+        // 2 local links, 1 external (skipped)
+        assert_eq!(refs.len(), 2, "Should emit edges for 2 local links, skip 1 external");
+    }
+
+    #[test]
+    fn test_frontmatter_empty_value_no_edge() {
+        let extractor = MarkdownExtractor::new();
+        let content = "---\nid: test\noutcome:\n---\n\n# Test\n\nContent.\n";
+        let result = extractor.extract(Path::new("doc.md"), content).unwrap();
+        let depends: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::DependsOn)
+            .collect();
+        assert_eq!(depends.len(), 0, "Empty frontmatter value should not produce edge");
+    }
+
+    #[test]
+    fn test_sibling_headings_at_same_level() {
+        // Regression: ensure sibling headings don't create parent-child edges between each other
+        let extractor = MarkdownExtractor::new();
+        let content = "## A\n\nContent A.\n\n## B\n\nContent B.\n\n## C\n\nContent C.\n";
+        let result = extractor.extract(Path::new("doc.md"), content).unwrap();
+        let defines: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Defines)
+            .collect();
+        assert_eq!(defines.len(), 0, "Same-level siblings should not have hierarchy edges");
+    }
 }
