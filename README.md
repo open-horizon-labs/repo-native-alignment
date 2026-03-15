@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/open-horizon-labs/repo-native-alignment/actions/workflows/rust-main-merge.yml/badge.svg)](https://github.com/open-horizon-labs/repo-native-alignment/actions) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-An MCP server that gives coding agents what LSP alone can't: a cross-language code graph, semantic search, and business outcome tracking. Single binary — no Docker, no external database, no API key.
+Local context discovery and alignment tool for coding agents. Makes the fractal, local knowledge in your codebase — architecture, topology, business intent, the stuff not in training data — discoverable and queryable. Single binary — no Docker, no external database, no API key.
 
 **[Quick Start](#quick-start)** | **[What Agents Can Do](#what-agents-can-do)** | **[RNA vs LSP](#why-not-just-lsp)** | **[MCP Tools](#mcp-tools)** | **[Compared To](#compared-to)** | **[Docs](#detailed-documentation)**
 
