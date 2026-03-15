@@ -32,6 +32,13 @@ use crate::extract::{ExtractorRegistry, EnricherRegistry};
 use crate::graph::NodeKind;
 use crate::graph::{Edge, Node};
 use crate::graph::index::GraphIndex;
+
+/// Languages that benefit from LSP enrichment (produce meaningful edges).
+/// Non-code languages like markdown, yaml, json, toml produce no LSP edges
+/// and should be skipped to avoid wasting time spawning language servers.
+fn is_lsp_worthy_language(lang: &str) -> bool {
+    !matches!(lang, "markdown" | "yaml" | "json" | "toml" | "text" | "unknown" | "")
+}
 use crate::graph::store::SCHEMA_VERSION;
 use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
 use crate::scanner::{ScanResult, Scanner};
@@ -920,6 +927,7 @@ impl RnaHandler {
             let bg_languages: Vec<String> = all_nodes
                 .iter()
                 .map(|n| n.language.clone())
+                .filter(|lang| is_lsp_worthy_language(lang))
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
                 .collect();
@@ -1465,8 +1473,8 @@ impl RnaHandler {
         }
 
         // Track only the delta (new/changed) for LanceDB upsert — not the full graph.
-        let mut upsert_nodes: Vec<Node> = extraction.nodes.clone();
-        let mut upsert_edges: Vec<Edge> = extraction.edges.clone();
+        let upsert_nodes: Vec<Node> = extraction.nodes.clone();
+        let upsert_edges: Vec<Edge> = extraction.edges.clone();
         graph.nodes.extend(extraction.nodes);
         graph.edges.extend(extraction.edges);
 
@@ -1479,120 +1487,141 @@ impl RnaHandler {
                 .ensure_node(&node.stable_id(), &node.id.kind.to_string());
         }
 
-        // Run LSP enrichers on the updated nodes (same as cold-start, but scoped to changed files)
-        // PageRank is deferred until after enrichment so topology changes are included.
+        // Run LSP enrichers on the updated nodes (same as cold-start, but scoped to changed files).
+        // Only code-language nodes benefit from LSP — markdown, yaml, json, toml produce no edges.
+        // LSP enrichment runs in a background task (matching the full-build pattern) so the
+        // write lock is released quickly and tool calls aren't blocked.
         let changed_files: std::collections::HashSet<_> = scan
             .changed_files
             .iter()
             .chain(scan.new_files.iter())
             .collect();
-        let changed_nodes: Vec<_> = graph
+        let code_changed_nodes: Vec<_> = graph
             .nodes
             .iter()
             .filter(|n| changed_files.iter().any(|f| n.id.file == **f))
+            .filter(|n| is_lsp_worthy_language(&n.language))
             .cloned()
             .collect();
 
-        if !changed_nodes.is_empty() {
-            let languages: Vec<String> = changed_nodes
+        if !code_changed_nodes.is_empty() {
+            let languages: Vec<String> = code_changed_nodes
                 .iter()
                 .map(|n| n.language.clone())
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
                 .collect();
 
+            tracing::info!(
+                "Spawning background incremental LSP enrichment for {} code nodes ({} languages)",
+                code_changed_nodes.len(),
+                languages.len()
+            );
+
+            // Snapshot what we need for the background task, then release the write lock.
+            let bg_graph = self.graph.clone();
+            let bg_repo_root = self.repo_root.clone();
+            let bg_lsp_status = self.lsp_status.clone();
+            let bg_embed_index = self.embed_index.clone();
+            let bg_index = graph.index.clone();
+
             self.lsp_status.set_running();
-            let enricher_registry = EnricherRegistry::with_builtins();
-            let enrichment = enricher_registry
-                .enrich_all(&changed_nodes, &graph.index, &languages, &self.repo_root)
-                .await;
 
-            if !enrichment.any_enricher_ran {
-                self.lsp_status.set_unavailable();
-            }
+            tokio::spawn(async move {
+                let enricher_registry = EnricherRegistry::with_builtins();
+                let enrichment = enricher_registry
+                    .enrich_all(&code_changed_nodes, &bg_index, &languages, &bg_repo_root)
+                    .await;
 
-            let incr_edge_count = enrichment.added_edges.len();
-
-            // Add virtual nodes synthesized for external symbols.
-            // These must NOT be re-embedded (no body).
-            if !enrichment.new_nodes.is_empty() {
-                tracing::info!(
-                    "Incremental LSP enrichment synthesized {} virtual external nodes",
-                    enrichment.new_nodes.len()
-                );
-                for vnode in &enrichment.new_nodes {
-                    graph.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
+                if !enrichment.any_enricher_ran {
+                    bg_lsp_status.set_unavailable();
+                    return;
                 }
-                // Include synthesized virtual nodes in the LanceDB upsert delta.
-                upsert_nodes.extend(enrichment.new_nodes.iter().cloned());
-                graph.nodes.extend(enrichment.new_nodes);
-            }
 
-            if !enrichment.added_edges.is_empty() {
-                tracing::info!(
-                    "Incremental LSP enrichment added {} edges",
-                    enrichment.added_edges.len()
-                );
-                for edge in &enrichment.added_edges {
-                    graph.index.add_edge(
-                        &edge.from.to_stable_id(),
-                        &edge.from.kind.to_string(),
-                        &edge.to.to_stable_id(),
-                        &edge.to.kind.to_string(),
-                        edge.kind.clone(),
-                    );
+                if enrichment.new_nodes.is_empty()
+                    && enrichment.added_edges.is_empty()
+                    && enrichment.updated_nodes.is_empty()
+                {
+                    tracing::info!("[incremental-bg] LSP enrichment: no changes");
+                    bg_lsp_status.set_complete(0);
+                    return;
                 }
-                // Include LSP-synthesized edges in the LanceDB upsert delta.
-                upsert_edges.extend(enrichment.added_edges.iter().cloned());
-                graph.edges.extend(enrichment.added_edges);
-            }
 
-            let enriched_node_ids: std::collections::HashSet<String> =
-                enrichment.updated_nodes.iter().map(|(id, _)| id.clone()).collect();
+                tracing::info!(
+                    "[incremental-bg] LSP enrichment: {} virtual nodes, {} edges, {} patches",
+                    enrichment.new_nodes.len(),
+                    enrichment.added_edges.len(),
+                    enrichment.updated_nodes.len()
+                );
 
-            for (node_id, patches) in &enrichment.updated_nodes {
-                if let Some(node) = graph.nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
-                    for (key, value) in patches {
-                        node.metadata.insert(key.clone(), value.clone());
+                // Acquire write lock briefly for in-memory graph mutation only.
+                let mut guard = bg_graph.write().await;
+                if let Some(ref mut gs) = *guard {
+                    for vnode in &enrichment.new_nodes {
+                        gs.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
                     }
-                }
-            }
+                    gs.nodes.extend(enrichment.new_nodes.clone());
 
-            // Re-embed the enriched nodes specifically, using their post-enrichment metadata.
-            // This is scoped to only changed nodes to avoid re-embedding the entire graph.
-            if !enriched_node_ids.is_empty() {
-                let embed_guard = self.embed_index.load();
-                if let Some(ref embed_idx) = **embed_guard {
-                    let enriched_nodes: Vec<_> = graph
-                        .nodes
-                        .iter()
+                    let persist_edges = enrichment.added_edges.clone();
+                    for edge in &enrichment.added_edges {
+                        gs.index.add_edge(
+                            &edge.from.to_stable_id(),
+                            &edge.from.kind.to_string(),
+                            &edge.to.to_stable_id(),
+                            &edge.to.kind.to_string(),
+                            edge.kind.clone(),
+                        );
+                    }
+                    gs.edges.extend(enrichment.added_edges);
+
+                    let enriched_node_ids: std::collections::HashSet<String> =
+                        enrichment.updated_nodes.iter().map(|(id, _)| id.clone()).collect();
+                    for (node_id, patches) in &enrichment.updated_nodes {
+                        if let Some(node) = gs.nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
+                            for (key, value) in patches {
+                                node.metadata.insert(key.clone(), value.clone());
+                            }
+                        }
+                    }
+
+                    // Collect nodes to persist/re-embed BEFORE releasing the lock.
+                    let upsert_nodes: Vec<Node> = gs.nodes.iter()
                         .filter(|n| enriched_node_ids.contains(&n.stable_id()))
                         .cloned()
                         .collect();
-                    // Also include LSP-enriched nodes in the LanceDB upsert delta so their
-                    // updated metadata (e.g. resolved signatures) is persisted.
-                    // Deduplicate against nodes already queued for upsert (extraction may overlap).
-                    let already_queued: std::collections::HashSet<String> =
-                        upsert_nodes.iter().map(|u| u.stable_id()).collect();
-                    let new_enriched: Vec<Node> = enriched_nodes
-                        .iter()
-                        .filter(|n| !already_queued.contains(&n.stable_id()))
+                    let all_upsert_nodes: Vec<Node> = enrichment.new_nodes.iter()
+                        .chain(upsert_nodes.iter())
                         .cloned()
                         .collect();
-                    upsert_nodes.extend(new_enriched);
-                    match embed_idx.reindex_nodes(&enriched_nodes).await {
-                        Ok(count) => tracing::info!(
-                            "Re-embedded {} enriched nodes with LSP metadata",
-                            count
-                        ),
-                        Err(e) => tracing::warn!("Failed to re-embed enriched nodes: {}", e),
-                    }
-                }
-            }
 
-            if enrichment.any_enricher_ran {
-                self.lsp_status.set_complete(incr_edge_count);
-            }
+                    // Recompute PageRank after topology changes.
+                    let pagerank_scores = gs.index.compute_pagerank(0.85, 20);
+                    for node in &mut gs.nodes {
+                        if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
+                            node.metadata.insert("importance".to_string(), format!("{:.6}", score));
+                        }
+                    }
+
+                    let edge_count = persist_edges.len();
+                    drop(guard); // Release lock before slow I/O.
+
+                    // Re-embed enriched nodes.
+                    let embed_guard = bg_embed_index.load();
+                    if let Some(ref embed_idx) = **embed_guard {
+                        if let Err(e) = embed_idx.reindex_nodes(&all_upsert_nodes).await {
+                            tracing::warn!("[incremental-bg] Failed to re-embed enriched nodes: {}", e);
+                        }
+                    }
+
+                    // Persist to LanceDB (slow — outside the lock).
+                    if let Err(e) = persist_graph_incremental(
+                        &bg_repo_root, &all_upsert_nodes, &persist_edges, &[], &[],
+                    ).await {
+                        tracing::error!("[incremental-bg] LSP enrichment persist failed: {}", e);
+                    }
+                    bg_lsp_status.set_complete(edge_count);
+                }
+            });
         }
 
         // Recompute PageRank importance scores after all graph mutations
@@ -2173,5 +2202,25 @@ mod tests {
                 std::mem::discriminant(&parsed),
             );
         }
+    }
+
+    #[test]
+    fn test_is_lsp_worthy_language() {
+        // Code languages should be LSP-worthy
+        assert!(is_lsp_worthy_language("rust"));
+        assert!(is_lsp_worthy_language("python"));
+        assert!(is_lsp_worthy_language("typescript"));
+        assert!(is_lsp_worthy_language("go"));
+        assert!(is_lsp_worthy_language("java"));
+        assert!(is_lsp_worthy_language("c-cpp"));
+
+        // Non-code languages should NOT be LSP-worthy
+        assert!(!is_lsp_worthy_language("markdown"));
+        assert!(!is_lsp_worthy_language("yaml"));
+        assert!(!is_lsp_worthy_language("json"));
+        assert!(!is_lsp_worthy_language("toml"));
+        assert!(!is_lsp_worthy_language("text"));
+        assert!(!is_lsp_worthy_language("unknown"));
+        assert!(!is_lsp_worthy_language(""));
     }
 }
