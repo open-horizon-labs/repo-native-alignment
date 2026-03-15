@@ -1,8 +1,8 @@
 //! LanceDB table schemas for the graph model.
 //!
 //! Defines Arrow schemas for the `symbols`, `edges`, and `file_index` tables.
-//! These are additive — the existing `EmbeddingIndex` in `embed.rs` continues
-//! to handle `.oh/` artifact embeddings.
+//! The `EmbeddingIndex` in `embed.rs` shares this same LanceDB directory,
+//! storing its `artifacts` table alongside `symbols`, `edges`, etc.
 
 use std::sync::Arc;
 

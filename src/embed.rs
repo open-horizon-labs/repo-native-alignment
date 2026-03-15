@@ -327,7 +327,7 @@ impl SearchResult {
 impl EmbeddingIndex {
     /// Create or open the embedding index. Stores data in memory.
     pub async fn new(repo_root: &Path) -> Result<Self> {
-        let db_path = repo_root.join(".oh").join(".cache").join("embeddings");
+        let db_path = repo_root.join(".oh").join(".cache").join("lance");
         std::fs::create_dir_all(&db_path)?;
         tracing::debug!("EmbeddingIndex: opening LanceDB at {}", db_path.display());
         let open_start = std::time::Instant::now();
