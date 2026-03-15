@@ -30,7 +30,9 @@ RNA uses LSP internally as one enrichment source (call hierarchy, type hierarchy
 | **Embeddings** | None | MiniLM-L6-v2 on Metal GPU (local) | UniXcoder (local) | None | None |
 | **LSP integration** | Is LSP | 37 servers, batch enrichment | None | None | None |
 | **Query model** | Single-symbol, single-hop | Multi-hop, cross-language | Multi-hop | Multi-hop | Multi-hop |
-| **MCP tools** | N/A (protocol, not MCP) | 5 | 10 | 17 | 23 |
+| **MCP tools** | N/A (protocol, not MCP) | 4 (+2 deprecated aliases) | 10 | 17 | 23 |
+| **CLI parity** | N/A | Full (shared service layer) | N/A | N/A | N/A |
+| **Cross-encoder reranking** | None | Jina Reranker v1 Turbo (opt-in) | None | None | None |
 | **Business context** | None | Outcomes, signals, guardrails, metis | None | None | None |
 
 ## Architecture Trade-offs
@@ -64,7 +66,7 @@ LSP provides the raw semantic data — call hierarchy, type hierarchy, reference
 
 | | LSP | RNA | CGR | CGC | CT |
 |---|---|---|---|---|---|
-| **Model** | N/A | MiniLM-L6-v2 (384-dim) | UniXcoder (768-dim, code-specific) | None | None |
+| **Model** | N/A | MiniLM-L6-v2 (384-dim) + Jina Reranker v1 Turbo | UniXcoder (768-dim, code-specific) | None | None |
 | **Hardware** | N/A | Metal GPU on Apple Silicon, CPU fallback | CPU | N/A | N/A |
 | **What's embedded** | N/A | Function bodies, all markdown, commits | Function bodies | Nothing | Nothing |
 | **Indexed together** | N/A | Code + markdown + git history | Code only | N/A | N/A |
@@ -75,7 +77,7 @@ RNA's unique advantage: semantic search spans code AND business artifacts in the
 
 ## MCP Tool Philosophy
 
-**RNA: 5 focused tools** — do one thing per tool, document edge semantics, let the agent compose.
+**RNA: 4 tools** (+2 deprecated aliases) — one `search` tool handles code symbols, artifacts, markdown, commits, and graph traversal. `outcome_progress` for business alignment. `repo_map` for orientation. `list_roots` for workspace management. CLI and MCP share a service layer — every capability available in both interfaces.
 
 **CGR: 10 tools** — mix of read + write + admin (file editing, database wipes, project deletion).
 
@@ -90,7 +92,8 @@ RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents
 1. **More accurate graph** — 22-language tree-sitter extraction + 37 LSP servers for compiler-grade call/type hierarchy and `Implements` edges. Neither CGR nor CGC has LSP enrichment. RNA's edges come from the same language servers your editor uses.
 2. **Faster queries** — In-process petgraph + LanceDB. No network hop, no Docker, no external DB. Microsecond graph traversal, millisecond semantic search.
 3. **Deeper semantic search** — Function bodies (not just names), all markdown (chunked by heading with hierarchy), and commits in one vector space. Results ranked 0-1 with test file demotion. CGR embeds function bodies but with raw scores. CGC doesn't embed at all.
-4. **Semantic graph entry points** — `graph_query(query="database pool", mode="impact")` works directly. No need to look up a `node_id` first. CGR and CGC require exact node identifiers.
+4. **Semantic graph entry points** — `search(query="database pool", mode="impact")` works directly. No need to look up a `node_id` first. CGR and CGC require exact node identifiers.
+5. **Cross-encoder reranking** — `search(rerank: true)` re-scores top candidates with a Jina cross-encoder for precise NL query results. None of the others have reranking.
 
 ## What RNA Does That Others Don't
 
@@ -105,11 +108,11 @@ RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents
 RNA is read-only infrastructure — it serves agents, it doesn't act as one. Things RNA deliberately doesn't do:
 
 - **File editing / code generation** — CGR has tools for writing files and wiping databases. RNA doesn't touch your code; agents have their own editors.
-- **Dead code detection, visualization** — CGC and codeTree both have dedicated tools for these. RNA exposes the graph and lets agents reason about it themselves. (RNA does compute cyclomatic complexity per function, surfaced via `search_symbols` with `min_complexity` / `sort="complexity"`.)
+- **Dead code detection, visualization** — CGC and codeTree both have dedicated tools for these. RNA exposes the graph and lets agents reason about it themselves. (RNA does compute cyclomatic complexity per function, surfaced via `search` with `min_complexity` / `sort_by="complexity"`.)
 - **Clone detection** — codeTree uses AST normalization to find structural duplicates. RNA doesn't do clone detection; code quality metrics are outside its alignment focus.
 - **Taint / dataflow analysis** — codeTree traces source-to-sink data flows with sanitizer detection. RNA is alignment infrastructure, not a security scanner.
 - **Doc suggestions** — codeTree identifies undocumented functions. RNA treats this as the agent's job, not the context server's.
-- **Repository map** — codeTree generates a compact codebase overview with entry points, hotspot files, and a suggested exploration path. RNA's tools assume you already know what to look for (though RNA's `list_roots` partially overlaps).
+- **Repository map** — codeTree generates a compact codebase overview with entry points, hotspot files, and a suggested exploration path. RNA now has `repo_map` which provides top symbols by PageRank importance, hotspot files, active outcomes, and entry points.
 - **Code-specific embedding model** — CGR uses UniXcoder (768-dim, trained on code). RNA uses MiniLM-L6-v2 (384-dim, general-purpose) because it needs to embed code, markdown, and business artifacts in the same space. Trade-off: slightly less code-specific precision, much broader coverage.
 - **SCIP indexing** — CGC supports Pyright, tsc, scip-go, scip-rust for compiler-grade precision in 4 languages. RNA spiked SCIP (#114) and concluded LSP provides the same semantic edges without requiring separate build-time indexers.
 

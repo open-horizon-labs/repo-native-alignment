@@ -11,7 +11,8 @@ mechanism: |-
 
   Remaining work is bug fixes, tool cleanup, and adoption improvements.
 files:
-- src/server.rs
+- src/server/*
+- src/service.rs
 - src/query.rs
 - .oh/outcomes/*
 - .oh/signals/*
