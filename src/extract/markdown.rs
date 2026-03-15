@@ -292,7 +292,7 @@ fn emit_link_edges(
 
             // Strip anchor fragment from path
             let dest_path_str = link_dest.split('#').next().unwrap_or(link_dest);
-            if dest_path_str.is_empty() {
+            if dest_path_str.is_empty() || dest_path_str.starts_with('/') {
                 continue;
             }
 
