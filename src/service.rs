@@ -430,7 +430,8 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         }).count()
     }).sum();
 
-    let entry_label = if valid_entry_ids.len() == 1 { format!("`{}`", valid_entry_ids[0]) } else { format!("{} entry nodes", valid_entry_ids.len()) };
+    let strip = ctx.root_filter.as_deref();
+    let entry_label = if valid_entry_ids.len() == 1 { format!("`{}`", strip_root_prefix(valid_entry_ids[0], strip)) } else { format!("{} entry nodes", valid_entry_ids.len()) };
     let direction = params.direction.as_deref().unwrap_or("outgoing");
     let freshness = format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
 
@@ -444,7 +445,6 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         };
         format!("{}{}{}", entry_header, mode_desc, freshness)
     } else {
-        let strip = ctx.root_filter.as_deref();
         let md = format_neighbors_grouped_with_root(&gs.nodes, &merged_groups, &gs.index, params.compact, strip);
         let heading = match mode {
             "neighbors" => format!("## Graph neighbors ({}) of {}\n\n{} result(s)\n\n", direction, entry_label, total_count),
@@ -466,8 +466,10 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
         let edge_filter = params.edge_types.as_ref().map(|types| types.iter().filter_map(|t| parse_edge_kind(t)).collect::<Vec<_>>());
         let edge_filter_slice = edge_filter.as_deref();
         let mut sections: Vec<String> = Vec::new();
+        let strip = ctx.root_filter.as_deref();
         for &nid in node_ids {
-            if gs.index.get_node(nid).is_none() { sections.push(format!("### `{}`\n\nNode not found in graph.", nid)); continue; }
+            let display_nid = strip_root_prefix(nid, strip);
+            if gs.index.get_node(nid).is_none() { sections.push(format!("### `{}`\n\nNode not found in graph.", display_nid)); continue; }
             match run_traversal_grouped(&gs.index, nid, mode, params.hops, params.direction.as_deref(), edge_filter_slice) {
                 Ok(mut groups) => {
                     // Remove self-references
@@ -487,10 +489,10 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
                                 .unwrap_or(true)
                         }).count()
                     }).sum();
-                    if total == 0 { sections.push(format!("### `{}`\n\nNo {} results.", nid, mode)); }
-                    else { let strip = ctx.root_filter.as_deref(); let md = format_neighbors_grouped_with_root(&gs.nodes, &groups, &gs.index, params.compact, strip); sections.push(format!("### `{}`\n\n{} result(s)\n\n{}", nid, total, md)); }
+                    if total == 0 { sections.push(format!("### `{}`\n\nNo {} results.", display_nid, mode)); }
+                    else { let md = format_neighbors_grouped_with_root(&gs.nodes, &groups, &gs.index, params.compact, strip); sections.push(format!("### `{}`\n\n{} result(s)\n\n{}", display_nid, total, md)); }
                 }
-                Err(msg) => sections.push(format!("### `{}`\n\n{}", nid, msg)),
+                Err(msg) => sections.push(format!("### `{}`\n\n{}", display_nid, msg)),
             }
         }
         format!("## Batch {} for {} node(s)\n\n{}{}", mode, node_ids.len(), sections.join("\n\n"), freshness)
@@ -498,11 +500,11 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
         let mut found = Vec::new();
         let mut missing = Vec::new();
         for &nid in node_ids { if let Some(node) = gs.nodes.iter().find(|n| n.stable_id() == nid) { found.push(node); } else { missing.push(nid); } }
-        if found.is_empty() { return format!("No nodes found for {}. Try search to find valid node IDs.{}", node_ids.iter().map(|id| format!("`{}`", id)).collect::<Vec<_>>().join(", "), freshness); }
         let strip = ctx.root_filter.as_deref();
+        if found.is_empty() { return format!("No nodes found for {}. Try search to find valid node IDs.{}", node_ids.iter().map(|id| format!("`{}`", strip_root_prefix(id, strip))).collect::<Vec<_>>().join(", "), freshness); }
         let md: String = found.iter().map(|n| format_node_entry_with_root(n, &gs.index, params.compact, strip)).collect::<Vec<_>>().join("\n\n");
         let mut result = format!("## Batch retrieve: {} found\n\n{}", found.len(), md);
-        if !missing.is_empty() { result.push_str(&format!("\n\n**Missing:** {}", missing.iter().map(|id| format!("`{}`", id)).collect::<Vec<_>>().join(", "))); }
+        if !missing.is_empty() { result.push_str(&format!("\n\n**Missing:** {}", missing.iter().map(|id| format!("`{}`", strip_root_prefix(id, strip))).collect::<Vec<_>>().join(", "))); }
         result.push_str(&freshness);
         result
     }

@@ -59,8 +59,12 @@ pub fn is_test_function(n: &Node) -> bool {
     if n.id.kind != NodeKind::Function {
         return false;
     }
-    // Check for #[test] decorator
-    if n.metadata.get("decorators").is_some_and(|d| d.contains("test")) {
+    // Check for #[test] decorator -- use word boundary matching to avoid
+    // false positives on decorators like "attestation"
+    if n.metadata.get("decorators").is_some_and(|d| {
+        d.split(|c: char| c == ',' || c.is_whitespace())
+            .any(|token| token.trim() == "test" || token.trim() == "tokio::test")
+    }) {
         return true;
     }
     // Fall back to path-based detection

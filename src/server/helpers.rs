@@ -130,16 +130,25 @@ pub(crate) fn strip_root_prefix(stable_id: &str, strip_root: Option<&str>) -> St
 /// Format an unresolved stable ID (no matching graph node) in a human-readable way.
 ///
 /// Parses `root:file:name:kind` and renders as `**name** (file)` instead of
-/// dumping the raw stable ID. Falls back to the (possibly stripped) raw ID if
-/// parsing fails.
+/// dumping the raw stable ID. Uses right-side splitting so it works correctly
+/// both with and without root prefix stripping. Falls back to the (possibly
+/// stripped) raw ID if parsing fails.
 pub(crate) fn format_unresolved_id(id: &str, strip_root: Option<&str>) -> String {
     let display_id = strip_root_prefix(id, strip_root);
-    // Try to parse as file:name:kind (after stripping root)
-    let parts: Vec<&str> = display_id.splitn(3, ':').collect();
-    if parts.len() >= 2 {
-        let file = parts[0];
-        let name = parts[1];
+    // Stable ID format: root:file:name:kind (4 parts) or file:name:kind (3 parts after strip)
+    // Split from the right to reliably get kind and name, since file paths may contain colons
+    let rparts: Vec<&str> = display_id.rsplitn(3, ':').collect();
+    if rparts.len() >= 3 {
+        // rparts[0] = kind, rparts[1] = name, rparts[2] = everything before (root:file or file)
+        let name = rparts[1];
+        let prefix = rparts[2];
+        // The prefix might be "root:file" or just "file" -- extract the file part
+        let file = if let Some((_root, f)) = prefix.split_once(':') { f } else { prefix };
         format!("- **{}** ({})", name, file)
+    } else if rparts.len() == 2 {
+        // Only two parts: treat as name:kind
+        let name = rparts[1];
+        format!("- **{}**", name)
     } else {
         format!("- `{}`", display_id)
     }
@@ -691,11 +700,13 @@ mod tests {
 
     #[test]
     fn test_format_unresolved_id_without_strip() {
+        // Without stripping, rsplitn parses from right: kind=markdown_section,
+        // name=dogfood-rna-tools, prefix=my-root:.oh/guardrails/dogfood.md
+        // The prefix is split on first ':' to extract file part
         let id = "my-root:.oh/guardrails/dogfood.md:dogfood-rna-tools:markdown_section";
         let result = format_unresolved_id(id, None);
-        // Without stripping, the "root" becomes the first part before ':'
-        // which is "my-root", file becomes ".oh/guardrails/dogfood.md", name becomes "dogfood-rna-tools:markdown_section"
-        assert!(result.contains(".oh/guardrails/dogfood.md"));
+        assert!(result.contains("dogfood-rna-tools"), "should contain name, got: {}", result);
+        assert!(result.contains(".oh/guardrails/dogfood.md"), "should contain file, got: {}", result);
     }
 
     #[test]
@@ -703,6 +714,14 @@ mod tests {
         let id = "some-id-without-colons";
         let result = format_unresolved_id(id, None);
         assert_eq!(result, "- `some-id-without-colons`");
+    }
+
+    #[test]
+    fn test_format_unresolved_id_cross_root_correct_parse() {
+        // Verify that root: "all" mode still renders correctly (no strip)
+        let id = "other-root:src/lib.rs:main:function";
+        let result = format_unresolved_id(id, None);
+        assert_eq!(result, "- **main** (src/lib.rs)");
     }
 
     // ── format_node_entry_with_root tests ───────────────────────────
