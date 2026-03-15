@@ -273,7 +273,11 @@ fn emit_link_edges(
     path: &Path,
     edges: &mut Vec<Edge>,
 ) {
+    use std::collections::HashSet;
+
     for (node, chunk) in nodes.iter().zip(chunks.iter()) {
+        let mut seen_targets: HashSet<PathBuf> = HashSet::new();
+
         for (_link_text, link_dest) in &chunk.links {
             // Skip external URLs and anchor-only links
             if link_dest.starts_with("http://")
@@ -297,6 +301,20 @@ fn emit_link_edges(
             } else {
                 PathBuf::from(dest_path_str)
             };
+
+            // Only emit edges to markdown files (md/mdx)
+            let is_markdown_target = matches!(
+                target_path.extension().and_then(|ext| ext.to_str()),
+                Some("md") | Some("mdx")
+            );
+            if !is_markdown_target {
+                continue;
+            }
+
+            // Deduplicate: skip if we already emitted an edge to this target from this node
+            if !seen_targets.insert(target_path.clone()) {
+                continue;
+            }
 
             let target_name = target_path
                 .file_stem()
@@ -322,12 +340,18 @@ fn emit_link_edges(
 }
 
 /// Normalize a path by resolving `.` and `..` components without filesystem access.
+/// Preserves leading `..` segments when there is nothing left to pop (out-of-repo links).
 fn normalize_path(path: &Path) -> PathBuf {
-    let mut components = Vec::new();
+    let mut components: Vec<std::path::Component> = Vec::new();
     for component in path.components() {
         match component {
             std::path::Component::ParentDir => {
-                components.pop();
+                // Only pop if there's a real directory component to remove
+                if matches!(components.last(), Some(c) if !matches!(c, std::path::Component::ParentDir)) {
+                    components.pop();
+                } else {
+                    components.push(component);
+                }
             }
             std::path::Component::CurDir => {}
             c => components.push(c),
@@ -776,6 +800,35 @@ mod tests {
         assert_eq!(normalize_path(Path::new("a/b/../c")), PathBuf::from("a/c"));
         assert_eq!(normalize_path(Path::new("a/./b")), PathBuf::from("a/b"));
         assert_eq!(normalize_path(Path::new("./a/b")), PathBuf::from("a/b"));
+    }
+
+    #[test]
+    fn test_normalize_path_preserves_leading_parent() {
+        // Leading .. should be preserved when there's nothing to pop
+        assert_eq!(normalize_path(Path::new("../outside.md")), PathBuf::from("../outside.md"));
+        assert_eq!(normalize_path(Path::new("../../up.md")), PathBuf::from("../../up.md"));
+    }
+
+    #[test]
+    fn test_link_edges_skip_non_markdown_targets() {
+        let extractor = MarkdownExtractor::new();
+        let content = "# Doc\n\nSee [code](../src/lib.rs) and [license](../LICENSE).\n";
+        let result = extractor.extract(Path::new("docs/readme.md"), content).unwrap();
+        let refs: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::References)
+            .collect();
+        assert_eq!(refs.len(), 0, "Non-markdown targets should not produce edges");
+    }
+
+    #[test]
+    fn test_link_edges_dedup_same_target_different_anchors() {
+        let extractor = MarkdownExtractor::new();
+        let content = "# Doc\n\nSee [sec1](./other.md#one) and [sec2](./other.md#two).\n";
+        let result = extractor.extract(Path::new("docs/readme.md"), content).unwrap();
+        let refs: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::References)
+            .collect();
+        assert_eq!(refs.len(), 1, "Same target with different anchors should produce one edge");
     }
 
     // --- Adversarial tests ---
