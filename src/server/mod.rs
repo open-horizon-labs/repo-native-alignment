@@ -1526,12 +1526,26 @@ impl RnaHandler {
 
             tokio::spawn(async move {
                 let enricher_registry = EnricherRegistry::with_builtins();
+
+                // Check if any registered enricher supports the delta's languages.
+                // If not, this is expected (e.g. yaml-only change with no yaml LSP) --
+                // don't mark global LSP status as unavailable since other enrichers
+                // (rust-analyzer, marksman) may still be healthy.
+                let supported = enricher_registry.supported_languages();
+                let has_supported_language = languages.iter().any(|l| supported.contains(l));
+
                 let enrichment = enricher_registry
                     .enrich_all(&changed_nodes, &bg_index, &languages, &bg_repo_root)
                     .await;
 
                 if !enrichment.any_enricher_ran {
-                    bg_lsp_status.set_unavailable();
+                    if has_supported_language {
+                        // Enricher was expected to run but didn't -- server likely missing.
+                        bg_lsp_status.set_unavailable();
+                    } else {
+                        // No enricher supports these languages -- not an error.
+                        bg_lsp_status.set_complete(0);
+                    }
                     return;
                 }
 
