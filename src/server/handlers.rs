@@ -348,4 +348,93 @@ mod tests {
             && !has_kind_filter;
         assert!(!rejected, "Empty query with kind filter should be allowed");
     }
+
+    // ==================== Adversarial tests for edge-type grouping ====================
+
+    #[test]
+    fn test_run_traversal_grouped_neighbors_1hop() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("a", "fn", "c", "struct", EdgeKind::DependsOn);
+        index.add_edge("a", "fn", "d", "fn", EdgeKind::Calls);
+
+        let groups = run_traversal_grouped(&index, "a", "neighbors", None, None, None).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[&EdgeKind::Calls].len(), 2);
+        assert_eq!(groups[&EdgeKind::DependsOn].len(), 1);
+    }
+
+    #[test]
+    fn test_run_traversal_grouped_neighbors_both_directions() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "a", "fn", EdgeKind::DependsOn);
+
+        let groups = run_traversal_grouped(&index, "a", "neighbors", None, Some("both"), None).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(groups[&EdgeKind::Calls].contains(&"b".to_string()));
+        assert!(groups[&EdgeKind::DependsOn].contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn test_run_traversal_grouped_tests_for_returns_calls() {
+        let mut index = GraphIndex::new();
+        index.add_edge("test_fn", "fn", "target", "fn", EdgeKind::Calls);
+        index.add_edge("prod_fn", "fn", "target", "fn", EdgeKind::Calls);
+
+        let groups = run_traversal_grouped(&index, "target", "tests_for", None, None, None).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(groups.contains_key(&EdgeKind::Calls));
+        assert_eq!(groups[&EdgeKind::Calls].len(), 2);
+    }
+
+    #[test]
+    fn test_run_traversal_grouped_empty_for_isolated_node() {
+        let mut index = GraphIndex::new();
+        index.ensure_node("lonely", "fn");
+
+        let groups = run_traversal_grouped(&index, "lonely", "neighbors", None, None, None).unwrap();
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_run_traversal_grouped_multi_hop_groups_by_first_hop() {
+        // a -calls-> b -depends_on-> c
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::DependsOn);
+
+        let groups = run_traversal_grouped(&index, "a", "neighbors", Some(2), None, None).unwrap();
+        // Both b and c should be grouped under Calls (first-hop edge type from a)
+        assert!(groups.contains_key(&EdgeKind::Calls), "should group under first-hop edge type");
+        let calls = &groups[&EdgeKind::Calls];
+        assert!(calls.contains(&"b".to_string()));
+        assert!(calls.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn test_run_traversal_grouped_impact_mode() {
+        // a -> b -> c (impact of c: b and a, reversed)
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::DependsOn);
+
+        let groups = run_traversal_grouped(&index, "c", "impact", None, None, None).unwrap();
+        assert!(!groups.is_empty(), "should find dependents");
+        // b is a direct incoming neighbor via DependsOn
+        assert!(groups.contains_key(&EdgeKind::DependsOn), "should have DependsOn group");
+    }
+
+    #[test]
+    fn test_run_traversal_grouped_with_edge_filter() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("a", "fn", "c", "struct", EdgeKind::DependsOn);
+        index.add_edge("a", "fn", "d", "trait", EdgeKind::Implements);
+
+        let filter = vec![EdgeKind::Calls, EdgeKind::Implements];
+        let groups = run_traversal_grouped(&index, "a", "neighbors", None, None, Some(&filter)).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(!groups.contains_key(&EdgeKind::DependsOn));
+    }
 }
