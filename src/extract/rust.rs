@@ -996,6 +996,32 @@ pub fn handle_request() {}
         assert!(decorators.contains("#[instrument(skip(self))]"), "got: {}", decorators);
     }
 
+    #[test]
+    fn test_private_functions_extracted() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+fn private_helper(x: i32) -> i32 {
+    x + 1
+}
+
+pub fn public_api(x: i32) -> i32 {
+    private_helper(x)
+}
+
+async fn embed_texts(texts: Vec<String>) -> Vec<Vec<f32>> {
+    vec![]
+}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+        let fns: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::Function)
+            .map(|n| n.id.name.as_str())
+            .collect();
+        assert!(fns.contains(&"private_helper"), "Should find private fn, got: {:?}", fns);
+        assert!(fns.contains(&"public_api"), "Should find public fn, got: {:?}", fns);
+        assert!(fns.contains(&"embed_texts"), "Should find async private fn, got: {:?}", fns);
+    }
+
     /// Adversarial: impl with `self` value parameter (move semantics)
     #[test]
     fn test_rust_is_static_self_by_value() {
