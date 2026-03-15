@@ -346,16 +346,28 @@ fn emit_link_edges(
 
 /// Normalize a path by resolving `.` and `..` components without filesystem access.
 /// Preserves leading `..` segments when there is nothing left to pop (out-of-repo links).
+/// Never pops past a root directory or prefix component.
 fn normalize_path(path: &Path) -> PathBuf {
     let mut components: Vec<std::path::Component> = Vec::new();
     for component in path.components() {
         match component {
             std::path::Component::ParentDir => {
-                // Only pop if there's a real directory component to remove
-                if matches!(components.last(), Some(c) if !matches!(c, std::path::Component::ParentDir)) {
-                    components.pop();
-                } else {
-                    components.push(component);
+                // Only pop if the last component is a normal directory (not root, prefix, or ..)
+                match components.last() {
+                    Some(std::path::Component::Normal(_)) => {
+                        components.pop();
+                    }
+                    _ => {
+                        // Preserve leading .. or don't pop past root
+                        if !matches!(
+                            components.last(),
+                            Some(std::path::Component::RootDir)
+                                | Some(std::path::Component::Prefix(_))
+                        ) {
+                            components.push(component);
+                        }
+                        // If last is RootDir/Prefix, silently ignore (can't go above root)
+                    }
                 }
             }
             std::path::Component::CurDir => {}
@@ -812,6 +824,13 @@ mod tests {
         // Leading .. should be preserved when there's nothing to pop
         assert_eq!(normalize_path(Path::new("../outside.md")), PathBuf::from("../outside.md"));
         assert_eq!(normalize_path(Path::new("../../up.md")), PathBuf::from("../../up.md"));
+    }
+
+    #[test]
+    fn test_normalize_path_absolute_stays_absolute() {
+        // .. should not pop past root directory
+        assert_eq!(normalize_path(Path::new("/foo/../../..")), PathBuf::from("/"));
+        assert_eq!(normalize_path(Path::new("/a/b/../c")), PathBuf::from("/a/c"));
     }
 
     #[test]
