@@ -128,11 +128,33 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Commands::Search(args)) => {
             init_tracing("warn", log_path.as_deref());
-            let repo_root = args.repo.canonicalize()?; eprintln!("Scanning {}...", repo_root.display());
-            let handler = RnaHandler { repo_root: repo_root.clone(), ..Default::default() }; let gs = handler.build_full_graph().await?;
-            // Initialize embedding index for semantic search + reranking.
+            let repo_root = args.repo.canonicalize()?;
+            // Load graph from LanceDB cache -- do NOT rebuild.
+            // If cache doesn't exist, tell the user to run `rna scan`.
+            let lance_path = repo_root.join(".oh").join(".cache").join("lance");
+            let gs = if lance_path.exists() {
+                match server::load_graph_from_lance(&repo_root).await {
+                    Ok(state) => {
+                        eprintln!("Loaded {} symbols from cache.", state.nodes.len());
+                        state
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to load cached index: {}. Run `repo-native-alignment scan --path .` first.", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                eprintln!("No index found. Run `repo-native-alignment scan --path .` first.");
+                std::process::exit(1);
+            };
+            // Load existing embedding index -- do NOT rebuild.
             let embed_idx = match repo_native_alignment::embed::EmbeddingIndex::new(&repo_root).await {
-                Ok(idx) => Some(idx),
+                Ok(idx) => {
+                    match idx.has_table().await {
+                        Ok(true) => Some(idx),
+                        _ => { eprintln!("No embedding index found. Run `repo-native-alignment scan --path .` first."); None }
+                    }
+                }
                 Err(e) => { tracing::warn!("EmbeddingIndex init failed; semantic search may degrade: {}", e); None }
             };
             let embed_ref = embed_idx.as_ref();

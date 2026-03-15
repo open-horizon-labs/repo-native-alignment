@@ -18,6 +18,27 @@ pub struct GraphState {
     pub last_scan_completed_at: Option<std::time::Instant>,
 }
 
+impl GraphState {
+    /// Build a HashMap from stable_id -> index for O(1) node lookups.
+    /// Call once per search context instead of O(N) linear scans per result.
+    pub fn node_index_map(&self) -> std::collections::HashMap<String, usize> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.stable_id(), i))
+            .collect()
+    }
+
+    /// Look up a node by stable_id using a pre-built index map. O(1).
+    pub fn node_by_stable_id<'a>(
+        &'a self,
+        id: &str,
+        index_map: &std::collections::HashMap<String, usize>,
+    ) -> Option<&'a Node> {
+        index_map.get(id).map(|&i| &self.nodes[i])
+    }
+}
+
 // ── Embedding build status ───────────────────────────────────────────
 
 /// Tracks embedding build progress so the search footer can show
