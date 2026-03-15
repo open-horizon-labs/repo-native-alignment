@@ -279,7 +279,10 @@ async fn flat_code_symbol_search<'a>(
     // Cross-encoder reranking: re-score the top candidates using a cross-encoder
     // model that attends to (query, document) pairs jointly. This produces more
     // precise relevance scores than bi-encoder similarity alone.
-    if params.rerank && !query_str.is_empty() && matches.len() > 1 {
+    // Skip reranking when an explicit sort_by mode is active (complexity,
+    // importance) -- the caller's sort request takes precedence.
+    let use_relevance_sort = !sort_by_complexity && !sort_by_importance;
+    if params.rerank && use_relevance_sort && !query_str.is_empty() && matches.len() > 1 {
         use crate::rerank::{RerankCandidate, rerank_results};
 
         let candidates: Vec<RerankCandidate> = matches
@@ -300,8 +303,16 @@ async fn flat_code_symbol_search<'a>(
             })
             .collect();
 
-        match rerank_results(query_str, &candidates) {
-            Ok(reranked) => {
+        // Run reranking on a blocking thread to avoid blocking the Tokio
+        // executor during ONNX model inference (and possible first-time
+        // model download/initialization).
+        let query_owned = query_str.to_string();
+        let rerank_result = tokio::task::spawn_blocking(move || {
+            rerank_results(&query_owned, &candidates)
+        }).await;
+
+        match rerank_result {
+            Ok(Ok(reranked)) => {
                 let original_matches = matches.clone();
                 matches = reranked
                     .iter()
@@ -309,16 +320,22 @@ async fn flat_code_symbol_search<'a>(
                     .collect();
                 tracing::debug!(
                     "Reranked {} candidates for query \"{}\"",
-                    candidates.len(),
+                    reranked.len(),
                     query_str
                 );
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(
                     "Cross-encoder reranking failed, using original order: {}",
                     e
                 );
                 // Fall through with original ordering -- reranking is best-effort.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Reranking task panicked, using original order: {}",
+                    e
+                );
             }
         }
     }

@@ -8,38 +8,20 @@
 //! The reranker is opt-in (`rerank: true` on the search tool) to avoid latency
 //! regression for simple lookups. It is lazy-loaded on first use.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use fastembed::{RerankerModel, RerankResult, TextRerank};
 
-/// Global lazy-loaded reranker instance behind a Mutex.
+/// Global reranker instance behind a Mutex. Only caches successful
+/// initialization; if model loading fails, subsequent calls will retry.
 /// The `TextRerank::rerank()` method requires `&mut self` (ONNX session state),
-/// so we wrap in `Mutex` for safe concurrent access. `OnceLock` ensures the
-/// model is loaded exactly once.
-static RERANKER: OnceLock<Mutex<Result<TextRerank, String>>> = OnceLock::new();
+/// so we use `Mutex` for safe concurrent access.
+static RERANKER: Mutex<Option<TextRerank>> = Mutex::new(None);
 
 /// Default model: Jina Reranker V1 Turbo (English).
 /// Smaller and faster than BGE-Reranker-Base while maintaining good quality.
 const DEFAULT_MODEL: RerankerModel = RerankerModel::JINARerankerV1TurboEn;
-
-/// Initialize the reranker on first call, then return a locked reference.
-fn init_reranker() -> &'static Mutex<Result<TextRerank, String>> {
-    RERANKER.get_or_init(|| {
-        let start = std::time::Instant::now();
-        tracing::info!("Reranker: loading {:?} (first use, one-time cost)", DEFAULT_MODEL);
-
-        let reranker = TextRerank::try_new(fastembed::RerankInitOptions::new(DEFAULT_MODEL))
-            .map_err(|e| format!("Failed to load reranker model: {}", e));
-
-        match &reranker {
-            Ok(_) => tracing::info!("Reranker: ready in {:?}", start.elapsed()),
-            Err(e) => tracing::warn!("Reranker: load failed in {:?}: {}", start.elapsed(), e),
-        }
-
-        Mutex::new(reranker)
-    })
-}
 
 /// A document to be reranked, carrying its original index so we can map
 /// reranked scores back to the original result set.
@@ -79,10 +61,26 @@ pub fn rerank_results(
         return Ok(Vec::new());
     }
 
-    let mutex = init_reranker();
-    let mut guard = mutex.lock().map_err(|e| anyhow::anyhow!("Reranker lock poisoned: {}", e))?;
-    let reranker = guard.as_mut().map_err(|e| anyhow::anyhow!("{}", e))?;
+    let mut guard = RERANKER.lock().map_err(|e| anyhow::anyhow!("Reranker lock poisoned: {}", e))?;
 
+    // Lazy-initialize on first use; retry on failure (don't cache errors).
+    if guard.is_none() {
+        let start = std::time::Instant::now();
+        tracing::info!("Reranker: loading {:?} (first use, one-time cost)", DEFAULT_MODEL);
+
+        match TextRerank::try_new(fastembed::RerankInitOptions::new(DEFAULT_MODEL)) {
+            Ok(reranker) => {
+                tracing::info!("Reranker: ready in {:?}", start.elapsed());
+                *guard = Some(reranker);
+            }
+            Err(e) => {
+                tracing::warn!("Reranker: load failed in {:?}: {}", start.elapsed(), e);
+                return Err(anyhow::anyhow!("Failed to load reranker model: {}", e));
+            }
+        }
+    }
+
+    let reranker = guard.as_mut().expect("reranker guaranteed Some after init");
     let start = std::time::Instant::now();
 
     // Collect document texts for the reranker.
