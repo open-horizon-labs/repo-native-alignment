@@ -28,7 +28,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search",
-    description = "All-in-one search: code symbols, business artifacts (.oh/), commits, and markdown. Without `mode`, performs flat ranked search using embedding index (hybrid BM25+vector by default) plus optional artifact/markdown results (enabled by default via `include_artifacts` and `include_markdown`). Falls back to name/signature matching when the embedding index is still building. With `mode` (neighbors/impact/reachable/tests_for), performs graph traversal from matched symbols. `tests_for` finds which test functions call a symbol. Entry point: `query` (name or semantic search) or `node` (stable ID from previous results). Batch: `nodes` retrieves multiple IDs in one call. `compact: true` returns signature + location only (~25x fewer tokens). Filter by kind, language, file. Sort by relevance, complexity, or importance (PageRank). search_mode: hybrid (default, keyword+vector RRF), keyword (BM25 only), semantic (vector only) — applies to code symbol search, artifact search, and graph entry-point resolution. Results default to the primary workspace root; pass root: \"all\" for cross-root search."
+    description = "All-in-one search: code symbols, business artifacts (.oh/), commits, and markdown. Without `mode`, performs flat ranked search using embedding index (hybrid BM25+vector by default) plus optional artifact/markdown results (enabled by default via `include_artifacts` and `include_markdown`). Falls back to name/signature matching when the embedding index is still building. With `mode` (neighbors/impact/reachable/tests_for), performs graph traversal from matched symbols. `tests_for` finds which test functions call a symbol. Entry point: `query` (name or semantic search) or `node` (stable ID from previous results). Batch: `nodes` retrieves multiple IDs in one call. `compact: true` returns signature + location only (~25x fewer tokens). Filter by kind, language, file. Sort by relevance, complexity, or importance (PageRank). search_mode: hybrid (default, keyword+vector RRF), keyword (BM25 only), semantic (vector only) — applies to code symbol search, artifact search, and graph entry-point resolution. `rerank: true` applies cross-encoder reranking to top candidates for more precise relevance scoring on natural language queries (~100-300ms extra latency). Results default to the primary workspace root; pass root: \"all\" for cross-root search."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct Search {
@@ -83,6 +83,9 @@ pub struct Search {
     /// Search ranking mode: "hybrid" (default, keyword + vector RRF), "keyword" (BM25 only), "semantic" (vector only). Applies to all search paths: flat code symbols, artifacts, and graph traversal entry-point resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_mode: Option<String>,
+    /// When true, apply cross-encoder reranking to the top candidates for more precise relevance scoring. Best for natural language queries where bi-encoder similarity misses nuanced matches. Adds ~100-300ms latency. Default: false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<bool>,
     /// Search .oh/ artifacts and commits via embedding index (default: true). Set to false for code-only search.
     #[serde(default = "default_true")]
     pub include_artifacts: Option<bool>,
@@ -156,6 +159,7 @@ impl SearchSymbols {
             compact: None,
             nodes: None,
             search_mode: None,
+            rerank: None,
             include_artifacts: Some(false),
             include_markdown: Some(false),
             artifact_types: None,
@@ -214,6 +218,7 @@ impl GraphQuery {
             compact: None,
             nodes: None,
             search_mode: None,
+            rerank: None,
             include_artifacts: Some(false),
             include_markdown: Some(false),
             artifact_types: None,
@@ -792,5 +797,39 @@ mod tests {
             "artifact_types": []
         })).unwrap();
         assert_eq!(s.artifact_types, Some(vec![]));
+    }
+
+    // ── Rerank parameter tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_search_rerank_default_is_none() {
+        let s = parse_search(json!({"query": "test"})).unwrap();
+        assert!(s.rerank.is_none());
+    }
+
+    #[test]
+    fn test_search_rerank_true() {
+        let s = parse_search(json!({"query": "test", "rerank": true})).unwrap();
+        assert_eq!(s.rerank, Some(true));
+    }
+
+    #[test]
+    fn test_search_rerank_false() {
+        let s = parse_search(json!({"query": "test", "rerank": false})).unwrap();
+        assert_eq!(s.rerank, Some(false));
+    }
+
+    #[test]
+    fn test_search_symbols_into_search_no_rerank() {
+        let ss: SearchSymbols = serde_json::from_value(json!({"query": "test"})).unwrap();
+        let s = ss.into_search();
+        assert!(s.rerank.is_none());
+    }
+
+    #[test]
+    fn test_graph_query_into_search_no_rerank() {
+        let gq: GraphQuery = serde_json::from_value(json!({"query": "test"})).unwrap();
+        let s = gq.into_search();
+        assert!(s.rerank.is_none());
     }
 }

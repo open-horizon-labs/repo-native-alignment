@@ -45,6 +45,7 @@ struct SearchArgs {
     #[arg(long)] compact: bool, #[arg(long)] nodes: Option<String>, #[arg(long)] search_mode: Option<String>,
     #[arg(long, default_value_t = true)] include_artifacts: bool, #[arg(long, default_value_t = true)] include_markdown: bool,
     #[arg(long)] artifact_types: Option<String>, #[arg(long)] root: Option<String>,
+    #[arg(long)] rerank: bool,
 }
 #[derive(clap::Args, Debug)]
 struct GraphArgs {
@@ -122,7 +123,8 @@ async fn main() -> anyhow::Result<()> {
                 limit: Some(args.limit), sort_by: args.sort_by.clone(), min_complexity: args.min_complexity,
                 synthetic: args.synthetic, compact: args.compact,
                 nodes: args.nodes.as_ref().map(|s| s.split(',').map(|t| t.trim().to_string()).collect()),
-                search_mode: args.search_mode.clone(), include_artifacts: args.include_artifacts, include_markdown: args.include_markdown,
+                search_mode: args.search_mode.clone(), rerank: args.rerank,
+                include_artifacts: args.include_artifacts, include_markdown: args.include_markdown,
                 artifact_types: args.artifact_types.as_ref().map(|s| s.split(',').map(|t| t.trim().to_string()).collect()),
             };
             let root_filter = resolve_root_filter(args.root.as_deref(), &repo_root);
