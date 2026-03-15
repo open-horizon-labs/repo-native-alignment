@@ -11,7 +11,7 @@ use crate::embed::{EmbeddingIndex, SearchMode, SearchOutcome};
 use crate::graph::{Node, NodeKind};
 use crate::ranking;
 use crate::server::helpers::{
-    format_freshness, format_neighbor_nodes, format_node_entry, retain_displayable,
+    format_freshness, format_neighbors_grouped, format_node_entry,
 };
 use crate::server::handlers::{parse_search_mode, run_traversal};
 use crate::server::state::{GraphState, LspEnrichmentStatus};
@@ -313,24 +313,52 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
 
     let edge_filter = params.edge_types.as_ref().map(|types| types.iter().filter_map(|t| parse_edge_kind(t)).collect::<Vec<_>>());
     let edge_filter_slice = edge_filter.as_deref();
-    let mut all_ids: Vec<String> = Vec::new();
+
+    // Collect grouped results across all entry nodes
+    use crate::server::handlers::run_traversal_grouped;
+    let mut merged_groups: std::collections::BTreeMap<crate::graph::EdgeKind, Vec<String>> = std::collections::BTreeMap::new();
     let mut seen = std::collections::HashSet::new();
+    let entry_set: HashSet<&str> = valid_entry_ids.iter().map(|s| s.as_str()).collect();
+
     for node_id in &valid_entry_ids {
-        match run_traversal(&gs.index, node_id, mode, params.hops, params.direction.as_deref(), edge_filter_slice) {
-            Ok(ids) => { for id in ids { if seen.insert(id.clone()) { all_ids.push(id); } } }
+        match run_traversal_grouped(&gs.index, node_id, mode, params.hops, params.direction.as_deref(), edge_filter_slice) {
+            Ok(groups) => {
+                for (kind, ids) in groups {
+                    let entry = merged_groups.entry(kind).or_default();
+                    for id in ids {
+                        if !entry_set.contains(id.as_str()) && seen.insert(id.clone()) {
+                            entry.push(id);
+                        }
+                    }
+                }
+            }
             Err(msg) => return msg,
         }
     }
-    let entry_set: HashSet<&str> = valid_entry_ids.iter().map(|s| s.as_str()).collect();
-    all_ids.retain(|id| !entry_set.contains(id.as_str()));
-    if mode == "tests_for" { all_ids.retain(|id| gs.nodes.iter().find(|n| n.stable_id() == *id).map(ranking::is_test_file).unwrap_or(false)); }
-    retain_displayable(&mut all_ids, &gs.nodes);
+
+    // Apply tests_for filtering
+    if mode == "tests_for" {
+        for ids in merged_groups.values_mut() {
+            ids.retain(|id| gs.nodes.iter().find(|n| n.stable_id() == *id).map(ranking::is_test_file).unwrap_or(false));
+        }
+    }
+    // Remove empty groups after filtering
+    merged_groups.retain(|_, ids| !ids.is_empty());
+
+    // Count total displayable results
+    let total_count: usize = merged_groups.values().map(|ids| {
+        ids.iter().filter(|id| {
+            gs.nodes.iter().find(|n| n.stable_id() == **id)
+                .map(|n| !crate::server::helpers::is_hidden_traversal_kind(&n.id.kind))
+                .unwrap_or(true)
+        }).count()
+    }).sum();
 
     let entry_label = if valid_entry_ids.len() == 1 { format!("`{}`", valid_entry_ids[0]) } else { format!("{} entry nodes", valid_entry_ids.len()) };
     let direction = params.direction.as_deref().unwrap_or("outgoing");
     let freshness = format_freshness(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status);
 
-    if all_ids.is_empty() {
+    if total_count == 0 {
         let mode_desc = match mode {
             "neighbors" => format!("No {} neighbors for {}.", direction, entry_label),
             "impact" => format!("No dependents found for {} within {} hops.", entry_label, params.hops.unwrap_or(3)),
@@ -340,12 +368,12 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         };
         format!("{}{}{}", entry_header, mode_desc, freshness)
     } else {
-        let md = format_neighbor_nodes(&gs.nodes, &all_ids, &gs.index, params.compact);
+        let md = format_neighbors_grouped(&gs.nodes, &merged_groups, &gs.index, params.compact);
         let heading = match mode {
-            "neighbors" => format!("## Graph neighbors ({}) of {}\n\n{} result(s)\n\n", direction, entry_label, all_ids.len()),
-            "impact" => format!("## Impact analysis for {}\n\n{} dependent(s) within {} hop(s)\n\n", entry_label, all_ids.len(), params.hops.unwrap_or(3)),
-            "reachable" => format!("## Reachable from {}\n\n{} node(s) within {} hop(s)\n\n", entry_label, all_ids.len(), params.hops.unwrap_or(3)),
-            "tests_for" => format!("## Test coverage for {}\n\n{} test function(s)\n\n", entry_label, all_ids.len()),
+            "neighbors" => format!("## Graph neighbors ({}) of {}\n\n{} result(s)\n\n", direction, entry_label, total_count),
+            "impact" => format!("## Impact analysis for {}\n\n{} dependent(s) within {} hop(s)\n\n", entry_label, total_count, params.hops.unwrap_or(3)),
+            "reachable" => format!("## Reachable from {}\n\n{} node(s) within {} hop(s)\n\n", entry_label, total_count, params.hops.unwrap_or(3)),
+            "tests_for" => format!("## Test coverage for {}\n\n{} test function(s)\n\n", entry_label, total_count),
             _ => String::new(),
         };
         format!("{}{}{}{}", entry_header, heading, md, freshness)
@@ -353,6 +381,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
 }
 
 fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_>) -> String {
+    use crate::server::handlers::run_traversal_grouped;
     let gs = ctx.graph_state;
     let freshness = format_freshness(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status);
     if params.mode.is_some() {
@@ -362,13 +391,27 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
         let mut sections: Vec<String> = Vec::new();
         for &nid in node_ids {
             if gs.index.get_node(nid).is_none() { sections.push(format!("### `{}`\n\nNode not found in graph.", nid)); continue; }
-            match run_traversal(&gs.index, nid, mode, params.hops, params.direction.as_deref(), edge_filter_slice) {
-                Ok(mut ids) => {
-                    ids.retain(|id| id != nid);
-                    if mode == "tests_for" { ids.retain(|id| gs.nodes.iter().find(|n| n.stable_id() == *id).map(ranking::is_test_file).unwrap_or(false)); }
-                    retain_displayable(&mut ids, &gs.nodes);
-                    if ids.is_empty() { sections.push(format!("### `{}`\n\nNo {} results.", nid, mode)); }
-                    else { let md = format_neighbor_nodes(&gs.nodes, &ids, &gs.index, params.compact); sections.push(format!("### `{}`\n\n{} result(s)\n\n{}", nid, ids.len(), md)); }
+            match run_traversal_grouped(&gs.index, nid, mode, params.hops, params.direction.as_deref(), edge_filter_slice) {
+                Ok(mut groups) => {
+                    // Remove self-references
+                    for ids in groups.values_mut() {
+                        ids.retain(|id| id != nid);
+                    }
+                    if mode == "tests_for" {
+                        for ids in groups.values_mut() {
+                            ids.retain(|id| gs.nodes.iter().find(|n| n.stable_id() == *id).map(ranking::is_test_file).unwrap_or(false));
+                        }
+                    }
+                    groups.retain(|_, ids| !ids.is_empty());
+                    let total: usize = groups.values().map(|ids| {
+                        ids.iter().filter(|id| {
+                            gs.nodes.iter().find(|n| n.stable_id() == **id)
+                                .map(|n| !crate::server::helpers::is_hidden_traversal_kind(&n.id.kind))
+                                .unwrap_or(true)
+                        }).count()
+                    }).sum();
+                    if total == 0 { sections.push(format!("### `{}`\n\nNo {} results.", nid, mode)); }
+                    else { let md = format_neighbors_grouped(&gs.nodes, &groups, &gs.index, params.compact); sections.push(format!("### `{}`\n\n{} result(s)\n\n{}", nid, total, md)); }
                 }
                 Err(msg) => sections.push(format!("### `{}`\n\n{}", nid, msg)),
             }
