@@ -90,20 +90,23 @@ fn resolve_root_filter(root_arg: Option<&str>, repo_root: &std::path::Path) -> O
     root_arg.map(|v| if v.eq_ignore_ascii_case("all") { None } else { Some(v.to_string()) }).unwrap_or_else(|| Some(root_slug))
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // Set fastembed model cache to ~/.cache/rna/models/ instead of .fastembed_cache/
-    // in the current directory. Must be set before any fastembed initialization
-    // (reranker model, or any future fastembed embedding model).
+    // in the current directory. Must be set before Tokio runtime and any fastembed
+    // initialization (reranker model, or any future fastembed embedding model).
     if std::env::var("FASTEMBED_CACHE_DIR").is_err()
         && let Ok(home) = std::env::var("HOME")
     {
         let cache_dir = std::path::PathBuf::from(home).join(".cache").join("rna").join("models");
-        // SAFETY: set_var is called at program startup before any threads
-        // are spawned, so there are no concurrent readers of this env var.
+        // SAFETY: called in single-threaded main() before Tokio runtime starts.
         unsafe { std::env::set_var("FASTEMBED_CACHE_DIR", &cache_dir) };
     }
 
+    async_main()
+}
+
+#[tokio::main]
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let log_path = cli.log_path.clone();
     match cli.command {

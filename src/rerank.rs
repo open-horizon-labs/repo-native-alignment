@@ -19,9 +19,12 @@ use fastembed::{RerankerModel, RerankResult, TextRerank};
 /// so we use `Mutex` for safe concurrent access.
 static RERANKER: Mutex<Option<TextRerank>> = Mutex::new(None);
 
-/// Return the RNA model cache directory (`~/.cache/rna/models/`).
-/// Falls back to the default fastembed cache dir if `$HOME` is unset.
+/// Return the model cache directory.
+/// Precedence: `FASTEMBED_CACHE_DIR` env var > `~/.cache/rna/models/` > fastembed default.
 fn rna_cache_dir() -> std::path::PathBuf {
+    if let Ok(explicit) = std::env::var("FASTEMBED_CACHE_DIR") {
+        return std::path::PathBuf::from(explicit);
+    }
     if let Ok(home) = std::env::var("HOME") {
         std::path::PathBuf::from(home).join(".cache").join("rna").join("models")
     } else {
@@ -79,7 +82,8 @@ pub fn rerank_results(
         tracing::info!("Reranker: loading {:?} (first use, one-time cost)", DEFAULT_MODEL);
 
         let cache_dir = rna_cache_dir();
-        let _ = std::fs::create_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir)
+            .context(format!("Failed to create reranker cache dir: {}", cache_dir.display()))?;
         tracing::info!("Reranker: cache dir = {}", cache_dir.display());
 
         let init_opts = fastembed::RerankInitOptions::new(DEFAULT_MODEL)
