@@ -15,7 +15,7 @@ pub(crate) use store::{
     check_and_migrate_schema, graph_lance_path,
     persist_graph_incremental, persist_graph_to_lance,
 };
-pub use state::{GraphState, LspEnrichmentStatus, LspState};
+pub use state::{EmbeddingStatus, GraphState, LspEnrichmentStatus, LspState};
 pub use helpers::format_freshness;
 
 use std::path::{Path, PathBuf};
@@ -64,6 +64,8 @@ pub struct RnaHandler {
     pub background_scanner_started: std::sync::atomic::AtomicBool,
     /// LSP enrichment status — shared with background enrichment tasks.
     pub lsp_status: Arc<LspEnrichmentStatus>,
+    /// Embedding build status — shared with background embedding tasks.
+    pub embed_status: Arc<EmbeddingStatus>,
 }
 
 impl Default for RnaHandler {
@@ -78,6 +80,7 @@ impl Default for RnaHandler {
             ),
             background_scanner_started: std::sync::atomic::AtomicBool::new(false),
             lsp_status: Arc::new(LspEnrichmentStatus::probe_for_servers()),
+            embed_status: Arc::new(EmbeddingStatus::default()),
         }
     }
 }

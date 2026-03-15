@@ -31,6 +31,42 @@ pub fn kind_rank(n: &Node) -> u8 {
     }
 }
 
+/// Known trait impl method names that pollute repo_map top-N because they
+/// accumulate many `Calls` edges (every `format!()` call creates an edge to `fmt`,
+/// every `.clone()` to `clone`, etc.). Filtered from display only -- PageRank
+/// scores stay accurate for graph traversal.
+pub const TRAIT_IMPL_METHODS: &[&str] = &[
+    "fmt", "clone", "drop", "default", "from", "into",
+    "deref", "deref_mut", "eq", "hash", "partial_cmp", "cmp",
+];
+
+/// Returns true if a node looks like a trait impl method that should be
+/// filtered from repo_map display. Checks the node name against
+/// [`TRAIT_IMPL_METHODS`] and requires `NodeKind::Function`.
+pub fn is_trait_impl_method(n: &Node) -> bool {
+    if n.id.kind != NodeKind::Function {
+        return false;
+    }
+    let name_lower = n.id.name.to_lowercase();
+    TRAIT_IMPL_METHODS.iter().any(|&m| name_lower == m)
+}
+
+/// Returns true if a node is a test function (by decorator or file path).
+///
+/// Checks for `#[test]` in the decorators metadata, or falls back to
+/// [`is_test_file`] for path-based detection.
+pub fn is_test_function(n: &Node) -> bool {
+    if n.id.kind != NodeKind::Function {
+        return false;
+    }
+    // Check for #[test] decorator
+    if n.metadata.get("decorators").is_some_and(|d| d.contains("test")) {
+        return true;
+    }
+    // Fall back to path-based detection
+    is_test_file(n)
+}
+
 /// Returns true if a file path looks like a test or test-adjacent file.
 ///
 /// This is the shared path-based check used by both `is_test_file()` (which takes
@@ -630,5 +666,79 @@ mod tests {
                 path, expected
             );
         }
+    }
+
+    // ==================== Trait impl method filtering ====================
+
+    #[test]
+    fn test_is_trait_impl_method_fmt() {
+        let node = make_node("fmt", NodeKind::Function, "src/types.rs");
+        assert!(is_trait_impl_method(&node), "fmt should be a trait impl method");
+    }
+
+    #[test]
+    fn test_is_trait_impl_method_clone() {
+        let node = make_node("clone", NodeKind::Function, "src/types.rs");
+        assert!(is_trait_impl_method(&node), "clone should be a trait impl method");
+    }
+
+    #[test]
+    fn test_is_trait_impl_method_from() {
+        let node = make_node("from", NodeKind::Function, "src/types.rs");
+        assert!(is_trait_impl_method(&node), "from should be a trait impl method");
+    }
+
+    #[test]
+    fn test_is_trait_impl_method_case_insensitive() {
+        let node = make_node("Fmt", NodeKind::Function, "src/types.rs");
+        assert!(is_trait_impl_method(&node), "Fmt should match (case-insensitive)");
+    }
+
+    #[test]
+    fn test_is_trait_impl_method_not_function() {
+        let node = make_node("fmt", NodeKind::Struct, "src/types.rs");
+        assert!(!is_trait_impl_method(&node), "struct named fmt should NOT be a trait impl method");
+    }
+
+    #[test]
+    fn test_is_trait_impl_method_custom_name() {
+        let node = make_node("process_data", NodeKind::Function, "src/main.rs");
+        assert!(!is_trait_impl_method(&node), "process_data is not a trait impl method");
+    }
+
+    #[test]
+    fn test_is_trait_impl_method_all_names() {
+        for name in TRAIT_IMPL_METHODS {
+            let node = make_node(name, NodeKind::Function, "src/types.rs");
+            assert!(is_trait_impl_method(&node), "{} should be a trait impl method", name);
+        }
+    }
+
+    // ==================== Test function detection ====================
+
+    #[test]
+    fn test_is_test_function_by_decorator() {
+        let mut node = make_node("test_my_feature", NodeKind::Function, "src/main.rs");
+        node.metadata.insert("decorators".to_string(), "test".to_string());
+        assert!(is_test_function(&node), "function with #[test] decorator should be detected");
+    }
+
+    #[test]
+    fn test_is_test_function_by_path() {
+        let node = make_node("helper", NodeKind::Function, "tests/test_main.rs");
+        assert!(is_test_function(&node), "function in test file should be detected");
+    }
+
+    #[test]
+    fn test_is_test_function_production_code() {
+        let node = make_node("process", NodeKind::Function, "src/main.rs");
+        assert!(!is_test_function(&node), "production function should not be detected");
+    }
+
+    #[test]
+    fn test_is_test_function_not_function_kind() {
+        let mut node = make_node("TestStruct", NodeKind::Struct, "tests/test_main.rs");
+        node.metadata.insert("decorators".to_string(), "test".to_string());
+        assert!(!is_test_function(&node), "struct should not be detected even with test decorator");
     }
 }

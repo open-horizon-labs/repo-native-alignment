@@ -18,6 +18,69 @@ pub struct GraphState {
     pub last_scan_completed_at: Option<std::time::Instant>,
 }
 
+// ── Embedding build status ───────────────────────────────────────────
+
+/// Tracks embedding build progress so the search footer can show
+/// `embedding... (N/M)` during build and just the count when done.
+pub struct EmbeddingStatus {
+    /// 0 = not started, 1 = building, 2 = complete
+    state: std::sync::atomic::AtomicU8,
+    /// Current progress (items embedded so far).
+    current: std::sync::atomic::AtomicUsize,
+    /// Total items to embed.
+    total: std::sync::atomic::AtomicUsize,
+    /// Final count after completion.
+    completed_count: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for EmbeddingStatus {
+    fn default() -> Self {
+        Self {
+            state: std::sync::atomic::AtomicU8::new(0),
+            current: std::sync::atomic::AtomicUsize::new(0),
+            total: std::sync::atomic::AtomicUsize::new(0),
+            completed_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl EmbeddingStatus {
+    /// Mark embedding as building with a known total.
+    pub fn set_building(&self, total: usize) {
+        self.total.store(total, std::sync::atomic::Ordering::Release);
+        self.current.store(0, std::sync::atomic::Ordering::Release);
+        self.state.store(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Update progress during embedding.
+    pub fn set_progress(&self, current: usize) {
+        self.current.store(current, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Mark embedding as complete with a final count.
+    pub fn set_complete(&self, count: usize) {
+        self.completed_count.store(count, std::sync::atomic::Ordering::Release);
+        self.state.store(2, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Render a footer segment for the search footer, or `None` if not started.
+    pub fn footer_segment(&self) -> Option<String> {
+        match self.state.load(std::sync::atomic::Ordering::Acquire) {
+            0 => None,
+            1 => {
+                let cur = self.current.load(std::sync::atomic::Ordering::Acquire);
+                let tot = self.total.load(std::sync::atomic::Ordering::Acquire);
+                Some(format!("embedding... ({}/{})", cur, tot))
+            }
+            2 => {
+                let count = self.completed_count.load(std::sync::atomic::Ordering::Acquire);
+                Some(format!("{} embedded", count))
+            }
+            _ => None,
+        }
+    }
+}
+
 // ── LSP enrichment status ────────────────────────────────────────────
 
 /// Named states for the LSP enrichment state machine.
@@ -668,5 +731,45 @@ mod tests {
         status.set_server_found();
         let footer = status.footer_segment().unwrap();
         assert!(footer.contains("rust-analyzer"), "got: {}", footer);
+    }
+
+    // ── EmbeddingStatus tests ───────────────────────────────────────
+
+    #[test]
+    fn test_embedding_status_not_started() {
+        let status = EmbeddingStatus::default();
+        assert!(status.footer_segment().is_none());
+    }
+
+    #[test]
+    fn test_embedding_status_building() {
+        let status = EmbeddingStatus::default();
+        status.set_building(5000);
+        status.set_progress(1200);
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("embedding..."), "got: {}", footer);
+        assert!(footer.contains("1200/5000"), "got: {}", footer);
+    }
+
+    #[test]
+    fn test_embedding_status_complete() {
+        let status = EmbeddingStatus::default();
+        status.set_building(5000);
+        status.set_complete(4500);
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("4500 embedded"), "got: {}", footer);
+        assert!(!footer.contains("embedding..."), "got: {}", footer);
+    }
+
+    #[test]
+    fn test_embedding_status_progress_updates() {
+        let status = EmbeddingStatus::default();
+        status.set_building(100);
+        status.set_progress(50);
+        let f1 = status.footer_segment().unwrap();
+        assert!(f1.contains("50/100"), "got: {}", f1);
+        status.set_progress(75);
+        let f2 = status.footer_segment().unwrap();
+        assert!(f2.contains("75/100"), "got: {}", f2);
     }
 }

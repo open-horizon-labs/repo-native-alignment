@@ -149,7 +149,7 @@ async fn async_main() -> anyhow::Result<()> {
                 artifact_types: args.artifact_types.as_ref().map(|s| s.split(',').map(|t| t.trim().to_string()).collect()),
             };
             let root_filter = resolve_root_filter(args.root.as_deref(), &repo_root);
-            let ctx = SearchContext { graph_state: &gs, embed_index: embed_ref, repo_root: &repo_root, lsp_status: None, root_filter, non_code_slugs: std::collections::HashSet::new() };
+            let ctx = SearchContext { graph_state: &gs, embed_index: embed_ref, repo_root: &repo_root, lsp_status: None, embed_status: None, root_filter, non_code_slugs: std::collections::HashSet::new() };
             println!("{}", service::search(&params, &ctx).await); return Ok(());
         }
         Some(Commands::Graph(args)) => {
@@ -194,7 +194,7 @@ async fn async_main() -> anyhow::Result<()> {
             let handler = RnaHandler { repo_root: repo_root.clone(), ..Default::default() }; let gs = handler.build_full_graph().await?;
             let root_filter = resolve_root_filter(args.root.as_deref(), &repo_root);
             let params = RepoMapParams { top_n: args.top_n, root_filter, non_code_slugs: std::collections::HashSet::new() };
-            let ctx = RepoMapContext { graph_state: &gs, repo_root: &repo_root, lsp_status: None };
+            let ctx = RepoMapContext { graph_state: &gs, repo_root: &repo_root, lsp_status: None, embed_status: None };
             println!("{}", service::repo_map(&params, &ctx)); return Ok(());
         }
         None => {}

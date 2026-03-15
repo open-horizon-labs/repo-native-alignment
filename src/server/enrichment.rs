@@ -351,6 +351,7 @@ impl RnaHandler {
         let bg_graph = self.graph.clone();
         let bg_embed_index = self.embed_index.clone();
         let bg_lsp_status = self.lsp_status.clone();
+        let bg_embed_status = self.embed_status.clone();
         let bg_nodes = all_nodes.to_vec();
         let bg_languages: Vec<String> = all_nodes
             .iter()
@@ -373,6 +374,11 @@ impl RnaHandler {
 
             let embed_repo_root = bg_repo_root.clone();
             let embed_index_ref = bg_embed_index.clone();
+            let embed_status = bg_embed_status;
+            let embeddable_count = embeddable_nodes.iter()
+                .filter(|n| n.id.kind.is_embeddable())
+                .count();
+            embed_status.set_building(embeddable_count);
             let embed_fut = async move {
                 // Always re-index so .oh/ artifacts added since the last
                 // full build become searchable.  index_all_inner drops and
@@ -382,13 +388,20 @@ impl RnaHandler {
                         match idx.index_all_with_symbols(&embed_repo_root, &embeddable_nodes).await {
                             Ok(count) => {
                                 tracing::info!("[background] Embedded {} items", count);
+                                embed_status.set_complete(count);
                                 // Atomic store -- no mutex needed
                                 embed_index_ref.store(Arc::new(Some(idx)));
                             }
-                            Err(e) => tracing::warn!("[background] Embedding failed: {}", e),
+                            Err(e) => {
+                                tracing::warn!("[background] Embedding failed: {}", e);
+                                embed_status.set_complete(0);
+                            }
                         }
                     }
-                    Err(e) => tracing::warn!("[background] EmbeddingIndex init failed: {}", e),
+                    Err(e) => {
+                        tracing::warn!("[background] EmbeddingIndex init failed: {}", e);
+                        embed_status.set_complete(0);
+                    }
                 }
             };
 

@@ -4,7 +4,7 @@ use crate::graph;
 use crate::graph::index::GraphIndex;
 use petgraph::Direction;
 use rust_mcp_sdk::schema::{CallToolError, CallToolResult, TextContent};
-use super::state::LspEnrichmentStatus;
+use super::state::{EmbeddingStatus, LspEnrichmentStatus};
 
 /// Minimum importance score to display in tool output.
 /// Scores at or below this threshold are suppressed as noise.
@@ -33,6 +33,19 @@ pub fn format_freshness(
     last_scan: Option<std::time::Instant>,
     lsp_status: Option<&LspEnrichmentStatus>,
 ) -> String {
+    format_freshness_full(node_count, last_scan, lsp_status, None)
+}
+
+/// Format an index freshness footer with optional embedding status.
+///
+/// When `embed_status` is provided, shows build progress during embedding
+/// and the final count when complete.
+pub fn format_freshness_full(
+    node_count: usize,
+    last_scan: Option<std::time::Instant>,
+    lsp_status: Option<&LspEnrichmentStatus>,
+    embed_status: Option<&EmbeddingStatus>,
+) -> String {
     let age = match last_scan {
         None => "never".to_string(),
         Some(t) => {
@@ -52,11 +65,17 @@ pub fn format_freshness(
         .map(|seg| format!(" · {}", seg))
         .unwrap_or_default();
 
+    let embed_part = embed_status
+        .and_then(|s| s.footer_segment())
+        .map(|seg| format!(" · {}", seg))
+        .unwrap_or_default();
+
     format!(
-        "\n\n*Index: {} symbols · last scan {} · schema v{}{}*",
+        "\n\n*Index: {} symbols · last scan {} · schema v{}{}{}*",
         node_count,
         age,
         crate::graph::store::SCHEMA_VERSION,
+        embed_part,
         lsp_part,
     )
 }
@@ -93,6 +112,39 @@ pub(crate) fn resolve_edge_target_by_suffix(
     // If 0 or 2+ matches, leave as-is (ambiguous or truly dangling)
 }
 
+/// Strip the root slug prefix from a stable ID when in single-root mode.
+///
+/// Stable IDs have the form `root:file:name:kind`. In single-root mode the
+/// root prefix is noise (62+ chars). This function strips it, returning
+/// `file:name:kind`. When `strip_root` is `None`, the full ID is returned.
+pub(crate) fn strip_root_prefix(stable_id: &str, strip_root: Option<&str>) -> String {
+    if let Some(slug) = strip_root {
+        let prefix = format!("{}:", slug);
+        if let Some(rest) = stable_id.strip_prefix(&prefix) {
+            return rest.to_string();
+        }
+    }
+    stable_id.to_string()
+}
+
+/// Format an unresolved stable ID (no matching graph node) in a human-readable way.
+///
+/// Parses `root:file:name:kind` and renders as `**name** (file)` instead of
+/// dumping the raw stable ID. Falls back to the (possibly stripped) raw ID if
+/// parsing fails.
+pub(crate) fn format_unresolved_id(id: &str, strip_root: Option<&str>) -> String {
+    let display_id = strip_root_prefix(id, strip_root);
+    // Try to parse as file:name:kind (after stripping root)
+    let parts: Vec<&str> = display_id.splitn(3, ':').collect();
+    if parts.len() >= 2 {
+        let file = parts[0];
+        let name = parts[1];
+        format!("- **{}** ({})", name, file)
+    } else {
+        format!("- `{}`", display_id)
+    }
+}
+
 /// Format a single node for search results output.
 ///
 /// When `compact` is true, returns a one-line summary: kind, name, file:lines, signature.
@@ -118,7 +170,16 @@ fn format_inline_code(s: &str) -> String {
 }
 
 pub(crate) fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> String {
+    format_node_entry_with_root(n, index, compact, None)
+}
+
+/// Format a single node, optionally stripping the root slug prefix from
+/// displayed stable IDs. When `strip_root` is `Some(slug)`, the `slug:`
+/// prefix is removed from the ID display -- used in single-root mode
+/// where the prefix is noise.
+pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, compact: bool, strip_root: Option<&str>) -> String {
     let stable_id = n.stable_id();
+    let display_id = strip_root_prefix(&stable_id, strip_root);
 
     if compact {
         // Compact: one-line summary for broad exploration
@@ -167,7 +228,7 @@ pub(crate) fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bo
         if edge_count > 0 {
             entry.push_str(&format!(" edges:{}", edge_count));
         }
-        entry.push_str(&format!("\n  `{}`", stable_id));
+        entry.push_str(&format!("\n  `{}`", display_id));
         entry
     } else {
         // Full detail (existing format)
@@ -178,7 +239,7 @@ pub(crate) fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bo
             n.id.kind, n.id.name, n.language,
             n.id.file.display(),
             n.line_start, n.line_end,
-            stable_id,
+            display_id,
         );
         if !n.signature.is_empty() {
             entry.push_str(&format!("\n  Sig: {}", format_inline_code(&n.signature)));
@@ -241,11 +302,27 @@ pub(crate) fn is_hidden_traversal_kind(kind: &graph::NodeKind) -> bool {
 /// Each edge type gets a section header (e.g., `#### Calls (3)`) followed by
 /// the node entries. Edge types with zero results after hidden-kind filtering
 /// are omitted.
+#[allow(dead_code)]  // used by tests
 pub(crate) fn format_neighbors_grouped(
     nodes: &[graph::Node],
     groups: &std::collections::BTreeMap<graph::EdgeKind, Vec<String>>,
     index: &GraphIndex,
     compact: bool,
+) -> String {
+    format_neighbors_grouped_with_root(nodes, groups, index, compact, None)
+}
+
+/// Format traversal results grouped by edge type, with optional root slug stripping.
+///
+/// When `strip_root` is `Some(slug)`, the root prefix is stripped from displayed
+/// stable IDs and unresolved nodes are rendered as `**name** (file)` instead of
+/// raw stable IDs.
+pub(crate) fn format_neighbors_grouped_with_root(
+    nodes: &[graph::Node],
+    groups: &std::collections::BTreeMap<graph::EdgeKind, Vec<String>>,
+    index: &GraphIndex,
+    compact: bool,
+    strip_root: Option<&str>,
 ) -> String {
     let mut sections: Vec<String> = Vec::new();
 
@@ -270,9 +347,9 @@ pub(crate) fn format_neighbors_grouped(
             .iter()
             .map(|id| {
                 if let Some(node) = nodes.iter().find(|n| n.stable_id() == **id) {
-                    format_node_entry(node, index, compact)
+                    format_node_entry_with_root(node, index, compact, strip_root)
                 } else {
-                    format!("- `{}`", id)
+                    format_unresolved_id(id, strip_root)
                 }
             })
             .collect();
@@ -566,5 +643,112 @@ mod tests {
         assert!(full.contains("#### Calls (1)"));
         // Full should be longer (more detail per node)
         assert!(full.len() > compact.len(), "full should be more detailed than compact");
+    }
+
+    // ── strip_root_prefix tests ─────────────────────────────────────
+
+    #[test]
+    fn test_strip_root_prefix_none() {
+        let id = "my-root:src/lib.rs:main:function";
+        assert_eq!(strip_root_prefix(id, None), id);
+    }
+
+    #[test]
+    fn test_strip_root_prefix_matching() {
+        let id = "my-root:src/lib.rs:main:function";
+        assert_eq!(
+            strip_root_prefix(id, Some("my-root")),
+            "src/lib.rs:main:function"
+        );
+    }
+
+    #[test]
+    fn test_strip_root_prefix_non_matching() {
+        let id = "other-root:src/lib.rs:main:function";
+        assert_eq!(
+            strip_root_prefix(id, Some("my-root")),
+            "other-root:src/lib.rs:main:function"
+        );
+    }
+
+    #[test]
+    fn test_strip_root_prefix_long_slug() {
+        let id = "users-muness1-src-open-horizon-labs-repo-native-alignment:src/scanner.rs:scan:function";
+        assert_eq!(
+            strip_root_prefix(id, Some("users-muness1-src-open-horizon-labs-repo-native-alignment")),
+            "src/scanner.rs:scan:function"
+        );
+    }
+
+    // ── format_unresolved_id tests ──────────────────────────────────
+
+    #[test]
+    fn test_format_unresolved_id_with_strip() {
+        let id = "my-root:.oh/guardrails/dogfood.md:dogfood-rna-tools:markdown_section";
+        let result = format_unresolved_id(id, Some("my-root"));
+        assert_eq!(result, "- **dogfood-rna-tools** (.oh/guardrails/dogfood.md)");
+    }
+
+    #[test]
+    fn test_format_unresolved_id_without_strip() {
+        let id = "my-root:.oh/guardrails/dogfood.md:dogfood-rna-tools:markdown_section";
+        let result = format_unresolved_id(id, None);
+        // Without stripping, the "root" becomes the first part before ':'
+        // which is "my-root", file becomes ".oh/guardrails/dogfood.md", name becomes "dogfood-rna-tools:markdown_section"
+        assert!(result.contains(".oh/guardrails/dogfood.md"));
+    }
+
+    #[test]
+    fn test_format_unresolved_id_no_colon() {
+        let id = "some-id-without-colons";
+        let result = format_unresolved_id(id, None);
+        assert_eq!(result, "- `some-id-without-colons`");
+    }
+
+    // ── format_node_entry_with_root tests ───────────────────────────
+
+    #[test]
+    fn test_format_node_entry_with_root_strips_prefix() {
+        let node = make_test_node("my_func");
+        let index = GraphIndex::new();
+        let full = format_node_entry_with_root(&node, &index, false, Some("test"));
+        // The stable ID should NOT start with "test:" in the display
+        assert!(full.contains("ID: `src/test.rs:my_func:function`"), "got: {}", full);
+    }
+
+    #[test]
+    fn test_format_node_entry_with_root_compact_strips_prefix() {
+        let node = make_test_node("my_func");
+        let index = GraphIndex::new();
+        let compact = format_node_entry_with_root(&node, &index, true, Some("test"));
+        // The trailing stable ID line should not have the root prefix
+        assert!(compact.contains("`src/test.rs:my_func:function`"), "got: {}", compact);
+        assert!(!compact.contains("`test:src/"), "root prefix should be stripped, got: {}", compact);
+    }
+
+    // ── format_freshness_full with embedding status ─────────────────
+
+    #[test]
+    fn test_format_freshness_with_embedding_building() {
+        let embed_status = super::super::state::EmbeddingStatus::default();
+        embed_status.set_building(5000);
+        embed_status.set_progress(1200);
+        let result = format_freshness_full(100, None, None, Some(&embed_status));
+        assert!(result.contains("embedding... (1200/5000)"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_format_freshness_with_embedding_complete() {
+        let embed_status = super::super::state::EmbeddingStatus::default();
+        embed_status.set_complete(4500);
+        let result = format_freshness_full(100, None, None, Some(&embed_status));
+        assert!(result.contains("4500 embedded"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_format_freshness_no_embedding_status() {
+        let result = format_freshness_full(100, None, None, None);
+        assert!(!result.contains("embedding"), "got: {}", result);
+        assert!(!result.contains("embedded"), "got: {}", result);
     }
 }
