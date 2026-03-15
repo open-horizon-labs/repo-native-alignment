@@ -450,6 +450,7 @@ pub fn find_node_at(
                         | NodeKind::TypeAlias
                         | NodeKind::Const
                         | NodeKind::Macro
+                        | NodeKind::EnumVariant
                 )
             })
             .min_by_key(|n| n.line_end.saturating_sub(n.line_start))
@@ -563,6 +564,22 @@ mod tests {
         let result = find_node_at(&index, &PathBuf::from("src/lib.rs"), 5);
         assert!(result.is_some(), "find_node_at should find TypeAlias nodes");
         assert_eq!(result.unwrap().name, "Result");
+    }
+
+    #[test]
+    fn test_find_node_at_finds_enum_variant() {
+        let nodes = vec![make_node(
+            "src/lib.rs",
+            "Active",
+            NodeKind::EnumVariant,
+            10,
+            10,
+        )];
+        let index = build_file_line_index(&nodes);
+
+        let result = find_node_at(&index, &PathBuf::from("src/lib.rs"), 10);
+        assert!(result.is_some(), "find_node_at should find EnumVariant nodes");
+        assert_eq!(result.unwrap().name, "Active");
     }
 
     // -- edge_id_set tests --
