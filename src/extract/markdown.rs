@@ -128,7 +128,7 @@ impl Extractor for MarkdownExtractor {
                     root: String::new(), // populated during multi-root integration
                     file: path.to_path_buf(),
                     name: section_name,
-                    kind: NodeKind::Other("markdown_section".to_string()),
+                    kind: NodeKind::MarkdownSection,
                 },
                 language: "markdown".to_string(),
                 line_start,

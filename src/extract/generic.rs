@@ -473,7 +473,7 @@ fn collect_nodes(
 
             // Emit structural edge from parent scope to this node.
             if let Some((scope_name, parent_kind)) = parent_scope {
-                let edge_kind = if node_kind == NodeKind::Field {
+                let edge_kind = if node_kind == NodeKind::Field || node_kind == NodeKind::EnumVariant {
                     EdgeKind::HasField
                 } else {
                     EdgeKind::Defines

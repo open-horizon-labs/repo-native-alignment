@@ -121,6 +121,8 @@ pub(crate) fn parse_node_kind(s: &str) -> NodeKind {
         "macro" => NodeKind::Macro,
         "field" => NodeKind::Field,
         "pr_merge" => NodeKind::PrMerge,
+        "enum_variant" => NodeKind::EnumVariant,
+        "markdown_section" => NodeKind::MarkdownSection,
         other => NodeKind::Other(other.to_string()),
     }
 }

@@ -78,6 +78,10 @@ pub enum NodeKind {
     Field,
     /// A merged PR (branch merge to base branch). The natural unit of meaningful change.
     PrMerge,
+    /// An enum variant (e.g. `Option::Some`, `Color::Red`).
+    EnumVariant,
+    /// A markdown section heading with its content.
+    MarkdownSection,
     Other(String),
 }
 
@@ -99,6 +103,8 @@ impl fmt::Display for NodeKind {
             NodeKind::Macro => write!(f, "macro"),
             NodeKind::Field => write!(f, "field"),
             NodeKind::PrMerge => write!(f, "pr_merge"),
+            NodeKind::EnumVariant => write!(f, "enum_variant"),
+            NodeKind::MarkdownSection => write!(f, "markdown_section"),
             NodeKind::Other(s) => write!(f, "{}", s),
         }
     }
@@ -120,6 +126,7 @@ impl NodeKind {
             | NodeKind::ProtoMessage
             | NodeKind::SqlTable
             | NodeKind::ApiEndpoint
+            | NodeKind::MarkdownSection
             | NodeKind::Other(_) => true,
 
             NodeKind::Import
@@ -127,6 +134,7 @@ impl NodeKind {
             | NodeKind::Module
             | NodeKind::Impl
             | NodeKind::Field
+            | NodeKind::EnumVariant
             | NodeKind::PrMerge => false,
         }
     }

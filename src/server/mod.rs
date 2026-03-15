@@ -2163,6 +2163,7 @@ mod tests {
             NodeKind::ProtoMessage, NodeKind::SqlTable,
             NodeKind::ApiEndpoint, NodeKind::Macro,
             NodeKind::Field, NodeKind::PrMerge,
+            NodeKind::EnumVariant, NodeKind::MarkdownSection,
         ];
         for variant in variants {
             let s = format!("{}", variant);
