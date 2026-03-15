@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::embed::{EmbeddingIndex, SearchOutcome};
+use crate::embed::{EmbeddingIndex, SearchMode, SearchOutcome};
 use crate::graph::{Node, NodeKind};
 use crate::ranking;
 use crate::server::helpers::{
@@ -116,48 +116,12 @@ async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchCon
     let limit = params.limit.unwrap_or(10);
     let mut sections: Vec<String> = Vec::new();
     let graph_state = ctx.graph_state;
-    let query_lower = query_str.to_lowercase();
 
-    let mut matches: Vec<&Node> = graph_state.nodes.iter().filter(|n| {
-        if complexity_search && n.id.kind != NodeKind::Function { return false; }
-        if !query_lower.is_empty() {
-            let name_match = n.id.name.to_lowercase().contains(&query_lower) || n.signature.to_lowercase().contains(&query_lower);
-            if !name_match { return false; }
-        }
-        if let Some(ref kf) = params.kind { if n.id.kind.to_string().to_lowercase() != kf.to_lowercase() { return false; } }
-        if let Some(ref lf) = params.language { if n.language.to_lowercase() != lf.to_lowercase() { return false; } }
-        if let Some(ref ff) = params.file { if !n.id.file.to_string_lossy().contains(ff.as_str()) { return false; } }
-        if !node_passes_root_filter(&n.id.root, &ctx.root_filter, &ctx.non_code_slugs) { return false; }
-        if let Some(sf) = params.synthetic { if (n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false)) != sf { return false; } }
-        if let Some(min_cc) = params.min_complexity {
-            let Some(cc) = n.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()) else { return false; };
-            if cc < min_cc { return false; }
-        }
-        true
-    }).collect();
-
-    if sort_by_complexity {
-        matches.retain(|n| n.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).is_some());
-        matches.sort_by(|a, b| {
-            let ca = a.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-            let cb = b.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-            cb.cmp(&ca)
-        });
-    } else if sort_by_importance {
-        matches.sort_by(|a, b| {
-            let ia = a.metadata.get("importance").and_then(|s| s.parse::<f64>().ok());
-            let ib = b.metadata.get("importance").and_then(|s| s.parse::<f64>().ok());
-            match (ia, ib) {
-                (Some(a), Some(b)) => b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            }
-        });
-    } else {
-        ranking::sort_symbol_matches(&mut matches, &query_lower, &graph_state.index);
-    }
-    matches.truncate(limit);
+    // Try embedding-ranked code symbol search first; fall back to name/signature matching.
+    let matches: Vec<&Node> = flat_code_symbol_search(
+        query_str, search_mode, limit, params, graph_state, ctx,
+        sort_by_complexity, sort_by_importance,
+    ).await;
 
     if !matches.is_empty() {
         let md: String = matches.iter().map(|n| format_node_entry(n, &graph_state.index, params.compact)).collect::<Vec<_>>().join("\n\n");
@@ -201,6 +165,112 @@ async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchCon
     let freshness = format_freshness(graph_state.nodes.len(), graph_state.last_scan_completed_at, ctx.lsp_status);
     if sections.is_empty() { format!("No results matching \"{}\".{}", query_str, freshness) }
     else { format!("## Search: \"{}\"\n\n{}{}", query_str, sections.join("\n\n"), freshness) }
+}
+
+/// Find code symbols for flat search, using embedding index when available.
+///
+/// Strategy:
+/// 1. If query is non-empty and embed index is available, use `search_with_mode`
+///    to get semantically-ranked code symbols, then resolve to graph nodes.
+/// 2. Fall back to name/signature string matching if embed is unavailable or not ready.
+/// 3. Apply post-filters (kind, language, file, root, synthetic, min_complexity).
+/// 4. Apply sort_by overrides (complexity, importance) if requested; otherwise
+///    preserve embed ranking or use name-match ranking for fallback results.
+#[allow(clippy::too_many_arguments)]
+async fn flat_code_symbol_search<'a>(
+    query_str: &str,
+    search_mode: SearchMode,
+    limit: usize,
+    params: &SearchParams,
+    graph_state: &'a GraphState,
+    ctx: &SearchContext<'_>,
+    sort_by_complexity: bool,
+    sort_by_importance: bool,
+) -> Vec<&'a Node> {
+    let query_lower = query_str.to_lowercase();
+    let complexity_search = params.min_complexity.is_some() || sort_by_complexity;
+
+    // Closure: does a node pass all active filters?
+    let node_passes_filters = |n: &Node| -> bool {
+        if complexity_search && n.id.kind != NodeKind::Function { return false; }
+        if let Some(ref kf) = params.kind { if n.id.kind.to_string().to_lowercase() != kf.to_lowercase() { return false; } }
+        if let Some(ref lf) = params.language { if n.language.to_lowercase() != lf.to_lowercase() { return false; } }
+        if let Some(ref ff) = params.file { if !n.id.file.to_string_lossy().contains(ff.as_str()) { return false; } }
+        if !node_passes_root_filter(&n.id.root, &ctx.root_filter, &ctx.non_code_slugs) { return false; }
+        if let Some(sf) = params.synthetic { if (n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false)) != sf { return false; } }
+        if let Some(min_cc) = params.min_complexity {
+            let Some(cc) = n.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()) else { return false; };
+            if cc < min_cc { return false; }
+        }
+        true
+    };
+
+    // Try embed-ranked search for code symbols when query is non-empty.
+    let mut used_embed = false;
+    let mut matches: Vec<&Node> = if !query_str.is_empty() {
+        if let Some(embed_idx) = ctx.embed_index {
+            // Over-fetch to allow for post-filtering.
+            let over_fetch = limit * 3;
+            match embed_idx.search_with_mode(query_str, None, over_fetch, search_mode).await {
+                Ok(SearchOutcome::Results(results)) => {
+                    used_embed = true;
+                    // Keep only code results, resolve to graph nodes, apply filters.
+                    results.iter()
+                        .filter(|r| r.kind.starts_with("code:"))
+                        .filter_map(|r| graph_state.nodes.iter().find(|n| n.stable_id() == r.id))
+                        .filter(|n| node_passes_filters(n))
+                        .take(limit)
+                        .collect()
+                }
+                // Embedding index not ready -- fall through to name/signature fallback.
+                Ok(SearchOutcome::NotReady) => Vec::new(),
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Fallback: name/signature matching (when embed is unavailable, not ready, or query is empty).
+    if !used_embed {
+        matches = graph_state.nodes.iter().filter(|n| {
+            if complexity_search && n.id.kind != NodeKind::Function { return false; }
+            if !query_lower.is_empty() {
+                let name_match = n.id.name.to_lowercase().contains(&query_lower) || n.signature.to_lowercase().contains(&query_lower);
+                if !name_match { return false; }
+            }
+            node_passes_filters(n)
+        }).collect();
+    }
+
+    // Apply sort overrides or default ranking.
+    if sort_by_complexity {
+        matches.retain(|n| n.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).is_some());
+        matches.sort_by(|a, b| {
+            let ca = a.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+            let cb = b.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+            cb.cmp(&ca)
+        });
+    } else if sort_by_importance {
+        matches.sort_by(|a, b| {
+            let ia = a.metadata.get("importance").and_then(|s| s.parse::<f64>().ok());
+            let ib = b.metadata.get("importance").and_then(|s| s.parse::<f64>().ok());
+            match (ia, ib) {
+                (Some(a), Some(b)) => b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        });
+    } else if !used_embed {
+        // Only apply name-match ranking for fallback results; embed results
+        // are already ranked by the embedding index.
+        ranking::sort_symbol_matches(&mut matches, &query_lower, &graph_state.index);
+    }
+    matches.truncate(limit);
+    matches
 }
 
 async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Option<&str>, ctx: &SearchContext<'_>) -> String {
@@ -384,11 +454,382 @@ pub fn search_result_passes_root_filter(result: &crate::embed::SearchResult, roo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use crate::graph::{NodeId, ExtractionSource};
+    use crate::graph::index::GraphIndex;
+
+    fn make_node(name: &str, kind: NodeKind, file: &str) -> Node {
+        Node {
+            id: NodeId { kind, name: name.to_string(), file: PathBuf::from(file), root: "local".to_string() },
+            language: "rust".to_string(), signature: format!("fn {}", name),
+            line_start: 0, line_end: 10, body: String::new(),
+            metadata: BTreeMap::new(), source: ExtractionSource::TreeSitter,
+        }
+    }
+
+    fn make_graph_state(nodes: Vec<Node>) -> GraphState {
+        let index = GraphIndex::new();
+        GraphState { nodes, edges: vec![], index, last_scan_completed_at: None }
+    }
+
+    fn make_search_context<'a>(graph_state: &'a GraphState, repo_root: &'a Path) -> SearchContext<'a> {
+        SearchContext {
+            graph_state, embed_index: None, repo_root,
+            lsp_status: None, root_filter: None, non_code_slugs: HashSet::new(),
+        }
+    }
+
     #[test] fn test_search_params_default() { let p = SearchParams::default(); assert!(p.query.is_none()); assert!(!p.compact); }
     #[test] fn test_node_passes_root_filter_all() { assert!(node_passes_root_filter("any", &None, &HashSet::new())); }
     #[test] fn test_node_passes_root_filter_match() { assert!(node_passes_root_filter("my-root", &Some("my-root".into()), &HashSet::new())); }
     #[test] fn test_node_passes_root_filter_external() { assert!(node_passes_root_filter("external", &Some("my-root".into()), &HashSet::new())); }
     #[test] fn test_node_passes_root_filter_reject() { assert!(!node_passes_root_filter("other", &Some("my-root".into()), &HashSet::new())); }
+
+    // ── flat_code_symbol_search tests ──────────────────────────────────
+
+    /// Without embed index, flat search falls back to name/signature matching.
+    #[tokio::test]
+    async fn test_flat_search_fallback_name_matching() {
+        let nodes = vec![
+            make_node("auth_handler", NodeKind::Function, "src/auth.rs"),
+            make_node("db_connect", NodeKind::Function, "src/db.rs"),
+        ];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams { query: Some("auth".into()), ..Default::default() };
+
+        let results = flat_code_symbol_search(
+            "auth", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.name, "auth_handler");
+    }
+
+    /// Fallback matches against signature too.
+    #[tokio::test]
+    async fn test_flat_search_fallback_signature_matching() {
+        let mut node = make_node("process", NodeKind::Function, "src/proc.rs");
+        node.signature = "fn process(auth_token: &str)".to_string();
+        let gs = make_graph_state(vec![node]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams { query: Some("auth_token".into()), ..Default::default() };
+
+        let results = flat_code_symbol_search(
+            "auth_token", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.name, "process");
+    }
+
+    /// Kind filter works with fallback path.
+    #[tokio::test]
+    async fn test_flat_search_fallback_kind_filter() {
+        let nodes = vec![
+            make_node("Config", NodeKind::Struct, "src/config.rs"),
+            make_node("config_init", NodeKind::Function, "src/config.rs"),
+        ];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("config".into()),
+            kind: Some("struct".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "config", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.name, "Config");
+    }
+
+    /// Language filter works with fallback path.
+    #[tokio::test]
+    async fn test_flat_search_fallback_language_filter() {
+        let mut py_node = make_node("handler", NodeKind::Function, "src/handler.py");
+        py_node.language = "python".to_string();
+        let rs_node = make_node("handler", NodeKind::Function, "src/handler.rs");
+        let gs = make_graph_state(vec![py_node, rs_node]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("handler".into()),
+            language: Some("python".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].language, "python");
+    }
+
+    /// File filter works with fallback path.
+    #[tokio::test]
+    async fn test_flat_search_fallback_file_filter() {
+        let nodes = vec![
+            make_node("parse", NodeKind::Function, "src/parser.rs"),
+            make_node("parse", NodeKind::Function, "src/config.rs"),
+        ];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("parse".into()),
+            file: Some("parser".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "parse", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].id.file.to_string_lossy().contains("parser"));
+    }
+
+    /// sort_by=complexity works with fallback path.
+    #[tokio::test]
+    async fn test_flat_search_sort_by_complexity() {
+        let mut low = make_node("simple", NodeKind::Function, "a.rs");
+        low.metadata.insert("cyclomatic".into(), "2".into());
+        let mut high = make_node("complex", NodeKind::Function, "b.rs");
+        high.metadata.insert("cyclomatic".into(), "15".into());
+        let gs = make_graph_state(vec![low, high]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            kind: Some("function".into()),
+            sort_by: Some("complexity".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, true, false,
+        ).await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id.name, "complex");
+        assert_eq!(results[1].id.name, "simple");
+    }
+
+    /// sort_by=importance works with fallback path.
+    #[tokio::test]
+    async fn test_flat_search_sort_by_importance() {
+        let mut low = make_node("leaf", NodeKind::Function, "a.rs");
+        low.metadata.insert("importance".into(), "0.01".into());
+        let mut high = make_node("hub", NodeKind::Function, "b.rs");
+        high.metadata.insert("importance".into(), "0.95".into());
+        let gs = make_graph_state(vec![low, high]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("".into()),
+            kind: Some("function".into()),
+            sort_by: Some("importance".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, true,
+        ).await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id.name, "hub");
+    }
+
+    /// search_mode is parsed correctly for all variants.
+    #[test]
+    fn test_search_mode_parsing_coverage() {
+        assert!(matches!(parse_search_mode(None), SearchMode::Hybrid));
+        assert!(matches!(parse_search_mode(Some("hybrid")), SearchMode::Hybrid));
+        assert!(matches!(parse_search_mode(Some("keyword")), SearchMode::Keyword));
+        assert!(matches!(parse_search_mode(Some("semantic")), SearchMode::Semantic));
+        assert!(matches!(parse_search_mode(Some("SEMANTIC")), SearchMode::Semantic));
+        assert!(matches!(parse_search_mode(Some("unknown")), SearchMode::Hybrid));
+    }
+
+    /// Empty query with no filters returns empty results (via the search function).
+    #[tokio::test]
+    async fn test_flat_search_empty_query_no_filters() {
+        let gs = make_graph_state(vec![make_node("foo", NodeKind::Function, "a.rs")]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams::default();
+
+        let result = search(&params, &ctx).await;
+        assert!(result.contains("Empty query"), "Should reject empty query without filters");
+    }
+
+    /// Verify full search function respects search_mode parameter in output
+    /// (no error, produces results via fallback when embed is absent).
+    #[tokio::test]
+    async fn test_flat_search_with_search_mode_no_embed() {
+        let nodes = vec![make_node("auth_handler", NodeKind::Function, "src/auth.rs")];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("auth".into()),
+            search_mode: Some("semantic".into()),
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+        assert!(result.contains("auth_handler"), "Fallback should find by name even with search_mode=semantic");
+        assert!(result.contains("Code symbols"), "Should have code symbols section");
+    }
+
+    /// min_complexity filter works with the new code path.
+    #[tokio::test]
+    async fn test_flat_search_min_complexity_filter() {
+        let mut simple = make_node("simple", NodeKind::Function, "a.rs");
+        simple.metadata.insert("cyclomatic".into(), "2".into());
+        let mut complex = make_node("complex", NodeKind::Function, "b.rs");
+        complex.metadata.insert("cyclomatic".into(), "10".into());
+        let gs = make_graph_state(vec![simple, complex]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            min_complexity: Some(5),
+            kind: Some("function".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.name, "complex");
+    }
+
+    // ── Adversarial tests (seeded from dissent) ──────────────────────
+
+    /// Dissent #1: Multiple filters stacked -- kind + language + file should
+    /// all compose correctly in fallback path.
+    #[tokio::test]
+    async fn test_flat_search_stacked_filters() {
+        let mut target = make_node("handler", NodeKind::Function, "src/api/handler.rs");
+        target.language = "rust".to_string();
+        let mut wrong_kind = make_node("handler", NodeKind::Struct, "src/api/handler.rs");
+        wrong_kind.language = "rust".to_string();
+        let mut wrong_lang = make_node("handler", NodeKind::Function, "src/api/handler.py");
+        wrong_lang.language = "python".to_string();
+        let wrong_file = make_node("handler", NodeKind::Function, "src/db/handler.rs");
+        let gs = make_graph_state(vec![target, wrong_kind, wrong_lang, wrong_file]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("handler".into()),
+            kind: Some("function".into()),
+            language: Some("rust".into()),
+            file: Some("api".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 1, "Only one node should pass all three filters");
+        assert_eq!(results[0].id.name, "handler");
+        assert!(results[0].id.file.to_string_lossy().contains("api"));
+    }
+
+    /// Dissent #2: Limit respected when more results available.
+    #[tokio::test]
+    async fn test_flat_search_limit_respected() {
+        let nodes: Vec<Node> = (0..20)
+            .map(|i| make_node(&format!("fn_{}", i), NodeKind::Function, "src/lib.rs"))
+            .collect();
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("fn".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "fn", SearchMode::Hybrid, 5, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 5, "Should respect limit of 5 even with 20 matches");
+    }
+
+    /// Dissent #3: Root filter rejects non-matching roots in fallback.
+    #[tokio::test]
+    async fn test_flat_search_root_filter_fallback() {
+        let mut local = make_node("handler", NodeKind::Function, "src/handler.rs");
+        local.id.root = "my-project".to_string();
+        let mut other = make_node("handler", NodeKind::Function, "src/handler.rs");
+        other.id.root = "other-project".to_string();
+        let gs = make_graph_state(vec![local, other]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = SearchContext {
+            graph_state: &gs, embed_index: None, repo_root: &repo_root,
+            lsp_status: None, root_filter: Some("my-project".into()),
+            non_code_slugs: HashSet::new(),
+        };
+        let params = SearchParams {
+            query: Some("handler".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 1, "Should only return nodes from matching root");
+        assert_eq!(results[0].id.root, "my-project");
+    }
+
+    /// Dissent #3: synthetic filter works correctly.
+    #[tokio::test]
+    async fn test_flat_search_synthetic_filter() {
+        let mut synth = make_node("CONSTANT", NodeKind::Const, "src/lib.rs");
+        synth.metadata.insert("synthetic".into(), "true".into());
+        let real = make_node("real_fn", NodeKind::Function, "src/lib.rs");
+        let gs = make_graph_state(vec![synth, real]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+
+        // Only synthetic
+        let params = SearchParams {
+            kind: Some("const".into()),
+            synthetic: Some(true),
+            ..Default::default()
+        };
+        let results = flat_code_symbol_search(
+            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.name, "CONSTANT");
+
+        // Only non-synthetic
+        let params2 = SearchParams {
+            synthetic: Some(false),
+            kind: Some("function".into()),
+            ..Default::default()
+        };
+        let results2 = flat_code_symbol_search(
+            "", SearchMode::Hybrid, 10, &params2, &gs, &ctx, false, false,
+        ).await;
+        assert_eq!(results2.len(), 1);
+        assert_eq!(results2[0].id.name, "real_fn");
+    }
 }
 
 // ── Outcome progress ───────────────────────────────────────────────
