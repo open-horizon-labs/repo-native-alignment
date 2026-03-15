@@ -385,4 +385,32 @@ mod tests {
         assert!(compact.contains("fn complex_fn("));
         assert!(!compact.contains("a: i32"));
     }
+
+    #[test]
+    fn test_is_static_display_compact_and_full() {
+        let index = GraphIndex::new();
+
+        // Static method: is_static = "true"
+        let mut static_node = make_test_node("create");
+        static_node.metadata.insert("is_static".to_string(), "true".to_string());
+        let compact = format_node_entry(&static_node, &index, true);
+        let full = format_node_entry(&static_node, &index, false);
+        assert!(compact.contains(" static"), "compact should show 'static' tag, got: {}", compact);
+        assert!(full.contains("Static: yes"), "full should show 'Static: yes', got: {}", full);
+
+        // Instance method: is_static = "false"
+        let mut instance_node = make_test_node("serve");
+        instance_node.metadata.insert("is_static".to_string(), "false".to_string());
+        let compact = format_node_entry(&instance_node, &index, true);
+        let full = format_node_entry(&instance_node, &index, false);
+        assert!(!compact.contains(" static"), "compact should NOT show 'static' for instance method, got: {}", compact);
+        assert!(full.contains("Static: no"), "full should show 'Static: no', got: {}", full);
+
+        // Top-level function: no is_static metadata
+        let top_level = make_test_node("main");
+        let compact = format_node_entry(&top_level, &index, true);
+        let full = format_node_entry(&top_level, &index, false);
+        assert!(!compact.contains("static"), "compact should NOT show 'static' for top-level function, got: {}", compact);
+        assert!(!full.contains("Static:"), "full should NOT show 'Static:' for top-level function, got: {}", full);
+    }
 }

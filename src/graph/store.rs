@@ -213,6 +213,20 @@ mod tests {
     }
 
     #[test]
+    fn test_is_static_column_type_and_nullability() {
+        // Adversarial: verify is_static is Boolean and nullable in both schemas
+        let schema = symbols_schema();
+        let field = schema.field_with_name("is_static").expect("is_static missing from symbols_schema");
+        assert_eq!(*field.data_type(), DataType::Boolean, "is_static should be Boolean");
+        assert!(field.is_nullable(), "is_static should be nullable (top-level functions have no is_static)");
+
+        let vec_schema = symbols_schema_with_vector(384);
+        let vec_field = vec_schema.field_with_name("is_static").expect("is_static missing from symbols_schema_with_vector");
+        assert_eq!(*vec_field.data_type(), DataType::Boolean, "is_static should be Boolean in vector schema");
+        assert!(vec_field.is_nullable(), "is_static should be nullable in vector schema");
+    }
+
+    #[test]
     fn test_edges_schema_fields() {
         let schema = edges_schema();
         assert!(schema.field_with_name("id").is_ok());
