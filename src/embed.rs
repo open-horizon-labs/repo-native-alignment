@@ -482,7 +482,7 @@ impl EmbeddingIndex {
             let text = if node.metadata.contains_key("oh_kind") {
                 build_artifact_embedding_text(&node.id.name, &node.body, &node.metadata)
             } else {
-                match node.id.kind {
+                match &node.id.kind {
                     crate::graph::NodeKind::MarkdownSection => {
                         truncate_chars(&node.body, 500).to_string()
                     }
@@ -770,7 +770,7 @@ impl EmbeddingIndex {
             let text = if node.metadata.contains_key("oh_kind") {
                 build_artifact_embedding_text(&node.id.name, &node.body, &node.metadata)
             } else {
-                match node.id.kind {
+                match &node.id.kind {
                     crate::graph::NodeKind::MarkdownSection => {
                         truncate_chars(&node.body, 500).to_string()
                     }
