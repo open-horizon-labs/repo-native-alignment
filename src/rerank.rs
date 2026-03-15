@@ -22,7 +22,7 @@ static RERANKER: Mutex<Option<TextRerank>> = Mutex::new(None);
 /// Return the model cache directory.
 /// Precedence: `FASTEMBED_CACHE_DIR` env var > `~/.cache/rna/models/` > fastembed default.
 fn rna_cache_dir() -> std::path::PathBuf {
-    if let Ok(explicit) = std::env::var("FASTEMBED_CACHE_DIR") {
+    if let Some(explicit) = std::env::var("FASTEMBED_CACHE_DIR").ok().filter(|v| !v.is_empty()) {
         return std::path::PathBuf::from(explicit);
     }
     if let Ok(home) = std::env::var("HOME") {

@@ -94,7 +94,7 @@ fn main() -> anyhow::Result<()> {
     // Set fastembed model cache to ~/.cache/rna/models/ instead of .fastembed_cache/
     // in the current directory. Must be set before Tokio runtime and any fastembed
     // initialization (reranker model, or any future fastembed embedding model).
-    if std::env::var("FASTEMBED_CACHE_DIR").is_err()
+    if std::env::var("FASTEMBED_CACHE_DIR").ok().filter(|v| !v.is_empty()).is_none()
         && let Ok(home) = std::env::var("HOME")
     {
         let cache_dir = std::path::PathBuf::from(home).join(".cache").join("rna").join("models");
