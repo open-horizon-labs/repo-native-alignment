@@ -403,7 +403,13 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
                         }
                     }
                     groups.retain(|_, ids| !ids.is_empty());
-                    let total: usize = groups.values().map(|ids| ids.len()).sum();
+                    let total: usize = groups.values().map(|ids| {
+                        ids.iter().filter(|id| {
+                            gs.nodes.iter().find(|n| n.stable_id() == **id)
+                                .map(|n| !crate::server::helpers::is_hidden_traversal_kind(&n.id.kind))
+                                .unwrap_or(true)
+                        }).count()
+                    }).sum();
                     if total == 0 { sections.push(format!("### `{}`\n\nNo {} results.", nid, mode)); }
                     else { let md = format_neighbors_grouped(&gs.nodes, &groups, &gs.index, params.compact); sections.push(format!("### `{}`\n\n{} result(s)\n\n{}", nid, total, md)); }
                 }
