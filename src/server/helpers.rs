@@ -140,6 +140,9 @@ pub(crate) fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bo
         if let Some(hint) = n.metadata.get("pattern_hint") {
             entry.push_str(&format!(" ~{}", hint));
         }
+        if n.metadata.get("is_static").map(|s| s == "true").unwrap_or(false) {
+            entry.push_str(" static");
+        }
         if let Some(decorators) = n.metadata.get("decorators") {
             entry.push_str(&format!(" [{}]", decorators));
         }
@@ -185,6 +188,9 @@ pub(crate) fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bo
         }
         if let Some(hint) = n.metadata.get("pattern_hint") {
             entry.push_str(&format!("\n  Pattern: {}", hint));
+        }
+        if let Some(is_static) = n.metadata.get("is_static") {
+            entry.push_str(&format!("\n  Static: {}", if is_static == "true" { "yes" } else { "no" }));
         }
         if let Some(decorators) = n.metadata.get("decorators") {
             entry.push_str(&format!("\n  Decorators: {}", decorators));

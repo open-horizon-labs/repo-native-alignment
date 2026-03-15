@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search`.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -54,6 +54,7 @@ pub fn symbols_schema() -> Schema {
         Field::new("decorators", DataType::Utf8, true),        // metadata["decorators"] — comma-separated decorator/attribute text
         Field::new("type_params", DataType::Utf8, true),       // metadata["type_params"] — generic type parameters (e.g. "<T: Clone + Send>")
         Field::new("pattern_hint", DataType::Utf8, true),        // metadata["pattern_hint"] — design pattern from naming conventions (e.g. "factory", "observer")
+        Field::new("is_static", DataType::Boolean, true),           // metadata["is_static"] — true for static/associated methods, false for instance methods
         // Vector column is added dynamically when embeddings are computed,
         // since the dimension depends on the model. See `symbols_schema_with_vector`.
         Field::new("updated_at", DataType::Int64, false),
@@ -87,6 +88,7 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("decorators", DataType::Utf8, true),
         Field::new("type_params", DataType::Utf8, true),
         Field::new("pattern_hint", DataType::Utf8, true),
+        Field::new("is_static", DataType::Boolean, true),
         Field::new(
             "vector",
             DataType::FixedSizeList(
@@ -193,6 +195,7 @@ mod tests {
         assert!(schema.field_with_name("mutable").is_ok());
         assert!(schema.field_with_name("decorators").is_ok());
         assert!(schema.field_with_name("type_params").is_ok());
+        assert!(schema.field_with_name("is_static").is_ok());
         assert!(schema.field_with_name("updated_at").is_ok());
         // no vector column in base schema
         assert!(schema.field_with_name("vector").is_err());
