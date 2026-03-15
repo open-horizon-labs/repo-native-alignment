@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 #[macros::mcp_tool(
     name = "outcome_progress",
-    description = "Track progress on a business outcome. Finds tagged commits, code symbols in changed files, and related markdown. Returns a navigable summary with stable Node IDs for use with search. Use search(node: \"<id>\", mode: \"neighbors\") for graph traversal. Set include_impact=true to add risk-classified blast radius showing which symbols are affected by the changes and how critical they are. Results default to the primary workspace root; pass root: \"all\" for cross-root search."
+    description = "Track progress on a business outcome. Finds tagged commits, changed symbols, and related docs. Set include_impact=true for risk-classified blast radius."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct OutcomeProgress {
@@ -28,7 +28,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search",
-    description = "All-in-one search: code symbols, business artifacts (.oh/), commits, and markdown. Without `mode`, performs flat ranked search using embedding index (hybrid BM25+vector by default) plus optional artifact/markdown results (enabled by default via `include_artifacts` and `include_markdown`). Falls back to name/signature matching when the embedding index is still building. With `mode` (neighbors/impact/reachable/tests_for), performs graph traversal from matched symbols. `tests_for` finds which test functions call a symbol. Entry point: `query` (name or semantic search) or `node` (stable ID from previous results). Batch: `nodes` retrieves multiple IDs in one call. `compact: true` returns signature + location only (~25x fewer tokens). Filter by kind, language, file. Sort by relevance, complexity, or importance (PageRank). search_mode: hybrid (default, keyword+vector RRF), keyword (BM25 only), semantic (vector only) — applies to code symbol search, artifact search, and graph entry-point resolution. `rerank: true` applies cross-encoder reranking to top candidates for more precise relevance scoring on natural language queries (~100-300ms extra latency). Results default to the primary workspace root; pass root: \"all\" for cross-root search."
+    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Add `mode` for graph traversal (neighbors/impact/reachable/tests_for). Use `compact: true` to save tokens. Use `rerank: true` for natural language queries."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct Search {
@@ -239,7 +239,7 @@ pub struct ListRoots {}
 
 #[macros::mcp_tool(
     name = "repo_map",
-    description = "Repository orientation for agents. Returns top symbols by PageRank importance, hotspot files (most definitions), active business outcomes, and entry points (main/handler functions). One call replaces an exploratory loop of search calls. Use this when starting work on an unfamiliar codebase. Results default to the primary workspace root; pass root: \"all\" for cross-root search."
+    description = "Codebase orientation. Top symbols by importance, hotspot files, active outcomes, entry points. Use when starting on an unfamiliar codebase."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct RepoMap {
