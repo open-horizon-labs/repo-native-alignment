@@ -1581,16 +1581,6 @@ impl RnaHandler {
                         }
                     }
 
-                    // Collect nodes to persist/re-embed BEFORE releasing the lock.
-                    let upsert_nodes: Vec<Node> = gs.nodes.iter()
-                        .filter(|n| enriched_node_ids.contains(&n.stable_id()))
-                        .cloned()
-                        .collect();
-                    let all_upsert_nodes: Vec<Node> = enrichment.new_nodes.iter()
-                        .chain(upsert_nodes.iter())
-                        .cloned()
-                        .collect();
-
                     // Recompute PageRank after topology changes.
                     let pagerank_scores = gs.index.compute_pagerank(0.85, 20);
                     for node in &mut gs.nodes {
@@ -1598,6 +1588,16 @@ impl RnaHandler {
                             node.metadata.insert("importance".to_string(), format!("{:.6}", score));
                         }
                     }
+
+                    // Collect nodes to persist/re-embed AFTER PageRank so importance is current.
+                    let all_upsert_node_ids: std::collections::HashSet<String> =
+                        enriched_node_ids.iter().cloned()
+                            .chain(enrichment.new_nodes.iter().map(|n| n.stable_id()))
+                            .collect();
+                    let all_upsert_nodes: Vec<Node> = gs.nodes.iter()
+                        .filter(|n| all_upsert_node_ids.contains(&n.stable_id()))
+                        .cloned()
+                        .collect();
 
                     let edge_count = persist_edges.len();
                     drop(guard); // Release lock before slow I/O.
