@@ -105,7 +105,7 @@ fn default_true() -> Option<bool> {
 
 #[macros::mcp_tool(
     name = "search_symbols",
-    description = "DEPRECATED: use `search` instead. Find code symbols by name or signature. This is an alias for `search` without a `mode` parameter."
+    description = "DEPRECATED: use `search` instead."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SearchSymbols {
@@ -169,7 +169,7 @@ impl SearchSymbols {
 
 #[macros::mcp_tool(
     name = "graph_query",
-    description = "DEPRECATED: use `search` with a `mode` parameter instead. Trace code relationships from a symbol or natural language query."
+    description = "DEPRECATED: use `search` with `mode` instead."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GraphQuery {
