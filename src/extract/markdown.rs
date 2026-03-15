@@ -241,8 +241,8 @@ fn emit_frontmatter_ref_edges(
 
         let target_path = PathBuf::from(format!(".oh/{}/{}.md", target_dir, value));
 
-        // Don't emit self-references
-        if path == target_path {
+        // Don't emit self-references (handles both relative and absolute source paths)
+        if path == target_path || path.ends_with(&target_path) {
             continue;
         }
 
