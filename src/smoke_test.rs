@@ -1306,7 +1306,13 @@ async fn run_schema_version_check() -> Check {
         return Check::fail("schema_version_check", format!("Failed to seed stale version file: {}", e));
     }
     // Create a dummy table directory so has_lance_data() detects stale data.
-    let _ = std::fs::create_dir_all(db_path.join("symbols.lance"));
+    if let Err(e) = std::fs::create_dir_all(db_path.join("symbols.lance")) {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return Check::fail(
+            "schema_version_check",
+            format!("Failed to create dummy LanceDB data directory: {}", e),
+        );
+    }
 
     // Step 2: First call — expect migration (returns true).
     let migrated = match check_and_migrate_schema(&db_path).await {

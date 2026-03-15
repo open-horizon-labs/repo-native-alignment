@@ -54,26 +54,38 @@ pub(crate) async fn check_and_migrate_schema(db_path: &Path) -> anyhow::Result<b
     // directory contains data files (legacy state without version file).
     let had_stale_data = stored_version.is_some() || has_lance_data(db_path);
 
-    tracing::info!(
-        "Schema version mismatch (stored={:?}, current={}) — dropping all LanceDB data",
-        stored_version,
-        SCHEMA_VERSION
-    );
+    if had_stale_data {
+        tracing::info!(
+            "Schema version mismatch (stored={:?}, current={}) — dropping all LanceDB data",
+            stored_version,
+            SCHEMA_VERSION
+        );
+    } else {
+        tracing::debug!(
+            "No stored schema version found; initializing schema_version to {}",
+            SCHEMA_VERSION
+        );
+    }
 
     // Delete all LanceDB data by removing directory contents (except the version file
     // we're about to write). This is more reliable than drop_table which can fail
     // on corrupted/incompatible tables.
     if let Ok(entries) = std::fs::read_dir(db_path) {
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry.context("check_and_migrate_schema: failed to read db_path entry")?;
             let path = entry.path();
             // Don't delete the version file yet — we'll overwrite it below.
             if path.file_name().map(|n| n == "schema_version").unwrap_or(false) {
                 continue;
             }
             if path.is_dir() {
-                let _ = std::fs::remove_dir_all(&path);
+                std::fs::remove_dir_all(&path).with_context(|| {
+                    format!("check_and_migrate_schema: failed to remove directory {}", path.display())
+                })?;
             } else {
-                let _ = std::fs::remove_file(&path);
+                std::fs::remove_file(&path).with_context(|| {
+                    format!("check_and_migrate_schema: failed to remove file {}", path.display())
+                })?;
             }
         }
     }
