@@ -230,23 +230,10 @@ pub(crate) fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bo
 }
 
 /// Node kinds that are structural scaffolding and should be hidden from traversal results.
-/// These are filtered by `format_neighbor_nodes` when rendering, so we must also filter
+/// These are filtered by `format_neighbors_grouped` when rendering, so we must also filter
 /// them from the ID list before counting to keep the reported count accurate.
 pub(crate) fn is_hidden_traversal_kind(kind: &graph::NodeKind) -> bool {
     matches!(kind, graph::NodeKind::Module | graph::NodeKind::PrMerge)
-}
-
-/// Remove IDs whose node kind is hidden scaffolding (Module, PrMerge) from traversal results.
-/// This ensures the count shown in headings matches the nodes actually rendered.
-#[allow(dead_code)]
-pub(crate) fn retain_displayable(all_ids: &mut Vec<String>, nodes: &[graph::Node]) {
-    all_ids.retain(|id| {
-        nodes.iter()
-            .find(|n| n.stable_id() == *id)
-            .map(|n| !is_hidden_traversal_kind(&n.id.kind))
-            // If node not found, keep the ID (it will render as a fallback `id` line)
-            .unwrap_or(true)
-    });
 }
 
 /// Format traversal results grouped by edge type.
@@ -305,8 +292,11 @@ pub(crate) fn format_neighbors_grouped(
     sections.join("\n\n")
 }
 
-/// Capitalize the first character of a string.
+/// Capitalize the first character of a string and replace underscores with spaces.
+///
+/// Example: `depends_on` -> `Depends on`, `calls` -> `Calls`
 fn capitalize_first(s: &str) -> String {
+    let s = s.replace('_', " ");
     let mut chars = s.chars();
     match chars.next() {
         None => String::new(),
@@ -314,6 +304,8 @@ fn capitalize_first(s: &str) -> String {
     }
 }
 
+/// Format neighbor nodes as a flat list (non-grouped). Available for contexts
+/// where edge-type grouping is not needed (e.g., outcome_progress display).
 #[allow(dead_code)]
 pub(crate) fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String], index: &GraphIndex, compact: bool) -> String {
     ids.iter()
@@ -502,7 +494,7 @@ mod tests {
         let result = format_neighbors_grouped(&nodes, &groups, &index, true);
 
         assert!(result.contains("#### Calls (2)"), "should have Calls header, got: {}", result);
-        assert!(result.contains("#### Depends_on (1)"), "should have DependsOn header, got: {}", result);
+        assert!(result.contains("#### Depends on (1)"), "should have DependsOn header, got: {}", result);
         assert!(result.contains("callee_a"), "should contain callee_a");
         assert!(result.contains("callee_b"), "should contain callee_b");
         assert!(result.contains("dep_c"), "should contain dep_c");
@@ -526,7 +518,7 @@ mod tests {
         let result = format_neighbors_grouped(&nodes, &groups, &index, true);
 
         assert!(result.contains("#### Calls (1)"), "should have Calls header");
-        assert!(!result.contains("Depends_on"), "should not have empty DependsOn section");
+        assert!(!result.contains("Depends on"), "should not have empty DependsOn section");
     }
 
     #[test]
