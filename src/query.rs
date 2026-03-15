@@ -270,6 +270,7 @@ pub fn compute_impact_risk(
         EdgeKind::HasField,
         EdgeKind::Evolves,
         EdgeKind::ReferencedBy,
+        EdgeKind::References,
         EdgeKind::TopologyBoundary,
     ];
 

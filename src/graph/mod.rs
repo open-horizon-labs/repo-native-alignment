@@ -156,6 +156,8 @@ pub enum EdgeKind {
     HasField,
     Evolves,
     ReferencedBy,
+    /// A node references another (e.g., markdown link to another file).
+    References,
     TopologyBoundary,
     /// PR modified this symbol/schema/component.
     Modified,
@@ -176,6 +178,7 @@ impl fmt::Display for EdgeKind {
             EdgeKind::HasField => write!(f, "has_field"),
             EdgeKind::Evolves => write!(f, "evolves"),
             EdgeKind::ReferencedBy => write!(f, "referenced_by"),
+            EdgeKind::References => write!(f, "references"),
             EdgeKind::TopologyBoundary => write!(f, "topology_boundary"),
             EdgeKind::Modified => write!(f, "modified"),
             EdgeKind::Affected => write!(f, "affected"),

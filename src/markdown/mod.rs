@@ -60,8 +60,12 @@ pub fn parse_markdown_source(source: &str, path: &Path) -> Vec<MarkdownChunk> {
     let mut current_heading_level: u32 = 0;
     let mut current_heading_plain_text = String::new(); // heading text without # prefix
     let mut current_code_spans: Vec<String> = Vec::new();
+    let mut current_links: Vec<(String, String)> = Vec::new();
     let mut chunk_byte_start: usize = 0;
     let mut in_heading = false;
+    let mut in_link = false;
+    let mut current_link_dest = String::new();
+    let mut current_link_text = String::new();
     let mut current_heading_text = String::new();
     let mut current_heading_lvl: u32 = 0;
     let mut saw_any_heading = false;
@@ -89,6 +93,7 @@ pub fn parse_markdown_source(source: &str, path: &Path) -> Vec<MarkdownChunk> {
                         byte_offset: chunk_byte_start + byte_offset_base,
                         byte_len: byte_end - chunk_byte_start,
                         code_spans: std::mem::take(&mut current_code_spans),
+                        links: std::mem::take(&mut current_links),
                     });
                 }
 
@@ -123,15 +128,34 @@ pub fn parse_markdown_source(source: &str, path: &Path) -> Vec<MarkdownChunk> {
                 current_heading_text = String::new();
             }
 
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                in_link = true;
+                current_link_dest = dest_url.to_string();
+                current_link_text = String::new();
+            }
+
+            Event::End(TagEnd::Link) => {
+                if in_link {
+                    current_links.push((current_link_text.clone(), current_link_dest.clone()));
+                    in_link = false;
+                }
+            }
+
             Event::Text(text) => {
                 if in_heading {
                     current_heading_text.push_str(&text);
+                }
+                if in_link {
+                    current_link_text.push_str(&text);
                 }
             }
 
             Event::Code(text) => {
                 if in_heading {
                     current_heading_text.push_str(&text);
+                }
+                if in_link {
+                    current_link_text.push_str(&text);
                 }
                 current_code_spans.push(text.to_string());
             }
@@ -156,6 +180,7 @@ pub fn parse_markdown_source(source: &str, path: &Path) -> Vec<MarkdownChunk> {
             byte_offset: chunk_byte_start + byte_offset_base,
             byte_len: byte_end - chunk_byte_start,
             code_spans: std::mem::take(&mut current_code_spans),
+            links: std::mem::take(&mut current_links),
         });
     }
 
@@ -235,6 +260,7 @@ fn extract_frontmatter_chunk<'a>(
                 byte_offset: 0,
                 byte_len: rest_start,
                 code_spans: Vec::new(),
+                links: Vec::new(),
             };
             return (Some(chunk), &source[rest_start..], rest_start);
         }
@@ -543,6 +569,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 11,
                 code_spans: vec![],
+                links: vec![],
             },
             MarkdownChunk {
                 file_path: PathBuf::from("b.md"),
@@ -556,6 +583,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 13,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -586,6 +614,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 30,
                 code_spans: vec![],
+                links: vec![],
             },
             MarkdownChunk {
                 file_path: PathBuf::from("a.md"),
@@ -599,6 +628,7 @@ mod tests {
                 byte_offset: 30,
                 byte_len: 36,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -652,6 +682,7 @@ mod tests {
             byte_offset: 0,
             byte_len: 26,
             code_spans: vec![],
+            links: vec![],
         };
 
         let text = chunk.embedding_text();
@@ -730,6 +761,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 27,
                 code_spans: vec![],
+                links: vec![],
             },
             MarkdownChunk {
                 file_path: PathBuf::from("b.md"),
@@ -742,6 +774,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 32,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -766,6 +799,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 22,
                 code_spans: vec![],
+                links: vec![],
             },
             MarkdownChunk {
                 file_path: PathBuf::from("b.md"),
@@ -778,6 +812,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 22,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -802,6 +837,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 30,
                 code_spans: vec!["parse_config".to_string()],
+                links: vec![],
             },
             MarkdownChunk {
                 file_path: PathBuf::from("b.md"),
@@ -814,6 +850,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 30,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -838,6 +875,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 11,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -871,6 +909,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 31,
                 code_spans: vec![],
+                links: vec![],
             },
             // Content-only match with high density + code span at h1
             MarkdownChunk {
@@ -884,6 +923,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 110,
                 code_spans: vec!["parse_config".to_string()],
+                links: vec![],
             },
         ];
 
@@ -915,6 +955,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 10,
                 code_spans: vec![],
+                links: vec![],
             },
             MarkdownChunk {
                 file_path: PathBuf::from("b.md"),
@@ -927,6 +968,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 29,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -957,6 +999,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 18,
                 code_spans: vec![],
+                links: vec![],
             },
             MarkdownChunk {
                 file_path: PathBuf::from("b.md"),
@@ -969,6 +1012,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 14,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -1004,6 +1048,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 40,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -1035,6 +1080,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 30,
                 code_spans: vec![],
+                links: vec![],
             },
             MarkdownChunk {
                 file_path: PathBuf::from("cjk.md"),
@@ -1047,6 +1093,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 18,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -1082,6 +1129,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 19,
                 code_spans: vec![],
+                links: vec![],
             },
             MarkdownChunk {
                 file_path: PathBuf::from("b.md"),
@@ -1094,6 +1142,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 18,
                 code_spans: vec![],
+                links: vec![],
             },
             MarkdownChunk {
                 file_path: PathBuf::from("c.md"),
@@ -1106,6 +1155,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 26,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -1141,6 +1191,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 39,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -1172,6 +1223,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 33,
                 code_spans: vec![],
+                links: vec![],
             })
             .collect();
 
@@ -1210,6 +1262,7 @@ mod tests {
             byte_offset: 0,
             byte_len: 200,
             code_spans: vec![],
+            links: vec![],
         }];
 
         let results = search_chunks_ranked(&chunks, "x");
@@ -1245,6 +1298,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 23,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -1275,6 +1329,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 25,
                 code_spans: vec!["ParseConfig".to_string()],
+                links: vec![],
             },
         ];
 
@@ -1312,6 +1367,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 38,
                 code_spans: vec![],
+                links: vec![],
             },
             MarkdownChunk {
                 file_path: PathBuf::from("b.md"),
@@ -1324,6 +1380,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 27,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -1353,6 +1410,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 17,
                 code_spans: vec![],
+                links: vec![],
             },
             MarkdownChunk {
                 file_path: PathBuf::from("exact.md"),
@@ -1365,6 +1423,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 17,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -1436,6 +1495,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 22,
                 code_spans: vec![],
+                links: vec![],
             },
             MarkdownChunk {
                 file_path: PathBuf::from("a.md"),
@@ -1448,6 +1508,7 @@ mod tests {
                 byte_offset: 22,
                 byte_len: 33,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -1476,6 +1537,7 @@ mod tests {
                 byte_offset: 0,
                 byte_len: 22,
                 code_spans: vec![],
+                links: vec![],
             },
             MarkdownChunk {
                 file_path: PathBuf::from("a.md"),
@@ -1488,6 +1550,7 @@ mod tests {
                 byte_offset: 22,
                 byte_len: 38,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -1691,6 +1754,7 @@ Deepest content.\n";
             byte_offset: 0,
             byte_len: 1000,
             code_spans: vec![],
+            links: vec![],
         };
 
         let text = chunk.embedding_text();
@@ -1715,6 +1779,7 @@ Deepest content.\n";
             byte_offset: 0,
             byte_len: 11,
             code_spans: vec![],
+            links: vec![],
         };
 
         // Should not panic even with very long section_path
@@ -1751,6 +1816,7 @@ Deepest content.\n";
             byte_offset: 0,
             byte_len: 600,
             code_spans: vec![],
+            links: vec![],
         };
 
         // Must not panic on multibyte boundary
@@ -1828,6 +1894,7 @@ Deepest content.\n";
             byte_offset: 0,
             byte_len: 28,
             code_spans: vec![],
+            links: vec![],
         }];
 
         let results = search_chunks(&chunks, "Architecture");
@@ -1847,6 +1914,7 @@ Deepest content.\n";
             byte_offset: 0,
             byte_len: 23,
             code_spans: vec![],
+            links: vec![],
         }];
 
         assert_eq!(search_chunks(&chunks, "readme").len(), 1);
@@ -1867,6 +1935,7 @@ Deepest content.\n";
             byte_offset: 0,
             byte_len: 5,
             code_spans: vec![],
+            links: vec![],
         }];
 
         // Empty string is contained in everything — should match all chunks
@@ -1889,6 +1958,7 @@ Deepest content.\n";
                 byte_offset: 0,
                 byte_len: 11,
                 code_spans: vec![],
+                links: vec![],
             },
             MarkdownChunk {
                 file_path: PathBuf::from("b.md"),
@@ -1901,6 +1971,7 @@ Deepest content.\n";
                 byte_offset: 0,
                 byte_len: 11,
                 code_spans: vec![],
+                links: vec![],
             },
         ];
 
@@ -1935,6 +2006,7 @@ Deepest content.\n";
             byte_offset: 0,
             byte_len: 17,
             code_spans: vec![],
+            links: vec![],
         };
 
         let text = chunk.embedding_text();
@@ -1960,6 +2032,7 @@ Deepest content.\n";
             byte_offset: 0,
             byte_len: 14,
             code_spans: vec![],
+            links: vec![],
         };
 
         let text = chunk.embedding_text();
