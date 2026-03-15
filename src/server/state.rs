@@ -71,6 +71,10 @@ pub struct LspEnrichmentStatus {
     state: std::sync::atomic::AtomicU8,
     /// Number of edges added by the most recent enrichment pass.
     edge_count: std::sync::atomic::AtomicUsize,
+    /// Whether the most recent persist to LanceDB failed.
+    /// When true, the footer shows "persist failed" to indicate edges are
+    /// in-memory but may not have been written to disk.
+    persist_failed: std::sync::atomic::AtomicBool,
     /// When enrichment last completed (for auto-hide after 30 s).
     completed_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// When the status was created (for elapsed time in transitions).
@@ -87,6 +91,7 @@ impl Default for LspEnrichmentStatus {
         Self {
             state: std::sync::atomic::AtomicU8::new(0),
             edge_count: std::sync::atomic::AtomicUsize::new(0),
+            persist_failed: std::sync::atomic::AtomicBool::new(false),
             completed_at: std::sync::Mutex::new(None),
             created_at: now,
             last_transition_at: std::sync::Mutex::new(now),
@@ -151,11 +156,31 @@ impl LspEnrichmentStatus {
 
     pub fn set_complete(&self, edge_count: usize) {
         self.edge_count.store(edge_count, std::sync::atomic::Ordering::Release);
+        self.persist_failed.store(false, std::sync::atomic::Ordering::Release);
         *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
         let prev = LspState::from_u8(
             self.state.swap(Self::COMPLETE, std::sync::atomic::Ordering::AcqRel)
         );
         self.log_transition(prev, LspState::Complete, &format!("{} edges", edge_count));
+    }
+
+    /// Mark enrichment as complete but with a persist failure.
+    ///
+    /// The edges were computed and added to the in-memory graph, but writing
+    /// them to LanceDB failed. The footer will show "persist failed" so agents
+    /// know the data may not survive a restart.
+    pub fn set_complete_persist_failed(&self, edge_count: usize) {
+        self.edge_count.store(edge_count, std::sync::atomic::Ordering::Release);
+        self.persist_failed.store(true, std::sync::atomic::Ordering::Release);
+        *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
+        let prev = LspState::from_u8(
+            self.state.swap(Self::COMPLETE, std::sync::atomic::Ordering::AcqRel)
+        );
+        self.log_transition(
+            prev,
+            LspState::Complete,
+            &format!("{} edges, persist failed", edge_count),
+        );
     }
 
     /// Mark that no LSP server was available for any of the detected languages.
@@ -289,14 +314,25 @@ impl LspEnrichmentStatus {
             Self::COMPLETE => {
                 let guard = self.completed_at.lock().unwrap();
                 if let Some(t) = *guard {
-                    if t.elapsed().as_secs() < 30 {
+                    let persist_failed = self.persist_failed.load(std::sync::atomic::Ordering::Acquire);
+                    // Always show persist failures (no auto-hide) so agents know
+                    // enrichment data may not survive a restart.
+                    if persist_failed || t.elapsed().as_secs() < 30 {
                         let count = self.edge_count.load(std::sync::atomic::Ordering::Acquire);
                         let total = self.elapsed();
-                        Some(format!(
-                            "LSP: enriched ({} edges in {:.1}s)",
-                            count,
-                            total.as_secs_f64(),
-                        ))
+                        if persist_failed {
+                            Some(format!(
+                                "LSP: enriched ({} edges, persist failed, {:.1}s)",
+                                count,
+                                total.as_secs_f64(),
+                            ))
+                        } else {
+                            Some(format!(
+                                "LSP: enriched ({} edges in {:.1}s)",
+                                count,
+                                total.as_secs_f64(),
+                            ))
+                        }
                     } else {
                         None
                     }
@@ -572,6 +608,39 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn test_lsp_status_persist_failed_shows_in_footer() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_complete_persist_failed(42);
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("42 edges"), "got: {}", footer);
+        assert!(footer.contains("persist failed"), "got: {}", footer);
+    }
+
+    #[test]
+    fn test_lsp_status_persist_failed_no_auto_hide() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_complete_persist_failed(10);
+        // persist_failed footer should always be shown (no 30s auto-hide)
+        assert!(status.footer_segment().is_some());
+    }
+
+    #[test]
+    fn test_lsp_status_persist_failed_cleared_on_success() {
+        let status = LspEnrichmentStatus::default();
+        status.set_running();
+        status.set_complete_persist_failed(10);
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("persist failed"), "got: {}", footer);
+        // Successful completion clears the persist_failed flag
+        status.set_complete(20);
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("20 edges"), "got: {}", footer);
+        assert!(!footer.contains("persist failed"), "got: {}", footer);
     }
 
     /// Adversarial: from_u8 with invalid value must not panic.
