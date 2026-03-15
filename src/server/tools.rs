@@ -50,7 +50,7 @@ pub struct Search {
     /// Filter edge types: calls, depends_on, implements, defines, etc. Only used with mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_types: Option<Vec<String>>,
-    /// Filter by symbol kind. Valid values: function, struct, trait, enum, type_alias, module, import, const, impl, proto_message, sql_table, api_endpoint, macro, enum_variant, field, pr_merge
+    /// Filter by symbol kind. Valid values: function, struct, trait, enum, type_alias, module, import, const, impl, proto_message, sql_table, api_endpoint, macro, enum_variant, markdown_section, field, pr_merge
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// Filter by language (rust, python, typescript, go, markdown)
@@ -108,7 +108,7 @@ fn default_true() -> Option<bool> {
 pub struct SearchSymbols {
     /// Search query string (matched against symbol name and signature)
     pub query: String,
-    /// Optional: filter by symbol kind. Valid values: function, struct, trait, enum, type_alias, module, import, const, impl, proto_message, sql_table, api_endpoint, macro, enum_variant, field, pr_merge
+    /// Optional: filter by symbol kind. Valid values: function, struct, trait, enum, type_alias, module, import, const, impl, proto_message, sql_table, api_endpoint, macro, enum_variant, markdown_section, field, pr_merge
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// Optional: filter by language (rust, python, typescript, go, markdown)
