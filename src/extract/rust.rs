@@ -34,7 +34,7 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
         ("use_declaration",  NodeKind::Import),
         ("macro_definition", NodeKind::Macro),
         ("field_declaration",        NodeKind::Field),
-        ("enum_variant",             NodeKind::Field),
+        ("enum_variant",             NodeKind::EnumVariant),
         ("function_signature_item",  NodeKind::Function),
     ],
     scope_parent_kinds: &["impl_item", "struct_item", "enum_item", "trait_item"],
@@ -516,9 +516,9 @@ pub enum Color {
         assert!(names.contains(&"Green"), "Should find variant Green");
         assert!(names.contains(&"Blue"), "Should find variant Blue");
 
-        // Variants should have kind Field
+        // Variants should have kind EnumVariant
         let active = result.nodes.iter().find(|n| n.id.name == "Active").unwrap();
-        assert_eq!(active.id.kind, NodeKind::Field, "Variant should be Field kind");
+        assert_eq!(active.id.kind, NodeKind::EnumVariant, "Variant should be EnumVariant kind");
 
         // Variants should have parent_scope pointing to the enum
         assert_eq!(

@@ -482,7 +482,12 @@ impl EmbeddingIndex {
             let text = if node.metadata.contains_key("oh_kind") {
                 build_artifact_embedding_text(&node.id.name, &node.body, &node.metadata)
             } else {
-                build_code_embedding_text(&node.id.name, &node.body, &node.metadata)
+                match node.id.kind {
+                    crate::graph::NodeKind::MarkdownSection => {
+                        truncate_chars(&node.body, 500).to_string()
+                    }
+                    _ => build_code_embedding_text(&node.id.name, &node.body, &node.metadata),
+                }
             };
             let text_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
 
@@ -766,7 +771,7 @@ impl EmbeddingIndex {
                 build_artifact_embedding_text(&node.id.name, &node.body, &node.metadata)
             } else {
                 match node.id.kind {
-                    crate::graph::NodeKind::Other(ref s) if s == "markdown_section" || s == "Section" => {
+                    crate::graph::NodeKind::MarkdownSection => {
                         truncate_chars(&node.body, 500).to_string()
                     }
                     _ => build_code_embedding_text(&node.id.name, &node.body, &node.metadata),
@@ -1904,7 +1909,7 @@ mod tests {
                 root: "test".into(),
                 file: PathBuf::from(".oh/outcomes/test-outcome.md"),
                 name: "Test Outcome".into(),
-                kind: NodeKind::Other("markdown_section".to_string()),
+                kind: NodeKind::MarkdownSection,
             },
             language: "markdown".into(),
             signature: "Test Outcome".into(),
