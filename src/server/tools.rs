@@ -28,11 +28,11 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search",
-    description = "All-in-one search: code symbols, business artifacts (.oh/), commits, and markdown. Without `mode`, performs flat ranked search by name/signature plus optional artifact/markdown results (enabled by default via `include_artifacts` and `include_markdown`). With `mode` (neighbors/impact/reachable/tests_for), performs graph traversal from matched symbols. `tests_for` finds which test functions call a symbol. Entry point: `query` (name or semantic search) or `node` (stable ID from previous results). Batch: `nodes` retrieves multiple IDs in one call. `compact: true` returns signature + location only (~25x fewer tokens). Filter by kind, language, file. Sort by relevance, complexity, or importance (PageRank). search_mode: hybrid (default, keyword+vector RRF), keyword (BM25 only), semantic (vector only) — applies to both artifact and graph entry-point search. Results default to the primary workspace root; pass root: \"all\" for cross-root search."
+    description = "All-in-one search: code symbols, business artifacts (.oh/), commits, and markdown. Without `mode`, performs flat ranked search using embedding index (hybrid BM25+vector by default) plus optional artifact/markdown results (enabled by default via `include_artifacts` and `include_markdown`). Falls back to name/signature matching when the embedding index is still building. With `mode` (neighbors/impact/reachable/tests_for), performs graph traversal from matched symbols. `tests_for` finds which test functions call a symbol. Entry point: `query` (name or semantic search) or `node` (stable ID from previous results). Batch: `nodes` retrieves multiple IDs in one call. `compact: true` returns signature + location only (~25x fewer tokens). Filter by kind, language, file. Sort by relevance, complexity, or importance (PageRank). search_mode: hybrid (default, keyword+vector RRF), keyword (BM25 only), semantic (vector only) — applies to code symbol search, artifact search, and graph entry-point resolution. Results default to the primary workspace root; pass root: \"all\" for cross-root search."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct Search {
-    /// Search query string — matched against symbol name and signature for flat search, or used as semantic search for graph traversal entry points
+    /// Search query string — ranked by embedding index (respects search_mode) for flat search and graph traversal entry points. Falls back to name/signature matching if embedding index is not ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
     /// Start from a known stable node ID (from previous search results). Takes precedence over query for graph traversal entry.
@@ -80,7 +80,7 @@ pub struct Search {
     /// Batch retrieve multiple nodes by stable ID. Returns combined results in a single response. Composes with compact and mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodes: Option<Vec<String>>,
-    /// Search ranking mode: "hybrid" (default, keyword + vector RRF), "keyword" (BM25 only), "semantic" (vector only). Applies to artifact search and graph traversal entry-point resolution.
+    /// Search ranking mode: "hybrid" (default, keyword + vector RRF), "keyword" (BM25 only), "semantic" (vector only). Applies to all search paths: flat code symbols, artifacts, and graph traversal entry-point resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_mode: Option<String>,
     /// Search .oh/ artifacts and commits via embedding index (default: true). Set to false for code-only search.
