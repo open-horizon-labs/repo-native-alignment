@@ -10,7 +10,7 @@ use arrow_array::builder::BooleanBuilder;
 
 use crate::graph::{Confidence, Edge, ExtractionSource, Node, NodeId, NodeKind, EdgeKind};
 use crate::graph::index::GraphIndex;
-use crate::graph::store::{symbols_schema, edges_schema, schema_meta_schema, SCHEMA_VERSION};
+use crate::graph::store::{symbols_schema, edges_schema, SCHEMA_VERSION};
 
 use super::state::GraphState;
 
@@ -21,86 +21,100 @@ pub(crate) fn graph_lance_path(repo_root: &Path) -> PathBuf {
     repo_root.join(".oh").join(".cache").join("lance")
 }
 
-/// Check the stored schema version and migrate (drop + recreate meta) if it mismatches.
+/// Check the stored schema version and migrate (drop + recreate) if it mismatches.
 ///
-/// Returns `true` if tables were dropped and the meta table was rewritten (migration occurred),
+/// Returns `true` if tables were dropped (migration occurred),
 /// `false` if the stored version already matches `SCHEMA_VERSION` (no-op).
+///
+/// Uses a simple file (`schema_version` alongside the LanceDB directory) instead
+/// of a LanceDB table. This avoids circular dependency: checking LanceDB health
+/// via LanceDB fails when the schema itself is incompatible.
 ///
 /// Downstream callers (`build_full_graph`, `persist_graph_to_lance`) use this to ensure
 /// stale LanceDB tables are discarded before any read or write.
 pub(crate) async fn check_and_migrate_schema(db_path: &Path) -> anyhow::Result<bool> {
-    use arrow_array::{RecordBatch, RecordBatchIterator, StringArray};
-    use futures::TryStreamExt;
-    use lancedb::query::ExecutableQuery;
-    use std::sync::Arc;
-
     std::fs::create_dir_all(db_path)?;
 
-    let db = lancedb::connect(db_path.to_str().unwrap_or_default())
-        .execute()
-        .await
-        .context("check_and_migrate_schema: failed to connect to LanceDB")?;
+    let version_file = db_path.join("schema_version");
 
-    // Try to read the stored version from _schema_meta.
-    let stored_version: Option<u32> = async {
-        let tbl = db.open_table("_schema_meta").execute().await.ok()?;
-        let batches: Vec<_> = tbl
-            .query()
-            .execute()
-            .await
-            .ok()?
-            .try_collect()
-            .await
-            .ok()?;
-        for batch in &batches {
-            let keys = batch.column_by_name("key")?.as_any().downcast_ref::<StringArray>()?;
-            let values = batch.column_by_name("value")?.as_any().downcast_ref::<StringArray>()?;
-            for i in 0..batch.num_rows() {
-                if keys.value(i) == "schema_version" {
-                    return values.value(i).parse::<u32>().ok();
-                }
-            }
-        }
-        None
-    }
-    .await;
+    // Read stored version from file (None if missing or unparseable).
+    let stored_version: Option<u32> = std::fs::read_to_string(&version_file)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
 
     // If version matches, nothing to do.
     if stored_version == Some(SCHEMA_VERSION) {
         return Ok(false);
     }
 
-    // Version mismatch (or missing table) — drop all tables and write new meta.
-    // Stale data exists if we had a schema version (normal case) OR if data
-    // tables exist without _schema_meta (legacy/corrupt state).
-    let had_stale_data = stored_version.is_some()
-        || db.open_table("symbols").execute().await.is_ok()
-        || db.open_table("edges").execute().await.is_ok();
+    // Version mismatch (or missing file) — nuke the LanceDB directory contents
+    // and rewrite the version file.
+    //
+    // Stale data exists if we had a version file (normal case) OR if the lance
+    // directory contains data files (legacy state without version file).
+    let had_stale_data = stored_version.is_some() || has_lance_data(db_path);
+
     tracing::info!(
-        "Schema version mismatch (stored={:?}, current={}) — dropping all LanceDB tables",
+        "Schema version mismatch (stored={:?}, current={}) — dropping all LanceDB data",
         stored_version,
         SCHEMA_VERSION
     );
 
-    for table_name in &["symbols", "edges", "pr_merges", "file_index", "_schema_meta"] {
-        let _ = db.drop_table(table_name, &[]).await;
+    // Delete all LanceDB data by removing directory contents (except the version file
+    // we're about to write). This is more reliable than drop_table which can fail
+    // on corrupted/incompatible tables.
+    if let Ok(entries) = std::fs::read_dir(db_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Don't delete the version file yet — we'll overwrite it below.
+            if path.file_name().map(|n| n == "schema_version").unwrap_or(false) {
+                continue;
+            }
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
 
-    // Write new _schema_meta with the current version.
-    let schema = Arc::new(schema_meta_schema());
-    let keys = StringArray::from(vec!["schema_version"]);
-    let values = StringArray::from(vec![SCHEMA_VERSION.to_string()]);
-    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(keys), Arc::new(values)])?;
-    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-    db.create_table("_schema_meta", Box::new(batches))
+    // Also try LanceDB drop_table as a belt-and-suspenders cleanup for any
+    // tables that survive directory deletion (e.g., external references).
+    if let Ok(db) = lancedb::connect(db_path.to_str().unwrap_or_default())
         .execute()
         .await
-        .context("check_and_migrate_schema: failed to create _schema_meta table")?;
+    {
+        for table_name in &["symbols", "edges", "pr_merges", "file_index", "_schema_meta"] {
+            let _ = db.drop_table(table_name, &[]).await;
+        }
+    }
+
+    // Write the current version to the file.
+    std::fs::write(&version_file, SCHEMA_VERSION.to_string())
+        .context("check_and_migrate_schema: failed to write schema_version file")?;
 
     // Return true only when stale data existed (real migration). Fresh directories
     // (stored_version == None) return false so incremental persist can proceed to
     // bootstrap the tables.
     Ok(had_stale_data)
+}
+
+/// Check whether the LanceDB directory contains any data files (tables).
+///
+/// Used to detect legacy state where tables exist without a version file.
+fn has_lance_data(db_path: &Path) -> bool {
+    std::fs::read_dir(db_path)
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    // LanceDB stores tables as directories; skip our version file
+                    name != "schema_version" && e.path().is_dir()
+                })
+        })
+        .unwrap_or(false)
 }
 
 /// Parse a NodeKind from its string representation.

@@ -161,17 +161,6 @@ pub fn file_index_schema() -> Schema {
     ])
 }
 
-/// Arrow schema for the `_schema_meta` table.
-///
-/// Single-row key/value table used to persist the schema version so the
-/// server can detect staleness on startup and auto-drop all tables.
-pub fn schema_meta_schema() -> Schema {
-    Schema::new(vec![
-        Field::new("key", DataType::Utf8, false),
-        Field::new("value", DataType::Utf8, false),
-    ])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,14 +169,6 @@ mod tests {
     fn test_schema_version_constant() {
         // SCHEMA_VERSION must be at least 8 (bumped for type_params column)
         assert!(SCHEMA_VERSION >= 8, "SCHEMA_VERSION should be >= 8");
-    }
-
-    #[test]
-    fn test_schema_meta_schema_fields() {
-        let schema = schema_meta_schema();
-        assert!(schema.field_with_name("key").is_ok());
-        assert!(schema.field_with_name("value").is_ok());
-        assert_eq!(schema.fields().len(), 2);
     }
 
     #[test]

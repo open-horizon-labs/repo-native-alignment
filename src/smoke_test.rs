@@ -1279,16 +1279,13 @@ async fn run_search_artifact_semantic_check(embed_index: &Option<EmbeddingIndex>
 /// Schema version check: verifies that `check_and_migrate_schema` detects stale versions
 /// and performs a clean migration, and is idempotent when the version already matches.
 ///
-/// 1. Writes a `_schema_meta` row with version 0 (intentionally stale).
+/// 1. Writes a `schema_version` file with version 0 (intentionally stale) plus a dummy
+///    LanceDB table to simulate existing data.
 /// 2. Calls `check_and_migrate_schema` — asserts it returns `true` (migration occurred).
-/// 3. Reads back the stored version — asserts it now equals `SCHEMA_VERSION`.
+/// 3. Reads back the stored version from the file — asserts it now equals `SCHEMA_VERSION`.
 /// 4. Calls `check_and_migrate_schema` again — asserts it returns `false` (no-op).
 async fn run_schema_version_check() -> Check {
-    use crate::graph::store::{schema_meta_schema, SCHEMA_VERSION};
-    use arrow_array::{RecordBatch, RecordBatchIterator, StringArray};
-    use futures::TryStreamExt;
-    use lancedb::query::ExecutableQuery;
-    use std::sync::Arc;
+    use crate::graph::store::SCHEMA_VERSION;
 
     let temp_dir = std::env::temp_dir().join("rna-smoke-schema-version");
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -1302,27 +1299,14 @@ async fn run_schema_version_check() -> Check {
         return Check::fail("schema_version_check", format!("Could not create lance dir: {}", e));
     }
 
-    // Step 1: Seed _schema_meta with version 0 (stale).
-    let seed_result: anyhow::Result<()> = async {
-        let db = lancedb::connect(db_path.to_str().unwrap_or_default())
-            .execute()
-            .await?;
-        let schema = Arc::new(schema_meta_schema());
-        let keys = StringArray::from(vec!["schema_version"]);
-        let values = StringArray::from(vec!["0"]);
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(keys), Arc::new(values)])?;
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        db.create_table("_schema_meta", Box::new(batches))
-            .execute()
-            .await?;
-        Ok(())
-    }
-    .await;
-
-    if let Err(e) = seed_result {
+    // Step 1: Seed schema_version file with version 0 (stale) and create a dummy
+    // directory to simulate existing LanceDB data.
+    if let Err(e) = std::fs::write(db_path.join("schema_version"), "0") {
         let _ = std::fs::remove_dir_all(&temp_dir);
-        return Check::fail("schema_version_check", format!("Failed to seed stale meta: {}", e));
+        return Check::fail("schema_version_check", format!("Failed to seed stale version file: {}", e));
     }
+    // Create a dummy table directory so has_lance_data() detects stale data.
+    let _ = std::fs::create_dir_all(db_path.join("symbols.lance"));
 
     // Step 2: First call — expect migration (returns true).
     let migrated = match check_and_migrate_schema(&db_path).await {
@@ -1341,45 +1325,26 @@ async fn run_schema_version_check() -> Check {
         );
     }
 
-    // Step 3: Read back stored version — must equal SCHEMA_VERSION.
-    let stored_version: anyhow::Result<u32> = async {
-        let db = lancedb::connect(db_path.to_str().unwrap_or_default())
-            .execute()
-            .await?;
-        let tbl = db.open_table("_schema_meta").execute().await?;
-        let batches: Vec<_> = tbl.query().execute().await?.try_collect().await?;
-        for batch in &batches {
-            let keys = batch
-                .column_by_name("key")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                .ok_or_else(|| anyhow::anyhow!("missing key column"))?;
-            let values = batch
-                .column_by_name("value")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                .ok_or_else(|| anyhow::anyhow!("missing value column"))?;
-            for i in 0..batch.num_rows() {
-                if keys.value(i) == "schema_version" {
-                    return values.value(i).parse::<u32>().map_err(Into::into);
-                }
+    // Step 3: Read back stored version from file — must equal SCHEMA_VERSION.
+    let stored_version = match std::fs::read_to_string(db_path.join("schema_version")) {
+        Ok(s) => match s.trim().parse::<u32>() {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&temp_dir);
+                return Check::fail("schema_version_check", format!("Failed to parse stored version: {}", e));
             }
-        }
-        anyhow::bail!("schema_version key not found in _schema_meta")
-    }
-    .await;
-
-    let version = match stored_version {
-        Ok(v) => v,
+        },
         Err(e) => {
             let _ = std::fs::remove_dir_all(&temp_dir);
-            return Check::fail("schema_version_check", format!("Failed to read stored version: {}", e));
+            return Check::fail("schema_version_check", format!("Failed to read version file: {}", e));
         }
     };
 
-    if version != SCHEMA_VERSION {
+    if stored_version != SCHEMA_VERSION {
         let _ = std::fs::remove_dir_all(&temp_dir);
         return Check::fail(
             "schema_version_check",
-            format!("Stored version {} != SCHEMA_VERSION {}", version, SCHEMA_VERSION),
+            format!("Stored version {} != SCHEMA_VERSION {}", stored_version, SCHEMA_VERSION),
         );
     }
 
