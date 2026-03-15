@@ -19,6 +19,16 @@ use fastembed::{RerankerModel, RerankResult, TextRerank};
 /// so we use `Mutex` for safe concurrent access.
 static RERANKER: Mutex<Option<TextRerank>> = Mutex::new(None);
 
+/// Return the RNA model cache directory (`~/.cache/rna/models/`).
+/// Falls back to the default fastembed cache dir if `$HOME` is unset.
+fn rna_cache_dir() -> std::path::PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        std::path::PathBuf::from(home).join(".cache").join("rna").join("models")
+    } else {
+        std::path::PathBuf::from(fastembed::get_cache_dir())
+    }
+}
+
 /// Default model: Jina Reranker V1 Turbo (English).
 /// Smaller and faster than BGE-Reranker-Base while maintaining good quality.
 const DEFAULT_MODEL: RerankerModel = RerankerModel::JINARerankerV1TurboEn;
@@ -68,7 +78,13 @@ pub fn rerank_results(
         let start = std::time::Instant::now();
         tracing::info!("Reranker: loading {:?} (first use, one-time cost)", DEFAULT_MODEL);
 
-        match TextRerank::try_new(fastembed::RerankInitOptions::new(DEFAULT_MODEL)) {
+        let cache_dir = rna_cache_dir();
+        let _ = std::fs::create_dir_all(&cache_dir);
+        tracing::info!("Reranker: cache dir = {}", cache_dir.display());
+
+        let init_opts = fastembed::RerankInitOptions::new(DEFAULT_MODEL)
+            .with_cache_dir(cache_dir);
+        match TextRerank::try_new(init_opts) {
             Ok(reranker) => {
                 tracing::info!("Reranker: ready in {:?}", start.elapsed());
                 *guard = Some(reranker);
@@ -110,7 +126,7 @@ pub fn rerank_results(
         })?;
         results.push(RerankedResult {
             original_index: candidate.original_index,
-            score: r.score as f32,
+            score: r.score,
         });
     }
 

@@ -92,6 +92,18 @@ fn resolve_root_filter(root_arg: Option<&str>, repo_root: &std::path::Path) -> O
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Set fastembed model cache to ~/.cache/rna/models/ instead of .fastembed_cache/
+    // in the current directory. Must be set before any fastembed initialization
+    // (reranker model, or any future fastembed embedding model).
+    if std::env::var("FASTEMBED_CACHE_DIR").is_err()
+        && let Ok(home) = std::env::var("HOME")
+    {
+        let cache_dir = std::path::PathBuf::from(home).join(".cache").join("rna").join("models");
+        // SAFETY: set_var is called at program startup before any threads
+        // are spawned, so there are no concurrent readers of this env var.
+        unsafe { std::env::set_var("FASTEMBED_CACHE_DIR", &cache_dir) };
+    }
+
     let cli = Cli::parse();
     let log_path = cli.log_path.clone();
     match cli.command {
@@ -115,6 +127,9 @@ async fn main() -> anyhow::Result<()> {
             init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?; eprintln!("Scanning {}...", repo_root.display());
             let handler = RnaHandler { repo_root: repo_root.clone(), ..Default::default() }; let gs = handler.build_full_graph().await?;
+            // Initialize embedding index for semantic search + reranking.
+            let embed_idx = repo_native_alignment::embed::EmbeddingIndex::new(&repo_root).await.ok();
+            let embed_ref = embed_idx.as_ref();
             let params = SearchParams {
                 query: if args.query.is_empty() { None } else { Some(args.query.clone()) },
                 node: args.node.clone(), mode: args.mode.clone(), hops: args.hops, direction: args.direction.clone(),
@@ -128,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
                 artifact_types: args.artifact_types.as_ref().map(|s| s.split(',').map(|t| t.trim().to_string()).collect()),
             };
             let root_filter = resolve_root_filter(args.root.as_deref(), &repo_root);
-            let ctx = SearchContext { graph_state: &gs, embed_index: None, repo_root: &repo_root, lsp_status: None, root_filter, non_code_slugs: std::collections::HashSet::new() };
+            let ctx = SearchContext { graph_state: &gs, embed_index: embed_ref, repo_root: &repo_root, lsp_status: None, root_filter, non_code_slugs: std::collections::HashSet::new() };
             println!("{}", service::search(&params, &ctx).await); return Ok(());
         }
         Some(Commands::Graph(args)) => {
