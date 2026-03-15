@@ -62,6 +62,9 @@ impl RnaHandler {
 
         // Slow path: build or update graph
         {
+            // Invalidate cached root slugs since graph structure may change.
+            self.invalidate_non_code_root_slugs_cache();
+
             let mut guard = self.graph.write().await;
             if guard.is_none() {
                 // First build -- full pipeline

@@ -75,11 +75,11 @@ impl ScanConfig {
             .map(|s| s.as_str())
             .collect();
         excludes.retain(|pattern| !include_set.contains(pattern.as_str()));
-        let exclude_set: std::collections::HashSet<String> = excludes.iter()
+        let mut exclude_set: std::collections::HashSet<String> = excludes.iter()
             .cloned()
             .collect();
         for extra in &self.exclude {
-            if !exclude_set.contains(extra) {
+            if exclude_set.insert(extra.clone()) {
                 excludes.push(extra.clone());
             }
         }

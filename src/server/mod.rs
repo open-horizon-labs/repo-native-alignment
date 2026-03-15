@@ -135,7 +135,6 @@ impl RnaHandler {
     }
 
     /// Invalidate the non-code root slugs cache (e.g., when roots change).
-    #[allow(dead_code)]
     pub(crate) fn invalidate_non_code_root_slugs_cache(&self) {
         *self.non_code_root_slugs_cache.lock().unwrap() = None;
     }
