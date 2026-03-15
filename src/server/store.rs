@@ -164,6 +164,7 @@ pub fn parse_edge_kind(s: &str) -> Option<EdgeKind> {
         "has_field" => EdgeKind::HasField,
         "evolves" => EdgeKind::Evolves,
         "referenced_by" => EdgeKind::ReferencedBy,
+        "references" => EdgeKind::References,
         "topology_boundary" => EdgeKind::TopologyBoundary,
         "modified" => EdgeKind::Modified,
         "affected" => EdgeKind::Affected,

@@ -77,6 +77,9 @@ pub struct MarkdownChunk {
     pub byte_len: usize,
     /// Code spans found in this chunk (potential cross-references)
     pub code_spans: Vec<String>,
+    /// Markdown links found in this chunk: (link_text, link_destination)
+    #[serde(default)]
+    pub links: Vec<(String, String)>,
 }
 
 impl MarkdownChunk {
