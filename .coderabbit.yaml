@@ -4,3 +4,15 @@ reviews:
   auto_review:
     enabled: true
     drafts: false
+  path_instructions:
+    - path: "src/**/*.rs"
+      instructions: |
+        PERFORMANCE: Flag these as blocking issues:
+        - .iter().find() on Vec<Node>, Vec<Edge>, or any graph collection — must use HashMap
+        - .clone() on Vec<Node> or Vec<Edge> — can it move instead?
+        - Vec.contains() in a loop — should be HashSet
+        - .to_string() for constant keys in loops — use static &str or const
+        - Any O(N) work inside a loop over N items (O(N²))
+        - Rebuilding data that's already cached (embed index, file index, artifact list)
+        - cargo run instead of using the installed binary for testing
+        - Full table drop+rebuild when incremental update with hash-skip would work
