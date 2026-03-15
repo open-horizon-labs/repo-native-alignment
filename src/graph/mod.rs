@@ -450,6 +450,7 @@ pub fn find_node_at(
                         | NodeKind::TypeAlias
                         | NodeKind::Const
                         | NodeKind::Macro
+                        | NodeKind::EnumVariant
                 )
             })
             .min_by_key(|n| n.line_end.saturating_sub(n.line_start))
@@ -563,6 +564,45 @@ mod tests {
         let result = find_node_at(&index, &PathBuf::from("src/lib.rs"), 5);
         assert!(result.is_some(), "find_node_at should find TypeAlias nodes");
         assert_eq!(result.unwrap().name, "Result");
+    }
+
+    #[test]
+    fn test_find_node_at_finds_enum_variant() {
+        let nodes = vec![make_node(
+            "src/lib.rs",
+            "Active",
+            NodeKind::EnumVariant,
+            10,
+            10,
+        )];
+        let index = build_file_line_index(&nodes);
+
+        let result = find_node_at(&index, &PathBuf::from("src/lib.rs"), 10);
+        assert!(result.is_some(), "find_node_at should find EnumVariant nodes");
+        assert_eq!(result.unwrap().name, "Active");
+    }
+
+    #[test]
+    fn test_find_node_at_enum_variant_vs_enum_same_line() {
+        // Adversarial: enum variant on same line as enclosing enum.
+        // find_node_at should prefer the narrower span (variant).
+        let nodes = vec![
+            make_node("src/lib.rs", "Status", NodeKind::Enum, 5, 10),
+            make_node("src/lib.rs", "Active", NodeKind::EnumVariant, 7, 7),
+        ];
+        let index = build_file_line_index(&nodes);
+
+        // On line 7 (variant line), should find the variant (narrower span)
+        let result = find_node_at(&index, &PathBuf::from("src/lib.rs"), 7);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "Active",
+            "Should prefer EnumVariant (span 1) over Enum (span 5) on variant line");
+
+        // On line 5 (enum declaration line, no variant), should find the enum
+        let result = find_node_at(&index, &PathBuf::from("src/lib.rs"), 5);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "Status",
+            "Should find Enum on enum declaration line");
     }
 
     // -- edge_id_set tests --
