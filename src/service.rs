@@ -314,10 +314,11 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
     let edge_filter = params.edge_types.as_ref().map(|types| types.iter().filter_map(|t| parse_edge_kind(t)).collect::<Vec<_>>());
     let edge_filter_slice = edge_filter.as_deref();
 
-    // Collect grouped results across all entry nodes
+    // Collect grouped results across all entry nodes.
+    // Deduplication is per-edge-kind: the same node may legitimately appear
+    // under multiple relationship kinds, so we only deduplicate within a kind.
     use crate::server::handlers::run_traversal_grouped;
     let mut merged_groups: std::collections::BTreeMap<crate::graph::EdgeKind, Vec<String>> = std::collections::BTreeMap::new();
-    let mut seen = std::collections::HashSet::new();
     let entry_set: HashSet<&str> = valid_entry_ids.iter().map(|s| s.as_str()).collect();
 
     for node_id in &valid_entry_ids {
@@ -326,7 +327,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
                 for (kind, ids) in groups {
                     let entry = merged_groups.entry(kind).or_default();
                     for id in ids {
-                        if !entry_set.contains(id.as_str()) && seen.insert(id.clone()) {
+                        if !entry_set.contains(id.as_str()) && !entry.contains(&id) {
                             entry.push(id);
                         }
                     }
