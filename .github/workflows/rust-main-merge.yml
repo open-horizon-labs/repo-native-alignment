@@ -25,6 +25,21 @@ jobs:
             echo "FAIL: language-specific logic in generic.rs — use LangConfig fields"
             exit 1
           fi
+      - name: No linear scans on graph collections
+        run: |
+          HITS=$(grep -rn '\.iter()\.find(' src/ --include='*.rs' | grep -v '#\[test\]' | grep -v '_test' | grep -v 'mod tests' || true)
+          if [ -n "$HITS" ]; then
+            echo "FAIL: .iter().find() on collections — use HashMap lookup"
+            echo "$HITS"
+            exit 1
+          fi
+      - name: No unnecessary clones of large collections
+        run: |
+          HITS=$(grep -rn '\.nodes\.clone()\|\.edges\.clone()' src/ --include='*.rs' | grep -v '#\[test\]' | grep -v '_test' || true)
+          if [ -n "$HITS" ]; then
+            echo "WARN: cloning nodes/edges vec — can you move instead?"
+            echo "$HITS"
+          fi
 
   test:
     runs-on: namespace-profile-cached
