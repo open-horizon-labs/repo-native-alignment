@@ -1464,8 +1464,11 @@ impl RnaHandler {
             helpers::resolve_edge_target_by_suffix(edge, &file_index);
         }
 
-        // Track only the delta (new/changed) for LanceDB upsert — not the full graph.
-        let upsert_nodes: Vec<Node> = extraction.nodes.clone();
+        // Track which node/edge IDs are in the delta for LanceDB upsert.
+        // We snapshot IDs now but rebuild the actual upsert data AFTER PageRank
+        // so persisted nodes include updated importance scores.
+        let upsert_node_ids: std::collections::HashSet<String> =
+            extraction.nodes.iter().map(|n| n.stable_id()).collect();
         let upsert_edges: Vec<Edge> = extraction.edges.clone();
         graph.nodes.extend(extraction.nodes);
         graph.edges.extend(extraction.edges);
@@ -1658,6 +1661,14 @@ impl RnaHandler {
         // .oh/ artifacts are now graph nodes (markdown_section with oh_kind metadata).
         // They're re-embedded through the same reindex_nodes path as code symbols
         // when their files change -- no separate reindex_artifacts call needed.
+
+        // Rebuild upsert_nodes from graph.nodes so they include post-PageRank importance.
+        let upsert_nodes: Vec<Node> = graph
+            .nodes
+            .iter()
+            .filter(|n| upsert_node_ids.contains(&n.stable_id()))
+            .cloned()
+            .collect();
 
         // Persist updated graph incrementally -- only the delta (changed/added nodes and edges).
         // Untouched rows remain in LanceDB as-is. Deleted files are removed by targeted delete.
