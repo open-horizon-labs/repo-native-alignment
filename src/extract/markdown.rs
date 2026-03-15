@@ -85,6 +85,11 @@ impl Extractor for MarkdownExtractor {
                 metadata.insert("is_frontmatter".to_string(), "true".to_string());
             }
 
+            // Detect .oh/ artifact kind from file path
+            if let Some(oh_kind) = detect_oh_kind(path) {
+                metadata.insert("oh_kind".to_string(), oh_kind);
+            }
+
             // Code spans as metadata (potential cross-references)
             if !chunk.code_spans.is_empty() {
                 metadata.insert("code_spans".to_string(), chunk.code_spans.join(", "));
@@ -147,6 +152,29 @@ impl Extractor for MarkdownExtractor {
             edges: Vec::new(),
         })
     }
+}
+
+/// Detect if a markdown file lives under `.oh/` and return the artifact kind.
+///
+/// Maps directory names to artifact kinds: outcomes -> outcome, signals -> signal,
+/// guardrails -> guardrail, metis -> metis. Returns None for non-.oh/ files.
+fn detect_oh_kind(path: &Path) -> Option<String> {
+    let components: Vec<_> = path.components().collect();
+    for (i, comp) in components.iter().enumerate() {
+        if comp.as_os_str() == ".oh" {
+            if let Some(next) = components.get(i + 1) {
+                let dir = next.as_os_str().to_string_lossy();
+                return match dir.as_ref() {
+                    "outcomes" => Some("outcome".to_string()),
+                    "signals" => Some("signal".to_string()),
+                    "guardrails" => Some("guardrail".to_string()),
+                    "metis" => Some("metis".to_string()),
+                    _ => None,
+                };
+            }
+        }
+    }
+    None
 }
 
 /// Extract YAML frontmatter from markdown content.
@@ -335,5 +363,68 @@ mod tests {
 
         assert_eq!(result.nodes[0].line_start, 1);
         assert_eq!(result.nodes[1].line_start, 5); // ## Section starts on line 5
+    }
+
+    #[test]
+    fn test_detect_oh_kind_outcome() {
+        assert_eq!(detect_oh_kind(Path::new(".oh/outcomes/my-outcome.md")), Some("outcome".to_string()));
+    }
+
+    #[test]
+    fn test_detect_oh_kind_signal() {
+        assert_eq!(detect_oh_kind(Path::new(".oh/signals/my-signal.md")), Some("signal".to_string()));
+    }
+
+    #[test]
+    fn test_detect_oh_kind_guardrail() {
+        assert_eq!(detect_oh_kind(Path::new(".oh/guardrails/my-guardrail.md")), Some("guardrail".to_string()));
+    }
+
+    #[test]
+    fn test_detect_oh_kind_metis() {
+        assert_eq!(detect_oh_kind(Path::new(".oh/metis/my-learning.md")), Some("metis".to_string()));
+    }
+
+    #[test]
+    fn test_detect_oh_kind_not_oh() {
+        assert_eq!(detect_oh_kind(Path::new("src/main.rs")), None);
+        assert_eq!(detect_oh_kind(Path::new("docs/README.md")), None);
+    }
+
+    #[test]
+    fn test_detect_oh_kind_unknown_subdir() {
+        assert_eq!(detect_oh_kind(Path::new(".oh/sessions/123.md")), None);
+        assert_eq!(detect_oh_kind(Path::new(".oh/.cache/data.md")), None);
+    }
+
+    #[test]
+    fn test_oh_artifact_gets_oh_kind_metadata() {
+        let extractor = MarkdownExtractor::new();
+        let content = "---\nid: test-outcome\nstatus: active\n---\n\n# My Outcome\n\nContent.\n";
+        let result = extractor.extract(Path::new(".oh/outcomes/test-outcome.md"), content).unwrap();
+        assert!(!result.nodes.is_empty());
+        for node in &result.nodes {
+            assert_eq!(node.metadata.get("oh_kind"), Some(&"outcome".to_string()),
+                "node {} should have oh_kind=outcome", node.id.name);
+        }
+    }
+
+    #[test]
+    fn test_non_oh_file_no_oh_kind() {
+        let extractor = MarkdownExtractor::new();
+        let content = "# Regular Doc\n\nContent.\n";
+        let result = extractor.extract(Path::new("docs/readme.md"), content).unwrap();
+        for node in &result.nodes {
+            assert!(node.metadata.get("oh_kind").is_none(),
+                "non-.oh/ node should not have oh_kind metadata");
+        }
+    }
+
+    #[test]
+    fn test_oh_artifact_with_absolute_path() {
+        assert_eq!(
+            detect_oh_kind(Path::new("/home/user/repo/.oh/metis/learning.md")),
+            Some("metis".to_string())
+        );
     }
 }

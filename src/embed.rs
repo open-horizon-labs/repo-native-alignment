@@ -8,7 +8,6 @@ use lance_index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
 
 use crate::git;
-use crate::oh;
 use crate::ranking;
 
 /// Search mode for the embedding index.
@@ -133,6 +132,28 @@ fn build_code_embedding_text(
 
     // Final safety truncation to hard budget
     truncate_chars(&t, CODE_EMBED_CHAR_BUDGET).to_string()
+}
+
+/// Build embedding text for .oh/ artifacts.
+fn build_artifact_embedding_text(
+    name: &str,
+    body: &str,
+    metadata: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let mut text = String::with_capacity(500);
+    let id = metadata.get("frontmatter.id").map(|s| s.as_str()).unwrap_or(name);
+    text.push_str(id);
+    text.push(' ');
+    for (key, value) in metadata {
+        if let Some(fm_key) = key.strip_prefix("frontmatter.") {
+            text.push_str(fm_key);
+            text.push_str(": ");
+            text.push_str(value);
+            text.push(' ');
+        }
+    }
+    text.push_str(body);
+    truncate_chars(&text, 500).to_string()
 }
 
 fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
@@ -398,8 +419,8 @@ impl EmbeddingIndex {
         }
     }
 
-    /// Index all .oh/ artifacts, git commits, and optionally code symbols.
-    /// Call with symbols from the graph to enable semantic code search.
+    /// Index all graph nodes (code, markdown, .oh/ artifacts), git commits, and PR merges.
+    /// Call with symbols from the graph.
     pub async fn index_all_with_symbols(
         &self,
         repo_root: &Path,
@@ -408,7 +429,7 @@ impl EmbeddingIndex {
         self.index_all_inner(repo_root, symbols).await
     }
 
-    /// Index all .oh/ artifacts and recent git commits. Rebuilds the table from scratch.
+    /// Index recent git commits only (no graph nodes). Rebuilds the table from scratch.
     pub async fn index_all(&self, repo_root: &Path) -> Result<usize> {
         self.index_all_inner(repo_root, &[]).await
     }
@@ -451,10 +472,28 @@ impl EmbeddingIndex {
                 k => format!("{}", k),
             };
 
-            let text = build_code_embedding_text(&node.id.name, &node.body, &node.metadata);
+            // Use oh_kind for .oh/ artifacts, code:{kind} for everything else
+            let embed_kind = if let Some(oh_kind) = node.metadata.get("oh_kind") {
+                oh_kind.clone()
+            } else {
+                format!("code:{}", kind_str)
+            };
+
+            let text = if node.metadata.contains_key("oh_kind") {
+                build_artifact_embedding_text(&node.id.name, &node.body, &node.metadata)
+            } else {
+                build_code_embedding_text(&node.id.name, &node.body, &node.metadata)
+            };
             let text_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
 
-            let title = format!("{} {} ({})", kind_str, node.id.name, node.language);
+            let title = if node.metadata.contains_key("oh_kind") {
+                node.metadata.get("frontmatter.title")
+                    .or(node.metadata.get("frontmatter.statement"))
+                    .cloned()
+                    .unwrap_or_else(|| format!("{} {} ({})", kind_str, node.id.name, node.language))
+            } else {
+                format!("{} {} ({})", kind_str, node.id.name, node.language)
+            };
             let body_display = format!(
                 "{}\n\n{}:{}",
                 node.signature,
@@ -464,7 +503,7 @@ impl EmbeddingIndex {
 
             candidates.push(Candidate {
                 id: node.stable_id(),
-                kind: format!("code:{}", kind_str),
+                kind: embed_kind,
                 title,
                 body: body_display,
                 text,
@@ -553,165 +592,10 @@ impl EmbeddingIndex {
         Ok(count)
     }
 
-    /// Re-embed `.oh/` artifacts incrementally (upsert into existing table).
-    ///
-    /// Loads all artifacts from `.oh/` directories, computes BLAKE3 text hashes,
-    /// skips unchanged artifacts, and upserts the rest via `merge_insert`.
-    /// This is the artifact counterpart to `reindex_nodes` for code symbols.
-    pub async fn reindex_artifacts(&self, repo_root: &Path) -> Result<usize> {
-        // Open table first — if it doesn't exist, nothing to update.
-        let table = match self.db.open_table(&self.table_name).execute().await {
-            Ok(t) => t,
-            Err(_) => {
-                // Table not yet created — nothing to update.
-                return Ok(0);
-            }
-        };
+    // reindex_artifacts() removed: .oh/ artifacts are now graph nodes
+    // (markdown_section with oh_kind metadata) and flow through
+    // reindex_nodes() like everything else.
 
-        let artifacts = oh::load_oh_artifacts(repo_root)?;
-        if artifacts.is_empty() {
-            return Ok(0);
-        }
-
-        // Build candidate data: id, kind, title, body, text, text_hash
-        struct Candidate {
-            id: String,
-            kind: String,
-            title: String,
-            body: String,
-            text: String,
-            text_hash: String,
-        }
-
-        let mut candidates: Vec<Candidate> = Vec::with_capacity(artifacts.len());
-
-        for a in &artifacts {
-            let mut text = String::new();
-            text.push_str(&a.id());
-            text.push(' ');
-            for (k, v) in &a.frontmatter {
-                if let Some(s) = v.as_str() {
-                    text.push_str(k);
-                    text.push_str(": ");
-                    text.push_str(s);
-                    text.push(' ');
-                }
-            }
-            text.push_str(&a.body);
-
-            let text_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
-
-            let title = a
-                .frontmatter
-                .get("title")
-                .and_then(|v| v.as_str())
-                .or_else(|| a.frontmatter.get("statement").and_then(|v| v.as_str()))
-                .unwrap_or(&a.id())
-                .to_string();
-
-            candidates.push(Candidate {
-                id: a.id(),
-                kind: a.kind.to_string(),
-                title,
-                body: a.body.clone(),
-                text,
-                text_hash,
-            });
-        }
-
-        // Query existing text_hash values to skip unchanged artifacts.
-        let existing_hashes = self
-            .query_text_hashes(
-                &table,
-                &candidates.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
-            )
-            .await;
-
-        let (to_embed, skipped): (Vec<_>, Vec<_>) =
-            candidates.into_iter().partition(|c| match &existing_hashes {
-                Some(map) => map.get(&c.id).is_none_or(|h| *h != c.text_hash),
-                None => true, // no text_hash column yet — embed all
-            });
-
-        if !skipped.is_empty() {
-            tracing::info!(
-                "reindex_artifacts: BLAKE3 text hash skipped {} unchanged artifact(s), embedding {} artifact(s)",
-                skipped.len(),
-                to_embed.len(),
-            );
-        }
-
-        if to_embed.is_empty() {
-            return Ok(0);
-        }
-
-        let mut ids: Vec<String> = Vec::new();
-        let mut kinds: Vec<String> = Vec::new();
-        let mut titles: Vec<String> = Vec::new();
-        let mut bodies: Vec<String> = Vec::new();
-        let mut texts: Vec<String> = Vec::new();
-        let mut text_hashes: Vec<String> = Vec::new();
-
-        for c in to_embed {
-            ids.push(c.id);
-            kinds.push(c.kind);
-            titles.push(c.title);
-            bodies.push(c.body);
-            texts.push(c.text);
-            text_hashes.push(c.text_hash);
-        }
-
-        let count = texts.len();
-        let embeddings = embed_texts(texts).await?;
-        let dim = embeddings[0].len();
-        let flat_embeddings: Vec<f32> = embeddings.into_iter().flatten().collect();
-
-        let schema = Arc::new(embedding_schema(dim));
-
-        let id_array = Arc::new(StringArray::from(ids)) as Arc<dyn arrow_array::Array>;
-        let kind_array = Arc::new(StringArray::from(kinds)) as Arc<dyn arrow_array::Array>;
-        let title_array = Arc::new(StringArray::from(titles)) as Arc<dyn arrow_array::Array>;
-        let body_array = Arc::new(StringArray::from(bodies)) as Arc<dyn arrow_array::Array>;
-        let text_hash_array =
-            Arc::new(StringArray::from(text_hashes)) as Arc<dyn arrow_array::Array>;
-        let values = Arc::new(Float32Array::from(flat_embeddings));
-        let list_field = Arc::new(Field::new("item", DataType::Float32, true));
-        let vector_array = Arc::new(arrow_array::FixedSizeListArray::try_new(
-            list_field,
-            dim as i32,
-            values,
-            None,
-        )?) as Arc<dyn arrow_array::Array>;
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                id_array,
-                kind_array,
-                title_array,
-                body_array,
-                text_hash_array,
-                vector_array,
-            ],
-        )?;
-
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let mut merge = table.merge_insert(&["id"]);
-        merge
-            .when_matched_update_all(None)
-            .when_not_matched_insert_all();
-        merge
-            .execute(Box::new(batches))
-            .await
-            .context("Failed to upsert artifact embeddings")?;
-
-        tracing::info!(
-            "reindex_artifacts: upserted {} artifact embedding(s)",
-            count
-        );
-
-        Ok(count)
-    }
 
     /// Query existing text_hash values for given node IDs from the embedding table.
     /// Returns None if the text_hash column doesn't exist (old schema).
@@ -781,43 +665,14 @@ impl EmbeddingIndex {
             "EmbeddingIndex: rebuilding full index for {}",
             repo_root.display()
         );
-        let artifacts = oh::load_oh_artifacts(repo_root)?;
-        let artifact_count = artifacts.len();
 
-        // Collect ids, kinds, titles, bodies, and embedding texts from artifacts
+        // .oh/ artifacts are now graph nodes (markdown_section with oh_kind metadata).
+        // They come through `symbols` via the unified extraction pipeline.
         let mut ids: Vec<String> = Vec::new();
         let mut kinds: Vec<String> = Vec::new();
         let mut titles: Vec<String> = Vec::new();
         let mut bodies: Vec<String> = Vec::new();
         let mut texts: Vec<String> = Vec::new();
-
-        for a in &artifacts {
-            ids.push(a.id());
-            kinds.push(a.kind.to_string());
-            titles.push(
-                a.frontmatter
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| a.frontmatter.get("statement").and_then(|v| v.as_str()))
-                    .unwrap_or(&a.id())
-                    .to_string(),
-            );
-            bodies.push(a.body.clone());
-
-            let mut text = String::new();
-            text.push_str(&a.id());
-            text.push(' ');
-            for (k, v) in &a.frontmatter {
-                if let Some(s) = v.as_str() {
-                    text.push_str(k);
-                    text.push_str(": ");
-                    text.push_str(s);
-                    text.push(' ');
-                }
-            }
-            text.push_str(&a.body);
-            texts.push(text);
-        }
 
         // Index recent git commits (capped for performance)
         let commit_count = match git::load_commits(repo_root, RECENT_COMMIT_LIMIT) {
@@ -881,53 +736,51 @@ impl EmbeddingIndex {
             .filter(|n| n.id.kind.is_embeddable())
             .collect();
         let skipped = symbols.len() - embeddable.len();
+        let oh_artifact_count = embeddable.iter()
+            .filter(|n| n.metadata.contains_key("oh_kind"))
+            .count();
         tracing::info!(
-            "EmbeddingIndex: collected {} artifact(s), {} commit(s), {} merge(s), {} symbol(s) ({} embeddable, {} skipped) for indexing",
-            artifact_count,
+            "EmbeddingIndex: collected {} commit(s), {} merge(s), {} symbol(s) ({} embeddable, {} .oh/ artifacts, {} skipped) for indexing",
             commit_count,
             merge_count,
             symbols.len(),
             embeddable.len(),
+            oh_artifact_count,
             skipped,
         );
 
-        // Index code symbols and markdown sections from the graph
+        // Index code symbols, markdown sections, and .oh/ artifacts from the graph
         for node in &embeddable {
             let kind_str = match &node.id.kind {
                 crate::graph::NodeKind::Other(s) => s.clone(),
                 k => format!("{}", k),
             };
 
-            // Build searchable text for embedding.
-            //
-            // For code symbols we include name + truncated body so that
-            // intent-based queries like "error handling" or "rate limiting" can
-            // match functions whose *body* implements that concept even when the
-            // function name/signature doesn't mention it.
-            //
-            // body already contains the signature (full AST node text), so we
-            // don't push the signature separately — avoids wasting tokens on
-            // redundant text.
-            //
-            // Total text is budgeted to ~800 chars to stay within MiniLM-L6-v2's
-            // 256-token effective limit (code tokenizes at ~3-4 tokens/identifier).
-            //
-            // This mirrors what `reindex_nodes` does for LSP-enriched nodes,
-            // closing the gap where the initial full build embedded only the
-            // signature.
-            let text = match node.id.kind {
-                crate::graph::NodeKind::Other(ref s) if s == "markdown_section" || s == "Section" => {
-                    // Markdown sections: just the body text, no breadcrumb prefix.
-                    // Mirrors MarkdownChunk::embedding_text() — the section path
-                    // adds no validated value for MiniLM-L6-v2.
-                    truncate_chars(&node.body, 500).to_string()
-                }
-                _ => {
-                    build_code_embedding_text(&node.id.name, &node.body, &node.metadata)
+            let embed_kind = if let Some(oh_kind) = node.metadata.get("oh_kind") {
+                oh_kind.clone()
+            } else {
+                format!("code:{}", kind_str)
+            };
+
+            let text = if node.metadata.contains_key("oh_kind") {
+                build_artifact_embedding_text(&node.id.name, &node.body, &node.metadata)
+            } else {
+                match node.id.kind {
+                    crate::graph::NodeKind::Other(ref s) if s == "markdown_section" || s == "Section" => {
+                        truncate_chars(&node.body, 500).to_string()
+                    }
+                    _ => build_code_embedding_text(&node.id.name, &node.body, &node.metadata),
                 }
             };
 
-            let title = format!("{} {} ({})", kind_str, node.id.name, node.language);
+            let title = if node.metadata.contains_key("oh_kind") {
+                node.metadata.get("frontmatter.title")
+                    .or(node.metadata.get("frontmatter.statement"))
+                    .cloned()
+                    .unwrap_or_else(|| format!("{} {} ({})", kind_str, node.id.name, node.language))
+            } else {
+                format!("{} {} ({})", kind_str, node.id.name, node.language)
+            };
             let body_display = format!(
                 "{}\n\n{}:{}",
                 node.signature,
@@ -936,7 +789,7 @@ impl EmbeddingIndex {
             );
 
             ids.push(node.stable_id());
-            kinds.push(format!("code:{}", kind_str));
+            kinds.push(embed_kind);
             titles.push(title);
             bodies.push(body_display);
             texts.push(text);
@@ -1254,7 +1107,7 @@ impl EmbeddingIndex {
 #[cfg(test)]
 mod tests {
     use super::{
-        truncate_chars, build_code_embedding_text, CODE_EMBED_CHAR_BUDGET,
+        truncate_chars, build_code_embedding_text, build_artifact_embedding_text, CODE_EMBED_CHAR_BUDGET,
         BATCH_FLOOR, BATCH_CEILING, BATCH_YIELD_MS, BACKOFF_THRESHOLD,
         EmbeddingIndex,
     };
@@ -2028,122 +1881,54 @@ mod tests {
         assert_ne!(SearchMode::Semantic, SearchMode::Hybrid);
     }
 
-    // ── Adversarial: reindex_artifacts ──────────────────────────────
+    // ── Unified artifact embedding via graph nodes ──────────────────────
 
     #[tokio::test]
-    async fn reindex_artifacts_returns_zero_when_no_table() {
-        // Dissent finding: reindex_artifacts should handle missing table gracefully.
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_root = tmp.path().to_path_buf();
-        std::fs::create_dir_all(repo_root.join(".oh/metis")).unwrap();
-        std::fs::write(
-            repo_root.join(".oh/metis/test.md"),
-            "---\ntitle: test\n---\ntest body",
-        )
-        .unwrap();
-
-        let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
-        // No table exists yet -- should return 0 without error.
-        let count = idx.reindex_artifacts(&repo_root).await.unwrap();
-        assert_eq!(count, 0, "should return 0 when embedding table doesn't exist");
-    }
-
-    #[tokio::test]
-    async fn reindex_artifacts_embeds_new_artifacts() {
+    async fn oh_artifact_node_gets_artifact_kind_in_embedding() {
         use crate::graph::{Node, NodeId, NodeKind, ExtractionSource};
         use std::path::PathBuf;
 
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().to_path_buf();
-        std::fs::create_dir_all(repo_root.join(".oh/metis")).unwrap();
-        std::fs::create_dir_all(repo_root.join(".git")).unwrap();
+        std::fs::create_dir_all(repo_root.join(".oh")).unwrap();
 
-        // First, build the table with a code node so the table exists.
         let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("oh_kind".to_string(), "outcome".to_string());
+        metadata.insert("frontmatter.id".to_string(), "test-outcome".to_string());
+        metadata.insert("frontmatter.title".to_string(), "Test Outcome".to_string());
+
         let node = Node {
             id: NodeId {
                 root: "test".into(),
-                file: PathBuf::from("test.rs"),
-                name: "dummy_fn".into(),
-                kind: NodeKind::Function,
+                file: PathBuf::from(".oh/outcomes/test-outcome.md"),
+                name: "Test Outcome".into(),
+                kind: NodeKind::Other("markdown_section".to_string()),
             },
-            language: "rust".into(),
-            signature: "fn dummy_fn()".into(),
-            body: "fn dummy_fn() { }".into(),
+            language: "markdown".into(),
+            signature: "Test Outcome".into(),
+            body: "This is a test outcome body.".into(),
             line_start: 1,
-            line_end: 1,
-            metadata: BTreeMap::new(),
-            source: ExtractionSource::TreeSitter,
+            line_end: 5,
+            metadata,
+            source: ExtractionSource::Markdown,
         };
-        let initial_count = idx.index_all_with_symbols(&repo_root, &[node]).await.unwrap();
-        assert!(initial_count > 0, "should have indexed initial items");
 
-        // Now create a new .oh/ artifact and call reindex_artifacts.
-        std::fs::write(
-            repo_root.join(".oh/metis/canary.md"),
-            "---\ntitle: canary artifact\n---\nThis is a test canary for adversarial testing.",
-        )
-        .unwrap();
-
-        let count = idx.reindex_artifacts(&repo_root).await.unwrap();
-        assert!(count > 0, "should have embedded the new canary artifact");
+        let count = idx.index_all_with_symbols(&repo_root, &[node]).await.unwrap();
+        assert!(count > 0, "should have indexed the .oh/ artifact node");
     }
 
-    #[tokio::test]
-    async fn reindex_artifacts_skips_unchanged_on_second_call() {
-        use crate::graph::{Node, NodeId, NodeKind, ExtractionSource};
-        use std::path::PathBuf;
+    #[test]
+    fn artifact_embedding_text_includes_frontmatter() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("oh_kind".to_string(), "outcome".to_string());
+        metadata.insert("frontmatter.id".to_string(), "ctx-assembly".to_string());
+        metadata.insert("frontmatter.status".to_string(), "active".to_string());
 
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_root = tmp.path().to_path_buf();
-        std::fs::create_dir_all(repo_root.join(".oh/metis")).unwrap();
-        std::fs::create_dir_all(repo_root.join(".git")).unwrap();
-
-        // Build table with a code node.
-        let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
-        let node = Node {
-            id: NodeId {
-                root: "test".into(),
-                file: PathBuf::from("test.rs"),
-                name: "dummy_fn".into(),
-                kind: NodeKind::Function,
-            },
-            language: "rust".into(),
-            signature: "fn dummy_fn()".into(),
-            body: "fn dummy_fn() { }".into(),
-            line_start: 1,
-            line_end: 1,
-            metadata: BTreeMap::new(),
-            source: ExtractionSource::TreeSitter,
-        };
-        idx.index_all_with_symbols(&repo_root, &[node]).await.unwrap();
-
-        // Create artifact.
-        std::fs::write(
-            repo_root.join(".oh/metis/stable.md"),
-            "---\ntitle: stable artifact\n---\nThis content does not change.",
-        )
-        .unwrap();
-
-        // First call should embed it.
-        let first_count = idx.reindex_artifacts(&repo_root).await.unwrap();
-        assert!(first_count > 0, "first call should embed the artifact");
-
-        // Second call with same content should skip (BLAKE3 hash match).
-        let second_count = idx.reindex_artifacts(&repo_root).await.unwrap();
-        assert_eq!(second_count, 0, "second call should skip unchanged artifact (BLAKE3 dedup)");
-    }
-
-    #[tokio::test]
-    async fn reindex_artifacts_no_oh_directory() {
-        // Dissent finding: what happens when .oh/ doesn't exist at all?
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_root = tmp.path().to_path_buf();
-        // No .oh/ directory created.
-
-        let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
-        // Should return 0 -- no artifacts to load, no table to open.
-        let count = idx.reindex_artifacts(&repo_root).await.unwrap();
-        assert_eq!(count, 0, "should return 0 when no .oh/ directory exists");
+        let text = build_artifact_embedding_text("My Outcome", "Body text here.", &metadata);
+        assert!(text.starts_with("ctx-assembly"), "should start with frontmatter id, got: {}", text);
+        assert!(text.contains("status: active"), "should contain frontmatter fields");
+        assert!(text.contains("Body text here."), "should contain body text");
     }
 }
