@@ -131,7 +131,10 @@ async fn async_main() -> anyhow::Result<()> {
             let repo_root = args.repo.canonicalize()?; eprintln!("Scanning {}...", repo_root.display());
             let handler = RnaHandler { repo_root: repo_root.clone(), ..Default::default() }; let gs = handler.build_full_graph().await?;
             // Initialize embedding index for semantic search + reranking.
-            let embed_idx = repo_native_alignment::embed::EmbeddingIndex::new(&repo_root).await.ok();
+            let embed_idx = match repo_native_alignment::embed::EmbeddingIndex::new(&repo_root).await {
+                Ok(idx) => Some(idx),
+                Err(e) => { tracing::warn!("EmbeddingIndex init failed; semantic search may degrade: {}", e); None }
+            };
             let embed_ref = embed_idx.as_ref();
             let params = SearchParams {
                 query: if args.query.is_empty() { None } else { Some(args.query.clone()) },
