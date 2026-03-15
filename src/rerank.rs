@@ -141,6 +141,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_rna_cache_dir_uses_home() {
+        let dir = rna_cache_dir();
+        let dir_str = dir.to_string_lossy();
+        // When HOME is set (typical in tests), cache dir should be under ~/.cache/rna/models
+        if std::env::var("HOME").is_ok() {
+            assert!(dir_str.contains(".cache/rna/models"), "Expected ~/.cache/rna/models, got: {}", dir_str);
+            assert!(!dir_str.contains(".fastembed_cache"), "Should not use .fastembed_cache: {}", dir_str);
+        }
+    }
+
+    #[test]
     fn test_rerank_empty_candidates() {
         let results = rerank_results("test query", &[]).unwrap();
         assert!(results.is_empty());
