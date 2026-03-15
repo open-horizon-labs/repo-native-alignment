@@ -300,23 +300,27 @@ impl RnaHandler {
         };
 
         // Pre-index cached graph by root slug to avoid O(roots * N) scanning.
+        // Consume cached_graph to move nodes/edges instead of cloning.
         let mut cached_nodes_by_root: std::collections::HashMap<String, Vec<Node>> =
             std::collections::HashMap::new();
         let mut cached_edges_by_root: std::collections::HashMap<String, Vec<Edge>> =
             std::collections::HashMap::new();
-        if let Some(ref cached) = cached_graph {
-            for node in &cached.nodes {
-                cached_nodes_by_root.entry(node.id.root.clone()).or_default().push(node.clone());
+        let has_cached_graph = cached_graph.is_some();
+        if let Some(cached) = cached_graph {
+            for node in cached.nodes {
+                let root = node.id.root.clone();
+                cached_nodes_by_root.entry(root).or_default().push(node);
             }
-            for edge in &cached.edges {
-                cached_edges_by_root.entry(edge.from.root.clone()).or_default().push(edge.clone());
+            for edge in cached.edges {
+                let root = edge.from.root.clone();
+                cached_edges_by_root.entry(root).or_default().push(edge);
             }
         }
 
         for (root_slug, scanner, _scan_result, root_path, root_changed) in &scanners {
             if !root_changed {
                 // Clean root: load from pre-indexed cache if available, otherwise extract.
-                if cached_graph.is_some() {
+                if has_cached_graph {
                     let cached_nodes = cached_nodes_by_root.remove(root_slug);
                     let cached_edges = cached_edges_by_root.remove(root_slug);
 
@@ -384,7 +388,7 @@ impl RnaHandler {
         // that don't belong to any current root.
         // Only include nodes whose root is genuinely external/virtual -- not stale
         // worktree items that were deleted but remain in the LanceDB cache.
-        if cached_graph.is_some() {
+        if has_cached_graph {
             let current_slugs: std::collections::HashSet<&str> = scanners
                 .iter()
                 .map(|(slug, _, _, _, _)| slug.as_str())
