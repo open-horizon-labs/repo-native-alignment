@@ -173,7 +173,7 @@ The system compounds from here. Agents use `search` to discover relevant context
 
 | Tool | What it's for |
 |------|--------------|
-| `search` | All-in-one search: code symbols by name/signature, .oh/ artifacts and commits via embedding index, markdown sections, and graph traversal with `mode` (neighbors, impact, reachable, tests_for). Supports `include_artifacts` and `include_markdown` (both default true), `artifact_types` filter, `compact: true` (~25x fewer tokens), batch retrieval via `nodes: [...]`, sorting by relevance/complexity/importance, and `search_mode` (hybrid/keyword/semantic). |
+| `search` | All-in-one search: code symbols ranked by embedding index (hybrid BM25+vector by default, falls back to name/signature matching while index builds), .oh/ artifacts and commits, markdown sections, and graph traversal with `mode` (neighbors, impact, reachable, tests_for). Supports `include_artifacts` and `include_markdown` (both default true), `artifact_types` filter, `compact: true` (~25x fewer tokens), batch retrieval via `nodes: [...]`, sorting by relevance/complexity/importance, and `search_mode` (hybrid/keyword/semantic) applies to all search paths. |
 | `repo_map` | Repository orientation: top symbols by PageRank importance, hotspot files, active outcomes, entry points. One call replaces an exploratory loop. |
 | `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols. Optional `include_impact: true` for risk-classified blast radius. |
 | `list_roots` | Show which workspace roots are configured and their scan status |
@@ -210,7 +210,7 @@ search(node="<id>", mode="impact")
 
 | Command | What it does |
 |---------|-------------|
-| `search <query>` | Search symbols by name/signature, filter by kind/language/file |
+| `search <query>` | Search symbols via embedding index (hybrid/keyword/semantic), filter by kind/language/file |
 | `graph --node <id> --mode <mode>` | Traverse neighbors, impact analysis, or reachability |
 | `scan --repo <dir>` | Scan + extract + embed + persist |
 | `scan --repo <dir> --full` | Full pipeline including LSP enrichment, with visible phase-by-phase output |
