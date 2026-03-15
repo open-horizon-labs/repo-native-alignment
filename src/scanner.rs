@@ -32,6 +32,7 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     "vendor/",
     ".build/",
     ".cache/",
+    ".fastembed_cache/",
     "*.pyc",
     "*.o",
     "*.so",
@@ -1131,6 +1132,8 @@ mod tests {
     fn test_dir_excluded() {
         assert!(is_dir_excluded("node_modules/", "node_modules"));
         assert!(is_dir_excluded("target/", "some/target"));
+        assert!(is_dir_excluded(".fastembed_cache/", ".fastembed_cache"));
+        assert!(is_dir_excluded(".cache/", ".oh/.cache"));
         assert!(!is_dir_excluded("target/", "src"));
         assert!(!is_dir_excluded("*.pyc", "some_dir"));
     }
@@ -1355,27 +1358,27 @@ mod tests {
     }
 
     #[test]
-    fn test_project_config_applies_to_custom_excludes() {
+    fn test_fastembed_cache_excluded_by_default() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
 
         create_file(root, "src/main.rs", "fn main() {}\n");
         create_file(root, ".fastembed_cache/model.onnx", "model bytes");
+        create_file(root, ".fastembed_cache/tokenizer.json", "{}");
         fs::create_dir_all(root.join(".oh/.cache")).unwrap();
-        fs::write(
-            root.join(".oh/config.toml"),
-            "[scanner]\nexclude = [\".fastembed_cache/\"]\n",
-        )
-        .unwrap();
 
-        let excludes = DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect();
-        let mut scanner = Scanner::with_excludes(root.to_path_buf(), excludes).unwrap();
+        let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
         let result = scanner.scan().unwrap();
 
         let all: Vec<_> = result.files_to_extract().into_iter().cloned().collect();
         assert!(
             !all.contains(&PathBuf::from(".fastembed_cache/model.onnx")),
-            "Config exclude should apply to custom scanners: {:?}",
+            ".fastembed_cache should be excluded by default: {:?}",
+            all
+        );
+        assert!(
+            !all.contains(&PathBuf::from(".fastembed_cache/tokenizer.json")),
+            ".fastembed_cache subdirs should be excluded by default: {:?}",
             all
         );
         assert!(all.contains(&PathBuf::from("src/main.rs")));
