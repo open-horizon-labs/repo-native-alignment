@@ -86,6 +86,143 @@ pub(crate) fn run_traversal(index: &GraphIndex, node_id: &str, mode: &str, hops:
     }
 }
 
+/// Execute a graph traversal and return results grouped by edge type.
+///
+/// For 1-hop neighbors, uses `neighbors_grouped()` directly.
+/// For multi-hop (reachable/impact), groups results by the edge type of the
+/// first hop connecting each result to the entry node.
+/// For tests_for, returns a single "Calls" group.
+pub(crate) fn run_traversal_grouped(
+    index: &GraphIndex,
+    node_id: &str,
+    mode: &str,
+    hops: Option<u32>,
+    direction: Option<&str>,
+    edge_filter: Option<&[EdgeKind]>,
+) -> Result<std::collections::BTreeMap<EdgeKind, Vec<String>>, String> {
+    match mode {
+        "neighbors" => {
+            let max_hops = hops.unwrap_or(1) as usize;
+            let dir = direction.unwrap_or("outgoing");
+
+            if max_hops == 1 {
+                // Direct 1-hop: use neighbors_grouped for exact edge info
+                match dir {
+                    "outgoing" => Ok(index.neighbors_grouped(node_id, edge_filter, Direction::Outgoing)),
+                    "incoming" => Ok(index.neighbors_grouped(node_id, edge_filter, Direction::Incoming)),
+                    "both" => {
+                        let mut out = index.neighbors_grouped(node_id, edge_filter, Direction::Outgoing);
+                        let inc = index.neighbors_grouped(node_id, edge_filter, Direction::Incoming);
+                        // Merge incoming groups into outgoing, deduplicating
+                        for (kind, ids) in inc {
+                            let entry = out.entry(kind).or_default();
+                            for id in ids {
+                                if !entry.contains(&id) {
+                                    entry.push(id);
+                                }
+                            }
+                        }
+                        Ok(out)
+                    }
+                    _ => Err(format!("Invalid direction: \"{}\". Use \"outgoing\", \"incoming\", or \"both\".", dir)),
+                }
+            } else {
+                // Multi-hop: get flat results then group by first-hop edge type
+                let flat_ids = run_traversal(index, node_id, mode, hops, direction, edge_filter)?;
+                Ok(group_by_first_hop(index, node_id, &flat_ids, edge_filter, dir))
+            }
+        }
+        "impact" => {
+            if edge_filter.is_some() {
+                return Err("edge_types is not supported with \"impact\" mode.".to_string());
+            }
+            let flat_ids = run_traversal(index, node_id, mode, hops, direction, edge_filter)?;
+            Ok(group_by_first_hop(index, node_id, &flat_ids, None, "incoming"))
+        }
+        "reachable" => {
+            let flat_ids = run_traversal(index, node_id, mode, hops, direction, edge_filter)?;
+            Ok(group_by_first_hop(index, node_id, &flat_ids, edge_filter, "outgoing"))
+        }
+        "tests_for" => {
+            if edge_filter.is_some() {
+                return Err("edge_types is not supported with \"tests_for\" mode.".to_string());
+            }
+            let flat_ids = run_traversal(index, node_id, mode, hops, direction, edge_filter)?;
+            let mut groups = std::collections::BTreeMap::new();
+            if !flat_ids.is_empty() {
+                groups.insert(EdgeKind::Calls, flat_ids);
+            }
+            Ok(groups)
+        }
+        other => Err(format!("Unknown mode: \"{}\". Use \"neighbors\", \"impact\", \"reachable\", or \"tests_for\".", other)),
+    }
+}
+
+/// Group flat traversal results by the edge type of the first hop from the entry node.
+///
+/// For each result ID, checks which edge type connects it (directly) to `node_id`.
+/// For multi-hop results not directly connected, assigns them to the edge type of
+/// the first-hop neighbor through which they were discovered.
+fn group_by_first_hop(
+    index: &GraphIndex,
+    node_id: &str,
+    flat_ids: &[String],
+    edge_filter: Option<&[EdgeKind]>,
+    dir: &str,
+) -> std::collections::BTreeMap<EdgeKind, Vec<String>> {
+    let direction = match dir {
+        "incoming" => Direction::Incoming,
+        _ => Direction::Outgoing,
+    };
+
+    // Get the direct 1-hop neighbors grouped by edge type
+    let first_hop = index.neighbors_grouped(node_id, edge_filter, direction);
+
+    // Build a lookup: direct neighbor -> edge_kind
+    let mut direct_edge: std::collections::HashMap<String, EdgeKind> = std::collections::HashMap::new();
+    for (kind, ids) in &first_hop {
+        for id in ids {
+            direct_edge.entry(id.clone()).or_insert_with(|| kind.clone());
+        }
+    }
+
+    // For each result in flat_ids, determine its first-hop edge type
+    let flat_set: std::collections::HashSet<&str> = flat_ids.iter().map(|s| s.as_str()).collect();
+    let mut groups: std::collections::BTreeMap<EdgeKind, Vec<String>> = std::collections::BTreeMap::new();
+
+    for id in flat_ids {
+        if let Some(kind) = direct_edge.get(id) {
+            // Direct neighbor: exact edge type known
+            groups.entry(kind.clone()).or_default().push(id.clone());
+        } else {
+            // Multi-hop: find which first-hop edge type leads here.
+            // Check each first-hop neighbor to see if this ID is reachable from it.
+            // Use the first matching first-hop neighbor's edge type.
+            let mut assigned = false;
+            for (kind, fh_ids) in &first_hop {
+                for fh_id in fh_ids {
+                    // Quick check: is the target reachable from this first-hop neighbor?
+                    let reachable = index.reachable(fh_id, 10, edge_filter);
+                    if reachable.iter().any(|r| r == id) {
+                        groups.entry(kind.clone()).or_default().push(id.clone());
+                        assigned = true;
+                        break;
+                    }
+                }
+                if assigned { break; }
+            }
+            if !assigned && !flat_set.is_empty() {
+                // Fallback: use the first available edge type
+                if let Some((kind, _)) = first_hop.iter().next() {
+                    groups.entry(kind.clone()).or_default().push(id.clone());
+                }
+            }
+        }
+    }
+
+    groups
+}
+
 /// Parse a `search_mode` string into [`SearchMode`].
 pub(crate) fn parse_search_mode(s: Option<&str>) -> SearchMode {
     match s.map(str::to_lowercase).as_deref() { Some("keyword") => SearchMode::Keyword, Some("semantic") => SearchMode::Semantic, _ => SearchMode::Hybrid }
@@ -210,5 +347,94 @@ mod tests {
             && !sort_by_importance
             && !has_kind_filter;
         assert!(!rejected, "Empty query with kind filter should be allowed");
+    }
+
+    // ==================== Adversarial tests for edge-type grouping ====================
+
+    #[test]
+    fn test_run_traversal_grouped_neighbors_1hop() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("a", "fn", "c", "struct", EdgeKind::DependsOn);
+        index.add_edge("a", "fn", "d", "fn", EdgeKind::Calls);
+
+        let groups = run_traversal_grouped(&index, "a", "neighbors", None, None, None).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[&EdgeKind::Calls].len(), 2);
+        assert_eq!(groups[&EdgeKind::DependsOn].len(), 1);
+    }
+
+    #[test]
+    fn test_run_traversal_grouped_neighbors_both_directions() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "a", "fn", EdgeKind::DependsOn);
+
+        let groups = run_traversal_grouped(&index, "a", "neighbors", None, Some("both"), None).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(groups[&EdgeKind::Calls].contains(&"b".to_string()));
+        assert!(groups[&EdgeKind::DependsOn].contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn test_run_traversal_grouped_tests_for_returns_calls() {
+        let mut index = GraphIndex::new();
+        index.add_edge("test_fn", "fn", "target", "fn", EdgeKind::Calls);
+        index.add_edge("prod_fn", "fn", "target", "fn", EdgeKind::Calls);
+
+        let groups = run_traversal_grouped(&index, "target", "tests_for", None, None, None).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(groups.contains_key(&EdgeKind::Calls));
+        assert_eq!(groups[&EdgeKind::Calls].len(), 2);
+    }
+
+    #[test]
+    fn test_run_traversal_grouped_empty_for_isolated_node() {
+        let mut index = GraphIndex::new();
+        index.ensure_node("lonely", "fn");
+
+        let groups = run_traversal_grouped(&index, "lonely", "neighbors", None, None, None).unwrap();
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_run_traversal_grouped_multi_hop_groups_by_first_hop() {
+        // a -calls-> b -depends_on-> c
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::DependsOn);
+
+        let groups = run_traversal_grouped(&index, "a", "neighbors", Some(2), None, None).unwrap();
+        // Both b and c should be grouped under Calls (first-hop edge type from a)
+        assert!(groups.contains_key(&EdgeKind::Calls), "should group under first-hop edge type");
+        let calls = &groups[&EdgeKind::Calls];
+        assert!(calls.contains(&"b".to_string()));
+        assert!(calls.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn test_run_traversal_grouped_impact_mode() {
+        // a -> b -> c (impact of c: b and a, reversed)
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::DependsOn);
+
+        let groups = run_traversal_grouped(&index, "c", "impact", None, None, None).unwrap();
+        assert!(!groups.is_empty(), "should find dependents");
+        // b is a direct incoming neighbor via DependsOn
+        assert!(groups.contains_key(&EdgeKind::DependsOn), "should have DependsOn group");
+    }
+
+    #[test]
+    fn test_run_traversal_grouped_with_edge_filter() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("a", "fn", "c", "struct", EdgeKind::DependsOn);
+        index.add_edge("a", "fn", "d", "trait", EdgeKind::Implements);
+
+        let filter = vec![EdgeKind::Calls, EdgeKind::Implements];
+        let groups = run_traversal_grouped(&index, "a", "neighbors", None, None, Some(&filter)).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(!groups.contains_key(&EdgeKind::DependsOn));
     }
 }

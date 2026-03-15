@@ -230,24 +230,83 @@ pub(crate) fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bo
 }
 
 /// Node kinds that are structural scaffolding and should be hidden from traversal results.
-/// These are filtered by `format_neighbor_nodes` when rendering, so we must also filter
+/// These are filtered by `format_neighbors_grouped` when rendering, so we must also filter
 /// them from the ID list before counting to keep the reported count accurate.
 pub(crate) fn is_hidden_traversal_kind(kind: &graph::NodeKind) -> bool {
     matches!(kind, graph::NodeKind::Module | graph::NodeKind::PrMerge)
 }
 
-/// Remove IDs whose node kind is hidden scaffolding (Module, PrMerge) from traversal results.
-/// This ensures the count shown in headings matches the nodes actually rendered.
-pub(crate) fn retain_displayable(all_ids: &mut Vec<String>, nodes: &[graph::Node]) {
-    all_ids.retain(|id| {
-        nodes.iter()
-            .find(|n| n.stable_id() == *id)
-            .map(|n| !is_hidden_traversal_kind(&n.id.kind))
-            // If node not found, keep the ID (it will render as a fallback `id` line)
-            .unwrap_or(true)
-    });
+/// Format traversal results grouped by edge type.
+///
+/// Each edge type gets a section header (e.g., `#### Calls (3)`) followed by
+/// the node entries. Edge types with zero results after hidden-kind filtering
+/// are omitted.
+pub(crate) fn format_neighbors_grouped(
+    nodes: &[graph::Node],
+    groups: &std::collections::BTreeMap<graph::EdgeKind, Vec<String>>,
+    index: &GraphIndex,
+    compact: bool,
+) -> String {
+    let mut sections: Vec<String> = Vec::new();
+
+    for (edge_kind, ids) in groups {
+        // Filter out hidden traversal kinds (Module, PrMerge)
+        let displayable_ids: Vec<&String> = ids
+            .iter()
+            .filter(|id| {
+                nodes
+                    .iter()
+                    .find(|n| n.stable_id() == **id)
+                    .map(|n| !is_hidden_traversal_kind(&n.id.kind))
+                    .unwrap_or(true)
+            })
+            .collect();
+
+        if displayable_ids.is_empty() {
+            continue;
+        }
+
+        let entries: Vec<String> = displayable_ids
+            .iter()
+            .map(|id| {
+                if let Some(node) = nodes.iter().find(|n| n.stable_id() == **id) {
+                    format_node_entry(node, index, compact)
+                } else {
+                    format!("- `{}`", id)
+                }
+            })
+            .collect();
+
+        // Capitalize the edge kind for display (e.g., "calls" -> "Calls")
+        let kind_str = edge_kind.to_string();
+        let kind_display = capitalize_first(&kind_str);
+
+        sections.push(format!(
+            "#### {} ({})\n\n{}",
+            kind_display,
+            displayable_ids.len(),
+            entries.join("\n"),
+        ));
+    }
+
+    sections.join("\n\n")
 }
 
+/// Capitalize the first character of a string and replace underscores with spaces.
+///
+/// Example: `depends_on` -> `Depends on`, `calls` -> `Calls`
+fn capitalize_first(s: &str) -> String {
+    let s = s.replace('_', " ");
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+    }
+}
+
+/// Format neighbor nodes as a flat list (non-grouped). Available for contexts
+/// where edge-type grouping is not needed (e.g., outcome_progress display).
+#[allow(dead_code)]
 pub(crate) fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String], index: &GraphIndex, compact: bool) -> String {
     ids.iter()
         .filter_map(|id| {
@@ -412,5 +471,100 @@ mod tests {
         let full = format_node_entry(&top_level, &index, false);
         assert!(!compact.contains("static"), "compact should NOT show 'static' for top-level function, got: {}", compact);
         assert!(!full.contains("Static:"), "full should NOT show 'Static:' for top-level function, got: {}", full);
+    }
+
+    #[test]
+    fn test_format_neighbors_grouped_basic() {
+        use crate::graph::EdgeKind;
+
+        let node_a = make_test_node("callee_a");
+        let node_b = make_test_node("callee_b");
+        let node_c = make_test_node("dep_c");
+        let nodes = vec![node_a.clone(), node_b.clone(), node_c.clone()];
+
+        let mut index = GraphIndex::new();
+        index.ensure_node(&node_a.stable_id(), "function");
+        index.ensure_node(&node_b.stable_id(), "function");
+        index.ensure_node(&node_c.stable_id(), "function");
+
+        let mut groups = std::collections::BTreeMap::new();
+        groups.insert(EdgeKind::Calls, vec![node_a.stable_id(), node_b.stable_id()]);
+        groups.insert(EdgeKind::DependsOn, vec![node_c.stable_id()]);
+
+        let result = format_neighbors_grouped(&nodes, &groups, &index, true);
+
+        assert!(result.contains("#### Calls (2)"), "should have Calls header, got: {}", result);
+        assert!(result.contains("#### Depends on (1)"), "should have DependsOn header, got: {}", result);
+        assert!(result.contains("callee_a"), "should contain callee_a");
+        assert!(result.contains("callee_b"), "should contain callee_b");
+        assert!(result.contains("dep_c"), "should contain dep_c");
+    }
+
+    #[test]
+    fn test_format_neighbors_grouped_omits_empty() {
+        use crate::graph::EdgeKind;
+
+        let node_a = make_test_node("only_node");
+        let nodes = vec![node_a.clone()];
+
+        let mut index = GraphIndex::new();
+        index.ensure_node(&node_a.stable_id(), "function");
+
+        let mut groups = std::collections::BTreeMap::new();
+        groups.insert(EdgeKind::Calls, vec![node_a.stable_id()]);
+        // Empty group should not appear
+        groups.insert(EdgeKind::DependsOn, vec![]);
+
+        let result = format_neighbors_grouped(&nodes, &groups, &index, true);
+
+        assert!(result.contains("#### Calls (1)"), "should have Calls header");
+        assert!(!result.contains("Depends on"), "should not have empty DependsOn section");
+    }
+
+    #[test]
+    fn test_format_neighbors_grouped_hides_module_nodes() {
+        use crate::graph::EdgeKind;
+
+        let mut module_node = make_test_node("my_module");
+        module_node.id.kind = graph::NodeKind::Module;
+        let func_node = make_test_node("my_func");
+        let nodes = vec![module_node.clone(), func_node.clone()];
+
+        let mut index = GraphIndex::new();
+        index.ensure_node(&module_node.stable_id(), "module");
+        index.ensure_node(&func_node.stable_id(), "function");
+
+        let mut groups = std::collections::BTreeMap::new();
+        groups.insert(EdgeKind::Defines, vec![module_node.stable_id(), func_node.stable_id()]);
+
+        let result = format_neighbors_grouped(&nodes, &groups, &index, true);
+
+        // Module node should be hidden; only func_node counted
+        assert!(result.contains("#### Defines (1)"), "should count only displayable nodes, got: {}", result);
+        assert!(result.contains("my_func"), "should contain my_func");
+        assert!(!result.contains("my_module"), "should not contain hidden module node");
+    }
+
+    #[test]
+    fn test_format_neighbors_grouped_compact_vs_full() {
+        use crate::graph::EdgeKind;
+
+        let node = make_test_node("test_fn");
+        let nodes = vec![node.clone()];
+
+        let mut index = GraphIndex::new();
+        index.ensure_node(&node.stable_id(), "function");
+
+        let mut groups = std::collections::BTreeMap::new();
+        groups.insert(EdgeKind::Calls, vec![node.stable_id()]);
+
+        let compact = format_neighbors_grouped(&nodes, &groups, &index, true);
+        let full = format_neighbors_grouped(&nodes, &groups, &index, false);
+
+        // Both should have the section header
+        assert!(compact.contains("#### Calls (1)"));
+        assert!(full.contains("#### Calls (1)"));
+        // Full should be longer (more detail per node)
+        assert!(full.len() > compact.len(), "full should be more detailed than compact");
     }
 }

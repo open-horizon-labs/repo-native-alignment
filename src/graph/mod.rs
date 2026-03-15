@@ -145,7 +145,7 @@ impl NodeKind {
 // ---------------------------------------------------------------------------
 
 /// The kind of relationship between two nodes.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
     Calls,

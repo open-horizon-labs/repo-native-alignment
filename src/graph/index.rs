@@ -4,7 +4,7 @@
 //! It provides fast BFS/DFS traversal, neighbor queries, and impact
 //! analysis that would be expensive as columnar joins.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef as PetgraphEdgeRef;
@@ -183,6 +183,46 @@ impl GraphIndex {
         }
 
         result
+    }
+
+    /// 1-hop neighbors grouped by edge type.
+    ///
+    /// Returns a `BTreeMap<EdgeKind, Vec<String>>` where each key is an edge type
+    /// and the value is the list of neighbor IDs connected by that edge type.
+    /// Edge types with no neighbors are omitted. BTreeMap ensures consistent
+    /// ordering across calls.
+    pub fn neighbors_grouped(
+        &self,
+        node_id: &str,
+        edge_types: Option<&[EdgeKind]>,
+        direction: Direction,
+    ) -> BTreeMap<EdgeKind, Vec<String>> {
+        let Some(&idx) = self.node_lookup.get(node_id) else {
+            return BTreeMap::new();
+        };
+
+        let mut groups: BTreeMap<EdgeKind, Vec<String>> = BTreeMap::new();
+        let edges = self.graph.edges_directed(idx, direction);
+
+        for edge_ref in edges {
+            let kind = &edge_ref.weight().edge_type;
+            if let Some(types) = edge_types {
+                if !types.contains(kind) {
+                    continue;
+                }
+            }
+
+            let neighbor_idx = match direction {
+                Direction::Outgoing => edge_ref.target(),
+                Direction::Incoming => edge_ref.source(),
+            };
+            groups
+                .entry(kind.clone())
+                .or_default()
+                .push(self.graph[neighbor_idx].id.clone());
+        }
+
+        groups
     }
 
     /// BFS reachability within N hops, optionally filtered by edge types.
@@ -988,5 +1028,71 @@ mod tests {
         // PR/outcome edges get minimal weight
         assert!(edge_weight(&EdgeKind::Modified) < 0.1);
         assert!(edge_weight(&EdgeKind::Serves) < 0.1);
+    }
+
+    // ==================== neighbors_grouped tests ====================
+
+    #[test]
+    fn test_neighbors_grouped_basic() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("a", "fn", "c", "struct", EdgeKind::DependsOn);
+        index.add_edge("a", "fn", "d", "fn", EdgeKind::Calls);
+
+        let groups = index.neighbors_grouped("a", None, Direction::Outgoing);
+        assert_eq!(groups.len(), 2, "should have 2 edge types");
+        assert_eq!(groups[&EdgeKind::Calls].len(), 2, "should have 2 Calls neighbors");
+        assert_eq!(groups[&EdgeKind::DependsOn].len(), 1, "should have 1 DependsOn neighbor");
+        assert!(groups[&EdgeKind::Calls].contains(&"b".to_string()));
+        assert!(groups[&EdgeKind::Calls].contains(&"d".to_string()));
+        assert!(groups[&EdgeKind::DependsOn].contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn test_neighbors_grouped_empty_for_nonexistent_node() {
+        let index = GraphIndex::new();
+        let groups = index.neighbors_grouped("nonexistent", None, Direction::Outgoing);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_neighbors_grouped_with_edge_filter() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("a", "fn", "c", "struct", EdgeKind::DependsOn);
+        index.add_edge("a", "fn", "d", "fn", EdgeKind::Implements);
+
+        let groups = index.neighbors_grouped("a", Some(&[EdgeKind::Calls, EdgeKind::Implements]), Direction::Outgoing);
+        assert_eq!(groups.len(), 2, "should only have filtered edge types");
+        assert!(!groups.contains_key(&EdgeKind::DependsOn));
+        assert_eq!(groups[&EdgeKind::Calls].len(), 1);
+        assert_eq!(groups[&EdgeKind::Implements].len(), 1);
+    }
+
+    #[test]
+    fn test_neighbors_grouped_incoming() {
+        let mut index = GraphIndex::new();
+        index.add_edge("x", "fn", "a", "fn", EdgeKind::Calls);
+        index.add_edge("y", "fn", "a", "fn", EdgeKind::DependsOn);
+        index.add_edge("z", "fn", "a", "fn", EdgeKind::Calls);
+
+        let groups = index.neighbors_grouped("a", None, Direction::Incoming);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[&EdgeKind::Calls].len(), 2);
+        assert_eq!(groups[&EdgeKind::DependsOn].len(), 1);
+    }
+
+    #[test]
+    fn test_neighbors_grouped_no_empty_groups() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+
+        let groups = index.neighbors_grouped("a", None, Direction::Outgoing);
+        // Should only have the one edge type that has results
+        assert_eq!(groups.len(), 1);
+        assert!(groups.contains_key(&EdgeKind::Calls));
+        // Other edge types should not appear
+        assert!(!groups.contains_key(&EdgeKind::DependsOn));
+        assert!(!groups.contains_key(&EdgeKind::Defines));
     }
 }
