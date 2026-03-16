@@ -67,30 +67,14 @@ jobs:
           name: repo-native-alignment-darwin-arm64-fast
           path: repo-native-alignment-darwin-arm64-fast.tar.gz
 
-  # M1 baseline + Linux after M4, sharing sccache warmth
-  build:
+  # M1 baseline after M4 (shares sccache for same target triple)
+  build-m1:
     needs: build-fast
-    strategy:
-      matrix:
-        include:
-          - os: namespace-profile-tahoe
-            target: aarch64-apple-darwin
-            features: ""
-            artifact: repo-native-alignment-darwin-arm64
-            rustflags: "-C target-cpu=apple-m1 -C link-arg=-Wl,-dead_strip"
-          - os: namespace-profile-cached
-            target: x86_64-unknown-linux-gnu
-            features: "--no-default-features"
-            artifact: repo-native-alignment-linux-x86_64
-            rustflags: ""
-
-    runs-on: ${{ matrix.os }}
+    runs-on: namespace-profile-tahoe
     timeout-minutes: 60
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Patch version from tag
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -101,47 +85,81 @@ jobs:
             sed -i 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
             sed -i 's/"version": "[^"]*"/"version": "'"$VERSION"'"/g' .claude-plugin/marketplace.json
           fi
-
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-
+          targets: aarch64-apple-darwin
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
-
       - name: Configure Namespace sccache cache
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
-
       - name: Cache Rust
         uses: namespacelabs/nscloud-cache-action@v1
         with:
           cache: rust
-
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
+        run: cargo build --release --target aarch64-apple-darwin
         env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
+          RUSTFLAGS: "-C target-cpu=apple-m1 -C link-arg=-Wl,-dead_strip"
           RUSTC_WRAPPER: sccache
-
       - name: Strip and compress binary
         run: |
-          strip target/${{ matrix.target }}/release/repo-native-alignment
-          tar czf ${{ matrix.artifact }}.tar.gz -C target/${{ matrix.target }}/release repo-native-alignment
-
+          strip target/aarch64-apple-darwin/release/repo-native-alignment
+          tar czf repo-native-alignment-darwin-arm64.tar.gz -C target/aarch64-apple-darwin/release repo-native-alignment
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.tar.gz
+          name: repo-native-alignment-darwin-arm64
+          path: repo-native-alignment-darwin-arm64.tar.gz
+
+  # Linux builds in parallel with M4 (no shared cache across architectures)
+  build-linux:
+    runs-on: namespace-profile-cached
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Patch version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
+          sed -i 's/"version": "[^"]*"/"version": "'"$VERSION"'"/g' .claude-plugin/marketplace.json
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure Namespace sccache cache
+        run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
+      - name: Cache Rust
+        uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: rust
+      - name: Build release binary
+        run: cargo build --release --target x86_64-unknown-linux-gnu --no-default-features
+        env:
+          RUSTC_WRAPPER: sccache
+      - name: Strip and compress binary
+        run: |
+          strip target/x86_64-unknown-linux-gnu/release/repo-native-alignment
+          tar czf repo-native-alignment-linux-x86_64.tar.gz -C target/x86_64-unknown-linux-gnu/release repo-native-alignment
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-native-alignment-linux-x86_64
+          path: repo-native-alignment-linux-x86_64.tar.gz
 
   release:
-    needs: [build-fast, build]
+    needs: [build-fast, build-m1, build-linux]
     runs-on: namespace-profile-cached
 
     steps:
