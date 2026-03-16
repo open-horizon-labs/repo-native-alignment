@@ -338,26 +338,56 @@ mod tests {
         assert_eq!(matches[0].id.kind, NodeKind::Macro);
     }
 
-    /// Verify that the empty-query guard allows kind-only search.
+    /// Verify that the empty-query guard allows browse filters (kind, file, synthetic).
     #[test]
     fn test_empty_query_guard_allows_kind_filter() {
         let query_str = "";
         let complexity_search = false;
         let sort_by_importance = false;
 
-        let has_kind_filter = false;
+        // No filters -- rejected
+        let has_browse_filter = false;
         let rejected = query_str.is_empty()
             && !complexity_search
             && !sort_by_importance
-            && !has_kind_filter;
-        assert!(rejected, "Empty query without kind should be rejected");
+            && !has_browse_filter;
+        assert!(rejected, "Empty query without any filter should be rejected");
 
-        let has_kind_filter = true;
+        // kind filter -- allowed
+        let has_browse_filter = true; // kind=Some
         let rejected = query_str.is_empty()
             && !complexity_search
             && !sort_by_importance
-            && !has_kind_filter;
+            && !has_browse_filter;
         assert!(!rejected, "Empty query with kind filter should be allowed");
+    }
+
+    #[test]
+    fn test_empty_query_guard_allows_file_filter() {
+        let query_str = "";
+        let complexity_search = false;
+        let sort_by_importance = false;
+
+        let has_browse_filter = true; // file=Some
+        let rejected = query_str.is_empty()
+            && !complexity_search
+            && !sort_by_importance
+            && !has_browse_filter;
+        assert!(!rejected, "Empty query with file filter should be allowed");
+    }
+
+    #[test]
+    fn test_empty_query_guard_allows_synthetic_filter() {
+        let query_str = "";
+        let complexity_search = false;
+        let sort_by_importance = false;
+
+        let has_browse_filter = true; // synthetic=Some
+        let rejected = query_str.is_empty()
+            && !complexity_search
+            && !sort_by_importance
+            && !has_browse_filter;
+        assert!(!rejected, "Empty query with synthetic filter should be allowed");
     }
 
     // ==================== Adversarial tests for edge-type grouping ====================
