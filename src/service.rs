@@ -1441,7 +1441,11 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
                                     .rev()
                                     .nth(1)
                                     .unwrap_or(&iface.node_id);
-                                format!("{}()", short_name)
+                                if iface.node_type == "function" {
+                                    format!("{}()", short_name)
+                                } else {
+                                    short_name.to_string()
+                                }
                             })
                             .collect();
                         format!("\n  Interfaces: {}", iface_list.join(", "))
