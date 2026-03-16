@@ -246,7 +246,16 @@ async fn flat_code_symbol_search<'a>(
         Vec::new()
     };
 
-    // Fallback: name/signature matching (when embed is unavailable, not ready, or query is empty).
+    // Supplement or fallback: name/signature matching.
+    //
+    // When embed search was used, exact name matches that the embedding missed
+    // are appended after the embed-ranked results. This ensures functions are
+    // always findable by name regardless of embedding quality or index freshness.
+    // (#275: without this, `search("embed_texts")` returned zero code results
+    // because the embedding didn't surface the function and no fallback fired.)
+    //
+    // When embed search was NOT used (unavailable, not ready, or empty query),
+    // name/signature matching is the sole source of results.
     if !used_embed {
         matches = graph_state.nodes.iter().filter(|n| {
             if complexity_search && n.id.kind != NodeKind::Function { return false; }
@@ -256,6 +265,37 @@ async fn flat_code_symbol_search<'a>(
             }
             node_passes_filters(n)
         }).collect();
+    } else if !query_lower.is_empty() {
+        // Embed search was used -- supplement with name/signature matches
+        // that the embedding missed. Deduplicate by stable_id so embed-ranked
+        // results keep their position; supplements are appended at the end.
+        //
+        // Cap supplements to avoid blowing up the reranker candidate pool
+        // and reserve slots so supplements survive the downstream truncate.
+        let supplement_budget = limit.min(10);
+        let seen: std::collections::HashSet<String> = matches.iter()
+            .map(|n| n.stable_id())
+            .collect();
+        let name_supplements: Vec<&Node> = graph_state.nodes.iter().filter(|n| {
+            if seen.contains(&n.stable_id()) { return false; }
+            let name_match = n.id.name.to_lowercase().contains(&query_lower)
+                || n.signature.to_lowercase().contains(&query_lower);
+            if !name_match { return false; }
+            node_passes_filters(n)
+        }).collect();
+        if !name_supplements.is_empty() {
+            // Sort supplements by name-match quality, then cap to budget.
+            let mut sorted_supplements = name_supplements;
+            ranking::sort_symbol_matches(&mut sorted_supplements, &query_lower, &graph_state.index);
+            sorted_supplements.truncate(supplement_budget);
+            // Evict tail embed results to make room so supplements survive
+            // the final truncate(limit).
+            let reserved = sorted_supplements.len();
+            if matches.len() + reserved > limit {
+                matches.truncate(limit.saturating_sub(reserved));
+            }
+            matches.extend(sorted_supplements);
+        }
     }
 
     // Apply sort overrides or default ranking.
