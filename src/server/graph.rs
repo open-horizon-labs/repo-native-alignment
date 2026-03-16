@@ -391,12 +391,42 @@ impl RnaHandler {
                 helpers::resolve_edge_target_by_suffix(edge, &file_index);
             }
 
+            // For dirty roots, carry forward cached LSP edges whose endpoints
+            // still exist in the freshly extracted node set. Tree-sitter re-extraction
+            // only produces tree-sitter edges; LSP edges (Calls, ReferencedBy from LSP)
+            // are produced by the background enricher and would otherwise be lost on
+            // every incremental rebuild.
+            let mut lsp_carry_count = 0usize;
+            if *root_changed && has_cached_graph {
+                if let Some(cached_edges) = cached_edges_by_root.remove(root_slug) {
+                    let node_ids: std::collections::HashSet<String> = extraction.nodes
+                        .iter()
+                        .map(|n| n.stable_id())
+                        .collect();
+                    for edge in cached_edges {
+                        if edge.source == crate::graph::ExtractionSource::Lsp {
+                            let from_id = edge.from.to_stable_id();
+                            let to_id = edge.to.to_stable_id();
+                            if node_ids.contains(&from_id) || node_ids.contains(&to_id) {
+                                extraction.edges.push(edge);
+                                lsp_carry_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
             tracing::info!(
-                "Extracted from '{}'{}: {} nodes, {} edges",
+                "Extracted from '{}'{}: {} nodes, {} edges{}",
                 root_slug,
                 if *root_changed { " (dirty)" } else { " (no cache)" },
                 extraction.nodes.len(),
-                extraction.edges.len()
+                extraction.edges.len(),
+                if lsp_carry_count > 0 {
+                    format!(" (carried forward {} LSP edges)", lsp_carry_count)
+                } else {
+                    String::new()
+                }
             );
 
             all_nodes.extend(extraction.nodes);
