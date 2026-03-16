@@ -259,7 +259,10 @@ impl ExtractorRegistry {
             let content = match std::fs::read_to_string(&abs_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::warn!("Failed to read {}: {}", abs_path.display(), e);
+                    // Binary files (or files with invalid UTF-8) are expected to fail
+                    // here. Use debug level to avoid spamming logs with hundreds of
+                    // warnings when stale build artifacts slip past the scanner.
+                    tracing::debug!("Skipping non-text file {}: {}", abs_path.display(), e);
                     continue;
                 }
             };

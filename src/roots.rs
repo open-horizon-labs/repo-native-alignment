@@ -460,7 +460,7 @@ excludes = ["*.iso", "*.dmg"]
     fn test_default_excludes_code_project() {
         let excludes = default_excludes_for_type(&RootType::CodeProject);
         assert!(excludes.contains(&"node_modules/".to_string()));
-        assert!(excludes.contains(&"target/".to_string()));
+        assert!(excludes.contains(&"target*/".to_string()));
         assert!(excludes.contains(&".git/".to_string()));
     }
 
