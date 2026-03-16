@@ -1284,6 +1284,26 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id.name, "search", "exact match should come first");
     }
+
+    /// Exact signature match sorts before substring-only matches with limit=1.
+    #[test]
+    fn test_resolve_entry_points_exact_signature_first() {
+        let mut node_a = make_node("foo", NodeKind::Function, "src/a.rs");
+        node_a.signature = "fn foo(config: &SearchParams)".to_string();
+        let mut node_b = make_node("bar", NodeKind::Function, "src/b.rs");
+        node_b.signature = "fn bar()".to_string();
+        let nodes = vec![node_a, node_b];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams::default();
+
+        // Query matches node_a by signature ("fn foo(config: &SearchParams)")
+        // but not node_b. With limit=1, node_a must survive.
+        let results = resolve_entry_points_by_name("fn foo(config: &SearchParams)", 1, &params, &ctx);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.name, "foo", "exact signature match should be kept with limit=1");
+    }
 }
 
 // ── Outcome progress ───────────────────────────────────────────────
