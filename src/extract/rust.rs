@@ -106,9 +106,27 @@ impl Extractor for RustExtractor {
 /// `metadata["storage"] = "static"`. For `static mut`, also sets
 /// `metadata["mutable"] = "true"`.
 fn enrich_static_metadata(
+    root: tree_sitter::Node,
+    source: &[u8],
+    nodes: &mut [crate::graph::Node],
+) {
+    // Build a HashMap for O(1) lookup by (name, kind, line) instead of linear scan.
+    let mut node_index: std::collections::HashMap<(String, usize), usize> =
+        std::collections::HashMap::new();
+    for (i, n) in nodes.iter().enumerate() {
+        if n.id.kind == NodeKind::Const {
+            node_index.insert((n.id.name.clone(), n.line_start), i);
+        }
+    }
+
+    enrich_static_metadata_walk(root, source, nodes, &node_index);
+}
+
+fn enrich_static_metadata_walk(
     node: tree_sitter::Node,
     source: &[u8],
     nodes: &mut [crate::graph::Node],
+    node_index: &std::collections::HashMap<(String, usize), usize>,
 ) {
     if node.kind() == "static_item" {
         let line = node.start_position().row + 1;
@@ -122,19 +140,13 @@ fn enrich_static_metadata(
             .filter_map(|i| node.child(i as u32))
             .any(|c| c.kind() == "mutable_specifier");
 
-        // Find the matching node emitted by the generic extractor
-        for n in nodes.iter_mut() {
-            if n.id.name == name
-                && n.id.kind == NodeKind::Const
-                && n.line_start == line
-            {
-                n.metadata
-                    .insert("storage".to_string(), "static".to_string());
-                if is_mutable {
-                    n.metadata
-                        .insert("mutable".to_string(), "true".to_string());
-                }
-                break;
+        // Find the matching node via HashMap lookup
+        if let Some(&idx) = node_index.get(&(name.to_string(), line)) {
+            nodes[idx].metadata
+                .insert("storage".to_string(), "static".to_string());
+            if is_mutable {
+                nodes[idx].metadata
+                    .insert("mutable".to_string(), "true".to_string());
             }
         }
     }
@@ -142,7 +154,7 @@ fn enrich_static_metadata(
     // Recurse
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            enrich_static_metadata(child, source, nodes);
+            enrich_static_metadata_walk(child, source, nodes, node_index);
         }
     }
 }

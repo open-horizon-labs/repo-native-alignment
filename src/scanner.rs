@@ -71,9 +71,15 @@ impl ScanConfig {
 
     /// Merge config with a base exclude list to produce the final exclude list.
     fn apply_to_base_excludes(&self, mut excludes: Vec<String>) -> Vec<String> {
-        excludes.retain(|pattern| !self.include.iter().any(|inc| inc == pattern));
+        let include_set: std::collections::HashSet<&str> = self.include.iter()
+            .map(|s| s.as_str())
+            .collect();
+        excludes.retain(|pattern| !include_set.contains(pattern.as_str()));
+        let mut exclude_set: std::collections::HashSet<String> = excludes.iter()
+            .cloned()
+            .collect();
         for extra in &self.exclude {
-            if !excludes.contains(extra) {
+            if exclude_set.insert(extra.clone()) {
                 excludes.push(extra.clone());
             }
         }
@@ -159,25 +165,29 @@ impl PatternConfig {
     /// plus extra custom patterns.
     pub fn effective_suffixes(&self) -> Vec<(String, String)> {
         // Normalize disable list once for case-insensitive comparison.
-        let disable_lower: Vec<String> = self.disable.iter()
+        let disable_lower: std::collections::HashSet<String> = self.disable.iter()
             .map(|d| d.to_ascii_lowercase())
             .collect();
 
+        let mut seen_suffixes: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut suffixes: Vec<(String, String)> = DEFAULT_PATTERN_SUFFIXES
             .iter()
-            .filter(|(_, hint)| !disable_lower.iter().any(|d| d == hint))
-            .map(|(suffix, hint)| (suffix.to_string(), hint.to_string()))
+            .filter(|(_, hint)| !disable_lower.contains(*hint))
+            .map(|(suffix, hint)| {
+                seen_suffixes.insert(suffix.to_string());
+                (suffix.to_string(), hint.to_string())
+            })
             .collect();
 
         for pair in &self.extra {
             let suffix = pair[0].to_ascii_lowercase();
             let hint = pair[1].to_ascii_lowercase();
             // Skip if disabled (disable applies to extras too, not just built-ins)
-            if disable_lower.iter().any(|d| *d == hint) {
+            if disable_lower.contains(&hint) {
                 continue;
             }
             // Avoid duplicates: skip if suffix already present
-            if !suffixes.iter().any(|(s, _)| *s == suffix) {
+            if seen_suffixes.insert(suffix.clone()) {
                 suffixes.push((suffix, hint));
             }
         }

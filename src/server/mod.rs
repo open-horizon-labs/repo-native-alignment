@@ -66,6 +66,8 @@ pub struct RnaHandler {
     pub lsp_status: Arc<LspEnrichmentStatus>,
     /// Embedding build status — shared with background embedding tasks.
     pub embed_status: Arc<EmbeddingStatus>,
+    /// Cached non-code root slugs (computed once, cleared on root changes).
+    pub non_code_root_slugs_cache: std::sync::Mutex<Option<std::collections::HashSet<String>>>,
 }
 
 impl Default for RnaHandler {
@@ -81,6 +83,7 @@ impl Default for RnaHandler {
             background_scanner_started: std::sync::atomic::AtomicBool::new(false),
             lsp_status: Arc::new(LspEnrichmentStatus::probe_for_servers()),
             embed_status: Arc::new(EmbeddingStatus::default()),
+            non_code_root_slugs_cache: std::sync::Mutex::new(None),
         }
     }
 }
@@ -109,18 +112,31 @@ impl RnaHandler {
     /// Return the set of root slugs that correspond to non-code roots
     /// (Notes, General, Custom). These should always be included in
     /// query results regardless of root filtering.
+    ///
+    /// Results are cached to avoid repeated filesystem/config reads per tool call.
     pub(crate) fn non_code_root_slugs(&self) -> std::collections::HashSet<String> {
+        let mut cache = self.non_code_root_slugs_cache.lock().unwrap();
+        if let Some(ref cached) = *cache {
+            return cached.clone();
+        }
         use crate::roots::{RootType, WorkspaceConfig};
         let workspace = WorkspaceConfig::load()
             .with_primary_root(self.repo_root.clone())
             .with_worktrees(&self.repo_root)
             .with_claude_memory(&self.repo_root);
-        workspace
+        let slugs: std::collections::HashSet<String> = workspace
             .resolved_roots()
             .into_iter()
             .filter(|r| r.config.root_type != RootType::CodeProject)
             .map(|r| r.slug)
-            .collect()
+            .collect();
+        *cache = Some(slugs.clone());
+        slugs
+    }
+
+    /// Invalidate the non-code root slugs cache (e.g., when roots change).
+    pub(crate) fn invalidate_non_code_root_slugs_cache(&self) {
+        *self.non_code_root_slugs_cache.lock().unwrap() = None;
     }
 
     /// Check whether a node passes the root filter.

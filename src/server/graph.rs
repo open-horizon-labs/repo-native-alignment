@@ -105,6 +105,9 @@ impl RnaHandler {
     }
 
     pub(crate) async fn build_full_graph_inner(&self, spawn_background: bool) -> anyhow::Result<GraphState> {
+        // Invalidate cached root slugs since workspace/worktree config may have changed.
+        self.invalidate_non_code_root_slugs_cache();
+
         // Initialize pattern config from .oh/config.toml (once, at first build).
         crate::extract::generic::init_pattern_config(&self.repo_root);
 
@@ -296,29 +299,44 @@ impl RnaHandler {
             }
         };
 
+        // Pre-index cached graph by root slug to avoid O(roots * N) scanning.
+        // Consume cached_graph to move nodes/edges instead of cloning.
+        let mut cached_nodes_by_root: std::collections::HashMap<String, Vec<Node>> =
+            std::collections::HashMap::new();
+        let mut cached_edges_by_root: std::collections::HashMap<String, Vec<Edge>> =
+            std::collections::HashMap::new();
+        let has_cached_graph = cached_graph.is_some();
+        if let Some(cached) = cached_graph {
+            for node in cached.nodes {
+                let root = node.id.root.clone();
+                cached_nodes_by_root.entry(root).or_default().push(node);
+            }
+            for edge in cached.edges {
+                let root = edge.from.root.clone();
+                cached_edges_by_root.entry(root).or_default().push(edge);
+            }
+        }
+
         for (root_slug, scanner, _scan_result, root_path, root_changed) in &scanners {
             if !root_changed {
-                // Clean root: load from LanceDB cache if available, otherwise extract.
-                if let Some(ref cached) = cached_graph {
-                    let cached_nodes: Vec<Node> = cached.nodes.iter()
-                        .filter(|n| n.id.root == *root_slug)
-                        .cloned()
-                        .collect();
-                    let cached_edges: Vec<Edge> = cached.edges.iter()
-                        .filter(|e| e.from.root == *root_slug)
-                        .cloned()
-                        .collect();
+                // Clean root: load from pre-indexed cache if available, otherwise extract.
+                if has_cached_graph {
+                    let cached_nodes = cached_nodes_by_root.remove(root_slug);
+                    let cached_edges = cached_edges_by_root.remove(root_slug);
 
-                    if !cached_nodes.is_empty() {
-                        tracing::info!(
-                            "Clean root '{}': loaded {} nodes, {} edges from cache (preserving LSP edges)",
-                            root_slug,
-                            cached_nodes.len(),
-                            cached_edges.len()
-                        );
-                        all_nodes.extend(cached_nodes);
-                        all_edges.extend(cached_edges);
-                        continue;
+                    if let Some(nodes) = cached_nodes {
+                        if !nodes.is_empty() {
+                            let edges = cached_edges.unwrap_or_default();
+                            tracing::info!(
+                                "Clean root '{}': loaded {} nodes, {} edges from cache (preserving LSP edges)",
+                                root_slug,
+                                nodes.len(),
+                                edges.len()
+                            );
+                            all_nodes.extend(nodes);
+                            all_edges.extend(edges);
+                            continue;
+                        }
                     }
                     // Fall through to full extract if cache had no nodes for this root
                     tracing::info!(
@@ -370,7 +388,7 @@ impl RnaHandler {
         // that don't belong to any current root.
         // Only include nodes whose root is genuinely external/virtual -- not stale
         // worktree items that were deleted but remain in the LanceDB cache.
-        if let Some(ref cached) = cached_graph {
+        if has_cached_graph {
             let current_slugs: std::collections::HashSet<&str> = scanners
                 .iter()
                 .map(|(slug, _, _, _, _)| slug.as_str())
@@ -379,22 +397,27 @@ impl RnaHandler {
             let is_virtual_root = |root: &str| -> bool {
                 root == "external" || non_code.contains(root)
             };
-            let external_nodes: Vec<Node> = cached.nodes.iter()
-                .filter(|n| !current_slugs.contains(n.id.root.as_str()) && is_virtual_root(&n.id.root))
-                .cloned()
-                .collect();
-            let external_edges: Vec<Edge> = cached.edges.iter()
-                .filter(|e| !current_slugs.contains(e.from.root.as_str()) && is_virtual_root(&e.from.root))
-                .cloned()
-                .collect();
-            if !external_nodes.is_empty() {
+            // Use remaining entries from pre-indexed maps (roots not consumed by clean-root reuse).
+            let mut ext_node_count = 0usize;
+            let mut ext_edge_count = 0usize;
+            for (root, nodes) in cached_nodes_by_root {
+                if !current_slugs.contains(root.as_str()) && is_virtual_root(&root) {
+                    ext_node_count += nodes.len();
+                    all_nodes.extend(nodes);
+                }
+            }
+            for (root, edges) in cached_edges_by_root {
+                if !current_slugs.contains(root.as_str()) && is_virtual_root(&root) {
+                    ext_edge_count += edges.len();
+                    all_edges.extend(edges);
+                }
+            }
+            if ext_node_count > 0 {
                 tracing::info!(
                     "Loaded {} external/virtual nodes, {} edges from cache",
-                    external_nodes.len(),
-                    external_edges.len()
+                    ext_node_count,
+                    ext_edge_count
                 );
-                all_nodes.extend(external_nodes);
-                all_edges.extend(external_edges);
             }
         }
 

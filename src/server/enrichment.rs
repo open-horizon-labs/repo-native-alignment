@@ -483,7 +483,7 @@ impl RnaHandler {
                     }
                     gs.edges.extend(enrichment.added_edges);
 
-                    let enriched_node_ids: Vec<String> = enrichment.updated_nodes.iter()
+                    let enriched_node_ids: std::collections::HashSet<String> = enrichment.updated_nodes.iter()
                         .map(|(id, _)| id.clone())
                         .collect();
                     for (node_id, patches) in &enrichment.updated_nodes {
@@ -611,7 +611,7 @@ impl RnaHandler {
                 }
                 gs.edges.extend(enrichment.added_edges);
 
-                let enriched_node_ids: Vec<String> = enrichment.updated_nodes.iter()
+                let enriched_node_ids: std::collections::HashSet<String> = enrichment.updated_nodes.iter()
                     .map(|(id, _)| id.clone())
                     .collect();
                 for (node_id, patches) in &enrichment.updated_nodes {
@@ -730,13 +730,18 @@ impl RnaHandler {
             // Acquire write lock briefly for in-memory graph mutation only.
             let mut guard = bg_graph.write().await;
             if let Some(ref mut gs) = *guard {
+                // Collect new node IDs before moving nodes into the graph.
+                let new_node_ids: Vec<String> = enrichment.new_nodes.iter()
+                    .map(|n| n.stable_id())
+                    .collect();
                 for vnode in &enrichment.new_nodes {
                     gs.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
                 }
-                gs.nodes.extend(enrichment.new_nodes.clone());
+                gs.nodes.extend(enrichment.new_nodes);
 
+                // Clone edges for persist (needed after lock is dropped), then move into graph.
                 let persist_edges = enrichment.added_edges.clone();
-                for edge in &enrichment.added_edges {
+                for edge in &persist_edges {
                     gs.index.add_edge(
                         &edge.from.to_stable_id(),
                         &edge.from.kind.to_string(),
@@ -768,7 +773,7 @@ impl RnaHandler {
                 // Collect nodes to persist/re-embed AFTER PageRank so importance is current.
                 let all_upsert_node_ids: std::collections::HashSet<String> =
                     enriched_node_ids.iter().cloned()
-                        .chain(enrichment.new_nodes.iter().map(|n| n.stable_id()))
+                        .chain(new_node_ids.into_iter())
                         .collect();
                 let all_upsert_nodes: Vec<Node> = gs.nodes.iter()
                     .filter(|n| all_upsert_node_ids.contains(&n.stable_id()))
@@ -971,7 +976,7 @@ impl RnaHandler {
                 }
                 gs.edges.extend(enrichment.added_edges);
 
-                let enriched_node_ids: Vec<String> = enrichment.updated_nodes.iter()
+                let enriched_node_ids: std::collections::HashSet<String> = enrichment.updated_nodes.iter()
                     .map(|(id, _)| id.clone())
                     .collect();
                 for (node_id, patches) in &enrichment.updated_nodes {
