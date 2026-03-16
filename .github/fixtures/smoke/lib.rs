@@ -1,3 +1,4 @@
+pub fn main() { println!("{}", hello()); }
 pub fn hello() -> &'static str { "world" }
 pub struct Config { pub name: String }
 fn private_helper() -> u32 { 42 }

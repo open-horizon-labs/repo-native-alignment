@@ -1,5 +1,5 @@
 ---
-id: test-outcome
+id: agent-alignment
 status: active
 mechanism: smoke test fixture
 files:
