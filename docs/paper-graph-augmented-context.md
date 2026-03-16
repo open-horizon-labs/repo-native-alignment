@@ -296,17 +296,22 @@ Three findings extend beyond the specific tool evaluated:
 
 These results are from an early-stage tool (RNA v0.1.9) on a single codebase (25K lines Rust) with a small sample (N=5). Independent replication on diverse codebases, languages, and model families would strengthen the findings. The benchmark design, prompts, scoring rubric, and raw results are published alongside this paper for reproducibility.
 
-## Appendix A: Benchmark Prompts
+## Appendix: Benchmark Materials
 
-### A.1 Vanilla Prompt
-[Include full prompt-v3.md]
+All benchmark materials are in [`benchmark/`](../benchmark/):
 
-### A.2 RNA Prompt
-[Include full prompt-v3-rna.md]
+### Prompts
+- [Vanilla prompt](../benchmark/prompt-v3.md) — the 5 developer questions without tool guidance
+- [RNA MCP prompt](../benchmark/prompt-v3-rna.md) — same questions with suggested MCP tool calls
+- [Evaluation rubric](../benchmark/eval-rubric-v3.md) — scoring criteria with anchored 1/3/5 examples
 
-### A.3 Evaluation Rubric
-[Include full eval-rubric-v3.md]
+### Scripts
+- [run-v3.sh](../benchmark/run-v3.sh) — serial benchmark runner (vanilla + RNA CLI pairs)
+- [score-results.sh](../benchmark/score-results.sh) — independent scorer for each solution
+- [aggregate-scores.py](../benchmark/aggregate-scores.py) — aggregates scores and efficiency metrics
+- [parse-results.py](../benchmark/parse-results.py) — extracts tool call breakdowns from transcripts
 
-## Appendix B: Raw Results
-
-[TODO: Include per-run token counts, scores, and solution texts]
+### Raw Results
+- [Vanilla runs](../benchmark/results/vanilla/) — `v3-run-{01..05}.json` (claude --print output with usage, cost, result)
+- [RNA MCP runs](../benchmark/results/rna-mcp/) — `v3-run-{01..05}.json`
+- [Scores](../benchmark/results/scores/) — `{vanilla,rna-mcp}-v3-run-{01..05}.json` (per-solution quality scores)
