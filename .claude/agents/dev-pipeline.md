@@ -205,7 +205,7 @@ Agent(subagent_type="ship", prompt="/ship <PR-number>\n\nWORKTREE: <worktree-pat
 
 > **DO NOT use Bash to run `claude` CLI commands.** Do not run `Bash(claude --agent ...)` or any variant. The Agent tool is a first-class tool available to you — use it directly. Running `claude` as a subprocess does not work and will waste time trying different CLI flags that don't exist.
 
-This launches the full 12-step pipeline as an autonomous agent:
+This launches the full 13-step pipeline as an autonomous agent:
 
 1. Review
 2. Dissent
@@ -219,6 +219,7 @@ This launches the full 12-step pipeline as an autonomous agent:
 8. README
 9. Smoke test
 10. CI green
+10b. Final comment sweep (catches CodeRabbit/human findings posted after step 3b)
 11. Merge
 
 The ship agent runs autonomously — do not wait for user prompts between steps. **Each substantive step MUST post its findings as a PR comment** (per `.claude/agents/ship.md`).
