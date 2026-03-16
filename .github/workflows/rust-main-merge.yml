@@ -13,7 +13,29 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  changes:
+    runs-on: namespace-profile-cached
+    timeout-minutes: 2
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'src/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'build.rs'
+              - '.github/workflows/**'
+              - '.github/scripts/**'
+              - '.github/fixtures/**'
+
   lint:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: namespace-profile-cached
     timeout-minutes: 5
     steps:
@@ -44,6 +66,8 @@ jobs:
           fi
 
   test:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: namespace-profile-cached
     timeout-minutes: 15
     steps:
@@ -77,7 +101,8 @@ jobs:
         run: cargo test --no-default-features
 
   smoke:
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false))
     runs-on: namespace-profile-cached
     timeout-minutes: 20
     steps:
@@ -147,7 +172,8 @@ jobs:
   # M4-optimized build runs first (this is what developers install).
   # Warms sccache for the M1 baseline build that follows.
   build-release-fast:
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: namespace-profile-tahoe
     timeout-minutes: 60
 
