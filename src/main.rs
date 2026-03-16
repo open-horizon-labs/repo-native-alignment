@@ -69,9 +69,16 @@ fn server_details() -> InitializeResult {
             icons: vec![], title: Some("Repo-Native Alignment".into()), website_url: None } }
 }
 
+/// Baseline directives that suppress noisy library internals.
+/// These are prepended to whatever default_filter the caller provides,
+/// so caller-level directives (e.g. `info`) win for RNA's own crate while
+/// lance internals stay at WARN unless RUST_LOG explicitly overrides.
+const LIBRARY_NOISE_FILTER: &str = "lance=warn,lance_index=warn,lance_file=warn,lancedb=warn";
+
 fn init_tracing(default_filter: &str, log_path: Option<&std::path::Path>) {
     use tracing_subscriber::prelude::*;
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter.into());
+    let composite_default = format!("{},{}", LIBRARY_NOISE_FILTER, default_filter);
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| composite_default.into());
     let effective_log_path = log_path.map(|p| p.to_path_buf()).or_else(|| std::env::var("RNA_LOG_FILE").ok().map(PathBuf::from));
     if let Some(ref file_path) = effective_log_path {
         if let Some(parent) = file_path.parent() { let _ = std::fs::create_dir_all(parent); }
