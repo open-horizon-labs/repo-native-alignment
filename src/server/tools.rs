@@ -28,7 +28,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search",
-    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Add `mode` for graph traversal (neighbors/impact/reachable/tests_for). Use `compact: true` to save tokens. Use `rerank: true` for natural language queries."
+    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Add `mode` for graph traversal (neighbors/impact/reachable/tests_for). Use `compact: true` to save tokens. Use `rerank: true` for natural language queries. Use `subsystem` to scope to a subsystem from repo_map."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct Search {
@@ -95,6 +95,9 @@ pub struct Search {
     /// Artifact filter: outcome, signal, guardrail, metis, commit
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_types: Option<Vec<String>>,
+    /// Filter to a specific subsystem (from repo_map)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subsystem: Option<String>,
 }
 
 fn default_true() -> Option<bool> {
@@ -436,6 +439,20 @@ mod tests {
         assert_eq!(s.artifact_types, Some(vec![]));
     }
 
+    // ── Subsystem parameter tests ────────────────────────────────────────
+
+    #[test]
+    fn test_search_subsystem_param() {
+        let s = parse_search(json!({"query": "scan", "subsystem": "scanner"})).unwrap();
+        assert_eq!(s.subsystem, Some("scanner".to_string()));
+    }
+
+    #[test]
+    fn test_search_subsystem_default_is_none() {
+        let s = parse_search(json!({"query": "test"})).unwrap();
+        assert!(s.subsystem.is_none());
+    }
+
     // ── Rerank parameter tests ───────────────────────────────────────────
 
     #[test]
@@ -490,6 +507,7 @@ mod tests {
             "Search .oh/ artifacts and commits (default: true)",
             "Search markdown sections (default: true)",
             "Artifact filter: outcome, signal, guardrail, metis, commit",
+            "Filter to a specific subsystem (from repo_map)",
             // RepoMap
             "Number of top symbols (default: 15)",
             // Shared

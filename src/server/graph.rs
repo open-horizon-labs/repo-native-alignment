@@ -520,6 +520,42 @@ impl RnaHandler {
         }
         tracing::info!("Computed PageRank importance for {} nodes", pagerank_scores.len());
 
+        // 6b. Detect subsystems and write cluster_id to node metadata.
+        // This runs after PageRank (which detect_communities needs) and before
+        // LanceDB persist so the metadata survives reload.
+        {
+            let node_file_map: std::collections::HashMap<String, String> = all_nodes
+                .iter()
+                .filter(|n| n.id.root != "external")
+                .map(|n| (n.stable_id(), n.id.file.display().to_string()))
+                .collect();
+
+            let subsystems = index.detect_communities(&pagerank_scores, &node_file_map);
+            if !subsystems.is_empty() {
+                // Build node_id -> subsystem_name lookup
+                let mut node_subsystem: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                for subsystem in &subsystems {
+                    for member_id in &subsystem.member_ids {
+                        node_subsystem.insert(member_id.clone(), subsystem.name.clone());
+                    }
+                }
+                let mut tagged = 0usize;
+                for node in &mut all_nodes {
+                    if let Some(subsystem_name) = node_subsystem.get(&node.stable_id()) {
+                        node.metadata
+                            .insert("subsystem".to_string(), subsystem_name.clone());
+                        tagged += 1;
+                    }
+                }
+                tracing::info!(
+                    "Tagged {} nodes with subsystem metadata ({} subsystems detected)",
+                    tagged,
+                    subsystems.len()
+                );
+            }
+        }
+
         // 7. Persist graph to LanceDB
         //
         // When `spawn_background=true` (MCP server path), persist NOW so the
@@ -717,6 +753,36 @@ impl RnaHandler {
         for node in &mut graph.nodes {
             if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
                 node.metadata.insert("importance".to_string(), format!("{:.6}", score));
+            }
+        }
+
+        // Recompute subsystem metadata after incremental graph update.
+        {
+            let node_file_map: std::collections::HashMap<String, String> = graph
+                .nodes
+                .iter()
+                .filter(|n| n.id.root != "external")
+                .map(|n| (n.stable_id(), n.id.file.display().to_string()))
+                .collect();
+
+            let subsystems = graph.index.detect_communities(&pagerank_scores, &node_file_map);
+            if !subsystems.is_empty() {
+                let mut node_subsystem: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                for subsystem in &subsystems {
+                    for member_id in &subsystem.member_ids {
+                        node_subsystem.insert(member_id.clone(), subsystem.name.clone());
+                    }
+                }
+                for node in &mut graph.nodes {
+                    if let Some(subsystem_name) = node_subsystem.get(&node.stable_id()) {
+                        node.metadata
+                            .insert("subsystem".to_string(), subsystem_name.clone());
+                    } else {
+                        // Remove stale subsystem metadata for nodes no longer in any cluster
+                        node.metadata.remove("subsystem");
+                    }
+                }
             }
         }
 

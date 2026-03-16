@@ -673,6 +673,7 @@ impl GraphIndex {
                 symbol_count: members.len(),
                 cohesion,
                 interfaces,
+                member_ids: member_ids.clone(),
             });
         }
 
@@ -697,6 +698,8 @@ pub struct Subsystem {
     pub cohesion: f64,
     /// Top interface functions, scored by cross_cluster_degree * pagerank.
     pub interfaces: Vec<SubsystemInterface>,
+    /// Stable IDs of all member nodes in this subsystem.
+    pub member_ids: Vec<String>,
 }
 
 /// An interface function at a subsystem boundary.
