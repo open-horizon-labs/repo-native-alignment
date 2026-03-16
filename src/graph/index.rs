@@ -628,18 +628,27 @@ impl GraphIndex {
                 0.0
             };
 
-            // Collect member node IDs
-            let member_ids: Vec<String> = members
-                .iter()
-                .filter_map(|&idx| {
-                    self.graph
-                        .node_weight(NodeIndex::new(idx))
-                        .map(|nr| nr.id.clone())
-                })
-                .collect();
+            // Collect member node IDs and module names
+            let mut member_ids: Vec<String> = Vec::new();
+            let mut module_names: Vec<String> = Vec::new();
+            for &idx in members {
+                if let Some(nr) = self.graph.node_weight(NodeIndex::new(idx)) {
+                    member_ids.push(nr.id.clone());
+                    if nr.node_type == "module" {
+                        // Extract the node name from the stable ID: "root:file:name:kind"
+                        // Split from the right since name and kind are simple identifiers
+                        // (no colons), but root/file might contain colons.
+                        if let Some(before_kind) = nr.id.rsplit_once(':') {
+                            if let Some((_, name)) = before_kind.0.rsplit_once(':') {
+                                module_names.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
 
-            // Cluster naming: dominant file-path prefix
-            let name = compute_cluster_name(&member_ids, node_file_map);
+            // Cluster naming: prefer module names, fall back to file-path prefix
+            let name = compute_cluster_name(&member_ids, node_file_map, &module_names);
 
             // Interface scoring: cross_cluster_degree * pagerank
             let mut interfaces: Vec<SubsystemInterface> = Vec::new();
@@ -690,7 +699,7 @@ impl GraphIndex {
 /// A detected subsystem (community) in the code graph.
 #[derive(Debug, Clone)]
 pub struct Subsystem {
-    /// Name derived from dominant file-path prefix of members.
+    /// Name derived from module nodes (preferred) or file-path prefix (fallback).
     pub name: String,
     /// Number of symbols in this subsystem.
     pub symbol_count: usize,
@@ -713,39 +722,98 @@ pub struct SubsystemInterface {
     pub interface_score: f64,
 }
 
-/// Compute a cluster name from the dominant file-path prefix of member nodes.
+/// Compute a cluster name from member nodes.
+///
+/// Priority:
+/// 1. If the cluster contains `Module` nodes, use the most common module name.
+/// 2. Otherwise, use the deepest common directory prefix of member file paths.
+/// 3. Never use function, struct, enum, or const names.
 fn compute_cluster_name(
     member_ids: &[String],
     node_file_map: &HashMap<String, String>,
+    module_names: &[String],
 ) -> String {
-    // Count file-path directory prefixes
-    let mut prefix_counts: HashMap<&str, usize> = HashMap::new();
-    for id in member_ids {
-        if let Some(file_path) = node_file_map.get(id) {
-            // Extract the first meaningful directory component after "src/"
-            let parts: Vec<&str> = file_path.split('/').collect();
-            let prefix = if parts.len() >= 2 && parts[0] == "src" {
-                if parts.len() >= 3 && parts[1] != "lib.rs" && parts[1] != "main.rs" {
-                    // e.g., src/graph/index.rs -> "graph"
-                    parts[1]
-                } else {
-                    // e.g., src/server.rs -> "server" (strip .rs)
-                    parts[1].strip_suffix(".rs").unwrap_or(parts[1])
-                }
-            } else if !parts.is_empty() {
-                parts[0]
-            } else {
-                continue;
-            };
-            *prefix_counts.entry(prefix).or_default() += 1;
+    // Priority 1: Use module names if any exist in this cluster
+    if !module_names.is_empty() {
+        // Pick the most common module name (handles clusters with multiple modules).
+        // Use BTreeMap for deterministic tie-breaking (lexicographic order).
+        let mut name_counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for name in module_names {
+            *name_counts.entry(name.as_str()).or_default() += 1;
+        }
+        if let Some((name, _)) = name_counts
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+        {
+            return name.to_string();
         }
     }
 
-    prefix_counts
-        .into_iter()
-        .max_by_key(|&(_, count)| count)
-        .map(|(prefix, _)| prefix.to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    // Priority 2: Deepest common directory prefix of member file paths.
+    // Compute the longest common directory path across all members, stripping
+    // "src/" prefix and file basenames. E.g., ["src/server/handlers/a.rs",
+    // "src/server/handlers/b.rs"] -> "server/handlers".
+    let mut dirs: Vec<Vec<&str>> = Vec::new();
+    for id in member_ids {
+        if let Some(file_path) = node_file_map.get(id.as_str()) {
+            let parts: Vec<&str> = file_path.split('/').collect();
+            if parts.is_empty() {
+                continue;
+            }
+            // Strip filename (last component); keep directory components
+            let dir_parts = &parts[..parts.len().saturating_sub(1)];
+            // Strip leading "src/" if present
+            let dir_parts = if dir_parts.first() == Some(&"src") {
+                &dir_parts[1..]
+            } else {
+                dir_parts
+            };
+            if dir_parts.is_empty() {
+                // File directly in src/ (e.g., src/server.rs) -- use stem as name
+                if let Some(stem) = parts.last().and_then(|f| f.strip_suffix(".rs")) {
+                    dirs.push(vec![stem]);
+                }
+            } else {
+                dirs.push(dir_parts.to_vec());
+            }
+        }
+    }
+
+    if let Some(first) = dirs.first() {
+        let mut common = first.clone();
+        for d in dirs.iter().skip(1) {
+            let mut i = 0;
+            while i < common.len() && i < d.len() && common[i] == d[i] {
+                i += 1;
+            }
+            common.truncate(i);
+            if common.is_empty() {
+                break;
+            }
+        }
+        if !common.is_empty() {
+            return common.join("/");
+        }
+    }
+
+    // Priority 3: When no common prefix exists (mixed directories), use the
+    // most frequent first directory component.
+    if !dirs.is_empty() {
+        let mut first_counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for d in &dirs {
+            if let Some(&first) = d.first() {
+                *first_counts.entry(first).or_default() += 1;
+            }
+        }
+        if let Some((name, _)) = first_counts
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+        {
+            return name.to_string();
+        }
+    }
+
+    "unknown".to_string()
 }
 
 impl Default for GraphIndex {
@@ -1696,24 +1764,105 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_cluster_name() {
+    fn test_compute_cluster_name_file_path_fallback() {
         let file_map = make_file_map(&[
             ("a", "src/graph/index.rs"),
             ("b", "src/graph/mod.rs"),
             ("c", "src/graph/store.rs"),
             ("d", "src/server.rs"),
         ]);
+        let no_modules: Vec<String> = vec![];
 
+        // No module nodes -> falls back to file-path prefix
         // Majority in src/graph/ -> name should be "graph"
-        let name = compute_cluster_name(&["a".to_string(), "b".to_string(), "c".to_string()], &file_map);
+        let name = compute_cluster_name(
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            &file_map,
+            &no_modules,
+        );
         assert_eq!(name, "graph");
 
         // Mixed: 2 graph + 1 server -> still "graph"
         let name = compute_cluster_name(
             &["a".to_string(), "b".to_string(), "d".to_string()],
             &file_map,
+            &no_modules,
         );
         assert_eq!(name, "graph");
+    }
+
+    #[test]
+    fn test_compute_cluster_name_prefers_module_nodes() {
+        let file_map = make_file_map(&[
+            ("a", "src/graph/index.rs"),
+            ("b", "src/graph/mod.rs"),
+            ("c", "src/server.rs"),
+        ]);
+
+        // Module node present -> use its name instead of file-path prefix
+        let module_names = vec!["graph".to_string()];
+        let name = compute_cluster_name(
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            &file_map,
+            &module_names,
+        );
+        assert_eq!(name, "graph");
+
+        // Module name wins even when file-path majority differs
+        let file_map2 = make_file_map(&[
+            ("a", "src/server/handler.rs"),
+            ("b", "src/server/routes.rs"),
+            ("c", "src/server/mod.rs"),
+        ]);
+        let module_names = vec!["my_server".to_string()];
+        let name = compute_cluster_name(
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            &file_map2,
+            &module_names,
+        );
+        assert_eq!(name, "my_server");
+    }
+
+    #[test]
+    fn test_compute_cluster_name_most_common_module() {
+        let file_map = HashMap::new();
+        // Multiple module nodes -> pick the most common
+        let module_names = vec![
+            "extract".to_string(),
+            "extract".to_string(),
+            "scanner".to_string(),
+        ];
+        let name = compute_cluster_name(&[], &file_map, &module_names);
+        assert_eq!(name, "extract");
+    }
+
+    #[test]
+    fn test_compute_cluster_name_deepest_common_prefix() {
+        let no_modules: Vec<String> = vec![];
+
+        // All files in same nested directory -> uses deepest common prefix
+        let file_map = make_file_map(&[
+            ("a", "src/server/handlers/auth.rs"),
+            ("b", "src/server/handlers/user.rs"),
+        ]);
+        let name = compute_cluster_name(
+            &["a".to_string(), "b".to_string()],
+            &file_map,
+            &no_modules,
+        );
+        assert_eq!(name, "server/handlers");
+
+        // Mixed nested paths -> common prefix is "server"
+        let file_map = make_file_map(&[
+            ("a", "src/server/handlers/auth.rs"),
+            ("b", "src/server/routes.rs"),
+        ]);
+        let name = compute_cluster_name(
+            &["a".to_string(), "b".to_string()],
+            &file_map,
+            &no_modules,
+        );
+        assert_eq!(name, "server");
     }
 
     #[test]
@@ -1758,6 +1907,60 @@ mod tests {
             subsystems.len() >= 2,
             "Groups connected only by DependsOn edges should remain separate clusters, got {} subsystem(s)",
             subsystems.len()
+        );
+    }
+
+    #[test]
+    fn test_detect_communities_uses_module_names() {
+        // When a cluster contains a Module node, the subsystem name should come
+        // from the module node's name, not from file paths or function names.
+        // Use realistic stable IDs (root:file:name:kind) since the extraction
+        // relies on splitting the ID to find the module name.
+        let mut index = GraphIndex::new();
+
+        let mod_id = "test:src/graph/mod.rs:graph:module";
+        let fn1_id = "test:src/graph/index.rs:build_graph:function";
+        let fn2_id = "test:src/graph/index.rs:add_edge:function";
+
+        // Cluster with a module node and several functions
+        index.add_edge(mod_id, "module", fn1_id, "fn", EdgeKind::Defines);
+        index.add_edge(fn1_id, "fn", fn2_id, "fn", EdgeKind::Calls);
+        index.add_edge(fn2_id, "fn", fn1_id, "fn", EdgeKind::Calls);
+        index.add_edge(fn1_id, "fn", mod_id, "module", EdgeKind::Calls);
+        index.add_edge(fn2_id, "fn", mod_id, "module", EdgeKind::Calls);
+        index.add_edge(mod_id, "module", fn2_id, "fn", EdgeKind::Calls);
+
+        let pagerank = index.compute_pagerank(0.85, 20);
+        let file_map: HashMap<String, String> = [
+            (mod_id, "src/graph/mod.rs"),
+            (fn1_id, "src/graph/index.rs"),
+            (fn2_id, "src/graph/index.rs"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let subsystems = index.detect_communities(&pagerank, &file_map);
+
+        // With 3 nodes and 5 coupling edges, Louvain should form a cluster
+        assert!(
+            !subsystems.is_empty(),
+            "expected at least one subsystem from a densely-connected 3-node graph"
+        );
+
+        let names: Vec<&str> = subsystems.iter().map(|s| s.name.as_str()).collect();
+
+        // Positive assertion: module-derived name "graph" should be used
+        assert!(
+            names.contains(&"graph"),
+            "subsystem should be named after the module node 'graph', got {:?}",
+            names
+        );
+        // Negative assertion: should NOT contain function names
+        assert!(
+            !names.contains(&"build_graph") && !names.contains(&"add_edge"),
+            "subsystem names should not be function names, got {:?}",
+            names
         );
     }
 
