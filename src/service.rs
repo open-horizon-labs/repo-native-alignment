@@ -1424,10 +1424,13 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
 
         let mut subsystems = graph_state.index.detect_communities(&pagerank_scores, &node_file_map);
         if !subsystems.is_empty() {
-            let total_symbols: usize = subsystems.iter().map(|s| s.symbol_count).sum();
-            // Filter out giant clusters that contain >50% of all symbols --
+            // Use the filtered node count (from node_file_map, which respects
+            // root_filter) as the denominator for giant-cluster detection. This
+            // avoids unrelated roots skewing the cutoff in multi-root mode.
+            let filtered_node_count = node_file_map.len();
+            // Filter out giant clusters that contain >50% of the filtered nodes --
             // they are not informative (everything is lumped together).
-            subsystems.retain(|s| (s.symbol_count as f64) < (total_symbols as f64 * 0.5));
+            subsystems.retain(|s| (s.symbol_count as f64) < (filtered_node_count as f64 * 0.5));
 
             // Deduplicate names: when multiple clusters share a name, append
             // a distinguishing suffix from their top interface function.
