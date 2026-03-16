@@ -410,6 +410,325 @@ impl GraphIndex {
         }
         result
     }
+
+
+    /// Detect subsystems via Louvain community detection on coupling edges.
+    ///
+    /// Only coupling edges are considered: Calls (1.0), Implements (0.8),
+    /// DependsOn (0.5), ReferencedBy (0.5), References (0.5), ConnectsTo (0.3).
+    /// Defines and HasField are excluded because they make every directory a
+    /// trivial cluster (structural containment, not coupling).
+    ///
+    /// Returns a list of detected subsystems, each with:
+    /// - A name derived from the dominant file-path prefix of member nodes
+    /// - Symbol count and cohesion ratio (internal edges / total edges)
+    /// - Interface functions scored by cross_cluster_degree * pagerank
+    ///
+    /// The `pagerank_scores` parameter should come from `compute_pagerank()`.
+    /// The `node_file_map` maps node IDs to their file paths (for cluster naming).
+    pub fn detect_communities(
+        &self,
+        pagerank_scores: &HashMap<String, f64>,
+        node_file_map: &HashMap<String, String>,
+    ) -> Vec<Subsystem> {
+        // Step 1: Build coupling subgraph as an undirected adjacency list.
+        // We work with NodeIndex values directly for performance.
+        let coupling_kinds = [
+            EdgeKind::Calls,
+            EdgeKind::Implements,
+            EdgeKind::DependsOn,
+            EdgeKind::ReferencedBy,
+            EdgeKind::References,
+            EdgeKind::ConnectsTo,
+        ];
+
+        // Collect coupling edges as undirected pairs with weights.
+        // adj[node_index] = vec of (neighbor_index, weight)
+        let n = self.graph.node_count();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        let mut total_weight = 0.0;
+
+        for edge_ref in self.graph.edge_references() {
+            let kind = &edge_ref.weight().edge_type;
+            if !coupling_kinds.contains(kind) {
+                continue;
+            }
+            let w = edge_weight(kind);
+            let s = edge_ref.source().index();
+            let t = edge_ref.target().index();
+            if s == t {
+                continue;
+            }
+            adj[s].push((t, w));
+            adj[t].push((s, w));
+            total_weight += w;
+        }
+
+        if total_weight == 0.0 {
+            return Vec::new();
+        }
+
+        // Weighted degree of each node (sum of coupling edge weights, undirected)
+        let k: Vec<f64> = adj.iter().map(|nbrs| nbrs.iter().map(|(_, w)| w).sum()).collect();
+
+        // Step 2: Louvain phase 1 -- iteratively move nodes to maximize modularity.
+        // community[i] = community assignment of node i
+        let mut community: Vec<usize> = (0..n).collect();
+        let m2 = 2.0 * total_weight; // sum of all edge weights (each counted once)
+
+        // Maintain sigma_tot incrementally: sum of weighted degrees per community.
+        // Initial state: each node is its own community, so sigma_tot[i] = k[i].
+        let mut sigma_tot: HashMap<usize, f64> = (0..n).map(|i| (i, k[i])).collect();
+
+        let mut improved = true;
+        let mut iterations = 0;
+        while improved && iterations < 20 {
+            improved = false;
+            iterations += 1;
+
+            for node in 0..n {
+                if k[node] == 0.0 {
+                    continue; // isolated node
+                }
+
+                let current_comm = community[node];
+
+                // Compute weight of edges from `node` to each neighboring community
+                let mut comm_weights: HashMap<usize, f64> = HashMap::new();
+                for &(nbr, w) in &adj[node] {
+                    *comm_weights.entry(community[nbr]).or_default() += w;
+                }
+
+                // Weight to current community (needed for removal delta)
+                let w_to_current = comm_weights.get(&current_comm).copied().unwrap_or(0.0);
+
+                let sigma_current = sigma_tot.get(&current_comm).copied().unwrap_or(0.0);
+                let ki = k[node];
+
+                // Modularity gain from removing node from its current community
+                let remove_delta = -w_to_current / m2 + ki * (sigma_current - ki) / (m2 * m2);
+
+                // Find best community to move to
+                let mut best_comm = current_comm;
+                let mut best_gain = 0.0;
+
+                for (&candidate_comm, &w_to_candidate) in &comm_weights {
+                    if candidate_comm == current_comm {
+                        continue;
+                    }
+                    let sigma_candidate = sigma_tot.get(&candidate_comm).copied().unwrap_or(0.0);
+                    let insert_delta = w_to_candidate / m2 - ki * sigma_candidate / (m2 * m2);
+                    let gain = remove_delta + insert_delta;
+                    if gain > best_gain {
+                        best_gain = gain;
+                        best_comm = candidate_comm;
+                    }
+                }
+
+                if best_comm != current_comm {
+                    // Update sigma_tot: remove node's degree from old, add to new
+                    *sigma_tot.entry(current_comm).or_default() -= ki;
+                    *sigma_tot.entry(best_comm).or_default() += ki;
+                    community[node] = best_comm;
+                    improved = true;
+                }
+            }
+        }
+
+        // Step 3: Collect communities, compute stats, and build Subsystem structs.
+        // Group nodes by community
+        let mut comm_members: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (node_idx, &comm) in community.iter().enumerate() {
+            comm_members.entry(comm).or_default().push(node_idx);
+        }
+
+        // Filter out tiny clusters (< 3 members) -- merge into nearest large cluster
+        let min_cluster_size = 3;
+        let large_comms: HashSet<usize> = comm_members
+            .iter()
+            .filter(|(_, members)| members.len() >= min_cluster_size)
+            .map(|(&comm, _)| comm)
+            .collect();
+
+        if large_comms.is_empty() {
+            return Vec::new();
+        }
+
+        // Reassign small-cluster nodes to the large cluster they have the most edges to
+        for node in 0..n {
+            if large_comms.contains(&community[node]) {
+                continue;
+            }
+            let mut best_comm = *large_comms.iter().next().unwrap();
+            let mut best_weight = 0.0_f64;
+            let mut comm_w: HashMap<usize, f64> = HashMap::new();
+            for &(nbr, w) in &adj[node] {
+                let c = community[nbr];
+                if large_comms.contains(&c) {
+                    *comm_w.entry(c).or_default() += w;
+                }
+            }
+            for (&c, &w) in &comm_w {
+                if w > best_weight {
+                    best_weight = w;
+                    best_comm = c;
+                }
+            }
+            community[node] = best_comm;
+        }
+
+        // Rebuild community members after merging
+        let mut comm_members: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (node_idx, &comm) in community.iter().enumerate() {
+            comm_members.entry(comm).or_default().push(node_idx);
+        }
+
+        // Build Subsystem structs
+        let mut subsystems: Vec<Subsystem> = Vec::new();
+
+        for (&_comm_id, members) in &comm_members {
+            if members.len() < min_cluster_size {
+                continue;
+            }
+
+            let member_set: HashSet<usize> = members.iter().copied().collect();
+
+            // Compute cohesion: internal_edges / total_edges for members
+            let mut internal_weight = 0.0_f64;
+            let mut total_member_weight = 0.0_f64;
+            for &node in members {
+                for &(nbr, w) in &adj[node] {
+                    total_member_weight += w;
+                    if member_set.contains(&nbr) {
+                        internal_weight += w;
+                    }
+                }
+            }
+            let cohesion = if total_member_weight > 0.0 {
+                internal_weight / total_member_weight
+            } else {
+                0.0
+            };
+
+            // Collect member node IDs
+            let member_ids: Vec<String> = members
+                .iter()
+                .filter_map(|&idx| {
+                    self.graph
+                        .node_weight(NodeIndex::new(idx))
+                        .map(|nr| nr.id.clone())
+                })
+                .collect();
+
+            // Cluster naming: dominant file-path prefix
+            let name = compute_cluster_name(&member_ids, node_file_map);
+
+            // Interface scoring: cross_cluster_degree * pagerank
+            let mut interfaces: Vec<SubsystemInterface> = Vec::new();
+            for &node in members {
+                let cross_cluster_degree: usize = adj[node]
+                    .iter()
+                    .filter(|(nbr, _)| !member_set.contains(nbr))
+                    .count();
+                if cross_cluster_degree == 0 {
+                    continue;
+                }
+                if let Some(nr) = self.graph.node_weight(NodeIndex::new(node)) {
+                    let importance = pagerank_scores.get(&nr.id).copied().unwrap_or(0.0);
+                    let interface_score = cross_cluster_degree as f64 * importance;
+                    interfaces.push(SubsystemInterface {
+                        node_id: nr.id.clone(),
+                        node_type: nr.node_type.clone(),
+                        interface_score,
+                    });
+                }
+            }
+            interfaces.sort_by(|a, b| {
+                b.interface_score
+                    .partial_cmp(&a.interface_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            interfaces.truncate(5); // top 5 interfaces per subsystem
+
+            subsystems.push(Subsystem {
+                name,
+                symbol_count: members.len(),
+                cohesion,
+                interfaces,
+            });
+        }
+
+        // Sort by symbol count descending
+        subsystems.sort_by(|a, b| b.symbol_count.cmp(&a.symbol_count));
+        subsystems
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subsystem detection types
+// ---------------------------------------------------------------------------
+
+/// A detected subsystem (community) in the code graph.
+#[derive(Debug, Clone)]
+pub struct Subsystem {
+    /// Name derived from dominant file-path prefix of members.
+    pub name: String,
+    /// Number of symbols in this subsystem.
+    pub symbol_count: usize,
+    /// Ratio of internal to total edge weight (0.0 to 1.0).
+    pub cohesion: f64,
+    /// Top interface functions, scored by cross_cluster_degree * pagerank.
+    pub interfaces: Vec<SubsystemInterface>,
+}
+
+/// An interface function at a subsystem boundary.
+#[derive(Debug, Clone)]
+pub struct SubsystemInterface {
+    /// Node ID of the interface function/struct.
+    pub node_id: String,
+    /// Node type (e.g., "function", "struct").
+    pub node_type: String,
+    /// Combined interface score: cross_cluster_degree * pagerank.
+    pub interface_score: f64,
+}
+
+/// Compute a cluster name from the dominant file-path prefix of member nodes.
+fn compute_cluster_name(
+    member_ids: &[String],
+    node_file_map: &HashMap<String, String>,
+) -> String {
+    // Count file-path directory prefixes
+    let mut prefix_counts: HashMap<&str, usize> = HashMap::new();
+    for id in member_ids {
+        if let Some(file_path) = node_file_map.get(id) {
+            // Extract the first meaningful directory component after "src/"
+            let parts: Vec<&str> = file_path.split('/').collect();
+            let prefix = if parts.len() >= 2 && parts[0] == "src" {
+                if parts.len() >= 3 && parts[1] != "lib.rs" && parts[1] != "main.rs" {
+                    // e.g., src/graph/index.rs -> "graph"
+                    parts[1]
+                } else {
+                    // e.g., src/server.rs -> "server" (strip .rs)
+                    parts[1].strip_suffix(".rs").unwrap_or(parts[1])
+                }
+            } else if !parts.is_empty() {
+                parts[0]
+            } else {
+                continue;
+            };
+            *prefix_counts.entry(prefix).or_default() += 1;
+        }
+    }
+
+    prefix_counts
+        .into_iter()
+        .max_by_key(|&(_, count)| count)
+        .map(|(prefix, _)| prefix.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 impl Default for GraphIndex {
@@ -1094,5 +1413,289 @@ mod tests {
         // Other edge types should not appear
         assert!(!groups.contains_key(&EdgeKind::DependsOn));
         assert!(!groups.contains_key(&EdgeKind::Defines));
+    }
+
+    // ==================== Community detection tests ====================
+
+    /// Helper to build a file map for community detection tests.
+    fn make_file_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(id, file)| (id.to_string(), file.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_detect_communities_empty_graph() {
+        let index = GraphIndex::new();
+        let subsystems = index.detect_communities(&HashMap::new(), &HashMap::new());
+        assert!(subsystems.is_empty());
+    }
+
+    #[test]
+    fn test_detect_communities_no_coupling_edges() {
+        // Only Defines edges -- should produce no subsystems since they are excluded
+        let mut index = GraphIndex::new();
+        for i in 0..5 {
+            index.add_edge(
+                &format!("struct_{}", i),
+                "struct",
+                &format!("field_{}", i),
+                "field",
+                EdgeKind::Defines,
+            );
+        }
+        let subsystems = index.detect_communities(&HashMap::new(), &HashMap::new());
+        assert!(
+            subsystems.is_empty(),
+            "Defines-only graph should produce no subsystems"
+        );
+    }
+
+    #[test]
+    fn test_detect_communities_two_clusters() {
+        // Cluster A: a1 <-> a2 <-> a3 (tightly connected via Calls)
+        // Cluster B: b1 <-> b2 <-> b3 (tightly connected via Calls)
+        // Single weak link between clusters: a3 -> b1
+        let mut index = GraphIndex::new();
+        // Cluster A: dense internal connections
+        index.add_edge("a1", "fn", "a2", "fn", EdgeKind::Calls);
+        index.add_edge("a2", "fn", "a1", "fn", EdgeKind::Calls);
+        index.add_edge("a2", "fn", "a3", "fn", EdgeKind::Calls);
+        index.add_edge("a3", "fn", "a2", "fn", EdgeKind::Calls);
+        index.add_edge("a1", "fn", "a3", "fn", EdgeKind::Calls);
+        index.add_edge("a3", "fn", "a1", "fn", EdgeKind::Calls);
+        // Cluster B: dense internal connections
+        index.add_edge("b1", "fn", "b2", "fn", EdgeKind::Calls);
+        index.add_edge("b2", "fn", "b1", "fn", EdgeKind::Calls);
+        index.add_edge("b2", "fn", "b3", "fn", EdgeKind::Calls);
+        index.add_edge("b3", "fn", "b2", "fn", EdgeKind::Calls);
+        index.add_edge("b1", "fn", "b3", "fn", EdgeKind::Calls);
+        index.add_edge("b3", "fn", "b1", "fn", EdgeKind::Calls);
+        // Weak inter-cluster link
+        index.add_edge("a3", "fn", "b1", "fn", EdgeKind::Calls);
+
+        let pagerank = index.compute_pagerank(0.85, 20);
+        let file_map = make_file_map(&[
+            ("a1", "src/alpha/mod.rs"),
+            ("a2", "src/alpha/mod.rs"),
+            ("a3", "src/alpha/mod.rs"),
+            ("b1", "src/beta/mod.rs"),
+            ("b2", "src/beta/mod.rs"),
+            ("b3", "src/beta/mod.rs"),
+        ]);
+
+        let subsystems = index.detect_communities(&pagerank, &file_map);
+        assert!(
+            subsystems.len() >= 2,
+            "should detect at least 2 clusters, got {}",
+            subsystems.len()
+        );
+
+        // Verify cluster names come from file paths
+        let names: Vec<&str> = subsystems.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"alpha") || names.contains(&"beta"),
+            "cluster names should reflect file paths, got {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_detect_communities_has_interfaces() {
+        // Same two-cluster setup; the cross-cluster link should produce an interface
+        let mut index = GraphIndex::new();
+        // Cluster A
+        index.add_edge("a1", "fn", "a2", "fn", EdgeKind::Calls);
+        index.add_edge("a2", "fn", "a1", "fn", EdgeKind::Calls);
+        index.add_edge("a2", "fn", "a3", "fn", EdgeKind::Calls);
+        index.add_edge("a3", "fn", "a2", "fn", EdgeKind::Calls);
+        index.add_edge("a1", "fn", "a3", "fn", EdgeKind::Calls);
+        index.add_edge("a3", "fn", "a1", "fn", EdgeKind::Calls);
+        // Cluster B
+        index.add_edge("b1", "fn", "b2", "fn", EdgeKind::Calls);
+        index.add_edge("b2", "fn", "b1", "fn", EdgeKind::Calls);
+        index.add_edge("b2", "fn", "b3", "fn", EdgeKind::Calls);
+        index.add_edge("b3", "fn", "b2", "fn", EdgeKind::Calls);
+        index.add_edge("b1", "fn", "b3", "fn", EdgeKind::Calls);
+        index.add_edge("b3", "fn", "b1", "fn", EdgeKind::Calls);
+        // Cross-cluster
+        index.add_edge("a3", "fn", "b1", "fn", EdgeKind::Calls);
+
+        let pagerank = index.compute_pagerank(0.85, 20);
+        let file_map = make_file_map(&[
+            ("a1", "src/alpha/mod.rs"),
+            ("a2", "src/alpha/mod.rs"),
+            ("a3", "src/alpha/mod.rs"),
+            ("b1", "src/beta/mod.rs"),
+            ("b2", "src/beta/mod.rs"),
+            ("b3", "src/beta/mod.rs"),
+        ]);
+
+        let subsystems = index.detect_communities(&pagerank, &file_map);
+        // At least one subsystem should have interface functions
+        let total_interfaces: usize = subsystems.iter().map(|s| s.interfaces.len()).sum();
+        assert!(
+            total_interfaces > 0,
+            "cross-cluster edges should produce interface functions"
+        );
+
+        // The interface nodes should be the ones on the boundary (a3 and/or b1)
+        let interface_ids: Vec<&str> = subsystems
+            .iter()
+            .flat_map(|s| s.interfaces.iter().map(|i| i.node_id.as_str()))
+            .collect();
+        assert!(
+            interface_ids.contains(&"a3") || interface_ids.contains(&"b1"),
+            "boundary nodes should be interfaces, got {:?}",
+            interface_ids
+        );
+    }
+
+    #[test]
+    fn test_detect_communities_cohesion_range() {
+        // Build a well-connected cluster
+        let mut index = GraphIndex::new();
+        for i in 0..5 {
+            for j in 0..5 {
+                if i != j {
+                    index.add_edge(
+                        &format!("n{}", i),
+                        "fn",
+                        &format!("n{}", j),
+                        "fn",
+                        EdgeKind::Calls,
+                    );
+                }
+            }
+        }
+
+        let pagerank = index.compute_pagerank(0.85, 20);
+        let file_map: HashMap<String, String> = (0..5)
+            .map(|i| (format!("n{}", i), "src/cluster/mod.rs".to_string()))
+            .collect();
+
+        let subsystems = index.detect_communities(&pagerank, &file_map);
+        // Should detect one cluster with high cohesion
+        if !subsystems.is_empty() {
+            for s in &subsystems {
+                assert!(
+                    s.cohesion >= 0.0 && s.cohesion <= 1.0,
+                    "cohesion should be in [0,1], got {}",
+                    s.cohesion
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_detect_communities_excludes_defines_edges() {
+        // Defines edges should NOT contribute to community detection.
+        // Two separate groups connected only by Defines should not form one community.
+        let mut index = GraphIndex::new();
+
+        // Group A: connected via Calls (real coupling)
+        index.add_edge("a1", "fn", "a2", "fn", EdgeKind::Calls);
+        index.add_edge("a2", "fn", "a1", "fn", EdgeKind::Calls);
+        index.add_edge("a2", "fn", "a3", "fn", EdgeKind::Calls);
+        index.add_edge("a3", "fn", "a2", "fn", EdgeKind::Calls);
+        index.add_edge("a1", "fn", "a3", "fn", EdgeKind::Calls);
+        index.add_edge("a3", "fn", "a1", "fn", EdgeKind::Calls);
+
+        // Group B: connected via Calls (real coupling)
+        index.add_edge("b1", "fn", "b2", "fn", EdgeKind::Calls);
+        index.add_edge("b2", "fn", "b1", "fn", EdgeKind::Calls);
+        index.add_edge("b2", "fn", "b3", "fn", EdgeKind::Calls);
+        index.add_edge("b3", "fn", "b2", "fn", EdgeKind::Calls);
+        index.add_edge("b1", "fn", "b3", "fn", EdgeKind::Calls);
+        index.add_edge("b3", "fn", "b1", "fn", EdgeKind::Calls);
+
+        // Connect A and B ONLY via Defines edges (should be ignored for clustering)
+        index.add_edge("a1", "struct", "b1", "field", EdgeKind::Defines);
+        index.add_edge("a2", "struct", "b2", "field", EdgeKind::Defines);
+
+        let pagerank = index.compute_pagerank(0.85, 20);
+        let file_map = make_file_map(&[
+            ("a1", "src/alpha/mod.rs"),
+            ("a2", "src/alpha/mod.rs"),
+            ("a3", "src/alpha/mod.rs"),
+            ("b1", "src/beta/mod.rs"),
+            ("b2", "src/beta/mod.rs"),
+            ("b3", "src/beta/mod.rs"),
+        ]);
+
+        let subsystems = index.detect_communities(&pagerank, &file_map);
+        // Should detect 2 separate clusters (A and B), not merge them via Defines
+        assert!(
+            subsystems.len() >= 2,
+            "Groups connected only by Defines edges should remain separate clusters, got {} subsystem(s)",
+            subsystems.len()
+        );
+    }
+
+    #[test]
+    fn test_detect_communities_single_dense_cluster() {
+        // All nodes tightly connected -- should produce exactly one subsystem
+        let mut index = GraphIndex::new();
+        let node_count = 6;
+        for i in 0..node_count {
+            for j in 0..node_count {
+                if i != j {
+                    index.add_edge(
+                        &format!("n{}", i),
+                        "fn",
+                        &format!("n{}", j),
+                        "fn",
+                        EdgeKind::Calls,
+                    );
+                }
+            }
+        }
+
+        let pagerank = index.compute_pagerank(0.85, 20);
+        let file_map: HashMap<String, String> = (0..node_count)
+            .map(|i| (format!("n{}", i), "src/core/mod.rs".to_string()))
+            .collect();
+
+        let subsystems = index.detect_communities(&pagerank, &file_map);
+        assert_eq!(
+            subsystems.len(),
+            1,
+            "fully connected graph should be one subsystem, got {}",
+            subsystems.len()
+        );
+        assert_eq!(subsystems[0].symbol_count, node_count);
+        // High cohesion expected (no external edges)
+        assert!(
+            subsystems[0].cohesion > 0.9,
+            "single cluster should have high cohesion, got {}",
+            subsystems[0].cohesion
+        );
+        // No interfaces since there's only one cluster
+        assert!(
+            subsystems[0].interfaces.is_empty(),
+            "single cluster should have no interfaces"
+        );
+    }
+
+    #[test]
+    fn test_compute_cluster_name() {
+        let file_map = make_file_map(&[
+            ("a", "src/graph/index.rs"),
+            ("b", "src/graph/mod.rs"),
+            ("c", "src/graph/store.rs"),
+            ("d", "src/server.rs"),
+        ]);
+
+        // Majority in src/graph/ -> name should be "graph"
+        let name = compute_cluster_name(&["a".to_string(), "b".to_string(), "c".to_string()], &file_map);
+        assert_eq!(name, "graph");
+
+        // Mixed: 2 graph + 1 server -> still "graph"
+        let name = compute_cluster_name(
+            &["a".to_string(), "b".to_string(), "d".to_string()],
+            &file_map,
+        );
+        assert_eq!(name, "graph");
     }
 }
