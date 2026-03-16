@@ -29,6 +29,51 @@ impl GraphState {
             .collect()
     }
 
+    /// Resolve a node ID that may be missing its root prefix.
+    ///
+    /// Search results display short IDs like `src/scanner.rs:scan:function`
+    /// (with root prefix stripped), but graph lookups need the full
+    /// `root-slug:src/scanner.rs:scan:function`. This method tries:
+    /// 1. Exact match (full stable ID)
+    /// 2. Prefix with each known root slug from the graph
+    ///
+    /// Returns the full stable ID if found, or the original ID if not.
+    pub fn resolve_node_id(&self, id: &str) -> String {
+        // Fast path: already a full stable ID
+        if self.nodes.iter().any(|n| n.stable_id() == id) {
+            return id.to_string();
+        }
+        // Try prepending each unique root slug
+        let roots: std::collections::HashSet<&str> = self.nodes.iter()
+            .map(|n| n.id.root.as_str())
+            .collect();
+        for root in &roots {
+            let full_id = format!("{}:{}", root, id);
+            if self.nodes.iter().any(|n| n.stable_id() == full_id) {
+                return full_id;
+            }
+        }
+        id.to_string()
+    }
+
+    /// Resolve a node ID using the pre-built index map. O(1) for exact match,
+    /// O(roots) for short-ID resolution.
+    pub fn resolve_node_id_fast(&self, id: &str, index_map: &std::collections::HashMap<String, usize>) -> String {
+        if index_map.contains_key(id) {
+            return id.to_string();
+        }
+        let roots: std::collections::HashSet<&str> = self.nodes.iter()
+            .map(|n| n.id.root.as_str())
+            .collect();
+        for root in &roots {
+            let full_id = format!("{}:{}", root, id);
+            if index_map.contains_key(&full_id) {
+                return full_id;
+            }
+        }
+        id.to_string()
+    }
+
     /// Look up a node by stable_id using a pre-built index map. O(1).
     pub fn node_by_stable_id<'a>(
         &'a self,
@@ -752,6 +797,113 @@ mod tests {
         status.set_server_found();
         let footer = status.footer_segment().unwrap();
         assert!(footer.contains("rust-analyzer"), "got: {}", footer);
+    }
+
+    // ── resolve_node_id / resolve_node_id_fast tests ────────────────
+
+    fn make_test_node(root: &str, file: &str, name: &str, kind: crate::graph::NodeKind) -> crate::graph::Node {
+        use crate::graph::*;
+        use std::collections::BTreeMap;
+        Node {
+            id: NodeId {
+                root: root.to_string(),
+                file: std::path::PathBuf::from(file),
+                name: name.to_string(),
+                kind,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 10,
+            signature: String::new(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        }
+    }
+
+    fn make_test_graph_state(nodes: Vec<crate::graph::Node>) -> GraphState {
+        let mut index = crate::graph::index::GraphIndex::new();
+        for n in &nodes {
+            index.ensure_node(&n.stable_id(), &n.id.kind.to_string());
+        }
+        GraphState { nodes, edges: vec![], index, last_scan_completed_at: None }
+    }
+
+    #[test]
+    fn test_resolve_node_id_exact_match() {
+        let node = make_test_node("myroot", "src/scanner.rs", "scan", crate::graph::NodeKind::Function);
+        let gs = make_test_graph_state(vec![node]);
+        // Full stable ID should resolve to itself
+        let full = "myroot:src/scanner.rs:scan:function";
+        assert_eq!(gs.resolve_node_id(full), full);
+    }
+
+    #[test]
+    fn test_resolve_node_id_short_id() {
+        let node = make_test_node("myroot", "src/scanner.rs", "scan", crate::graph::NodeKind::Function);
+        let gs = make_test_graph_state(vec![node]);
+        // Short ID (without root prefix) should resolve to full
+        let short = "src/scanner.rs:scan:function";
+        assert_eq!(gs.resolve_node_id(short), "myroot:src/scanner.rs:scan:function");
+    }
+
+    #[test]
+    fn test_resolve_node_id_unknown_passes_through() {
+        let node = make_test_node("myroot", "src/scanner.rs", "scan", crate::graph::NodeKind::Function);
+        let gs = make_test_graph_state(vec![node]);
+        let unknown = "nonexistent:file.rs:foo:function";
+        assert_eq!(gs.resolve_node_id(unknown), unknown);
+    }
+
+    #[test]
+    fn test_resolve_node_id_fast_exact_match() {
+        let node = make_test_node("myroot", "src/embed.rs", "EmbeddingIndex", crate::graph::NodeKind::Struct);
+        let gs = make_test_graph_state(vec![node]);
+        let index_map = gs.node_index_map();
+        let full = "myroot:src/embed.rs:EmbeddingIndex:struct";
+        assert_eq!(gs.resolve_node_id_fast(full, &index_map), full);
+    }
+
+    #[test]
+    fn test_resolve_node_id_fast_short_id() {
+        let node = make_test_node("myroot", "src/embed.rs", "EmbeddingIndex", crate::graph::NodeKind::Struct);
+        let gs = make_test_graph_state(vec![node]);
+        let index_map = gs.node_index_map();
+        let short = "src/embed.rs:EmbeddingIndex:struct";
+        assert_eq!(gs.resolve_node_id_fast(short, &index_map), "myroot:src/embed.rs:EmbeddingIndex:struct");
+    }
+
+    #[test]
+    fn test_resolve_node_id_fast_unknown_passes_through() {
+        let node = make_test_node("myroot", "src/embed.rs", "EmbeddingIndex", crate::graph::NodeKind::Struct);
+        let gs = make_test_graph_state(vec![node]);
+        let index_map = gs.node_index_map();
+        let unknown = "totally:bogus:id";
+        assert_eq!(gs.resolve_node_id_fast(unknown, &index_map), unknown);
+    }
+
+    #[test]
+    fn test_resolve_node_id_multiple_roots() {
+        let node1 = make_test_node("root-a", "src/lib.rs", "foo", crate::graph::NodeKind::Function);
+        let node2 = make_test_node("root-b", "src/lib.rs", "foo", crate::graph::NodeKind::Function);
+        let gs = make_test_graph_state(vec![node1, node2]);
+        // Both full IDs should resolve exactly
+        assert_eq!(gs.resolve_node_id("root-a:src/lib.rs:foo:function"), "root-a:src/lib.rs:foo:function");
+        assert_eq!(gs.resolve_node_id("root-b:src/lib.rs:foo:function"), "root-b:src/lib.rs:foo:function");
+        // Short ID should resolve to one of them (either is valid since both exist)
+        let resolved = gs.resolve_node_id("src/lib.rs:foo:function");
+        assert!(
+            resolved == "root-a:src/lib.rs:foo:function" || resolved == "root-b:src/lib.rs:foo:function",
+            "expected one of the full IDs, got: {}", resolved
+        );
+    }
+
+    #[test]
+    fn test_resolve_node_id_empty_string() {
+        let node = make_test_node("myroot", "src/lib.rs", "bar", crate::graph::NodeKind::Function);
+        let gs = make_test_graph_state(vec![node]);
+        // Empty string should pass through unchanged
+        assert_eq!(gs.resolve_node_id(""), "");
     }
 
     // ── EmbeddingStatus tests ───────────────────────────────────────
