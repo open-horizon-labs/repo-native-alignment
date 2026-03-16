@@ -183,26 +183,26 @@ Each solution scored independently (not head-to-head) by a scorer agent using a 
 
 | Metric | Vanilla (N=4) | RNA MCP (N=5) | Delta |
 |---|---|---|---|
-| Cost (USD) | $1.62 | $0.65 | **-60%** |
-| Wall time (s) | 530 | 146 | **-72%** |
+| Cost (USD) | $1.62 ($1.52–$1.71) | $0.65 ($0.56–$0.72) | **-60%** |
+| Wall time (s) | 530 (371–623) | 146 (133–163) | **-72%** |
 
 ### 4.2 Quality Scores (1-5 scale, scored independently by LLM evaluator)
 
 | Criterion (weight) | Vanilla | RNA MCP | Delta |
 |---|---|---|---|
-| Q1 Volume flow (25%) | 4.50 | 5.00 | +0.50 |
-| Q2 Adapter checklist (20%) | 5.00 | 5.00 | +0.00 |
-| Q3 Test coverage (20%) | 5.00 | 5.00 | +0.00 |
-| Q4 Zone blast radius (20%) | 4.75 | 4.60 | -0.15 |
-| Q5 Complexity ranking (15%) | 4.00 | 4.80 | +0.80 |
-| **Weighted total** | **4.67** | **4.89** | **+0.22** |
+| Q1 Volume flow (25%) | 4.50 (4–5) | 5.00 (5–5) | +0.50 |
+| Q2 Adapter checklist (20%) | 5.00 (5–5) | 5.00 (5–5) | +0.00 |
+| Q3 Test coverage (20%) | 5.00 (5–5) | 5.00 (5–5) | +0.00 |
+| Q4 Zone blast radius (20%) | 4.75 (4–5) | 4.60 (4–5) | -0.15 |
+| Q5 Complexity ranking (15%) | 4.00 (3–5) | 4.80 (4–5) | +0.80 |
+| **Weighted total** | **4.67** (4.25–5.0) | **4.89** (4.65–5.0) | **+0.22** |
 
 ### 4.3 Specificity Metrics
 
 | Metric | Vanilla | RNA MCP | Delta |
 |---|---|---|---|
-| Functions/files named | 45.5 | 57.2 | **+26%** |
-| Factual errors | 2.5 | 1.6 | **-36%** |
+| Functions/files named | 45.5 (42–53) | 57.2 (47–63) | **+26%** |
+| Factual errors | 2.5 (1–5) | 1.6 (0–3) | **-36%** |
 
 ### 4.4 Observations
 
