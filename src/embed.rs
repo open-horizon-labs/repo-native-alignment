@@ -959,8 +959,31 @@ impl EmbeddingIndex {
         // --- Delete stale rows (#298) ---
         // If we used merge_insert (table already existed), there may be rows
         // for nodes that no longer exist in the graph. Delete them.
+        // Build the current ID set from candidates (already computed above)
+        // to avoid re-loading commits/merges.
         if table_exists {
-            if let Err(e) = self.delete_stale_rows(repo_root, symbols).await {
+            let current_ids: std::collections::HashSet<String> = {
+                // Re-collect current valid IDs. We can't reuse `candidates`
+                // (consumed by partition) so rebuild from the same sources.
+                let mut ids = std::collections::HashSet::new();
+                if let Ok(commits) = git::load_commits(repo_root, RECENT_COMMIT_LIMIT) {
+                    for c in &commits {
+                        ids.insert(c.short_hash.clone());
+                    }
+                }
+                if let Ok((merge_nodes, _)) = git::pr_merges::extract_pr_merges(repo_root, Some(PR_MERGE_LIMIT)) {
+                    for node in &merge_nodes {
+                        let merge_sha = node.metadata.get("merge_sha").cloned().unwrap_or_default();
+                        let short = merge_sha.get(..7).unwrap_or(&merge_sha).to_string();
+                        ids.insert(format!("merge:{}", short));
+                    }
+                }
+                for node in symbols.iter().filter(|n| n.id.kind.is_embeddable()) {
+                    ids.insert(node.stable_id());
+                }
+                ids
+            };
+            if let Err(e) = self.delete_stale_rows_with_ids(&current_ids).await {
                 tracing::warn!("EmbeddingIndex: failed to delete stale rows: {}", e);
             }
         }
@@ -994,33 +1017,11 @@ impl EmbeddingIndex {
 
     /// Delete embedding rows for IDs that are no longer in the current graph.
     /// Called after merge_insert to clean up stale entries from previous builds.
-    async fn delete_stale_rows(&self, repo_root: &Path, symbols: &[crate::graph::Node]) -> Result<()> {
+    async fn delete_stale_rows_with_ids(&self, current_ids: &std::collections::HashSet<String>) -> Result<()> {
         use futures::TryStreamExt;
 
         let table = self.db.open_table(&self.table_name).execute().await
             .context("Failed to open table for stale row deletion")?;
-
-        // Collect all current valid IDs
-        let mut current_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        // Commit IDs
-        if let Ok(commits) = git::load_commits(repo_root, RECENT_COMMIT_LIMIT) {
-            for c in &commits {
-                current_ids.insert(c.short_hash.clone());
-            }
-        }
-        // Merge IDs
-        if let Ok((merge_nodes, _)) = git::pr_merges::extract_pr_merges(repo_root, Some(PR_MERGE_LIMIT)) {
-            for node in &merge_nodes {
-                let merge_sha = node.metadata.get("merge_sha").cloned().unwrap_or_default();
-                let short = merge_sha.get(..7).unwrap_or(&merge_sha).to_string();
-                current_ids.insert(format!("merge:{}", short));
-            }
-        }
-        // Symbol IDs
-        for node in symbols.iter().filter(|n| n.id.kind.is_embeddable()) {
-            current_ids.insert(node.stable_id());
-        }
 
         // Query all IDs currently in the table
         let stream = table
