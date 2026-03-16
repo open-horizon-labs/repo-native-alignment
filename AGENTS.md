@@ -127,7 +127,7 @@ Local context discovery and alignment tool for coding agents. Makes the fractal,
 - Use compiler-driven refactoring (add field, let `cargo check` find every construction site)
 - `cargo install --path .` before `/mcp` reconnect (or restart Claude Code)
 - Parallel worktree builds: `scripts/prep-worktree.sh <path> <branch>` creates a worktree with warm build cache (hardlinks `target/`). Set `CARGO_TARGET_DIR=$WORKTREE/target` before cargo commands. Enables genuinely parallel builds on M4 Max without cache thrashing.
-- **Cargo output: save to file, then grep/tail as needed.** Never pipe cargo commands through `tail` or `grep` directly — you'll miss errors and have to re-run the whole build. Instead: `cargo test 2>&1 > /tmp/cargo-out.txt; echo "exit: $?"` then grep or tail the file. Use unique filenames per agent to avoid conflicts. **Use `run_in_background: true` for long cargo commands** — never `sleep` then poll.
+- **Cargo: use `cargo check --lib` for fast error checking** (seconds, not minutes). Only run `cargo test` once code compiles. Never `cargo run` for testing — use the installed binary. Save output to file, then grep/tail. **Use `run_in_background: true` for long cargo commands** — never `sleep` then poll.
 
 ## Anti-Patterns to Avoid
 - Don't search function bodies in code search (noise) — match name + signature only
