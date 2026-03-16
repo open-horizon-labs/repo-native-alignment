@@ -15,9 +15,19 @@ Agents retrieve and reason about **subsystems** ("the embedding pipeline", "the 
 
 `repo_map` is the cold-start orientation tool — the first thing an agent sees when entering an unfamiliar codebase. Today it shows top symbols by PageRank and hotspot files. With subsystem detection, it shows the **architecture**: clusters of tightly-connected symbols with their boundary interfaces. This is what an engineer draws on a whiteboard when onboarding someone.
 
+## Roadmap
+
+| Issue | What | Status |
+|-------|------|--------|
+| #311 | Louvain detection + repo_map rendering | Merged, integration fix in progress |
+| #316 | cluster_id as metadata + subsystem-scoped search + subsystem-aware impact | Queued |
+| #317 | Within-subsystem neighbors + cross-subsystem edge queries | Queued (depends on #316) |
+
 ## Success signals
 
 - `repo_map` shows detected subsystems with internal symbol count, edge density, and external interface functions
-- `search(mode="impact")` can report "this change affects the scanner subsystem" not just a list of functions
+- `search(query="auth", subsystem="server")` scopes results to a detected subsystem
+- `search(mode="impact")` groups affected symbols by subsystem with entry points
+- Agents can query edges within a subsystem and across subsystem boundaries
 - Agents spontaneously use subsystem names in their reasoning
 - New developers using RNA orient faster because they see the system's architecture, not a flat list of important functions
