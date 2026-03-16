@@ -2,41 +2,105 @@
 
 ## Abstract
 
-Coding agents explore codebases through text search — grep, file reading, glob — recovering structural relationships through repeated sequential queries. This is expensive: each hop in a call chain costs a tool call, context tokens, and wall time. We evaluate whether a hybrid vector-graph representation (semantic embeddings for discovery, structural graph for traversal) can reduce this cost. Using RNA, an early-stage local context discovery tool, we benchmark against standard Claude Code tooling on 5 realistic developer questions against a [25K-line Rust codebase](https://github.com/open-horizon-labs/unified-hifi-control) (N=5 per condition). Results: 60% lower cost ($0.65 vs $1.62), 72% faster (146s vs 530s), +5% quality (4.89 vs 4.67/5.0), with the strongest gains in multi-hop traversal and complexity analysis. The primary value is efficiency, not accuracy — agents get equivalent answers faster and cheaper.
+A software repository is not a collection of text files. It is a graph of relationships between symbols, modules, services, and business outcomes. Traditional AI coding tools flatten this structure into text and rely on language models to rediscover relationships through token matching. We take the opposite approach: extract the repository's native structure and expose it directly as a queryable graph, augmented with semantic embeddings. Agents retrieve structured subgraphs instead of text blobs, allowing them to reason about the system in the same structural terms that the compiler and runtime use. Using RNA, an early-stage local context discovery tool, we benchmark against standard Claude Code tooling on 5 realistic developer questions against a [25K-line Rust codebase](https://github.com/open-horizon-labs/unified-hifi-control) (N=5 per condition). Results: 60% lower cost ($0.65 vs $1.62), 72% faster (146s vs 530s), +5% quality (4.89 vs 4.67/5.0), with the strongest gains in multi-hop traversal and complexity analysis. The primary value is efficiency, not accuracy — agents get equivalent answers faster and cheaper.
 
 ## 1. Introduction
 
-### 1.1 The Context Assembly Problem
+### 1.1 Complex Systems Are Networks, Not Collections
 
-Large language models compress common human knowledge during training. But every codebase contains fractal, local knowledge not in training data: architecture decisions, naming conventions, dependency topology, business intent. An agent working in an unfamiliar codebase must discover this knowledge through tool use — and the efficiency of that discovery directly determines task success, cost, and latency.
+Complex systems — software, organizations, markets, biology — share a structural property: **relationships carry more information than components**. Consider the same four components arranged two ways:
 
-Current coding agent harnesses (Claude Code, Codex, OpenCode) provide text-based tools: grep for content search, file reading for comprehension, glob for file discovery. These tools treat code as text. But code is not text — it is a graph of typed relationships: functions call functions, structs contain fields, modules import modules, tests exercise production code, business outcomes connect to implementation through commit history.
+```
+A → B → C → D       (pipeline)
+A → B, A → C, A → D (hub)
+```
 
-### 1.2 Two Layers of Context Assembly
+Same nodes. Completely different behavior. The difference is the edges.
+
+This principle has a name in complex systems theory: **structure carries more information than components**. A city is not a list of buildings — it is a network of roads connecting neighborhoods to services. A protein is not a sequence of amino acids — it is a folded structure of interaction surfaces. A codebase is not a collection of files — it is a dense dependency graph where every component is constrained by its relationships to others.
+
+When we index a 25K-line Rust codebase with RNA, we find:
+
+```
+9,366 nodes (functions, types, modules, tests)
+16,364 edges (calls, references, defines, implements, depends_on)
+```
+
+That is ~1.7 edges per node — enough connectivity that the meaning of each node comes primarily from its relationships. An agent that reads only the node (a function's source code) misses the structural context that determines its actual behavior: who calls it, what depends on it, what breaks if it changes.
+
+### 1.2 The Flattening Problem
+
+Current coding agent harnesses (Claude Code, Codex, OpenCode) provide text-based tools: grep for content search, file reading for comprehension, glob for file discovery. These tools treat code as text. The implicit pipeline is:
+
+```
+graph-structured system → flattened text → LLM reasoning
+```
+
+Information is lost in the flattening. When a graph is serialized into text, you lose dependency direction, distance between components, cluster boundaries, and transitive relationships. An agent reading file chunks might see `A calls B` and `B calls C` in separate tool calls but never synthesize `A → C` — a relationship the graph makes explicit.
+
+Text search can answer "where is function X?" but fails at structural questions:
+
+- "What transitively depends on X?" (impact analysis)
+- "What calls X through intermediaries?" (call chain tracing)
+- "Which functions have the highest cyclomatic complexity?" (computed metrics)
+- "What tests cover this production code?" (test-to-code mapping)
+
+These are graph questions. Answering them through sequential grep-read-grep loops is expensive: each hop in a call chain costs a tool call, context tokens, and wall time. Pre-computing the graph collapses multi-hop exploration into single queries.
+
+### 1.3 The Context Compiler Pattern
+
+RNA implements what we call a **context compiler**: a pipeline that transforms raw artifacts into structured, queryable context for LLM reasoning.
+
+```
+Raw artifacts (code, docs, git history)
+        ↓
+Entity extraction (tree-sitter: symbols, types, modules)
+        ↓
+Relationship extraction (LSP: calls, references, implements)
+        ↓
+Knowledge graph (nodes + typed edges)
+        ↓               ↓
+Graph queries      Embeddings
+(structure)        (semantics)
+        ↓               ↓
+     Context assembly
+        ↓
+     LLM reasoning
+```
+
+The two retrieval paths are complementary: **graph = structure** (what connects to what, what depends on what), **embeddings = meaning** (what is conceptually related, what answers this question). Together they approximate how humans reason about complex systems — we navigate both structural relationships ("this function calls that service") and semantic associations ("this is related to authentication") simultaneously. Neither alone is sufficient: graph without semantics can't answer "find code related to payment processing"; embeddings without graph can't answer "what breaks if I change this."
+
+Compare with traditional RAG:
+
+```
+documents → chunk → embed → similarity search → LLM
+```
+
+The difference is structure preservation. Traditional RAG discards the relationships between chunks. The context compiler preserves them, so the model reasons over topology — `payment_api → order_service → inventory_db` — not scattered file contents.
+
+### 1.4 Two Layers of Context
 
 Context for a coding agent comes from two sources:
 
-**Prompt context** — what's assembled into the system prompt and conversation before the model reasons: CLAUDE.md/AGENTS.md instructions, skill definitions, MCP tool descriptions, prior conversation turns. This is curated at the harness level and determines the agent's behavior, constraints, and available capabilities. Prompt context engineering is about selecting, ordering, and sizing this information to maximize the model's instruction-following and task comprehension.
+**Prompt context** — what's assembled into the system prompt before the model reasons: instructions, skill definitions, MCP tool descriptions, prior conversation turns. This is curated at the harness level and determines behavior and capabilities.
 
-**Local context** — what's discoverable in the working environment: code, documentation, configuration, git history, build artifacts, business artifacts. This is queried during the task via tool use. Local context is orders of magnitude larger than prompt context (a codebase is millions of tokens; a system prompt is thousands) and must be accessed selectively.
+**Local context** — what's discoverable in the working environment: code, documentation, configuration, git history, business artifacts. This is queried during the task via tool use. Local context is orders of magnitude larger than prompt context (a codebase is millions of tokens; a system prompt is thousands) and must be accessed selectively.
 
-These layers interact. Prompt context tells the agent *how* to explore; local context is *what* it explores. A well-engineered prompt with poor local context tools produces an agent that knows what to do but can't find what it needs. Good local context tools with a poor prompt produces an agent that finds information but doesn't know how to use it.
+These layers interact. Prompt context tells the agent *how* to explore; local context is *what* it explores. RNA addresses the local context layer: making the structural knowledge in a codebase queryable so the agent retrieves precisely the relevant subgraph, not everything that matches a keyword.
 
-RNA addresses the local context layer: making the fractal, structural knowledge in a codebase queryable so the agent retrieves precisely what it needs, not everything that matches a keyword. The prompt context layer (how agents are instructed to use RNA, how tool descriptions are worded, how much system prompt budget MCP tools consume) is a separate engineering challenge that significantly affects RNA's effectiveness — as our benchmark demonstrates.
-
-### 1.3 Codebases as Knowledge Graphs
+### 1.5 Three Layers of Codebase Knowledge
 
 A codebase encodes three layers of knowledge:
 
-1. **Structural knowledge** — what exists (functions, types, modules) and how they relate (calls, imports, implements, defines). This is a directed graph recoverable through static analysis.
+1. **Structural knowledge** — what exists and how it relates. Functions call functions, structs contain fields, modules import modules. This is a directed graph recoverable through static analysis and LSP queries.
 
-2. **Semantic knowledge** — what concepts are represented and how they cluster. "Authentication" spans multiple files and function names; "payment processing" may not appear as a literal string anywhere. This requires vector representations.
+2. **Semantic knowledge** — what concepts are represented and how they cluster. "Authentication" spans multiple files; "payment processing" may not appear as a literal string. This requires vector representations.
 
-3. **Intentional knowledge** — why things exist, what outcomes they serve, what constraints govern them. This lives in documentation, commit messages, and (when explicitly declared) business artifacts. This requires both vector search (discovery) and graph structure (tracing intent to implementation).
+3. **Intentional knowledge** — why things exist, what outcomes they serve, what constraints govern them. This lives in documentation, commit messages, and business artifacts. It requires both vector search (discovery) and graph structure (tracing intent to implementation).
 
-Text search (grep) can access layer 1 for single-hop queries ("where is function X?") but fails for multi-hop queries ("what transitively depends on X?"). It cannot access layer 2 at all (semantic similarity requires embeddings). It can access layer 3 only through keyword matching, which is fragile.
+Text search accesses layer 1 for single-hop queries but fails for multi-hop. It cannot access layer 2 at all. It accesses layer 3 only through keyword matching, which is fragile.
 
-### 1.3 Hypothesis
+### 1.6 Hypothesis
 
 A hybrid vector-graph representation that pre-computes structural relationships (via static analysis and LSP) and semantic embeddings (via transformer models) will enable coding agents to:
 
@@ -44,15 +108,20 @@ A hybrid vector-graph representation that pre-computes structural relationships 
 - **Achieve equal or better answer quality** (more complete, more specific, fewer factual errors)
 - **Access information text search cannot produce** (transitive dependencies, complexity metrics, test coverage gaps)
 
-### 1.4 Generalization Beyond Code
+### 1.7 Generalization Beyond Code
 
-This hypothesis generalizes beyond codebases. Any corpus of knowledge work artifacts — design documents, process specifications, organizational structures — can be represented as a graph of concepts with typed relationships. The same hybrid approach (embedding for discovery, graph for traversal) should apply to:
+This hypothesis generalizes beyond codebases. Any complex system where relationships dominate — where the meaning of a component comes primarily from its connections — benefits from the same approach:
 
-- Legal document corpora (statutes reference statutes, cases cite cases)
-- Engineering specifications (requirements trace to tests, components connect to subsystems)
-- Business process models (activities depend on activities, roles connect to responsibilities)
+| Domain | Objects (easy to describe in text) | Relationships (where the information lives) |
+|--------|-----------------------------------|---------------------------------------------|
+| Software | functions, classes | call graph, dependency graph |
+| Organizations | teams, roles | communication graph, reporting structure |
+| Markets | assets, instruments | correlation graph, exposure chains |
+| Biology | proteins, genes | interaction networks, metabolic pathways |
+| Legal | statutes, cases | citation graph, precedent chains |
+| Infrastructure | services, databases | dependency graph, failure propagation |
 
-We focus on codebases because they provide the tightest feedback loop: tool calls are logged, answers are verifiable against source code, and the ground truth (what the code actually does) is available for evaluation.
+In each domain, listing the objects tells you almost nothing about the system. Describing the connections reveals its structure. We focus on codebases because they provide the tightest feedback loop: tool calls are logged, answers are verifiable against source code, and ground truth is available for evaluation.
 
 ## 2. System Design: RNA
 
@@ -283,17 +352,23 @@ Current coding agent harnesses make assumptions that work against graph-augmente
 
 ## 7. Conclusion
 
-A hybrid vector-graph representation of a codebase enables coding agents to answer developer questions 60% cheaper and 72% faster than text search alone, with comparable or slightly better answer quality (+5% weighted score, +26% specificity, -36% factual errors). The efficiency gain comes from collapsing sequential grep-read-grep exploration loops into single graph queries. The quality gain is concentrated in tasks requiring computed metrics (cyclomatic complexity) and multi-hop traversal (call chain tracing) — information that text search fundamentally cannot produce.
+Complex systems are networks of constraints, not collections of objects. A codebase with 9,366 nodes and 16,364 edges is not a folder of source files — it is a dense dependency network where the behavior of each component is determined primarily by its relationships. Current coding agent harnesses flatten this graph into text and ask language models to rediscover structure through sequential token matching. This works, but it is expensive: each hop in a dependency chain costs a tool call, context tokens, and wall time.
 
-However, the quality advantage is modest (4.89 vs 4.67 on a 5-point scale). For well-defined lookup tasks, text search is equally effective. The primary value proposition of graph-augmented context is **efficiency, not accuracy** — the agent gets the same answer faster and cheaper.
+A hybrid vector-graph representation that preserves the repository's native structure enables coding agents to answer developer questions 60% cheaper and 72% faster than text search alone, with comparable or slightly better answer quality (+5% weighted score, +26% specificity, -36% factual errors). The efficiency gain comes from collapsing sequential grep-read-grep exploration loops into single graph queries. The quality gain is concentrated in tasks requiring computed metrics (cyclomatic complexity) and multi-hop traversal (call chain tracing) — information that text search fundamentally cannot produce.
 
-Three findings extend beyond the specific tool evaluated:
+The quality advantage is modest (4.89 vs 4.67 on a 5-point scale). For well-defined lookup tasks, text search is equally effective. The primary value proposition is **efficiency, not accuracy** — the agent gets the same answer faster and cheaper.
 
-1. **Context selectivity matters more than context volume.** Consistent with Chroma's Context Rot findings, returning precisely the relevant structural relationships (graph edges) outperforms returning all text matches (grep results) even when the text matches contain the answer.
+Four findings extend beyond the specific tool evaluated:
 
-2. **Tool adoption cannot be prompt-engineered.** Agents default to built-in text search even when explicitly instructed to use graph tools. The integration surface (how tools appear in the system prompt, whether training included the tool) determines adoption more than tool capabilities.
+1. **Structure carries more information than components.** The ~1.7 edges per node in our benchmark codebase means that reading a function's source (the node) without its call graph, dependents, and test coverage (the edges) misses most of the information needed for structural reasoning. Consistent with Chroma's Context Rot findings, returning precisely the relevant structural relationships outperforms returning all text matches even when the text matches contain the answer.
 
-3. **Harness design limits tool effectiveness.** MCP tool schemas consume 22K tokens of system prompt, context compaction discards tool results the agent later needs, and KV-prefix caching is invalidated by every unique tool response. A harness designed for persistent queryable state rather than ephemeral text responses would change the economics significantly.
+2. **The context compiler pattern generalizes.** Any domain where relationships dominate — legal corpora (citation graphs), organizations (communication graphs), infrastructure (dependency graphs), biology (interaction networks) — can benefit from the same pipeline: entity extraction → relationship extraction → graph + embeddings → structured retrieval. The scaling limit for AI agents operating on complex systems is not context window size but structure extraction.
+
+3. **Tool adoption cannot be prompt-engineered.** Agents default to built-in text search even when explicitly instructed to use graph tools. The integration surface (how tools appear in the system prompt, whether training included the tool) determines adoption more than tool capabilities.
+
+4. **Harness design limits tool effectiveness.** MCP tool schemas consume 22K tokens of system prompt, context compaction discards tool results the agent later needs, and KV-prefix caching is invalidated by every unique tool response. A harness designed for persistent queryable state rather than ephemeral text responses would change the economics significantly.
+
+A natural next step is automatic subsystem detection. The graph's edge density likely implies clear cluster boundaries — modules that are densely connected internally but sparsely connected to other modules. Detecting these automatically would let agents reason about subsystems rather than individual files, which is closer to how engineers actually think about codebases.
 
 These results are from an early-stage tool (RNA v0.1.9) on a single codebase (25K lines Rust) with a small sample (N=5). Independent replication on diverse codebases, languages, and model families would strengthen the findings. The benchmark design, prompts, scoring rubric, and raw results are published alongside this paper for reproducibility.
 
