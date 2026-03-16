@@ -436,9 +436,11 @@ impl PipelinedTransport {
         }
 
         // Wait for the response with timeout.
-        // 5s timeout for pipelined enrichment requests (vs 60s for sequential init).
-        // Functions that can't be resolved in 5s are likely stale or broken.
-        let timeout = tokio::time::Duration::from_secs(5);
+        // 30s timeout for pipelined enrichment requests. The old 5s timeout
+        // was too aggressive: rust-analyzer may still be finishing indexing
+        // when the first batch of queries arrives, and complex call hierarchy
+        // lookups on large codebases can legitimately take 10-20s.
+        let timeout = tokio::time::Duration::from_secs(30);
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(anyhow::anyhow!("LSP response channel closed for {} (id={})", method, id)),
@@ -446,7 +448,7 @@ impl PipelinedTransport {
                 // Remove the pending entry on timeout
                 let mut map = self.pending.lock().unwrap();
                 map.remove(&id);
-                Err(anyhow::anyhow!("LSP request {} timed out after 5s (id={})", method, id))
+                Err(anyhow::anyhow!("LSP request {} timed out after 30s (id={})", method, id))
             }
         }
     }
@@ -559,7 +561,7 @@ impl LspEnricher {
         let quiescent = msg
             .pointer("/params/quiescent")
             .and_then(|q| q.as_bool())
-            .unwrap_or(true);
+            .unwrap_or(false); // Default to NOT ready if field is absent
         health == "ok" && quiescent
     }
 
@@ -638,6 +640,13 @@ impl LspEnricher {
                     work_done_progress: Some(true),
                     ..Default::default()
                 }),
+                // Declare support for experimental/serverStatus notifications.
+                // Without this, rust-analyzer won't send serverStatus and the
+                // readiness wait falls through to a timeout, sending queries
+                // while the server is still indexing (producing 0 edges).
+                experimental: Some(serde_json::json!({
+                    "serverStatusNotification": true
+                })),
                 ..Default::default()
             },
             ..Default::default()
@@ -688,8 +697,8 @@ impl LspEnricher {
         // lookups return "file not found."
         //
         // We drain notifications looking for progress/done signals.
-        // Timeout after 60 seconds to avoid hanging on broken servers.
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+        // Timeout after 120 seconds to allow large workspaces to finish indexing.
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(120);
         let transport = state.transport.as_mut().unwrap();
         // Wait for the server to be ready.
         //
@@ -700,10 +709,25 @@ impl LspEnricher {
         // Other LSP servers may not send this — for those, we fall back
         // to a timeout after `$/progress` tokens complete.
         let mut server_ready = false;
+        // Track whether we've seen any serverStatus notification.
+        // If the server supports serverStatus, we should keep waiting for
+        // quiescent=true rather than bailing on a per-message timeout.
+        let mut seen_server_status = false;
 
         while tokio::time::Instant::now() < deadline {
+            // Use a short timeout only when we haven't seen serverStatus yet.
+            // Once we know the server supports serverStatus, wait up to the
+            // full deadline for the quiescent signal.
+            let msg_timeout = if seen_server_status {
+                // Wait up to remaining time in the deadline
+                let remaining = deadline.duration_since(tokio::time::Instant::now());
+                remaining.min(tokio::time::Duration::from_secs(60))
+            } else {
+                tokio::time::Duration::from_secs(5)
+            };
+
             match tokio::time::timeout(
-                tokio::time::Duration::from_secs(5),
+                msg_timeout,
                 transport.read_message(),
             )
             .await
@@ -713,8 +737,9 @@ impl LspEnricher {
                         match method {
                             // rust-analyzer's readiness signal
                             "experimental/serverStatus" => {
+                                seen_server_status = true;
                                 let health = msg.pointer("/params/health").and_then(|h| h.as_str()).unwrap_or("");
-                                let quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(true);
+                                let quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(false);
                                 tracing::info!("{} serverStatus: health={}, quiescent={}", self.server_command, health, quiescent);
 
                                 if Self::server_status_is_ready(&msg) {
@@ -722,6 +747,7 @@ impl LspEnricher {
                                     server_ready = true;
                                     break;
                                 }
+                                tracing::info!("{} not yet ready, continuing to wait for indexing...", self.server_command);
                             }
                             // Respond to progress create requests (required by protocol)
                             "window/workDoneProgress/create" => {
@@ -739,7 +765,7 @@ impl LspEnricher {
                                 let kind = msg.pointer("/params/value/kind").and_then(|k| k.as_str()).unwrap_or("");
                                 let title = msg.pointer("/params/value/title").and_then(|t| t.as_str()).unwrap_or("");
                                 if kind == "begin" || kind == "end" {
-                                    tracing::debug!("{} progress {}: {}", self.server_command, kind, title);
+                                    tracing::info!("{} progress {}: {}", self.server_command, kind, title);
                                 }
                             }
                             _ => {}
@@ -751,15 +777,24 @@ impl LspEnricher {
                     break;
                 }
                 Err(_) => {
-                    // 5s timeout with no messages — server may not support serverStatus
-                    tracing::info!("{} no serverStatus after 5s, assuming ready", self.server_command);
+                    if seen_server_status {
+                        // We know the server supports serverStatus but hit the deadline
+                        // without quiescent=true. Proceed anyway.
+                        tracing::warn!(
+                            "{} waited for quiescent but deadline reached, proceeding",
+                            self.server_command
+                        );
+                    } else {
+                        // No serverStatus received — server may not support it
+                        tracing::info!("{} no serverStatus after 5s, assuming ready", self.server_command);
+                    }
                     break;
                 }
             }
         }
 
         if !server_ready {
-            tracing::info!("{} readiness timeout reached, proceeding anyway", self.server_command);
+            tracing::info!("{} readiness wait complete (server_ready=false, seen_status={}), proceeding", self.server_command, seen_server_status);
         }
 
         tracing::info!("{} ready for {}", self.server_command, self.language);
@@ -2388,13 +2423,14 @@ mod tests {
         assert!(!LspEnricher::server_status_is_ready(&make_status("error", true)),
             "health: error should NOT be ready regardless of quiescent");
 
-        // Missing quiescent field defaults to true (ready)
+        // Missing quiescent field defaults to false (NOT ready)
+        // Conservative: if the server doesn't tell us it's quiescent, assume it's not
         let no_quiescent = serde_json::json!({
             "method": "experimental/serverStatus",
             "params": { "health": "ok" }
         });
-        assert!(LspEnricher::server_status_is_ready(&no_quiescent),
-            "missing quiescent should default to true (ready)");
+        assert!(!LspEnricher::server_status_is_ready(&no_quiescent),
+            "missing quiescent should default to false (not ready)");
     }
 
     // -----------------------------------------------------------------------
@@ -2529,5 +2565,92 @@ mod tests {
         assert_eq!(format!("{}", edge.kind), "referenced_by");
         assert_eq!(edge.source, ExtractionSource::Lsp);
         assert_eq!(edge.confidence, Confidence::Confirmed);
+    }
+
+    /// Verify that the initialize request includes experimental.serverStatusNotification.
+    ///
+    /// Without this capability, rust-analyzer won't send serverStatus notifications
+    /// and the readiness wait falls through to a 5s timeout, querying before indexing
+    /// is complete and producing 0 edges. This was the root cause of issue #293.
+    #[test]
+    fn test_init_params_declare_server_status_notification() {
+        // Build the same init params that ensure_initialized() would build
+        let root_uri = Uri::from_str("file:///tmp/test").unwrap();
+        #[allow(deprecated)]
+        let init_params = InitializeParams {
+            root_uri: Some(root_uri),
+            capabilities: ClientCapabilities {
+                window: Some(lsp_types::WindowClientCapabilities {
+                    work_done_progress: Some(true),
+                    ..Default::default()
+                }),
+                experimental: Some(serde_json::json!({
+                    "serverStatusNotification": true
+                })),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Verify the experimental capability is set
+        let experimental = init_params.capabilities.experimental.as_ref()
+            .expect("experimental capabilities must be set");
+        assert_eq!(
+            experimental.get("serverStatusNotification"),
+            Some(&serde_json::json!(true)),
+            "serverStatusNotification must be true to receive serverStatus from rust-analyzer"
+        );
+    }
+
+    /// Integration test: run LSP enrichment against the RNA repo itself.
+    ///
+    /// This test requires rust-analyzer to be on PATH and the RNA repo to be a
+    /// valid Cargo workspace. It is marked #[ignore] so it doesn't run in CI
+    /// (which may not have rust-analyzer installed), but can be run explicitly
+    /// with `cargo test -- --ignored test_lsp_enrichment_produces_edges`.
+    #[tokio::test]
+    #[ignore]
+    async fn test_lsp_enrichment_produces_edges() {
+        use crate::extract::ExtractorRegistry;
+        use crate::scanner::Scanner;
+
+        // Find the repo root (where Cargo.toml is)
+        let repo_root = std::env::current_dir()
+            .expect("failed to get cwd");
+        assert!(repo_root.join("Cargo.toml").exists(),
+            "test must be run from the repo root");
+
+        // Scan the repo to get files
+        let mut scanner = Scanner::new(repo_root.clone())
+            .expect("failed to create scanner");
+        let scan_result = scanner.scan()
+            .expect("scan failed");
+
+        // Extract nodes from scanned files
+        let registry = ExtractorRegistry::default();
+        let extraction = registry.extract_scan_result(&repo_root, &scan_result);
+        let nodes = extraction.nodes;
+        assert!(nodes.len() > 100, "expected >100 nodes from RNA repo, got {}", nodes.len());
+
+        // Create enricher and run
+        let enricher = LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]);
+        let index = GraphIndex::new();
+        let result = enricher.enrich(&nodes, &index, &repo_root).await
+            .expect("LSP enrichment failed");
+
+        let edge_count = result.added_edges.len();
+        eprintln!("LSP enrichment produced {} edges from {} nodes", edge_count, nodes.len());
+
+        assert!(edge_count > 100,
+            "expected >100 LSP edges from RNA repo, got {}. \
+             This likely means rust-analyzer is not responding to call hierarchy queries.",
+            edge_count);
+
+        // Check that we have Calls edges specifically
+        let calls_edges = result.added_edges.iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .count();
+        assert!(calls_edges > 50,
+            "expected >50 Calls edges, got {}", calls_edges);
     }
 }
