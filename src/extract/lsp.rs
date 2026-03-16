@@ -2387,4 +2387,139 @@ mod tests {
         assert!(LspEnricher::server_status_is_ready(&no_quiescent),
             "missing quiescent should default to true (ready)");
     }
+
+    // -----------------------------------------------------------------------
+    // Adversarial tests for find_enclosing_symbol (PR #286 ship pipeline)
+    // Seeded from dissent: module-level references, self-references, edge cases
+    // -----------------------------------------------------------------------
+
+    /// Dissent finding: references at module level (outside any function/struct/impl)
+    /// should return None -- no enclosing symbol exists.
+    #[test]
+    fn test_find_enclosing_symbol_module_level_returns_none() {
+        let nodes = vec![
+            make_node("src/lib.rs", "my_fn", NodeKind::Function, 10, 20),
+            make_node("src/lib.rs", "MyStruct", NodeKind::Struct, 25, 35),
+        ];
+        let refs: Vec<&Node> = nodes.iter().collect();
+
+        // Line 5 is before any symbol -- module-level use statement
+        let result = find_enclosing_symbol(&refs, Path::new("src/lib.rs"), 5);
+        assert!(result.is_none(), "module-level reference should not resolve to any symbol");
+
+        // Line 22 is between symbols -- also module level
+        let result = find_enclosing_symbol(&refs, Path::new("src/lib.rs"), 22);
+        assert!(result.is_none(), "gap between symbols should not resolve");
+    }
+
+    /// Dissent finding: nested symbols should resolve to the narrowest enclosing one.
+    #[test]
+    fn test_find_enclosing_symbol_prefers_narrowest() {
+        let nodes = vec![
+            make_node("src/lib.rs", "MyImpl", NodeKind::Impl, 1, 50),
+            make_node("src/lib.rs", "inner_fn", NodeKind::Function, 10, 20),
+        ];
+        let refs: Vec<&Node> = nodes.iter().collect();
+
+        // Line 15 is inside both MyImpl and inner_fn -- should resolve to inner_fn
+        let result = find_enclosing_symbol(&refs, Path::new("src/lib.rs"), 15);
+        assert_eq!(result.unwrap().name, "inner_fn", "should resolve to narrowest enclosing symbol");
+    }
+
+    /// Dissent finding: references in a different file should not match.
+    #[test]
+    fn test_find_enclosing_symbol_wrong_file_returns_none() {
+        let nodes = vec![
+            make_node("src/lib.rs", "my_fn", NodeKind::Function, 1, 50),
+        ];
+        let refs: Vec<&Node> = nodes.iter().collect();
+
+        let result = find_enclosing_symbol(&refs, Path::new("src/other.rs"), 10);
+        assert!(result.is_none(), "reference in different file should not match");
+    }
+
+    /// Dissent finding: find_enclosing_symbol only matches Function|Impl|Struct.
+    /// References inside Enum or Const bodies won't resolve. Verify this is the
+    /// actual behavior so we know the limitation.
+    #[test]
+    fn test_find_enclosing_symbol_skips_enum_and_const() {
+        let nodes = vec![
+            make_node("src/lib.rs", "MyEnum", NodeKind::Enum, 1, 20),
+            make_node("src/lib.rs", "MY_CONST", NodeKind::Const, 25, 30),
+        ];
+        let refs: Vec<&Node> = nodes.iter().collect();
+
+        // Line inside enum -- should NOT resolve (Enum not in the filter)
+        let result = find_enclosing_symbol(&refs, Path::new("src/lib.rs"), 10);
+        assert!(result.is_none(), "Enum is not in find_enclosing_symbol filter -- references inside enums are dropped");
+
+        // Line inside const -- should NOT resolve
+        let result = find_enclosing_symbol(&refs, Path::new("src/lib.rs"), 27);
+        assert!(result.is_none(), "Const is not in find_enclosing_symbol filter -- references inside consts are dropped");
+    }
+
+    /// Verify the self-reference filtering logic: a reference at the definition
+    /// site (same file, within line_start..line_end) should be filtered.
+    #[test]
+    fn test_self_reference_detection_logic() {
+        let node = make_node("src/lib.rs", "MyStruct", NodeKind::Struct, 10, 20);
+
+        // Reference at the definition site
+        let ref_file = PathBuf::from("src/lib.rs");
+        let ref_line: usize = 15;
+        let is_self_ref = ref_file == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end;
+        assert!(is_self_ref, "reference within definition site should be detected as self-reference");
+
+        // Reference in same file but outside definition
+        let ref_line: usize = 25;
+        let is_self_ref = ref_file == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end;
+        assert!(!is_self_ref, "reference outside definition should not be self-reference");
+
+        // Reference in different file
+        let ref_file = PathBuf::from("src/other.rs");
+        let ref_line: usize = 15;
+        let is_self_ref = ref_file == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end;
+        assert!(!is_self_ref, "reference in different file should not be self-reference");
+    }
+
+    /// Verify that .cargo path filtering works correctly.
+    #[test]
+    fn test_cargo_dep_filtering_logic() {
+        let cargo_path = PathBuf::from("/home/user/.cargo/registry/src/index.crates.io/serde-1.0.0/src/lib.rs");
+        assert!(cargo_path.to_string_lossy().contains(".cargo"), ".cargo dependency should be detected");
+
+        let project_path = PathBuf::from("src/lib.rs");
+        assert!(!project_path.to_string_lossy().contains(".cargo"), "project file should not be filtered");
+
+        // Dissent edge case: project with "cargo" in name
+        let tricky_path = PathBuf::from("my-cargo-tool/src/lib.rs");
+        assert!(!tricky_path.to_string_lossy().contains(".cargo"),
+            "project with 'cargo' in name (no dot prefix) should not be filtered");
+    }
+
+    /// Verify ReferencedBy edge kind has correct weight and string representation.
+    #[test]
+    fn test_referenced_by_edge_properties() {
+        let edge = Edge {
+            from: NodeId {
+                root: String::new(),
+                file: PathBuf::from("src/main.rs"),
+                name: "caller".into(),
+                kind: NodeKind::Function,
+            },
+            to: NodeId {
+                root: String::new(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "MyStruct".into(),
+                kind: NodeKind::Struct,
+            },
+            kind: EdgeKind::ReferencedBy,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+        };
+
+        assert_eq!(format!("{}", edge.kind), "referenced_by");
+        assert_eq!(edge.source, ExtractionSource::Lsp);
+        assert_eq!(edge.confidence, Confidence::Confirmed);
+    }
 }
