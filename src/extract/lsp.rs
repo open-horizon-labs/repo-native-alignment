@@ -2431,6 +2431,30 @@ mod tests {
         });
         assert!(!LspEnricher::server_status_is_ready(&no_quiescent),
             "missing quiescent should default to false (not ready)");
+
+        // Adversarial: completely empty params should not be ready
+        let empty_params = serde_json::json!({
+            "method": "experimental/serverStatus",
+            "params": {}
+        });
+        assert!(!LspEnricher::server_status_is_ready(&empty_params),
+            "empty params should not be ready");
+
+        // Adversarial: missing params entirely should not be ready
+        let no_params = serde_json::json!({
+            "method": "experimental/serverStatus"
+        });
+        assert!(!LspEnricher::server_status_is_ready(&no_params),
+            "missing params should not be ready");
+
+        // Adversarial: quiescent as string "true" should not be ready
+        // (must be boolean true, not string)
+        let string_quiescent = serde_json::json!({
+            "method": "experimental/serverStatus",
+            "params": { "health": "ok", "quiescent": "true" }
+        });
+        assert!(!LspEnricher::server_status_is_ready(&string_quiescent),
+            "quiescent as string 'true' should not be ready (must be bool)");
     }
 
     // -----------------------------------------------------------------------
