@@ -110,10 +110,13 @@ async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchCon
     let sort_by_importance = params.sort_by.as_deref() == Some("importance");
     let complexity_search = params.min_complexity.is_some() || sort_by_complexity;
     let has_kind_filter = params.kind.is_some();
+    let has_file_filter = params.file.is_some();
+    let has_synthetic_filter = params.synthetic.is_some();
+    let has_browse_filter = has_kind_filter || has_file_filter || has_synthetic_filter;
 
     let query_str = query.unwrap_or("");
-    if query_str.is_empty() && !complexity_search && !sort_by_importance && !has_kind_filter {
-        return "Empty query. Please describe what you're looking for (or use kind, min_complexity, sort_by=\"complexity\", or sort_by=\"importance\").".to_string();
+    if query_str.is_empty() && !complexity_search && !sort_by_importance && !has_browse_filter {
+        return "Empty query. Please describe what you're looking for (or use kind, file, synthetic, min_complexity, sort_by=\"complexity\", or sort_by=\"importance\").".to_string();
     }
 
     let search_mode = parse_search_mode(params.search_mode.as_deref());
@@ -1052,6 +1055,102 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id.name, "foo");
     }
+
+    // ── Empty query guard tests (#213) ──────────────────────────────
+
+    /// Empty query with file filter should be allowed (not rejected as "Empty query").
+    #[tokio::test]
+    async fn test_search_empty_query_with_file_filter() {
+        let nodes = vec![
+            make_node("parse", NodeKind::Function, "src/parser.rs"),
+            make_node("connect", NodeKind::Function, "src/db.rs"),
+        ];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            file: Some("parser".into()),
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+        assert!(!result.contains("Empty query"), "File filter should bypass empty query guard");
+        assert!(result.contains("parse"), "Should find symbols in the filtered file");
+    }
+
+    /// Empty query with synthetic filter should be allowed.
+    #[tokio::test]
+    async fn test_search_empty_query_with_synthetic_filter() {
+        let mut synth = make_node("MAGIC", NodeKind::Const, "src/lib.rs");
+        synth.metadata.insert("synthetic".into(), "true".into());
+        let real = make_node("real_fn", NodeKind::Function, "src/lib.rs");
+        let gs = make_graph_state(vec![synth, real]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            synthetic: Some(false),
+            include_artifacts: false,
+            include_markdown: false,
+            ..Default::default()
+        };
+
+        let result = search(&params, &ctx).await;
+        assert!(!result.contains("Empty query"), "Synthetic filter should bypass empty query guard");
+        assert!(result.contains("real_fn"), "Should include non-synthetic symbol when synthetic=false");
+        assert!(!result.contains("MAGIC"), "Should exclude synthetic symbol when synthetic=false");
+    }
+
+    // ── repo_map root prefix tests (#270) ───────────────────────────
+
+    /// In single-root mode, repo_map output should not contain root slug brackets.
+    #[test]
+    fn test_repo_map_single_root_no_prefix() {
+        let long_slug = "users-muness1-src-open-horizon-labs-repo-native-alignment";
+        let mut node = make_node("important_fn", NodeKind::Function, "src/main.rs");
+        node.id.root = long_slug.to_string();
+        node.metadata.insert("importance".into(), "0.5".into());
+        let gs = make_graph_state(vec![node]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = RepoMapContext {
+            graph_state: &gs, repo_root: &repo_root,
+            lsp_status: None, embed_status: None,
+        };
+        let params = RepoMapParams {
+            top_n: 15,
+            root_filter: Some(long_slug.to_string()),
+            non_code_slugs: HashSet::new(),
+        };
+
+        let result = repo_map(&params, &ctx);
+        assert!(!result.contains(&format!("[{}]", long_slug)),
+            "Single-root mode should not show root slug prefix: {}", result);
+        assert!(result.contains("important_fn"), "Should still show the symbol name");
+    }
+
+    /// In multi-root mode (root_filter=None), repo_map shows root slugs.
+    #[test]
+    fn test_repo_map_multi_root_shows_prefix() {
+        let mut node = make_node("main", NodeKind::Function, "src/main.rs");
+        node.id.root = "project-a".to_string();
+        node.metadata.insert("importance".into(), "0.5".into());
+        let gs = make_graph_state(vec![node]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = RepoMapContext {
+            graph_state: &gs, repo_root: &repo_root,
+            lsp_status: None, embed_status: None,
+        };
+        let params = RepoMapParams {
+            top_n: 15,
+            root_filter: None,
+            non_code_slugs: HashSet::new(),
+        };
+
+        let result = repo_map(&params, &ctx);
+        assert!(result.contains("[project-a]"),
+            "Multi-root mode should show root slug prefix: {}", result);
+    }
 }
 
 // ── Outcome progress ───────────────────────────────────────────────
@@ -1128,7 +1227,10 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
         swi.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         swi.truncate(params.top_n);
         if !swi.is_empty() {
-            let md: String = swi.iter().map(|(n, imp)| { let mut line = format!("- **{}** `{}` ({}) [{}] `{}`:{}-{} -- importance: {:.3}", n.id.kind, n.id.name, n.language, n.id.root, n.id.file.display(), n.line_start, n.line_end, imp);
+            let single_root = params.root_filter.is_some();
+            let md: String = swi.iter().map(|(n, imp)| {
+                let root_tag = if single_root { String::new() } else { format!(" [{}]", n.id.root) };
+                let mut line = format!("- **{}** `{}` ({}){} `{}`:{}-{} -- importance: {:.3}", n.id.kind, n.id.name, n.language, root_tag, n.id.file.display(), n.line_start, n.line_end, imp);
                 if let Some(cc) = n.metadata.get("cyclomatic") { line.push_str(&format!(", complexity: {}", cc)); } line }).collect::<Vec<_>>().join("\n");
             sections.push(format!("## Top {} symbols by importance\n\n{}", swi.len(), md));
         }
@@ -1139,7 +1241,11 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
             if !node_passes_root_filter(&n.id.root, &params.root_filter, &params.non_code_slugs) { continue; }
             *fc.entry((n.id.root.clone(), n.id.file.display().to_string())).or_default() += 1; }
         let mut sf: Vec<_> = fc.into_iter().collect(); sf.sort_by(|a, b| b.1.cmp(&a.1)); sf.truncate(10);
-        if !sf.is_empty() { let md: String = sf.iter().map(|((root, f), count)| format!("- [{}] `{}` -- {} definitions", root, f, count)).collect::<Vec<_>>().join("\n"); sections.push(format!("## Hotspot files\n\n{}", md)); } }
+        let single_root = params.root_filter.is_some();
+        if !sf.is_empty() { let md: String = sf.iter().map(|((root, f), count)| {
+            if single_root { format!("- `{}` -- {} definitions", f, count) }
+            else { format!("- [{}] `{}` -- {} definitions", root, f, count) }
+        }).collect::<Vec<_>>().join("\n"); sections.push(format!("## Hotspot files\n\n{}", md)); } }
     { let outcomes = crate::oh::load_oh_artifacts(ctx.repo_root).unwrap_or_default().into_iter().filter(|a| a.kind == crate::types::OhArtifactKind::Outcome).collect::<Vec<_>>();
         if !outcomes.is_empty() { let md: String = outcomes.iter().map(|o| { let files: Vec<String> = o.frontmatter.get("files").and_then(|v| v.as_sequence()).map(|seq| seq.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
             let fs = if files.is_empty() { String::new() } else { format!(" (files: {})", files.join(", ")) }; format!("- **{}**{}", o.id(), fs) }).collect::<Vec<_>>().join("\n"); sections.push(format!("## Active outcomes\n\n{}", md)); } }
@@ -1149,7 +1255,14 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
             .filter(|n| { let name = n.id.name.to_lowercase(); name == "main" || name.starts_with("handle_") || name.starts_with("handler") || name.ends_with("_handler") || name.contains("endpoint") }).collect();
         ep.sort_by(|a, b| { let ia = a.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0); let ib = b.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0); ib.partial_cmp(&ia).unwrap_or(std::cmp::Ordering::Equal) });
         ep.truncate(10);
-        if !ep.is_empty() { let md: String = ep.iter().map(|n| format!("- **{}** [{}] `{}`:{}-{}", n.id.name, n.id.root, n.id.file.display(), n.line_start, n.line_end)).collect::<Vec<_>>().join("\n"); sections.push(format!("## Entry points\n\n{}", md)); } }
+        if !ep.is_empty() {
+            let single_root = params.root_filter.is_some();
+            let md: String = ep.iter().map(|n| {
+                if single_root { format!("- **{}** `{}`:{}-{}", n.id.name, n.id.file.display(), n.line_start, n.line_end) }
+                else { format!("- **{}** [{}] `{}`:{}-{}", n.id.name, n.id.root, n.id.file.display(), n.line_start, n.line_end) }
+            }).collect::<Vec<_>>().join("\n");
+            sections.push(format!("## Entry points\n\n{}", md));
+        } }
     let freshness = format_freshness_full(graph_state.nodes.len(), graph_state.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
     if sections.is_empty() { format!("No repository data available yet.{}", freshness) } else { format!("# Repository Map\n\n{}{}", sections.join("\n\n"), freshness) }
 }
