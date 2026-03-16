@@ -225,8 +225,6 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
             tools: vec![
                 OutcomeProgress::tool(),
                 Search::tool(),
-                SearchSymbols::tool(),  // deprecated alias
-                GraphQuery::tool(),     // deprecated alias
                 ListRoots::tool(),
                 RepoMap::tool(),
             ],
@@ -267,17 +265,6 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                 self.handle_outcome_progress(args).await
             }
 
-            // -- Deprecated aliases --
-            "search_symbols" => {
-                let args: SearchSymbols = parse_args(params.arguments)?;
-                self.handle_search(args.into_search()).await
-            }
-            "graph_query" => {
-                let args: GraphQuery = parse_args(params.arguments)?;
-                self.handle_search(args.into_search()).await
-            }
-
-            // -- Unified search --
             "search" => {
                 let args: Search = parse_args(params.arguments)?;
                 self.handle_search(args).await
