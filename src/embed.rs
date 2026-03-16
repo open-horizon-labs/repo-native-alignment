@@ -864,7 +864,9 @@ impl EmbeddingIndex {
                 tracing::info!(
                     "EmbeddingIndex: dropping old-schema table (missing text_hash column)"
                 );
-                let _ = self.db.drop_table(&self.table_name, &[]).await;
+                if let Err(e) = self.db.drop_table(&self.table_name, &[]).await {
+                    tracing::debug!("EmbeddingIndex: drop_table failed (proceeding with create): {}", e);
+                }
                 (false, candidates)
             } else {
                 let (to_embed, unchanged): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
@@ -1020,7 +1022,7 @@ impl EmbeddingIndex {
             tracing::warn!("Could not open table for FTS index creation; hybrid search will use vector-only");
         }
 
-        Ok(total_candidates)
+        Ok(embedded_count)
     }
 
     /// Delete embedding rows for IDs that are no longer in the current graph.
@@ -2137,9 +2139,9 @@ mod tests {
         assert!(count1 > 0, "first build should index items");
         assert!(idx.has_table().await.unwrap(), "table should exist after first build");
 
-        // Second build with same node: should still succeed (merge_insert path)
+        // Second build with same node: BLAKE3 hash skip means 0 newly embedded
         let count2 = idx.index_all_with_symbols(&repo_root, &[node]).await.unwrap();
-        assert!(count2 > 0, "second build should report total candidates");
+        assert_eq!(count2, 0, "second build should skip all unchanged nodes via BLAKE3 hash");
     }
 
     #[tokio::test]
@@ -2196,9 +2198,10 @@ mod tests {
         let count1 = idx.index_all_with_symbols(&repo_root, &[node_a.clone(), node_b]).await.unwrap();
         assert!(count1 > 0);
 
-        // Rebuild with only node_a -- node_b should be cleaned up
+        // Rebuild with only node_a -- node_b should be cleaned up.
+        // count2 is 0 because node_a is unchanged (BLAKE3 hash hit).
         let count2 = idx.index_all_with_symbols(&repo_root, &[node_a]).await.unwrap();
-        assert!(count2 > 0);
+        assert_eq!(count2, 0, "node_a unchanged, should skip via BLAKE3 hash");
 
         // Verify stale row is truly gone by querying text hashes for node_b
         let table = idx.db.open_table(&idx.table_name).execute().await.unwrap();
