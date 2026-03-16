@@ -407,7 +407,14 @@ impl RnaHandler {
                         if edge.source == crate::graph::ExtractionSource::Lsp {
                             let from_id = edge.from.to_stable_id();
                             let to_id = edge.to.to_stable_id();
-                            if node_ids.contains(&from_id) || node_ids.contains(&to_id) {
+                            // Require the source node to still exist. For the
+                            // target, only require existence if it belongs to
+                            // the same dirty root -- external/virtual targets
+                            // may not be in our extraction node set.
+                            let from_exists = node_ids.contains(&from_id);
+                            let to_exists = edge.to.root != *root_slug
+                                || node_ids.contains(&to_id);
+                            if from_exists && to_exists {
                                 extraction.edges.push(edge);
                                 lsp_carry_count += 1;
                             }
