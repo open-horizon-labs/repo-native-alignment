@@ -1,6 +1,6 @@
 ---
 name: ship
-description: RNA delivery pipeline. 12-step quality gate from implementation to merge, with delivery verification.
+description: RNA delivery pipeline. 13-step quality gate from implementation to merge, with delivery verification and final comment sweep.
 tools: Read, Write, Edit, Grep, Glob, Bash, Agent
 mcpServers:
   - rna-mcp
@@ -8,7 +8,7 @@ mcpServers:
 
 # RNA /ship Pipeline
 
-The full quality gate for this project. 12 steps. Run sequentially — each step must complete before the next begins. **Do not wait for user prompts between steps.** When one step completes, immediately start the next.
+The full quality gate for this project. 13 steps. Run sequentially — each step must complete before the next begins. **Do not wait for user prompts between steps.** When one step completes, immediately start the next.
 
 > **You are an RNA power user.** Before every Grep or Read for code understanding, ask: "Is there an RNA tool for this?" Check the table in `/friction` (`.claude/skills/friction.md`). Use `search`, `search_symbols`, `graph_query`, and `outcome_progress` as your FIRST choice — for review context, dissent grounding, impact analysis, and guardrail checks. **Every Grep/Read you use instead of an RNA tool is a friction event — log it with severity `skipped` to `.oh/friction-logs/`.** When an RNA tool fails, log that too. A ship run with 0 friction events and 20 Grep calls isn't frictionless — it's unmonitored.
 
@@ -224,6 +224,42 @@ Verify CI passes on the final commit: `gh pr checks <PR>`.
 
 If CI is pending, wait. If CI fails, fix and re-run from step 9.
 
+### 10b. Final comment sweep
+
+**Pre-merge gate: verify ALL PR comments are addressed.**
+
+External reviewers (CodeRabbit, humans) post findings after step 3b (mark ready). The fix step (3) only catches findings that existed *before* marking ready. This step catches everything that arrived since.
+
+**How:**
+1. Fetch all PR comments:
+   ```bash
+   gh api repos/{owner}/{repo}/pulls/<PR>/comments --paginate
+   gh api repos/{owner}/{repo}/issues/<PR>/comments --paginate
+   ```
+2. For each comment from a non-ship-agent source (CodeRabbit, humans, review skill):
+   - Is there a commit that addresses it? → OK
+   - Is there an explicit reply explaining why it's N/A? → OK
+   - Neither? → **Fix it now** or explicitly mark N/A with reasoning
+3. If any fixes were made, push and re-run step 9 (smoke test) and step 10 (CI green).
+
+**Severity rules:**
+- **Critical/Major findings** — must be fixed, no exceptions
+- **Minor findings** — fix if straightforward, mark N/A with reasoning if not
+- **Suggestions/nitpicks** — fix or explicitly acknowledge
+
+**Post results as PR comment:**
+```bash
+gh pr comment <PR> --body "$(cat <<'EOF'
+## Ship Step 10b: Final Comment Sweep
+**External comments reviewed:** N
+**Unaddressed findings fixed:** N
+**Marked N/A with reasoning:** N
+
+[details if any fixes were made]
+EOF
+)"
+```
+
 ### 11. Merge
 
 **Pre-merge gate: acceptance criteria.**
@@ -251,6 +287,7 @@ gh pr merge <PR-number> --squash --delete-branch
 | Manual verification | Does the computation work with real data? |
 | **Delivery verification** | **Can an agent actually see this through MCP tools?** |
 | Smoke test + CI | Does the build pass? |
+| **Final comment sweep** | **Are ALL external review comments addressed?** |
 | **Merge gate** | **Are all acceptance criteria checked off?** |
 
 ## Automation Rules
