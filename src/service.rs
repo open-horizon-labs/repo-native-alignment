@@ -404,7 +404,10 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
 
     let search_mode = parse_search_mode(params.search_mode.as_deref());
     let (entry_node_ids, entry_header): (Vec<String>, String) = if let Some(node_id) = node {
-        (vec![node_id.to_string()], String::new())
+        // Resolve short IDs (without root prefix) to full stable IDs.
+        // Search results display `src/file.rs:name:kind` but graph needs `root:src/file.rs:name:kind`.
+        let resolved = ctx.graph_state.resolve_node_id(node_id);
+        (vec![resolved], String::new())
     } else if let Some(query_text) = query {
         // Try name matching against graph nodes first (#290).
         // This ensures `search("SearchParams", kind: "struct", mode: "neighbors")`
@@ -528,8 +531,9 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
     use crate::server::handlers::run_traversal_grouped;
     let gs = ctx.graph_state;
     let freshness = format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
-    // Build O(1) lookup map once for the entire batch.
+    // Build O(1) lookup map and root slugs once for the entire batch.
     let node_index_map = gs.node_index_map();
+    let roots = GraphState::root_slugs_from_index_map(&node_index_map);
     if params.mode.is_some() {
         let mode = params.mode.as_deref().unwrap_or("neighbors");
         let edge_filter = params.edge_types.as_ref().map(|types| types.iter().filter_map(|t| parse_edge_kind(t)).collect::<Vec<_>>());
@@ -537,13 +541,15 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
         let mut sections: Vec<String> = Vec::new();
         let strip = ctx.root_filter.as_deref();
         for &nid in node_ids {
-            let display_nid = strip_root_prefix(nid, strip);
-            if gs.index.get_node(nid).is_none() { sections.push(format!("### `{}`\n\nNode not found in graph.", display_nid)); continue; }
-            match run_traversal_grouped(&gs.index, nid, mode, params.hops, params.direction.as_deref(), edge_filter_slice) {
+            // Resolve short IDs (without root prefix) to full stable IDs.
+            let resolved_nid = GraphState::resolve_node_id_fast(nid, &node_index_map, &roots);
+            let display_nid = strip_root_prefix(&resolved_nid, strip);
+            if gs.index.get_node(&resolved_nid).is_none() { sections.push(format!("### `{}`\n\nNode not found in graph.", display_nid)); continue; }
+            match run_traversal_grouped(&gs.index, &resolved_nid, mode, params.hops, params.direction.as_deref(), edge_filter_slice) {
                 Ok(mut groups) => {
                     // Remove self-references
                     for ids in groups.values_mut() {
-                        ids.retain(|id| id != nid);
+                        ids.retain(|id| id != resolved_nid.as_str());
                     }
                     if mode == "tests_for" {
                         for ids in groups.values_mut() {
@@ -568,7 +574,10 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
     } else {
         let mut found = Vec::new();
         let mut missing = Vec::new();
-        for &nid in node_ids { if let Some(node) = gs.node_by_stable_id(nid, &node_index_map) { found.push(node); } else { missing.push(nid); } }
+        for &nid in node_ids {
+            let resolved = GraphState::resolve_node_id_fast(nid, &node_index_map, &roots);
+            if let Some(node) = gs.node_by_stable_id(&resolved, &node_index_map) { found.push(node); } else { missing.push(nid); }
+        }
         let strip = ctx.root_filter.as_deref();
         if found.is_empty() { return format!("No nodes found for {}. Try search to find valid node IDs.{}", node_ids.iter().map(|id| format!("`{}`", strip_root_prefix(id, strip))).collect::<Vec<_>>().join(", "), freshness); }
         let md: String = found.iter().map(|n| format_node_entry_with_root(n, &gs.index, params.compact, strip)).collect::<Vec<_>>().join("\n\n");
@@ -593,7 +602,9 @@ pub struct GraphParams {
 pub fn graph_query(params: &GraphParams, graph_state: &GraphState) -> Result<String, String> {
     let edge_filter = params.edge_types.as_ref().map(|types| types.iter().filter_map(|t| parse_edge_kind(t.trim())).collect::<Vec<_>>());
     let edge_filter_slice = edge_filter.as_deref();
-    let result_ids = run_traversal(&graph_state.index, &params.node, &params.mode, params.max_hops.map(|h| h as u32), Some(params.direction.as_str()), edge_filter_slice)?;
+    // Resolve short IDs (without root prefix) to full stable IDs.
+    let resolved_node = graph_state.resolve_node_id(&params.node);
+    let result_ids = run_traversal(&graph_state.index, &resolved_node, &params.mode, params.max_hops.map(|h| h as u32), Some(params.direction.as_str()), edge_filter_slice)?;
     if result_ids.is_empty() { return Ok(format!("No results for `{}` ({}).", params.node, params.mode)); }
     let node_index_map = graph_state.node_index_map();
     let mut lines = vec![format!("## {} `{}`\n\n{} result(s)\n", params.mode, params.node, result_ids.len())];
