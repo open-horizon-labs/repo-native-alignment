@@ -148,7 +148,7 @@ Solo developer. PRs go through the full /ship pipeline (12 steps). "Done" = all 
 - `src/query.rs` — outcome_progress structural joins
 
 ## Shipped Capabilities
-- LSP enrichment: 252 `Calls` edges via rust-analyzer callHierarchy (pyright, tsserver, gopls, marksman registered)
+- LSP enrichment: `Calls` edges via callHierarchy + `ReferencedBy` edges via textDocument/references for structs, enums, type aliases, consts (rust-analyzer, pyright, tsserver, gopls, marksman registered)
 - Schema extractors: .proto, SQL, OpenAPI
 - Multi-root workspace: `~/.config/rna/roots.toml` + per-root scanning
 - PR merge extraction: git merge history → graph nodes + outcome_progress integration

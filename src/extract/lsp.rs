@@ -76,7 +76,9 @@ fn find_enclosing_symbol(nodes: &[&Node], file: &Path, line: usize) -> Option<No
     }
 
     file_matches.iter()
-        .filter(|n| matches!(n.id.kind, NodeKind::Function | NodeKind::Impl | NodeKind::Struct))
+        .filter(|n| matches!(n.id.kind,
+            NodeKind::Function | NodeKind::Impl | NodeKind::Struct
+            | NodeKind::Trait | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const))
         .filter(|n| n.line_start <= line && n.line_end >= line)
         .min_by_key(|n| n.line_end - n.line_start)
         .map(|n| n.id.clone())
@@ -492,6 +494,8 @@ struct LspState {
     init_failed: bool,
     /// Whether the language server supports type hierarchy requests.
     has_type_hierarchy: bool,
+    /// Whether the language server supports textDocument/references requests.
+    has_references: bool,
     /// Consecutive type hierarchy failures. After MAX_TYPE_HIERARCHY_STRIKES,
     /// type hierarchy is disabled for the rest of the session.
     type_hierarchy_strikes: u32,
@@ -528,6 +532,7 @@ impl LspEnricher {
                 root_path: None,
                 init_failed: false,
                 has_type_hierarchy: false,
+                has_references: false,
                 type_hierarchy_strikes: 0,
             }),
         }
@@ -667,6 +672,7 @@ impl LspEnricher {
         );
 
         state.has_type_hierarchy = has_type_hierarchy;
+        state.has_references = has_references;
 
         // Send initialized notification
         let transport = state.transport.as_mut().unwrap();
@@ -936,6 +942,32 @@ impl LspEnricher {
         }
     }
 
+    /// Find references to a symbol at a position (pipelined).
+    /// Returns a list of LSP Location objects for each reference site.
+    async fn find_references_p(
+        transport: &PipelinedTransport,
+        file_uri: &Uri,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<Location>> {
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri.as_str() },
+            "position": { "line": line, "character": character },
+            "context": { "includeDeclaration": false }
+        });
+
+        let result: serde_json::Value = transport
+            .request("textDocument/references", &params)
+            .await?;
+
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+
+        let locations: Vec<Location> = serde_json::from_value(result).unwrap_or_default();
+        Ok(locations)
+    }
+
     /// Use type hierarchy to discover supertypes for a node, creating
     /// Implements edges for each resolved supertype relationship.
     ///
@@ -1169,7 +1201,7 @@ impl Enricher for LspEnricher {
         }
 
         // Extract state under lock, then release the lock for concurrent work
-        let (transport, root, has_type_hierarchy, type_hierarchy_strikes) = {
+        let (transport, root, has_type_hierarchy, type_hierarchy_strikes, has_references) = {
             let state = self.state.lock().await;
             let root = state
                 .root_path
@@ -1179,7 +1211,7 @@ impl Enricher for LspEnricher {
                 Some(t) => Arc::clone(t),
                 None => return Ok(result),
             };
-            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes)
+            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references)
         };
         // State lock is released here — concurrent tasks can proceed
 
@@ -1201,7 +1233,8 @@ impl Enricher for LspEnricher {
         // and halve the total RPC count.
         let enrichable_nodes: Vec<&Node> = matching_nodes.iter()
             .filter(|n| matches!(n.id.kind,
-                NodeKind::Function | NodeKind::Trait | NodeKind::Other(_)))
+                NodeKind::Function | NodeKind::Trait | NodeKind::Other(_)
+                | NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const))
             .filter(|n| {
                 // Skip test functions (have #[test] or #[tokio::test] decorator)
                 if n.id.kind == NodeKind::Function {
@@ -1220,12 +1253,18 @@ impl Enricher for LspEnricher {
             .copied()
             .collect();
 
+        let ref_eligible = enrichable_nodes.iter()
+            .filter(|n| matches!(n.id.kind,
+                NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const))
+            .count();
         tracing::info!(
-            "LSP pipeline: {} enrichable nodes out of {} total ({}f, {}t, {}o)",
+            "LSP pipeline: {} enrichable nodes out of {} total ({}f, {}t, {}r, {}o) [references={}]",
             enrichable_nodes.len(), matching_nodes.len(),
             enrichable_nodes.iter().filter(|n| n.id.kind == NodeKind::Function).count(),
             enrichable_nodes.iter().filter(|n| n.id.kind == NodeKind::Trait).count(),
+            ref_eligible,
             enrichable_nodes.iter().filter(|n| matches!(n.id.kind, NodeKind::Other(_))).count(),
+            has_references,
         );
 
         // Concurrency control: TCP slow-start from 4 to 64.
@@ -1444,6 +1483,60 @@ impl Enricher for LspEnricher {
                             }
                             Err(e) => {
                                 tracing::debug!("Implementation lookup failed for {}: {}", node.id.name, e);
+                            }
+                        }
+                    }
+                    NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
+                        // Use textDocument/references to find usage sites for
+                        // non-function symbols (structs, enums, type aliases, consts).
+                        if has_references {
+                            match Self::find_references_p(&transport, &file_uri, line, col).await {
+                                Ok(locations) => {
+                                    // Build per-file index once to avoid O(R*N) scans
+                                    let matching_refs: Vec<&Node> = matching_owned.iter().collect();
+                                    let mut refs_by_file: HashMap<&Path, Vec<&Node>> = HashMap::new();
+                                    for n in &matching_refs {
+                                        refs_by_file.entry(n.id.file.as_path()).or_default().push(*n);
+                                    }
+                                    for loc in &locations {
+                                        let ref_path = uri_to_relative_path(&loc.uri, &root);
+                                        let ref_line = loc.range.start.line as usize + 1;
+
+                                        // Skip external dependencies
+                                        if ref_path.to_string_lossy().contains(".cargo") {
+                                            continue;
+                                        }
+
+                                        // Skip self-references (definition site)
+                                        if ref_path == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end {
+                                            continue;
+                                        }
+
+                                        // Resolve to the enclosing symbol at the reference site
+                                        let referrer_id = refs_by_file
+                                            .get(ref_path.as_path())
+                                            .and_then(|candidates| find_enclosing_symbol(candidates, &ref_path, ref_line));
+
+                                        if let Some(referrer) = referrer_id {
+                                            // Skip self-edges
+                                            if referrer == node.id {
+                                                continue;
+                                            }
+                                            edges.push(Edge {
+                                                from: referrer,
+                                                to: node.id.clone(),
+                                                kind: EdgeKind::ReferencedBy,
+                                                source: ExtractionSource::Lsp,
+                                                confidence: Confidence::Confirmed,
+                                            });
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    had_error = true;
+                                    error_count.fetch_add(1, Ordering::Relaxed);
+                                    tracing::debug!("textDocument/references failed for {}: {}", node.id.name, e);
+                                }
                             }
                         }
                     }
@@ -2302,5 +2395,139 @@ mod tests {
         });
         assert!(LspEnricher::server_status_is_ready(&no_quiescent),
             "missing quiescent should default to true (ready)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Adversarial tests for find_enclosing_symbol (PR #286 ship pipeline)
+    // Seeded from dissent: module-level references, self-references, edge cases
+    // -----------------------------------------------------------------------
+
+    /// Dissent finding: references at module level (outside any function/struct/impl)
+    /// should return None -- no enclosing symbol exists.
+    #[test]
+    fn test_find_enclosing_symbol_module_level_returns_none() {
+        let nodes = vec![
+            make_node("src/lib.rs", "my_fn", NodeKind::Function, 10, 20),
+            make_node("src/lib.rs", "MyStruct", NodeKind::Struct, 25, 35),
+        ];
+        let refs: Vec<&Node> = nodes.iter().collect();
+
+        // Line 5 is before any symbol -- module-level use statement
+        let result = find_enclosing_symbol(&refs, Path::new("src/lib.rs"), 5);
+        assert!(result.is_none(), "module-level reference should not resolve to any symbol");
+
+        // Line 22 is between symbols -- also module level
+        let result = find_enclosing_symbol(&refs, Path::new("src/lib.rs"), 22);
+        assert!(result.is_none(), "gap between symbols should not resolve");
+    }
+
+    /// Dissent finding: nested symbols should resolve to the narrowest enclosing one.
+    #[test]
+    fn test_find_enclosing_symbol_prefers_narrowest() {
+        let nodes = vec![
+            make_node("src/lib.rs", "MyImpl", NodeKind::Impl, 1, 50),
+            make_node("src/lib.rs", "inner_fn", NodeKind::Function, 10, 20),
+        ];
+        let refs: Vec<&Node> = nodes.iter().collect();
+
+        // Line 15 is inside both MyImpl and inner_fn -- should resolve to inner_fn
+        let result = find_enclosing_symbol(&refs, Path::new("src/lib.rs"), 15);
+        assert_eq!(result.unwrap().name, "inner_fn", "should resolve to narrowest enclosing symbol");
+    }
+
+    /// Dissent finding: references in a different file should not match.
+    #[test]
+    fn test_find_enclosing_symbol_wrong_file_returns_none() {
+        let nodes = vec![
+            make_node("src/lib.rs", "my_fn", NodeKind::Function, 1, 50),
+        ];
+        let refs: Vec<&Node> = nodes.iter().collect();
+
+        let result = find_enclosing_symbol(&refs, Path::new("src/other.rs"), 10);
+        assert!(result.is_none(), "reference in different file should not match");
+    }
+
+    /// Verify find_enclosing_symbol resolves Enum and Const scopes
+    /// (expanded filter per CodeRabbit review feedback).
+    #[test]
+    fn test_find_enclosing_symbol_resolves_enum_and_const() {
+        let nodes = vec![
+            make_node("src/lib.rs", "MyEnum", NodeKind::Enum, 1, 20),
+            make_node("src/lib.rs", "MY_CONST", NodeKind::Const, 25, 30),
+        ];
+        let refs: Vec<&Node> = nodes.iter().collect();
+
+        // Line inside enum -- should resolve after filter expansion
+        let result = find_enclosing_symbol(&refs, Path::new("src/lib.rs"), 10);
+        assert_eq!(result.unwrap().name, "MyEnum", "Enum should now resolve in find_enclosing_symbol");
+
+        // Line inside const -- should resolve after filter expansion
+        let result = find_enclosing_symbol(&refs, Path::new("src/lib.rs"), 27);
+        assert_eq!(result.unwrap().name, "MY_CONST", "Const should now resolve in find_enclosing_symbol");
+    }
+
+    /// Verify the self-reference filtering logic: a reference at the definition
+    /// site (same file, within line_start..line_end) should be filtered.
+    #[test]
+    fn test_self_reference_detection_logic() {
+        let node = make_node("src/lib.rs", "MyStruct", NodeKind::Struct, 10, 20);
+
+        // Reference at the definition site
+        let ref_file = PathBuf::from("src/lib.rs");
+        let ref_line: usize = 15;
+        let is_self_ref = ref_file == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end;
+        assert!(is_self_ref, "reference within definition site should be detected as self-reference");
+
+        // Reference in same file but outside definition
+        let ref_line: usize = 25;
+        let is_self_ref = ref_file == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end;
+        assert!(!is_self_ref, "reference outside definition should not be self-reference");
+
+        // Reference in different file
+        let ref_file = PathBuf::from("src/other.rs");
+        let ref_line: usize = 15;
+        let is_self_ref = ref_file == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end;
+        assert!(!is_self_ref, "reference in different file should not be self-reference");
+    }
+
+    /// Verify that .cargo path filtering works correctly.
+    #[test]
+    fn test_cargo_dep_filtering_logic() {
+        let cargo_path = PathBuf::from("/home/user/.cargo/registry/src/index.crates.io/serde-1.0.0/src/lib.rs");
+        assert!(cargo_path.to_string_lossy().contains(".cargo"), ".cargo dependency should be detected");
+
+        let project_path = PathBuf::from("src/lib.rs");
+        assert!(!project_path.to_string_lossy().contains(".cargo"), "project file should not be filtered");
+
+        // Dissent edge case: project with "cargo" in name
+        let tricky_path = PathBuf::from("my-cargo-tool/src/lib.rs");
+        assert!(!tricky_path.to_string_lossy().contains(".cargo"),
+            "project with 'cargo' in name (no dot prefix) should not be filtered");
+    }
+
+    /// Verify ReferencedBy edge kind has correct weight and string representation.
+    #[test]
+    fn test_referenced_by_edge_properties() {
+        let edge = Edge {
+            from: NodeId {
+                root: String::new(),
+                file: PathBuf::from("src/main.rs"),
+                name: "caller".into(),
+                kind: NodeKind::Function,
+            },
+            to: NodeId {
+                root: String::new(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "MyStruct".into(),
+                kind: NodeKind::Struct,
+            },
+            kind: EdgeKind::ReferencedBy,
+            source: ExtractionSource::Lsp,
+            confidence: Confidence::Confirmed,
+        };
+
+        assert_eq!(format!("{}", edge.kind), "referenced_by");
+        assert_eq!(edge.source, ExtractionSource::Lsp);
+        assert_eq!(edge.confidence, Confidence::Confirmed);
     }
 }
