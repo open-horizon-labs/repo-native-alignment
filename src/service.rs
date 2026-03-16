@@ -1098,6 +1098,8 @@ mod tests {
 
         let result = search(&params, &ctx).await;
         assert!(!result.contains("Empty query"), "Synthetic filter should bypass empty query guard");
+        assert!(result.contains("real_fn"), "Should include non-synthetic symbol when synthetic=false");
+        assert!(!result.contains("MAGIC"), "Should exclude synthetic symbol when synthetic=false");
     }
 
     // ── repo_map root prefix tests (#270) ───────────────────────────
