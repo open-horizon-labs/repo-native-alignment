@@ -2,7 +2,7 @@
 
 ## Abstract
 
-Coding agents explore codebases through text search — grep, file reading, glob — recovering structural relationships through repeated sequential queries. This is expensive: each hop in a call chain costs a tool call, context tokens, and wall time. We evaluate whether a hybrid vector-graph representation (semantic embeddings for discovery, structural graph for traversal) can reduce this cost. Using RNA, an early-stage local context discovery tool, we benchmark against standard Claude Code tooling on 5 realistic developer questions against a 25K-line Rust codebase (N=5 per condition). Results: 60% lower cost ($0.65 vs $1.62), 72% faster (146s vs 530s), +5% quality (4.89 vs 4.67/5.0), with the strongest gains in multi-hop traversal and complexity analysis. The primary value is efficiency, not accuracy — agents get equivalent answers faster and cheaper.
+Coding agents explore codebases through text search — grep, file reading, glob — recovering structural relationships through repeated sequential queries. This is expensive: each hop in a call chain costs a tool call, context tokens, and wall time. We evaluate whether a hybrid vector-graph representation (semantic embeddings for discovery, structural graph for traversal) can reduce this cost. Using RNA, an early-stage local context discovery tool, we benchmark against standard Claude Code tooling on 5 realistic developer questions against a [25K-line Rust codebase](https://github.com/open-horizon-labs/unified-hifi-control) (N=5 per condition). Results: 60% lower cost ($0.65 vs $1.62), 72% faster (146s vs 530s), +5% quality (4.89 vs 4.67/5.0), with the strongest gains in multi-hop traversal and complexity analysis. The primary value is efficiency, not accuracy — agents get equivalent answers faster and cheaper.
 
 ## 1. Introduction
 
@@ -124,7 +124,7 @@ Questions were designed to be:
 
 ### 3.2 Target Codebase
 
-unified-hifi-control: a 25K-line Rust application with 5 adapters (Roon, LMS, OpenHome, UPnP, HQPlayer), an event bus architecture, web UI (Dioxus), and MCP server. The codebase is authored by the benchmark designer — noted as a threat to validity in section 3.6.
+[unified-hifi-control](https://github.com/open-horizon-labs/unified-hifi-control): a 25K-line Rust application with 5 adapters (Roon, LMS, OpenHome, UPnP, HQPlayer), an event bus architecture, web UI (Dioxus), and MCP server. The codebase is authored by the benchmark designer — noted as a threat to validity in section 3.6.
 
 Graph statistics after RNA indexing:
 - 15,132 nodes (code symbols + markdown sections)
