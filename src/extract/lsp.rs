@@ -76,7 +76,9 @@ fn find_enclosing_symbol(nodes: &[&Node], file: &Path, line: usize) -> Option<No
     }
 
     file_matches.iter()
-        .filter(|n| matches!(n.id.kind, NodeKind::Function | NodeKind::Impl | NodeKind::Struct))
+        .filter(|n| matches!(n.id.kind,
+            NodeKind::Function | NodeKind::Impl | NodeKind::Struct
+            | NodeKind::Trait | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const))
         .filter(|n| n.line_start <= line && n.line_end >= line)
         .min_by_key(|n| n.line_end - n.line_start)
         .map(|n| n.id.clone())
@@ -1490,7 +1492,12 @@ impl Enricher for LspEnricher {
                         if has_references {
                             match Self::find_references_p(&transport, &file_uri, line, col).await {
                                 Ok(locations) => {
+                                    // Build per-file index once to avoid O(R*N) scans
                                     let matching_refs: Vec<&Node> = matching_owned.iter().collect();
+                                    let mut refs_by_file: HashMap<&Path, Vec<&Node>> = HashMap::new();
+                                    for n in &matching_refs {
+                                        refs_by_file.entry(n.id.file.as_path()).or_default().push(*n);
+                                    }
                                     for loc in &locations {
                                         let ref_path = uri_to_relative_path(&loc.uri, &root);
                                         let ref_line = loc.range.start.line as usize + 1;
@@ -1506,7 +1513,9 @@ impl Enricher for LspEnricher {
                                         }
 
                                         // Resolve to the enclosing symbol at the reference site
-                                        let referrer_id = find_enclosing_symbol(&matching_refs, &ref_path, ref_line);
+                                        let referrer_id = refs_by_file
+                                            .get(ref_path.as_path())
+                                            .and_then(|candidates| find_enclosing_symbol(candidates, &ref_path, ref_line));
 
                                         if let Some(referrer) = referrer_id {
                                             // Skip self-edges
@@ -2438,24 +2447,23 @@ mod tests {
         assert!(result.is_none(), "reference in different file should not match");
     }
 
-    /// Dissent finding: find_enclosing_symbol only matches Function|Impl|Struct.
-    /// References inside Enum or Const bodies won't resolve. Verify this is the
-    /// actual behavior so we know the limitation.
+    /// Verify find_enclosing_symbol resolves Enum and Const scopes
+    /// (expanded filter per CodeRabbit review feedback).
     #[test]
-    fn test_find_enclosing_symbol_skips_enum_and_const() {
+    fn test_find_enclosing_symbol_resolves_enum_and_const() {
         let nodes = vec![
             make_node("src/lib.rs", "MyEnum", NodeKind::Enum, 1, 20),
             make_node("src/lib.rs", "MY_CONST", NodeKind::Const, 25, 30),
         ];
         let refs: Vec<&Node> = nodes.iter().collect();
 
-        // Line inside enum -- should NOT resolve (Enum not in the filter)
+        // Line inside enum -- should resolve after filter expansion
         let result = find_enclosing_symbol(&refs, Path::new("src/lib.rs"), 10);
-        assert!(result.is_none(), "Enum is not in find_enclosing_symbol filter -- references inside enums are dropped");
+        assert_eq!(result.unwrap().name, "MyEnum", "Enum should now resolve in find_enclosing_symbol");
 
-        // Line inside const -- should NOT resolve
+        // Line inside const -- should resolve after filter expansion
         let result = find_enclosing_symbol(&refs, Path::new("src/lib.rs"), 27);
-        assert!(result.is_none(), "Const is not in find_enclosing_symbol filter -- references inside consts are dropped");
+        assert_eq!(result.unwrap().name, "MY_CONST", "Const should now resolve in find_enclosing_symbol");
     }
 
     /// Verify the self-reference filtering logic: a reference at the definition
