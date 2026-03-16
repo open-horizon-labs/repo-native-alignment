@@ -746,34 +746,71 @@ fn compute_cluster_name(
         }
     }
 
-    // Priority 2: Deepest common directory prefix of member file paths
-    let mut prefix_counts: HashMap<&str, usize> = HashMap::new();
+    // Priority 2: Deepest common directory prefix of member file paths.
+    // Compute the longest common directory path across all members, stripping
+    // "src/" prefix and file basenames. E.g., ["src/server/handlers/a.rs",
+    // "src/server/handlers/b.rs"] -> "server/handlers".
+    let mut dirs: Vec<Vec<&str>> = Vec::new();
     for id in member_ids {
-        if let Some(file_path) = node_file_map.get(id) {
-            // Extract the first meaningful directory component after "src/"
+        if let Some(file_path) = node_file_map.get(id.as_str()) {
             let parts: Vec<&str> = file_path.split('/').collect();
-            let prefix = if parts.len() >= 2 && parts[0] == "src" {
-                if parts.len() >= 3 && parts[1] != "lib.rs" && parts[1] != "main.rs" {
-                    // e.g., src/graph/index.rs -> "graph"
-                    parts[1]
-                } else {
-                    // e.g., src/server.rs -> "server" (strip .rs)
-                    parts[1].strip_suffix(".rs").unwrap_or(parts[1])
-                }
-            } else if !parts.is_empty() {
-                parts[0]
-            } else {
+            if parts.is_empty() {
                 continue;
+            }
+            // Strip filename (last component); keep directory components
+            let dir_parts = &parts[..parts.len().saturating_sub(1)];
+            // Strip leading "src/" if present
+            let dir_parts = if dir_parts.first() == Some(&"src") {
+                &dir_parts[1..]
+            } else {
+                dir_parts
             };
-            *prefix_counts.entry(prefix).or_default() += 1;
+            if dir_parts.is_empty() {
+                // File directly in src/ (e.g., src/server.rs) -- use stem as name
+                if let Some(stem) = parts.last().and_then(|f| f.strip_suffix(".rs")) {
+                    dirs.push(vec![stem]);
+                }
+            } else {
+                dirs.push(dir_parts.to_vec());
+            }
         }
     }
 
-    prefix_counts
-        .into_iter()
-        .max_by_key(|&(_, count)| count)
-        .map(|(prefix, _)| prefix.to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    if let Some(first) = dirs.first() {
+        let mut common = first.clone();
+        for d in dirs.iter().skip(1) {
+            let mut i = 0;
+            while i < common.len() && i < d.len() && common[i] == d[i] {
+                i += 1;
+            }
+            common.truncate(i);
+            if common.is_empty() {
+                break;
+            }
+        }
+        if !common.is_empty() {
+            return common.join("/");
+        }
+    }
+
+    // Priority 3: When no common prefix exists (mixed directories), use the
+    // most frequent first directory component.
+    if !dirs.is_empty() {
+        let mut first_counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for d in &dirs {
+            if let Some(&first) = d.first() {
+                *first_counts.entry(first).or_default() += 1;
+            }
+        }
+        if let Some((name, _)) = first_counts
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+        {
+            return name.to_string();
+        }
+    }
+
+    "unknown".to_string()
 }
 
 impl Default for GraphIndex {
@@ -1794,6 +1831,35 @@ mod tests {
         ];
         let name = compute_cluster_name(&[], &file_map, &module_names);
         assert_eq!(name, "extract");
+    }
+
+    #[test]
+    fn test_compute_cluster_name_deepest_common_prefix() {
+        let no_modules: Vec<String> = vec![];
+
+        // All files in same nested directory -> uses deepest common prefix
+        let file_map = make_file_map(&[
+            ("a", "src/server/handlers/auth.rs"),
+            ("b", "src/server/handlers/user.rs"),
+        ]);
+        let name = compute_cluster_name(
+            &["a".to_string(), "b".to_string()],
+            &file_map,
+            &no_modules,
+        );
+        assert_eq!(name, "server/handlers");
+
+        // Mixed nested paths -> common prefix is "server"
+        let file_map = make_file_map(&[
+            ("a", "src/server/handlers/auth.rs"),
+            ("b", "src/server/routes.rs"),
+        ]);
+        let name = compute_cluster_name(
+            &["a".to_string(), "b".to_string()],
+            &file_map,
+            &no_modules,
+        );
+        assert_eq!(name, "server");
     }
 
     #[test]
