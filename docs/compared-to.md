@@ -30,7 +30,7 @@ RNA uses LSP internally as one enrichment source (call hierarchy, type hierarchy
 | **Embeddings** | None | MiniLM-L6-v2 on Metal GPU (local) | UniXcoder (local) | None | None |
 | **LSP integration** | Is LSP | 37 servers, batch enrichment | None | None | None |
 | **Query model** | Single-symbol, single-hop | Multi-hop, cross-language | Multi-hop | Multi-hop | Multi-hop |
-| **MCP tools** | N/A (protocol, not MCP) | 4 (+2 deprecated aliases) | 10 | 17 | 23 |
+| **MCP tools** | N/A (protocol, not MCP) | 4 | 10 | 17 | 23 |
 | **CLI parity** | N/A | Full (shared service layer) | N/A | N/A | N/A |
 | **Cross-encoder reranking** | None | Jina Reranker v1 Turbo (opt-in) | None | None | None |
 | **Business context** | None | Outcomes, signals, guardrails, metis | None | None | None |
@@ -77,7 +77,7 @@ RNA's unique advantage: semantic search spans code AND business artifacts in the
 
 ## MCP Tool Philosophy
 
-**RNA: 4 tools** (+2 deprecated aliases) — one `search` tool handles code symbols, artifacts, markdown, commits, and graph traversal. `outcome_progress` for business alignment. `repo_map` for orientation. `list_roots` for workspace management. CLI and MCP share a service layer — every capability available in both interfaces.
+**RNA: 4 tools** — one `search` tool handles code symbols, artifacts, markdown, commits, and graph traversal. `outcome_progress` for business alignment. `repo_map` for orientation. `list_roots` for workspace management. CLI and MCP share a service layer — every capability available in both interfaces.
 
 **CGR: 10 tools** — mix of read + write + admin (file editing, database wipes, project deletion).
 
