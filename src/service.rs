@@ -1422,46 +1422,76 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
             })
             .collect();
 
-        let subsystems = graph_state.index.detect_communities(&pagerank_scores, &node_file_map);
+        let mut subsystems = graph_state.index.detect_communities(&pagerank_scores, &node_file_map);
         if !subsystems.is_empty() {
-            let md: String = subsystems
-                .iter()
-                .map(|s| {
-                    let interfaces_str = if s.interfaces.is_empty() {
-                        String::new()
-                    } else {
-                        let iface_list: Vec<String> = s
-                            .interfaces
-                            .iter()
-                            .map(|iface| {
-                                // Extract short name from node ID (last colon-separated segment before kind)
-                                let short_name = iface
-                                    .node_id
-                                    .split(':')
-                                    .rev()
-                                    .nth(1)
-                                    .unwrap_or(&iface.node_id);
-                                if iface.node_type == "function" {
-                                    format!("{}()", short_name)
-                                } else {
-                                    short_name.to_string()
-                                }
-                            })
-                            .collect();
-                        format!("\n  Interfaces: {}", iface_list.join(", "))
-                    };
-                    format!(
-                        "- **{}** ({} symbols, cohesion: {:.2}){}",
-                        s.name, s.symbol_count, s.cohesion, interfaces_str
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            sections.push(format!(
-                "## Subsystems ({} detected)\n\n{}",
-                subsystems.len(),
-                md
-            ));
+            let total_symbols: usize = subsystems.iter().map(|s| s.symbol_count).sum();
+            // Filter out giant clusters that contain >50% of all symbols --
+            // they are not informative (everything is lumped together).
+            subsystems.retain(|s| (s.symbol_count as f64) < (total_symbols as f64 * 0.5));
+
+            // Deduplicate names: when multiple clusters share a name, append
+            // a distinguishing suffix from their top interface function.
+            let mut name_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for s in &subsystems {
+                *name_counts.entry(s.name.clone()).or_default() += 1;
+            }
+            for s in &mut subsystems {
+                if name_counts.get(&s.name).copied().unwrap_or(0) > 1 {
+                    if let Some(iface) = s.interfaces.first() {
+                        let short = iface.node_id.split(':').rev().nth(1).unwrap_or(&iface.node_id);
+                        s.name = format!("{}/{}", s.name, short);
+                    }
+                }
+            }
+
+            // Cap output to top 15 subsystems by symbol count.
+            let shown = subsystems.len().min(15);
+            let total_detected = subsystems.len();
+            subsystems.truncate(shown);
+
+            if !subsystems.is_empty() {
+                let md: String = subsystems
+                    .iter()
+                    .map(|s| {
+                        let interfaces_str = if s.interfaces.is_empty() {
+                            String::new()
+                        } else {
+                            let iface_list: Vec<String> = s
+                                .interfaces
+                                .iter()
+                                .map(|iface| {
+                                    let short_name = iface
+                                        .node_id
+                                        .split(':')
+                                        .rev()
+                                        .nth(1)
+                                        .unwrap_or(&iface.node_id);
+                                    if iface.node_type == "function" {
+                                        format!("{}()", short_name)
+                                    } else {
+                                        short_name.to_string()
+                                    }
+                                })
+                                .collect();
+                            format!("\n  Interfaces: {}", iface_list.join(", "))
+                        };
+                        format!(
+                            "- **{}** ({} symbols, cohesion: {:.2}){}",
+                            s.name, s.symbol_count, s.cohesion, interfaces_str
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let suffix = if total_detected > shown {
+                    format!(" (showing top {})", shown)
+                } else {
+                    String::new()
+                };
+                sections.push(format!(
+                    "## Subsystems ({} detected{})\n\n{}",
+                    total_detected, suffix, md
+                ));
+            }
         }
     }
     { let mut fc: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();

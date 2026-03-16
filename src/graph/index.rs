@@ -433,10 +433,13 @@ impl GraphIndex {
     ) -> Vec<Subsystem> {
         // Step 1: Build coupling subgraph as an undirected adjacency list.
         // We work with NodeIndex values directly for performance.
+        // Edge selection: only edges that represent actual coupling between
+        // symbols. DependsOn (imports) is excluded because it creates trivially
+        // large clusters -- every file that imports a common type ends up in one
+        // giant community. Calls and Implements are the strongest coupling signals.
         let coupling_kinds = [
             EdgeKind::Calls,
             EdgeKind::Implements,
-            EdgeKind::DependsOn,
             EdgeKind::ReferencedBy,
             EdgeKind::References,
             EdgeKind::ConnectsTo,
@@ -469,6 +472,15 @@ impl GraphIndex {
         }
 
         if total_weight == 0.0 {
+            return Vec::new();
+        }
+
+        // Guard: require a minimum density of coupling edges relative to node
+        // count. Without enough edges (e.g., no LSP data), the graph is too
+        // sparse for Louvain to find meaningful communities. We require at
+        // least 5% of nodes to have coupling edges for large graphs.
+        let nodes_with_edges = adj.iter().filter(|nbrs| !nbrs.is_empty()).count();
+        if nodes_with_edges < 3 || (n > 100 && (nodes_with_edges as f64) < (n as f64 * 0.05)) {
             return Vec::new();
         }
 
@@ -546,8 +558,10 @@ impl GraphIndex {
             comm_members.entry(comm).or_default().push(node_idx);
         }
 
-        // Filter out tiny clusters (< 3 members) -- merge into nearest large cluster
-        let min_cluster_size = 3;
+        // Filter out tiny clusters -- merge into nearest large cluster.
+        // Scale threshold: for small graphs 3 is fine, for larger graphs require
+        // at least 5 members per cluster to avoid noise from test helper groups.
+        let min_cluster_size = if n < 50 { 3 } else { 5 };
         let large_comms: HashSet<usize> = comm_members
             .iter()
             .filter(|(_, members)| members.len() >= min_cluster_size)
@@ -1697,5 +1711,79 @@ mod tests {
             &file_map,
         );
         assert_eq!(name, "graph");
+    }
+
+    #[test]
+    fn test_detect_communities_excludes_depends_on() {
+        // DependsOn edges should NOT contribute to community detection.
+        // Two separate groups connected only by DependsOn should not form one community.
+        let mut index = GraphIndex::new();
+
+        // Group A: connected via Calls (real coupling)
+        index.add_edge("a1", "fn", "a2", "fn", EdgeKind::Calls);
+        index.add_edge("a2", "fn", "a1", "fn", EdgeKind::Calls);
+        index.add_edge("a2", "fn", "a3", "fn", EdgeKind::Calls);
+        index.add_edge("a3", "fn", "a2", "fn", EdgeKind::Calls);
+        index.add_edge("a1", "fn", "a3", "fn", EdgeKind::Calls);
+        index.add_edge("a3", "fn", "a1", "fn", EdgeKind::Calls);
+
+        // Group B: connected via Calls (real coupling)
+        index.add_edge("b1", "fn", "b2", "fn", EdgeKind::Calls);
+        index.add_edge("b2", "fn", "b1", "fn", EdgeKind::Calls);
+        index.add_edge("b2", "fn", "b3", "fn", EdgeKind::Calls);
+        index.add_edge("b3", "fn", "b2", "fn", EdgeKind::Calls);
+        index.add_edge("b1", "fn", "b3", "fn", EdgeKind::Calls);
+        index.add_edge("b3", "fn", "b1", "fn", EdgeKind::Calls);
+
+        // Connect A and B ONLY via DependsOn edges (should be ignored for clustering)
+        index.add_edge("a1", "fn", "b1", "module", EdgeKind::DependsOn);
+        index.add_edge("a2", "fn", "b2", "module", EdgeKind::DependsOn);
+
+        let pagerank = index.compute_pagerank(0.85, 20);
+        let file_map = make_file_map(&[
+            ("a1", "src/alpha/mod.rs"),
+            ("a2", "src/alpha/mod.rs"),
+            ("a3", "src/alpha/mod.rs"),
+            ("b1", "src/beta/mod.rs"),
+            ("b2", "src/beta/mod.rs"),
+            ("b3", "src/beta/mod.rs"),
+        ]);
+
+        let subsystems = index.detect_communities(&pagerank, &file_map);
+        // Should detect 2 separate clusters (A and B), not merge them via DependsOn
+        assert!(
+            subsystems.len() >= 2,
+            "Groups connected only by DependsOn edges should remain separate clusters, got {} subsystem(s)",
+            subsystems.len()
+        );
+    }
+
+    #[test]
+    fn test_detect_communities_density_guard() {
+        // A large sparse graph with very few coupling edges should produce no subsystems.
+        // This tests the density guard that prevents garbage results when LSP data
+        // is unavailable.
+        let mut index = GraphIndex::new();
+
+        // Add 200 nodes connected only by Defines edges (no coupling signal)
+        for i in 0..100 {
+            index.add_edge(
+                &format!("struct_{}", i),
+                "struct",
+                &format!("field_{}", i),
+                "field",
+                EdgeKind::Defines,
+            );
+        }
+        // Add just 2 coupling edges (far below 5% of 200 nodes)
+        index.add_edge("struct_0", "struct", "struct_1", "struct", EdgeKind::Calls);
+        index.add_edge("struct_1", "struct", "struct_0", "struct", EdgeKind::Calls);
+
+        let subsystems = index.detect_communities(&HashMap::new(), &HashMap::new());
+        assert!(
+            subsystems.is_empty(),
+            "Sparse graph with minimal coupling edges should produce no subsystems, got {}",
+            subsystems.len()
+        );
     }
 }
