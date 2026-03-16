@@ -671,13 +671,22 @@ impl EmbeddingIndex {
             repo_root.display()
         );
 
-        // .oh/ artifacts are now graph nodes (markdown_section with oh_kind metadata).
-        // They come through `symbols` via the unified extraction pipeline.
-        let mut ids: Vec<String> = Vec::new();
-        let mut kinds: Vec<String> = Vec::new();
-        let mut titles: Vec<String> = Vec::new();
-        let mut bodies: Vec<String> = Vec::new();
-        let mut texts: Vec<String> = Vec::new();
+        // Batch size for streaming writes to LanceDB (#110, #298).
+        const WRITE_BATCH_SIZE: usize = 2048;
+
+        // Build candidate structs: id, kind, title, body, text, text_hash.
+        // We collect metadata eagerly but defer embedding to streaming batches
+        // so we never hold all embedding vectors in memory simultaneously (#298).
+        struct Candidate {
+            id: String,
+            kind: String,
+            title: String,
+            body: String,
+            text: String,
+            text_hash: String,
+        }
+
+        let mut candidates: Vec<Candidate> = Vec::new();
 
         // Index recent git commits (capped for performance)
         let commit_count = match git::load_commits(repo_root, RECENT_COMMIT_LIMIT) {
@@ -691,12 +700,16 @@ impl EmbeddingIndex {
                         .join(", ");
                     let body = format!("{}\n\nFiles: {}", c.message, changed_files_str);
                     let title = c.message.lines().next().unwrap_or(&c.message).to_string();
+                    let text_hash = blake3::hash(body.as_bytes()).to_hex().to_string();
 
-                    ids.push(c.short_hash.clone());
-                    kinds.push("commit".to_string());
-                    titles.push(title);
-                    bodies.push(body.clone());
-                    texts.push(body);
+                    candidates.push(Candidate {
+                        id: c.short_hash.clone(),
+                        kind: "commit".to_string(),
+                        title,
+                        body: body.clone(),
+                        text: body,
+                        text_hash,
+                    });
                 }
                 commits.len()
             }
@@ -724,12 +737,16 @@ impl EmbeddingIndex {
                     let branch = node.metadata.get("branch_name").cloned().unwrap_or_default();
                     let files = node.metadata.get("files_changed").cloned().unwrap_or_default();
                     let body = format!("{}\n\nBranch: {}\nFiles: {}", node.body, branch, files);
+                    let text_hash = blake3::hash(body.as_bytes()).to_hex().to_string();
 
-                    ids.push(format!("merge:{}", short));
-                    kinds.push("merge".to_string());
-                    titles.push(node.signature.clone());
-                    bodies.push(body.clone());
-                    texts.push(body);
+                    candidates.push(Candidate {
+                        id: format!("merge:{}", short),
+                        kind: "merge".to_string(),
+                        title: node.signature.clone(),
+                        body: body.clone(),
+                        text: body,
+                        text_hash,
+                    });
                 }
                 seen_merge_shas.len()
             }
@@ -792,107 +809,177 @@ impl EmbeddingIndex {
                 node.id.file.display(),
                 node.line_start
             );
+            let text_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
 
-            ids.push(node.stable_id());
-            kinds.push(embed_kind);
-            titles.push(title);
-            bodies.push(body_display);
-            texts.push(text);
+            candidates.push(Candidate {
+                id: node.stable_id(),
+                kind: embed_kind,
+                title,
+                body: body_display,
+                text,
+                text_hash,
+            });
         }
 
-
-        // Compute BLAKE3 text hashes for all embedding texts
-        let text_hashes: Vec<String> = texts
-            .iter()
-            .map(|t| blake3::hash(t.as_bytes()).to_hex().to_string())
-            .collect();
-
-        if texts.is_empty() {
+        if candidates.is_empty() {
             tracing::info!("EmbeddingIndex: no texts collected for {}", repo_root.display());
             return Ok(0);
         }
 
-        let count = texts.len();
-        tracing::info!(
-            "EmbeddingIndex: preparing {} row(s) for full index rebuild",
-            count
-        );
+        let total_candidates = candidates.len();
 
-        // Compute embeddings
-        let embed_start = std::time::Instant::now();
-        let embeddings = embed_texts(texts).await?;
-        let dim = embeddings[0].len();
-        let flat_embeddings: Vec<f32> = embeddings.into_iter().flatten().collect();
-        tracing::info!(
-            "EmbeddingIndex: computed {} embedding row(s) with dimension {} in {:?}",
-            count,
-            dim,
-            embed_start.elapsed()
-        );
+        // --- BLAKE3 hash check: skip unchanged embeddings (#298) ---
+        // If the table exists, query existing hashes and partition candidates
+        // into changed vs unchanged. This avoids re-embedding the entire corpus
+        // on every full rebuild.
+        let table_exists = self.has_table().await.unwrap_or(false);
 
-        let schema = Arc::new(embedding_schema(dim));
+        let (to_embed, _unchanged_count) = if table_exists {
+            let table = self.db.open_table(&self.table_name).execute().await
+                .context("Failed to open embedding table for hash check")?;
+            let all_ids: Vec<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
+            let existing_hashes = self.query_text_hashes(&table, &all_ids).await;
 
-        // Split into batches of 2048 rows to avoid lance panics on large writes (#110).
-        const WRITE_BATCH_SIZE: usize = 2048;
-        let persist_start = std::time::Instant::now();
-        let _ = self.db.drop_table(&self.table_name, &[]).await;
+            let (to_embed, unchanged): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
+                match &existing_hashes {
+                    Some(map) => map.get(&c.id).is_none_or(|h| *h != c.text_hash),
+                    None => true,
+                }
+            });
+            let unchanged_count = unchanged.len();
 
-        let total_rows = ids.len();
-        let mut offset = 0;
-        let mut first = true;
-        while offset < total_rows {
-            let end = (offset + WRITE_BATCH_SIZE).min(total_rows);
-            let batch_ids: Vec<String> = ids[offset..end].to_vec();
-            let batch_kinds: Vec<String> = kinds[offset..end].to_vec();
-            let batch_titles: Vec<String> = titles[offset..end].to_vec();
-            let batch_bodies: Vec<String> = bodies[offset..end].to_vec();
-            let batch_text_hashes: Vec<String> = text_hashes[offset..end].to_vec();
-            let batch_flat: Vec<f32> = flat_embeddings[offset * dim..end * dim].to_vec();
-
-            let id_array = Arc::new(StringArray::from(batch_ids)) as Arc<dyn arrow_array::Array>;
-            let kind_array = Arc::new(StringArray::from(batch_kinds)) as Arc<dyn arrow_array::Array>;
-            let title_array = Arc::new(StringArray::from(batch_titles)) as Arc<dyn arrow_array::Array>;
-            let body_array = Arc::new(StringArray::from(batch_bodies)) as Arc<dyn arrow_array::Array>;
-            let text_hash_array = Arc::new(StringArray::from(batch_text_hashes)) as Arc<dyn arrow_array::Array>;
-            let values = Arc::new(Float32Array::from(batch_flat));
-            let list_field = Arc::new(Field::new("item", DataType::Float32, true));
-            let vector_array = Arc::new(arrow_array::FixedSizeListArray::try_new(
-                list_field, dim as i32, values, None,
-            )?) as Arc<dyn arrow_array::Array>;
-
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![id_array, kind_array, title_array, body_array, text_hash_array, vector_array],
-            )?;
-
-            if first {
-                let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-                self.db
-                    .create_table(&self.table_name, Box::new(batches))
-                    .execute()
-                    .await
-                    .context("Failed to create LanceDB table")?;
-                first = false;
-            } else {
-                let table = self.db.open_table(&self.table_name).execute().await
-                    .context("Failed to open table for append")?;
-                let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-                table.add(Box::new(batches)).execute().await
-                    .context("Failed to append batch to LanceDB table")?;
+            if unchanged_count > 0 {
+                tracing::info!(
+                    "EmbeddingIndex: BLAKE3 hash skipped {} unchanged row(s), embedding {} row(s)",
+                    unchanged_count,
+                    to_embed.len(),
+                );
             }
+            (to_embed, unchanged_count)
+        } else {
+            (candidates, 0_usize)
+        };
 
-            tracing::info!(
-                "EmbeddingIndex: persisted batch {}-{} of {} rows",
-                offset, end, total_rows
-            );
-            offset = end;
-        }
         tracing::info!(
-            "EmbeddingIndex: persisted {} row(s) to LanceDB in {:?} (total {:?})",
-            count,
-            persist_start.elapsed(),
+            "EmbeddingIndex: preparing {} row(s) for embedding ({} total, {} skipped via BLAKE3)",
+            to_embed.len(),
+            total_candidates,
+            total_candidates - to_embed.len(),
+        );
+
+        // --- Stream embeddings in batches (#298) ---
+        // Embed WRITE_BATCH_SIZE texts at a time and merge_insert each batch
+        // immediately, so we never hold all embedding vectors in memory.
+        let embed_start = std::time::Instant::now();
+        let mut embedded_count = 0usize;
+
+        if !to_embed.is_empty() {
+            // Determine embedding dimension from a probe batch.
+            // We embed the first batch to learn dim, then continue with the rest.
+            let mut remaining = to_embed;
+            let mut batch_idx = 0usize;
+
+            while !remaining.is_empty() {
+                let bs = remaining.len().min(WRITE_BATCH_SIZE);
+                let batch_candidates: Vec<Candidate> = remaining.drain(..bs).collect();
+
+                let batch_texts: Vec<String> = batch_candidates.iter().map(|c| c.text.clone()).collect();
+                let embeddings = embed_texts(batch_texts).await?;
+
+                if embeddings.is_empty() {
+                    continue;
+                }
+
+                let dim = embeddings[0].len();
+                let flat_embeddings: Vec<f32> = embeddings.into_iter().flatten().collect();
+
+                let batch_ids: Vec<String> = batch_candidates.iter().map(|c| c.id.clone()).collect();
+                let batch_kinds: Vec<String> = batch_candidates.iter().map(|c| c.kind.clone()).collect();
+                let batch_titles: Vec<String> = batch_candidates.iter().map(|c| c.title.clone()).collect();
+                let batch_bodies: Vec<String> = batch_candidates.iter().map(|c| c.body.clone()).collect();
+                let batch_text_hashes: Vec<String> = batch_candidates.iter().map(|c| c.text_hash.clone()).collect();
+
+                let schema = Arc::new(embedding_schema(dim));
+
+                let id_array = Arc::new(StringArray::from(batch_ids)) as Arc<dyn arrow_array::Array>;
+                let kind_array = Arc::new(StringArray::from(batch_kinds)) as Arc<dyn arrow_array::Array>;
+                let title_array = Arc::new(StringArray::from(batch_titles)) as Arc<dyn arrow_array::Array>;
+                let body_array = Arc::new(StringArray::from(batch_bodies)) as Arc<dyn arrow_array::Array>;
+                let text_hash_array = Arc::new(StringArray::from(batch_text_hashes)) as Arc<dyn arrow_array::Array>;
+                let values = Arc::new(Float32Array::from(flat_embeddings));
+                let list_field = Arc::new(Field::new("item", DataType::Float32, true));
+                let vector_array = Arc::new(arrow_array::FixedSizeListArray::try_new(
+                    list_field, dim as i32, values, None,
+                )?) as Arc<dyn arrow_array::Array>;
+
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![id_array, kind_array, title_array, body_array, text_hash_array, vector_array],
+                )?;
+
+                if !table_exists && batch_idx == 0 {
+                    // First batch on a fresh table: create it
+                    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+                    self.db
+                        .create_table(&self.table_name, Box::new(batches))
+                        .execute()
+                        .await
+                        .context("Failed to create LanceDB table")?;
+                } else {
+                    // Merge-insert: upsert by id (update if exists, insert if new)
+                    let table = self.db.open_table(&self.table_name).execute().await
+                        .context("Failed to open table for merge_insert")?;
+                    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+                    let mut merge = table.merge_insert(&["id"]);
+                    merge
+                        .when_matched_update_all(None)
+                        .when_not_matched_insert_all();
+                    merge
+                        .execute(Box::new(batches))
+                        .await
+                        .context("Failed to merge_insert batch into LanceDB table")?;
+                }
+
+                embedded_count += bs;
+                batch_idx += 1;
+                tracing::info!(
+                    "EmbeddingIndex: embedded+persisted batch {} ({}/{} rows)",
+                    batch_idx, embedded_count, embedded_count + remaining.len()
+                );
+            }
+        }
+
+        tracing::info!(
+            "EmbeddingIndex: embedded {} row(s) in {:?} (total {:?})",
+            embedded_count,
+            embed_start.elapsed(),
             index_start.elapsed()
         );
+
+        // --- Delete stale rows (#298) ---
+        // If we used merge_insert (table already existed), there may be rows
+        // for nodes that no longer exist in the graph. Delete them.
+        if table_exists {
+            if let Err(e) = self.delete_stale_rows(repo_root, symbols).await {
+                tracing::warn!("EmbeddingIndex: failed to delete stale rows: {}", e);
+            }
+        }
+
+        // --- Compact lance to reclaim space (#298) ---
+        if let Ok(table) = self.db.open_table(&self.table_name).execute().await {
+            let compact_start = std::time::Instant::now();
+            match table.optimize(lancedb::table::OptimizeAction::All).await {
+                Ok(_stats) => {
+                    tracing::info!(
+                        "EmbeddingIndex: lance compaction completed in {:?}",
+                        compact_start.elapsed(),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("EmbeddingIndex: lance compaction failed: {}", e);
+                }
+            }
+        }
 
         // Build FTS index for hybrid search (BM25 on title + body).
         // Best-effort: failure is logged but does not fail the indexing operation.
@@ -902,7 +989,84 @@ impl EmbeddingIndex {
             tracing::warn!("Could not open table for FTS index creation; hybrid search will use vector-only");
         }
 
-        Ok(count)
+        Ok(total_candidates)
+    }
+
+    /// Delete embedding rows for IDs that are no longer in the current graph.
+    /// Called after merge_insert to clean up stale entries from previous builds.
+    async fn delete_stale_rows(&self, repo_root: &Path, symbols: &[crate::graph::Node]) -> Result<()> {
+        use futures::TryStreamExt;
+
+        let table = self.db.open_table(&self.table_name).execute().await
+            .context("Failed to open table for stale row deletion")?;
+
+        // Collect all current valid IDs
+        let mut current_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Commit IDs
+        if let Ok(commits) = git::load_commits(repo_root, RECENT_COMMIT_LIMIT) {
+            for c in &commits {
+                current_ids.insert(c.short_hash.clone());
+            }
+        }
+        // Merge IDs
+        if let Ok((merge_nodes, _)) = git::pr_merges::extract_pr_merges(repo_root, Some(PR_MERGE_LIMIT)) {
+            for node in &merge_nodes {
+                let merge_sha = node.metadata.get("merge_sha").cloned().unwrap_or_default();
+                let short = merge_sha.get(..7).unwrap_or(&merge_sha).to_string();
+                current_ids.insert(format!("merge:{}", short));
+            }
+        }
+        // Symbol IDs
+        for node in symbols.iter().filter(|n| n.id.kind.is_embeddable()) {
+            current_ids.insert(node.stable_id());
+        }
+
+        // Query all IDs currently in the table
+        let stream = table
+            .query()
+            .select(lancedb::query::Select::columns(&["id"]))
+            .execute()
+            .await
+            .context("Failed to query IDs for stale detection")?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await
+            .context("Failed to collect ID batches")?;
+
+        let mut stale_ids: Vec<String> = Vec::new();
+        for batch in &batches {
+            if let Some(id_col) = batch.column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            {
+                for i in 0..id_col.len() {
+                    if !id_col.is_null(i) {
+                        let id = id_col.value(i);
+                        if !current_ids.contains(id) {
+                            stale_ids.push(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if stale_ids.is_empty() {
+            tracing::info!("EmbeddingIndex: no stale rows to delete");
+            return Ok(());
+        }
+
+        tracing::info!("EmbeddingIndex: deleting {} stale row(s)", stale_ids.len());
+
+        // Delete in batches to avoid filter length limits
+        for chunk in stale_ids.chunks(500) {
+            let quoted: Vec<String> = chunk.iter()
+                .map(|id| format!("'{}'", id.replace('\'', "''")))
+                .collect();
+            let filter = format!("id IN ({})", quoted.join(", "));
+            table.delete(&filter).await
+                .context("Failed to delete stale rows")?;
+        }
+
+        tracing::info!("EmbeddingIndex: deleted {} stale row(s)", stale_ids.len());
+        Ok(())
     }
 
     /// Search over indexed artifacts using the specified mode.

@@ -117,6 +117,25 @@ impl RnaHandler {
             tracing::info!("Schema migrated to v{} -- cache rebuilt", SCHEMA_VERSION);
         }
 
+        // Clean up stale cache directories from previous schema versions (#298).
+        // The old `.oh/.cache/embeddings/` directory is a dead copy from before
+        // lance path consolidation. Remove it if the lance path exists.
+        let stale_embeddings_dir = self.repo_root.join(".oh").join(".cache").join("embeddings");
+        let lance_dir = self.repo_root.join(".oh").join(".cache").join("lance");
+        if lance_dir.join("artifacts.lance").exists() && stale_embeddings_dir.exists() {
+            match std::fs::remove_dir_all(&stale_embeddings_dir) {
+                Ok(()) => tracing::info!(
+                    "Cleaned up stale cache directory: {}",
+                    stale_embeddings_dir.display()
+                ),
+                Err(e) => tracing::warn!(
+                    "Failed to remove stale cache directory {}: {}",
+                    stale_embeddings_dir.display(),
+                    e
+                ),
+            }
+        }
+
         // Load workspace config and merge with --repo as primary root.
         // Also auto-detect any live git worktrees and Claude Code memory
         // so all roots are indexed on the first full build.
@@ -483,8 +502,9 @@ impl RnaHandler {
         let symbols_ready_at = std::time::Instant::now();
 
         // Store embed index immediately so it's available for queries.
-        // The background task below will always re-index (including .oh/
-        // artifacts) via index_all_inner which drops and rebuilds the table.
+        // The background task below will re-index (including .oh/
+        // artifacts) via index_all_inner which uses merge_insert to upsert
+        // changed rows and skip unchanged ones (BLAKE3 hash check).
         match EmbeddingIndex::new(&self.repo_root).await {
             Ok(idx) => {
                 tracing::info!("Embedding index created -- background task will re-index");
