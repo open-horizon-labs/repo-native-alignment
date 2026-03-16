@@ -732,12 +732,16 @@ fn compute_cluster_name(
 ) -> String {
     // Priority 1: Use module names if any exist in this cluster
     if !module_names.is_empty() {
-        // Pick the most common module name (handles clusters with multiple modules)
-        let mut name_counts: HashMap<&str, usize> = HashMap::new();
+        // Pick the most common module name (handles clusters with multiple modules).
+        // Use BTreeMap for deterministic tie-breaking (lexicographic order).
+        let mut name_counts: BTreeMap<&str, usize> = BTreeMap::new();
         for name in module_names {
             *name_counts.entry(name.as_str()).or_default() += 1;
         }
-        if let Some((name, _)) = name_counts.into_iter().max_by_key(|&(_, count)| count) {
+        if let Some((name, _)) = name_counts
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+        {
             return name.to_string();
         }
     }
@@ -1841,22 +1845,31 @@ mod tests {
     fn test_detect_communities_uses_module_names() {
         // When a cluster contains a Module node, the subsystem name should come
         // from the module node's name, not from file paths or function names.
+        // Use realistic stable IDs (root:file:name:kind) since the extraction
+        // relies on splitting the ID to find the module name.
         let mut index = GraphIndex::new();
 
+        let mod_id = "test:src/graph/mod.rs:graph:module";
+        let fn1_id = "test:src/graph/index.rs:build_graph:function";
+        let fn2_id = "test:src/graph/index.rs:add_edge:function";
+
         // Cluster with a module node and several functions
-        index.add_edge("graph_mod", "module", "build_graph", "fn", EdgeKind::Defines);
-        index.add_edge("build_graph", "fn", "add_edge", "fn", EdgeKind::Calls);
-        index.add_edge("add_edge", "fn", "build_graph", "fn", EdgeKind::Calls);
-        index.add_edge("build_graph", "fn", "graph_mod", "module", EdgeKind::Calls);
-        index.add_edge("add_edge", "fn", "graph_mod", "module", EdgeKind::Calls);
-        index.add_edge("graph_mod", "module", "add_edge", "fn", EdgeKind::Calls);
+        index.add_edge(mod_id, "module", fn1_id, "fn", EdgeKind::Defines);
+        index.add_edge(fn1_id, "fn", fn2_id, "fn", EdgeKind::Calls);
+        index.add_edge(fn2_id, "fn", fn1_id, "fn", EdgeKind::Calls);
+        index.add_edge(fn1_id, "fn", mod_id, "module", EdgeKind::Calls);
+        index.add_edge(fn2_id, "fn", mod_id, "module", EdgeKind::Calls);
+        index.add_edge(mod_id, "module", fn2_id, "fn", EdgeKind::Calls);
 
         let pagerank = index.compute_pagerank(0.85, 20);
-        let file_map = make_file_map(&[
-            ("graph_mod", "src/graph/mod.rs"),
-            ("build_graph", "src/graph/index.rs"),
-            ("add_edge", "src/graph/index.rs"),
-        ]);
+        let file_map: HashMap<String, String> = [
+            (mod_id, "src/graph/mod.rs"),
+            (fn1_id, "src/graph/index.rs"),
+            (fn2_id, "src/graph/index.rs"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
 
         let subsystems = index.detect_communities(&pagerank, &file_map);
 
@@ -1866,11 +1879,15 @@ mod tests {
             "expected at least one subsystem from a densely-connected 3-node graph"
         );
 
-        // The node ID for graph_mod is "test:src/lib.rs:graph_mod:module"
-        // (from make_node_id which uses "test" root, "src/lib.rs" file).
-        // The module name extracted from the ID is "graph_mod".
         let names: Vec<&str> = subsystems.iter().map(|s| s.name.as_str()).collect();
-        // Should NOT contain function names like "build_graph" or "add_edge"
+
+        // Positive assertion: module-derived name "graph" should be used
+        assert!(
+            names.contains(&"graph"),
+            "subsystem should be named after the module node 'graph', got {:?}",
+            names
+        );
+        // Negative assertion: should NOT contain function names
         assert!(
             !names.contains(&"build_graph") && !names.contains(&"add_edge"),
             "subsystem names should not be function names, got {:?}",
