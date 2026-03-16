@@ -954,7 +954,7 @@ impl RnaHandler {
                 lsp_time.as_secs_f64(),
             ));
 
-            // Apply enrichment to graph
+            // Apply enrichment to in-memory graph
             let mut guard = self.graph.write().await;
             if let Some(ref mut gs) = *guard {
                 for vnode in &enrichment.new_nodes {
@@ -962,7 +962,6 @@ impl RnaHandler {
                 }
                 gs.nodes.extend(enrichment.new_nodes);
 
-                let persist_edges = enrichment.added_edges.clone();
                 for edge in &enrichment.added_edges {
                     let from_id = edge.from.to_stable_id();
                     let to_id = edge.to.to_stable_id();
@@ -976,9 +975,6 @@ impl RnaHandler {
                 }
                 gs.edges.extend(enrichment.added_edges);
 
-                let enriched_node_ids: std::collections::HashSet<String> = enrichment.updated_nodes.iter()
-                    .map(|(id, _)| id.clone())
-                    .collect();
                 for (node_id, patches) in &enrichment.updated_nodes {
                     if let Some(node) = gs.nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
                         for (key, value) in patches {
@@ -987,37 +983,31 @@ impl RnaHandler {
                     }
                 }
 
-                let upsert_nodes: Vec<Node> = gs.nodes.iter()
-                    .filter(|n| enriched_node_ids.contains(&n.stable_id()))
-                    .cloned()
-                    .collect();
                 drop(guard);
-                match persist_graph_incremental(
-                    &self.repo_root, &upsert_nodes, &persist_edges, &[], &[],
-                ).await {
-                    Ok(true) => {
-                        tracing::info!("Foreground LSP enrichment: schema migrated; performing full persist");
-                        let snapshot = {
-                            let g = self.graph.read().await;
-                            g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
-                        };
-                        if let Some((nodes, edges)) = snapshot {
-                            if let Err(e) = persist_graph_to_lance(&self.repo_root, &nodes, &edges).await {
-                                tracing::error!("Foreground LSP enrichment: full persist after migration failed: {}", e);
-                                self.lsp_status.set_complete_persist_failed(lsp_edge_count);
-                                return Err(e.context("LSP enrichment full persist after migration failed"));
-                            }
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::error!("Foreground LSP enrichment persist failed: {}", e);
-                        self.lsp_status.set_complete_persist_failed(lsp_edge_count);
-                        return Err(e.context("LSP enrichment persist failed during foreground pipeline"));
-                    }
-                }
             }
             self.lsp_status.set_complete(lsp_edge_count);
+        }
+
+        // Phase 3: Full persist — write the complete graph (tree-sitter + LSP edges)
+        // to LanceDB. build_full_graph_inner(false) deferred persistence so we can
+        // include LSP edges in a single atomic write (#311).
+        {
+            let snapshot = {
+                let g = self.graph.read().await;
+                g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+            };
+            if let Some((nodes, edges)) = snapshot {
+                tracing::info!(
+                    "Foreground full persist: {} nodes, {} edges (including {} LSP)",
+                    nodes.len(),
+                    edges.len(),
+                    lsp_edge_count,
+                );
+                if let Err(e) = persist_graph_to_lance(&self.repo_root, &nodes, &edges).await {
+                    tracing::error!("Foreground full persist failed: {}", e);
+                    return Err(e.context("Full persist failed during foreground pipeline"));
+                }
+            }
         }
 
         // Phase 4: Summary

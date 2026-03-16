@@ -521,20 +521,32 @@ impl RnaHandler {
         tracing::info!("Computed PageRank importance for {} nodes", pagerank_scores.len());
 
         // 7. Persist graph to LanceDB
-        if let Err(e) = persist_graph_to_lance(&self.repo_root, &all_nodes, &all_edges).await {
-            tracing::error!("Failed to persist graph to LanceDB: {}", e);
-            return Err(e.context("LanceDB full persist failed during graph build"));
+        //
+        // When `spawn_background=true` (MCP server path), persist NOW so the
+        // graph is queryable immediately while background LSP+embed run.
+        // The background enrichment task re-persists after adding LSP edges.
+        //
+        // When `spawn_background=false` (CLI `--full` path via run_pipeline_foreground),
+        // skip the early persist -- the caller runs LSP synchronously and then
+        // does a full persist with the complete graph (tree-sitter + LSP edges).
+        // Persisting here would write only tree-sitter edges, and a subsequent
+        // `repo-map` loading from LanceDB cache would miss LSP edges (#311).
+        if spawn_background {
+            if let Err(e) = persist_graph_to_lance(&self.repo_root, &all_nodes, &all_edges).await {
+                tracing::error!("Failed to persist graph to LanceDB: {}", e);
+                return Err(e.context("LanceDB full persist failed during graph build"));
+            }
         }
 
-        // Persist succeeded -- commit scanner state for all roots so the
-        // next scan doesn't re-process the same files.
+        // Persist succeeded (or deferred) -- commit scanner state for all roots
+        // so the next scan doesn't re-process the same files.
         for (_slug, scanner, _scan, _path, _changed) in &scanners {
             if let Err(e) = scanner.commit_state() {
                 tracing::error!("Failed to commit scanner state: {}", e);
             }
         }
 
-        // Graph is persisted -- return immediately so agents can query.
+        // Graph is ready -- return immediately so agents can query.
         // Embedding and LSP enrichment run in background via the shared graph lock.
         let symbols_ready_at = std::time::Instant::now();
 
