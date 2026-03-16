@@ -79,7 +79,7 @@ pub(crate) fn run_traversal(index: &GraphIndex, node_id: &str, mode: &str, hops:
                 _ => Err(format!("Invalid direction: \"{}\". Use \"outgoing\", \"incoming\", or \"both\".", dir)),
             }
         }
-        "impact" => { if edge_filter.is_some() { return Err("edge_types is not supported with \"impact\" mode.".to_string()); } let max_hops = hops.unwrap_or(3) as usize; Ok(index.impact(node_id, max_hops, None)) }
+        "impact" => { let max_hops = hops.unwrap_or(3) as usize; let default_filter = [EdgeKind::Calls, EdgeKind::ReferencedBy]; let filter = edge_filter.unwrap_or(&default_filter); Ok(index.impact(node_id, max_hops, Some(filter))) }
         "reachable" => { let max_hops = hops.unwrap_or(3) as usize; Ok(index.reachable(node_id, max_hops, edge_filter)) }
         "tests_for" => { if edge_filter.is_some() { return Err("edge_types is not supported with \"tests_for\" mode.".to_string()); } let calls_filter = &[EdgeKind::Calls]; Ok(index.neighbors(node_id, Some(calls_filter), Direction::Incoming)) }
         other => Err(format!("Unknown mode: \"{}\". Use \"neighbors\", \"impact\", \"reachable\", or \"tests_for\".", other)),
