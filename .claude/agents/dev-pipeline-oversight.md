@@ -83,6 +83,17 @@ For each external comment, check:
 - [ ] **Test assertions** — verify tests actually assert what they claim to test
 - [ ] **Duplicate work** — verify no unnecessary re-computation flagged by reviewers
 
+### Delivery spot-check
+
+**After the comment audit, verify the feature actually works end-to-end.** This catches the "unit tests pass but integration is broken" gap that comments alone won't reveal.
+
+1. Read the PR's ship step 7b (delivery verification) comment
+2. If 7b was marked N/A — skip this check
+3. If 7b was verified via unit tests only — **run the actual CLI or MCP command** that exercises the feature with real data
+4. If the feature doesn't produce visible output in real usage, **flag it** and create a fix
+
+This exists because PR #313 shipped subsystem detection with passing unit tests, but `repo_map` showed no subsystems because LSP edges weren't reaching the petgraph index through the LanceDB persist/reload path. The comment audit found nothing wrong — the bug was invisible to reviewers.
+
 ### What NOT to do
 
 - Don't re-run the entire ship pipeline
