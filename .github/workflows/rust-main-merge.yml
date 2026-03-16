@@ -172,8 +172,7 @@ jobs:
   # M4-optimized build runs first (this is what developers install).
   # Warms sccache for the M1 baseline build that follows.
   build-release-fast:
-    needs: changes
-    if: needs.changes.outputs.rust == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: namespace-profile-tahoe
     timeout-minutes: 60
 
