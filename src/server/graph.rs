@@ -520,6 +520,68 @@ impl RnaHandler {
         }
         tracing::info!("Computed PageRank importance for {} nodes", pagerank_scores.len());
 
+        // 6b. Detect subsystems and write cluster_id to node metadata.
+        // This runs after PageRank (which detect_communities needs) and before
+        // LanceDB persist so the metadata survives reload.
+        {
+            let node_file_map: std::collections::HashMap<String, String> = all_nodes
+                .iter()
+                .filter(|n| n.id.root != "external")
+                .map(|n| (n.stable_id(), n.id.file.display().to_string()))
+                .collect();
+
+            let mut subsystems = index.detect_communities(&pagerank_scores, &node_file_map);
+            // Deduplicate subsystem names (matching repo_map rendering):
+            // when multiple clusters share a name, append /<interface> suffix.
+            {
+                let mut name_counts: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                for s in &subsystems {
+                    *name_counts.entry(s.name.clone()).or_default() += 1;
+                }
+                for s in &mut subsystems {
+                    if name_counts.get(&s.name).copied().unwrap_or(0) > 1 {
+                        if let Some(iface) = s.interfaces.first() {
+                            let short = iface
+                                .node_id
+                                .split(':')
+                                .rev()
+                                .nth(1)
+                                .unwrap_or(&iface.node_id);
+                            s.name = format!("{}/{}", s.name, short);
+                        }
+                    }
+                }
+            }
+            // Build node_id -> subsystem_name lookup
+            let mut node_subsystem: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for subsystem in &subsystems {
+                for member_id in &subsystem.member_ids {
+                    node_subsystem.insert(member_id.clone(), subsystem.name.clone());
+                }
+            }
+            let mut tagged = 0usize;
+            for node in &mut all_nodes {
+                if let Some(subsystem_name) = node_subsystem.get(&node.stable_id()) {
+                    node.metadata
+                        .insert("subsystem".to_string(), subsystem_name.clone());
+                    tagged += 1;
+                } else {
+                    // Remove stale subsystem metadata from cached nodes that are
+                    // no longer in any cluster.
+                    node.metadata.remove("subsystem");
+                }
+            }
+            if tagged > 0 {
+                tracing::info!(
+                    "Tagged {} nodes with subsystem metadata ({} subsystems detected)",
+                    tagged,
+                    subsystems.len()
+                );
+            }
+        }
+
         // 7. Persist graph to LanceDB
         //
         // When `spawn_background=true` (MCP server path), persist NOW so the
@@ -674,7 +736,7 @@ impl RnaHandler {
         // Track which node/edge IDs are in the delta for LanceDB upsert.
         // We snapshot IDs now but rebuild the actual upsert data AFTER PageRank
         // so persisted nodes include updated importance scores.
-        let upsert_node_ids: std::collections::HashSet<String> =
+        let mut upsert_node_ids: std::collections::HashSet<String> =
             extraction.nodes.iter().map(|n| n.stable_id()).collect();
         let upsert_edges: Vec<Edge> = extraction.edges.clone();
         graph.nodes.extend(extraction.nodes);
@@ -717,6 +779,60 @@ impl RnaHandler {
         for node in &mut graph.nodes {
             if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
                 node.metadata.insert("importance".to_string(), format!("{:.6}", score));
+            }
+        }
+
+        // Recompute subsystem metadata after incremental graph update.
+        {
+            let node_file_map: std::collections::HashMap<String, String> = graph
+                .nodes
+                .iter()
+                .filter(|n| n.id.root != "external")
+                .map(|n| (n.stable_id(), n.id.file.display().to_string()))
+                .collect();
+
+            let mut subsystems = graph.index.detect_communities(&pagerank_scores, &node_file_map);
+            // Deduplicate subsystem names (matching repo_map rendering)
+            {
+                let mut name_counts: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                for s in &subsystems {
+                    *name_counts.entry(s.name.clone()).or_default() += 1;
+                }
+                for s in &mut subsystems {
+                    if name_counts.get(&s.name).copied().unwrap_or(0) > 1 {
+                        if let Some(iface) = s.interfaces.first() {
+                            let short = iface
+                                .node_id
+                                .split(':')
+                                .rev()
+                                .nth(1)
+                                .unwrap_or(&iface.node_id);
+                            s.name = format!("{}/{}", s.name, short);
+                        }
+                    }
+                }
+            }
+            let mut node_subsystem: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for subsystem in &subsystems {
+                for member_id in &subsystem.member_ids {
+                    node_subsystem.insert(member_id.clone(), subsystem.name.clone());
+                }
+            }
+            // Track nodes whose subsystem changed so they get persisted to LanceDB
+            for node in &mut graph.nodes {
+                let sid = node.stable_id();
+                let old_sub = node.metadata.get("subsystem").cloned();
+                let new_sub = node_subsystem.get(&sid).cloned();
+                if old_sub != new_sub {
+                    match new_sub {
+                        Some(name) => { node.metadata.insert("subsystem".to_string(), name); }
+                        None => { node.metadata.remove("subsystem"); }
+                    }
+                    // Include in upsert set so LanceDB gets the updated metadata
+                    upsert_node_ids.insert(sid);
+                }
             }
         }
 

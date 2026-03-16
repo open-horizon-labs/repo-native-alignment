@@ -41,6 +41,7 @@ pub struct SearchParams {
     pub include_artifacts: bool,
     pub include_markdown: bool,
     pub artifact_types: Option<Vec<String>>,
+    pub subsystem: Option<String>,
 }
 
 impl SearchParams {
@@ -67,6 +68,7 @@ impl SearchParams {
             include_artifacts: args.include_artifacts.unwrap_or(true),
             include_markdown: args.include_markdown.unwrap_or(true),
             artifact_types: args.artifact_types.clone(),
+            subsystem: args.subsystem.clone(),
         }
     }
 }
@@ -112,7 +114,8 @@ async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchCon
     let has_kind_filter = params.kind.is_some();
     let has_file_filter = params.file.is_some();
     let has_synthetic_filter = params.synthetic.is_some();
-    let has_browse_filter = has_kind_filter || has_file_filter || has_synthetic_filter;
+    let has_subsystem_filter = params.subsystem.is_some();
+    let has_browse_filter = has_kind_filter || has_file_filter || has_synthetic_filter || has_subsystem_filter;
 
     let query_str = query.unwrap_or("");
     if query_str.is_empty() && !complexity_search && !sort_by_importance && !has_browse_filter {
@@ -213,6 +216,10 @@ async fn flat_code_symbol_search<'a>(
         if let Some(min_cc) = params.min_complexity {
             let Some(cc) = n.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()) else { return false; };
             if cc < min_cc { return false; }
+        }
+        if let Some(ref sub) = params.subsystem {
+            let node_sub = n.metadata.get("subsystem").map(|s| s.as_str()).unwrap_or("");
+            if !node_sub.eq_ignore_ascii_case(sub) { return false; }
         }
         true
     };
@@ -429,7 +436,21 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
             // finds nothing.
             match embed_idx.search_with_mode(query_text, None, top_k.min(50) * 3, search_mode).await {
                 Ok(SearchOutcome::Results(results)) if !results.is_empty() => {
-                    let code_results: Vec<_> = results.into_iter().filter(|r| r.kind.starts_with("code:")).filter(|r| search_result_passes_root_filter(r, &ctx.root_filter, &ctx.non_code_slugs)).take(top_k).collect();
+                    let node_index_map_for_entry = ctx.graph_state.node_index_map();
+                    let code_results: Vec<_> = results.into_iter()
+                        .filter(|r| r.kind.starts_with("code:"))
+                        .filter(|r| search_result_passes_root_filter(r, &ctx.root_filter, &ctx.non_code_slugs))
+                        .filter(|r| {
+                            if let Some(ref sub) = params.subsystem {
+                                ctx.graph_state.node_by_stable_id(&r.id, &node_index_map_for_entry)
+                                    .and_then(|n| n.metadata.get("subsystem"))
+                                    .map(|s| s.eq_ignore_ascii_case(sub))
+                                    .unwrap_or(false)
+                            } else {
+                                true
+                            }
+                        })
+                        .take(top_k).collect();
                     if code_results.is_empty() { return format!("No code symbols matched query \"{}\". Try a different query or use node parameter.", query_text); }
                     let mut header = format!("### Matched entry nodes for \"{}\"\n\n", query_text);
                     let strip = ctx.root_filter.as_deref();
@@ -488,6 +509,17 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
             ids.retain(|id| gs.node_by_stable_id(id, &node_index_map).map(ranking::is_test_file).unwrap_or(false));
         }
     }
+    // Apply subsystem filter to traversal results
+    if let Some(ref sub) = params.subsystem {
+        for ids in merged_groups.values_mut() {
+            ids.retain(|id| {
+                gs.node_by_stable_id(id, &node_index_map)
+                    .and_then(|n| n.metadata.get("subsystem"))
+                    .map(|s| s.eq_ignore_ascii_case(sub))
+                    .unwrap_or(false)
+            });
+        }
+    }
     // Remove empty groups after filtering
     merged_groups.retain(|_, ids| !ids.is_empty());
 
@@ -523,8 +555,76 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
             "tests_for" => format!("## Test coverage for {}\n\n{} test function(s)\n\n", entry_label, total_count),
             _ => String::new(),
         };
-        format!("{}{}{}{}", entry_header, heading, md, freshness)
+
+        // For impact mode, append a subsystem breakdown showing which subsystems
+        // are affected and through which interface function the impact propagates.
+        let subsystem_section = if mode == "impact" {
+            format_impact_subsystem_breakdown(&merged_groups, gs, &node_index_map, strip)
+        } else {
+            String::new()
+        };
+
+        format!("{}{}{}{}{}", entry_header, heading, md, subsystem_section, freshness)
     }
+}
+
+/// Group impact results by subsystem metadata and format as a summary section.
+///
+/// For each affected subsystem, reports the symbol count and the first node in
+/// that subsystem (the "entry point" through which impact propagates).
+fn format_impact_subsystem_breakdown(
+    merged_groups: &std::collections::BTreeMap<crate::graph::EdgeKind, Vec<String>>,
+    gs: &GraphState,
+    node_index_map: &std::collections::HashMap<String, usize>,
+    strip: Option<&str>,
+) -> String {
+    // Collect all unique result node IDs across edge-kind groups, deduplicated.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut subsystem_nodes: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for ids in merged_groups.values() {
+        for id in ids {
+            if !seen.insert(id.clone()) {
+                continue; // Skip duplicates across edge-kind buckets
+            }
+            if let Some(node) = gs.node_by_stable_id(id, node_index_map) {
+                if let Some(sub) = node.metadata.get("subsystem") {
+                    subsystem_nodes
+                        .entry(sub.clone())
+                        .or_default()
+                        .push(id.clone());
+                }
+            }
+        }
+    }
+
+    if subsystem_nodes.is_empty() {
+        return String::new();
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    for (subsystem, ids) in &subsystem_nodes {
+        // The first node in this subsystem is the interface through which impact enters
+        let entry_point = ids
+            .first()
+            .and_then(|id| gs.node_by_stable_id(id, node_index_map))
+            .map(|n| {
+                let display = strip_root_prefix(&n.stable_id(), strip);
+                format!(", entry point: `{}`", display)
+            })
+            .unwrap_or_default();
+        lines.push(format!(
+            "- **{}** ({} symbol(s){})",
+            subsystem,
+            ids.len(),
+            entry_point
+        ));
+    }
+
+    format!(
+        "\n\n### Affected subsystems\n\n{}\n",
+        lines.join("\n")
+    )
 }
 
 fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_>) -> String {
@@ -678,6 +778,10 @@ fn resolve_entry_points_by_name<'a>(
         }
         if !node_passes_root_filter(&n.id.root, &ctx.root_filter, &ctx.non_code_slugs) {
             return false;
+        }
+        if let Some(ref sub) = params.subsystem {
+            let node_sub = n.metadata.get("subsystem").map(|s| s.as_str()).unwrap_or("");
+            if !node_sub.eq_ignore_ascii_case(sub) { return false; }
         }
         true
     }).collect();
@@ -1314,6 +1418,107 @@ mod tests {
         let results = resolve_entry_points_by_name("fn foo(config: &SearchParams)", 1, &params, &ctx);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id.name, "foo", "exact signature match should be kept with limit=1");
+    }
+
+    // ── Subsystem filter tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_flat_search_subsystem_filter() {
+        let mut node_a = make_node("scan_files", NodeKind::Function, "src/scanner.rs");
+        node_a.metadata.insert("subsystem".to_string(), "scanner".to_string());
+        let mut node_b = make_node("scan_config", NodeKind::Function, "src/config.rs");
+        node_b.metadata.insert("subsystem".to_string(), "config".to_string());
+        let node_c = make_node("scan_other", NodeKind::Function, "src/other.rs");
+        // node_c has no subsystem metadata
+
+        let gs = make_graph_state(vec![node_a, node_b, node_c]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("scan".into()),
+            subsystem: Some("scanner".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "scan", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 1, "Only scanner-subsystem node should match");
+        assert_eq!(results[0].id.name, "scan_files");
+    }
+
+    #[tokio::test]
+    async fn test_flat_search_subsystem_filter_case_insensitive() {
+        let mut node = make_node("handler", NodeKind::Function, "src/server.rs");
+        node.metadata.insert("subsystem".to_string(), "Server".to_string());
+
+        let gs = make_graph_state(vec![node]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            query: Some("handler".into()),
+            subsystem: Some("server".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 1, "Case-insensitive subsystem match should work");
+    }
+
+    #[tokio::test]
+    async fn test_flat_search_subsystem_allows_empty_query_browse() {
+        let mut node = make_node("extract", NodeKind::Function, "src/extract.rs");
+        node.metadata.insert("subsystem".to_string(), "extractor".to_string());
+        let gs = make_graph_state(vec![node]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            subsystem: Some("extractor".into()),
+            ..Default::default()
+        };
+
+        // Empty query with subsystem filter should be allowed (not rejected)
+        let result = search(&params, &ctx).await;
+        assert!(!result.contains("Empty query"), "Subsystem filter should act as browse filter");
+    }
+
+    #[test]
+    fn test_format_impact_subsystem_breakdown_empty() {
+        let groups = std::collections::BTreeMap::new();
+        let gs = make_graph_state(vec![]);
+        let node_index_map = gs.node_index_map();
+        let result = format_impact_subsystem_breakdown(&groups, &gs, &node_index_map, None);
+        assert!(result.is_empty(), "No subsystem data should produce empty string");
+    }
+
+    #[test]
+    fn test_format_impact_subsystem_breakdown_groups_correctly() {
+        use crate::graph::EdgeKind;
+        let mut node_a = make_node("fn_a", NodeKind::Function, "src/alpha.rs");
+        node_a.metadata.insert("subsystem".to_string(), "alpha".to_string());
+        let mut node_b = make_node("fn_b", NodeKind::Function, "src/beta.rs");
+        node_b.metadata.insert("subsystem".to_string(), "beta".to_string());
+        let mut node_c = make_node("fn_c", NodeKind::Function, "src/beta.rs");
+        node_c.metadata.insert("subsystem".to_string(), "beta".to_string());
+        let gs = make_graph_state(vec![node_a.clone(), node_b.clone(), node_c.clone()]);
+        let node_index_map = gs.node_index_map();
+
+        let mut groups = std::collections::BTreeMap::new();
+        groups.insert(EdgeKind::Calls, vec![
+            node_a.stable_id(),
+            node_b.stable_id(),
+            node_c.stable_id(),
+        ]);
+
+        let result = format_impact_subsystem_breakdown(&groups, &gs, &node_index_map, None);
+        assert!(result.contains("alpha"), "Should contain alpha subsystem");
+        assert!(result.contains("beta"), "Should contain beta subsystem");
+        assert!(result.contains("2 symbol(s)"), "Beta should have 2 symbols");
+        assert!(result.contains("1 symbol(s)"), "Alpha should have 1 symbol");
     }
 }
 
