@@ -508,7 +508,7 @@ impl GraphIndex {
 
         // Step 3: Louvain Phase 2 -- contract communities into super-nodes and
         // repeat Phase 1 on the coarsened graph until no further improvement.
-        let mut community = louvain_phase2(&adj, community, total_weight, gamma, n);
+        let mut community = louvain_phase2(&adj, community, gamma, n);
 
         // Step 4: Collect communities, compute stats, and build Subsystem structs.
         // Group production nodes by community
@@ -804,7 +804,6 @@ fn louvain_phase1(
 fn louvain_phase2(
     adj: &[Vec<(usize, f64)>],
     mut community: Vec<usize>,
-    _total_weight: f64,
     gamma: f64,
     n: usize,
 ) -> Vec<usize> {
@@ -827,6 +826,12 @@ fn louvain_phase2(
     let target_k = 12.0_f64;
     let ratio = (target_k / initial_comm_count.max(1) as f64).min(1.0);
     let merge_threshold = gamma * ratio.sqrt();
+
+    // Size cap: don't merge if the result would exceed 30% of production
+    // nodes. This prevents the "snowball" effect where one cluster absorbs
+    // everything through incremental merges.
+    let prod_count = (0..n).filter(|&i| !adj[i].is_empty()).count();
+    let max_community_size = (prod_count as f64 * 0.30) as usize;
 
     let max_rounds = 200;
 
@@ -855,11 +860,6 @@ fn louvain_phase2(
         }
 
         // Find the pair with the highest merge score.
-        // Size cap: don't merge if either community already exceeds a
-        // maximum size or the merged result would. This prevents the
-        // "snowball" effect where the largest cluster absorbs everything.
-        let prod_count = (0..n).filter(|&i| !adj[i].is_empty()).count();
-        let max_community_size = (prod_count as f64 * 0.30) as usize;
         let mut best_pair: Option<(usize, usize)> = None;
         let mut best_score = 0.0_f64;
 
