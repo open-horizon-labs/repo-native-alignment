@@ -673,8 +673,10 @@ fn resolve_entry_points_by_name<'a>(
 
     // Sort: exact name match first, then contains.
     matches.sort_by(|a, b| {
-        let a_exact = a.id.name.to_lowercase() == query_lower;
-        let b_exact = b.id.name.to_lowercase() == query_lower;
+        let a_exact =
+            a.id.name.eq_ignore_ascii_case(query) || a.signature.eq_ignore_ascii_case(query);
+        let b_exact =
+            b.id.name.eq_ignore_ascii_case(query) || b.signature.eq_ignore_ascii_case(query);
         b_exact.cmp(&a_exact)
     });
 
