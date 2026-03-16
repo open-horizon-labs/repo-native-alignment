@@ -92,8 +92,6 @@ For each external comment, check:
 3. If 7b was verified via unit tests only — **run the actual CLI or MCP command** that exercises the feature with real data
 4. If the feature doesn't produce visible output in real usage, **flag it** and create a fix
 
-This exists because PR #313 shipped subsystem detection with passing unit tests, but `repo_map` showed no subsystems because LSP edges weren't reaching the petgraph index through the LanceDB persist/reload path. The comment audit found nothing wrong — the bug was invisible to reviewers.
-
 ### What NOT to do
 
 - Don't re-run the entire ship pipeline
