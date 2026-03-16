@@ -39,21 +39,8 @@ impl GraphState {
     ///
     /// Returns the full stable ID if found, or the original ID if not.
     pub fn resolve_node_id(&self, id: &str) -> String {
-        // Fast path: already a full stable ID
-        if self.nodes.iter().any(|n| n.stable_id() == id) {
-            return id.to_string();
-        }
-        // Try prepending each unique root slug
-        let roots: std::collections::HashSet<&str> = self.nodes.iter()
-            .map(|n| n.id.root.as_str())
-            .collect();
-        for root in &roots {
-            let full_id = format!("{}:{}", root, id);
-            if self.nodes.iter().any(|n| n.stable_id() == full_id) {
-                return full_id;
-            }
-        }
-        id.to_string()
+        let index_map = self.node_index_map();
+        self.resolve_node_id_fast(id, &index_map)
     }
 
     /// Resolve a node ID using the pre-built index map. O(1) for exact match,
@@ -62,8 +49,9 @@ impl GraphState {
         if index_map.contains_key(id) {
             return id.to_string();
         }
-        let roots: std::collections::HashSet<&str> = self.nodes.iter()
-            .map(|n| n.id.root.as_str())
+        // Extract unique root slugs from index_map keys (everything before the first ':').
+        let roots: std::collections::HashSet<&str> = index_map.keys()
+            .filter_map(|stable_id| stable_id.split_once(':').map(|(root, _)| root))
             .collect();
         for root in &roots {
             let full_id = format!("{}:{}", root, id);
