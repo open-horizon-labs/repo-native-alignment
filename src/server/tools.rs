@@ -11,12 +11,12 @@ use serde::{Deserialize, Serialize};
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct OutcomeProgress {
-    /// The outcome ID (e.g. 'agent-alignment') from .oh/outcomes/
+    /// Outcome ID (e.g. "agent-alignment")
     pub outcome_id: String,
-    /// When true, compute blast radius for changed symbols and classify risk as CRITICAL/HIGH/MEDIUM/LOW
+    /// Add risk-classified blast radius (default: false)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_impact: Option<bool>,
-    /// Filter to a specific workspace root (by slug). Defaults to the primary root. Use "all" for cross-root search.
+    /// Workspace root slug; "all" for cross-root
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
 }
@@ -32,67 +32,67 @@ pub struct OutcomeProgress {
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct Search {
-    /// Search query string — ranked by embedding index (respects search_mode) for flat search and graph traversal entry points. Falls back to name/signature matching if embedding index is not ready.
+    /// Search query (name, keyword, or natural language)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
-    /// Start from a known stable node ID (from previous search results). Takes precedence over query for graph traversal entry.
+    /// Stable node ID from previous results
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
-    /// Graph traversal mode: "neighbors" (direct connections), "impact" (reverse dependents), "reachable" (forward BFS), "tests_for" (which test functions call this symbol). Omit for flat search.
+    /// Traversal: "neighbors", "impact", "reachable", "tests_for"; omit for flat search
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
-    /// Maximum traversal depth (default: 1 for neighbors, 3 for impact/reachable). Only used with mode.
+    /// Max traversal depth (default: 1 neighbors, 3 impact/reachable)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hops: Option<u32>,
-    /// Direction for neighbors mode: "outgoing" (default), "incoming", "both". Only used with mode="neighbors".
+    /// Neighbors direction: "outgoing" (default), "incoming", "both"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
-    /// Filter edge types: calls, depends_on, implements, defines, etc. Only used with mode.
+    /// Edge filter: calls, depends_on, implements, defines, etc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_types: Option<Vec<String>>,
-    /// Filter by symbol kind. Valid values: function, struct, trait, enum, type_alias, module, import, const, impl, proto_message, sql_table, api_endpoint, macro, enum_variant, markdown_section, field, pr_merge
+    /// Symbol kind: function, struct, trait, enum, type_alias, module, etc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
-    /// Filter by language (rust, python, typescript, go, markdown)
+    /// Language: rust, python, typescript, go, markdown
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
-    /// Filter by file path substring
+    /// File path substring filter
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
-    /// Filter to a specific workspace root (by slug). Defaults to the primary root. Use "all" for cross-root search.
+    /// Workspace root slug; "all" for cross-root
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
-    /// Number of results (flat search, default: 10) or entry points (traversal, default: 1)
+    /// Max results (flat default: 10, traversal default: 1)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
-    /// Sort results by "relevance" (default), "complexity" (descending cyclomatic), or "importance" (descending PageRank)
+    /// Sort: "relevance" (default), "complexity", "importance"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_by: Option<String>,
-    /// Minimum cyclomatic complexity threshold. Only return functions with complexity >= this value.
+    /// Min cyclomatic complexity threshold
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_complexity: Option<u32>,
-    /// If true, include only synthetic (inferred) constants. If false, exclude them. If absent, return all.
+    /// Filter synthetic (inferred) constants: true=only, false=exclude
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synthetic: Option<bool>,
-    /// When true, return compact output: signature + line range + kind + file only (no body). ~25x token reduction for exploration.
+    /// Compact output: signature + location only (~25x fewer tokens)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact: Option<bool>,
-    /// Batch retrieve multiple nodes by stable ID. Returns combined results in a single response. Composes with compact and mode.
+    /// Batch-retrieve multiple node IDs in one call
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodes: Option<Vec<String>>,
-    /// Search ranking mode: "hybrid" (default, keyword + vector RRF), "keyword" (BM25 only), "semantic" (vector only). Applies to all search paths: flat code symbols, artifacts, and graph traversal entry-point resolution.
+    /// Ranking: "hybrid" (default), "keyword", "semantic"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_mode: Option<String>,
-    /// When true, apply cross-encoder reranking to the top candidates for more precise relevance scoring. Best for natural language queries where bi-encoder similarity misses nuanced matches. Adds ~100-300ms latency. Default: false.
+    /// Cross-encoder reranking for precision (~100-300ms); default: false
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank: Option<bool>,
-    /// Search .oh/ artifacts and commits via embedding index (default: true). Set to false for code-only search.
+    /// Search .oh/ artifacts and commits (default: true)
     #[serde(default = "default_true")]
     pub include_artifacts: Option<bool>,
-    /// Search markdown sections (default: true). Set to false to exclude doc sections.
+    /// Search markdown sections (default: true)
     #[serde(default = "default_true")]
     pub include_markdown: Option<bool>,
-    /// Filter artifact types: outcome, signal, guardrail, metis, commit. Only used when include_artifacts is true.
+    /// Artifact filter: outcome, signal, guardrail, metis, commit
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_types: Option<Vec<String>>,
 }
@@ -100,7 +100,6 @@ pub struct Search {
 fn default_true() -> Option<bool> {
     Some(true)
 }
-
 
 #[macros::mcp_tool(
     name = "list_roots",
@@ -115,10 +114,10 @@ pub struct ListRoots {}
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct RepoMap {
-    /// Number of top symbols to return (default: 15)
+    /// Number of top symbols (default: 15)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_n: Option<u32>,
-    /// Filter to a specific workspace root (by slug). Defaults to the primary root. Use "all" for cross-root search.
+    /// Workspace root slug; "all" for cross-root
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
 }
@@ -457,4 +456,53 @@ mod tests {
         assert_eq!(s.rerank, Some(false));
     }
 
+    // ── Schema description length guardrail ───────────────────────────────
+    // Doc comments on struct fields become JSON schema descriptions via JsonSchema derive.
+    // This test ensures no parameter description regresses to multi-sentence verbosity.
+    // We test the source strings directly since schemars isn't a direct dependency.
+
+    #[test]
+    fn test_param_descriptions_are_slim() {
+        // All parameter doc comments from tools.rs, extracted as string literals.
+        // If you add a parameter, add its description here.
+        let descriptions = vec![
+            // OutcomeProgress
+            r#"Outcome ID (e.g. "agent-alignment")"#,
+            "Add risk-classified blast radius (default: false)",
+            // Search
+            "Search query (name, keyword, or natural language)",
+            "Stable node ID from previous results",
+            r#"Traversal: "neighbors", "impact", "reachable", "tests_for"; omit for flat search"#,
+            "Max traversal depth (default: 1 neighbors, 3 impact/reachable)",
+            r#"Neighbors direction: "outgoing" (default), "incoming", "both""#,
+            "Edge filter: calls, depends_on, implements, defines, etc.",
+            "Symbol kind: function, struct, trait, enum, type_alias, module, etc.",
+            "Language: rust, python, typescript, go, markdown",
+            "File path substring filter",
+            "Max results (flat default: 10, traversal default: 1)",
+            r#"Sort: "relevance" (default), "complexity", "importance""#,
+            "Min cyclomatic complexity threshold",
+            "Filter synthetic (inferred) constants: true=only, false=exclude",
+            "Compact output: signature + location only (~25x fewer tokens)",
+            "Batch-retrieve multiple node IDs in one call",
+            r#"Ranking: "hybrid" (default), "keyword", "semantic""#,
+            "Cross-encoder reranking for precision (~100-300ms); default: false",
+            "Search .oh/ artifacts and commits (default: true)",
+            "Search markdown sections (default: true)",
+            "Artifact filter: outcome, signal, guardrail, metis, commit",
+            // RepoMap
+            "Number of top symbols (default: 15)",
+            // Shared
+            r#"Workspace root slug; "all" for cross-root"#,
+        ];
+
+        let max_len = 80;
+        for desc in &descriptions {
+            assert!(
+                desc.len() <= max_len,
+                "Description too long ({} chars, max {max_len}): {desc:?}",
+                desc.len()
+            );
+        }
+    }
 }
