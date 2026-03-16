@@ -1634,6 +1634,51 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_communities_single_dense_cluster() {
+        // All nodes tightly connected -- should produce exactly one subsystem
+        let mut index = GraphIndex::new();
+        let node_count = 6;
+        for i in 0..node_count {
+            for j in 0..node_count {
+                if i != j {
+                    index.add_edge(
+                        &format!("n{}", i),
+                        "fn",
+                        &format!("n{}", j),
+                        "fn",
+                        EdgeKind::Calls,
+                    );
+                }
+            }
+        }
+
+        let pagerank = index.compute_pagerank(0.85, 20);
+        let file_map: HashMap<String, String> = (0..node_count)
+            .map(|i| (format!("n{}", i), "src/core/mod.rs".to_string()))
+            .collect();
+
+        let subsystems = index.detect_communities(&pagerank, &file_map);
+        assert_eq!(
+            subsystems.len(),
+            1,
+            "fully connected graph should be one subsystem, got {}",
+            subsystems.len()
+        );
+        assert_eq!(subsystems[0].symbol_count, node_count);
+        // High cohesion expected (no external edges)
+        assert!(
+            subsystems[0].cohesion > 0.9,
+            "single cluster should have high cohesion, got {}",
+            subsystems[0].cohesion
+        );
+        // No interfaces since there's only one cluster
+        assert!(
+            subsystems[0].interfaces.is_empty(),
+            "single cluster should have no interfaces"
+        );
+    }
+
+    #[test]
     fn test_compute_cluster_name() {
         let file_map = make_file_map(&[
             ("a", "src/graph/index.rs"),
