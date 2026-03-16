@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_EXCLUDES: &[&str] = &[
     "node_modules/",
     ".venv/",
-    "target/",
+    "target*/",
     "build/",
     "__pycache__/",
     ".git/",
@@ -36,6 +36,13 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     "*.o",
     "*.so",
     "*.dylib",
+    "*.rmeta",
+    "*.rlib",
+    "*.bc",
+    "*.a",
+    "*.dll",
+    "*.exe",
+    "*.wasm",
     ".DS_Store",
 ];
 
@@ -1003,6 +1010,7 @@ impl Scanner {
 ///
 /// Pattern types:
 /// - `dirname/` — matches any path component equal to `dirname`
+/// - `prefix*/` — matches any path component starting with `prefix`
 /// - `*.ext` — matches files ending in `.ext`
 /// - `filename` — matches the exact filename (last component)
 fn is_file_excluded(pattern: &str, path: &str) -> bool {
@@ -1012,7 +1020,7 @@ fn is_file_excluded(pattern: &str, path: &str) -> bool {
     }
     if let Some(dirname) = pattern.strip_suffix('/') {
         // Directory pattern: check if any path component matches
-        return path.split('/').any(|comp| comp == dirname);
+        return dir_component_matches(dirname, path);
     }
     // Exact filename match against last component
     if let Some(filename) = path.rsplit('/').next() {
@@ -1024,10 +1032,19 @@ fn is_file_excluded(pattern: &str, path: &str) -> bool {
 /// Check if a directory path matches an exclude pattern.
 fn is_dir_excluded(pattern: &str, dir_path: &str) -> bool {
     if let Some(dirname) = pattern.strip_suffix('/') {
-        // Directory pattern: any component matches
-        return dir_path.split('/').any(|comp| comp == dirname);
+        return dir_component_matches(dirname, dir_path);
     }
     false
+}
+
+/// Check if any path component matches a directory name pattern.
+/// Supports trailing `*` glob: `target*` matches `target`, `target-194`, etc.
+fn dir_component_matches(dirname: &str, path: &str) -> bool {
+    if let Some(prefix) = dirname.strip_suffix('*') {
+        path.split('/').any(|comp| comp.starts_with(prefix))
+    } else {
+        path.split('/').any(|comp| comp == dirname)
+    }
 }
 
 // ── State persistence ───────────────────────────────────────────────
@@ -1143,6 +1160,33 @@ mod tests {
         assert!(is_dir_excluded("target/", "some/target"));
         assert!(!is_dir_excluded("target/", "src"));
         assert!(!is_dir_excluded("*.pyc", "some_dir"));
+    }
+
+    #[test]
+    fn test_glob_dir_pattern_excludes_prefixed_dirs() {
+        // target*/ should match target, target-194, target-worktree, etc.
+        assert!(is_dir_excluded("target*/", "target"));
+        assert!(is_dir_excluded("target*/", "target-194"));
+        assert!(is_dir_excluded("target*/", "target-worktree"));
+        assert!(is_dir_excluded("target*/", "some/target-194"));
+        assert!(!is_dir_excluded("target*/", "src"));
+        assert!(!is_dir_excluded("target*/", "not-target"));
+
+        // file exclude also respects glob dir patterns
+        assert!(is_file_excluded("target*/", "target-194/debug/build/foo.rmeta"));
+        assert!(is_file_excluded("target*/", "target/release/libfoo.rlib"));
+        assert!(!is_file_excluded("target*/", "src/main.rs"));
+    }
+
+    #[test]
+    fn test_binary_extension_excludes() {
+        assert!(is_file_excluded("*.rmeta", "target/debug/deps/libfoo.rmeta"));
+        assert!(is_file_excluded("*.rlib", "target/release/libfoo.rlib"));
+        assert!(is_file_excluded("*.bc", "target/debug/deps/foo.bc"));
+        assert!(is_file_excluded("*.a", "lib/libfoo.a"));
+        assert!(is_file_excluded("*.dll", "bin/foo.dll"));
+        assert!(is_file_excluded("*.exe", "bin/foo.exe"));
+        assert!(is_file_excluded("*.wasm", "pkg/foo.wasm"));
     }
 
     // ── ScanState serialization roundtrip ───────────────────────────
