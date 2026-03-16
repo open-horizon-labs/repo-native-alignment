@@ -62,9 +62,6 @@ impl RnaHandler {
 
         // Slow path: build or update graph
         {
-            // Invalidate cached root slugs since graph structure may change.
-            self.invalidate_non_code_root_slugs_cache();
-
             let mut guard = self.graph.write().await;
             if guard.is_none() {
                 // First build -- full pipeline
@@ -108,6 +105,9 @@ impl RnaHandler {
     }
 
     pub(crate) async fn build_full_graph_inner(&self, spawn_background: bool) -> anyhow::Result<GraphState> {
+        // Invalidate cached root slugs since workspace/worktree config may have changed.
+        self.invalidate_non_code_root_slugs_cache();
+
         // Initialize pattern config from .oh/config.toml (once, at first build).
         crate::extract::generic::init_pattern_config(&self.repo_root);
 
