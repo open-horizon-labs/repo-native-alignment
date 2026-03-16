@@ -277,8 +277,9 @@ Current coding agent harnesses make assumptions that work against graph-augmente
 
 ### 6.3 Agent Architecture
 
-- **12-Factor Agents / Context Engineering** (humanlayer.dev) — Framework for systematic context management. Distinguishes harness engineering (tool configuration) from context engineering (what information reaches the model). RNA implements the "give agents the right context" principle via queryable pre-indexed artifacts.
-- **Harness Engineering** (Viv Trivedy, vtrivedy.com) — Identifies four customization levers: system prompt, tools/MCPs, context, sub-agents. Our benchmark measures the tools/MCPs lever specifically — does a better code exploration tool improve outcomes?
+- **12-Factor Agents / Context Engineering** (Dex Horthy; [talk](https://www.youtube.com/watch?v=IS_y40zY-hc), [post](https://github.com/humanlayer/12-factor-agents)) — Framework for systematic context management. Distinguishes harness engineering (tool configuration) from context engineering (what information reaches the model). RNA implements the "give agents the right context" principle via queryable pre-indexed artifacts.
+- **Harness Engineering** (Viv Trivedy; [post 1](https://www.vtrivedy.com/posts/claude-code-sdk-haas-harness-as-a-service), [post 2](https://blog.langchain.com/the-anatomy-of-an-agent-harness/)) — Identifies four customization levers: system prompt, tools/MCPs, context, sub-agents. Our benchmark measures the tools/MCPs lever specifically — does a better code exploration tool improve outcomes?
+- **Skill Issue: Harness Engineering for Coding Agents** (HumanLayer; [post](https://www.humanlayer.dev/blog/skill-issue-harness-engineering-for-coding-agents)) — Practical guide to harness configuration. Notes that sub-agents function as "context firewalls" and that tool count matters for context budget. RNA's consolidation from 20+ tools to 4 aligns with their finding that fewer, focused tools outperform broad tool suites.
 
 ## 7. Conclusion
 
