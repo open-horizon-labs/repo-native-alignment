@@ -135,15 +135,17 @@ pub(crate) fn strip_root_prefix(stable_id: &str, strip_root: Option<&str>) -> St
 /// stripped) raw ID if parsing fails.
 pub(crate) fn format_unresolved_id(id: &str, strip_root: Option<&str>) -> String {
     let display_id = strip_root_prefix(id, strip_root);
-    // Stable ID format: root:file:name:kind (4 parts) or file:name:kind (3 parts after strip)
-    // Split from the right to reliably get kind and name, since file paths may contain colons
-    let rparts: Vec<&str> = display_id.rsplitn(3, ':').collect();
+    // Stable ID format: root:file:name:kind. Split the original id from the
+    // right so file paths with colons (e.g. Windows `C:\...`) are handled correctly.
+    let rparts: Vec<&str> = id.rsplitn(3, ':').collect();
     if rparts.len() >= 3 {
-        // rparts[0] = kind, rparts[1] = name, rparts[2] = everything before (root:file or file)
+        // rparts[0] = kind, rparts[1] = name, rparts[2] = root:file
         let name = rparts[1];
         let prefix = rparts[2];
-        // The prefix might be "root:file" or just "file" -- extract the file part
-        let file = if let Some((_root, f)) = prefix.split_once(':') { f } else { prefix };
+        // Strip the root slug from the prefix to get the file path
+        let file = strip_root
+            .and_then(|slug| prefix.strip_prefix(&format!("{}:", slug)))
+            .unwrap_or(prefix);
         format!("- **{}** ({})", name, file)
     } else if rparts.len() == 2 {
         // Only two parts: treat as name:kind
@@ -333,6 +335,13 @@ pub(crate) fn format_neighbors_grouped_with_root(
     compact: bool,
     strip_root: Option<&str>,
 ) -> String {
+    // Build O(1) lookup map: stable_id -> index into nodes vec.
+    let node_map: std::collections::HashMap<String, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.stable_id(), i))
+        .collect();
+
     let mut sections: Vec<String> = Vec::new();
 
     for (edge_kind, ids) in groups {
@@ -340,10 +349,8 @@ pub(crate) fn format_neighbors_grouped_with_root(
         let displayable_ids: Vec<&String> = ids
             .iter()
             .filter(|id| {
-                nodes
-                    .iter()
-                    .find(|n| n.stable_id() == **id)
-                    .map(|n| !is_hidden_traversal_kind(&n.id.kind))
+                node_map.get(id.as_str())
+                    .map(|&i| !is_hidden_traversal_kind(&nodes[i].id.kind))
                     .unwrap_or(true)
             })
             .collect();
@@ -355,8 +362,8 @@ pub(crate) fn format_neighbors_grouped_with_root(
         let entries: Vec<String> = displayable_ids
             .iter()
             .map(|id| {
-                if let Some(node) = nodes.iter().find(|n| n.stable_id() == **id) {
-                    format_node_entry_with_root(node, index, compact, strip_root)
+                if let Some(&i) = node_map.get(id.as_str()) {
+                    format_node_entry_with_root(&nodes[i], index, compact, strip_root)
                 } else {
                     format_unresolved_id(id, strip_root)
                 }
@@ -394,13 +401,20 @@ fn capitalize_first(s: &str) -> String {
 /// where edge-type grouping is not needed (e.g., outcome_progress display).
 #[allow(dead_code)]
 pub(crate) fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String], index: &GraphIndex, compact: bool) -> String {
+    // Build O(1) lookup map: stable_id -> index into nodes vec.
+    let node_map: std::collections::HashMap<String, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.stable_id(), i))
+        .collect();
+
     ids.iter()
         .filter_map(|id| {
-            if let Some(node) = nodes.iter().find(|n| n.stable_id() == *id) {
-                if is_hidden_traversal_kind(&node.id.kind) {
+            if let Some(&i) = node_map.get(id.as_str()) {
+                if is_hidden_traversal_kind(&nodes[i].id.kind) {
                     return None;
                 }
-                Some(format_node_entry(node, index, compact))
+                Some(format_node_entry(&nodes[i], index, compact))
             } else {
                 Some(format!("- `{}`", id))
             }
@@ -700,13 +714,12 @@ mod tests {
 
     #[test]
     fn test_format_unresolved_id_without_strip() {
-        // Without stripping, rsplitn parses from right: kind=markdown_section,
-        // name=dogfood-rna-tools, prefix=my-root:.oh/guardrails/dogfood.md
-        // The prefix is split on first ':' to extract file part
+        // Without stripping, the full root:file prefix is preserved for disambiguation
         let id = "my-root:.oh/guardrails/dogfood.md:dogfood-rna-tools:markdown_section";
         let result = format_unresolved_id(id, None);
         assert!(result.contains("dogfood-rna-tools"), "should contain name, got: {}", result);
-        assert!(result.contains(".oh/guardrails/dogfood.md"), "should contain file, got: {}", result);
+        // Without strip_root, the root prefix is preserved in the file path
+        assert!(result.contains("my-root:.oh/guardrails/dogfood.md"), "should contain root:file for disambiguation, got: {}", result);
     }
 
     #[test]
@@ -718,10 +731,10 @@ mod tests {
 
     #[test]
     fn test_format_unresolved_id_cross_root_correct_parse() {
-        // Verify that root: "all" mode still renders correctly (no strip)
+        // In multi-root mode (no strip), root prefix is preserved for disambiguation
         let id = "other-root:src/lib.rs:main:function";
         let result = format_unresolved_id(id, None);
-        assert_eq!(result, "- **main** (src/lib.rs)");
+        assert_eq!(result, "- **main** (other-root:src/lib.rs)");
     }
 
     // ── format_node_entry_with_root tests ───────────────────────────

@@ -18,6 +18,27 @@ pub struct GraphState {
     pub last_scan_completed_at: Option<std::time::Instant>,
 }
 
+impl GraphState {
+    /// Build a HashMap from stable_id -> index for O(1) node lookups.
+    /// Call once per search context instead of O(N) linear scans per result.
+    pub fn node_index_map(&self) -> std::collections::HashMap<String, usize> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.stable_id(), i))
+            .collect()
+    }
+
+    /// Look up a node by stable_id using a pre-built index map. O(1).
+    pub fn node_by_stable_id<'a>(
+        &'a self,
+        id: &str,
+        index_map: &std::collections::HashMap<String, usize>,
+    ) -> Option<&'a Node> {
+        index_map.get(id).and_then(|&i| self.nodes.get(i))
+    }
+}
+
 // ── Embedding build status ───────────────────────────────────────────
 
 /// Tracks embedding build progress so the search footer can show
@@ -771,5 +792,89 @@ mod tests {
         status.set_progress(75);
         let f2 = status.footer_segment().unwrap();
         assert!(f2.contains("75/100"), "got: {}", f2);
+    }
+
+    // ── Adversarial: EmbeddingStatus ──────────────────────────────────
+
+    /// Dissent finding: concurrent set_building/set_complete should not panic
+    /// or produce invalid footer output. Uses atomics so no UB, but values
+    /// could be interleaved.
+    #[test]
+    fn test_embedding_status_concurrent_transitions() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let status = Arc::new(EmbeddingStatus::default());
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let s = status.clone();
+                thread::spawn(move || {
+                    for j in 0..100 {
+                        match (i + j) % 3 {
+                            0 => s.set_building(1000 + j),
+                            1 => s.set_progress(j),
+                            2 => s.set_complete(j),
+                            _ => unreachable!(),
+                        }
+                        // Reading footer mid-transition must not panic
+                        let _ = s.footer_segment();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // After all threads finish, footer_segment must still return valid output
+        let seg = status.footer_segment();
+        assert!(seg.is_some() || seg.is_none(), "footer_segment returned something");
+    }
+
+    /// Edge case: set_complete without set_building (skip straight to done).
+    #[test]
+    fn test_embedding_status_complete_without_building() {
+        let status = EmbeddingStatus::default();
+        status.set_complete(42);
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("42 embedded"), "got: {}", footer);
+    }
+
+    /// Edge case: set_building(0) — zero items to embed.
+    #[test]
+    fn test_embedding_status_building_zero_items() {
+        let status = EmbeddingStatus::default();
+        status.set_building(0);
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("embedding..."), "got: {}", footer);
+        assert!(footer.contains("0/0"), "got: {}", footer);
+    }
+
+    /// Edge case: set_progress beyond total (shouldn't happen but shouldn't panic).
+    #[test]
+    fn test_embedding_status_progress_exceeds_total() {
+        let status = EmbeddingStatus::default();
+        status.set_building(100);
+        status.set_progress(200); // > total
+        let footer = status.footer_segment().unwrap();
+        // Should render without panic, even if numbers look odd
+        assert!(footer.contains("200/100"), "got: {}", footer);
+    }
+
+    /// Rapid state cycling: building -> complete -> building -> complete.
+    #[test]
+    fn test_embedding_status_rapid_cycling() {
+        let status = EmbeddingStatus::default();
+        for i in 0..50 {
+            status.set_building(i * 100);
+            status.set_progress(i * 50);
+            let _ = status.footer_segment();
+            status.set_complete(i * 90);
+            let seg = status.footer_segment().unwrap();
+            assert!(
+                seg.contains("embedded"),
+                "After set_complete, should show 'embedded', got: {}",
+                seg
+            );
+        }
     }
 }

@@ -195,6 +195,10 @@ async fn flat_code_symbol_search<'a>(
     let query_lower = query_str.to_lowercase();
     let complexity_search = params.min_complexity.is_some() || sort_by_complexity;
 
+    // Build O(1) lookup map: stable_id -> index into graph_state.nodes.
+    // Replaces O(N) linear scans per result when resolving embed results.
+    let node_index_map = graph_state.node_index_map();
+
     // Closure: does a node pass all active filters?
     let node_passes_filters = |n: &Node| -> bool {
         if complexity_search && n.id.kind != NodeKind::Function { return false; }
@@ -223,10 +227,10 @@ async fn flat_code_symbol_search<'a>(
             match embed_idx.search_with_mode(query_str, None, over_fetch, search_mode).await {
                 Ok(SearchOutcome::Results(results)) => {
                     used_embed = true;
-                    // Keep only code results, resolve to graph nodes, apply filters.
+                    // Keep only code results, resolve to graph nodes via HashMap (O(1)), apply filters.
                     results.iter()
                         .filter(|r| r.kind.starts_with("code:"))
-                        .filter_map(|r| graph_state.nodes.iter().find(|n| n.stable_id() == r.id))
+                        .filter_map(|r| graph_state.node_by_stable_id(&r.id, &node_index_map))
                         .filter(|n| node_passes_filters(n))
                         .take(rerank_over_fetch)
                         .collect()
@@ -452,10 +456,13 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         }
     }
 
+    // Build O(1) lookup map for stable_id -> node index.
+    let node_index_map = gs.node_index_map();
+
     // Apply tests_for filtering
     if mode == "tests_for" {
         for ids in merged_groups.values_mut() {
-            ids.retain(|id| gs.nodes.iter().find(|n| n.stable_id() == *id).map(ranking::is_test_file).unwrap_or(false));
+            ids.retain(|id| gs.node_by_stable_id(id, &node_index_map).map(ranking::is_test_file).unwrap_or(false));
         }
     }
     // Remove empty groups after filtering
@@ -464,7 +471,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
     // Count total displayable results
     let total_count: usize = merged_groups.values().map(|ids| {
         ids.iter().filter(|id| {
-            gs.nodes.iter().find(|n| n.stable_id() == **id)
+            gs.node_by_stable_id(id, &node_index_map)
                 .map(|n| !crate::server::helpers::is_hidden_traversal_kind(&n.id.kind))
                 .unwrap_or(true)
         }).count()
@@ -501,6 +508,8 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
     use crate::server::handlers::run_traversal_grouped;
     let gs = ctx.graph_state;
     let freshness = format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
+    // Build O(1) lookup map once for the entire batch.
+    let node_index_map = gs.node_index_map();
     if params.mode.is_some() {
         let mode = params.mode.as_deref().unwrap_or("neighbors");
         let edge_filter = params.edge_types.as_ref().map(|types| types.iter().filter_map(|t| parse_edge_kind(t)).collect::<Vec<_>>());
@@ -518,13 +527,13 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
                     }
                     if mode == "tests_for" {
                         for ids in groups.values_mut() {
-                            ids.retain(|id| gs.nodes.iter().find(|n| n.stable_id() == *id).map(ranking::is_test_file).unwrap_or(false));
+                            ids.retain(|id| gs.node_by_stable_id(id, &node_index_map).map(ranking::is_test_file).unwrap_or(false));
                         }
                     }
                     groups.retain(|_, ids| !ids.is_empty());
                     let total: usize = groups.values().map(|ids| {
                         ids.iter().filter(|id| {
-                            gs.nodes.iter().find(|n| n.stable_id() == **id)
+                            gs.node_by_stable_id(id, &node_index_map)
                                 .map(|n| !crate::server::helpers::is_hidden_traversal_kind(&n.id.kind))
                                 .unwrap_or(true)
                         }).count()
@@ -539,7 +548,7 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
     } else {
         let mut found = Vec::new();
         let mut missing = Vec::new();
-        for &nid in node_ids { if let Some(node) = gs.nodes.iter().find(|n| n.stable_id() == nid) { found.push(node); } else { missing.push(nid); } }
+        for &nid in node_ids { if let Some(node) = gs.node_by_stable_id(nid, &node_index_map) { found.push(node); } else { missing.push(nid); } }
         let strip = ctx.root_filter.as_deref();
         if found.is_empty() { return format!("No nodes found for {}. Try search to find valid node IDs.{}", node_ids.iter().map(|id| format!("`{}`", strip_root_prefix(id, strip))).collect::<Vec<_>>().join(", "), freshness); }
         let md: String = found.iter().map(|n| format_node_entry_with_root(n, &gs.index, params.compact, strip)).collect::<Vec<_>>().join("\n\n");
@@ -566,9 +575,10 @@ pub fn graph_query(params: &GraphParams, graph_state: &GraphState) -> Result<Str
     let edge_filter_slice = edge_filter.as_deref();
     let result_ids = run_traversal(&graph_state.index, &params.node, &params.mode, params.max_hops.map(|h| h as u32), Some(params.direction.as_str()), edge_filter_slice)?;
     if result_ids.is_empty() { return Ok(format!("No results for `{}` ({}).", params.node, params.mode)); }
+    let node_index_map = graph_state.node_index_map();
     let mut lines = vec![format!("## {} `{}`\n\n{} result(s)\n", params.mode, params.node, result_ids.len())];
     for id in &result_ids {
-        if let Some(node) = graph_state.nodes.iter().find(|n| n.stable_id() == *id) {
+        if let Some(node) = graph_state.node_by_stable_id(id, &node_index_map) {
             if matches!(node.id.kind, NodeKind::Module | NodeKind::PrMerge) { continue; }
             lines.push(format!("- **{}** `{}` ({}) `{}`:{}-{}", node.id.kind, node.id.name, node.language, node.id.file.display(), node.line_start, node.line_end));
             if !node.signature.is_empty() { lines.push(format!("  Sig: `{}`", node.signature)); }

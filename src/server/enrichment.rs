@@ -380,12 +380,27 @@ impl RnaHandler {
                 .count();
             embed_status.set_building(embeddable_count);
             let embed_fut = async move {
-                // Always re-index so .oh/ artifacts added since the last
-                // full build become searchable.  index_all_inner drops and
-                // rebuilds the table -- acceptable at current repo scale.
+                // Use BLAKE3 incremental reindex: hash-skip unchanged items
+                // instead of dropping and rebuilding the entire table.
+                // Falls back to full rebuild only if the table doesn't exist yet.
                 match EmbeddingIndex::new(&embed_repo_root).await {
                     Ok(idx) => {
-                        match idx.index_all_with_symbols(&embed_repo_root, &embeddable_nodes).await {
+                        let result = match idx.has_table().await {
+                            Ok(true) => {
+                                // Table exists -- use incremental reindex with BLAKE3 hash-skipping
+                                idx.reindex_nodes(&embeddable_nodes).await
+                            }
+                            Ok(false) => {
+                                // Table missing -- full build needed
+                                idx.index_all_with_symbols(&embed_repo_root, &embeddable_nodes).await
+                            }
+                            Err(e) => {
+                                tracing::warn!("[background] Embedding table check failed: {}", e);
+                                embed_status.set_complete(0);
+                                return;
+                            }
+                        };
+                        match result {
                             Ok(count) => {
                                 tracing::info!("[background] Embedded {} items", count);
                                 embed_status.set_complete(count);
