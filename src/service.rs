@@ -406,7 +406,24 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
     let (entry_node_ids, entry_header): (Vec<String>, String) = if let Some(node_id) = node {
         (vec![node_id.to_string()], String::new())
     } else if let Some(query_text) = query {
-        if let Some(embed_idx) = ctx.embed_index {
+        // Try name matching against graph nodes first (#290).
+        // This ensures `search("SearchParams", kind: "struct", mode: "neighbors")`
+        // finds the struct by name, not by semantic similarity to random markdown.
+        let name_matches = resolve_entry_points_by_name(query_text, top_k, params, ctx);
+        if !name_matches.is_empty() {
+            let mut header = format!("### Matched entry nodes for \"{}\" (name match)\n\n", query_text);
+            let strip = ctx.root_filter.as_deref();
+            let ids: Vec<String> = name_matches.iter().map(|n| {
+                let stable_id = n.id.to_stable_id();
+                let display = strip_root_prefix(&stable_id, strip);
+                header.push_str(&format!("- `{}` -- {} {}\n", display, n.id.kind, n.id.name));
+                stable_id
+            }).collect();
+            header.push('\n');
+            (ids, header)
+        } else if let Some(embed_idx) = ctx.embed_index {
+            // Fall back to embed index for natural-language queries where name matching
+            // finds nothing.
             match embed_idx.search_with_mode(query_text, None, top_k.min(50) * 3, search_mode).await {
                 Ok(SearchOutcome::Results(results)) if !results.is_empty() => {
                     let code_results: Vec<_> = results.into_iter().filter(|r| r.kind.starts_with("code:")).filter(|r| search_result_passes_root_filter(r, &ctx.root_filter, &ctx.non_code_slugs)).take(top_k).collect();
@@ -422,7 +439,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
                 Err(e) => return format!("Semantic search failed: {}. Use node parameter instead.", e),
             }
         } else {
-            return "Embedding index not available. Use node parameter instead, or wait for the background index to build.".to_string();
+            return "No matching graph nodes found and embedding index not available. Use node parameter instead.".to_string();
         }
     } else { unreachable!() };
 
@@ -615,6 +632,54 @@ pub async fn stats(repo_root: &Path, graph_state: &GraphState) -> StatsResult {
         .unwrap_or_else(|| "unknown".to_string());
     StatsResult { node_count: graph_state.nodes.len(), edge_count: graph_state.edges.len(), embeddings_available: embed_available,
         languages: langs.into_iter().collect(), last_scan_age, artifact_count: artifacts.len(), outcome_count: outcomes, signal_count: signals, guardrail_count: guardrails, metis_count: metis }
+}
+
+/// Resolve traversal entry points by exact name/signature matching against graph nodes.
+///
+/// Applies kind, language, file, and root filters. Returns matching nodes sorted
+/// by name-match quality (exact > contains). This is used as the primary entry
+/// point resolution strategy for traversal queries (#290), with the embed index
+/// as a fallback for natural-language queries where name matching finds nothing.
+fn resolve_entry_points_by_name<'a>(
+    query: &str,
+    limit: usize,
+    params: &SearchParams,
+    ctx: &SearchContext<'a>,
+) -> Vec<&'a Node> {
+    let query_lower = query.to_lowercase();
+    let gs = ctx.graph_state;
+
+    let mut matches: Vec<&Node> = gs.nodes.iter().filter(|n| {
+        // Name or signature must match.
+        let name_match = n.id.name.to_lowercase().contains(&query_lower)
+            || n.signature.to_lowercase().contains(&query_lower);
+        if !name_match { return false; }
+
+        // Apply filters (kind, language, file, root).
+        if let Some(ref kf) = params.kind {
+            if n.id.kind.to_string().to_lowercase() != kf.to_lowercase() { return false; }
+        }
+        if let Some(ref lf) = params.language {
+            if n.language.to_lowercase() != lf.to_lowercase() { return false; }
+        }
+        if let Some(ref ff) = params.file {
+            if !n.id.file.to_string_lossy().contains(ff.as_str()) { return false; }
+        }
+        if !node_passes_root_filter(&n.id.root, &ctx.root_filter, &ctx.non_code_slugs) {
+            return false;
+        }
+        true
+    }).collect();
+
+    // Sort: exact name match first, then contains.
+    matches.sort_by(|a, b| {
+        let a_exact = a.id.name.to_lowercase() == query_lower;
+        let b_exact = b.id.name.to_lowercase() == query_lower;
+        b_exact.cmp(&a_exact)
+    });
+
+    matches.truncate(limit);
+    matches
 }
 
 pub fn node_passes_root_filter(node_root: &str, root_filter: &Option<String>, non_code_slugs: &HashSet<String>) -> bool {
@@ -1150,6 +1215,72 @@ mod tests {
         let result = repo_map(&params, &ctx);
         assert!(result.contains("[project-a]"),
             "Multi-root mode should show root slug prefix: {}", result);
+    }
+
+    // ── resolve_entry_points_by_name tests (#290) ─────────────────────
+
+    /// Name matching finds a struct by exact name.
+    #[test]
+    fn test_resolve_entry_points_by_name_exact_match() {
+        let nodes = vec![
+            make_node("SearchParams", NodeKind::Struct, "src/service.rs"),
+            make_node("search_handler", NodeKind::Function, "src/handler.rs"),
+        ];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams { kind: Some("struct".into()), ..Default::default() };
+
+        let results = resolve_entry_points_by_name("SearchParams", 10, &params, &ctx);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.name, "SearchParams");
+    }
+
+    /// Name matching returns empty for unrelated query.
+    #[test]
+    fn test_resolve_entry_points_by_name_no_match() {
+        let nodes = vec![make_node("Config", NodeKind::Struct, "src/config.rs")];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams::default();
+
+        let results = resolve_entry_points_by_name("nonexistent", 10, &params, &ctx);
+        assert!(results.is_empty());
+    }
+
+    /// Kind filter is applied during name matching.
+    #[test]
+    fn test_resolve_entry_points_by_name_kind_filter() {
+        let nodes = vec![
+            make_node("Config", NodeKind::Struct, "src/config.rs"),
+            make_node("config_init", NodeKind::Function, "src/config.rs"),
+        ];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams { kind: Some("function".into()), ..Default::default() };
+
+        let results = resolve_entry_points_by_name("config", 10, &params, &ctx);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.name, "config_init");
+    }
+
+    /// Exact name matches sort before substring matches.
+    #[test]
+    fn test_resolve_entry_points_by_name_exact_first() {
+        let nodes = vec![
+            make_node("search_handler", NodeKind::Function, "src/handler.rs"),
+            make_node("search", NodeKind::Function, "src/search.rs"),
+        ];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams::default();
+
+        let results = resolve_entry_points_by_name("search", 10, &params, &ctx);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id.name, "search", "exact match should come first");
     }
 }
 
