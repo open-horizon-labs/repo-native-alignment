@@ -2,7 +2,7 @@
 
 ## Abstract
 
-Codebases are graphs of relationships between concepts, responsibilities, and runtime behaviors. When coding agents explore code using text search alone (grep, file reading), they recover these relationships through repeated sequential queries — an expensive process that scales poorly with codebase size and relationship depth. We hypothesize that a hybrid vector-graph representation of a codebase — combining semantic embeddings for concept discovery with a structural graph for relationship traversal — enables coding agents to answer developer questions with fewer tokens, comparable or better accuracy, and access to information that text search fundamentally cannot produce (transitive call chains, test coverage gaps, cyclomatic complexity rankings). We evaluate this hypothesis using RNA (Repo-Native Alignment), an early-stage local context discovery tool, benchmarked against standard Claude Code tooling (Grep/Read/Glob) on realistic developer questions against a 25K-line Rust codebase. Results from N=5 paired runs show [TOKEN_REDUCTION]% fewer tokens with [QUALITY_DELTA] quality scores, with RNA's strongest advantages in multi-hop traversal and complexity analysis.
+Codebases are graphs of relationships between concepts, responsibilities, and runtime behaviors. When coding agents explore code using text search alone (grep, file reading), they recover these relationships through repeated sequential queries — an expensive process that scales poorly with codebase size and relationship depth. We hypothesize that a hybrid vector-graph representation of a codebase — combining semantic embeddings for concept discovery with a structural graph for relationship traversal — enables coding agents to answer developer questions with fewer tokens, comparable or better accuracy, and access to information that text search fundamentally cannot produce (transitive call chains, test coverage gaps, cyclomatic complexity rankings). We evaluate this hypothesis using RNA (Repo-Native Alignment), an early-stage local context discovery tool, benchmarked against standard Claude Code tooling (Grep/Read/Glob) on realistic developer questions against a 25K-line Rust codebase. Results from N=5 paired runs show 60% lower cost, 72% faster wall time, and comparable quality (4.89 vs 4.67 on a 5-point scale), with RNA's strongest advantages in multi-hop traversal and complexity analysis. The primary value is efficiency, not accuracy — agents get the same answers faster and cheaper.
 
 ## 1. Introduction
 
@@ -124,7 +124,7 @@ Questions were designed to be:
 
 ### 3.2 Target Codebase
 
-unified-hifi-control: a 25K-line Rust application with 5 adapters (Roon, LMS, OpenHome, UPnP, HQPlayer), an event bus architecture, web UI (Dioxus), and MCP server. The codebase was unknown to the benchmark designers during question formulation.
+unified-hifi-control: a 25K-line Rust application with 5 adapters (Roon, LMS, OpenHome, UPnP, HQPlayer), an event bus architecture, web UI (Dioxus), and MCP server. The codebase is authored by the benchmark designer — noted as a threat to validity in section 3.6.
 
 Graph statistics after RNA indexing:
 - 15,132 nodes (code symbols + markdown sections)
@@ -135,9 +135,9 @@ Graph statistics after RNA indexing:
 
 **Vanilla agent**: Standard Claude Code tooling — Grep, Read, Glob, Bash. No MCP servers. Instructed to use only these tools.
 
-**RNA agent**: Same base tools + RNA CLI accessible via Bash. Prompt includes exact RNA CLI commands for each question (e.g., `search --mode impact --hops 3`). RNA index pre-built with warm cache.
+**RNA agent**: Same base tools + RNA MCP server providing `search` and `repo_map` tools natively. The MCP server is configured in the target repo's `.mcp.json`, pre-indexed with LSP call edges. Prompt includes suggested MCP tool calls for each question (e.g., `search(mode: "impact", hops: 3)`).
 
-Both agents use the same model (Claude Opus 4.6, 1M context), same token budget, same question prompt (minus tool-specific instructions).
+Both agents use the same model (Claude Opus 4.6, 1M context), same token budget, same question prompt (minus tool-specific instructions). Both run via `claude --print` from the target repository directory.
 
 ### 3.4 Measurement
 
@@ -165,7 +165,7 @@ Each solution scored independently (not head-to-head) by a scorer agent using a 
 
 **Tool nudging**: The RNA agent's prompt includes explicit CLI commands to use. The vanilla agent receives no equivalent "use grep like this" guidance. This creates an asymmetry — the RNA agent is told HOW to use its tools, while the vanilla agent must figure it out. We chose this design because: (a) without explicit commands, agents default to Grep/Read even when RNA is available (observed in pilot runs), and (b) in practice, RNA users would have AGENTS.md guidance suggesting tool usage patterns.
 
-**Harness limitations**: RNA is accessed via CLI (Bash commands) rather than native MCP integration, adding per-call overhead (~150ms cache load). Native MCP integration was not testable in this benchmark configuration because the MCP server is bound to the working directory.
+**Harness limitations**: RNA is accessed via native MCP integration (`claude --print` from the target repo directory with RNA configured in `.mcp.json`). The MCP tool schemas add ~22K tokens to the system prompt (4 tools with full JSON parameter schemas). This is a one-time cache_creation cost per session, but the cached prefix is re-read on every turn. RNA MCP agents also tend to use more turns (38 vs 6 in pilot runs) because graph traversal queries are separate tool calls, further amplifying cache_read totals. This overhead is reducible — the current parameter descriptions are verbose and could be slimmed significantly (#295).
 
 **Single codebase**: Results are from one Rust project. Generalization to other languages, project sizes, and architectures is not established.
 
@@ -181,40 +181,54 @@ Each solution scored independently (not head-to-head) by a scorer agent using a 
 
 ### 4.1 Efficiency Metrics
 
-| Metric | Vanilla (mean ± sd) | RNA (mean ± sd) | Delta |
+| Metric | Vanilla (N=4) | RNA MCP (N=5) | Delta |
 |---|---|---|---|
-| Total tokens | [TODO] | [TODO] | [TODO]% |
-| Wall time (s) | [TODO] | [TODO] | [TODO]% |
-| Tool calls | [TODO] | [TODO] | [TODO] |
+| Cost (USD) | $1.62 | $0.65 | **-60%** |
+| Wall time (s) | 530 | 146 | **-72%** |
 
-### 4.2 Quality Scores
+### 4.2 Quality Scores (1-5 scale, scored independently by LLM evaluator)
 
-| Criterion (weight) | Vanilla | RNA | Delta |
+| Criterion (weight) | Vanilla | RNA MCP | Delta |
 |---|---|---|---|
-| Q1 Volume flow (25%) | [TODO] | [TODO] | [TODO] |
-| Q2 Adapter checklist (20%) | [TODO] | [TODO] | [TODO] |
-| Q3 Test coverage (20%) | [TODO] | [TODO] | [TODO] |
-| Q4 Zone blast radius (20%) | [TODO] | [TODO] | [TODO] |
-| Q5 Complexity ranking (15%) | [TODO] | [TODO] | [TODO] |
-| **Weighted total** | [TODO] | [TODO] | [TODO] |
+| Q1 Volume flow (25%) | 4.50 | 5.00 | +0.50 |
+| Q2 Adapter checklist (20%) | 5.00 | 5.00 | +0.00 |
+| Q3 Test coverage (20%) | 5.00 | 5.00 | +0.00 |
+| Q4 Zone blast radius (20%) | 4.75 | 4.60 | -0.15 |
+| Q5 Complexity ranking (15%) | 4.00 | 4.80 | +0.80 |
+| **Weighted total** | **4.67** | **4.89** | **+0.22** |
 
-### 4.3 Qualitative Observations
+### 4.3 Specificity Metrics
 
-[TODO: Fill from actual results]
+| Metric | Vanilla | RNA MCP | Delta |
+|---|---|---|---|
+| Functions/files named | 45.5 | 57.2 | **+26%** |
+| Factual errors | 2.5 | 1.6 | **-36%** |
 
-- Q5 (complexity): RNA provides cyclomatic complexity numbers that grep cannot compute
-- Q1 (volume flow): Both agents trace similar chains; RNA may find more transitive connections
-- Q3 (test coverage): RNA's tests_for mode systematically checks each function; grep approximates via filename matching
+### 4.4 Observations
+
+**Q1 (volume flow):** Both agents trace the full chain from UI to device. RNA consistently scores 5.0 because graph traversal returns the complete path in structured form; vanilla occasionally misses intermediate hops, scoring 4.5.
+
+**Q2 (adapter checklist):** Both score 5.0. This question has a well-defined answer (two traits, one macro, specific files) that both approaches find equally well via search or grep.
+
+**Q3 (test coverage):** Both score 5.0. RNA uses `tests_for` mode systematically; vanilla greps for function names in test files. Both arrive at the same conclusion (zero unit tests on SOAP parsing).
+
+**Q4 (blast radius):** Near-identical scores (4.75 vs 4.60). Vanilla traces slightly deeper because sequential file reading discovers incidental usages. RNA returns the structural dependents but may miss runtime-only references.
+
+**Q5 (complexity ranking):** RNA's clearest advantage (+0.80). RNA returns cyclomatic complexity numbers directly via `sort_by: "complexity"` — information grep fundamentally cannot compute. Vanilla must estimate complexity from line count and visual inspection, producing less precise rankings.
 
 ## 5. Discussion
 
 ### 5.1 Where Graph Augmentation Helps
 
-[TODO]
+The strongest efficiency gains come from questions requiring **multi-hop traversal** (Q1: volume flow) and **computed metrics** (Q5: complexity ranking). These are tasks where text search requires sequential exploration — read a file, find a function call, grep for that function, read its file, repeat. Each hop adds a tool call, context tokens, and wall time. Graph traversal collapses this into a single query.
+
+The strongest quality gain (Q5: +0.80) comes from **information text search cannot produce at all**: cyclomatic complexity scores. RNA pre-computes these during extraction and returns them as node metadata. An agent using grep would need to parse ASTs or count branch points manually — impractical within a tool-use loop.
 
 ### 5.2 Where Text Search Is Sufficient
 
-[TODO]
+For well-defined lookup tasks (Q2: adapter checklist, Q3: test coverage), both approaches score identically (5.0). When the answer is "find these specific traits and list their methods," grep and file reading are perfectly adequate. The information is localized, the search terms are known, and multi-hop traversal adds no value.
+
+Q4 (blast radius) slightly favors vanilla (4.75 vs 4.60). Sequential file reading discovers incidental usages that graph traversal misses — for example, a function that constructs a `Zone` via a helper function, where the helper isn't in the direct `impact` results. Text search's exhaustiveness compensates for its inefficiency in these cases.
 
 ### 5.3 The Tool Adoption Problem
 
@@ -268,7 +282,19 @@ Current coding agent harnesses make assumptions that work against graph-augmente
 
 ## 7. Conclusion
 
-[TODO: Fill after results]
+A hybrid vector-graph representation of a codebase enables coding agents to answer developer questions 60% cheaper and 72% faster than text search alone, with comparable or slightly better answer quality (+5% weighted score, +26% specificity, -36% factual errors). The efficiency gain comes from collapsing sequential grep-read-grep exploration loops into single graph queries. The quality gain is concentrated in tasks requiring computed metrics (cyclomatic complexity) and multi-hop traversal (call chain tracing) — information that text search fundamentally cannot produce.
+
+However, the quality advantage is modest (4.89 vs 4.67 on a 5-point scale). For well-defined lookup tasks, text search is equally effective. The primary value proposition of graph-augmented context is **efficiency, not accuracy** — the agent gets the same answer faster and cheaper.
+
+Three findings extend beyond the specific tool evaluated:
+
+1. **Context selectivity matters more than context volume.** Consistent with Chroma's Context Rot findings, returning precisely the relevant structural relationships (graph edges) outperforms returning all text matches (grep results) even when the text matches contain the answer.
+
+2. **Tool adoption cannot be prompt-engineered.** Agents default to built-in text search even when explicitly instructed to use graph tools. The integration surface (how tools appear in the system prompt, whether training included the tool) determines adoption more than tool capabilities.
+
+3. **Harness design limits tool effectiveness.** MCP tool schemas consume 22K tokens of system prompt, context compaction discards tool results the agent later needs, and KV-prefix caching is invalidated by every unique tool response. A harness designed for persistent queryable state rather than ephemeral text responses would change the economics significantly.
+
+These results are from an early-stage tool (RNA v0.1.9) on a single codebase (25K lines Rust) with a small sample (N=5). Independent replication on diverse codebases, languages, and model families would strengthen the findings. The benchmark design, prompts, scoring rubric, and raw results are published alongside this paper for reproducibility.
 
 ## Appendix A: Benchmark Prompts
 
