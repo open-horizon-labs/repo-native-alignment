@@ -192,6 +192,16 @@ fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
 }
 
 async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    let model = new_model()?;
+    embed_texts_with_model(&model, texts).await
+}
+
+/// Embed texts using a pre-loaded model. Avoids repeated model initialization
+/// when called in a loop (e.g., streaming batch writes in index_all_inner).
+async fn embed_texts_with_model(
+    model: &metal_candle::embeddings::EmbeddingModel,
+    texts: Vec<String>,
+) -> Result<Vec<Vec<f32>>> {
     let total = texts.len();
     if total == 0 {
         return Ok(Vec::new());
@@ -204,7 +214,6 @@ async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         total, total_chars, BATCH_FLOOR, BATCH_CEILING
     );
 
-    let model = new_model()?;
     let mut remaining = texts;
     let mut all_embeddings = Vec::with_capacity(total);
     let mut processed = 0usize;
@@ -828,36 +837,55 @@ impl EmbeddingIndex {
 
         let total_candidates = candidates.len();
 
+        // Capture all current IDs before partitioning consumes candidates.
+        // Used later by delete_stale_rows_with_ids to avoid re-loading
+        // commits/merges from git (CodeRabbit review finding).
+        let current_ids: std::collections::HashSet<String> =
+            candidates.iter().map(|c| c.id.clone()).collect();
+
         // --- BLAKE3 hash check: skip unchanged embeddings (#298) ---
         // If the table exists, query existing hashes and partition candidates
         // into changed vs unchanged. This avoids re-embedding the entire corpus
         // on every full rebuild.
-        let table_exists = self.has_table().await.unwrap_or(false);
+        let table_exists = self.has_table().await
+            .context("Failed to check embedding table before full reindex")?;
 
-        let (to_embed, _unchanged_count) = if table_exists {
+        // If the table exists but has an old schema (no text_hash column),
+        // drop it and treat as fresh. merge_insert does not support schema
+        // evolution (adding new columns).
+        let (table_exists, to_embed) = if table_exists {
             let table = self.db.open_table(&self.table_name).execute().await
                 .context("Failed to open embedding table for hash check")?;
             let all_ids: Vec<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
             let existing_hashes = self.query_text_hashes(&table, &all_ids).await;
 
-            let (to_embed, unchanged): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
-                match &existing_hashes {
-                    Some(map) => map.get(&c.id).is_none_or(|h| *h != c.text_hash),
-                    None => true,
-                }
-            });
-            let unchanged_count = unchanged.len();
-
-            if unchanged_count > 0 {
+            if existing_hashes.is_none() {
+                // Old schema without text_hash column. Drop and rebuild.
                 tracing::info!(
-                    "EmbeddingIndex: BLAKE3 hash skipped {} unchanged row(s), embedding {} row(s)",
-                    unchanged_count,
-                    to_embed.len(),
+                    "EmbeddingIndex: dropping old-schema table (missing text_hash column)"
                 );
+                let _ = self.db.drop_table(&self.table_name, &[]).await;
+                (false, candidates)
+            } else {
+                let (to_embed, unchanged): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
+                    match &existing_hashes {
+                        Some(map) => map.get(&c.id).is_none_or(|h| *h != c.text_hash),
+                        None => true,
+                    }
+                });
+                let unchanged_count = unchanged.len();
+
+                if unchanged_count > 0 {
+                    tracing::info!(
+                        "EmbeddingIndex: BLAKE3 hash skipped {} unchanged row(s), embedding {} row(s)",
+                        unchanged_count,
+                        to_embed.len(),
+                    );
+                }
+                (true, to_embed)
             }
-            (to_embed, unchanged_count)
         } else {
-            (candidates, 0_usize)
+            (false, candidates)
         };
 
         tracing::info!(
@@ -874,8 +902,9 @@ impl EmbeddingIndex {
         let mut embedded_count = 0usize;
 
         if !to_embed.is_empty() {
-            // Determine embedding dimension from a probe batch.
-            // We embed the first batch to learn dim, then continue with the rest.
+            // Load model once and reuse across all write batches to avoid
+            // repeated heavyweight model initialization.
+            let model = new_model()?;
             let mut remaining = to_embed;
             let mut batch_idx = 0usize;
 
@@ -884,7 +913,7 @@ impl EmbeddingIndex {
                 let batch_candidates: Vec<Candidate> = remaining.drain(..bs).collect();
 
                 let batch_texts: Vec<String> = batch_candidates.iter().map(|c| c.text.clone()).collect();
-                let embeddings = embed_texts(batch_texts).await?;
+                let embeddings = embed_texts_with_model(&model, batch_texts).await?;
 
                 if embeddings.is_empty() {
                     continue;
@@ -959,30 +988,9 @@ impl EmbeddingIndex {
         // --- Delete stale rows (#298) ---
         // If we used merge_insert (table already existed), there may be rows
         // for nodes that no longer exist in the graph. Delete them.
-        // Build the current ID set from candidates (already computed above)
-        // to avoid re-loading commits/merges.
+        // Uses current_ids captured before partitioning to avoid re-loading
+        // commits/merges from git.
         if table_exists {
-            let current_ids: std::collections::HashSet<String> = {
-                // Re-collect current valid IDs. We can't reuse `candidates`
-                // (consumed by partition) so rebuild from the same sources.
-                let mut ids = std::collections::HashSet::new();
-                if let Ok(commits) = git::load_commits(repo_root, RECENT_COMMIT_LIMIT) {
-                    for c in &commits {
-                        ids.insert(c.short_hash.clone());
-                    }
-                }
-                if let Ok((merge_nodes, _)) = git::pr_merges::extract_pr_merges(repo_root, Some(PR_MERGE_LIMIT)) {
-                    for node in &merge_nodes {
-                        let merge_sha = node.metadata.get("merge_sha").cloned().unwrap_or_default();
-                        let short = merge_sha.get(..7).unwrap_or(&merge_sha).to_string();
-                        ids.insert(format!("merge:{}", short));
-                    }
-                }
-                for node in symbols.iter().filter(|n| n.id.kind.is_embeddable()) {
-                    ids.insert(node.stable_id());
-                }
-                ids
-            };
             if let Err(e) = self.delete_stale_rows_with_ids(&current_ids).await {
                 tracing::warn!("EmbeddingIndex: failed to delete stale rows: {}", e);
             }
@@ -2182,6 +2190,7 @@ mod tests {
         };
 
         let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
+        let node_b_id = node_b.stable_id();
 
         // Build with both nodes
         let count1 = idx.index_all_with_symbols(&repo_root, &[node_a.clone(), node_b]).await.unwrap();
@@ -2191,9 +2200,18 @@ mod tests {
         let count2 = idx.index_all_with_symbols(&repo_root, &[node_a]).await.unwrap();
         assert!(count2 > 0);
 
-        // Verify: search should not find node_b's signature
-        // (We can't easily verify deletion without querying, but the test
-        // exercises the delete_stale_rows path without panicking)
+        // Verify stale row is truly gone by querying text hashes for node_b
+        let table = idx.db.open_table(&idx.table_name).execute().await.unwrap();
+        let hashes = idx.query_text_hashes(&table, &[&node_b_id]).await;
+        match hashes {
+            Some(map) => {
+                assert!(!map.contains_key(&node_b_id),
+                    "stale row for removed node should be deleted, but found id: {}", node_b_id);
+            }
+            None => {
+                // text_hash column missing = old schema, acceptable
+            }
+        }
     }
 
     #[test]

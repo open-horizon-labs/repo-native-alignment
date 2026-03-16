@@ -122,7 +122,7 @@ impl RnaHandler {
         // lance path consolidation. Remove it if the lance path exists.
         let stale_embeddings_dir = self.repo_root.join(".oh").join(".cache").join("embeddings");
         let lance_dir = self.repo_root.join(".oh").join(".cache").join("lance");
-        if lance_dir.join("artifacts.lance").exists() && stale_embeddings_dir.exists() {
+        if lance_dir.exists() && stale_embeddings_dir.exists() {
             match std::fs::remove_dir_all(&stale_embeddings_dir) {
                 Ok(()) => tracing::info!(
                     "Cleaned up stale cache directory: {}",
