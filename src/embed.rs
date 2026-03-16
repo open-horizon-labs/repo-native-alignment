@@ -956,8 +956,22 @@ impl EmbeddingIndex {
                         .execute()
                         .await
                         .context("Failed to create LanceDB table")?;
+                } else if !table_exists {
+                    // Subsequent batches on a fresh table: simple append.
+                    // No duplicates are possible on a fresh build, so
+                    // merge_insert (which can fail on a newly created table)
+                    // is unnecessary -- plain add() is correct and sufficient.
+                    let table = self.db.open_table(&self.table_name).execute().await
+                        .context("Failed to open table for add")?;
+                    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+                    table
+                        .add(Box::new(batches))
+                        .execute()
+                        .await
+                        .context("Failed to add batch to LanceDB table")?;
                 } else {
-                    // Merge-insert: upsert by id (update if exists, insert if new)
+                    // Incremental update: merge-insert to upsert by id
+                    // (update if hash changed, insert if new)
                     let table = self.db.open_table(&self.table_name).execute().await
                         .context("Failed to open table for merge_insert")?;
                     let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
