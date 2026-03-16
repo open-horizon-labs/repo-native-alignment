@@ -74,9 +74,8 @@ try {
   const requiredTools = new Set([
     "outcome_progress",
     "search",
-    "search_symbols",
-    "graph_query",
     "list_roots",
+    "repo_map",
   ]);
   const seen = new Set(tools.map((t) => t.name));
   for (const name of requiredTools) {
@@ -86,11 +85,13 @@ try {
       pass(`required tool present: ${name}`);
     }
   }
-  // Verify oh_search_context is removed
-  if (seen.has("oh_search_context")) {
-    fail("oh_search_context should be removed", "tool still present in listTools");
-  } else {
-    pass("oh_search_context correctly removed from tool list");
+  // Verify deprecated tools are removed
+  for (const removed of ["oh_search_context", "search_symbols", "graph_query"]) {
+    if (seen.has(removed)) {
+      fail(`${removed} should be removed`, "tool still present in listTools");
+    } else {
+      pass(`${removed} correctly removed from tool list`);
+    }
   }
 
   // ── 2. search (with artifacts) ──────────────────────────────────────────
@@ -113,18 +114,18 @@ try {
     pass("search (artifacts) returned non-empty response");
   }
 
-  // ── 4. search_symbols ───────────────────────────────────────────────────
-  console.log("\n── search_symbols ──");
+  // ── 4. search (code symbols) ────────────────────────────────────────────
+  console.log("\n── search (code) ──");
   const searchSymResult = await client.callTool({
-    name: "search_symbols",
-    arguments: { query: "main", limit: 5 },
+    name: "search",
+    arguments: { query: "main", include_artifacts: false, include_markdown: false, top_k: 5 },
   });
   const searchSymText = extractText(searchSymResult);
-  if (searchSymText.startsWith("No symbols matching")) {
-    fail("search_symbols('main') returns results", "Got 'No symbols matching'");
+  if (searchSymText.startsWith("No results matching")) {
+    fail("search('main') returns results", "Got 'No results matching'");
   } else {
-    assertContains("search_symbols returns symbol entry", searchSymText, "main");
-    pass("search_symbols('main') returned results");
+    assertContains("search returns code symbol entry", searchSymText, "main");
+    pass("search('main') returned results");
   }
 
   // ── 5. outcome_progress ─────────────────────────────────────────────────
