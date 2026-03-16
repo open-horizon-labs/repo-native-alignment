@@ -436,7 +436,21 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
             // finds nothing.
             match embed_idx.search_with_mode(query_text, None, top_k.min(50) * 3, search_mode).await {
                 Ok(SearchOutcome::Results(results)) if !results.is_empty() => {
-                    let code_results: Vec<_> = results.into_iter().filter(|r| r.kind.starts_with("code:")).filter(|r| search_result_passes_root_filter(r, &ctx.root_filter, &ctx.non_code_slugs)).take(top_k).collect();
+                    let node_index_map_for_entry = ctx.graph_state.node_index_map();
+                    let code_results: Vec<_> = results.into_iter()
+                        .filter(|r| r.kind.starts_with("code:"))
+                        .filter(|r| search_result_passes_root_filter(r, &ctx.root_filter, &ctx.non_code_slugs))
+                        .filter(|r| {
+                            if let Some(ref sub) = params.subsystem {
+                                ctx.graph_state.node_by_stable_id(&r.id, &node_index_map_for_entry)
+                                    .and_then(|n| n.metadata.get("subsystem"))
+                                    .map(|s| s.eq_ignore_ascii_case(sub))
+                                    .unwrap_or(false)
+                            } else {
+                                true
+                            }
+                        })
+                        .take(top_k).collect();
                     if code_results.is_empty() { return format!("No code symbols matched query \"{}\". Try a different query or use node parameter.", query_text); }
                     let mut header = format!("### Matched entry nodes for \"{}\"\n\n", query_text);
                     let strip = ctx.root_filter.as_deref();
@@ -564,11 +578,15 @@ fn format_impact_subsystem_breakdown(
     node_index_map: &std::collections::HashMap<String, usize>,
     strip: Option<&str>,
 ) -> String {
-    // Collect all result node IDs across edge-kind groups
+    // Collect all unique result node IDs across edge-kind groups, deduplicated.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut subsystem_nodes: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
     for ids in merged_groups.values() {
         for id in ids {
+            if !seen.insert(id.clone()) {
+                continue; // Skip duplicates across edge-kind buckets
+            }
             if let Some(node) = gs.node_by_stable_id(id, node_index_map) {
                 if let Some(sub) = node.metadata.get("subsystem") {
                     subsystem_nodes
@@ -760,6 +778,10 @@ fn resolve_entry_points_by_name<'a>(
         }
         if !node_passes_root_filter(&n.id.root, &ctx.root_filter, &ctx.non_code_slugs) {
             return false;
+        }
+        if let Some(ref sub) = params.subsystem {
+            let node_sub = n.metadata.get("subsystem").map(|s| s.as_str()).unwrap_or("");
+            if !node_sub.eq_ignore_ascii_case(sub) { return false; }
         }
         true
     }).collect();
