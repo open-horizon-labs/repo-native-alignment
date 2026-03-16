@@ -3,6 +3,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Metadata key for subsystem cluster assignment.
+/// Shared with service.rs for filtering.
+pub(crate) const SUBSYSTEM_KEY: &str = "subsystem";
+
 use crate::embed::EmbeddingIndex;
 use crate::extract::ExtractorRegistry;
 use crate::graph::{Edge, Node};
@@ -565,12 +569,12 @@ impl RnaHandler {
             for node in &mut all_nodes {
                 if let Some(subsystem_name) = node_subsystem.get(&node.stable_id()) {
                     node.metadata
-                        .insert("subsystem".to_string(), subsystem_name.clone());
+                        .insert(SUBSYSTEM_KEY.to_owned(), subsystem_name.clone());
                     tagged += 1;
                 } else {
                     // Remove stale subsystem metadata from cached nodes that are
                     // no longer in any cluster.
-                    node.metadata.remove("subsystem");
+                    node.metadata.remove(SUBSYSTEM_KEY);
                 }
             }
             if tagged > 0 {
@@ -823,12 +827,12 @@ impl RnaHandler {
             // Track nodes whose subsystem changed so they get persisted to LanceDB
             for node in &mut graph.nodes {
                 let sid = node.stable_id();
-                let old_sub = node.metadata.get("subsystem").cloned();
+                let old_sub = node.metadata.get(SUBSYSTEM_KEY).cloned();
                 let new_sub = node_subsystem.get(&sid).cloned();
                 if old_sub != new_sub {
                     match new_sub {
-                        Some(name) => { node.metadata.insert("subsystem".to_string(), name); }
-                        None => { node.metadata.remove("subsystem"); }
+                        Some(name) => { node.metadata.insert(SUBSYSTEM_KEY.to_owned(), name); }
+                        None => { node.metadata.remove(SUBSYSTEM_KEY); }
                     }
                     // Include in upsert set so LanceDB gets the updated metadata
                     upsert_node_ids.insert(sid);

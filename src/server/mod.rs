@@ -8,6 +8,9 @@ pub mod helpers;
 mod graph;
 mod enrichment;
 
+// Re-export subsystem metadata key for service layer filtering.
+pub(crate) use graph::SUBSYSTEM_KEY;
+
 // Re-export public API so external `use crate::server::X` still works.
 pub use tools::*;
 pub use store::{load_graph_from_lance, parse_edge_kind};

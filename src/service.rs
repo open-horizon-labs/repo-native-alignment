@@ -218,7 +218,7 @@ async fn flat_code_symbol_search<'a>(
             if cc < min_cc { return false; }
         }
         if let Some(ref sub) = params.subsystem {
-            let node_sub = n.metadata.get("subsystem").map(|s| s.as_str()).unwrap_or("");
+            let node_sub = n.metadata.get(crate::server::SUBSYSTEM_KEY).map(|s| s.as_str()).unwrap_or("");
             if !node_sub.eq_ignore_ascii_case(sub) { return false; }
         }
         true
@@ -443,7 +443,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
                         .filter(|r| {
                             if let Some(ref sub) = params.subsystem {
                                 ctx.graph_state.node_by_stable_id(&r.id, &node_index_map_for_entry)
-                                    .and_then(|n| n.metadata.get("subsystem"))
+                                    .and_then(|n| n.metadata.get(crate::server::SUBSYSTEM_KEY))
                                     .map(|s| s.eq_ignore_ascii_case(sub))
                                     .unwrap_or(false)
                             } else {
@@ -514,7 +514,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         for ids in merged_groups.values_mut() {
             ids.retain(|id| {
                 gs.node_by_stable_id(id, &node_index_map)
-                    .and_then(|n| n.metadata.get("subsystem"))
+                    .and_then(|n| n.metadata.get(crate::server::SUBSYSTEM_KEY))
                     .map(|s| s.eq_ignore_ascii_case(sub))
                     .unwrap_or(false)
             });
@@ -588,7 +588,7 @@ fn format_impact_subsystem_breakdown(
                 continue; // Skip duplicates across edge-kind buckets
             }
             if let Some(node) = gs.node_by_stable_id(id, node_index_map) {
-                if let Some(sub) = node.metadata.get("subsystem") {
+                if let Some(sub) = node.metadata.get(crate::server::SUBSYSTEM_KEY) {
                     subsystem_nodes
                         .entry(sub.clone())
                         .or_default()
@@ -780,7 +780,7 @@ fn resolve_entry_points_by_name<'a>(
             return false;
         }
         if let Some(ref sub) = params.subsystem {
-            let node_sub = n.metadata.get("subsystem").map(|s| s.as_str()).unwrap_or("");
+            let node_sub = n.metadata.get(crate::server::SUBSYSTEM_KEY).map(|s| s.as_str()).unwrap_or("");
             if !node_sub.eq_ignore_ascii_case(sub) { return false; }
         }
         true
@@ -1425,9 +1425,9 @@ mod tests {
     #[tokio::test]
     async fn test_flat_search_subsystem_filter() {
         let mut node_a = make_node("scan_files", NodeKind::Function, "src/scanner.rs");
-        node_a.metadata.insert("subsystem".to_string(), "scanner".to_string());
+        node_a.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "scanner".to_string());
         let mut node_b = make_node("scan_config", NodeKind::Function, "src/config.rs");
-        node_b.metadata.insert("subsystem".to_string(), "config".to_string());
+        node_b.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "config".to_string());
         let node_c = make_node("scan_other", NodeKind::Function, "src/other.rs");
         // node_c has no subsystem metadata
 
@@ -1451,7 +1451,7 @@ mod tests {
     #[tokio::test]
     async fn test_flat_search_subsystem_filter_case_insensitive() {
         let mut node = make_node("handler", NodeKind::Function, "src/server.rs");
-        node.metadata.insert("subsystem".to_string(), "Server".to_string());
+        node.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "Server".to_string());
 
         let gs = make_graph_state(vec![node]);
         let repo_root = PathBuf::from("/tmp/test");
@@ -1472,7 +1472,7 @@ mod tests {
     #[tokio::test]
     async fn test_flat_search_subsystem_allows_empty_query_browse() {
         let mut node = make_node("extract", NodeKind::Function, "src/extract.rs");
-        node.metadata.insert("subsystem".to_string(), "extractor".to_string());
+        node.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "extractor".to_string());
         let gs = make_graph_state(vec![node]);
         let repo_root = PathBuf::from("/tmp/test");
         let ctx = make_search_context(&gs, &repo_root);
@@ -1499,11 +1499,11 @@ mod tests {
     fn test_format_impact_subsystem_breakdown_groups_correctly() {
         use crate::graph::EdgeKind;
         let mut node_a = make_node("fn_a", NodeKind::Function, "src/alpha.rs");
-        node_a.metadata.insert("subsystem".to_string(), "alpha".to_string());
+        node_a.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "alpha".to_string());
         let mut node_b = make_node("fn_b", NodeKind::Function, "src/beta.rs");
-        node_b.metadata.insert("subsystem".to_string(), "beta".to_string());
+        node_b.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "beta".to_string());
         let mut node_c = make_node("fn_c", NodeKind::Function, "src/beta.rs");
-        node_c.metadata.insert("subsystem".to_string(), "beta".to_string());
+        node_c.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "beta".to_string());
         let gs = make_graph_state(vec![node_a.clone(), node_b.clone(), node_c.clone()]);
         let node_index_map = gs.node_index_map();
 
