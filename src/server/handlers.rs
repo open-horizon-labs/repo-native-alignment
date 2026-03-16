@@ -458,12 +458,12 @@ mod tests {
         // a -> b -> c (impact of c: b and a, reversed)
         let mut index = GraphIndex::new();
         index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
-        index.add_edge("b", "fn", "c", "fn", EdgeKind::DependsOn);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
 
         let groups = run_traversal_grouped(&index, "c", "impact", None, None, None).unwrap();
-        assert!(!groups.is_empty(), "should find dependents");
-        // b is a direct incoming neighbor via DependsOn
-        assert!(groups.contains_key(&EdgeKind::DependsOn), "should have DependsOn group");
+        assert!(!groups.is_empty(), "should find dependents via Calls edges");
+        // b is a direct incoming neighbor via Calls (impact defaults to Calls+ReferencedBy)
+        assert!(groups.contains_key(&EdgeKind::Calls), "should have Calls group");
     }
 
     #[test]
