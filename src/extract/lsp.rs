@@ -492,6 +492,8 @@ struct LspState {
     init_failed: bool,
     /// Whether the language server supports type hierarchy requests.
     has_type_hierarchy: bool,
+    /// Whether the language server supports textDocument/references requests.
+    has_references: bool,
     /// Consecutive type hierarchy failures. After MAX_TYPE_HIERARCHY_STRIKES,
     /// type hierarchy is disabled for the rest of the session.
     type_hierarchy_strikes: u32,
@@ -528,6 +530,7 @@ impl LspEnricher {
                 root_path: None,
                 init_failed: false,
                 has_type_hierarchy: false,
+                has_references: false,
                 type_hierarchy_strikes: 0,
             }),
         }
@@ -667,6 +670,7 @@ impl LspEnricher {
         );
 
         state.has_type_hierarchy = has_type_hierarchy;
+        state.has_references = has_references;
 
         // Send initialized notification
         let transport = state.transport.as_mut().unwrap();
@@ -936,6 +940,32 @@ impl LspEnricher {
         }
     }
 
+    /// Find references to a symbol at a position (pipelined).
+    /// Returns a list of LSP Location objects for each reference site.
+    async fn find_references_p(
+        transport: &PipelinedTransport,
+        file_uri: &Uri,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<Location>> {
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri.as_str() },
+            "position": { "line": line, "character": character },
+            "context": { "includeDeclaration": false }
+        });
+
+        let result: serde_json::Value = transport
+            .request("textDocument/references", &params)
+            .await?;
+
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+
+        let locations: Vec<Location> = serde_json::from_value(result).unwrap_or_default();
+        Ok(locations)
+    }
+
     /// Use type hierarchy to discover supertypes for a node, creating
     /// Implements edges for each resolved supertype relationship.
     ///
@@ -1169,7 +1199,7 @@ impl Enricher for LspEnricher {
         }
 
         // Extract state under lock, then release the lock for concurrent work
-        let (transport, root, has_type_hierarchy, type_hierarchy_strikes) = {
+        let (transport, root, has_type_hierarchy, type_hierarchy_strikes, has_references) = {
             let state = self.state.lock().await;
             let root = state
                 .root_path
@@ -1179,7 +1209,7 @@ impl Enricher for LspEnricher {
                 Some(t) => Arc::clone(t),
                 None => return Ok(result),
             };
-            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes)
+            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references)
         };
         // State lock is released here — concurrent tasks can proceed
 
@@ -1201,7 +1231,8 @@ impl Enricher for LspEnricher {
         // and halve the total RPC count.
         let enrichable_nodes: Vec<&Node> = matching_nodes.iter()
             .filter(|n| matches!(n.id.kind,
-                NodeKind::Function | NodeKind::Trait | NodeKind::Other(_)))
+                NodeKind::Function | NodeKind::Trait | NodeKind::Other(_)
+                | NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const))
             .filter(|n| {
                 // Skip test functions (have #[test] or #[tokio::test] decorator)
                 if n.id.kind == NodeKind::Function {
@@ -1220,12 +1251,18 @@ impl Enricher for LspEnricher {
             .copied()
             .collect();
 
+        let ref_eligible = enrichable_nodes.iter()
+            .filter(|n| matches!(n.id.kind,
+                NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const))
+            .count();
         tracing::info!(
-            "LSP pipeline: {} enrichable nodes out of {} total ({}f, {}t, {}o)",
+            "LSP pipeline: {} enrichable nodes out of {} total ({}f, {}t, {}r, {}o) [references={}]",
             enrichable_nodes.len(), matching_nodes.len(),
             enrichable_nodes.iter().filter(|n| n.id.kind == NodeKind::Function).count(),
             enrichable_nodes.iter().filter(|n| n.id.kind == NodeKind::Trait).count(),
+            ref_eligible,
             enrichable_nodes.iter().filter(|n| matches!(n.id.kind, NodeKind::Other(_))).count(),
+            has_references,
         );
 
         // Concurrency control: TCP slow-start from 4 to 64.
@@ -1444,6 +1481,53 @@ impl Enricher for LspEnricher {
                             }
                             Err(e) => {
                                 tracing::debug!("Implementation lookup failed for {}: {}", node.id.name, e);
+                            }
+                        }
+                    }
+                    NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
+                        // Use textDocument/references to find usage sites for
+                        // non-function symbols (structs, enums, type aliases, consts).
+                        if has_references {
+                            match Self::find_references_p(&transport, &file_uri, line, col).await {
+                                Ok(locations) => {
+                                    let matching_refs: Vec<&Node> = matching_owned.iter().collect();
+                                    for loc in &locations {
+                                        let ref_path = uri_to_relative_path(&loc.uri, &root);
+                                        let ref_line = loc.range.start.line as usize + 1;
+
+                                        // Skip external dependencies
+                                        if ref_path.to_string_lossy().contains(".cargo") {
+                                            continue;
+                                        }
+
+                                        // Skip self-references (definition site)
+                                        if ref_path == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end {
+                                            continue;
+                                        }
+
+                                        // Resolve to the enclosing symbol at the reference site
+                                        let referrer_id = find_enclosing_symbol(&matching_refs, &ref_path, ref_line);
+
+                                        if let Some(referrer) = referrer_id {
+                                            // Skip self-edges
+                                            if referrer == node.id {
+                                                continue;
+                                            }
+                                            edges.push(Edge {
+                                                from: referrer,
+                                                to: node.id.clone(),
+                                                kind: EdgeKind::ReferencedBy,
+                                                source: ExtractionSource::Lsp,
+                                                confidence: Confidence::Confirmed,
+                                            });
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    had_error = true;
+                                    error_count.fetch_add(1, Ordering::Relaxed);
+                                    tracing::debug!("textDocument/references failed for {}: {}", node.id.name, e);
+                                }
                             }
                         }
                     }
