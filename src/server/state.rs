@@ -40,20 +40,33 @@ impl GraphState {
     /// Returns the full stable ID if found, or the original ID if not.
     pub fn resolve_node_id(&self, id: &str) -> String {
         let index_map = self.node_index_map();
-        self.resolve_node_id_fast(id, &index_map)
+        let roots = Self::root_slugs_from_index_map(&index_map);
+        Self::resolve_node_id_fast(id, &index_map, &roots)
     }
 
-    /// Resolve a node ID using the pre-built index map. O(1) for exact match,
-    /// O(roots) for short-ID resolution.
-    pub fn resolve_node_id_fast(&self, id: &str, index_map: &std::collections::HashMap<String, usize>) -> String {
+    /// Extract sorted, deterministic root slugs from a pre-built index map.
+    /// Call once per search context, then pass to `resolve_node_id_fast`.
+    pub fn root_slugs_from_index_map(
+        index_map: &std::collections::HashMap<String, usize>,
+    ) -> Vec<String> {
+        let mut roots = std::collections::BTreeSet::new();
+        for stable_id in index_map.keys() {
+            if let Some((root, _)) = stable_id.split_once(':') {
+                roots.insert(root.to_string());
+            }
+        }
+        roots.into_iter().collect()
+    }
+
+    /// Resolve a node ID using the pre-built index map and roots list.
+    /// O(1) for exact match, O(roots) for short-ID resolution.
+    /// Precompute `roots` with `root_slugs_from_index_map` to avoid
+    /// rebuilding per call in batch loops.
+    pub fn resolve_node_id_fast(id: &str, index_map: &std::collections::HashMap<String, usize>, roots: &[String]) -> String {
         if index_map.contains_key(id) {
             return id.to_string();
         }
-        // Extract unique root slugs from index_map keys (everything before the first ':').
-        let roots: std::collections::HashSet<&str> = index_map.keys()
-            .filter_map(|stable_id| stable_id.split_once(':').map(|(root, _)| root))
-            .collect();
-        for root in &roots {
+        for root in roots {
             let full_id = format!("{}:{}", root, id);
             if index_map.contains_key(&full_id) {
                 return full_id;
@@ -848,8 +861,9 @@ mod tests {
         let node = make_test_node("myroot", "src/embed.rs", "EmbeddingIndex", crate::graph::NodeKind::Struct);
         let gs = make_test_graph_state(vec![node]);
         let index_map = gs.node_index_map();
+        let roots = GraphState::root_slugs_from_index_map(&index_map);
         let full = "myroot:src/embed.rs:EmbeddingIndex:struct";
-        assert_eq!(gs.resolve_node_id_fast(full, &index_map), full);
+        assert_eq!(GraphState::resolve_node_id_fast(full, &index_map, &roots), full);
     }
 
     #[test]
@@ -857,8 +871,9 @@ mod tests {
         let node = make_test_node("myroot", "src/embed.rs", "EmbeddingIndex", crate::graph::NodeKind::Struct);
         let gs = make_test_graph_state(vec![node]);
         let index_map = gs.node_index_map();
+        let roots = GraphState::root_slugs_from_index_map(&index_map);
         let short = "src/embed.rs:EmbeddingIndex:struct";
-        assert_eq!(gs.resolve_node_id_fast(short, &index_map), "myroot:src/embed.rs:EmbeddingIndex:struct");
+        assert_eq!(GraphState::resolve_node_id_fast(short, &index_map, &roots), "myroot:src/embed.rs:EmbeddingIndex:struct");
     }
 
     #[test]
@@ -866,8 +881,9 @@ mod tests {
         let node = make_test_node("myroot", "src/embed.rs", "EmbeddingIndex", crate::graph::NodeKind::Struct);
         let gs = make_test_graph_state(vec![node]);
         let index_map = gs.node_index_map();
+        let roots = GraphState::root_slugs_from_index_map(&index_map);
         let unknown = "totally:bogus:id";
-        assert_eq!(gs.resolve_node_id_fast(unknown, &index_map), unknown);
+        assert_eq!(GraphState::resolve_node_id_fast(unknown, &index_map, &roots), unknown);
     }
 
     #[test]
