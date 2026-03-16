@@ -1399,6 +1399,67 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
             sections.push(format!("## Top {} symbols by importance\n\n{}", swi.len(), md));
         }
     }
+    // Subsystem detection via Louvain community detection on coupling edges
+    {
+        // Build node-id -> file-path map for cluster naming
+        let node_file_map: std::collections::HashMap<String, String> = graph_state
+            .nodes
+            .iter()
+            .filter(|n| n.id.root != "external")
+            .filter(|n| node_passes_root_filter(&n.id.root, &params.root_filter, &params.non_code_slugs))
+            .map(|n| (n.stable_id(), n.id.file.display().to_string()))
+            .collect();
+
+        // Build pagerank scores map from node metadata
+        let pagerank_scores: std::collections::HashMap<String, f64> = graph_state
+            .nodes
+            .iter()
+            .filter_map(|n| {
+                n.metadata
+                    .get("importance")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .map(|imp| (n.stable_id(), imp))
+            })
+            .collect();
+
+        let subsystems = graph_state.index.detect_communities(&pagerank_scores, &node_file_map);
+        if !subsystems.is_empty() {
+            let md: String = subsystems
+                .iter()
+                .map(|s| {
+                    let interfaces_str = if s.interfaces.is_empty() {
+                        String::new()
+                    } else {
+                        let iface_list: Vec<String> = s
+                            .interfaces
+                            .iter()
+                            .map(|iface| {
+                                // Extract short name from node ID (last colon-separated segment before kind)
+                                let short_name = iface
+                                    .node_id
+                                    .split(':')
+                                    .rev()
+                                    .nth(1)
+                                    .unwrap_or(&iface.node_id);
+                                format!("{}()", short_name)
+                            })
+                            .collect();
+                        format!("\n  Interfaces: {}", iface_list.join(", "))
+                    };
+                    format!(
+                        "- **{}** ({} symbols, cohesion: {:.2}){}",
+                        s.name, s.symbol_count, s.cohesion, interfaces_str
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            sections.push(format!(
+                "## Subsystems ({} detected)\n\n{}",
+                subsystems.len(),
+                md
+            ));
+        }
+    }
     { let mut fc: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
         for n in &graph_state.nodes { if matches!(n.id.kind, NodeKind::Import | NodeKind::Module | NodeKind::PrMerge | NodeKind::Field) { continue; }
             if n.id.root == "external" { continue; }
