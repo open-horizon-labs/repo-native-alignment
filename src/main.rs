@@ -46,6 +46,7 @@ struct SearchArgs {
     #[arg(long, default_value_t = true)] include_artifacts: bool, #[arg(long, default_value_t = true)] include_markdown: bool,
     #[arg(long)] artifact_types: Option<String>, #[arg(long)] root: Option<String>,
     #[arg(long)] rerank: bool, #[arg(long)] subsystem: Option<String>,
+    #[arg(long)] target_subsystem: Option<String>,
 }
 #[derive(clap::Args, Debug)]
 struct GraphArgs {
@@ -184,6 +185,7 @@ async fn async_main() -> anyhow::Result<()> {
                 include_artifacts: args.include_artifacts, include_markdown: args.include_markdown,
                 artifact_types: args.artifact_types.as_ref().map(|s| s.split(',').map(|t| t.trim().to_string()).collect()),
                 subsystem: args.subsystem.clone(),
+                target_subsystem: args.target_subsystem.clone(),
             };
             let root_filter = resolve_root_filter(args.root.as_deref(), &repo_root);
             let ctx = SearchContext { graph_state: &gs, embed_index: embed_ref, repo_root: &repo_root, lsp_status: None, embed_status: None, root_filter, non_code_slugs: std::collections::HashSet::new() };

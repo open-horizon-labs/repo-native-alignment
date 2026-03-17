@@ -42,6 +42,7 @@ pub struct SearchParams {
     pub include_markdown: bool,
     pub artifact_types: Option<Vec<String>>,
     pub subsystem: Option<String>,
+    pub target_subsystem: Option<String>,
 }
 
 impl SearchParams {
@@ -69,6 +70,7 @@ impl SearchParams {
             include_markdown: args.include_markdown.unwrap_or(true),
             artifact_types: args.artifact_types.clone(),
             subsystem: args.subsystem.clone(),
+            target_subsystem: args.target_subsystem.clone(),
         }
     }
 }
@@ -509,13 +511,27 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
             ids.retain(|id| gs.node_by_stable_id(id, &node_index_map).map(ranking::is_test_file).unwrap_or(false));
         }
     }
-    // Apply subsystem filter to traversal results
+    // Apply subsystem filter to traversal results (within-subsystem query).
+    // When only `subsystem` is set, restrict neighbors to the same subsystem.
     if let Some(ref sub) = params.subsystem {
         for ids in merged_groups.values_mut() {
             ids.retain(|id| {
                 gs.node_by_stable_id(id, &node_index_map)
                     .and_then(|n| n.metadata.get(crate::server::SUBSYSTEM_KEY))
                     .map(|s| subsystem_matches(s, sub))
+                    .unwrap_or(false)
+            });
+        }
+    }
+    // Apply target_subsystem filter (cross-subsystem query).
+    // When set, keep only neighbors whose subsystem matches the target.
+    // This enables queries like "what connects node X to the server subsystem?"
+    if let Some(ref target_sub) = params.target_subsystem {
+        for ids in merged_groups.values_mut() {
+            ids.retain(|id| {
+                gs.node_by_stable_id(id, &node_index_map)
+                    .and_then(|n| n.metadata.get(crate::server::SUBSYSTEM_KEY))
+                    .map(|s| subsystem_matches(s, target_sub))
                     .unwrap_or(false)
             });
         }
@@ -848,6 +864,25 @@ mod tests {
     fn make_graph_state(nodes: Vec<Node>) -> GraphState {
         let index = GraphIndex::new();
         GraphState { nodes, edges: vec![], index, last_scan_completed_at: None }
+    }
+
+    fn make_graph_state_with_edges(nodes: Vec<Node>, edges: Vec<crate::graph::Edge>) -> GraphState {
+        let mut index = GraphIndex::new();
+        index.rebuild_from_edges(&edges);
+        for node in &nodes {
+            index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+        }
+        GraphState { nodes, edges, index, last_scan_completed_at: None }
+    }
+
+    fn make_edge(from: &Node, to: &Node, kind: crate::graph::EdgeKind) -> crate::graph::Edge {
+        crate::graph::Edge {
+            from: from.id.clone(),
+            to: to.id.clone(),
+            kind,
+            source: ExtractionSource::TreeSitter,
+            confidence: crate::graph::Confidence::Detected,
+        }
     }
 
     fn make_search_context<'a>(graph_state: &'a GraphState, repo_root: &'a Path) -> SearchContext<'a> {
@@ -1553,6 +1588,148 @@ mod tests {
         assert!(result.contains("enrich"), "Should include extract/enrich child");
         assert!(result.contains("NodeId"), "Should include extract/Node child");
         assert!(!result.contains("embed_texts"), "Should NOT include embed subsystem");
+    }
+
+    // ── Cross-subsystem traversal tests ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_traversal_target_subsystem_filters_neighbors() {
+        use crate::graph::EdgeKind;
+
+        // Create nodes in different subsystems
+        let mut node_a = make_node("handler", NodeKind::Function, "src/server.rs");
+        node_a.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "server".to_string());
+        let mut node_b = make_node("embed_text", NodeKind::Function, "src/embed.rs");
+        node_b.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "embed".to_string());
+        let mut node_c = make_node("scan_file", NodeKind::Function, "src/scanner.rs");
+        node_c.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "scanner".to_string());
+
+        // handler calls embed_text and scan_file
+        let edge1 = make_edge(&node_a, &node_b, EdgeKind::Calls);
+        let edge2 = make_edge(&node_a, &node_c, EdgeKind::Calls);
+
+        let gs = make_graph_state_with_edges(
+            vec![node_a.clone(), node_b.clone(), node_c.clone()],
+            vec![edge1, edge2],
+        );
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+
+        // Query: neighbors of handler, filtered to embed subsystem only
+        let params = SearchParams {
+            node: Some(node_a.stable_id()),
+            mode: Some("neighbors".into()),
+            target_subsystem: Some("embed".into()),
+            ..Default::default()
+        };
+        let result = search(&params, &ctx).await;
+        assert!(result.contains("embed_text"), "Should include embed neighbor");
+        assert!(!result.contains("scan_file"), "Should NOT include scanner neighbor");
+    }
+
+    #[tokio::test]
+    async fn test_traversal_target_subsystem_no_match_returns_empty() {
+        use crate::graph::EdgeKind;
+
+        let mut node_a = make_node("handler", NodeKind::Function, "src/server.rs");
+        node_a.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "server".to_string());
+        let mut node_b = make_node("embed_text", NodeKind::Function, "src/embed.rs");
+        node_b.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "embed".to_string());
+
+        let edge = make_edge(&node_a, &node_b, EdgeKind::Calls);
+        let gs = make_graph_state_with_edges(
+            vec![node_a.clone(), node_b.clone()],
+            vec![edge],
+        );
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+
+        // Query: neighbors of handler, filtered to nonexistent subsystem
+        let params = SearchParams {
+            node: Some(node_a.stable_id()),
+            mode: Some("neighbors".into()),
+            target_subsystem: Some("nonexistent".into()),
+            ..Default::default()
+        };
+        let result = search(&params, &ctx).await;
+        assert!(result.contains("No outgoing neighbors"), "Should report no neighbors when target_subsystem matches nothing");
+    }
+
+    #[tokio::test]
+    async fn test_traversal_subsystem_and_target_subsystem_combined() {
+        use crate::graph::EdgeKind;
+
+        // node_a (server) -> node_b (embed), node_c (scanner), node_d (server)
+        let mut node_a = make_node("handler", NodeKind::Function, "src/server.rs");
+        node_a.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "server".to_string());
+        let mut node_b = make_node("embed_text", NodeKind::Function, "src/embed.rs");
+        node_b.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "embed".to_string());
+        let mut node_c = make_node("scan_file", NodeKind::Function, "src/scanner.rs");
+        node_c.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "scanner".to_string());
+        let mut node_d = make_node("route", NodeKind::Function, "src/server/route.rs");
+        node_d.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "server".to_string());
+
+        let edges = vec![
+            make_edge(&node_a, &node_b, EdgeKind::Calls),
+            make_edge(&node_a, &node_c, EdgeKind::Calls),
+            make_edge(&node_a, &node_d, EdgeKind::Calls),
+        ];
+
+        let gs = make_graph_state_with_edges(
+            vec![node_a.clone(), node_b.clone(), node_c.clone(), node_d.clone()],
+            edges,
+        );
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+
+        // Both subsystem (server) and target_subsystem (embed) set.
+        // subsystem filters entry-point resolution (not relevant here since we use node ID).
+        // target_subsystem filters the traversal results.
+        let params = SearchParams {
+            node: Some(node_a.stable_id()),
+            mode: Some("neighbors".into()),
+            target_subsystem: Some("embed".into()),
+            ..Default::default()
+        };
+        let result = search(&params, &ctx).await;
+        assert!(result.contains("embed_text"), "Should include embed neighbor");
+        assert!(!result.contains("scan_file"), "Should NOT include scanner neighbor");
+        assert!(!result.contains("route"), "Should NOT include server neighbor");
+    }
+
+    #[tokio::test]
+    async fn test_traversal_target_subsystem_hierarchical_match() {
+        use crate::graph::EdgeKind;
+
+        let mut node_a = make_node("handler", NodeKind::Function, "src/server.rs");
+        node_a.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "server".to_string());
+        let mut node_b = make_node("enrich_node", NodeKind::Function, "src/extract/enrich.rs");
+        node_b.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "extract/enrich".to_string());
+        let mut node_c = make_node("parse_node", NodeKind::Function, "src/extract/parse.rs");
+        node_c.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "extract/parse".to_string());
+
+        let edges = vec![
+            make_edge(&node_a, &node_b, EdgeKind::Calls),
+            make_edge(&node_a, &node_c, EdgeKind::Calls),
+        ];
+
+        let gs = make_graph_state_with_edges(
+            vec![node_a.clone(), node_b.clone(), node_c.clone()],
+            edges,
+        );
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+
+        // target_subsystem="extract" should match both extract/enrich and extract/parse
+        let params = SearchParams {
+            node: Some(node_a.stable_id()),
+            mode: Some("neighbors".into()),
+            target_subsystem: Some("extract".into()),
+            ..Default::default()
+        };
+        let result = search(&params, &ctx).await;
+        assert!(result.contains("enrich_node"), "Should include extract/enrich child");
+        assert!(result.contains("parse_node"), "Should include extract/parse child");
     }
 
     #[test]

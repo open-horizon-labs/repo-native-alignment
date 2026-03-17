@@ -28,7 +28,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search",
-    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Add `mode` for graph traversal (neighbors/impact/reachable/tests_for). Use `compact: true` to save tokens. Use `rerank: true` for natural language queries. Use `subsystem` to scope to a subsystem from repo_map."
+    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Add `mode` for graph traversal (neighbors/impact/reachable/tests_for). Use `compact: true` to save tokens. Use `rerank: true` for natural language queries. Use `subsystem` to scope to a subsystem from repo_map. Use `target_subsystem` with mode to find cross-subsystem edges."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct Search {
@@ -98,6 +98,9 @@ pub struct Search {
     /// Filter to a specific subsystem (from repo_map)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subsystem: Option<String>,
+    /// Cross-subsystem query: show only neighbors in this target subsystem. Use with mode="neighbors" to find edges between subsystems.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_subsystem: Option<String>,
 }
 
 fn default_true() -> Option<bool> {
@@ -451,6 +454,18 @@ mod tests {
     fn test_search_subsystem_default_is_none() {
         let s = parse_search(json!({"query": "test"})).unwrap();
         assert!(s.subsystem.is_none());
+    }
+
+    #[test]
+    fn test_search_target_subsystem_param() {
+        let s = parse_search(json!({"query": "handler", "mode": "neighbors", "node": "x", "target_subsystem": "embed"})).unwrap();
+        assert_eq!(s.target_subsystem, Some("embed".to_string()));
+    }
+
+    #[test]
+    fn test_search_target_subsystem_default_is_none() {
+        let s = parse_search(json!({"query": "test"})).unwrap();
+        assert!(s.target_subsystem.is_none());
     }
 
     // ── Rerank parameter tests ───────────────────────────────────────────
