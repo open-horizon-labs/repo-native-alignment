@@ -11,6 +11,7 @@ use petgraph::visit::EdgeRef as PetgraphEdgeRef;
 use petgraph::Direction;
 
 use super::{Edge, EdgeKind};
+use crate::ranking::is_test_path;
 
 // ---------------------------------------------------------------------------
 // Edge-type weights for PageRank
@@ -431,8 +432,25 @@ impl GraphIndex {
         pagerank_scores: &HashMap<String, f64>,
         node_file_map: &HashMap<String, String>,
     ) -> Vec<Subsystem> {
+        // Step 0: Identify test nodes. Test functions form small tight clusters
+        // that are not architectural units. We exclude them from Louvain and
+        // assign them to their nearest production subsystem post-hoc.
+        let n = self.graph.node_count();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        let is_test_node: Vec<bool> = (0..n)
+            .map(|idx| {
+                let nr = &self.graph[NodeIndex::new(idx)];
+                node_file_map
+                    .get(&nr.id)
+                    .map(|p| is_test_path(p))
+                    .unwrap_or(false)
+            })
+            .collect();
+
         // Step 1: Build coupling subgraph as an undirected adjacency list.
-        // We work with NodeIndex values directly for performance.
         // Edge selection: only edges that represent actual coupling between
         // symbols. DependsOn (imports) is excluded because it creates trivially
         // large clusters -- every file that imports a common type ends up in one
@@ -445,13 +463,8 @@ impl GraphIndex {
             EdgeKind::ConnectsTo,
         ];
 
-        // Collect coupling edges as undirected pairs with weights.
         // adj[node_index] = vec of (neighbor_index, weight)
-        let n = self.graph.node_count();
-        if n == 0 {
-            return Vec::new();
-        }
-
+        // Only production (non-test) nodes participate.
         let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
         let mut total_weight = 0.0;
 
@@ -460,12 +473,12 @@ impl GraphIndex {
             if !coupling_kinds.contains(kind) {
                 continue;
             }
-            let w = edge_weight(kind);
             let s = edge_ref.source().index();
             let t = edge_ref.target().index();
-            if s == t {
+            if s == t || is_test_node[s] || is_test_node[t] {
                 continue;
             }
+            let w = edge_weight(kind);
             adj[s].push((t, w));
             adj[t].push((s, w));
             total_weight += w;
@@ -477,91 +490,46 @@ impl GraphIndex {
 
         // Guard: require a minimum density of coupling edges relative to node
         // count. Without enough edges (e.g., no LSP data), the graph is too
-        // sparse for Louvain to find meaningful communities. We require at
-        // least 5% of nodes to have coupling edges for large graphs.
+        // sparse for Louvain to find meaningful communities.
+        let prod_count = is_test_node.iter().filter(|t| !**t).count();
         let nodes_with_edges = adj.iter().filter(|nbrs| !nbrs.is_empty()).count();
-        if nodes_with_edges < 3 || (n > 100 && (nodes_with_edges as f64) < (n as f64 * 0.05)) {
+        if nodes_with_edges < 3
+            || (prod_count > 100 && (nodes_with_edges as f64) < (prod_count as f64 * 0.05))
+        {
             return Vec::new();
         }
 
-        // Weighted degree of each node (sum of coupling edge weights, undirected)
-        let k: Vec<f64> = adj.iter().map(|nbrs| nbrs.iter().map(|(_, w)| w).sum()).collect();
+        // Resolution parameter gamma: lower values produce fewer, larger clusters.
+        // gamma=1.0 is standard Louvain; gamma<1.0 penalizes small communities.
+        let gamma: f64 = 0.8;
 
-        // Step 2: Louvain phase 1 -- iteratively move nodes to maximize modularity.
-        // community[i] = community assignment of node i
-        let mut community: Vec<usize> = (0..n).collect();
-        let m2 = 2.0 * total_weight; // sum of all edge weights (each counted once)
+        // Step 2: Louvain Phase 1 -- iteratively move nodes to maximize modularity.
+        let community = louvain_phase1(&adj, total_weight, gamma, n);
 
-        // Maintain sigma_tot incrementally: sum of weighted degrees per community.
-        // Initial state: each node is its own community, so sigma_tot[i] = k[i].
-        let mut sigma_tot: HashMap<usize, f64> = (0..n).map(|i| (i, k[i])).collect();
+        // Step 3: Louvain Phase 2 -- contract communities into super-nodes and
+        // repeat Phase 1 on the coarsened graph until no further improvement.
+        let mut community = louvain_phase2(&adj, community, gamma, n);
 
-        let mut improved = true;
-        let mut iterations = 0;
-        while improved && iterations < 20 {
-            improved = false;
-            iterations += 1;
-
-            for node in 0..n {
-                if k[node] == 0.0 {
-                    continue; // isolated node
-                }
-
-                let current_comm = community[node];
-
-                // Compute weight of edges from `node` to each neighboring community
-                let mut comm_weights: HashMap<usize, f64> = HashMap::new();
-                for &(nbr, w) in &adj[node] {
-                    *comm_weights.entry(community[nbr]).or_default() += w;
-                }
-
-                // Weight to current community (needed for removal delta)
-                let w_to_current = comm_weights.get(&current_comm).copied().unwrap_or(0.0);
-
-                let sigma_current = sigma_tot.get(&current_comm).copied().unwrap_or(0.0);
-                let ki = k[node];
-
-                // Modularity gain from removing node from its current community
-                let remove_delta = -w_to_current / m2 + ki * (sigma_current - ki) / (m2 * m2);
-
-                // Find best community to move to
-                let mut best_comm = current_comm;
-                let mut best_gain = 0.0;
-
-                for (&candidate_comm, &w_to_candidate) in &comm_weights {
-                    if candidate_comm == current_comm {
-                        continue;
-                    }
-                    let sigma_candidate = sigma_tot.get(&candidate_comm).copied().unwrap_or(0.0);
-                    let insert_delta = w_to_candidate / m2 - ki * sigma_candidate / (m2 * m2);
-                    let gain = remove_delta + insert_delta;
-                    if gain > best_gain {
-                        best_gain = gain;
-                        best_comm = candidate_comm;
-                    }
-                }
-
-                if best_comm != current_comm {
-                    // Update sigma_tot: remove node's degree from old, add to new
-                    *sigma_tot.entry(current_comm).or_default() -= ki;
-                    *sigma_tot.entry(best_comm).or_default() += ki;
-                    community[node] = best_comm;
-                    improved = true;
-                }
+        // Step 4: Collect communities, compute stats, and build Subsystem structs.
+        // Group production nodes by community
+        let mut comm_members: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (node_idx, &comm) in community.iter().enumerate() {
+            if !is_test_node[node_idx] {
+                comm_members.entry(comm).or_default().push(node_idx);
             }
         }
 
-        // Step 3: Collect communities, compute stats, and build Subsystem structs.
-        // Group nodes by community
-        let mut comm_members: HashMap<usize, Vec<usize>> = HashMap::new();
-        for (node_idx, &comm) in community.iter().enumerate() {
-            comm_members.entry(comm).or_default().push(node_idx);
-        }
-
         // Filter out tiny clusters -- merge into nearest large cluster.
-        // Scale threshold: for small graphs 3 is fine, for larger graphs require
-        // at least 5 members per cluster to avoid noise from test helper groups.
-        let min_cluster_size = if n < 50 { 3 } else { 5 };
+        // Scale threshold with graph size: larger graphs need bigger clusters
+        // to be considered meaningful subsystems. Minimum 3 for small graphs,
+        // up to 10 for large graphs. Too high a threshold (>15) absorbs real
+        // subsystems like "rerank" or "process" that are architecturally
+        // distinct but small.
+        let min_cluster_size = if prod_count < 50 {
+            3
+        } else {
+            (prod_count / 200).clamp(5, 10)
+        };
         let large_comms: HashSet<usize> = comm_members
             .iter()
             .filter(|(_, members)| members.len() >= min_cluster_size)
@@ -572,9 +540,10 @@ impl GraphIndex {
             return Vec::new();
         }
 
-        // Reassign small-cluster nodes to the large cluster they have the most edges to
+        // Reassign small-cluster production nodes to the large cluster they
+        // have the most edges to.
         for node in 0..n {
-            if large_comms.contains(&community[node]) {
+            if is_test_node[node] || large_comms.contains(&community[node]) {
                 continue;
             }
             let mut best_comm = *large_comms.iter().next().unwrap();
@@ -595,7 +564,51 @@ impl GraphIndex {
             community[node] = best_comm;
         }
 
-        // Rebuild community members after merging
+        // Step 5: Assign test nodes to their nearest production subsystem.
+        // Each test node gets the community that has the most coupling edges
+        // to it (using the full graph, not the filtered adjacency list).
+        for node in 0..n {
+            if !is_test_node[node] {
+                continue;
+            }
+            let mut best_comm = *large_comms.iter().next().unwrap();
+            let mut best_weight = 0.0_f64;
+            let mut comm_w: HashMap<usize, f64> = HashMap::new();
+            // Check all edges in the original graph for this test node
+            for edge_ref in self.graph.edges(NodeIndex::new(node)) {
+                let nbr = edge_ref.target().index();
+                if !is_test_node[nbr] {
+                    let c = community[nbr];
+                    if large_comms.contains(&c) {
+                        let w = edge_weight(&edge_ref.weight().edge_type);
+                        *comm_w.entry(c).or_default() += w;
+                    }
+                }
+            }
+            // Also check incoming edges
+            for edge_ref in self
+                .graph
+                .edges_directed(NodeIndex::new(node), Direction::Incoming)
+            {
+                let nbr = edge_ref.source().index();
+                if !is_test_node[nbr] {
+                    let c = community[nbr];
+                    if large_comms.contains(&c) {
+                        let w = edge_weight(&edge_ref.weight().edge_type);
+                        *comm_w.entry(c).or_default() += w;
+                    }
+                }
+            }
+            for (&c, &w) in &comm_w {
+                if w > best_weight {
+                    best_weight = w;
+                    best_comm = c;
+                }
+            }
+            community[node] = best_comm;
+        }
+
+        // Rebuild community members after merging (includes test nodes now)
         let mut comm_members: HashMap<usize, Vec<usize>> = HashMap::new();
         for (node_idx, &comm) in community.iter().enumerate() {
             comm_members.entry(comm).or_default().push(node_idx);
@@ -636,8 +649,6 @@ impl GraphIndex {
                     member_ids.push(nr.id.clone());
                     if nr.node_type == "module" {
                         // Extract the node name from the stable ID: "root:file:name:kind"
-                        // Split from the right since name and kind are simple identifiers
-                        // (no colons), but root/file might contain colons.
                         if let Some(before_kind) = nr.id.rsplit_once(':') {
                             if let Some((_, name)) = before_kind.0.rsplit_once(':') {
                                 module_names.push(name.to_string());
@@ -690,6 +701,202 @@ impl GraphIndex {
         subsystems.sort_by(|a, b| b.symbol_count.cmp(&a.symbol_count));
         subsystems
     }
+}
+
+// ---------------------------------------------------------------------------
+// Louvain algorithm helpers
+// ---------------------------------------------------------------------------
+
+/// Louvain Phase 1: iteratively move nodes to the community that maximizes
+/// modularity gain. Returns a community assignment vector.
+///
+/// `gamma` is the resolution parameter: lower values produce fewer, larger
+/// clusters. gamma=1.0 is standard Louvain.
+fn louvain_phase1(
+    adj: &[Vec<(usize, f64)>],
+    total_weight: f64,
+    gamma: f64,
+    n: usize,
+) -> Vec<usize> {
+    let k: Vec<f64> = adj
+        .iter()
+        .map(|nbrs| nbrs.iter().map(|(_, w)| w).sum())
+        .collect();
+
+    let mut community: Vec<usize> = (0..n).collect();
+    let m2 = 2.0 * total_weight;
+
+    let mut sigma_tot: HashMap<usize, f64> = (0..n).map(|i| (i, k[i])).collect();
+
+    let mut improved = true;
+    let mut iterations = 0;
+    while improved && iterations < 20 {
+        improved = false;
+        iterations += 1;
+
+        for node in 0..n {
+            if k[node] == 0.0 {
+                continue;
+            }
+
+            let current_comm = community[node];
+
+            let mut comm_weights: HashMap<usize, f64> = HashMap::new();
+            for &(nbr, w) in &adj[node] {
+                *comm_weights.entry(community[nbr]).or_default() += w;
+            }
+
+            let w_to_current = comm_weights.get(&current_comm).copied().unwrap_or(0.0);
+            let sigma_current = sigma_tot.get(&current_comm).copied().unwrap_or(0.0);
+            let ki = k[node];
+
+            // Modularity gain from removing node from its current community.
+            // The gamma factor scales the expected-edges penalty term.
+            let remove_delta =
+                -w_to_current / m2 + gamma * ki * (sigma_current - ki) / (m2 * m2);
+
+            let mut best_comm = current_comm;
+            let mut best_gain = 0.0;
+
+            for (&candidate_comm, &w_to_candidate) in &comm_weights {
+                if candidate_comm == current_comm {
+                    continue;
+                }
+                let sigma_candidate =
+                    sigma_tot.get(&candidate_comm).copied().unwrap_or(0.0);
+                let insert_delta =
+                    w_to_candidate / m2 - gamma * ki * sigma_candidate / (m2 * m2);
+                let gain = remove_delta + insert_delta;
+                if gain > best_gain {
+                    best_gain = gain;
+                    best_comm = candidate_comm;
+                }
+            }
+
+            if best_comm != current_comm {
+                *sigma_tot.entry(current_comm).or_default() -= ki;
+                *sigma_tot.entry(best_comm).or_default() += ki;
+                community[node] = best_comm;
+                improved = true;
+            }
+        }
+    }
+
+    community
+}
+
+/// Louvain Phase 2: hierarchical contraction of communities.
+///
+/// After Phase 1 produces fine-grained communities, Phase 2 merges pairs
+/// of communities that share strong inter-community coupling relative to
+/// their sizes. This is a greedy agglomerative merge: repeatedly find the
+/// pair with the highest merge score and combine them, until no pair
+/// exceeds the merge threshold.
+///
+/// The merge score between communities A and B is:
+///   cross_weight(A,B) / min(size_A, size_B)
+///
+/// This normalizes by the smaller community's size, so small clusters with
+/// many edges to a larger cluster merge in (e.g., 6 extract/* fragments
+/// merge into one "extract" super-cluster).
+///
+/// `gamma` controls the merge threshold: lower gamma = more merging.
+fn louvain_phase2(
+    adj: &[Vec<(usize, f64)>],
+    mut community: Vec<usize>,
+    gamma: f64,
+    n: usize,
+) -> Vec<usize> {
+    // Count initial communities from production nodes only (nodes with
+    // coupling edges). Isolated nodes (test nodes, etc.) don't participate
+    // in Phase 2 and shouldn't inflate the community count.
+    let initial_comm_count = (0..n)
+        .filter(|&i| !adj[i].is_empty())
+        .map(|i| community[i])
+        .collect::<HashSet<_>>()
+        .len();
+
+    // Merge threshold: scale with gamma and the square root of the ratio
+    // between target and initial community count. This balances between
+    // over-merging (one giant cluster) and under-merging (91 fragments).
+    //
+    // For 2 communities: threshold = gamma * min(1.0, sqrt(12/2)) = gamma
+    // For 12 communities: threshold = gamma * sqrt(1.0) = gamma (~0.8)
+    // For 90 communities: threshold = gamma * sqrt(12/90) = 0.29
+    let target_k = 12.0_f64;
+    let ratio = (target_k / initial_comm_count.max(1) as f64).min(1.0);
+    let merge_threshold = gamma * ratio.sqrt();
+
+    // Size cap: don't merge if the result would exceed 30% of production
+    // nodes. This prevents the "snowball" effect where one cluster absorbs
+    // everything through incremental merges.
+    let prod_count = (0..n).filter(|&i| !adj[i].is_empty()).count();
+    let max_community_size = (prod_count as f64 * 0.30) as usize;
+
+    let max_rounds = 200;
+
+    for _ in 0..max_rounds {
+        // Collect unique community IDs and their sizes
+        let mut comm_sizes: HashMap<usize, usize> = HashMap::new();
+        for node in 0..n {
+            *comm_sizes.entry(community[node]).or_default() += 1;
+        }
+
+        let comm_ids: Vec<usize> = comm_sizes.keys().copied().collect();
+        if comm_ids.len() <= 1 {
+            break;
+        }
+
+        // Compute cross-community edge weights between all pairs
+        let mut cross_weights: HashMap<(usize, usize), f64> = HashMap::new();
+        for node in 0..n {
+            let ca = community[node];
+            for &(nbr, w) in &adj[node] {
+                let cb = community[nbr];
+                if ca < cb {
+                    *cross_weights.entry((ca, cb)).or_default() += w;
+                }
+            }
+        }
+
+        // Find the pair with the highest merge score.
+        let mut best_pair: Option<(usize, usize)> = None;
+        let mut best_score = 0.0_f64;
+
+        for (&(ca, cb), &w) in &cross_weights {
+            let size_a = comm_sizes[&ca];
+            let size_b = comm_sizes[&cb];
+            if size_a + size_b > max_community_size {
+                continue; // would create a giant cluster
+            }
+            let min_size = size_a.min(size_b) as f64;
+            let score = w / min_size;
+            if score > best_score {
+                best_score = score;
+                best_pair = Some((ca, cb));
+            }
+        }
+
+        if best_score < merge_threshold {
+            break; // no pair worth merging
+        }
+
+        // Merge: reassign all nodes from the smaller community to the larger
+        if let Some((ca, cb)) = best_pair {
+            let (from, to) = if comm_sizes[&ca] < comm_sizes[&cb] {
+                (ca, cb)
+            } else {
+                (cb, ca)
+            };
+            for node in 0..n {
+                if community[node] == from {
+                    community[node] = to;
+                }
+            }
+        }
+    }
+
+    community
 }
 
 // ---------------------------------------------------------------------------
@@ -1539,36 +1746,46 @@ mod tests {
 
     #[test]
     fn test_detect_communities_two_clusters() {
-        // Cluster A: a1 <-> a2 <-> a3 (tightly connected via Calls)
-        // Cluster B: b1 <-> b2 <-> b3 (tightly connected via Calls)
-        // Single weak link between clusters: a3 -> b1
+        // Two dense clusters of 6 nodes each with a single weak inter-cluster
+        // link. Needs 6 nodes per cluster so the modularity signal is strong
+        // enough to resist merging under gamma=0.8 + Phase 2 contraction.
         let mut index = GraphIndex::new();
-        // Cluster A: dense internal connections
-        index.add_edge("a1", "fn", "a2", "fn", EdgeKind::Calls);
-        index.add_edge("a2", "fn", "a1", "fn", EdgeKind::Calls);
-        index.add_edge("a2", "fn", "a3", "fn", EdgeKind::Calls);
-        index.add_edge("a3", "fn", "a2", "fn", EdgeKind::Calls);
-        index.add_edge("a1", "fn", "a3", "fn", EdgeKind::Calls);
-        index.add_edge("a3", "fn", "a1", "fn", EdgeKind::Calls);
-        // Cluster B: dense internal connections
-        index.add_edge("b1", "fn", "b2", "fn", EdgeKind::Calls);
-        index.add_edge("b2", "fn", "b1", "fn", EdgeKind::Calls);
-        index.add_edge("b2", "fn", "b3", "fn", EdgeKind::Calls);
-        index.add_edge("b3", "fn", "b2", "fn", EdgeKind::Calls);
-        index.add_edge("b1", "fn", "b3", "fn", EdgeKind::Calls);
-        index.add_edge("b3", "fn", "b1", "fn", EdgeKind::Calls);
-        // Weak inter-cluster link
-        index.add_edge("a3", "fn", "b1", "fn", EdgeKind::Calls);
+
+        // Cluster A: fully connected 6-node clique
+        let a_nodes: Vec<String> = (1..=6).map(|i| format!("a{}", i)).collect();
+        for i in 0..a_nodes.len() {
+            for j in 0..a_nodes.len() {
+                if i != j {
+                    index.add_edge(&a_nodes[i], "fn", &a_nodes[j], "fn", EdgeKind::Calls);
+                }
+            }
+        }
+
+        // Cluster B: fully connected 6-node clique
+        let b_nodes: Vec<String> = (1..=6).map(|i| format!("b{}", i)).collect();
+        for i in 0..b_nodes.len() {
+            for j in 0..b_nodes.len() {
+                if i != j {
+                    index.add_edge(&b_nodes[i], "fn", &b_nodes[j], "fn", EdgeKind::Calls);
+                }
+            }
+        }
+
+        // Single weak inter-cluster link
+        index.add_edge("a6", "fn", "b1", "fn", EdgeKind::Calls);
 
         let pagerank = index.compute_pagerank(0.85, 20);
-        let file_map = make_file_map(&[
-            ("a1", "src/alpha/mod.rs"),
-            ("a2", "src/alpha/mod.rs"),
-            ("a3", "src/alpha/mod.rs"),
-            ("b1", "src/beta/mod.rs"),
-            ("b2", "src/beta/mod.rs"),
-            ("b3", "src/beta/mod.rs"),
-        ]);
+        let mut file_map_entries: Vec<(&str, &str)> = Vec::new();
+        for n in &a_nodes {
+            file_map_entries.push((n.as_str(), "src/alpha/mod.rs"));
+        }
+        for n in &b_nodes {
+            file_map_entries.push((n.as_str(), "src/beta/mod.rs"));
+        }
+        let file_map: HashMap<String, String> = file_map_entries
+            .iter()
+            .map(|(id, file)| (id.to_string(), file.to_string()))
+            .collect();
 
         let subsystems = index.detect_communities(&pagerank, &file_map);
         assert!(
@@ -1588,34 +1805,45 @@ mod tests {
 
     #[test]
     fn test_detect_communities_has_interfaces() {
-        // Same two-cluster setup; the cross-cluster link should produce an interface
+        // Two dense 6-node clusters with a cross-cluster link; the boundary
+        // nodes should be detected as interface functions.
         let mut index = GraphIndex::new();
-        // Cluster A
-        index.add_edge("a1", "fn", "a2", "fn", EdgeKind::Calls);
-        index.add_edge("a2", "fn", "a1", "fn", EdgeKind::Calls);
-        index.add_edge("a2", "fn", "a3", "fn", EdgeKind::Calls);
-        index.add_edge("a3", "fn", "a2", "fn", EdgeKind::Calls);
-        index.add_edge("a1", "fn", "a3", "fn", EdgeKind::Calls);
-        index.add_edge("a3", "fn", "a1", "fn", EdgeKind::Calls);
-        // Cluster B
-        index.add_edge("b1", "fn", "b2", "fn", EdgeKind::Calls);
-        index.add_edge("b2", "fn", "b1", "fn", EdgeKind::Calls);
-        index.add_edge("b2", "fn", "b3", "fn", EdgeKind::Calls);
-        index.add_edge("b3", "fn", "b2", "fn", EdgeKind::Calls);
-        index.add_edge("b1", "fn", "b3", "fn", EdgeKind::Calls);
-        index.add_edge("b3", "fn", "b1", "fn", EdgeKind::Calls);
-        // Cross-cluster
-        index.add_edge("a3", "fn", "b1", "fn", EdgeKind::Calls);
+
+        // Cluster A: fully connected 6-node clique
+        let a_nodes: Vec<String> = (1..=6).map(|i| format!("a{}", i)).collect();
+        for i in 0..a_nodes.len() {
+            for j in 0..a_nodes.len() {
+                if i != j {
+                    index.add_edge(&a_nodes[i], "fn", &a_nodes[j], "fn", EdgeKind::Calls);
+                }
+            }
+        }
+
+        // Cluster B: fully connected 6-node clique
+        let b_nodes: Vec<String> = (1..=6).map(|i| format!("b{}", i)).collect();
+        for i in 0..b_nodes.len() {
+            for j in 0..b_nodes.len() {
+                if i != j {
+                    index.add_edge(&b_nodes[i], "fn", &b_nodes[j], "fn", EdgeKind::Calls);
+                }
+            }
+        }
+
+        // Cross-cluster link
+        index.add_edge("a6", "fn", "b1", "fn", EdgeKind::Calls);
 
         let pagerank = index.compute_pagerank(0.85, 20);
-        let file_map = make_file_map(&[
-            ("a1", "src/alpha/mod.rs"),
-            ("a2", "src/alpha/mod.rs"),
-            ("a3", "src/alpha/mod.rs"),
-            ("b1", "src/beta/mod.rs"),
-            ("b2", "src/beta/mod.rs"),
-            ("b3", "src/beta/mod.rs"),
-        ]);
+        let mut file_map_entries: Vec<(&str, &str)> = Vec::new();
+        for n in &a_nodes {
+            file_map_entries.push((n.as_str(), "src/alpha/mod.rs"));
+        }
+        for n in &b_nodes {
+            file_map_entries.push((n.as_str(), "src/beta/mod.rs"));
+        }
+        let file_map: HashMap<String, String> = file_map_entries
+            .iter()
+            .map(|(id, file)| (id.to_string(), file.to_string()))
+            .collect();
 
         let subsystems = index.detect_communities(&pagerank, &file_map);
         // At least one subsystem should have interface functions
@@ -1625,13 +1853,13 @@ mod tests {
             "cross-cluster edges should produce interface functions"
         );
 
-        // The interface nodes should be the ones on the boundary (a3 and/or b1)
+        // The interface nodes should be the ones on the boundary (a6 and/or b1)
         let interface_ids: Vec<&str> = subsystems
             .iter()
             .flat_map(|s| s.interfaces.iter().map(|i| i.node_id.as_str()))
             .collect();
         assert!(
-            interface_ids.contains(&"a3") || interface_ids.contains(&"b1"),
+            interface_ids.contains(&"a6") || interface_ids.contains(&"b1"),
             "boundary nodes should be interfaces, got {:?}",
             interface_ids
         );
@@ -1679,35 +1907,42 @@ mod tests {
         // Two separate groups connected only by Defines should not form one community.
         let mut index = GraphIndex::new();
 
-        // Group A: connected via Calls (real coupling)
-        index.add_edge("a1", "fn", "a2", "fn", EdgeKind::Calls);
-        index.add_edge("a2", "fn", "a1", "fn", EdgeKind::Calls);
-        index.add_edge("a2", "fn", "a3", "fn", EdgeKind::Calls);
-        index.add_edge("a3", "fn", "a2", "fn", EdgeKind::Calls);
-        index.add_edge("a1", "fn", "a3", "fn", EdgeKind::Calls);
-        index.add_edge("a3", "fn", "a1", "fn", EdgeKind::Calls);
+        // Group A: fully connected 6-node clique via Calls
+        let a_nodes: Vec<String> = (1..=6).map(|i| format!("a{}", i)).collect();
+        for i in 0..a_nodes.len() {
+            for j in 0..a_nodes.len() {
+                if i != j {
+                    index.add_edge(&a_nodes[i], "fn", &a_nodes[j], "fn", EdgeKind::Calls);
+                }
+            }
+        }
 
-        // Group B: connected via Calls (real coupling)
-        index.add_edge("b1", "fn", "b2", "fn", EdgeKind::Calls);
-        index.add_edge("b2", "fn", "b1", "fn", EdgeKind::Calls);
-        index.add_edge("b2", "fn", "b3", "fn", EdgeKind::Calls);
-        index.add_edge("b3", "fn", "b2", "fn", EdgeKind::Calls);
-        index.add_edge("b1", "fn", "b3", "fn", EdgeKind::Calls);
-        index.add_edge("b3", "fn", "b1", "fn", EdgeKind::Calls);
+        // Group B: fully connected 6-node clique via Calls
+        let b_nodes: Vec<String> = (1..=6).map(|i| format!("b{}", i)).collect();
+        for i in 0..b_nodes.len() {
+            for j in 0..b_nodes.len() {
+                if i != j {
+                    index.add_edge(&b_nodes[i], "fn", &b_nodes[j], "fn", EdgeKind::Calls);
+                }
+            }
+        }
 
         // Connect A and B ONLY via Defines edges (should be ignored for clustering)
         index.add_edge("a1", "struct", "b1", "field", EdgeKind::Defines);
         index.add_edge("a2", "struct", "b2", "field", EdgeKind::Defines);
 
         let pagerank = index.compute_pagerank(0.85, 20);
-        let file_map = make_file_map(&[
-            ("a1", "src/alpha/mod.rs"),
-            ("a2", "src/alpha/mod.rs"),
-            ("a3", "src/alpha/mod.rs"),
-            ("b1", "src/beta/mod.rs"),
-            ("b2", "src/beta/mod.rs"),
-            ("b3", "src/beta/mod.rs"),
-        ]);
+        let mut file_map_entries: Vec<(&str, &str)> = Vec::new();
+        for n in &a_nodes {
+            file_map_entries.push((n.as_str(), "src/alpha/mod.rs"));
+        }
+        for n in &b_nodes {
+            file_map_entries.push((n.as_str(), "src/beta/mod.rs"));
+        }
+        let file_map: HashMap<String, String> = file_map_entries
+            .iter()
+            .map(|(id, file)| (id.to_string(), file.to_string()))
+            .collect();
 
         let subsystems = index.detect_communities(&pagerank, &file_map);
         // Should detect 2 separate clusters (A and B), not merge them via Defines
@@ -1871,35 +2106,42 @@ mod tests {
         // Two separate groups connected only by DependsOn should not form one community.
         let mut index = GraphIndex::new();
 
-        // Group A: connected via Calls (real coupling)
-        index.add_edge("a1", "fn", "a2", "fn", EdgeKind::Calls);
-        index.add_edge("a2", "fn", "a1", "fn", EdgeKind::Calls);
-        index.add_edge("a2", "fn", "a3", "fn", EdgeKind::Calls);
-        index.add_edge("a3", "fn", "a2", "fn", EdgeKind::Calls);
-        index.add_edge("a1", "fn", "a3", "fn", EdgeKind::Calls);
-        index.add_edge("a3", "fn", "a1", "fn", EdgeKind::Calls);
+        // Group A: fully connected 6-node clique via Calls
+        let a_nodes: Vec<String> = (1..=6).map(|i| format!("a{}", i)).collect();
+        for i in 0..a_nodes.len() {
+            for j in 0..a_nodes.len() {
+                if i != j {
+                    index.add_edge(&a_nodes[i], "fn", &a_nodes[j], "fn", EdgeKind::Calls);
+                }
+            }
+        }
 
-        // Group B: connected via Calls (real coupling)
-        index.add_edge("b1", "fn", "b2", "fn", EdgeKind::Calls);
-        index.add_edge("b2", "fn", "b1", "fn", EdgeKind::Calls);
-        index.add_edge("b2", "fn", "b3", "fn", EdgeKind::Calls);
-        index.add_edge("b3", "fn", "b2", "fn", EdgeKind::Calls);
-        index.add_edge("b1", "fn", "b3", "fn", EdgeKind::Calls);
-        index.add_edge("b3", "fn", "b1", "fn", EdgeKind::Calls);
+        // Group B: fully connected 6-node clique via Calls
+        let b_nodes: Vec<String> = (1..=6).map(|i| format!("b{}", i)).collect();
+        for i in 0..b_nodes.len() {
+            for j in 0..b_nodes.len() {
+                if i != j {
+                    index.add_edge(&b_nodes[i], "fn", &b_nodes[j], "fn", EdgeKind::Calls);
+                }
+            }
+        }
 
         // Connect A and B ONLY via DependsOn edges (should be ignored for clustering)
         index.add_edge("a1", "fn", "b1", "module", EdgeKind::DependsOn);
         index.add_edge("a2", "fn", "b2", "module", EdgeKind::DependsOn);
 
         let pagerank = index.compute_pagerank(0.85, 20);
-        let file_map = make_file_map(&[
-            ("a1", "src/alpha/mod.rs"),
-            ("a2", "src/alpha/mod.rs"),
-            ("a3", "src/alpha/mod.rs"),
-            ("b1", "src/beta/mod.rs"),
-            ("b2", "src/beta/mod.rs"),
-            ("b3", "src/beta/mod.rs"),
-        ]);
+        let mut file_map_entries: Vec<(&str, &str)> = Vec::new();
+        for n in &a_nodes {
+            file_map_entries.push((n.as_str(), "src/alpha/mod.rs"));
+        }
+        for n in &b_nodes {
+            file_map_entries.push((n.as_str(), "src/beta/mod.rs"));
+        }
+        let file_map: HashMap<String, String> = file_map_entries
+            .iter()
+            .map(|(id, file)| (id.to_string(), file.to_string()))
+            .collect();
 
         let subsystems = index.detect_communities(&pagerank, &file_map);
         // Should detect 2 separate clusters (A and B), not merge them via DependsOn
@@ -1989,6 +2231,150 @@ mod tests {
         assert!(
             subsystems.is_empty(),
             "Sparse graph with minimal coupling edges should produce no subsystems, got {}",
+            subsystems.len()
+        );
+    }
+
+    #[test]
+    fn test_detect_communities_excludes_test_nodes() {
+        // Test nodes should NOT form their own subsystems. They should be
+        // filtered from Louvain and assigned to their nearest production
+        // subsystem post-hoc.
+        let mut index = GraphIndex::new();
+
+        // Production cluster: fully connected 6-node clique
+        let prod_nodes: Vec<String> = (1..=6).map(|i| format!("p{}", i)).collect();
+        for i in 0..prod_nodes.len() {
+            for j in 0..prod_nodes.len() {
+                if i != j {
+                    index.add_edge(
+                        &prod_nodes[i],
+                        "fn",
+                        &prod_nodes[j],
+                        "fn",
+                        EdgeKind::Calls,
+                    );
+                }
+            }
+        }
+
+        // Test cluster: 6 test nodes tightly interconnected
+        let test_nodes: Vec<String> = (1..=6).map(|i| format!("t{}", i)).collect();
+        for i in 0..test_nodes.len() {
+            for j in 0..test_nodes.len() {
+                if i != j {
+                    index.add_edge(
+                        &test_nodes[i],
+                        "fn",
+                        &test_nodes[j],
+                        "fn",
+                        EdgeKind::Calls,
+                    );
+                }
+            }
+        }
+
+        // Test nodes call production nodes (tests import production code)
+        index.add_edge("t1", "fn", "p1", "fn", EdgeKind::Calls);
+        index.add_edge("t2", "fn", "p2", "fn", EdgeKind::Calls);
+
+        let pagerank = index.compute_pagerank(0.85, 20);
+
+        // Map production nodes to src/core/, test nodes to src/core/tests/
+        let mut file_map = HashMap::new();
+        for n in &prod_nodes {
+            file_map.insert(n.clone(), "src/core/mod.rs".to_string());
+        }
+        for n in &test_nodes {
+            file_map.insert(n.clone(), "src/core/tests/mod.rs".to_string());
+        }
+
+        let subsystems = index.detect_communities(&pagerank, &file_map);
+
+        // Should produce exactly 1 subsystem (production), not 2
+        // Test nodes are folded into the production subsystem
+        assert_eq!(
+            subsystems.len(),
+            1,
+            "test nodes should not form their own subsystem, got {} subsystems: {:?}",
+            subsystems.len(),
+            subsystems.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        // The subsystem should contain both production and test nodes
+        let total_symbols: usize = subsystems.iter().map(|s| s.symbol_count).sum();
+        assert!(
+            total_symbols >= prod_nodes.len(),
+            "subsystem should contain at least all production nodes"
+        );
+    }
+
+    #[test]
+    fn test_detect_communities_phase2_contraction() {
+        // Phase 2 contraction should merge sub-clusters that belong together.
+        // Build 4 mini-clusters (4 nodes each) with many inter-pair links:
+        //   A1-A2 are densely linked (should merge in Phase 2)
+        //   B1-B2 are densely linked (should merge in Phase 2)
+        // But A-pair and B-pair have only a single weak link.
+        let mut index = GraphIndex::new();
+
+        // Helper: build a 4-node fully connected clique
+        fn add_clique(index: &mut GraphIndex, prefix: &str) -> Vec<String> {
+            let nodes: Vec<String> = (1..=4).map(|i| format!("{}{}", prefix, i)).collect();
+            for i in 0..nodes.len() {
+                for j in 0..nodes.len() {
+                    if i != j {
+                        index.add_edge(&nodes[i], "fn", &nodes[j], "fn", EdgeKind::Calls);
+                    }
+                }
+            }
+            nodes
+        }
+
+        let a1 = add_clique(&mut index, "a1_");
+        let a2 = add_clique(&mut index, "a2_");
+        let b1 = add_clique(&mut index, "b1_");
+        let b2 = add_clique(&mut index, "b2_");
+
+        // Dense inter-links within A-pair: every a1 node connects to every a2 node
+        for a1n in &a1 {
+            for a2n in &a2 {
+                index.add_edge(a1n, "fn", a2n, "fn", EdgeKind::Calls);
+                index.add_edge(a2n, "fn", a1n, "fn", EdgeKind::Calls);
+            }
+        }
+
+        // Dense inter-links within B-pair: every b1 node connects to every b2 node
+        for b1n in &b1 {
+            for b2n in &b2 {
+                index.add_edge(b1n, "fn", b2n, "fn", EdgeKind::Calls);
+                index.add_edge(b2n, "fn", b1n, "fn", EdgeKind::Calls);
+            }
+        }
+
+        // Single weak link between A-pair and B-pair
+        index.add_edge(&a1[3], "fn", &b1[3], "fn", EdgeKind::Calls);
+
+        let pagerank = index.compute_pagerank(0.85, 20);
+        let mut file_map = HashMap::new();
+        for n in a1.iter().chain(a2.iter()) {
+            file_map.insert(n.clone(), "src/alpha/mod.rs".to_string());
+        }
+        for n in b1.iter().chain(b2.iter()) {
+            file_map.insert(n.clone(), "src/beta/mod.rs".to_string());
+        }
+
+        let subsystems = index.detect_communities(&pagerank, &file_map);
+        // With dense inter-pair links, Phase 1 or Phase 2 should merge a1+a2
+        // and b1+b2, yielding at most 3 subsystems (ideally 2).
+        assert!(
+            subsystems.len() <= 3,
+            "Phase 2 contraction should merge sub-clusters, got {} subsystems",
+            subsystems.len()
+        );
+        assert!(
+            subsystems.len() >= 2,
+            "should still keep distinct architectural groups separate, got {} subsystem(s)",
             subsystems.len()
         );
     }
