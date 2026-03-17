@@ -923,14 +923,13 @@ impl RnaHandler {
             }
 
             // Check if cached graph needs LSP enrichment.
-            let (total_node_count, total_edge_count, has_call_edges) = {
+            let has_call_edges = {
                 let guard = self.graph.read().await;
                 let gs = guard.as_ref().unwrap();
-                let has_calls = gs.edges.iter().any(|e| matches!(e.kind, crate::graph::EdgeKind::Calls));
-                (gs.nodes.len(), gs.edges.len(), has_calls)
+                gs.edges.iter().any(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
             };
 
-            if has_call_edges {
+            let lsp_edge_count = if has_call_edges {
                 let call_count = {
                     let guard = self.graph.read().await;
                     guard.as_ref().unwrap().edges.iter()
@@ -939,14 +938,22 @@ impl RnaHandler {
                 };
                 self.lsp_status.set_complete(call_count);
                 on_progress(&format!("LSP: {} cached call edges", call_count));
+                call_count
             } else {
                 // Need LSP enrichment even though no files changed.
                 // Run it synchronously on all nodes.
                 on_progress("LSP: no cached call edges -- running full enrichment...");
-                self.run_foreground_lsp_and_persist(&on_progress).await?;
-            }
+                self.run_foreground_lsp_and_persist(&on_progress).await?
+            };
 
             scanner.commit_state()?;
+
+            // Read final counts (may have changed after LSP enrichment).
+            let (total_node_count, total_edge_count) = {
+                let guard = self.graph.read().await;
+                let gs = guard.as_ref().unwrap();
+                (gs.nodes.len(), gs.edges.len())
+            };
 
             let total_time = pipeline_start.elapsed();
             on_progress(&format!("Graph: {} nodes, {} edges", total_node_count, total_edge_count));
@@ -955,7 +962,7 @@ impl RnaHandler {
             return Ok(PipelineResult {
                 node_count: total_node_count,
                 edge_count: total_edge_count,
-                lsp_edge_count: 0,
+                lsp_edge_count,
                 embed_count: 0,
                 total_time,
             });
@@ -1345,10 +1352,11 @@ impl RnaHandler {
 
     /// Run LSP enrichment on the full graph synchronously and persist.
     /// Used when the cached graph has no call edges and needs enrichment.
+    /// Returns the number of LSP edges added.
     async fn run_foreground_lsp_and_persist<F>(
         &self,
         on_progress: &F,
-    ) -> anyhow::Result<()>
+    ) -> anyhow::Result<usize>
     where
         F: Fn(&str) + Send + Sync,
     {
@@ -1377,7 +1385,7 @@ impl RnaHandler {
         if !enrichment.any_enricher_ran {
             on_progress("LSP: no server available");
             self.lsp_status.set_unavailable();
-            return Ok(());
+            return Ok(0);
         }
 
         let lsp_edge_count = enrichment.added_edges.len();
@@ -1426,6 +1434,6 @@ impl RnaHandler {
             }
         }
 
-        Ok(())
+        Ok(lsp_edge_count)
     }
 }
