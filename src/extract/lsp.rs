@@ -1628,6 +1628,11 @@ impl Enricher for LspEnricher {
         let mut attempted = 0u32;
         let mut errors = 0u32;
         let mut seen_virtual_ids = std::collections::HashSet::new();
+        let total_nodes = enrichable_nodes.len();
+        let mut last_progress_log = std::time::Instant::now();
+        let mut last_logged_count = 0u64;
+        const PROGRESS_LOG_INTERVAL_SECS: u64 = 30;
+        const PROGRESS_LOG_INTERVAL_NODES: u64 = 1_000;
 
         while let Some(task_result) = join_set.join_next().await {
             match task_result {
@@ -1649,13 +1654,34 @@ impl Enricher for LspEnricher {
                 }
             }
 
-            // Log progress every 500 completions
-            let done = completed.load(Ordering::Relaxed);
-            if done % 500 == 0 && done > 0 {
+            // Log progress every 1,000 nodes or every 30 seconds (whichever comes first)
+            let done = completed.load(Ordering::Relaxed) as u64;
+            let elapsed_since_log = last_progress_log.elapsed().as_secs();
+            let nodes_since_log = done.saturating_sub(last_logged_count);
+            if done > 0
+                && (nodes_since_log >= PROGRESS_LOG_INTERVAL_NODES
+                    || elapsed_since_log >= PROGRESS_LOG_INTERVAL_SECS)
+            {
+                let elapsed_total = pass1_start.elapsed().as_secs_f64();
+                let rate = done as f64 / elapsed_total;
+                let remaining = if rate > 0.0 {
+                    let remaining_nodes = (total_nodes as f64) - (done as f64);
+                    let remaining_secs = remaining_nodes / rate;
+                    if remaining_secs >= 120.0 {
+                        format!("~{} min remaining", (remaining_secs / 60.0).round() as u64)
+                    } else {
+                        format!("~{}s remaining", remaining_secs.round() as u64)
+                    }
+                } else {
+                    "estimating...".to_string()
+                };
                 tracing::info!(
-                    "LSP enrichment progress: {}/{} nodes, {} edges so far",
-                    done, enrichable_nodes.len(), result.added_edges.len(),
+                    "LSP: {} processing... {}/{} nodes ({} edges found, {})",
+                    self.server_command, done, total_nodes,
+                    result.added_edges.len(), remaining,
                 );
+                last_progress_log = std::time::Instant::now();
+                last_logged_count = done;
             }
         }
 
@@ -1684,6 +1710,12 @@ impl Enricher for LspEnricher {
                 );
             }
 
+            let pass2_start = std::time::Instant::now();
+            let mut pass2_done = 0u64;
+            let pass2_total = type_nodes.len();
+            let mut pass2_last_log = std::time::Instant::now();
+            let mut pass2_last_count = 0u64;
+
             for node in &type_nodes {
                 let abs_path = root.join(&node.id.file);
                 let file_uri = match path_to_uri(&abs_path) {
@@ -1702,6 +1734,33 @@ impl Enricher for LspEnricher {
                     &mut type_hierarchy_strikes,
                     &mut has_type_hierarchy,
                 );
+
+                pass2_done += 1;
+
+                // Log progress every 500 nodes or every 30 seconds
+                let since_log = pass2_last_log.elapsed().as_secs();
+                let nodes_since = pass2_done - pass2_last_count;
+                if nodes_since >= 500 || since_log >= 30 {
+                    let elapsed = pass2_start.elapsed().as_secs_f64();
+                    let rate = pass2_done as f64 / elapsed;
+                    let remaining_secs = if rate > 0.0 {
+                        ((pass2_total as f64) - (pass2_done as f64)) / rate
+                    } else {
+                        0.0
+                    };
+                    let remaining = if remaining_secs >= 120.0 {
+                        format!("~{} min remaining", (remaining_secs / 60.0).round() as u64)
+                    } else {
+                        format!("~{}s remaining", remaining_secs.round() as u64)
+                    };
+                    tracing::info!(
+                        "LSP: {} type hierarchy... {}/{} nodes ({} edges total, {})",
+                        self.server_command, pass2_done, pass2_total,
+                        result.added_edges.len(), remaining,
+                    );
+                    pass2_last_log = std::time::Instant::now();
+                    pass2_last_count = pass2_done;
+                }
 
                 if !has_type_hierarchy {
                     break;
