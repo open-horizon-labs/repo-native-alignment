@@ -513,6 +513,11 @@ const MAX_TYPE_HIERARCHY_STRIKES: u32 = 3;
 /// without a venv, or a server that can't resolve any references).
 const ZERO_EDGE_ABORT_THRESHOLD: u32 = 1_000;
 
+/// Time-based abort: if no edges after this duration, abort enrichment.
+/// On slow LSP servers (e.g., pyright without warm cache), reaching the
+/// node-count threshold can take 100+ minutes. This caps the wait at 2 minutes.
+const ZERO_EDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 impl LspEnricher {
     /// Create a new LSP enricher for the given language server.
     ///
@@ -1690,12 +1695,15 @@ impl Enricher for LspEnricher {
                 last_logged_count = done;
             }
 
-            // Early abort: if we've processed >= 1,000 nodes with 0 edges,
-            // the language server is likely misconfigured (e.g., missing venv).
-            if result.added_edges.is_empty() && attempted >= ZERO_EDGE_ABORT_THRESHOLD {
+            // Early abort: if we've processed >= 1,000 nodes OR spent >= 2 minutes
+            // with 0 edges, the language server is likely misconfigured (e.g., missing venv).
+            if result.added_edges.is_empty()
+                && (attempted >= ZERO_EDGE_ABORT_THRESHOLD
+                    || pass1_start.elapsed() > ZERO_EDGE_TIMEOUT)
+            {
                 tracing::warn!(
-                    "LSP: {} produced 0 edges after {}/{} nodes — aborting (likely misconfigured)",
-                    self.server_command, attempted, total_nodes,
+                    "LSP: {} produced 0 edges after {}/{} nodes ({:.1}s) — aborting (likely misconfigured)",
+                    self.server_command, attempted, total_nodes, pass1_start.elapsed().as_secs_f64(),
                 );
                 join_set.abort_all();
                 break;
@@ -1780,11 +1788,14 @@ impl Enricher for LspEnricher {
                     pass2_last_count = pass2_done;
                 }
 
-                // Early abort: 0 new edges after 1,000 type hierarchy nodes
-                if result.added_edges.len() == edges_before_pass2 && pass2_done >= ZERO_EDGE_ABORT_THRESHOLD as u64 {
+                // Early abort: 0 new edges after 1,000 nodes OR 2 minutes
+                if result.added_edges.len() == edges_before_pass2
+                    && (pass2_done >= ZERO_EDGE_ABORT_THRESHOLD as u64
+                        || pass2_start.elapsed() > ZERO_EDGE_TIMEOUT)
+                {
                     tracing::warn!(
-                        "LSP: {} type hierarchy produced 0 edges after {}/{} nodes — aborting (likely misconfigured)",
-                        self.server_command, pass2_done, pass2_total,
+                        "LSP: {} type hierarchy produced 0 edges after {}/{} nodes ({:.1}s) — aborting (likely misconfigured)",
+                        self.server_command, pass2_done, pass2_total, pass2_start.elapsed().as_secs_f64(),
                     );
                     break;
                 }
