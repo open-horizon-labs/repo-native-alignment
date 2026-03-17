@@ -225,7 +225,7 @@ repo-native-alignment scan --repo . --full
 
 Without `--full`, the scan skips LSP enrichment — faster (~1s) but subsystem detection and call-graph traversal won't have coupling edges.
 
-To force a clean rebuild (e.g., after upgrading RNA):
+**After upgrading RNA**, clear the old index and rebuild. Schema changes between versions (e.g., subsystem metadata, LSP edge persistence) require a fresh index:
 
 ```bash
 rm -rf .oh/.cache/lance .oh/.cache/scan-state.json
