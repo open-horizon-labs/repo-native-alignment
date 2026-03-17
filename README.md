@@ -127,7 +127,7 @@ For HTTP transport: `repo-native-alignment --repo . --transport http --port 8382
 Before wiring up MCP, evaluate RNA directly from the terminal:
 
 ```bash
-repo-native-alignment scan --repo /path/to/your/project --full   # build full index
+repo-native-alignment scan --repo . --full   # build full index
 repo-native-alignment search "auth" --repo /path/to/your/project  # search symbols
 repo-native-alignment graph --node "<stable-id-from-search>" --mode impact --repo .
 ```
@@ -155,7 +155,7 @@ This explores your codebase, asks about your aims, writes `AGENTS.md`, scaffolds
 ### 4. Build the index
 
 ```bash
-repo-native-alignment scan --repo /path/to/your/project --full
+repo-native-alignment scan --repo . --full
 ```
 
 Runs the complete pipeline with visible output: scan → extract → embed → LSP enrich → graph. Shows timing and edge counts for each phase. Recommended before first MCP session so agents start with a warm index including LSP call edges.
@@ -213,7 +213,7 @@ The MCP server builds an index automatically on first query. For best results (i
 
 ```bash
 # Full pipeline: scan → extract → embed → LSP enrich → persist
-repo-native-alignment scan --repo /path/to/your/project --full
+repo-native-alignment scan --repo . --full
 
 # Typical output:
 # Scan+Extract: 8,700 symbols across 210 files in 0.6s
