@@ -592,14 +592,8 @@ impl EmbeddingIndex {
         // Delete existing rows for these IDs, then add() fresh.
         // merge_insert fails on tables created by the same process (#332),
         // so we use delete + add instead.
-        let quoted: Vec<String> = ids_for_delete.iter()
-            .map(|id| format!("'{}'", id.replace('\'', "''")))
-            .collect();
-        for chunk in quoted.chunks(500) {
-            let filter = format!("id IN ({})", chunk.join(", "));
-            table.delete(&filter).await
-                .context("Failed to delete rows before re-embed in reindex_nodes")?;
-        }
+        let id_refs: Vec<&str> = ids_for_delete.iter().map(|s| s.as_str()).collect();
+        self.delete_rows_by_ids(&table, &id_refs).await?;
 
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
         table
@@ -621,6 +615,19 @@ impl EmbeddingIndex {
     // (markdown_section with oh_kind metadata) and flow through
     // reindex_nodes() like everything else.
 
+
+    /// Delete rows by ID in batches of 500. Used before add() to avoid merge_insert (#332).
+    async fn delete_rows_by_ids(&self, table: &lancedb::Table, ids: &[&str]) -> Result<()> {
+        for chunk in ids.chunks(500) {
+            let quoted: Vec<String> = chunk.iter()
+                .map(|id| format!("'{}'", id.replace('\'', "''")))
+                .collect();
+            let filter = format!("id IN ({})", quoted.join(", "));
+            table.delete(&filter).await
+                .context("Failed to delete rows by ID")?;
+        }
+        Ok(())
+    }
 
     /// Query existing text_hash values for given node IDs from the embedding table.
     /// Returns None if the text_hash column doesn't exist (old schema).
@@ -924,14 +931,7 @@ impl EmbeddingIndex {
                 let table = self.db.open_table(&self.table_name).execute().await
                     .context("Failed to open table to delete stale rows before re-embed")?;
                 let ids_to_delete: Vec<&str> = to_embed.iter().map(|c| c.id.as_str()).collect();
-                for chunk in ids_to_delete.chunks(500) {
-                    let quoted: Vec<String> = chunk.iter()
-                        .map(|id| format!("'{}'", id.replace('\'', "''")))
-                        .collect();
-                    let filter = format!("id IN ({})", quoted.join(", "));
-                    table.delete(&filter).await
-                        .context("Failed to delete rows before re-embed")?;
-                }
+                self.delete_rows_by_ids(&table, &ids_to_delete).await?;
                 tracing::info!(
                     "EmbeddingIndex: deleted {} existing row(s) before re-embed",
                     ids_to_delete.len(),
@@ -990,23 +990,11 @@ impl EmbeddingIndex {
                         .execute()
                         .await
                         .context("Failed to create LanceDB table")?;
-                } else if !table_exists {
-                    // Subsequent batches on a fresh table: simple append.
-                    // No duplicates are possible on a fresh build, so
-                    // merge_insert (which can fail on a newly created table)
-                    // is unnecessary -- plain add() is correct and sufficient.
-                    let table = self.db.open_table(&self.table_name).execute().await
-                        .context("Failed to open table for add")?;
-                    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-                    table
-                        .add(Box::new(batches))
-                        .execute()
-                        .await
-                        .context("Failed to add batch to LanceDB table")?;
                 } else {
-                    // Existing table: rows to re-embed were already deleted above,
-                    // so plain add() is correct (no duplicates possible).
-                    // merge_insert fails on tables created by the same process (#332).
+                    // Subsequent batches (fresh or existing table): plain add().
+                    // For fresh tables, no duplicates are possible.
+                    // For existing tables, rows to re-embed were already deleted
+                    // above (#332).
                     let table = self.db.open_table(&self.table_name).execute().await
                         .context("Failed to open table for add")?;
                     let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -1113,14 +1101,8 @@ impl EmbeddingIndex {
         tracing::info!("EmbeddingIndex: deleting {} stale row(s)", stale_ids.len());
 
         // Delete in batches to avoid filter length limits
-        for chunk in stale_ids.chunks(500) {
-            let quoted: Vec<String> = chunk.iter()
-                .map(|id| format!("'{}'", id.replace('\'', "''")))
-                .collect();
-            let filter = format!("id IN ({})", quoted.join(", "));
-            table.delete(&filter).await
-                .context("Failed to delete stale rows")?;
-        }
+        let stale_refs: Vec<&str> = stale_ids.iter().map(|s| s.as_str()).collect();
+        self.delete_rows_by_ids(&table, &stale_refs).await?;
 
         tracing::info!("EmbeddingIndex: deleted {} stale row(s)", stale_ids.len());
         Ok(())
