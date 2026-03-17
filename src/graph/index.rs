@@ -694,6 +694,7 @@ impl GraphIndex {
                 cohesion,
                 interfaces,
                 member_ids: member_ids.clone(),
+                children: Vec::new(),
             });
         }
 
@@ -916,6 +917,8 @@ pub struct Subsystem {
     pub interfaces: Vec<SubsystemInterface>,
     /// Stable IDs of all member nodes in this subsystem.
     pub member_ids: Vec<String>,
+    /// Child sub-modules when this is a hierarchical parent subsystem.
+    pub children: Vec<Subsystem>,
 }
 
 /// An interface function at a subsystem boundary.
@@ -927,6 +930,80 @@ pub struct SubsystemInterface {
     pub node_type: String,
     /// Combined interface score: cross_cluster_degree * pagerank.
     pub interface_score: f64,
+}
+
+/// Group flat subsystems by shared first path component into a hierarchy.
+///
+/// When multiple subsystems share the same prefix before `/` (e.g., `extract/Node`,
+/// `extract/enrich`), they become children of a parent subsystem named after the
+/// shared prefix. Single subsystems (no `/` or unique prefix) remain as-is.
+///
+/// Parent stats are aggregated: symbol_count = sum of children, cohesion = weighted
+/// average by symbol count, interfaces = merged and re-sorted top 5, member_ids =
+/// union of all children.
+pub fn group_subsystems_by_prefix(subsystems: Vec<Subsystem>) -> Vec<Subsystem> {
+    // Partition: subsystems with a `/` in their name vs. those without.
+    // Group by first path component for those with `/`.
+    let mut prefix_groups: std::collections::BTreeMap<String, Vec<Subsystem>> =
+        std::collections::BTreeMap::new();
+    let mut standalone: Vec<Subsystem> = Vec::new();
+
+    for s in subsystems {
+        if let Some(slash_pos) = s.name.find('/') {
+            let prefix = s.name[..slash_pos].to_string();
+            prefix_groups.entry(prefix).or_default().push(s);
+        } else {
+            standalone.push(s);
+        }
+    }
+
+    let mut result: Vec<Subsystem> = standalone;
+
+    for (prefix, children) in prefix_groups {
+        if children.len() == 1 {
+            // Single child -- no grouping needed, keep as leaf
+            result.push(children.into_iter().next().unwrap());
+        } else {
+            // Aggregate stats from children
+            let total_symbols: usize = children.iter().map(|c| c.symbol_count).sum();
+            let weighted_cohesion: f64 = if total_symbols > 0 {
+                children
+                    .iter()
+                    .map(|c| c.cohesion * c.symbol_count as f64)
+                    .sum::<f64>()
+                    / total_symbols as f64
+            } else {
+                0.0
+            };
+            let all_member_ids: Vec<String> = children
+                .iter()
+                .flat_map(|c| c.member_ids.iter().cloned())
+                .collect();
+            let mut all_interfaces: Vec<SubsystemInterface> = children
+                .iter()
+                .flat_map(|c| c.interfaces.iter().cloned())
+                .collect();
+            all_interfaces.sort_by(|a, b| {
+                b.interface_score
+                    .partial_cmp(&a.interface_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            all_interfaces.truncate(5);
+
+            result.push(Subsystem {
+                name: prefix,
+                symbol_count: total_symbols,
+                cohesion: weighted_cohesion,
+                interfaces: all_interfaces,
+                member_ids: all_member_ids,
+                children,
+            });
+        }
+    }
+
+    // Sort by symbol count descending (matching detect_communities output order)
+    result.sort_by(|a, b| b.symbol_count.cmp(&a.symbol_count));
+    result
 }
 
 /// Compute a cluster name from member nodes.
@@ -2377,5 +2454,91 @@ mod tests {
             "should still keep distinct architectural groups separate, got {} subsystem(s)",
             subsystems.len()
         );
+    }
+
+    #[test]
+    fn test_group_subsystems_by_prefix_groups_shared_prefix() {
+        use super::{group_subsystems_by_prefix, Subsystem};
+        let subsystems = vec![
+            Subsystem {
+                name: "extract/Node".into(),
+                symbol_count: 100,
+                cohesion: 0.8,
+                interfaces: vec![],
+                member_ids: vec!["a".into()],
+                children: vec![],
+            },
+            Subsystem {
+                name: "extract/enrich".into(),
+                symbol_count: 50,
+                cohesion: 0.9,
+                interfaces: vec![],
+                member_ids: vec!["b".into()],
+                children: vec![],
+            },
+            Subsystem {
+                name: "graph".into(),
+                symbol_count: 200,
+                cohesion: 0.85,
+                interfaces: vec![],
+                member_ids: vec!["c".into()],
+                children: vec![],
+            },
+        ];
+        let grouped = group_subsystems_by_prefix(subsystems);
+        assert_eq!(grouped.len(), 2, "Should have 2 top-level: graph + extract");
+        // Sorted by symbol_count desc: graph(200), extract(150)
+        assert_eq!(grouped[0].name, "graph");
+        assert!(grouped[0].children.is_empty());
+        assert_eq!(grouped[1].name, "extract");
+        assert_eq!(grouped[1].symbol_count, 150);
+        assert_eq!(grouped[1].children.len(), 2);
+        assert_eq!(grouped[1].member_ids.len(), 2); // "a" + "b"
+    }
+
+    #[test]
+    fn test_group_subsystems_by_prefix_single_child_no_group() {
+        use super::{group_subsystems_by_prefix, Subsystem};
+        let subsystems = vec![Subsystem {
+            name: "embed/model".into(),
+            symbol_count: 30,
+            cohesion: 0.9,
+            interfaces: vec![],
+            member_ids: vec!["x".into()],
+            children: vec![],
+        }];
+        let grouped = group_subsystems_by_prefix(subsystems);
+        assert_eq!(grouped.len(), 1);
+        // Single child: kept as leaf, not wrapped in parent
+        assert_eq!(grouped[0].name, "embed/model");
+        assert!(grouped[0].children.is_empty());
+    }
+
+    #[test]
+    fn test_group_subsystems_weighted_cohesion() {
+        use super::{group_subsystems_by_prefix, Subsystem};
+        let subsystems = vec![
+            Subsystem {
+                name: "md/parse".into(),
+                symbol_count: 60,
+                cohesion: 0.8,
+                interfaces: vec![],
+                member_ids: vec![],
+                children: vec![],
+            },
+            Subsystem {
+                name: "md/search".into(),
+                symbol_count: 40,
+                cohesion: 0.9,
+                interfaces: vec![],
+                member_ids: vec![],
+                children: vec![],
+            },
+        ];
+        let grouped = group_subsystems_by_prefix(subsystems);
+        assert_eq!(grouped.len(), 1);
+        let parent = &grouped[0];
+        // Weighted average: (0.8*60 + 0.9*40) / 100 = 84/100 = 0.84
+        assert!((parent.cohesion - 0.84).abs() < 0.01);
     }
 }
