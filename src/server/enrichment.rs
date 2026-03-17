@@ -824,10 +824,10 @@ impl RnaHandler {
 
     /// Run the full pipeline synchronously with progress reporting.
     ///
-    /// This is the `--full` CLI path. It runs the same pipeline as
-    /// `build_full_graph()` but does embedding and LSP enrichment in the
-    /// foreground so the caller can observe progress and the process doesn't
-    /// exit before background tasks complete.
+    /// This is the `--full` CLI path. When a cached graph exists in LanceDB,
+    /// it uses the incremental path (only re-extract changed files, LSP on
+    /// changed nodes only) for dramatically faster rescans. Falls back to
+    /// full rebuild when no cache exists.
     ///
     /// The `on_progress` callback receives structured status messages.
     pub async fn run_pipeline_foreground<F>(
@@ -839,6 +839,319 @@ impl RnaHandler {
     {
         let pipeline_start = std::time::Instant::now();
 
+        // Try incremental path: load cached graph, apply delta, LSP on changed nodes.
+        let lance_path = super::store::graph_lance_path(&self.repo_root);
+        let cached = if lance_path.exists() {
+            match super::store::load_graph_from_lance(&self.repo_root).await {
+                Ok(state) => {
+                    on_progress(&format!(
+                        "Loaded cached graph: {} nodes, {} edges",
+                        state.nodes.len(),
+                        state.edges.len(),
+                    ));
+                    Some(state)
+                }
+                Err(e) => {
+                    tracing::debug!("Could not load cached graph, falling back to full rebuild: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(cached_state) = cached {
+            return self.run_pipeline_foreground_incremental(cached_state, on_progress, pipeline_start).await;
+        }
+
+        // No cache -- full rebuild path.
+        self.run_pipeline_foreground_full(on_progress, pipeline_start).await
+    }
+
+    /// Incremental foreground pipeline: load from cache, extract only changed files,
+    /// LSP enrich only changed nodes, re-embed only changed symbols.
+    async fn run_pipeline_foreground_incremental<F>(
+        &self,
+        mut cached_state: GraphState,
+        on_progress: F,
+        pipeline_start: std::time::Instant,
+    ) -> anyhow::Result<PipelineResult>
+    where
+        F: Fn(&str) + Send + Sync,
+    {
+        // Pre-flight: ensure schema version matches. If migration happened,
+        // the cache was rebuilt and our loaded graph is stale -- fall back to
+        // full rebuild by returning an error that the caller can catch.
+        let db_path = super::store::graph_lance_path(&self.repo_root);
+        if super::store::check_and_migrate_schema(&db_path).await? {
+            tracing::info!("Schema migrated during incremental pre-flight -- falling back to full rebuild");
+            on_progress("Schema migration detected -- rebuilding from scratch.");
+            return self.run_pipeline_foreground_full(on_progress, pipeline_start).await;
+        }
+
+        // Phase 1: Scan to detect changes.
+        let t0 = std::time::Instant::now();
+        let mut scanner = Scanner::new(self.repo_root.clone())?;
+        let scan = scanner.scan()?;
+        let scan_time = t0.elapsed();
+
+        let change_count = scan.changed_files.len() + scan.new_files.len() + scan.deleted_files.len();
+
+        on_progress(&format!(
+            "Scan: {} changed, {} new, {} deleted in {:.1}s",
+            scan.changed_files.len(),
+            scan.new_files.len(),
+            scan.deleted_files.len(),
+            scan_time.as_secs_f64(),
+        ));
+
+        if change_count == 0 {
+            on_progress("No changes detected -- reusing cached graph.");
+
+            // Store graph and set up embedding index.
+            {
+                let mut guard = self.graph.write().await;
+                *guard = Some(cached_state);
+            }
+
+            // Reuse existing embedding index.
+            if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await {
+                if let Ok(true) = idx.has_table().await {
+                    idx.ensure_fts_index().await;
+                    self.embed_index.store(Arc::new(Some(idx)));
+                }
+            }
+
+            // Check if cached graph needs LSP enrichment.
+            let has_call_edges = {
+                let guard = self.graph.read().await;
+                let gs = guard.as_ref().unwrap();
+                gs.edges.iter().any(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
+            };
+
+            let lsp_edge_count = if has_call_edges {
+                let call_count = {
+                    let guard = self.graph.read().await;
+                    guard.as_ref().unwrap().edges.iter()
+                        .filter(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
+                        .count()
+                };
+                self.lsp_status.set_complete(call_count);
+                on_progress(&format!("LSP: {} cached call edges", call_count));
+                call_count
+            } else {
+                // Need LSP enrichment even though no files changed.
+                // Run it synchronously on all nodes.
+                on_progress("LSP: no cached call edges -- running full enrichment...");
+                self.run_foreground_lsp_and_persist(&on_progress).await?
+            };
+
+            scanner.commit_state()?;
+
+            // Read final counts (may have changed after LSP enrichment).
+            let (total_node_count, total_edge_count) = {
+                let guard = self.graph.read().await;
+                let gs = guard.as_ref().unwrap();
+                (gs.nodes.len(), gs.edges.len())
+            };
+
+            let total_time = pipeline_start.elapsed();
+            on_progress(&format!("Graph: {} nodes, {} edges", total_node_count, total_edge_count));
+            on_progress(&format!("Done in {:.1}s (incremental, no changes)", total_time.as_secs_f64()));
+
+            return Ok(PipelineResult {
+                node_count: total_node_count,
+                edge_count: total_edge_count,
+                lsp_edge_count,
+                embed_count: 0,
+                total_time,
+            });
+        }
+
+        // Phase 2: Incremental extract -- only changed files.
+        let t1 = std::time::Instant::now();
+
+        // Track changed file paths for LSP scoping.
+        let changed_file_set: std::collections::HashSet<PathBuf> = scan.changed_files.iter()
+            .chain(scan.new_files.iter())
+            .cloned()
+            .collect();
+
+        // Rebuild the index before update_graph_with_scan (it expects a valid index).
+        cached_state.index = crate::graph::index::GraphIndex::new();
+        cached_state.index.rebuild_from_edges(&cached_state.edges);
+        for node in &cached_state.nodes {
+            cached_state.index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+        }
+
+        // Store the cached graph so update_graph_with_scan can modify it in-place.
+        {
+            let mut guard = self.graph.write().await;
+            *guard = Some(cached_state);
+        }
+
+        // Run incremental update (extract only changed files, remove deleted, re-embed).
+        // LSP spawning is disabled (spawn_lsp=false) -- we handle it synchronously below.
+        {
+            let mut guard = self.graph.write().await;
+            let gs = guard.as_mut().unwrap();
+            self.update_graph_with_scan(gs, Some(scan), false).await?;
+        }
+
+        let extract_time = t1.elapsed();
+
+        let (node_count, file_count) = {
+            let guard = self.graph.read().await;
+            let gs = guard.as_ref().unwrap();
+            let files: std::collections::HashSet<_> = gs.nodes.iter()
+                .map(|n| n.id.file.to_string_lossy().to_string())
+                .collect();
+            (gs.nodes.len(), files.len())
+        };
+
+        on_progress(&format!(
+            "Incremental extract: {} symbols across {} files in {:.1}s (only {} files re-extracted)",
+            node_count,
+            file_count,
+            extract_time.as_secs_f64(),
+            changed_file_set.len(),
+        ));
+
+        // Phase 3: LSP enrichment on changed nodes only (synchronous).
+        let changed_nodes: Vec<Node> = {
+            let guard = self.graph.read().await;
+            let gs = guard.as_ref().unwrap();
+            gs.nodes.iter()
+                .filter(|n| changed_file_set.iter().any(|f| n.id.file == *f))
+                .cloned()
+                .collect()
+        };
+
+        let languages: Vec<String> = changed_nodes.iter()
+            .map(|n| n.language.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let server_name = self.lsp_status.server_name();
+        if let Some(ref name) = server_name {
+            on_progress(&format!("LSP: {} found on PATH", name));
+        }
+        self.lsp_status.set_running();
+
+        on_progress(&format!(
+            "LSP: enriching {} changed nodes ({} languages: [{}])...",
+            changed_nodes.len(),
+            languages.len(),
+            languages.join(", "),
+        ));
+
+        let t2 = std::time::Instant::now();
+        let enricher_registry = EnricherRegistry::with_builtins();
+        let graph_index = {
+            let guard = self.graph.read().await;
+            guard.as_ref().unwrap().index.clone()
+        };
+        let enrichment = enricher_registry
+            .enrich_all(&changed_nodes, &graph_index, &languages, &self.repo_root)
+            .await;
+        let lsp_time = t2.elapsed();
+
+        let lsp_edge_count;
+        if !enrichment.any_enricher_ran {
+            on_progress(&format!("LSP: no server available ({:.1}s)", lsp_time.as_secs_f64()));
+            self.lsp_status.set_unavailable();
+            lsp_edge_count = 0;
+        } else {
+            lsp_edge_count = enrichment.added_edges.len();
+            on_progress(&format!(
+                "LSP: enriched {} call edges for changed files in {:.1}s",
+                lsp_edge_count,
+                lsp_time.as_secs_f64(),
+            ));
+
+            // Apply enrichment to in-memory graph.
+            let mut guard = self.graph.write().await;
+            if let Some(ref mut gs) = *guard {
+                for vnode in &enrichment.new_nodes {
+                    gs.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
+                }
+                gs.nodes.extend(enrichment.new_nodes);
+
+                for edge in &enrichment.added_edges {
+                    gs.index.add_edge(
+                        &edge.from.to_stable_id(),
+                        &edge.from.kind.to_string(),
+                        &edge.to.to_stable_id(),
+                        &edge.to.kind.to_string(),
+                        edge.kind.clone(),
+                    );
+                }
+                gs.edges.extend(enrichment.added_edges);
+
+                for (node_id, patches) in &enrichment.updated_nodes {
+                    if let Some(node) = gs.nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
+                        for (key, value) in patches {
+                            node.metadata.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+            }
+            self.lsp_status.set_complete(lsp_edge_count);
+        }
+
+        // Phase 4: Full persist with LSP edges included.
+        {
+            let snapshot = {
+                let g = self.graph.read().await;
+                g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+            };
+            if let Some((nodes, edges)) = snapshot {
+                tracing::info!(
+                    "Foreground incremental persist: {} nodes, {} edges (including {} LSP)",
+                    nodes.len(),
+                    edges.len(),
+                    lsp_edge_count,
+                );
+                if let Err(e) = persist_graph_to_lance(&self.repo_root, &nodes, &edges).await {
+                    tracing::error!("Foreground incremental persist failed: {}", e);
+                    return Err(e.context("Full persist failed during incremental foreground pipeline"));
+                }
+            }
+        }
+
+        // Commit scanner state after successful persist.
+        scanner.commit_state()?;
+
+        // Phase 5: Summary.
+        let (total_node_count, total_edge_count) = {
+            let guard = self.graph.read().await;
+            let gs = guard.as_ref().unwrap();
+            (gs.nodes.len(), gs.edges.len())
+        };
+
+        let total_time = pipeline_start.elapsed();
+        on_progress(&format!("Graph: {} nodes, {} edges", total_node_count, total_edge_count));
+        on_progress(&format!("Done in {:.1}s (incremental)", total_time.as_secs_f64()));
+
+        Ok(PipelineResult {
+            node_count: total_node_count,
+            edge_count: total_edge_count,
+            lsp_edge_count,
+            embed_count: 0, // re-embed handled by update_graph_with_scan
+            total_time,
+        })
+    }
+
+    /// Full rebuild foreground pipeline (no cache available).
+    async fn run_pipeline_foreground_full<F>(
+        &self,
+        on_progress: F,
+        pipeline_start: std::time::Instant,
+    ) -> anyhow::Result<PipelineResult>
+    where
+        F: Fn(&str) + Send + Sync,
+    {
         // Phase 1: Scan + Extract (reuses build_full_graph without background tasks)
         let t0 = std::time::Instant::now();
         let graph_state = self.build_full_graph_inner(false).await?;
@@ -1035,5 +1348,92 @@ impl RnaHandler {
             embed_count,
             total_time,
         })
+    }
+
+    /// Run LSP enrichment on the full graph synchronously and persist.
+    /// Used when the cached graph has no call edges and needs enrichment.
+    /// Returns the number of LSP edges added.
+    async fn run_foreground_lsp_and_persist<F>(
+        &self,
+        on_progress: &F,
+    ) -> anyhow::Result<usize>
+    where
+        F: Fn(&str) + Send + Sync,
+    {
+        let (all_nodes, graph_index, languages) = {
+            let guard = self.graph.read().await;
+            let gs = guard.as_ref().unwrap();
+            let langs: Vec<String> = gs.nodes.iter()
+                .map(|n| n.language.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            (gs.nodes.clone(), gs.index.clone(), langs)
+        };
+
+        let server_name = self.lsp_status.server_name();
+        if let Some(ref name) = server_name {
+            on_progress(&format!("LSP: {} found on PATH", name));
+        }
+        self.lsp_status.set_running();
+
+        let enricher_registry = EnricherRegistry::with_builtins();
+        let enrichment = enricher_registry
+            .enrich_all(&all_nodes, &graph_index, &languages, &self.repo_root)
+            .await;
+
+        if !enrichment.any_enricher_ran {
+            on_progress("LSP: no server available");
+            self.lsp_status.set_unavailable();
+            return Ok(0);
+        }
+
+        let lsp_edge_count = enrichment.added_edges.len();
+        on_progress(&format!("LSP: enriched {} call edges", lsp_edge_count));
+
+        // Apply enrichment to in-memory graph.
+        {
+            let mut guard = self.graph.write().await;
+            if let Some(ref mut gs) = *guard {
+                for vnode in &enrichment.new_nodes {
+                    gs.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
+                }
+                gs.nodes.extend(enrichment.new_nodes);
+
+                for edge in &enrichment.added_edges {
+                    gs.index.add_edge(
+                        &edge.from.to_stable_id(),
+                        &edge.from.kind.to_string(),
+                        &edge.to.to_stable_id(),
+                        &edge.to.kind.to_string(),
+                        edge.kind.clone(),
+                    );
+                }
+                gs.edges.extend(enrichment.added_edges);
+
+                for (node_id, patches) in &enrichment.updated_nodes {
+                    if let Some(node) = gs.nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
+                        for (key, value) in patches {
+                            node.metadata.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+            }
+        }
+        self.lsp_status.set_complete(lsp_edge_count);
+
+        // Persist with LSP edges.
+        let snapshot = {
+            let g = self.graph.read().await;
+            g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+        };
+        if let Some((nodes, edges)) = snapshot {
+            if let Err(e) = persist_graph_to_lance(&self.repo_root, &nodes, &edges).await {
+                tracing::error!("Foreground LSP persist failed: {}", e);
+                return Err(e.context("LSP persist failed during foreground pipeline"));
+            }
+        }
+
+        Ok(lsp_edge_count)
     }
 }
