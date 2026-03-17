@@ -507,6 +507,12 @@ struct LspState {
 /// for the remainder of the enrichment pass to avoid stalling on broken servers.
 const MAX_TYPE_HIERARCHY_STRIKES: u32 = 3;
 
+/// After processing this many nodes with zero edges, abort enrichment.
+/// A functioning language server should produce at least some edges within
+/// the first 1,000 nodes; zero edges indicates misconfiguration (e.g., pyright
+/// without a venv, or a server that can't resolve any references).
+const ZERO_EDGE_ABORT_THRESHOLD: u32 = 1_000;
+
 impl LspEnricher {
     /// Create a new LSP enricher for the given language server.
     ///
@@ -1686,7 +1692,7 @@ impl Enricher for LspEnricher {
 
             // Early abort: if we've processed >= 1,000 nodes with 0 edges,
             // the language server is likely misconfigured (e.g., missing venv).
-            if result.added_edges.is_empty() && attempted >= 1_000 {
+            if result.added_edges.is_empty() && attempted >= ZERO_EDGE_ABORT_THRESHOLD {
                 tracing::warn!(
                     "LSP: {} produced 0 edges after {}/{} nodes — aborting (likely misconfigured)",
                     self.server_command, attempted, total_nodes,
@@ -1775,7 +1781,7 @@ impl Enricher for LspEnricher {
                 }
 
                 // Early abort: 0 new edges after 1,000 type hierarchy nodes
-                if result.added_edges.len() == edges_before_pass2 && pass2_done >= 1_000 {
+                if result.added_edges.len() == edges_before_pass2 && pass2_done >= ZERO_EDGE_ABORT_THRESHOLD as u64 {
                     tracing::warn!(
                         "LSP: {} type hierarchy produced 0 edges after {}/{} nodes — aborting (likely misconfigured)",
                         self.server_command, pass2_done, pass2_total,
