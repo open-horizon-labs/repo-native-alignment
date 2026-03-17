@@ -431,6 +431,111 @@ mod tests {
         }
     }
 
+    /// Adversarial test: run_pipeline_foreground uses incremental path on second run.
+    /// Seeded from dissent: verify changed files are detected and old symbols removed.
+    #[tokio::test]
+    async fn test_foreground_pipeline_incremental_on_second_run() {
+        use tempfile::TempDir;
+        use std::sync::Mutex;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn alpha_function() {}\npub fn beta_function() {}\n",
+        )
+        .unwrap();
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            ..Default::default()
+        };
+
+        // First run: full rebuild (no cache).
+        let progress: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let p = progress.clone();
+        let result = handler
+            .run_pipeline_foreground(move |msg| {
+                p.lock().unwrap().push(msg.to_string());
+            })
+            .await
+            .expect("first foreground pipeline should succeed");
+
+        assert!(result.node_count > 0, "should have extracted nodes");
+        // Verify alpha and beta are in the graph.
+        {
+            let guard = handler.graph.read().await;
+            let gs = guard.as_ref().unwrap();
+            assert!(gs.nodes.iter().any(|n| n.id.name == "alpha_function"));
+            assert!(gs.nodes.iter().any(|n| n.id.name == "beta_function"));
+        }
+
+        // Verify the first run used the full rebuild path (no "Loaded cached graph" message).
+        let msgs = progress.lock().unwrap();
+        assert!(
+            !msgs.iter().any(|m| m.contains("Loaded cached graph")),
+            "first run should NOT use cached graph"
+        );
+        drop(msgs);
+
+        // Sleep so mtime changes are detected.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Modify: replace beta with gamma.
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn alpha_function() {}\npub fn gamma_function() {}\n",
+        )
+        .unwrap();
+
+        // Second run: should use incremental path.
+        // Need a fresh handler because the graph lock is held.
+        let handler2 = RnaHandler {
+            repo_root: root.to_path_buf(),
+            ..Default::default()
+        };
+
+        let progress2: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let p2 = progress2.clone();
+        let result2 = handler2
+            .run_pipeline_foreground(move |msg| {
+                p2.lock().unwrap().push(msg.to_string());
+            })
+            .await
+            .expect("second foreground pipeline should succeed");
+
+        assert!(result2.node_count > 0, "should have nodes after incremental");
+
+        // Verify the second run used the incremental path.
+        let msgs2 = progress2.lock().unwrap();
+        assert!(
+            msgs2.iter().any(|m| m.contains("Loaded cached graph")),
+            "second run should use cached graph. Messages: {:?}",
+            *msgs2
+        );
+
+        // Verify gamma replaced beta.
+        {
+            let guard = handler2.graph.read().await;
+            let gs = guard.as_ref().unwrap();
+            assert!(
+                gs.nodes.iter().any(|n| n.id.name == "alpha_function"),
+                "alpha_function should still be present"
+            );
+            assert!(
+                gs.nodes.iter().any(|n| n.id.name == "gamma_function"),
+                "gamma_function should be added by incremental update"
+            );
+            assert!(
+                !gs.nodes.iter().any(|n| n.id.name == "beta_function"),
+                "beta_function should be removed by incremental update"
+            );
+        }
+    }
+
     // ── effective_root_filter / node_passes_root_filter tests ──────────
 
     #[test]
