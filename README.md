@@ -15,7 +15,10 @@ Local context discovery and alignment tool for coding agents. Makes the fractal,
 - "Where is the authentication handler?" → `search("AuthHandler")` → file, line, signature, complexity, graph edges
 - "What are the riskiest functions?" → `search(query="", min_complexity=20, sort_by="complexity")` → hotspots ranked by cyclomatic complexity
 - "What are the most important symbols?" → `search(sort_by="importance")` → top symbols ranked by PageRank
-- "Give me a map of this repo" → `repo_map()` → top symbols, hotspot files, active outcomes, entry points
+- "Give me a map of this repo" → `repo_map()` → **subsystems** with cohesion scores and interfaces, top symbols, hotspot files, active outcomes, entry points
+- "What subsystems exist?" → `repo_map()` → Louvain community detection on call edges: `extract (1120 symbols, cohesion: 0.88)`, `server (721)`, `graph (223)`, ...
+- "Find auth code in the server subsystem" → `search(query="auth", subsystem="server")` → scoped to detected subsystem
+- "What connects extract to server?" → `search(node="X", mode="neighbors", target_subsystem="server")` → cross-subsystem edges
 
 ### See the blast radius of a change
 
@@ -173,12 +176,10 @@ The system compounds from here. Agents use `search` to discover relevant context
 
 | Tool | What it's for |
 |------|--------------|
-| `search` | All-in-one search: code symbols ranked by embedding index (hybrid BM25+vector by default, falls back to name/signature matching while index builds), .oh/ artifacts and commits, markdown sections, and graph traversal with `mode` (neighbors, impact, reachable, tests_for). Supports `include_artifacts` and `include_markdown` (both default true), `artifact_types` filter, `compact: true` (~25x fewer tokens), batch retrieval via `nodes: [...]`, sorting by relevance/complexity/importance, `search_mode` (hybrid/keyword/semantic), and `rerank: true` for cross-encoder reranking of top candidates (improves precision for natural language queries, ~100-300ms extra latency). |
-| `repo_map` | Repository orientation: top symbols by PageRank importance, hotspot files, active outcomes, entry points. One call replaces an exploratory loop. |
+| `search` | All-in-one search: code symbols ranked by embedding index (hybrid BM25+vector by default, falls back to name/signature matching while index builds), .oh/ artifacts and commits, markdown sections, and graph traversal with `mode` (neighbors, impact, reachable, tests_for). Supports `subsystem` filter (scope to detected subsystem), `target_subsystem` (cross-subsystem edge queries), `include_artifacts` and `include_markdown` (both default true), `artifact_types` filter, `compact: true` (~25x fewer tokens), batch retrieval via `nodes: [...]`, sorting by relevance/complexity/importance, `search_mode` (hybrid/keyword/semantic), and `rerank: true` for cross-encoder reranking of top candidates (improves precision for natural language queries, ~100-300ms extra latency). Node IDs from search results can be passed directly to graph traversal — short IDs resolve automatically. |
+| `repo_map` | Repository orientation: **detected subsystems** (Louvain community detection on call edges) with cohesion scores and interface functions, top symbols by PageRank importance, hotspot files, active outcomes, entry points. One call replaces an exploratory loop. |
 | `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols. Optional `include_impact: true` for risk-classified blast radius. |
 | `list_roots` | Show which workspace roots are configured and their scan status |
-
-> **Note:** `search_symbols` and `graph_query` still work as deprecated aliases for `search`.
 
 **Root scoping:** All query tools default to the primary workspace root (`--repo`). Pass `root: "all"` for cross-root search, or `root: "<slug>"` for a specific root. Non-code roots (.oh/ artifacts, commits, Notes) always pass through regardless of root filter.
 
@@ -205,6 +206,31 @@ search(node="<id>", mode="impact")
 | `graph --node <id> --mode neighbors` | `search(node="<id>", mode="neighbors")` | Graph traversal |
 | `scan --full` | *(runs automatically on first query)* | Full pipeline: scan → extract → embed → LSP → graph |
 | `test` | — | 25 pipeline checks end-to-end |
+
+### Building the Index
+
+The MCP server builds an index automatically on first query. For best results (including LSP call edges for subsystem detection and impact analysis), build the full index from the CLI first:
+
+```bash
+# Full pipeline: scan → extract → embed → LSP enrich → persist
+repo-native-alignment scan --repo /path/to/your/project --full
+
+# Typical output:
+# Scan+Extract: 8,700 symbols across 210 files in 0.6s
+# Embed: 2,800 items in 30s
+# LSP: enriched 8,200 call edges in 50s
+# Graph: 9,000 nodes, 16,600 edges
+# Done in 50s
+```
+
+Without `--full`, the scan skips LSP enrichment — faster (~1s) but subsystem detection and call-graph traversal won't have coupling edges.
+
+To force a clean rebuild (e.g., after upgrading RNA):
+
+```bash
+rm -rf .oh/.cache/lance .oh/.cache/scan-state.json
+repo-native-alignment scan --repo . --full
+```
 
 ### CLI Subcommands
 
@@ -262,7 +288,7 @@ RNA works standalone. These add organizational context and workflow structure:
 
 ## Status
 
-Tree-sitter + pipelined LSP enrichment, 5 MCP tools, 10 CLI subcommands, 710+ tests. Ships as a Claude Code plugin. CLI and MCP share a service layer — adding a parameter to the service automatically makes it available in both interfaces.
+Tree-sitter + pipelined LSP enrichment, 4 MCP tools, 10 CLI subcommands, 870+ tests. Automatic subsystem detection via Louvain community detection on call edges. Ships as a Claude Code plugin. CLI and MCP share a service layer — adding a parameter to the service automatically makes it available in both interfaces.
 
 ### Platform Support
 
