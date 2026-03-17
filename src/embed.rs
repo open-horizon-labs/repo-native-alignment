@@ -565,6 +565,8 @@ impl EmbeddingIndex {
         }
 
         let count = texts.len();
+        // Save IDs before they're moved into Arrow arrays — needed for delete-before-add.
+        let ids_for_delete: Vec<String> = ids.clone();
         let embeddings = embed_texts(texts).await?;
         let dim = embeddings[0].len();
         let flat_embeddings: Vec<f32> = embeddings.into_iter().flatten().collect();
@@ -587,15 +589,24 @@ impl EmbeddingIndex {
             vec![id_array, kind_array, title_array, body_array, text_hash_array, vector_array],
         )?;
 
+        // Delete existing rows for these IDs, then add() fresh.
+        // merge_insert fails on tables created by the same process (#332),
+        // so we use delete + add instead.
+        let quoted: Vec<String> = ids_for_delete.iter()
+            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .collect();
+        for chunk in quoted.chunks(500) {
+            let filter = format!("id IN ({})", chunk.join(", "));
+            table.delete(&filter).await
+                .context("Failed to delete rows before re-embed in reindex_nodes")?;
+        }
+
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let mut merge = table.merge_insert(&["id"]);
-        merge
-            .when_matched_update_all(None)
-            .when_not_matched_insert_all();
-        merge
-            .execute(Box::new(batches))
+        table
+            .add(Box::new(batches))
+            .execute()
             .await
-            .context("Failed to upsert enriched node embeddings")?;
+            .context("Failed to add enriched node embeddings")?;
 
         // Skip FTS rebuild on incremental upsert — the full FTS index is rebuilt
         // during index_all_inner(). Rebuilding on every small upsert defeats the
@@ -898,12 +909,35 @@ impl EmbeddingIndex {
         );
 
         // --- Stream embeddings in batches (#298) ---
-        // Embed WRITE_BATCH_SIZE texts at a time and merge_insert each batch
+        // Embed WRITE_BATCH_SIZE texts at a time and persist each batch
         // immediately, so we never hold all embedding vectors in memory.
         let embed_start = std::time::Instant::now();
         let mut embedded_count = 0usize;
 
         if !to_embed.is_empty() {
+            // If the table already exists, delete the IDs we're about to re-embed
+            // so we can use simple add() instead of merge_insert.  merge_insert
+            // fails on tables created by the same process (#332) and is unnecessary
+            // here: the BLAKE3 hash check already partitioned candidates into
+            // changed (to_embed) vs unchanged (kept in-place).
+            if table_exists {
+                let table = self.db.open_table(&self.table_name).execute().await
+                    .context("Failed to open table to delete stale rows before re-embed")?;
+                let ids_to_delete: Vec<&str> = to_embed.iter().map(|c| c.id.as_str()).collect();
+                for chunk in ids_to_delete.chunks(500) {
+                    let quoted: Vec<String> = chunk.iter()
+                        .map(|id| format!("'{}'", id.replace('\'', "''")))
+                        .collect();
+                    let filter = format!("id IN ({})", quoted.join(", "));
+                    table.delete(&filter).await
+                        .context("Failed to delete rows before re-embed")?;
+                }
+                tracing::info!(
+                    "EmbeddingIndex: deleted {} existing row(s) before re-embed",
+                    ids_to_delete.len(),
+                );
+            }
+
             // Load model once and reuse across all write batches to avoid
             // repeated heavyweight model initialization.
             let model = new_model()?;
@@ -970,19 +1004,17 @@ impl EmbeddingIndex {
                         .await
                         .context("Failed to add batch to LanceDB table")?;
                 } else {
-                    // Incremental update: merge-insert to upsert by id
-                    // (update if hash changed, insert if new)
+                    // Existing table: rows to re-embed were already deleted above,
+                    // so plain add() is correct (no duplicates possible).
+                    // merge_insert fails on tables created by the same process (#332).
                     let table = self.db.open_table(&self.table_name).execute().await
-                        .context("Failed to open table for merge_insert")?;
+                        .context("Failed to open table for add")?;
                     let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-                    let mut merge = table.merge_insert(&["id"]);
-                    merge
-                        .when_matched_update_all(None)
-                        .when_not_matched_insert_all();
-                    merge
-                        .execute(Box::new(batches))
+                    table
+                        .add(Box::new(batches))
+                        .execute()
                         .await
-                        .context("Failed to merge_insert batch into LanceDB table")?;
+                        .context("Failed to add batch to LanceDB table")?;
                 }
 
                 embedded_count += bs;
@@ -1002,8 +1034,8 @@ impl EmbeddingIndex {
         );
 
         // --- Delete stale rows (#298) ---
-        // If we used merge_insert (table already existed), there may be rows
-        // for nodes that no longer exist in the graph. Delete them.
+        // If the table already existed, there may be rows for nodes that no
+        // longer exist in the graph. Delete them.
         // Uses current_ids captured before partitioning to avoid re-loading
         // commits/merges from git.
         if table_exists {
@@ -1040,7 +1072,7 @@ impl EmbeddingIndex {
     }
 
     /// Delete embedding rows for IDs that are no longer in the current graph.
-    /// Called after merge_insert to clean up stale entries from previous builds.
+    /// Called after rebuild to clean up stale entries from previous builds.
     async fn delete_stale_rows_with_ids(&self, current_ids: &std::collections::HashSet<String>) -> Result<()> {
         use futures::TryStreamExt;
 
@@ -2229,6 +2261,57 @@ mod tests {
                 // text_hash column missing = old schema, acceptable
             }
         }
+    }
+
+    #[tokio::test]
+    async fn enrichment_re_embed_succeeds_on_existing_table() {
+        // Regression test for #332: second index_all_with_symbols call on an
+        // existing table (simulating post-enrichment re-embed) should succeed.
+        // The node body changes between calls, forcing a re-embed (BLAKE3 miss).
+        use crate::graph::{Node, NodeId, NodeKind, ExtractionSource};
+        use std::path::PathBuf;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_root.join(".oh")).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(&repo_root)
+            .output()
+            .ok();
+
+        let node_v1 = Node {
+            id: NodeId {
+                root: "test".into(),
+                file: PathBuf::from("enrich.rs"),
+                name: "enriched_fn".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            signature: "fn enriched_fn()".into(),
+            body: "fn enriched_fn() { original(); }".into(),
+            line_start: 1,
+            line_end: 1,
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        // Enriched version: same ID, different body (simulates LSP metadata)
+        let mut node_v2 = node_v1.clone();
+        node_v2.body = "fn enriched_fn() { original(); /* LSP: calls foo, bar */ }".into();
+        node_v2.metadata.insert("callers".into(), "foo, bar".into());
+
+        let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
+
+        // First build: creates table
+        let count1 = idx.index_all_with_symbols(&repo_root, &[node_v1]).await.unwrap();
+        assert!(count1 > 0, "first build should index items");
+        assert!(idx.has_table().await.unwrap(), "table should exist after first build");
+
+        // Second build with enriched node: body changed so BLAKE3 hash differs,
+        // must re-embed. Before fix #332 this failed with merge_insert error.
+        let count2 = idx.index_all_with_symbols(&repo_root, &[node_v2]).await.unwrap();
+        assert!(count2 > 0, "enrichment re-embed should re-index changed node");
     }
 
     #[test]
