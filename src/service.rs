@@ -219,7 +219,7 @@ async fn flat_code_symbol_search<'a>(
         }
         if let Some(ref sub) = params.subsystem {
             let node_sub = n.metadata.get(crate::server::SUBSYSTEM_KEY).map(|s| s.as_str()).unwrap_or("");
-            if !node_sub.eq_ignore_ascii_case(sub) { return false; }
+            if !subsystem_matches(node_sub, sub) { return false; }
         }
         true
     };
@@ -444,7 +444,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
                             if let Some(ref sub) = params.subsystem {
                                 ctx.graph_state.node_by_stable_id(&r.id, &node_index_map_for_entry)
                                     .and_then(|n| n.metadata.get(crate::server::SUBSYSTEM_KEY))
-                                    .map(|s| s.eq_ignore_ascii_case(sub))
+                                    .map(|s| subsystem_matches(s, sub))
                                     .unwrap_or(false)
                             } else {
                                 true
@@ -515,7 +515,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
             ids.retain(|id| {
                 gs.node_by_stable_id(id, &node_index_map)
                     .and_then(|n| n.metadata.get(crate::server::SUBSYSTEM_KEY))
-                    .map(|s| s.eq_ignore_ascii_case(sub))
+                    .map(|s| subsystem_matches(s, sub))
                     .unwrap_or(false)
             });
         }
@@ -781,7 +781,7 @@ fn resolve_entry_points_by_name<'a>(
         }
         if let Some(ref sub) = params.subsystem {
             let node_sub = n.metadata.get(crate::server::SUBSYSTEM_KEY).map(|s| s.as_str()).unwrap_or("");
-            if !node_sub.eq_ignore_ascii_case(sub) { return false; }
+            if !subsystem_matches(node_sub, sub) { return false; }
         }
         true
     }).collect();
@@ -797,6 +797,25 @@ fn resolve_entry_points_by_name<'a>(
 
     matches.truncate(limit);
     matches
+}
+
+/// Match a node's subsystem metadata against a filter value.
+///
+/// Supports hierarchical matching: `subsystem="extract"` matches nodes whose
+/// subsystem is exactly "extract" (case-insensitive) OR starts with "extract/"
+/// (i.e., any child sub-module). `subsystem="extract/enrich"` matches only
+/// nodes in that specific sub-module.
+fn subsystem_matches(node_subsystem: &str, filter: &str) -> bool {
+    if node_subsystem.eq_ignore_ascii_case(filter) {
+        return true;
+    }
+    // Parent-level match: filter="extract" should match node_subsystem="extract/Node".
+    // Check without allocating: node_subsystem must start with filter + "/" (case-insensitive).
+    if node_subsystem.len() > filter.len() {
+        let (head, tail) = node_subsystem.split_at(filter.len());
+        return head.eq_ignore_ascii_case(filter) && tail.starts_with('/');
+    }
+    false
 }
 
 pub fn node_passes_root_filter(node_root: &str, root_filter: &Option<String>, non_code_slugs: &HashSet<String>) -> bool {
@@ -1487,6 +1506,56 @@ mod tests {
     }
 
     #[test]
+    fn test_subsystem_matches_exact() {
+        assert!(super::subsystem_matches("extract", "extract"));
+        assert!(super::subsystem_matches("Extract", "extract"));
+        assert!(super::subsystem_matches("extract", "Extract"));
+    }
+
+    #[test]
+    fn test_subsystem_matches_parent_prefix() {
+        // Parent filter matches child sub-modules
+        assert!(super::subsystem_matches("extract/Node", "extract"));
+        assert!(super::subsystem_matches("extract/enrich", "extract"));
+        assert!(super::subsystem_matches("Extract/Node", "extract"));
+    }
+
+    #[test]
+    fn test_subsystem_matches_child_specific() {
+        // Child-specific filter matches only that child
+        assert!(super::subsystem_matches("extract/enrich", "extract/enrich"));
+        assert!(!super::subsystem_matches("extract/Node", "extract/enrich"));
+    }
+
+    #[test]
+    fn test_subsystem_matches_no_false_prefix() {
+        // "extract" should NOT match "extraction" (not a `/`-separated prefix)
+        assert!(!super::subsystem_matches("extraction", "extract"));
+    }
+
+    #[tokio::test]
+    async fn test_flat_search_subsystem_parent_matches_children() {
+        let mut node_a = make_node("enrich", NodeKind::Function, "src/extract/enrich.rs");
+        node_a.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "extract/enrich".to_string());
+        let mut node_b = make_node("NodeId", NodeKind::Struct, "src/extract/mod.rs");
+        node_b.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "extract/Node".to_string());
+        let mut node_c = make_node("embed_texts", NodeKind::Function, "src/embed.rs");
+        node_c.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "embed".to_string());
+        let gs = make_graph_state(vec![node_a, node_b, node_c]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            subsystem: Some("extract".into()),
+            ..Default::default()
+        };
+        let result = search(&params, &ctx).await;
+        // Both extract/enrich and extract/Node should match, but not embed
+        assert!(result.contains("enrich"), "Should include extract/enrich child");
+        assert!(result.contains("NodeId"), "Should include extract/Node child");
+        assert!(!result.contains("embed_texts"), "Should NOT include embed subsystem");
+    }
+
+    #[test]
     fn test_format_impact_subsystem_breakdown_empty() {
         let groups = std::collections::BTreeMap::new();
         let gs = make_graph_state(vec![]);
@@ -1652,40 +1721,51 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
                 }
             }
 
-            // Cap output to top 15 subsystems by symbol count.
-            let shown = subsystems.len().min(15);
-            let total_detected = subsystems.len();
-            subsystems.truncate(shown);
+            // Group flat subsystems by shared module prefix into a hierarchy.
+            let grouped = crate::graph::index::group_subsystems_by_prefix(subsystems);
 
-            if !subsystems.is_empty() {
-                let md: String = subsystems
+            // Cap output to top 15 top-level subsystems by symbol count.
+            let total_detected = grouped.len();
+            let shown = grouped.len().min(15);
+            let displayed: Vec<_> = grouped.into_iter().take(shown).collect();
+
+            if !displayed.is_empty() {
+                let format_interfaces = |s: &crate::graph::index::Subsystem| -> String {
+                    if s.interfaces.is_empty() {
+                        return String::new();
+                    }
+                    let iface_list: Vec<String> = s
+                        .interfaces
+                        .iter()
+                        .map(|iface| {
+                            let short_name = iface
+                                .node_id
+                                .split(':')
+                                .rev()
+                                .nth(1)
+                                .unwrap_or(&iface.node_id);
+                            if iface.node_type == "function" {
+                                format!("{}()", short_name)
+                            } else {
+                                short_name.to_string()
+                            }
+                        })
+                        .collect();
+                    format!("\n  Interfaces: {}", iface_list.join(", "))
+                };
+
+                let md: String = displayed
                     .iter()
                     .map(|s| {
-                        let interfaces_str = if s.interfaces.is_empty() {
+                        let sub_modules = if s.children.is_empty() {
                             String::new()
                         } else {
-                            let iface_list: Vec<String> = s
-                                .interfaces
-                                .iter()
-                                .map(|iface| {
-                                    let short_name = iface
-                                        .node_id
-                                        .split(':')
-                                        .rev()
-                                        .nth(1)
-                                        .unwrap_or(&iface.node_id);
-                                    if iface.node_type == "function" {
-                                        format!("{}()", short_name)
-                                    } else {
-                                        short_name.to_string()
-                                    }
-                                })
-                                .collect();
-                            format!("\n  Interfaces: {}", iface_list.join(", "))
+                            format!(", {} sub-modules", s.children.len())
                         };
+                        let interfaces_str = format_interfaces(s);
                         format!(
-                            "- **{}** ({} symbols, cohesion: {:.2}){}",
-                            s.name, s.symbol_count, s.cohesion, interfaces_str
+                            "- **{}** ({} symbols{}, cohesion: {:.2}){}",
+                            s.name, s.symbol_count, sub_modules, s.cohesion, interfaces_str
                         )
                     })
                     .collect::<Vec<_>>()
