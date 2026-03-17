@@ -1760,12 +1760,20 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
                         let sub_modules = if s.children.is_empty() {
                             String::new()
                         } else {
-                            format!(", {} sub-modules", s.children.len())
+                            let child_names: Vec<String> = s.children.iter()
+                                .map(|c| {
+                                    // Strip parent prefix for cleaner display
+                                    let short = c.name.strip_prefix(&format!("{}/", s.name))
+                                        .unwrap_or(&c.name);
+                                    format!("{} ({})", short, c.symbol_count)
+                                })
+                                .collect();
+                            format!("\n  Sub-modules: {}", child_names.join(", "))
                         };
                         let interfaces_str = format_interfaces(s);
                         format!(
-                            "- **{}** ({} symbols{}, cohesion: {:.2}){}",
-                            s.name, s.symbol_count, sub_modules, s.cohesion, interfaces_str
+                            "- **{}** ({} symbols, cohesion: {:.2}){}{}",
+                            s.name, s.symbol_count, s.cohesion, sub_modules, interfaces_str
                         )
                     })
                     .collect::<Vec<_>>()
