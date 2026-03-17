@@ -1022,7 +1022,7 @@ impl RnaHandler {
             let guard = self.graph.read().await;
             let gs = guard.as_ref().unwrap();
             gs.nodes.iter()
-                .filter(|n| changed_file_set.iter().any(|f| n.id.file == *f))
+                .filter(|n| changed_file_set.contains(&n.id.file))
                 .cloned()
                 .collect()
         };
@@ -1048,6 +1048,8 @@ impl RnaHandler {
 
         let t2 = std::time::Instant::now();
         let enricher_registry = EnricherRegistry::with_builtins();
+        let supported = enricher_registry.supported_languages();
+        let has_supported_language = languages.iter().any(|l| supported.contains(l));
         let graph_index = {
             let guard = self.graph.read().await;
             guard.as_ref().unwrap().index.clone()
@@ -1059,8 +1061,13 @@ impl RnaHandler {
 
         let lsp_edge_count;
         if !enrichment.any_enricher_ran {
-            on_progress(&format!("LSP: no server available ({:.1}s)", lsp_time.as_secs_f64()));
-            self.lsp_status.set_unavailable();
+            if has_supported_language {
+                on_progress(&format!("LSP: no server available ({:.1}s)", lsp_time.as_secs_f64()));
+                self.lsp_status.set_unavailable();
+            } else {
+                on_progress(&format!("LSP: no supported enrichers for changed files ({:.1}s)", lsp_time.as_secs_f64()));
+                self.lsp_status.set_complete(0);
+            }
             lsp_edge_count = 0;
         } else {
             lsp_edge_count = enrichment.added_edges.len();
@@ -1089,8 +1096,15 @@ impl RnaHandler {
                 }
                 gs.edges.extend(enrichment.added_edges);
 
+                // Build index for O(1) lookup instead of O(N) find per patch.
+                let node_pos: std::collections::HashMap<String, usize> = gs.nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| (n.stable_id(), i))
+                    .collect();
                 for (node_id, patches) in &enrichment.updated_nodes {
-                    if let Some(node) = gs.nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
+                    if let Some(&idx) = node_pos.get(node_id) {
+                        let node = &mut gs.nodes[idx];
                         for (key, value) in patches {
                             node.metadata.insert(key.clone(), value.clone());
                         }
@@ -1411,8 +1425,15 @@ impl RnaHandler {
                 }
                 gs.edges.extend(enrichment.added_edges);
 
+                // Build index for O(1) lookup instead of O(N) find per patch.
+                let node_pos: std::collections::HashMap<String, usize> = gs.nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| (n.stable_id(), i))
+                    .collect();
                 for (node_id, patches) in &enrichment.updated_nodes {
-                    if let Some(node) = gs.nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
+                    if let Some(&idx) = node_pos.get(node_id) {
+                        let node = &mut gs.nodes[idx];
                         for (key, value) in patches {
                             node.metadata.insert(key.clone(), value.clone());
                         }
