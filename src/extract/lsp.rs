@@ -1683,6 +1683,17 @@ impl Enricher for LspEnricher {
                 last_progress_log = std::time::Instant::now();
                 last_logged_count = done;
             }
+
+            // Early abort: if we've processed >= 1,000 nodes with 0 edges,
+            // the language server is likely misconfigured (e.g., missing venv).
+            if result.added_edges.is_empty() && attempted >= 1_000 {
+                tracing::warn!(
+                    "LSP: {} produced 0 edges after {}/{} nodes — aborting (likely misconfigured)",
+                    self.server_command, attempted, total_nodes,
+                );
+                join_set.abort_all();
+                break;
+            }
         }
 
         tracing::info!(
@@ -1713,6 +1724,7 @@ impl Enricher for LspEnricher {
             let pass2_start = std::time::Instant::now();
             let mut pass2_done = 0u64;
             let pass2_total = type_nodes.len();
+            let edges_before_pass2 = result.added_edges.len();
             let mut pass2_last_log = std::time::Instant::now();
             let mut pass2_last_count = 0u64;
 
@@ -1760,6 +1772,15 @@ impl Enricher for LspEnricher {
                     );
                     pass2_last_log = std::time::Instant::now();
                     pass2_last_count = pass2_done;
+                }
+
+                // Early abort: 0 new edges after 1,000 type hierarchy nodes
+                if result.added_edges.len() == edges_before_pass2 && pass2_done >= 1_000 {
+                    tracing::warn!(
+                        "LSP: {} type hierarchy produced 0 edges after {}/{} nodes — aborting (likely misconfigured)",
+                        self.server_command, pass2_done, pass2_total,
+                    );
+                    break;
                 }
 
                 if !has_type_hierarchy {
