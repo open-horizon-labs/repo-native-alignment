@@ -879,6 +879,16 @@ impl RnaHandler {
     where
         F: Fn(&str) + Send + Sync,
     {
+        // Pre-flight: ensure schema version matches. If migration happened,
+        // the cache was rebuilt and our loaded graph is stale -- fall back to
+        // full rebuild by returning an error that the caller can catch.
+        let db_path = super::store::graph_lance_path(&self.repo_root);
+        if super::store::check_and_migrate_schema(&db_path).await? {
+            tracing::info!("Schema migrated during incremental pre-flight -- falling back to full rebuild");
+            on_progress("Schema migration detected -- rebuilding from scratch.");
+            return self.run_pipeline_foreground_full(on_progress, pipeline_start).await;
+        }
+
         // Phase 1: Scan to detect changes.
         let t0 = std::time::Instant::now();
         let mut scanner = Scanner::new(self.repo_root.clone())?;
