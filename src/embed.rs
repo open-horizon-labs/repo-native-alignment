@@ -909,7 +909,7 @@ impl EmbeddingIndex {
         );
 
         // --- Stream embeddings in batches (#298) ---
-        // Embed WRITE_BATCH_SIZE texts at a time and merge_insert each batch
+        // Embed WRITE_BATCH_SIZE texts at a time and persist each batch
         // immediately, so we never hold all embedding vectors in memory.
         let embed_start = std::time::Instant::now();
         let mut embedded_count = 0usize;
@@ -1034,8 +1034,8 @@ impl EmbeddingIndex {
         );
 
         // --- Delete stale rows (#298) ---
-        // If we used merge_insert (table already existed), there may be rows
-        // for nodes that no longer exist in the graph. Delete them.
+        // If the table already existed, there may be rows for nodes that no
+        // longer exist in the graph. Delete them.
         // Uses current_ids captured before partitioning to avoid re-loading
         // commits/merges from git.
         if table_exists {
@@ -1072,7 +1072,7 @@ impl EmbeddingIndex {
     }
 
     /// Delete embedding rows for IDs that are no longer in the current graph.
-    /// Called after merge_insert to clean up stale entries from previous builds.
+    /// Called after rebuild to clean up stale entries from previous builds.
     async fn delete_stale_rows_with_ids(&self, current_ids: &std::collections::HashSet<String>) -> Result<()> {
         use futures::TryStreamExt;
 
