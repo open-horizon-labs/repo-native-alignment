@@ -78,7 +78,7 @@ impl RnaHandler {
                     None => (None, None),
                 };
                 let graph = guard.as_mut().unwrap();
-                self.update_graph_with_scan(graph, scan).await?;
+                self.update_graph_with_scan(graph, scan, true).await?;
                 // Graph update succeeded -- now persist scanner state
                 if let Some(scanner) = scanner {
                     scanner.commit_state()?;
@@ -649,10 +649,15 @@ impl RnaHandler {
     ///
     /// When `pending_scan` is `None`, this method creates its own scanner and
     /// commits state only after the graph update succeeds.
+    ///
+    /// When `spawn_lsp` is true (default for MCP server), LSP enrichment for
+    /// changed nodes is spawned as a background task. When false (CLI `--full`
+    /// incremental path), no LSP is spawned -- the caller handles it.
     pub(crate) async fn update_graph_with_scan(
         &self,
         graph: &mut GraphState,
         pending_scan: Option<ScanResult>,
+        spawn_lsp: bool,
     ) -> anyhow::Result<()> {
         // If no pre-computed scan, create a fresh scanner. We hold it so we
         // can commit state after successful processing.
@@ -773,7 +778,7 @@ impl RnaHandler {
             .cloned()
             .collect();
 
-        if !changed_nodes.is_empty() {
+        if spawn_lsp && !changed_nodes.is_empty() {
             self.spawn_incremental_lsp_enrichment(changed_nodes, graph.index.clone());
         }
 
