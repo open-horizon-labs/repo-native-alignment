@@ -71,6 +71,10 @@ pub struct RnaHandler {
     pub embed_status: Arc<EmbeddingStatus>,
     /// Cached non-code root slugs (computed once, cleared on root changes).
     pub non_code_root_slugs_cache: std::sync::Mutex<Option<std::collections::HashSet<String>>>,
+    /// Serializes all LanceDB writes to prevent concurrent merge_insert conflicts.
+    /// Background enrichment and scanner-triggered incremental updates both write
+    /// to the same LanceDB tables; concurrent writes cause "conflict" errors (#344).
+    pub lance_write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for RnaHandler {
@@ -87,6 +91,7 @@ impl Default for RnaHandler {
             lsp_status: Arc::new(LspEnrichmentStatus::probe_for_servers()),
             embed_status: Arc::new(EmbeddingStatus::default()),
             non_code_root_slugs_cache: std::sync::Mutex::new(None),
+            lance_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }

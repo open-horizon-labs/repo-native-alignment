@@ -22,6 +22,7 @@ impl RnaHandler {
     pub(crate) fn spawn_background_scanner(&self) {
         let graph = Arc::clone(&self.graph);
         let repo_root = self.repo_root.clone();
+        let lance_write_lock = Arc::clone(&self.lance_write_lock);
         tokio::spawn(async move {
             // Track root slugs from the previous tick to detect removed worktrees.
             // Seed from the current resolved roots so the first tick doesn't
@@ -274,18 +275,22 @@ impl RnaHandler {
                 drop(guard);
 
                 // Persist incremental deltas to LanceDB for each root (lock released above).
+                // Acquire the write mutex to serialize with other LanceDB writers (#344 round 3).
                 // Track which roots persisted successfully so we can commit scanner state.
                 let mut persisted_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for (slug, root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove) in lance_deltas {
-                    match persist_graph_incremental(
-                        &root_path,
-                        &upsert_nodes,
-                        &upsert_edges,
-                        &deleted_edge_ids,
-                        &files_to_remove,
-                    )
-                    .await
-                    {
+                    let persist_result = {
+                        let _lance_guard = lance_write_lock.lock().await;
+                        persist_graph_incremental(
+                            &root_path,
+                            &upsert_nodes,
+                            &upsert_edges,
+                            &deleted_edge_ids,
+                            &files_to_remove,
+                        )
+                        .await
+                    };
+                    match persist_result {
                         Ok(true) => {
                             tracing::info!("Background scan: schema migrated; performing full persist now");
                             let snapshot = {
@@ -293,8 +298,9 @@ impl RnaHandler {
                                 g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
                             };
                             if let Some((nodes, edges)) = snapshot {
+                                let _lance_guard = lance_write_lock.lock().await;
                                 if let Err(e) = persist_graph_to_lance(&repo_root, &nodes, &edges).await {
-                                    tracing::error!("Background scan: full persist after migration failed: {}", e);
+                                    tracing::error!("Background scan: full persist after migration failed: {:#}", e);
                                     continue; // Don't commit scanner state for this root
                                 }
                             }
@@ -304,7 +310,7 @@ impl RnaHandler {
                             persisted_slugs.insert(slug);
                         }
                         Err(e) => {
-                            tracing::error!("Background scan: failed to persist graph delta for '{}': {}", slug, e);
+                            tracing::error!("Background scan: failed to persist graph delta for '{}': {:#}", slug, e);
                             // Don't commit scanner state -- next scan will re-detect changes
                         }
                     }
@@ -352,6 +358,7 @@ impl RnaHandler {
         let bg_embed_index = self.embed_index.clone();
         let bg_lsp_status = self.lsp_status.clone();
         let bg_embed_status = self.embed_status.clone();
+        let bg_lance_write_lock = Arc::clone(&self.lance_write_lock);
         let bg_nodes = all_nodes.to_vec();
         let bg_languages: Vec<String> = all_nodes
             .iter()
@@ -528,10 +535,15 @@ impl RnaHandler {
                         upsert_nodes.len(),
                         persist_edges.len(),
                     );
-                    drop(guard); // release lock before async persist
-                    match persist_graph_incremental(
-                        &lsp_repo_root, &upsert_nodes, &persist_edges, &[], &[],
-                    ).await {
+                    drop(guard); // release graph lock before acquiring lance write lock
+                    // Serialize with other LanceDB writers via the shared mutex (#344 round 3).
+                    let persist_result = {
+                        let _lance_guard = bg_lance_write_lock.lock().await;
+                        persist_graph_incremental(
+                            &lsp_repo_root, &upsert_nodes, &persist_edges, &[], &[],
+                        ).await
+                    };
+                    match persist_result {
                         Ok(true) => {
                             // Schema migrated -- tables were dropped, need full persist
                             tracing::info!("[background] LSP enrichment: schema migrated; performing full persist");
@@ -540,8 +552,9 @@ impl RnaHandler {
                                 g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
                             };
                             if let Some((nodes, edges)) = snapshot {
+                                let _lance_guard = bg_lance_write_lock.lock().await;
                                 if let Err(e) = persist_graph_to_lance(&lsp_repo_root, &nodes, &edges).await {
-                                    tracing::error!("[background] LSP enrichment: full persist after migration failed: {}", e);
+                                    tracing::error!("[background] LSP enrichment: full persist after migration failed: {:#}", e);
                                     bg_lsp_status.set_complete_persist_failed(edge_count);
                                 } else {
                                     bg_lsp_status.set_complete(edge_count);
@@ -552,7 +565,7 @@ impl RnaHandler {
                         }
                         Ok(false) => bg_lsp_status.set_complete(edge_count),
                         Err(e) => {
-                            tracing::error!("[background] LSP enrichment: incremental persist failed: {}", e);
+                            tracing::error!("[background] LSP enrichment: incremental persist failed: {:#}", e);
                             bg_lsp_status.set_complete_persist_failed(edge_count);
                         }
                     }
@@ -569,6 +582,7 @@ impl RnaHandler {
         let bg_repo_root = self.repo_root.clone();
         let bg_graph = self.graph.clone();
         let bg_lsp_status = self.lsp_status.clone();
+        let bg_lance_write_lock = Arc::clone(&self.lance_write_lock);
         let bg_nodes: Vec<Node> = nodes.to_vec();
         let bg_languages: Vec<String> = nodes
             .iter()
@@ -675,10 +689,15 @@ impl RnaHandler {
                     upsert_nodes.len(),
                     persist_edges.len(),
                 );
-                drop(guard);
-                match persist_graph_incremental(
-                    &bg_repo_root, &upsert_nodes, &persist_edges, &[], &[],
-                ).await {
+                drop(guard); // release graph lock before acquiring lance write lock
+                // Serialize with other LanceDB writers via the shared mutex (#344 round 3).
+                let persist_result = {
+                    let _lance_guard = bg_lance_write_lock.lock().await;
+                    persist_graph_incremental(
+                        &bg_repo_root, &upsert_nodes, &persist_edges, &[], &[],
+                    ).await
+                };
+                match persist_result {
                     Ok(true) => {
                         tracing::info!("[background] LSP enrichment (cache-hit): schema migrated; performing full persist");
                         let snapshot = {
@@ -686,8 +705,9 @@ impl RnaHandler {
                             g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
                         };
                         if let Some((nodes, edges)) = snapshot {
+                            let _lance_guard = bg_lance_write_lock.lock().await;
                             if let Err(e) = persist_graph_to_lance(&bg_repo_root, &nodes, &edges).await {
-                                tracing::error!("[background] LSP enrichment (cache-hit): full persist after migration failed: {}", e);
+                                tracing::error!("[background] LSP enrichment (cache-hit): full persist after migration failed: {:#}", e);
                                 bg_lsp_status.set_complete_persist_failed(edge_count);
                             } else {
                                 bg_lsp_status.set_complete(edge_count);
@@ -698,7 +718,7 @@ impl RnaHandler {
                     }
                     Ok(false) => bg_lsp_status.set_complete(edge_count),
                     Err(e) => {
-                        tracing::error!("[background] LSP enrichment (cache-hit): incremental persist failed: {}", e);
+                        tracing::error!("[background] LSP enrichment (cache-hit): incremental persist failed: {:#}", e);
                         bg_lsp_status.set_complete_persist_failed(edge_count);
                     }
                 }
@@ -731,6 +751,7 @@ impl RnaHandler {
         let bg_repo_root = self.repo_root.clone();
         let bg_lsp_status = self.lsp_status.clone();
         let bg_embed_index = self.embed_index.clone();
+        let bg_lance_write_lock = Arc::clone(&self.lance_write_lock);
 
         self.lsp_status.set_running();
 
@@ -840,9 +861,14 @@ impl RnaHandler {
                 }
 
                 // Persist to LanceDB (slow -- outside the lock).
-                match persist_graph_incremental(
-                    &bg_repo_root, &all_upsert_nodes, &persist_edges, &[], &[],
-                ).await {
+                // Acquire the write mutex to serialize with other LanceDB writers (#344 round 3).
+                let persist_result = {
+                    let _lance_guard = bg_lance_write_lock.lock().await;
+                    persist_graph_incremental(
+                        &bg_repo_root, &all_upsert_nodes, &persist_edges, &[], &[],
+                    ).await
+                };
+                match persist_result {
                     Ok(true) => {
                         tracing::info!("[incremental-bg] LSP enrichment: schema migrated; performing full persist");
                         let snapshot = {
@@ -850,8 +876,9 @@ impl RnaHandler {
                             g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
                         };
                         if let Some((nodes, edges)) = snapshot {
+                            let _lance_guard = bg_lance_write_lock.lock().await;
                             if let Err(e) = persist_graph_to_lance(&bg_repo_root, &nodes, &edges).await {
-                                tracing::error!("[incremental-bg] Full persist after migration failed: {}", e);
+                                tracing::error!("[incremental-bg] Full persist after migration failed: {:#}", e);
                                 bg_lsp_status.set_complete_persist_failed(edge_count);
                             } else {
                                 bg_lsp_status.set_complete(edge_count);
@@ -862,7 +889,7 @@ impl RnaHandler {
                     }
                     Ok(false) => bg_lsp_status.set_complete(edge_count),
                     Err(e) => {
-                        tracing::error!("[incremental-bg] LSP enrichment persist failed: {}", e);
+                        tracing::error!("[incremental-bg] LSP enrichment persist failed: {:#}", e);
                         bg_lsp_status.set_complete_persist_failed(edge_count);
                     }
                 }

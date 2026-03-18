@@ -598,10 +598,12 @@ impl RnaHandler {
         // Persisting here would write only tree-sitter edges, and a subsequent
         // `repo-map` loading from LanceDB cache would miss LSP edges (#311).
         if spawn_background {
+            let _lance_guard = self.lance_write_lock.lock().await;
             if let Err(e) = persist_graph_to_lance(&self.repo_root, &all_nodes, &all_edges).await {
                 tracing::error!("Failed to persist graph to LanceDB: {}", e);
                 return Err(e.context("LanceDB full persist failed during graph build"));
             }
+            drop(_lance_guard);
         }
 
         // Persist succeeded (or deferred) -- commit scanner state for all roots
@@ -889,35 +891,54 @@ impl RnaHandler {
         // Untouched rows remain in LanceDB as-is. Deleted files are removed by targeted delete.
         // merge_insert keeps tables alive; no empty-result query window.
         //
-        // Persist failures are propagated as errors (not warnings) so the caller
-        // knows not to commit scanner state -- ensuring the next scan re-detects
-        // the same changes instead of silently losing them.
-        match persist_graph_incremental(
-            &self.repo_root,
-            &upsert_nodes,
-            &upsert_edges,
-            &deleted_edge_ids,
-            &files_to_remove,
-        )
-        .await
-        {
+        // Acquire the write mutex before persisting to prevent concurrent LanceDB write
+        // conflicts with background enrichment tasks (#344 round 3). The lock is released
+        // after persist completes so the next persist can proceed.
+        //
+        // Persist failures are logged but do NOT block the MCP response — the in-memory
+        // graph update succeeded and queries can proceed. Scanner state is NOT committed on
+        // failure, so the next scan re-detects and retries the persist.
+        let persist_result = {
+            let _lance_guard = self.lance_write_lock.lock().await;
+            persist_graph_incremental(
+                &self.repo_root,
+                &upsert_nodes,
+                &upsert_edges,
+                &deleted_edge_ids,
+                &files_to_remove,
+            )
+            .await
+        };
+        let persist_succeeded = match persist_result {
             Ok(true) => {
                 tracing::info!("Schema migrated during incremental update; performing full persist now");
+                let _lance_guard = self.lance_write_lock.lock().await;
                 if let Err(e) = persist_graph_to_lance(&self.repo_root, &graph.nodes, &graph.edges).await {
-                    tracing::error!("Full persist after migration failed: {}", e);
-                    return Err(e.context("LanceDB full persist after migration failed"));
+                    tracing::error!("Full persist after migration failed: {:#}", e);
+                    // Don't block MCP response — log and treat as persist failure.
+                    // Scanner state won't be committed so next scan retries.
+                    false
+                } else {
+                    true
                 }
             }
             Err(e) => {
-                tracing::error!("Failed to persist updated graph: {}", e);
-                return Err(e.context("LanceDB incremental persist failed"));
+                tracing::error!("Incremental persist failed (LanceDB error): {:#}", e);
+                // Don't return error — the in-memory graph update succeeded.
+                // Queries will use the correct in-memory state.
+                // Scanner state is NOT committed when false so next scan retries persist.
+                false
             }
-            _ => {}
-        }
+            Ok(false) => true,
+        };
 
         // Commit fallback scanner state only after successful persist.
-        if let Some(scanner) = fallback_scanner {
-            scanner.commit_state()?;
+        // If persist failed, scanner state is left uncommitted so the next scan
+        // re-detects the same changes and retries the LanceDB write.
+        if persist_succeeded {
+            if let Some(scanner) = fallback_scanner {
+                scanner.commit_state()?;
+            }
         }
 
         graph.last_scan_completed_at = Some(std::time::Instant::now());
