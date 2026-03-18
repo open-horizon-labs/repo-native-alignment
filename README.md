@@ -223,7 +223,7 @@ repo-native-alignment scan --repo . --full
 # Done in 50s
 ```
 
-Without `--full`, the scan skips LSP enrichment — faster (~1s) but subsystem detection and call-graph traversal won't have coupling edges.
+Without `--full`, the scan skips LSP enrichment — subsystem detection and call-graph traversal won't have coupling edges.
 
 **After upgrading RNA**, clear the old index and rebuild. Schema changes between versions (e.g., subsystem metadata, LSP edge persistence) require a fresh index:
 
