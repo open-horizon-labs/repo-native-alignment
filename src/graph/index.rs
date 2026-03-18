@@ -1006,6 +1006,67 @@ pub fn group_subsystems_by_prefix(subsystems: Vec<Subsystem>) -> Vec<Subsystem> 
     result
 }
 
+/// Derive a child sub-module name from the file paths of its member nodes.
+///
+/// Given a parent prefix (e.g., "server") and the member IDs of a child cluster,
+/// returns the most common second-level directory component or file stem that
+/// distinguishes this child from siblings.  For example, members mostly in
+/// `src/server/graph.rs` -> "graph"; members in `src/extract/lsp.rs` -> "lsp".
+///
+/// Falls back to "sub" if no distinguishing component can be determined.
+pub fn child_name_from_files(
+    member_ids: &[String],
+    node_file_map: &HashMap<String, String>,
+    _parent_prefix: &str,
+) -> String {
+    let mut component_counts: BTreeMap<String, usize> = BTreeMap::new();
+
+    for id in member_ids {
+        if let Some(file_path) = node_file_map.get(id.as_str()) {
+            let parts: Vec<&str> = file_path.split('/').collect();
+            // Strip "src/" prefix if present
+            let parts = if parts.first() == Some(&"src") {
+                &parts[1..]
+            } else {
+                &parts[..]
+            };
+
+            if parts.len() >= 2 {
+                // "server/graph.rs" -> "graph", "server/graph/mod.rs" -> "graph"
+                let component = if parts.len() == 2 {
+                    parts[1]
+                        .rsplit_once('.')
+                        .map(|(stem, _)| stem)
+                        .unwrap_or(parts[1])
+                } else {
+                    parts[1]
+                };
+                if component != "mod" {
+                    *component_counts.entry(component.to_string()).or_default() += 1;
+                }
+            } else if parts.len() == 1 {
+                // Flat file in src/ (e.g., "embed.rs") -> use file stem
+                let stem = parts[0]
+                    .rsplit_once('.')
+                    .map(|(s, _)| s)
+                    .unwrap_or(parts[0]);
+                if !stem.is_empty() {
+                    *component_counts.entry(stem.to_string()).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    if let Some((name, _)) = component_counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+    {
+        return name;
+    }
+
+    "sub".to_string()
+}
+
 /// Compute a cluster name from member nodes.
 ///
 /// Priority:
@@ -2512,6 +2573,53 @@ mod tests {
         // Single child: kept as leaf, not wrapped in parent
         assert_eq!(grouped[0].name, "embed/model");
         assert!(grouped[0].children.is_empty());
+    }
+
+    #[test]
+    fn test_child_name_from_files_uses_directory_component() {
+        use super::child_name_from_files;
+        let mut node_file_map = HashMap::new();
+        node_file_map.insert("id1".to_string(), "src/server/graph.rs".to_string());
+        node_file_map.insert("id2".to_string(), "src/server/graph.rs".to_string());
+        node_file_map.insert("id3".to_string(), "src/server/graph.rs".to_string());
+        node_file_map.insert("id4".to_string(), "src/server/tools.rs".to_string());
+
+        let member_ids: Vec<String> = vec!["id1", "id2", "id3", "id4"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let name = child_name_from_files(&member_ids, &node_file_map, "server");
+        assert_eq!(name, "graph", "Should use most-common second-level dir component");
+    }
+
+    #[test]
+    fn test_child_name_from_files_nested_directory() {
+        use super::child_name_from_files;
+        let mut node_file_map = HashMap::new();
+        node_file_map.insert("id1".to_string(), "src/extract/lsp/mod.rs".to_string());
+        node_file_map.insert("id2".to_string(), "src/extract/lsp/enricher.rs".to_string());
+
+        let member_ids: Vec<String> = vec!["id1", "id2"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let name = child_name_from_files(&member_ids, &node_file_map, "extract");
+        assert_eq!(name, "lsp", "Should use second-level directory name");
+    }
+
+    #[test]
+    fn test_child_name_from_files_flat_src_files() {
+        use super::child_name_from_files;
+        let mut node_file_map = HashMap::new();
+        node_file_map.insert("id1".to_string(), "src/embed.rs".to_string());
+        node_file_map.insert("id2".to_string(), "src/embed.rs".to_string());
+
+        let member_ids: Vec<String> = vec!["id1", "id2"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let name = child_name_from_files(&member_ids, &node_file_map, "server");
+        assert_eq!(name, "embed", "Should use file stem for flat src/ files");
     }
 
     #[test]

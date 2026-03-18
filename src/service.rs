@@ -2123,10 +2123,15 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
             }
             for s in &mut subsystems {
                 if name_counts.get(&s.name).copied().unwrap_or(0) > 1 {
-                    if let Some(iface) = s.interfaces.first() {
-                        let short = iface.node_id.split(':').rev().nth(1).unwrap_or(&iface.node_id);
-                        s.name = format!("{}/{}", s.name, short);
-                    }
+                    // Derive disambiguating suffix from the most-common second-level
+                    // directory component of member files rather than from a function
+                    // name. E.g., members in src/server/graph.rs -> "graph".
+                    let suffix = crate::graph::index::child_name_from_files(
+                        &s.member_ids,
+                        &node_file_map,
+                        &s.name,
+                    );
+                    s.name = format!("{}/{}", s.name, suffix);
                 }
             }
 
