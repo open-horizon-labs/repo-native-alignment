@@ -2116,7 +2116,8 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
             subsystems.retain(|s| (s.symbol_count as f64) < (filtered_node_count as f64 * 0.5));
 
             // Deduplicate names: when multiple clusters share a name, append
-            // a distinguishing suffix from their top interface function.
+            // a distinguishing suffix derived from the most-common file directory
+            // component of the cluster's members.
             let mut name_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
             for s in &subsystems {
                 *name_counts.entry(s.name.clone()).or_default() += 1;
