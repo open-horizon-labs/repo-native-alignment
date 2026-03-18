@@ -22,7 +22,7 @@ Local context discovery and alignment tool for coding agents. Makes the fractal,
 
 ### See the blast radius of a change
 
-- "What depends on the database connection pool?" → `search(query="database connection pool", mode="impact")` → transitive dependents across languages, one call
+- "What depends on the database connection pool?" → `search(query="database connection pool", mode="impact")` → transitive dependents grouped by subsystem with entry points; auto-summarized when large
 - "What calls AuthHandler?" → `search(query="AuthHandler", mode="neighbors", direction="incoming")` → callers, implementors
 - "Find all trait implementors" → `search(query="Enricher trait", mode="neighbors", edge_types=["implements"])` → concrete types with compiler-grade edges
 
@@ -205,7 +205,7 @@ search(node="<id>", mode="impact")
 | `search "auth"` | `search(query="auth")` | Find symbols by name |
 | `graph --node <id> --mode neighbors` | `search(node="<id>", mode="neighbors")` | Graph traversal |
 | `scan --full` | *(runs automatically on first query)* | Full pipeline: scan → extract → embed → LSP → graph |
-| `test` | — | 25 pipeline checks end-to-end |
+| `test` | — | 29 pipeline checks end-to-end |
 
 ### Building the Index
 
@@ -239,7 +239,7 @@ repo-native-alignment scan --repo . --full
 | `search <query>` | Search symbols via embedding index (hybrid/keyword/semantic), filter by kind/language/file |
 | `graph --node <id> --mode <mode>` | Traverse neighbors, impact analysis, or reachability |
 | `scan --repo <dir>` | Scan + extract + embed + persist |
-| `scan --repo <dir> --full` | Full pipeline including LSP enrichment, with visible phase-by-phase output |
+| `scan --repo <dir> --full` | Full pipeline including LSP enrichment. Incremental when cache exists (~0.1s on no-change runs). LSP aborts early if misconfigured (0 edges after 1,000 nodes or 2 minutes). |
 | `stats --repo <dir>` | Show repo stats from persisted index (no re-scan) |
 | `test --repo <dir>` | Run 25 pipeline checks end-to-end |
 | `setup --project <dir>` | Bootstrap RNA + OH MCP + skills for a project |
