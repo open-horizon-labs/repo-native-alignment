@@ -578,14 +578,24 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
             "impact" if large_impact => {
                 let subsystem_breakdown = format_impact_subsystem_breakdown(&merged_groups, gs, &node_index_map, strip);
                 let subsystem_count = count_affected_subsystems(&merged_groups, gs, &node_index_map);
-                format!(
-                    "## Impact of {} ({} subsystems affected)\n\n{} dependent(s) within {} hop(s)\n{}\n",
-                    entry_label,
-                    subsystem_count,
-                    total_count,
-                    params.hops.unwrap_or(3),
-                    subsystem_breakdown,
-                )
+                if subsystem_count == 0 {
+                    // Subsystem metadata not available — fall back to count-only summary
+                    format!(
+                        "## Impact of {}\n\n{} dependent(s) within {} hop(s) (result summarized — use `subsystem` filter to drill down)\n\n",
+                        entry_label,
+                        total_count,
+                        params.hops.unwrap_or(3),
+                    )
+                } else {
+                    format!(
+                        "## Impact of {} ({} subsystems affected)\n\n{} dependent(s) within {} hop(s)\n{}\n",
+                        entry_label,
+                        subsystem_count,
+                        total_count,
+                        params.hops.unwrap_or(3),
+                        subsystem_breakdown,
+                    )
+                }
             }
             "impact" => format!("## Impact analysis for {}\n\n{} dependent(s) within {} hop(s)\n\n", entry_label, total_count, params.hops.unwrap_or(3)),
             "reachable" => format!("## Reachable from {}\n\n{} node(s) within {} hop(s)\n\n", entry_label, total_count, params.hops.unwrap_or(3)),
