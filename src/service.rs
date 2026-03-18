@@ -2090,7 +2090,12 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
             .iter()
             .filter(|n| n.id.root != "external")
             .filter(|n| node_passes_root_filter(&n.id.root, &params.root_filter, &params.non_code_slugs))
-            .map(|n| (n.stable_id(), n.id.file.display().to_string()))
+            .map(|n| {
+                // Normalize to forward slashes so child_name_from_files works
+                // on all platforms (Path::display uses OS-native separators).
+                let path = n.id.file.to_string_lossy().replace('\\', "/");
+                (n.stable_id(), path)
+            })
             .collect();
 
         // Build pagerank scores map from node metadata
@@ -2133,6 +2138,21 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
                         &s.name,
                     );
                     s.name = format!("{}/{}", s.name, suffix);
+                }
+            }
+
+            // Ensure final names are globally unique after disambiguation.
+            // Two clusters could still collide if they share the same dominant
+            // directory component (e.g., both get "server/graph").
+            {
+                let mut seen: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                for s in &mut subsystems {
+                    let count = seen.entry(s.name.clone()).or_default();
+                    *count += 1;
+                    if *count > 1 {
+                        s.name = format!("{}-{}", s.name, *count);
+                    }
                 }
             }
 
