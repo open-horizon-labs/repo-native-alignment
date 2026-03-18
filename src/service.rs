@@ -2116,17 +2116,23 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
             subsystems.retain(|s| (s.symbol_count as f64) < (filtered_node_count as f64 * 0.5));
 
             // Deduplicate names: when multiple clusters share a name, append
-            // a distinguishing suffix from their top interface function.
+            // a distinguishing suffix derived from the most-common file directory
+            // component of the cluster's members.
             let mut name_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
             for s in &subsystems {
                 *name_counts.entry(s.name.clone()).or_default() += 1;
             }
             for s in &mut subsystems {
                 if name_counts.get(&s.name).copied().unwrap_or(0) > 1 {
-                    if let Some(iface) = s.interfaces.first() {
-                        let short = iface.node_id.split(':').rev().nth(1).unwrap_or(&iface.node_id);
-                        s.name = format!("{}/{}", s.name, short);
-                    }
+                    // Derive disambiguating suffix from the most-common second-level
+                    // directory component of member files rather than from a function
+                    // name. E.g., members in src/server/graph.rs -> "graph".
+                    let suffix = crate::graph::index::child_name_from_files(
+                        &s.member_ids,
+                        &node_file_map,
+                        &s.name,
+                    );
+                    s.name = format!("{}/{}", s.name, suffix);
                 }
             }
 
