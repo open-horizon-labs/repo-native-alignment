@@ -1443,7 +1443,7 @@ async fn run_broken_symlink_check() -> Check {
 /// `detect_communities()` returns >0 subsystems. If the graph has too few
 /// coupling edges the check is skipped rather than failed.
 fn run_subsystem_detection_check(index: &GraphIndex, nodes: &[Node], edges: &[Edge]) -> Check {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     // Count only the coupling edge kinds that detect_communities actually uses.
     // Tree-sitter produces Defines/HasField edges but NOT Calls/Implements;
@@ -1457,10 +1457,11 @@ fn run_subsystem_detection_check(index: &GraphIndex, nodes: &[Node], edges: &[Ed
         EdgeKind::References,
         EdgeKind::ConnectsTo,
     ];
-    let coupling_edge_count = edges
+    let coupling_edges: Vec<&Edge> = edges
         .iter()
         .filter(|e| coupling_kinds.contains(&e.kind))
-        .count();
+        .collect();
+    let coupling_edge_count = coupling_edges.len();
 
     if coupling_edge_count == 0 {
         return Check::skip(
@@ -1472,19 +1473,39 @@ fn run_subsystem_detection_check(index: &GraphIndex, nodes: &[Node], edges: &[Ed
         );
     }
 
-    if coupling_edge_count < 2 {
-        return Check::skip(
-            "subsystem_detection",
-            format!("Insufficient coupling edges ({}) for community detection", coupling_edge_count),
-        );
-    }
-
     // Build the node_file_map and pagerank_scores that detect_communities needs
     let node_file_map: HashMap<String, String> = nodes
         .iter()
         .filter(|n| n.id.root != "external")
         .map(|n| (n.stable_id(), n.id.file.display().to_string()))
         .collect();
+    let prod_count = node_file_map.len();
+
+    // Count unique non-external nodes that participate in coupling edges.
+    // This mirrors detect_communities()'s density guard which checks
+    // nodes_with_edges (unique coupling participants) against prod_count.
+    let mut coupling_node_ids: HashSet<String> = HashSet::new();
+    for e in &coupling_edges {
+        let from_id = e.from.to_stable_id();
+        let to_id = e.to.to_stable_id();
+        if node_file_map.contains_key(&from_id) {
+            coupling_node_ids.insert(from_id);
+        }
+        if node_file_map.contains_key(&to_id) {
+            coupling_node_ids.insert(to_id);
+        }
+    }
+    let nodes_with_coupling = coupling_node_ids.len();
+
+    if nodes_with_coupling < 3 {
+        return Check::skip(
+            "subsystem_detection",
+            format!(
+                "Too few nodes with coupling edges ({} nodes from {} edges) for community detection",
+                nodes_with_coupling, coupling_edge_count,
+            ),
+        );
+    }
 
     let pagerank_scores = index.compute_pagerank(0.85, 20);
 
@@ -1493,28 +1514,26 @@ fn run_subsystem_detection_check(index: &GraphIndex, nodes: &[Node], edges: &[Ed
     if subsystems.is_empty() {
         // detect_communities has an internal density guard: it requires at
         // least 5% of production nodes to have coupling neighbors. When the
-        // graph is large but coupling edges are sparse (e.g., LSP enrichment
+        // graph is large but coupling nodes are sparse (e.g., LSP enrichment
         // only ran briefly), returning 0 subsystems is correct behavior, not
         // a bug. Mirror that density check here to decide skip vs. fail.
-        let node_count = index.node_count();
-        let is_sparse = coupling_edge_count < 10
-            || (node_count > 100
-                && (coupling_edge_count as f64) < (node_count as f64 * 0.05));
+        let is_sparse = prod_count > 100
+            && (nodes_with_coupling as f64) < (prod_count as f64 * 0.05);
 
         if is_sparse {
             Check::skip(
                 "subsystem_detection",
                 format!(
-                    "No subsystems detected — coupling edges too sparse ({} coupling / {} nodes)",
-                    coupling_edge_count, node_count,
+                    "No subsystems detected — coupling nodes too sparse ({} coupling nodes / {} prod nodes)",
+                    nodes_with_coupling, prod_count,
                 ),
             )
         } else {
             Check::fail(
                 "subsystem_detection",
                 format!(
-                    "No subsystems detected despite {} coupling edges ({} nodes) — detect_communities may be broken",
-                    coupling_edge_count, node_count,
+                    "No subsystems detected despite {} coupling nodes from {} edges ({} prod nodes) — detect_communities may be broken",
+                    nodes_with_coupling, coupling_edge_count, prod_count,
                 ),
             )
         }
@@ -1523,10 +1542,11 @@ fn run_subsystem_detection_check(index: &GraphIndex, nodes: &[Node], edges: &[Ed
         Check::pass(
             "subsystem_detection",
             format!(
-                "{} subsystem(s) detected ({} total members) from {} coupling edges",
+                "{} subsystem(s) detected ({} total members) from {} coupling edges ({} coupling nodes)",
                 subsystems.len(),
                 total_members,
                 coupling_edge_count,
+                nodes_with_coupling,
             ),
         )
     }
