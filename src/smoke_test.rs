@@ -350,6 +350,18 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     // 25. LSP status footer — verifies format_freshness renders all 4 LSP states
     checks.push(run_lsp_status_footer_check());
 
+    // 26. Subsystem detection — verifies detect_communities returns >0 subsystems when coupling edges exist
+    checks.push(run_subsystem_detection_check(&index, &all_nodes));
+
+    // 27. Impact output size — verifies impact traversal output stays under 50K chars
+    checks.push(run_impact_output_size_check(&index, &all_nodes).await);
+
+    // 28. Short ID resolution — verifies GraphState.resolve_node_id resolves short IDs back to full IDs
+    checks.push(run_short_id_resolution_check(&index, &all_nodes));
+
+    // 29. Edge persist parity — verifies edge count matches after persist + reload (±5%)
+    checks.push(run_edge_persist_parity_check(&all_nodes, &all_edges).await);
+
     Ok(print_and_return(args, checks))
 }
 
@@ -1422,6 +1434,328 @@ async fn run_broken_symlink_check() -> Check {
             let _ = std::fs::remove_dir_all(&temp_dir);
             Check::fail("broken_symlink", format!("Scan crashed on broken symlink: {}", e))
         }
+    }
+}
+
+// ── Regression checks (issue #353) ──────────────────────────────────
+
+/// Subsystem detection check: after graph build with coupling edges, verify
+/// `detect_communities()` returns >0 subsystems. If the graph has too few
+/// coupling edges the check is skipped rather than failed.
+fn run_subsystem_detection_check(index: &GraphIndex, nodes: &[Node]) -> Check {
+    use std::collections::HashMap;
+
+    // Need coupling edges (Calls, Implements, etc.) for meaningful community detection
+    let coupling_edge_count = index.edge_count();
+    if coupling_edge_count < 2 {
+        return Check::skip(
+            "subsystem_detection",
+            format!("Insufficient coupling edges ({}) for community detection", coupling_edge_count),
+        );
+    }
+
+    // Build the node_file_map and pagerank_scores that detect_communities needs
+    let node_file_map: HashMap<String, String> = nodes
+        .iter()
+        .filter(|n| n.id.root != "external")
+        .map(|n| (n.stable_id(), n.id.file.display().to_string()))
+        .collect();
+
+    let pagerank_scores = index.compute_pagerank(0.85, 20);
+
+    let subsystems = index.detect_communities(&pagerank_scores, &node_file_map);
+
+    if subsystems.is_empty() {
+        // If the graph has coupling edges but no subsystems were detected,
+        // the fixture may be too small. Skip rather than fail.
+        if coupling_edge_count < 10 {
+            Check::skip(
+                "subsystem_detection",
+                format!(
+                    "No subsystems detected with {} coupling edges (fixture may be too small)",
+                    coupling_edge_count
+                ),
+            )
+        } else {
+            Check::fail(
+                "subsystem_detection",
+                format!(
+                    "No subsystems detected despite {} coupling edges — detect_communities may be broken",
+                    coupling_edge_count
+                ),
+            )
+        }
+    } else {
+        let total_members: usize = subsystems.iter().map(|s| s.symbol_count).sum();
+        Check::pass(
+            "subsystem_detection",
+            format!(
+                "{} subsystem(s) detected ({} total members) from {} coupling edges",
+                subsystems.len(),
+                total_members,
+                coupling_edge_count,
+            ),
+        )
+    }
+}
+
+/// Impact output size check: run impact traversal on the highest-PageRank node
+/// and verify the output is under 50K chars. This catches the summary threshold
+/// not triggering on large graphs.
+async fn run_impact_output_size_check(index: &GraphIndex, nodes: &[Node]) -> Check {
+    use crate::server::GraphState;
+
+    if nodes.is_empty() {
+        return Check::skip("impact_output_size", "No nodes available for impact check");
+    }
+
+    // Find the highest-PageRank node
+    let pagerank_scores = index.compute_pagerank(0.85, 20);
+    let best_node = nodes.iter()
+        .filter(|n| n.id.root != "external")
+        .max_by(|a, b| {
+            let sa = pagerank_scores.get(&a.stable_id()).copied().unwrap_or(0.0);
+            let sb = pagerank_scores.get(&b.stable_id()).copied().unwrap_or(0.0);
+            sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+    let best_node = match best_node {
+        Some(n) => n,
+        None => return Check::skip("impact_output_size", "No non-external nodes available"),
+    };
+
+    let node_id = best_node.stable_id();
+
+    // Build a GraphState for the search context
+    let mut gs_index = GraphIndex::new();
+    let edges_for_index: Vec<Edge> = Vec::new();
+    gs_index.rebuild_from_edges(&edges_for_index);
+    for n in nodes {
+        gs_index.ensure_node(&n.stable_id(), &n.id.kind.to_string());
+    }
+    // Copy the actual index so we have real edges
+    let graph_state = GraphState {
+        nodes: nodes.to_vec(),
+        edges: Vec::new(),
+        index: index.clone(),
+        last_scan_completed_at: None,
+    };
+
+    let ctx = crate::service::SearchContext {
+        graph_state: &graph_state,
+        embed_index: None,
+        repo_root: std::path::Path::new("."),
+        lsp_status: None,
+        embed_status: None,
+        root_filter: None,
+        non_code_slugs: std::collections::HashSet::new(),
+    };
+
+    let params = crate::service::SearchParams {
+        query: None,
+        node: Some(node_id.clone()),
+        mode: Some("impact".to_string()),
+        hops: Some(3),
+        direction: None,
+        edge_types: None,
+        kind: None,
+        language: None,
+        file: None,
+        limit: Some(50),
+        sort_by: None,
+        min_complexity: None,
+        synthetic: None,
+        compact: false,
+        nodes: None,
+        search_mode: None,
+        rerank: false,
+        include_artifacts: false,
+        include_markdown: false,
+        artifact_types: None,
+        subsystem: None,
+        target_subsystem: None,
+    };
+
+    let output = crate::service::search(&params, &ctx).await;
+    let output_len = output.len();
+    let max_chars = 50_000;
+
+    if output_len > max_chars {
+        Check::fail(
+            "impact_output_size",
+            format!(
+                "Impact traversal on '{}' produced {} chars (limit: {}). Summary threshold may not be triggering.",
+                best_node.id.name, output_len, max_chars
+            ),
+        )
+    } else {
+        Check::pass(
+            "impact_output_size",
+            format!(
+                "Impact traversal on '{}' produced {} chars (under {} limit)",
+                best_node.id.name, output_len, max_chars
+            ),
+        )
+    }
+}
+
+/// Short ID resolution check: constructs nodes with a known root prefix, then
+/// strips the root prefix (simulating what search results display), passes the
+/// short ID to `GraphState.resolve_node_id()`, and verifies it resolves back to
+/// the full ID.
+///
+/// Uses synthetic nodes with a root prefix rather than the extracted nodes,
+/// because extraction sets `root=""` — the root is only populated when the
+/// server builds the full graph from LanceDB data.
+fn run_short_id_resolution_check(_index: &GraphIndex, _nodes: &[Node]) -> Check {
+    use crate::graph::{ExtractionSource, NodeId, NodeKind};
+    use crate::server::GraphState;
+    use std::collections::BTreeMap;
+
+    let root = "smoke-test-root";
+    let file = "src/example.rs";
+    let name = "example_fn";
+    let kind = NodeKind::Function;
+
+    let node = Node {
+        id: NodeId {
+            root: root.to_string(),
+            file: PathBuf::from(file),
+            name: name.to_string(),
+            kind: kind.clone(),
+        },
+        language: "rust".to_string(),
+        line_start: 1,
+        line_end: 3,
+        signature: "fn example_fn()".to_string(),
+        body: "fn example_fn() {}".to_string(),
+        metadata: BTreeMap::new(),
+        source: ExtractionSource::TreeSitter,
+    };
+
+    let full_id = node.stable_id(); // "smoke-test-root:src/example.rs:example_fn:function"
+
+    // Build a GraphState with this node
+    let mut index = GraphIndex::new();
+    index.ensure_node(&full_id, &kind.to_string());
+
+    let graph_state = GraphState {
+        nodes: vec![node],
+        edges: Vec::new(),
+        index,
+        last_scan_completed_at: None,
+    };
+
+    // Strip the root prefix to get the short ID
+    let short_id = match full_id.split_once(':') {
+        Some((_root, rest)) => rest.to_string(),
+        None => return Check::fail("short_id_resolution", "Node stable_id has no colon separator"),
+    };
+
+    let resolved = graph_state.resolve_node_id(&short_id);
+
+    if resolved == full_id {
+        Check::pass(
+            "short_id_resolution",
+            format!(
+                "Short ID '{}' resolved to full ID '{}'",
+                truncate_for_display(&short_id, 60),
+                truncate_for_display(&full_id, 60),
+            ),
+        )
+    } else if resolved == short_id {
+        Check::fail(
+            "short_id_resolution",
+            format!(
+                "Short ID '{}' was NOT resolved (returned as-is). Expected full ID '{}'.",
+                truncate_for_display(&short_id, 60),
+                truncate_for_display(&full_id, 60),
+            ),
+        )
+    } else {
+        Check::fail(
+            "short_id_resolution",
+            format!(
+                "Short ID '{}' resolved to unexpected ID '{}'. Expected '{}'.",
+                truncate_for_display(&short_id, 60),
+                truncate_for_display(&resolved, 60),
+                truncate_for_display(&full_id, 60),
+            ),
+        )
+    }
+}
+
+/// Edge persist parity check: after `persist_graph_to_lance()`, call
+/// `load_graph_from_lance()`. Compare edge counts. They should match within 5%.
+/// This catches LSP edges being lost during persist.
+async fn run_edge_persist_parity_check(nodes: &[Node], edges: &[Edge]) -> Check {
+    if nodes.is_empty() {
+        return Check::skip("edge_persist_parity", "No nodes available for edge parity check");
+    }
+
+    let temp_dir = std::env::temp_dir().join("rna-smoke-edge-persist-parity");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+        return Check::fail("edge_persist_parity", format!("Could not create temp dir: {}", e));
+    }
+
+    // Persist the graph
+    if let Err(e) = persist_graph_to_lance(&temp_dir, nodes, edges).await {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return Check::fail("edge_persist_parity", format!("persist_graph_to_lance failed: {}", e));
+    }
+
+    // Reload from LanceDB
+    let reloaded = match load_graph_from_lance(&temp_dir).await {
+        Ok(state) => state,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Check::fail("edge_persist_parity", format!("load_graph_from_lance failed: {}", e));
+        }
+    };
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    let original_edge_count = edges.len();
+    let reloaded_edge_count = reloaded.edges.len();
+
+    if original_edge_count == 0 && reloaded_edge_count == 0 {
+        return Check::pass(
+            "edge_persist_parity",
+            "Both original and reloaded have 0 edges (no edges in fixture)",
+        );
+    }
+
+    // Allow 5% tolerance
+    let max = original_edge_count.max(reloaded_edge_count) as f64;
+    let min = original_edge_count.min(reloaded_edge_count) as f64;
+    let parity_ratio = if max > 0.0 { min / max } else { 1.0 };
+
+    if parity_ratio < 0.95 {
+        Check::fail(
+            "edge_persist_parity",
+            format!(
+                "Edge count mismatch: original={}, reloaded={} (parity: {:.1}%). Edges may be lost during persist.",
+                original_edge_count, reloaded_edge_count, parity_ratio * 100.0
+            ),
+        )
+    } else {
+        Check::pass(
+            "edge_persist_parity",
+            format!(
+                "Edge persist parity OK: original={}, reloaded={} (parity: {:.1}%)",
+                original_edge_count, reloaded_edge_count, parity_ratio * 100.0
+            ),
+        )
+    }
+}
+
+/// Truncate a string for display in check output, appending "..." if truncated.
+fn truncate_for_display(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len])
     }
 }
 
