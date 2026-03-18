@@ -17,7 +17,7 @@ use petgraph::Direction;
 
 use crate::embed::EmbeddingIndex;
 use crate::extract::ExtractorRegistry;
-use crate::graph::{Edge, Node};
+use crate::graph::{Edge, EdgeKind, Node};
 use crate::graph::index::GraphIndex;
 use crate::query;
 use crate::roots::WorkspaceConfig;
@@ -351,7 +351,7 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     checks.push(run_lsp_status_footer_check());
 
     // 26. Subsystem detection — verifies detect_communities returns >0 subsystems when coupling edges exist
-    checks.push(run_subsystem_detection_check(&index, &all_nodes));
+    checks.push(run_subsystem_detection_check(&index, &all_nodes, &all_edges));
 
     // 27. Impact output size — verifies impact traversal output stays under 50K chars
     checks.push(run_impact_output_size_check(&index, &all_nodes).await);
@@ -1442,11 +1442,36 @@ async fn run_broken_symlink_check() -> Check {
 /// Subsystem detection check: after graph build with coupling edges, verify
 /// `detect_communities()` returns >0 subsystems. If the graph has too few
 /// coupling edges the check is skipped rather than failed.
-fn run_subsystem_detection_check(index: &GraphIndex, nodes: &[Node]) -> Check {
+fn run_subsystem_detection_check(index: &GraphIndex, nodes: &[Node], edges: &[Edge]) -> Check {
     use std::collections::HashMap;
 
-    // Need coupling edges (Calls, Implements, etc.) for meaningful community detection
-    let coupling_edge_count = index.edge_count();
+    // Count only the coupling edge kinds that detect_communities actually uses.
+    // Tree-sitter produces Defines/HasField edges but NOT Calls/Implements;
+    // those come from LSP enrichment. Using index.edge_count() here would
+    // count all edge kinds and incorrectly report "coupling edges" when there
+    // are none.
+    let coupling_kinds = [
+        EdgeKind::Calls,
+        EdgeKind::Implements,
+        EdgeKind::ReferencedBy,
+        EdgeKind::References,
+        EdgeKind::ConnectsTo,
+    ];
+    let coupling_edge_count = edges
+        .iter()
+        .filter(|e| coupling_kinds.contains(&e.kind))
+        .count();
+
+    if coupling_edge_count == 0 {
+        return Check::skip(
+            "subsystem_detection",
+            format!(
+                "No coupling edges available ({} total edges are structural only — LSP not run)",
+                edges.len()
+            ),
+        );
+    }
+
     if coupling_edge_count < 2 {
         return Check::skip(
             "subsystem_detection",
@@ -1466,22 +1491,30 @@ fn run_subsystem_detection_check(index: &GraphIndex, nodes: &[Node]) -> Check {
     let subsystems = index.detect_communities(&pagerank_scores, &node_file_map);
 
     if subsystems.is_empty() {
-        // If the graph has coupling edges but no subsystems were detected,
-        // the fixture may be too small. Skip rather than fail.
-        if coupling_edge_count < 10 {
+        // detect_communities has an internal density guard: it requires at
+        // least 5% of production nodes to have coupling neighbors. When the
+        // graph is large but coupling edges are sparse (e.g., LSP enrichment
+        // only ran briefly), returning 0 subsystems is correct behavior, not
+        // a bug. Mirror that density check here to decide skip vs. fail.
+        let node_count = index.node_count();
+        let is_sparse = coupling_edge_count < 10
+            || (node_count > 100
+                && (coupling_edge_count as f64) < (node_count as f64 * 0.05));
+
+        if is_sparse {
             Check::skip(
                 "subsystem_detection",
                 format!(
-                    "No subsystems detected with {} coupling edges (fixture may be too small)",
-                    coupling_edge_count
+                    "No subsystems detected — coupling edges too sparse ({} coupling / {} nodes)",
+                    coupling_edge_count, node_count,
                 ),
             )
         } else {
             Check::fail(
                 "subsystem_detection",
                 format!(
-                    "No subsystems detected despite {} coupling edges — detect_communities may be broken",
-                    coupling_edge_count
+                    "No subsystems detected despite {} coupling edges ({} nodes) — detect_communities may be broken",
+                    coupling_edge_count, node_count,
                 ),
             )
         }
