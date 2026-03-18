@@ -568,10 +568,27 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         };
         format!("{}{}{}", entry_header, mode_desc, freshness)
     } else {
-        // For large impact results (>100 nodes), show only the subsystem summary
+        // For large impact results (>100 unique nodes), show only the subsystem summary
         // instead of listing every node. This prevents 162K+ char responses that
         // overflow MCP response limits and are unreadable by agents.
-        let large_impact = mode == "impact" && total_count > IMPACT_SUMMARY_THRESHOLD;
+        // Use unique node count (not per-bucket total_count) because the same node
+        // can appear under multiple edge kinds in merged_groups.
+        let unique_impact_count = if mode == "impact" {
+            let mut seen: HashSet<&str> = HashSet::new();
+            for ids in merged_groups.values() {
+                for id in ids {
+                    if let Some(node) = gs.node_by_stable_id(id, &node_index_map) {
+                        if !crate::server::helpers::is_hidden_traversal_kind(&node.id.kind) {
+                            seen.insert(id.as_str());
+                        }
+                    }
+                }
+            }
+            seen.len()
+        } else {
+            0
+        };
+        let large_impact = mode == "impact" && unique_impact_count > IMPACT_SUMMARY_THRESHOLD;
 
         let heading = match mode {
             "neighbors" => format!("## Graph neighbors ({}) of {}\n\n{} result(s)\n\n", direction, entry_label, total_count),
@@ -583,7 +600,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
                     format!(
                         "## Impact of {}\n\n{} dependent(s) within {} hop(s) (result summarized — use `subsystem` filter to drill down)\n\n",
                         entry_label,
-                        total_count,
+                        unique_impact_count,
                         params.hops.unwrap_or(3),
                     )
                 } else {
@@ -591,7 +608,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
                         "## Impact of {} ({} subsystems affected)\n\n{} dependent(s) within {} hop(s)\n{}\n",
                         entry_label,
                         subsystem_count,
-                        total_count,
+                        unique_impact_count,
                         params.hops.unwrap_or(3),
                         subsystem_breakdown,
                     )
@@ -642,6 +659,9 @@ fn format_impact_subsystem_breakdown(
                 continue; // Skip duplicates across edge-kind buckets
             }
             if let Some(node) = gs.node_by_stable_id(id, node_index_map) {
+                if crate::server::helpers::is_hidden_traversal_kind(&node.id.kind) {
+                    continue;
+                }
                 if let Some(sub) = node.metadata.get(crate::server::SUBSYSTEM_KEY) {
                     subsystem_nodes
                         .entry(sub.clone())
@@ -695,6 +715,9 @@ fn count_affected_subsystems(
                 continue;
             }
             if let Some(node) = gs.node_by_stable_id(id, node_index_map) {
+                if crate::server::helpers::is_hidden_traversal_kind(&node.id.kind) {
+                    continue;
+                }
                 if let Some(sub) = node.metadata.get(crate::server::SUBSYSTEM_KEY) {
                     subsystems.insert(sub.as_str());
                 }
