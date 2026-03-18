@@ -185,7 +185,7 @@ This step exists because PR #137 taught us: computing a value is not delivering 
   - `search_symbols` formatting
   - `graph_query` / `format_neighbor_nodes` formatting
   - `search` code results formatting
-- [ ] **End-to-end:** After `cargo install --path .` + restart + rescan, does the value appear in actual tool output?
+- [ ] **End-to-end (MCP server path):** Start the MCP server and verify through the MCP protocol — not just CLI. Run `.github/scripts/mcp-smoke.mjs ./target/release/repo-native-alignment .github/fixtures/smoke` and verify the specific feature being tested. If the feature isn't covered by the smoke script, add an assertion to it or test manually with `npx @modelcontextprotocol/inspector`. **Unit tests and CLI scans do not substitute for this — the MCP server has a different code path and has regressed multiple times when only the CLI was tested.**
 
 **If the PR doesn't add agent-visible data, mark this step N/A.**
 
@@ -202,6 +202,7 @@ gh pr comment <PR> --body "$(cat <<'EOF'
 - [x/blank] Render: `graph_query` / `format_neighbor_nodes` formatting
 - [x/blank] Render: `search` code results formatting
 - [x/blank] End-to-end: value visible in tool output after `cargo install --path .` + restart + rescan
+- [x/blank] MCP server path: verified via `mcp-smoke.mjs` or `@modelcontextprotocol/inspector` (not just CLI)
 EOF
 )"
 ```
