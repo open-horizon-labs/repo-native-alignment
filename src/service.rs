@@ -18,6 +18,11 @@ use crate::server::handlers::{parse_search_mode, run_traversal};
 use crate::server::state::{EmbeddingStatus, GraphState, LspEnrichmentStatus};
 use crate::server::store::parse_edge_kind;
 
+/// When impact results exceed this threshold, render a subsystem-grouped summary
+/// instead of listing every node. This prevents huge responses (162K+ chars) that
+/// overflow MCP response limits and are unreadable by agents.
+const IMPACT_SUMMARY_THRESHOLD: usize = 100;
+
 /// Interface-agnostic search parameters.
 #[derive(Debug, Default)]
 pub struct SearchParams {
@@ -563,24 +568,47 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         };
         format!("{}{}{}", entry_header, mode_desc, freshness)
     } else {
-        let md = format_neighbors_grouped_with_root(&gs.nodes, &merged_groups, &gs.index, params.compact, strip);
+        // For large impact results (>100 nodes), show only the subsystem summary
+        // instead of listing every node. This prevents 162K+ char responses that
+        // overflow MCP response limits and are unreadable by agents.
+        let large_impact = mode == "impact" && total_count > IMPACT_SUMMARY_THRESHOLD;
+
         let heading = match mode {
             "neighbors" => format!("## Graph neighbors ({}) of {}\n\n{} result(s)\n\n", direction, entry_label, total_count),
+            "impact" if large_impact => {
+                let subsystem_breakdown = format_impact_subsystem_breakdown(&merged_groups, gs, &node_index_map, strip);
+                let subsystem_count = count_affected_subsystems(&merged_groups, gs, &node_index_map);
+                format!(
+                    "## Impact of {} ({} subsystems affected)\n\n{} dependent(s) within {} hop(s)\n{}\n",
+                    entry_label,
+                    subsystem_count,
+                    total_count,
+                    params.hops.unwrap_or(3),
+                    subsystem_breakdown,
+                )
+            }
             "impact" => format!("## Impact analysis for {}\n\n{} dependent(s) within {} hop(s)\n\n", entry_label, total_count, params.hops.unwrap_or(3)),
             "reachable" => format!("## Reachable from {}\n\n{} node(s) within {} hop(s)\n\n", entry_label, total_count, params.hops.unwrap_or(3)),
             "tests_for" => format!("## Test coverage for {}\n\n{} test function(s)\n\n", entry_label, total_count),
             _ => String::new(),
         };
 
-        // For impact mode, append a subsystem breakdown showing which subsystems
-        // are affected and through which interface function the impact propagates.
-        let subsystem_section = if mode == "impact" {
-            format_impact_subsystem_breakdown(&merged_groups, gs, &node_index_map, strip)
+        if large_impact {
+            // Summary-only: heading already contains the subsystem breakdown
+            format!("{}{}{}", entry_header, heading, freshness)
         } else {
-            String::new()
-        };
+            let md = format_neighbors_grouped_with_root(&gs.nodes, &merged_groups, &gs.index, params.compact, strip);
 
-        format!("{}{}{}{}{}", entry_header, heading, md, subsystem_section, freshness)
+            // For impact mode, append a subsystem breakdown showing which subsystems
+            // are affected and through which interface function the impact propagates.
+            let subsystem_section = if mode == "impact" {
+                format_impact_subsystem_breakdown(&merged_groups, gs, &node_index_map, strip)
+            } else {
+                String::new()
+            };
+
+            format!("{}{}{}{}{}", entry_header, heading, md, subsystem_section, freshness)
+        }
     }
 }
 
@@ -641,6 +669,29 @@ fn format_impact_subsystem_breakdown(
         "\n\n### Affected subsystems\n\n{}\n",
         lines.join("\n")
     )
+}
+
+/// Count the number of distinct subsystems affected by impact results.
+fn count_affected_subsystems(
+    merged_groups: &std::collections::BTreeMap<crate::graph::EdgeKind, Vec<String>>,
+    gs: &GraphState,
+    node_index_map: &std::collections::HashMap<String, usize>,
+) -> usize {
+    let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut subsystems: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for ids in merged_groups.values() {
+        for id in ids {
+            if !seen_ids.insert(id.as_str()) {
+                continue;
+            }
+            if let Some(node) = gs.node_by_stable_id(id, node_index_map) {
+                if let Some(sub) = node.metadata.get(crate::server::SUBSYSTEM_KEY) {
+                    subsystems.insert(sub.as_str());
+                }
+            }
+        }
+    }
+    subsystems.len()
 }
 
 fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_>) -> String {
@@ -1765,6 +1816,43 @@ mod tests {
         assert!(result.contains("beta"), "Should contain beta subsystem");
         assert!(result.contains("2 symbol(s)"), "Beta should have 2 symbols");
         assert!(result.contains("1 symbol(s)"), "Alpha should have 1 symbol");
+    }
+
+    #[test]
+    fn test_count_affected_subsystems() {
+        use crate::graph::EdgeKind;
+        let mut node_a = make_node("fn_a", NodeKind::Function, "src/alpha.rs");
+        node_a.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "alpha".to_string());
+        let mut node_b = make_node("fn_b", NodeKind::Function, "src/beta.rs");
+        node_b.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "beta".to_string());
+        let mut node_c = make_node("fn_c", NodeKind::Function, "src/beta.rs");
+        node_c.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "beta".to_string());
+        let gs = make_graph_state(vec![node_a.clone(), node_b.clone(), node_c.clone()]);
+        let node_index_map = gs.node_index_map();
+
+        let mut groups = std::collections::BTreeMap::new();
+        groups.insert(EdgeKind::Calls, vec![
+            node_a.stable_id(),
+            node_b.stable_id(),
+            node_c.stable_id(),
+        ]);
+
+        assert_eq!(count_affected_subsystems(&groups, &gs, &node_index_map), 2);
+    }
+
+    #[test]
+    fn test_count_affected_subsystems_empty() {
+        let groups = std::collections::BTreeMap::new();
+        let gs = make_graph_state(vec![]);
+        let node_index_map = gs.node_index_map();
+        assert_eq!(count_affected_subsystems(&groups, &gs, &node_index_map), 0);
+    }
+
+    #[test]
+    fn test_impact_summary_threshold_is_reasonable() {
+        // The threshold should be between 50 and 200 to be useful
+        assert!(IMPACT_SUMMARY_THRESHOLD >= 50, "Threshold too low");
+        assert!(IMPACT_SUMMARY_THRESHOLD <= 200, "Threshold too high");
     }
 }
 
