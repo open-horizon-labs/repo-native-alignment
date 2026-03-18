@@ -1864,6 +1864,117 @@ mod tests {
         assert!(IMPACT_SUMMARY_THRESHOLD >= 50, "Threshold too low");
         assert!(IMPACT_SUMMARY_THRESHOLD <= 200, "Threshold too high");
     }
+
+    /// Adversarial: verify large impact results produce summary, not full listing.
+    /// Creates 150 nodes (across 3 subsystems) all calling one root node,
+    /// then runs search(mode="impact") and verifies the output is compact.
+    #[tokio::test]
+    async fn test_large_impact_produces_subsystem_summary() {
+        use crate::graph::EdgeKind;
+
+        let root_node = make_node("RootType", NodeKind::Struct, "src/root.rs");
+        let mut all_nodes = vec![root_node.clone()];
+        let mut all_edges = Vec::new();
+
+        // Impact traversal follows incoming Calls/ReferencedBy edges.
+        // "fn_0 calls RootType" = edge from fn_0 to RootType = incoming edge on RootType.
+        let subsystems = ["alpha", "beta", "gamma"];
+        for i in 0..150 {
+            let sub = subsystems[i % 3];
+            let file = format!("src/{}/mod.rs", sub);
+            let mut node = make_node(&format!("fn_{}", i), NodeKind::Function, &file);
+            node.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), sub.to_string());
+            all_edges.push(make_edge(&node, &root_node, EdgeKind::Calls));
+            all_nodes.push(node);
+        }
+
+        let gs = make_graph_state_with_edges(all_nodes, all_edges);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+
+        let params = SearchParams {
+            node: Some(root_node.stable_id()),
+            mode: Some("impact".into()),
+            ..Default::default()
+        };
+        let result = search(&params, &ctx).await;
+
+        // Should contain subsystem summary, not individual node listings
+        assert!(result.contains("subsystems affected"), "Should show subsystem count in heading, got: {}", &result[..result.len().min(500)]);
+        assert!(result.contains("alpha"), "Should list alpha subsystem");
+        assert!(result.contains("beta"), "Should list beta subsystem");
+        assert!(result.contains("gamma"), "Should list gamma subsystem");
+        assert!(result.contains("50 symbol(s)"), "Each subsystem should have 50 nodes");
+
+        // Should NOT contain full node listings (edge-kind grouped sections)
+        assert!(!result.contains("#### Calls"), "Should NOT have edge-kind grouped sections in summary mode");
+
+        // Output should be compact -- well under 10K chars for 150 nodes
+        assert!(result.len() < 5000, "Summary should be compact, got {} chars", result.len());
+    }
+
+    /// Adversarial: verify small impact results still show full listing.
+    #[tokio::test]
+    async fn test_small_impact_preserves_full_listing() {
+        use crate::graph::EdgeKind;
+
+        let root_node = make_node("SmallRoot", NodeKind::Struct, "src/root.rs");
+        let mut dep = make_node("one_dep", NodeKind::Function, "src/dep.rs");
+        dep.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "dep".to_string());
+        let edge = make_edge(&dep, &root_node, EdgeKind::Calls);
+
+        let gs = make_graph_state_with_edges(vec![root_node.clone(), dep.clone()], vec![edge]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+
+        let params = SearchParams {
+            node: Some(root_node.stable_id()),
+            mode: Some("impact".into()),
+            ..Default::default()
+        };
+        let result = search(&params, &ctx).await;
+
+        // Should show full listing with edge-kind groups
+        assert!(result.contains("Impact analysis for"), "Should use standard heading for small results, got: {}", &result[..result.len().min(500)]);
+        assert!(result.contains("one_dep"), "Should list individual nodes");
+        // Should also have subsystem breakdown appended
+        assert!(result.contains("Affected subsystems"), "Should still have subsystem breakdown");
+    }
+
+    /// Adversarial: verify large impact with NO subsystem metadata handles gracefully.
+    #[tokio::test]
+    async fn test_large_impact_no_subsystem_metadata() {
+        use crate::graph::EdgeKind;
+
+        let root_node = make_node("OrphanRoot", NodeKind::Struct, "src/root.rs");
+        let mut all_nodes = vec![root_node.clone()];
+        let mut all_edges = Vec::new();
+
+        // 150 nodes with NO subsystem metadata
+        for i in 0..150 {
+            let node = make_node(&format!("orphan_{}", i), NodeKind::Function, "src/orphan.rs");
+            all_edges.push(make_edge(&node, &root_node, EdgeKind::Calls));
+            all_nodes.push(node);
+        }
+
+        let gs = make_graph_state_with_edges(all_nodes, all_edges);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+
+        let params = SearchParams {
+            node: Some(root_node.stable_id()),
+            mode: Some("impact".into()),
+            ..Default::default()
+        };
+        let result = search(&params, &ctx).await;
+
+        // Should fall back to count-only summary
+        assert!(result.contains("150 dependent(s)"), "Should show total count, got: {}", &result[..result.len().min(500)]);
+        assert!(result.contains("result summarized"), "Should indicate summarized output");
+        assert!(result.contains("subsystem"), "Should hint to use subsystem filter");
+        // Should NOT crash or produce empty output
+        assert!(result.len() > 50, "Should produce meaningful output");
+    }
 }
 
 // ── Outcome progress ───────────────────────────────────────────────
