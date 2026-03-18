@@ -18,10 +18,15 @@ use crate::server::handlers::{parse_search_mode, run_traversal};
 use crate::server::state::{EmbeddingStatus, GraphState, LspEnrichmentStatus};
 use crate::server::store::parse_edge_kind;
 
-/// When impact results exceed this threshold, render a subsystem-grouped summary
-/// instead of listing every node. This prevents huge responses (162K+ chars) that
-/// overflow MCP response limits and are unreadable by agents.
-const IMPACT_SUMMARY_THRESHOLD: usize = 100;
+/// When impact results exceed this node-count threshold, render a
+/// subsystem-grouped summary instead of listing every node.
+const IMPACT_SUMMARY_NODE_THRESHOLD: usize = 30;
+
+/// Even when the node count is below the node threshold, if the rendered output
+/// exceeds this character limit we retroactively switch to the summary view.
+/// This catches cases where a small number of nodes with verbose bodies (non-
+/// compact mode) still produce huge responses (e.g., 157K chars for ~80 nodes).
+const IMPACT_SUMMARY_CHAR_THRESHOLD: usize = 40_000;
 
 /// Interface-agnostic search parameters.
 #[derive(Debug, Default)]
@@ -588,42 +593,44 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         } else {
             0
         };
-        let large_impact = mode == "impact" && unique_impact_count > IMPACT_SUMMARY_THRESHOLD;
+        let large_by_count = mode == "impact" && unique_impact_count > IMPACT_SUMMARY_NODE_THRESHOLD;
 
-        let heading = match mode {
-            "neighbors" => format!("## Graph neighbors ({}) of {}\n\n{} result(s)\n\n", direction, entry_label, total_count),
-            "impact" if large_impact => {
-                let subsystem_breakdown = format_impact_subsystem_breakdown(&merged_groups, gs, &node_index_map, strip);
-                let subsystem_count = count_affected_subsystems(&merged_groups, gs, &node_index_map);
-                if subsystem_count == 0 {
-                    // Subsystem metadata not available — fall back to count-only summary
-                    format!(
-                        "## Impact of {}\n\n{} dependent(s) within {} hop(s) (result summarized — use `subsystem` filter to drill down)\n\n",
-                        entry_label,
-                        unique_impact_count,
-                        params.hops.unwrap_or(3),
-                    )
-                } else {
-                    format!(
-                        "## Impact of {} ({} subsystems affected)\n\n{} dependent(s) within {} hop(s)\n{}\n",
-                        entry_label,
-                        subsystem_count,
-                        unique_impact_count,
-                        params.hops.unwrap_or(3),
-                        subsystem_breakdown,
-                    )
-                }
-            }
-            "impact" => format!("## Impact analysis for {}\n\n{} dependent(s) within {} hop(s)\n\n", entry_label, total_count, params.hops.unwrap_or(3)),
-            "reachable" => format!("## Reachable from {}\n\n{} node(s) within {} hop(s)\n\n", entry_label, total_count, params.hops.unwrap_or(3)),
-            "tests_for" => format!("## Test coverage for {}\n\n{} test function(s)\n\n", entry_label, total_count),
-            _ => String::new(),
+        // Helper: build the summary-only response for large impact results.
+        let build_summary = |entry_header: &str, entry_label: &str, freshness: &str| -> String {
+            let subsystem_breakdown = format_impact_subsystem_breakdown(&merged_groups, gs, &node_index_map, strip);
+            let subsystem_count = count_affected_subsystems(&merged_groups, gs, &node_index_map);
+            let heading = if subsystem_count == 0 {
+                format!(
+                    "## Impact of {}\n\n{} dependent(s) within {} hop(s) (result summarized — use `subsystem` filter to drill down)\n\n",
+                    entry_label,
+                    unique_impact_count,
+                    params.hops.unwrap_or(3),
+                )
+            } else {
+                format!(
+                    "## Impact of {} ({} subsystems affected)\n\n{} dependent(s) within {} hop(s)\n{}\n",
+                    entry_label,
+                    subsystem_count,
+                    unique_impact_count,
+                    params.hops.unwrap_or(3),
+                    subsystem_breakdown,
+                )
+            };
+            format!("{}{}{}", entry_header, heading, freshness)
         };
 
-        if large_impact {
-            // Summary-only: heading already contains the subsystem breakdown
-            format!("{}{}{}", entry_header, heading, freshness)
+        if large_by_count {
+            // Node count alone exceeds threshold — skip rendering the full list.
+            build_summary(&entry_header, &entry_label, &freshness)
         } else {
+            let heading = match mode {
+                "neighbors" => format!("## Graph neighbors ({}) of {}\n\n{} result(s)\n\n", direction, entry_label, total_count),
+                "impact" => format!("## Impact analysis for {}\n\n{} dependent(s) within {} hop(s)\n\n", entry_label, total_count, params.hops.unwrap_or(3)),
+                "reachable" => format!("## Reachable from {}\n\n{} node(s) within {} hop(s)\n\n", entry_label, total_count, params.hops.unwrap_or(3)),
+                "tests_for" => format!("## Test coverage for {}\n\n{} test function(s)\n\n", entry_label, total_count),
+                _ => String::new(),
+            };
+
             let md = format_neighbors_grouped_with_root(&gs.nodes, &merged_groups, &gs.index, params.compact, strip);
 
             // For impact mode, append a subsystem breakdown showing which subsystems
@@ -634,7 +641,17 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
                 String::new()
             };
 
-            format!("{}{}{}{}{}", entry_header, heading, md, subsystem_section, freshness)
+            let full_output = format!("{}{}{}{}{}", entry_header, heading, md, subsystem_section, freshness);
+
+            // Safety net: if the rendered output exceeds the character threshold,
+            // retroactively switch to the summary view. This catches cases where
+            // a moderate number of nodes (below the node threshold) still produce
+            // enormous output due to verbose non-compact rendering.
+            if mode == "impact" && full_output.len() > IMPACT_SUMMARY_CHAR_THRESHOLD {
+                build_summary(&entry_header, &entry_label, &freshness)
+            } else {
+                full_output
+            }
         }
     }
 }
@@ -1882,10 +1899,15 @@ mod tests {
     }
 
     #[test]
-    fn test_impact_summary_threshold_is_reasonable() {
-        // The threshold should be between 50 and 200 to be useful
-        assert!(IMPACT_SUMMARY_THRESHOLD >= 50, "Threshold too low");
-        assert!(IMPACT_SUMMARY_THRESHOLD <= 200, "Threshold too high");
+    fn test_impact_summary_thresholds_are_reasonable() {
+        // Node threshold: low enough to catch moderate-count-but-verbose-output cases.
+        // The old threshold of 100 was too high — 80 non-compact nodes produced 157K chars.
+        assert!(IMPACT_SUMMARY_NODE_THRESHOLD >= 10, "Node threshold too low");
+        assert!(IMPACT_SUMMARY_NODE_THRESHOLD <= 60, "Node threshold too high");
+        // Character threshold: safety net for when node count is below the node threshold
+        // but the rendered output is still too large.
+        assert!(IMPACT_SUMMARY_CHAR_THRESHOLD >= 20_000, "Char threshold too low");
+        assert!(IMPACT_SUMMARY_CHAR_THRESHOLD <= 100_000, "Char threshold too high");
     }
 
     /// Adversarial: verify large impact results produce summary, not full listing.
@@ -1962,6 +1984,56 @@ mod tests {
         assert!(result.contains("one_dep"), "Should list individual nodes");
         // Should also have subsystem breakdown appended
         assert!(result.contains("Affected subsystems"), "Should still have subsystem breakdown");
+    }
+
+    /// Adversarial: moderate node count (below node threshold) but verbose output
+    /// that exceeds the character threshold should still trigger the summary view.
+    /// This is the exact bug from #345 round 2: ~80 nodes producing 157K chars.
+    #[tokio::test]
+    async fn test_moderate_count_but_verbose_output_triggers_char_threshold() {
+        use crate::graph::EdgeKind;
+
+        let root_node = make_node("VerboseRoot", NodeKind::Struct, "src/root.rs");
+        let mut all_nodes = vec![root_node.clone()];
+        let mut all_edges = Vec::new();
+
+        // Create 25 nodes (below node threshold of 30) but each with a very
+        // long signature that inflates the non-compact output beyond 40K chars.
+        let subsystems = ["verbose_a", "verbose_b"];
+        for i in 0..25 {
+            let sub = subsystems[i % 2];
+            let file = format!("src/{}/mod.rs", sub);
+            let mut node = make_node(&format!("verbose_fn_{}", i), NodeKind::Function, &file);
+            // A 2000-char signature makes each node ~2KB+ in non-compact mode
+            node.signature = format!("fn verbose_fn_{}({})", i, "x: SomeLongType, ".repeat(100));
+            node.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), sub.to_string());
+            all_edges.push(make_edge(&node, &root_node, EdgeKind::Calls));
+            all_nodes.push(node);
+        }
+
+        let gs = make_graph_state_with_edges(all_nodes, all_edges);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+
+        let params = SearchParams {
+            node: Some(root_node.stable_id()),
+            mode: Some("impact".into()),
+            ..Default::default()
+        };
+        let result = search(&params, &ctx).await;
+
+        // The char threshold should kick in and produce a summary
+        assert!(
+            result.contains("subsystems affected") || result.contains("result summarized"),
+            "Should trigger summary via char threshold, got: {}",
+            &result[..result.len().min(500)]
+        );
+        // Should be compact
+        assert!(
+            result.len() < IMPACT_SUMMARY_CHAR_THRESHOLD,
+            "Summary should be well under char threshold, got {} chars",
+            result.len()
+        );
     }
 
     /// Adversarial: verify large impact with NO subsystem metadata handles gracefully.
