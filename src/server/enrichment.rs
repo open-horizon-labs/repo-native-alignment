@@ -477,6 +477,16 @@ impl RnaHandler {
 
                 // Apply enrichment to shared graph
                 let edge_count = enrichment.added_edges.len();
+
+                // Collect IDs and clone edges for persist BEFORE moving into graph.
+                let new_node_ids: std::collections::HashSet<String> = enrichment.new_nodes.iter()
+                    .map(|n| n.stable_id()).collect();
+                let enriched_node_ids: std::collections::HashSet<String> =
+                    enrichment.updated_nodes.iter().map(|(id, _)| id.clone()).collect();
+                let all_upsert_node_ids: std::collections::HashSet<String> =
+                    enriched_node_ids.into_iter().chain(new_node_ids.into_iter()).collect();
+                let persist_edges = enrichment.added_edges.clone();
+
                 let mut guard = bg_graph.write().await;
                 if let Some(ref mut gs) = *guard {
                     for vnode in &enrichment.new_nodes {
@@ -505,26 +515,44 @@ impl RnaHandler {
                         }
                     }
 
-                    // Full persist: write the complete graph (tree-sitter + LSP
-                    // edges) atomically, matching the foreground pipeline pattern.
-                    // The initial persist in build_full_graph_inner wrote
-                    // tree-sitter-only edges; this replaces it with the complete
-                    // graph so the next LanceDB cache load has all edges (#344).
-                    let persist_nodes = gs.nodes.clone();
-                    let persist_edges = gs.edges.clone();
+                    // Incremental persist: upsert the new LSP nodes and edges
+                    // into the existing LanceDB tables via merge_insert.
+                    // This avoids DROP+CREATE which races with the background
+                    // scanner's own incremental persist (#344 round 2).
+                    let upsert_nodes: Vec<Node> = gs.nodes.iter()
+                        .filter(|n| all_upsert_node_ids.contains(&n.stable_id()))
+                        .cloned()
+                        .collect();
                     tracing::info!(
-                        "[background] LSP enrichment: full persist with {} nodes, {} edges (including {} LSP)",
-                        persist_nodes.len(),
+                        "[background] LSP enrichment: incremental persist with {} upsert nodes, {} edges",
+                        upsert_nodes.len(),
                         persist_edges.len(),
-                        edge_count,
                     );
                     drop(guard); // release lock before async persist
-                    match persist_graph_to_lance(
-                        &lsp_repo_root, &persist_nodes, &persist_edges,
+                    match persist_graph_incremental(
+                        &lsp_repo_root, &upsert_nodes, &persist_edges, &[], &[],
                     ).await {
-                        Ok(()) => bg_lsp_status.set_complete(edge_count),
+                        Ok(true) => {
+                            // Schema migrated -- tables were dropped, need full persist
+                            tracing::info!("[background] LSP enrichment: schema migrated; performing full persist");
+                            let snapshot = {
+                                let g = bg_graph.read().await;
+                                g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+                            };
+                            if let Some((nodes, edges)) = snapshot {
+                                if let Err(e) = persist_graph_to_lance(&lsp_repo_root, &nodes, &edges).await {
+                                    tracing::error!("[background] LSP enrichment: full persist after migration failed: {}", e);
+                                    bg_lsp_status.set_complete_persist_failed(edge_count);
+                                } else {
+                                    bg_lsp_status.set_complete(edge_count);
+                                }
+                            } else {
+                                bg_lsp_status.set_complete(edge_count);
+                            }
+                        }
+                        Ok(false) => bg_lsp_status.set_complete(edge_count),
                         Err(e) => {
-                            tracing::error!("[background] LSP enrichment: full persist failed: {}", e);
+                            tracing::error!("[background] LSP enrichment: incremental persist failed: {}", e);
                             bg_lsp_status.set_complete_persist_failed(edge_count);
                         }
                     }
@@ -597,6 +625,16 @@ impl RnaHandler {
 
             // Apply enrichment to shared graph
             let edge_count = enrichment.added_edges.len();
+
+            // Collect IDs and clone edges for persist BEFORE moving into graph.
+            let new_node_ids: std::collections::HashSet<String> = enrichment.new_nodes.iter()
+                .map(|n| n.stable_id()).collect();
+            let enriched_node_ids: std::collections::HashSet<String> =
+                enrichment.updated_nodes.iter().map(|(id, _)| id.clone()).collect();
+            let all_upsert_node_ids: std::collections::HashSet<String> =
+                enriched_node_ids.into_iter().chain(new_node_ids.into_iter()).collect();
+            let persist_edges = enrichment.added_edges.clone();
+
             let mut guard = bg_graph.write().await;
             if let Some(ref mut gs) = *guard {
                 for vnode in &enrichment.new_nodes {
@@ -625,23 +663,42 @@ impl RnaHandler {
                     }
                 }
 
-                // Full persist: write the complete graph (tree-sitter + LSP)
-                // atomically so the LanceDB cache has all edges (#344).
-                let persist_nodes = gs.nodes.clone();
-                let persist_edges = gs.edges.clone();
+                // Incremental persist: upsert LSP nodes and edges into existing
+                // LanceDB tables via merge_insert. Avoids DROP+CREATE which
+                // races with background scanner's incremental persist (#344 round 2).
+                let upsert_nodes: Vec<Node> = gs.nodes.iter()
+                    .filter(|n| all_upsert_node_ids.contains(&n.stable_id()))
+                    .cloned()
+                    .collect();
                 tracing::info!(
-                    "[background] LSP enrichment: full persist with {} nodes, {} edges (including {} LSP)",
-                    persist_nodes.len(),
+                    "[background] LSP enrichment (cache-hit): incremental persist with {} upsert nodes, {} edges",
+                    upsert_nodes.len(),
                     persist_edges.len(),
-                    edge_count,
                 );
                 drop(guard);
-                match persist_graph_to_lance(
-                    &bg_repo_root, &persist_nodes, &persist_edges,
+                match persist_graph_incremental(
+                    &bg_repo_root, &upsert_nodes, &persist_edges, &[], &[],
                 ).await {
-                    Ok(()) => bg_lsp_status.set_complete(edge_count),
+                    Ok(true) => {
+                        tracing::info!("[background] LSP enrichment (cache-hit): schema migrated; performing full persist");
+                        let snapshot = {
+                            let g = bg_graph.read().await;
+                            g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+                        };
+                        if let Some((nodes, edges)) = snapshot {
+                            if let Err(e) = persist_graph_to_lance(&bg_repo_root, &nodes, &edges).await {
+                                tracing::error!("[background] LSP enrichment (cache-hit): full persist after migration failed: {}", e);
+                                bg_lsp_status.set_complete_persist_failed(edge_count);
+                            } else {
+                                bg_lsp_status.set_complete(edge_count);
+                            }
+                        } else {
+                            bg_lsp_status.set_complete(edge_count);
+                        }
+                    }
+                    Ok(false) => bg_lsp_status.set_complete(edge_count),
                     Err(e) => {
-                        tracing::error!("[background] LSP enrichment: full persist failed: {}", e);
+                        tracing::error!("[background] LSP enrichment (cache-hit): incremental persist failed: {}", e);
                         bg_lsp_status.set_complete_persist_failed(edge_count);
                     }
                 }
