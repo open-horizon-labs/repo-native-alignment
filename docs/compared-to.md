@@ -17,7 +17,7 @@ LSP (Language Server Protocol) is what your editor already uses. It's the null s
 
 **The practical cost:** Early testing shows agents take ~120s and ~2x the tokens to answer structural questions with raw LSP available, vs ~50s and ~half the tokens with RNA — because LSP forces many small round-trips where RNA pre-assembles the graph for single-call traversal.
 
-RNA uses LSP internally as one enrichment source (call hierarchy, type hierarchy, implements edges), fuses the results with tree-sitter, embeddings, git, and business artifacts, and exposes it all through multi-hop graph queries. For agents, RNA replaces the need for separate LSP plugins.
+RNA uses LSP internally as one enrichment source (call hierarchy, type hierarchy, implements edges), fuses the results with tree-sitter, embeddings, git, and business artifacts, and exposes it all through multi-hop graph queries. For agents, RNA replaces the need for separate LSP plugins. LSP enrichment aborts early if a language server produces 0 edges after 1,000 nodes or 2 minutes, with a clear diagnostic message — so misconfigured servers fail fast instead of hanging for hours.
 
 ## At a Glance
 
@@ -40,7 +40,7 @@ RNA uses LSP internally as one enrichment source (call hierarchy, type hierarchy
 | Axis | LSP | RNA | CGR | CGC | CT |
 |------|-----|-----|-----|-----|-----|
 | **Cold start** | Server init (seconds) | ~5-10s scan, ~2min embed | Index + Docker startup | Index + DB setup | ~1s scan + SQLite index |
-| **Warm restart** | Server re-init | <1s (on-disk cache) | Memgraph persists | DB persists | SQLite persists (mtime invalidation) |
+| **Warm restart** | Server re-init | <1s (on-disk cache). `scan --full` is incremental — re-extracts only changed files, re-runs LSP only on changed nodes. ~0.1s on no-change runs. | Memgraph persists | DB persists | SQLite persists (mtime invalidation) |
 | **Memory** | Per-server process | in-process (no external DB) | Docker container | External or embedded DB | In-process (SQLite) |
 | **Query latency** | ms per hop (N round-trips) | ms total (in-process, single call) | Network hop to Memgraph | Network hop or embedded | ms (embedded SQLite) |
 | **Offline capable** | Yes | Fully offline | Needs Docker | Depends on DB choice | Fully offline |
@@ -77,7 +77,7 @@ RNA's unique advantage: semantic search spans code AND business artifacts in the
 
 ## MCP Tool Philosophy
 
-**RNA: 4 tools** — one `search` tool handles code symbols, artifacts, markdown, commits, and graph traversal. `outcome_progress` for business alignment. `repo_map` for orientation. `list_roots` for workspace management. CLI and MCP share a service layer — every capability available in both interfaces.
+**RNA: 4 tools** — one `search` tool handles code symbols, artifacts, markdown, commits, and graph traversal. Supports subsystem-scoped search (`subsystem=`), cross-subsystem edge filtering (`target_subsystem=`), and impact mode that auto-summarizes large results into a subsystem-grouped breakdown (triggered above 30 nodes or 40K chars). `outcome_progress` for business alignment. `repo_map` for orientation — includes automatically detected architectural subsystems with cohesion scores and interfaces. `list_roots` for workspace management. CLI and MCP share a service layer — every capability available in both interfaces.
 
 **CGR: 10 tools** — mix of read + write + admin (file editing, database wipes, project deletion).
 
@@ -94,14 +94,17 @@ RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents
 3. **Deeper semantic search** — Function bodies (not just names), all markdown (chunked by heading with hierarchy), and commits in one vector space. Results are relevance-ranked with test file demotion. CGR embeds function bodies but with raw scores. CGC doesn't embed at all.
 4. **Semantic graph entry points** — `search(query="database pool", mode="impact")` works directly. No need to look up a `node_id` first. CGR and CGC require exact node identifiers.
 5. **Cross-encoder reranking** — `search(rerank: true)` re-scores top candidates with a Jina cross-encoder for precise NL query results. None of the others have reranking.
+6. **Subsystem detection** — `repo_map` automatically clusters the codebase into 8-12 architectural subsystems using Louvain community detection on actual call edges. No configuration required. Agents can scope search to a subsystem, filter cross-subsystem edges, and see the architecture on first call. CGR, CGC, and codeTree return flat symbol or file lists.
+7. **Impact summaries that don't flood context** — `search(mode="impact")` on high-connectivity nodes auto-summarizes into a subsystem-grouped breakdown instead of returning hundreds of raw node listings. Triggered above 30 nodes or 40K chars. Before v0.1.12, high-connectivity nodes like `EdgeKind` would return 157K characters of raw output, overflowing context.
 
 ## What RNA Does That Others Don't
 
 1. **Outcome-to-code structural joins** — `outcome_progress` traces declared business outcomes through tagged commits to symbols. No other tool connects "why" to "what."
 2. **Cross-session learning** — `.oh/metis/` persists practical wisdom across agent sessions, searchable via the same embedding index.
 3. **Staleness awareness** — `LSP: pending`, `LSP: enriched (N edges)`, "Embedding index: building" — agents know when to trust results and when to retry.
-4. **Self-tuning performance** — Adaptive batch sizing, background reindexing, lock-free double-buffered embedding index.
+4. **Self-tuning performance** — Adaptive batch sizing, background reindexing, lock-free double-buffered embedding index. `scan --full` is incremental when a cache exists — only changed files and nodes are reprocessed, dropping repeat scans from ~50s to ~0.1s on no-change runs.
 5. **Zero external dependencies** — Single binary, no Docker, no DB server, no API key.
+6. **Architecture-aware queries** — Subsystem detection (Louvain, phase-2 contraction) clusters symbols by actual coupling. Subsystem name, cohesion score, and interface list are available to agents on the first `repo_map` call — no tuning or config required.
 
 ## What Others Do That RNA Doesn't
 
@@ -112,7 +115,7 @@ RNA is read-only infrastructure — it serves agents, it doesn't act as one. Thi
 - **Clone detection** — codeTree uses AST normalization to find structural duplicates. RNA doesn't do clone detection; code quality metrics are outside its alignment focus.
 - **Taint / dataflow analysis** — codeTree traces source-to-sink data flows with sanitizer detection. RNA is alignment infrastructure, not a security scanner.
 - **Doc suggestions** — codeTree identifies undocumented functions. RNA treats this as the agent's job, not the context server's.
-- **Repository map** — codeTree generates a compact codebase overview with entry points, hotspot files, and a suggested exploration path. RNA now has `repo_map` which provides top symbols by PageRank importance, hotspot files, active outcomes, and entry points.
+- **Repository map** — codeTree generates a compact codebase overview with entry points, hotspot files, and a suggested exploration path. RNA's `repo_map` covers this ground and adds automatically detected architectural subsystems (via Louvain community detection), cohesion scores, and subsystem interfaces — `repo_map` provides a structural architecture view, not just a symbol list.
 - **Code-specific embedding model** — CGR uses UniXcoder (trained on code). RNA uses MiniLM-L6-v2 (general-purpose text model) because it needs to embed code, markdown, and business artifacts in the same space. Trade-off: slightly less code-specific precision, much broader coverage.
 - **SCIP indexing** — CGC supports Pyright, tsc, scip-go, scip-rust for compiler-grade precision in 4 languages. RNA spiked SCIP (#114) and concluded LSP provides the same semantic edges without requiring separate build-time indexers.
 

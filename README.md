@@ -285,7 +285,7 @@ RNA works standalone. These add organizational context and workflow structure:
 
 ## Status
 
-4 MCP tools, 10 CLI subcommands, 870+ tests. Extracts symbols from 22 languages, builds a call graph via language server analysis, detects architectural subsystems automatically. Ships as a Claude Code plugin. CLI and MCP share the same index and service layer.
+4 MCP tools, 10 CLI subcommands, 890+ tests. Extracts symbols from 22 languages, builds a call graph via language server analysis, detects architectural subsystems automatically. Ships as a Claude Code plugin. CLI and MCP share the same index and service layer.
 
 ### Platform Support
 
