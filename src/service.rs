@@ -18,6 +18,11 @@ use crate::server::handlers::{parse_search_mode, run_traversal};
 use crate::server::state::{EmbeddingStatus, GraphState, LspEnrichmentStatus};
 use crate::server::store::parse_edge_kind;
 
+/// When impact results exceed this threshold, render a subsystem-grouped summary
+/// instead of listing every node. This prevents huge responses (162K+ chars) that
+/// overflow MCP response limits and are unreadable by agents.
+const IMPACT_SUMMARY_THRESHOLD: usize = 100;
+
 /// Interface-agnostic search parameters.
 #[derive(Debug, Default)]
 pub struct SearchParams {
@@ -563,24 +568,74 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         };
         format!("{}{}{}", entry_header, mode_desc, freshness)
     } else {
-        let md = format_neighbors_grouped_with_root(&gs.nodes, &merged_groups, &gs.index, params.compact, strip);
+        // For large impact results (>100 unique nodes), show only the subsystem summary
+        // instead of listing every node. This prevents 162K+ char responses that
+        // overflow MCP response limits and are unreadable by agents.
+        // Use unique node count (not per-bucket total_count) because the same node
+        // can appear under multiple edge kinds in merged_groups.
+        let unique_impact_count = if mode == "impact" {
+            let mut seen: HashSet<&str> = HashSet::new();
+            for ids in merged_groups.values() {
+                for id in ids {
+                    if let Some(node) = gs.node_by_stable_id(id, &node_index_map) {
+                        if !crate::server::helpers::is_hidden_traversal_kind(&node.id.kind) {
+                            seen.insert(id.as_str());
+                        }
+                    }
+                }
+            }
+            seen.len()
+        } else {
+            0
+        };
+        let large_impact = mode == "impact" && unique_impact_count > IMPACT_SUMMARY_THRESHOLD;
+
         let heading = match mode {
             "neighbors" => format!("## Graph neighbors ({}) of {}\n\n{} result(s)\n\n", direction, entry_label, total_count),
+            "impact" if large_impact => {
+                let subsystem_breakdown = format_impact_subsystem_breakdown(&merged_groups, gs, &node_index_map, strip);
+                let subsystem_count = count_affected_subsystems(&merged_groups, gs, &node_index_map);
+                if subsystem_count == 0 {
+                    // Subsystem metadata not available — fall back to count-only summary
+                    format!(
+                        "## Impact of {}\n\n{} dependent(s) within {} hop(s) (result summarized — use `subsystem` filter to drill down)\n\n",
+                        entry_label,
+                        unique_impact_count,
+                        params.hops.unwrap_or(3),
+                    )
+                } else {
+                    format!(
+                        "## Impact of {} ({} subsystems affected)\n\n{} dependent(s) within {} hop(s)\n{}\n",
+                        entry_label,
+                        subsystem_count,
+                        unique_impact_count,
+                        params.hops.unwrap_or(3),
+                        subsystem_breakdown,
+                    )
+                }
+            }
             "impact" => format!("## Impact analysis for {}\n\n{} dependent(s) within {} hop(s)\n\n", entry_label, total_count, params.hops.unwrap_or(3)),
             "reachable" => format!("## Reachable from {}\n\n{} node(s) within {} hop(s)\n\n", entry_label, total_count, params.hops.unwrap_or(3)),
             "tests_for" => format!("## Test coverage for {}\n\n{} test function(s)\n\n", entry_label, total_count),
             _ => String::new(),
         };
 
-        // For impact mode, append a subsystem breakdown showing which subsystems
-        // are affected and through which interface function the impact propagates.
-        let subsystem_section = if mode == "impact" {
-            format_impact_subsystem_breakdown(&merged_groups, gs, &node_index_map, strip)
+        if large_impact {
+            // Summary-only: heading already contains the subsystem breakdown
+            format!("{}{}{}", entry_header, heading, freshness)
         } else {
-            String::new()
-        };
+            let md = format_neighbors_grouped_with_root(&gs.nodes, &merged_groups, &gs.index, params.compact, strip);
 
-        format!("{}{}{}{}{}", entry_header, heading, md, subsystem_section, freshness)
+            // For impact mode, append a subsystem breakdown showing which subsystems
+            // are affected and through which interface function the impact propagates.
+            let subsystem_section = if mode == "impact" {
+                format_impact_subsystem_breakdown(&merged_groups, gs, &node_index_map, strip)
+            } else {
+                String::new()
+            };
+
+            format!("{}{}{}{}{}", entry_header, heading, md, subsystem_section, freshness)
+        }
     }
 }
 
@@ -604,6 +659,9 @@ fn format_impact_subsystem_breakdown(
                 continue; // Skip duplicates across edge-kind buckets
             }
             if let Some(node) = gs.node_by_stable_id(id, node_index_map) {
+                if crate::server::helpers::is_hidden_traversal_kind(&node.id.kind) {
+                    continue;
+                }
                 if let Some(sub) = node.metadata.get(crate::server::SUBSYSTEM_KEY) {
                     subsystem_nodes
                         .entry(sub.clone())
@@ -641,6 +699,32 @@ fn format_impact_subsystem_breakdown(
         "\n\n### Affected subsystems\n\n{}\n",
         lines.join("\n")
     )
+}
+
+/// Count the number of distinct subsystems affected by impact results.
+fn count_affected_subsystems(
+    merged_groups: &std::collections::BTreeMap<crate::graph::EdgeKind, Vec<String>>,
+    gs: &GraphState,
+    node_index_map: &std::collections::HashMap<String, usize>,
+) -> usize {
+    let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut subsystems: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for ids in merged_groups.values() {
+        for id in ids {
+            if !seen_ids.insert(id.as_str()) {
+                continue;
+            }
+            if let Some(node) = gs.node_by_stable_id(id, node_index_map) {
+                if crate::server::helpers::is_hidden_traversal_kind(&node.id.kind) {
+                    continue;
+                }
+                if let Some(sub) = node.metadata.get(crate::server::SUBSYSTEM_KEY) {
+                    subsystems.insert(sub.as_str());
+                }
+            }
+        }
+    }
+    subsystems.len()
 }
 
 fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_>) -> String {
@@ -1765,6 +1849,154 @@ mod tests {
         assert!(result.contains("beta"), "Should contain beta subsystem");
         assert!(result.contains("2 symbol(s)"), "Beta should have 2 symbols");
         assert!(result.contains("1 symbol(s)"), "Alpha should have 1 symbol");
+    }
+
+    #[test]
+    fn test_count_affected_subsystems() {
+        use crate::graph::EdgeKind;
+        let mut node_a = make_node("fn_a", NodeKind::Function, "src/alpha.rs");
+        node_a.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "alpha".to_string());
+        let mut node_b = make_node("fn_b", NodeKind::Function, "src/beta.rs");
+        node_b.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "beta".to_string());
+        let mut node_c = make_node("fn_c", NodeKind::Function, "src/beta.rs");
+        node_c.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "beta".to_string());
+        let gs = make_graph_state(vec![node_a.clone(), node_b.clone(), node_c.clone()]);
+        let node_index_map = gs.node_index_map();
+
+        let mut groups = std::collections::BTreeMap::new();
+        groups.insert(EdgeKind::Calls, vec![
+            node_a.stable_id(),
+            node_b.stable_id(),
+            node_c.stable_id(),
+        ]);
+
+        assert_eq!(count_affected_subsystems(&groups, &gs, &node_index_map), 2);
+    }
+
+    #[test]
+    fn test_count_affected_subsystems_empty() {
+        let groups = std::collections::BTreeMap::new();
+        let gs = make_graph_state(vec![]);
+        let node_index_map = gs.node_index_map();
+        assert_eq!(count_affected_subsystems(&groups, &gs, &node_index_map), 0);
+    }
+
+    #[test]
+    fn test_impact_summary_threshold_is_reasonable() {
+        // The threshold should be between 50 and 200 to be useful
+        assert!(IMPACT_SUMMARY_THRESHOLD >= 50, "Threshold too low");
+        assert!(IMPACT_SUMMARY_THRESHOLD <= 200, "Threshold too high");
+    }
+
+    /// Adversarial: verify large impact results produce summary, not full listing.
+    /// Creates 150 nodes (across 3 subsystems) all calling one root node,
+    /// then runs search(mode="impact") and verifies the output is compact.
+    #[tokio::test]
+    async fn test_large_impact_produces_subsystem_summary() {
+        use crate::graph::EdgeKind;
+
+        let root_node = make_node("RootType", NodeKind::Struct, "src/root.rs");
+        let mut all_nodes = vec![root_node.clone()];
+        let mut all_edges = Vec::new();
+
+        // Impact traversal follows incoming Calls/ReferencedBy edges.
+        // "fn_0 calls RootType" = edge from fn_0 to RootType = incoming edge on RootType.
+        let subsystems = ["alpha", "beta", "gamma"];
+        for i in 0..150 {
+            let sub = subsystems[i % 3];
+            let file = format!("src/{}/mod.rs", sub);
+            let mut node = make_node(&format!("fn_{}", i), NodeKind::Function, &file);
+            node.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), sub.to_string());
+            all_edges.push(make_edge(&node, &root_node, EdgeKind::Calls));
+            all_nodes.push(node);
+        }
+
+        let gs = make_graph_state_with_edges(all_nodes, all_edges);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+
+        let params = SearchParams {
+            node: Some(root_node.stable_id()),
+            mode: Some("impact".into()),
+            ..Default::default()
+        };
+        let result = search(&params, &ctx).await;
+
+        // Should contain subsystem summary, not individual node listings
+        assert!(result.contains("subsystems affected"), "Should show subsystem count in heading, got: {}", &result[..result.len().min(500)]);
+        assert!(result.contains("alpha"), "Should list alpha subsystem");
+        assert!(result.contains("beta"), "Should list beta subsystem");
+        assert!(result.contains("gamma"), "Should list gamma subsystem");
+        assert!(result.contains("50 symbol(s)"), "Each subsystem should have 50 nodes");
+
+        // Should NOT contain full node listings (edge-kind grouped sections)
+        assert!(!result.contains("#### Calls"), "Should NOT have edge-kind grouped sections in summary mode");
+
+        // Output should be compact -- well under 10K chars for 150 nodes
+        assert!(result.len() < 5000, "Summary should be compact, got {} chars", result.len());
+    }
+
+    /// Adversarial: verify small impact results still show full listing.
+    #[tokio::test]
+    async fn test_small_impact_preserves_full_listing() {
+        use crate::graph::EdgeKind;
+
+        let root_node = make_node("SmallRoot", NodeKind::Struct, "src/root.rs");
+        let mut dep = make_node("one_dep", NodeKind::Function, "src/dep.rs");
+        dep.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "dep".to_string());
+        let edge = make_edge(&dep, &root_node, EdgeKind::Calls);
+
+        let gs = make_graph_state_with_edges(vec![root_node.clone(), dep.clone()], vec![edge]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+
+        let params = SearchParams {
+            node: Some(root_node.stable_id()),
+            mode: Some("impact".into()),
+            ..Default::default()
+        };
+        let result = search(&params, &ctx).await;
+
+        // Should show full listing with edge-kind groups
+        assert!(result.contains("Impact analysis for"), "Should use standard heading for small results, got: {}", &result[..result.len().min(500)]);
+        assert!(result.contains("one_dep"), "Should list individual nodes");
+        // Should also have subsystem breakdown appended
+        assert!(result.contains("Affected subsystems"), "Should still have subsystem breakdown");
+    }
+
+    /// Adversarial: verify large impact with NO subsystem metadata handles gracefully.
+    #[tokio::test]
+    async fn test_large_impact_no_subsystem_metadata() {
+        use crate::graph::EdgeKind;
+
+        let root_node = make_node("OrphanRoot", NodeKind::Struct, "src/root.rs");
+        let mut all_nodes = vec![root_node.clone()];
+        let mut all_edges = Vec::new();
+
+        // 150 nodes with NO subsystem metadata
+        for i in 0..150 {
+            let node = make_node(&format!("orphan_{}", i), NodeKind::Function, "src/orphan.rs");
+            all_edges.push(make_edge(&node, &root_node, EdgeKind::Calls));
+            all_nodes.push(node);
+        }
+
+        let gs = make_graph_state_with_edges(all_nodes, all_edges);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+
+        let params = SearchParams {
+            node: Some(root_node.stable_id()),
+            mode: Some("impact".into()),
+            ..Default::default()
+        };
+        let result = search(&params, &ctx).await;
+
+        // Should fall back to count-only summary
+        assert!(result.contains("150 dependent(s)"), "Should show total count, got: {}", &result[..result.len().min(500)]);
+        assert!(result.contains("result summarized"), "Should indicate summarized output");
+        assert!(result.contains("subsystem"), "Should hint to use subsystem filter");
+        // Should NOT crash or produce empty output
+        assert!(result.len() > 50, "Should produce meaningful output");
     }
 }
 
