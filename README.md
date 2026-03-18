@@ -16,7 +16,7 @@ Local context discovery and alignment tool for coding agents. Makes the fractal,
 - "What are the riskiest functions?" → `search(query="", min_complexity=20, sort_by="complexity")` → hotspots ranked by cyclomatic complexity
 - "What are the most important symbols?" → `search(sort_by="importance")` → top symbols ranked by PageRank
 - "Give me a map of this repo" → `repo_map()` → **subsystems** with cohesion scores and interfaces, top symbols, hotspot files, active outcomes, entry points
-- "What subsystems exist?" → `repo_map()` → Louvain community detection on call edges: `extract (1120 symbols, cohesion: 0.88)`, `server (721)`, `graph (223)`, ...
+- "What subsystems exist?" → `repo_map()` → detected from actual call relationships: `extract (1120 symbols)`, `server (721)`, `graph (223)`, ...
 - "Find auth code in the server subsystem" → `search(query="auth", subsystem="server")` → scoped to detected subsystem
 - "What connects extract to server?" → `search(node="X", mode="neighbors", target_subsystem="server")` → cross-subsystem edges
 
@@ -177,7 +177,7 @@ The system compounds from here. Agents use `search` to discover relevant context
 | Tool | What it's for |
 |------|--------------|
 | `search` | Code symbols, artifacts, commits, and markdown — flat or graph traversal (`mode`: neighbors, impact, reachable, tests_for). Scope to a subsystem (`subsystem=`), filter cross-subsystem edges (`target_subsystem=`), use `compact: true` for ~25x fewer tokens, `rerank: true` for precision. Short node IDs resolve automatically. |
-| `repo_map` | Repository orientation: **detected subsystems** (Louvain community detection on call edges) with cohesion scores and interface functions, top symbols by PageRank importance, hotspot files, active outcomes, entry points. One call replaces an exploratory loop. |
+| `repo_map` | Repository orientation: **detected subsystems** with their key interfaces, top symbols by importance, hotspot files, active outcomes, entry points. One call replaces an exploratory loop. |
 | `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols. Optional `include_impact: true` for risk-classified blast radius. |
 | `list_roots` | Show which workspace roots are configured and their scan status |
 
@@ -185,7 +185,7 @@ The system compounds from here. Agents use `search` to discover relevant context
 
 ### CLI ↔ MCP Equivalence
 
-CLI and MCP share the same index. Run `scan --full` from the CLI to build the complete graph (including LSP call edges), then query via either interface. A pre-built index means the MCP server starts with warm data — no cold-start delay.
+CLI and MCP share the same index. Run `scan --full` from the CLI to build the complete index (including call graph edges from your language server), then query via either interface. A pre-built index means the MCP server starts with warm data — no cold-start delay.
 
 ```bash
 # Build the full index (visible, verifiable)
@@ -209,23 +209,20 @@ search(node="<id>", mode="impact")
 
 ### Building the Index
 
-The MCP server builds an index automatically on first query. For best results (including LSP call edges for subsystem detection and impact analysis), build the full index from the CLI first:
+The MCP server builds an index automatically on first query. For best results — including subsystem detection and impact analysis — build the full index from the CLI first so language server analysis runs before agents start:
 
 ```bash
-# Full pipeline: scan → extract → embed → LSP enrich → persist
 repo-native-alignment scan --repo . --full
 
-# Typical output:
 # Scan+Extract: 8,700 symbols across 210 files in 0.6s
 # Embed: 2,800 items in 30s
-# LSP: enriched 8,200 call edges in 50s
-# Graph: 9,000 nodes, 16,600 edges
+# LSP: 8,200 call edges in 50s
 # Done in 50s
 ```
 
-Without `--full`, the scan skips LSP enrichment — subsystem detection and call-graph traversal won't have coupling edges.
+Without `--full`, the scan skips language server analysis — subsystem detection and "what calls this" queries won't work.
 
-**After upgrading RNA**, clear the old index and rebuild. Schema changes between versions (e.g., subsystem metadata, LSP edge persistence) require a fresh index:
+**After upgrading RNA**, clear the old index and rebuild:
 
 ```bash
 rm -rf .oh/.cache/lance .oh/.cache/scan-state.json
@@ -236,12 +233,12 @@ repo-native-alignment scan --repo . --full
 
 | Command | What it does |
 |---------|-------------|
-| `search <query>` | Search symbols via embedding index (hybrid/keyword/semantic), filter by kind/language/file |
+| `search <query>` | Search symbols by name, keyword, or meaning — filter by kind/language/file |
 | `graph --node <id> --mode <mode>` | Traverse neighbors, impact analysis, or reachability |
 | `scan --repo <dir>` | Scan + extract + embed + persist |
 | `scan --repo <dir> --full` | Full pipeline including LSP enrichment. Incremental when cache exists (~0.1s on no-change runs). LSP aborts early if misconfigured (0 edges after 1,000 nodes or 2 minutes). |
 | `stats --repo <dir>` | Show repo stats from persisted index (no re-scan) |
-| `test --repo <dir>` | Run 25 pipeline checks end-to-end |
+| `test --repo <dir>` | Run 29 pipeline checks end-to-end |
 | `setup --project <dir>` | Bootstrap RNA + OH MCP + skills for a project |
 
 ### Plugin Skills
@@ -288,7 +285,7 @@ RNA works standalone. These add organizational context and workflow structure:
 
 ## Status
 
-Tree-sitter + pipelined LSP enrichment, 4 MCP tools, 10 CLI subcommands, 870+ tests. Automatic subsystem detection via Louvain community detection on call edges. Ships as a Claude Code plugin. CLI and MCP share a service layer — adding a parameter to the service automatically makes it available in both interfaces.
+4 MCP tools, 10 CLI subcommands, 870+ tests. Extracts symbols from 22 languages, builds a call graph via language server analysis, detects architectural subsystems automatically. Ships as a Claude Code plugin. CLI and MCP share the same index and service layer.
 
 ### Platform Support
 
@@ -333,5 +330,5 @@ MIT — see [LICENSE](LICENSE).
 - [Extractors](docs/extractors.md) — tree-sitter language extractors, constants, synthetic literals
 - [LSP Enrichment](docs/lsp-enrichment.md) — auto-detected language servers
 - [Scanner](docs/scanner.md) — incremental, event-driven, worktree-aware scanning
-- [Graph Architecture](docs/graph.md) — LanceDB + petgraph, edge types, SourceEnvelope
+- [Graph Architecture](docs/graph.md) — edge types, persistence, in-memory index
 - [Source Compatibility](docs/rna-source-compatibility.md) — source-capability design for future Context Assembler integration
