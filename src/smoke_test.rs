@@ -1526,14 +1526,7 @@ async fn run_impact_output_size_check(index: &GraphIndex, nodes: &[Node]) -> Che
 
     let node_id = best_node.stable_id();
 
-    // Build a GraphState for the search context
-    let mut gs_index = GraphIndex::new();
-    let edges_for_index: Vec<Edge> = Vec::new();
-    gs_index.rebuild_from_edges(&edges_for_index);
-    for n in nodes {
-        gs_index.ensure_node(&n.stable_id(), &n.id.kind.to_string());
-    }
-    // Copy the actual index so we have real edges
+    // Build a GraphState using the caller's index (which has real edges)
     let graph_state = GraphState {
         nodes: nodes.to_vec(),
         edges: Vec::new(),
