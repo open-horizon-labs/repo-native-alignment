@@ -1602,6 +1602,7 @@ async fn run_impact_output_size_check(index: &GraphIndex, nodes: &[Node]) -> Che
         node: Some(node_id.clone()),
         mode: Some("impact".to_string()),
         hops: Some(3),
+        depth: None,
         direction: None,
         edge_types: None,
         kind: None,

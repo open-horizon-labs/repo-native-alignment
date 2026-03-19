@@ -147,7 +147,35 @@ try {
   const rootsText = extractText(rootsResult);
   assertContains("list_roots response contains 'Workspace Roots'", rootsText, "Workspace Roots");
 
-  // ── 7. negative test: unknown tool ──────────────────────────────────────
+  // ── 7. search (neighbors depth=2) ──────────────────────────────────────
+  // Verifies that the depth parameter is accepted and processed through the
+  // MCP protocol. We check for error conditions only — valid output may vary
+  // based on fixture content (the node may have no neighbors in minimal fixtures).
+  console.log("\n── search (neighbors depth=2) ──");
+  const depthSearchResult = await client.callTool({
+    name: "search",
+    arguments: {
+      query: "main",
+      mode: "neighbors",
+      depth: 2,
+      compact: true,
+      include_artifacts: false,
+      include_markdown: false,
+      top_k: 1,
+    },
+  });
+  const depthSearchText = extractText(depthSearchResult);
+  if (depthSearchText.includes("depth > 1 is not supported")) {
+    fail("search (depth=2): depth parameter rejected unexpectedly", depthSearchText);
+  } else if (depthSearchText.includes("No repository data") || depthSearchText.length === 0) {
+    fail("search (depth=2): server returned empty/error response", depthSearchText);
+  } else {
+    // depth parameter was accepted and processed — any non-error output is valid.
+    // The fixture may have no neighbors for "main", which produces a "No neighbors" message.
+    pass("search depth=2 parameter honored through MCP protocol");
+  }
+
+  // ── 8. negative test: unknown tool ──────────────────────────────────────
   console.log("\n── unknown tool (negative test) ──");
   try {
     const unknownResult = await client.callTool({ name: "nonexistent_tool_rna_smoke", arguments: {} });

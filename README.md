@@ -20,6 +20,7 @@ Local context discovery and alignment tool for coding agents. Makes the fractal,
 - "What subsystems exist?" → `repo_map()` → detected from actual call relationships: `extract (1120 symbols)`, `server (721)`, `graph (223)`, ...
 - "Find auth code in the server subsystem" → `search(query="auth", subsystem="server")` → scoped to detected subsystem
 - "What connects extract to server?" → `search(node="X", mode="neighbors", target_subsystem="server")` → cross-subsystem edges
+- "Show me the full structure of a module" → `search(node="server:module", mode="neighbors", depth=2, compact=true)` → module → members → their members in one call
 
 ### See the blast radius of a change
 
@@ -177,7 +178,7 @@ The system compounds from here. Agents use `search` to discover relevant context
 
 | Tool | What it's for |
 |------|--------------|
-| `search` | Code symbols, artifacts, commits, and markdown — flat or graph traversal (`mode`: neighbors, impact, reachable, tests_for). Scope to a subsystem (`subsystem=`), filter cross-subsystem edges (`target_subsystem=`), use `compact: true` for ~25x fewer tokens, `rerank: true` for precision. Short node IDs resolve automatically. |
+| `search` | Code symbols, artifacts, commits, and markdown — flat or graph traversal (`mode`: neighbors, impact, reachable, tests_for). Scope to a subsystem (`subsystem=`), filter cross-subsystem edges (`target_subsystem=`), use `depth=2` with neighbors to walk N levels deep, use `compact: true` for ~25x fewer tokens, `rerank: true` for precision. Short node IDs resolve automatically. |
 | `repo_map` | Repository orientation: **detected subsystems** with their key interfaces, top symbols by importance, hotspot files, active outcomes, entry points. One call replaces an exploratory loop. |
 | `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols. Optional `include_impact: true` for risk-classified blast radius. |
 | `list_roots` | Show which workspace roots are configured and their scan status |
