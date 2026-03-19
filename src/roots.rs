@@ -319,15 +319,17 @@ impl WorkspaceConfig {
 
             // Skip duplicates (same canonical path already registered).
             // We canonicalize both sides so /var and /private/var compare equal.
-            if self.roots.iter().any(|r| {
+            let duplicate_slug = self.roots.iter().find_map(|r| {
                 let existing = std::fs::canonicalize(r.resolved_path())
                     .unwrap_or_else(|_| r.resolved_path());
-                existing == resolved
-            }) {
+                if existing == resolved { Some(r.slug()) } else { None }
+            });
+            if let Some(existing_slug) = duplicate_slug {
                 tracing::debug!(
-                    "Declared workspace root '{}' at '{}' already registered — skipping",
+                    "Declared workspace root '{}' at '{}' already registered as '{}' — skipping",
                     slug,
-                    resolved.display()
+                    resolved.display(),
+                    existing_slug
                 );
                 continue;
             }
