@@ -147,7 +147,31 @@ try {
   const rootsText = extractText(rootsResult);
   assertContains("list_roots response contains 'Workspace Roots'", rootsText, "Workspace Roots");
 
-  // ── 7. negative test: unknown tool ──────────────────────────────────────
+  // ── 7. search (neighbors depth=2) ──────────────────────────────────────
+  console.log("\n── search (neighbors depth=2) ──");
+  const depthSearchResult = await client.callTool({
+    name: "search",
+    arguments: {
+      query: "main",
+      mode: "neighbors",
+      depth: 2,
+      compact: true,
+      include_artifacts: false,
+      include_markdown: false,
+      top_k: 1,
+    },
+  });
+  const depthSearchText = extractText(depthSearchResult);
+  if (depthSearchText.includes("No matching graph nodes") || depthSearchText.includes("not have edges")) {
+    console.log("  [SKIP] search (depth=2): no matching nodes with neighbors (fixture may be minimal)");
+  } else if (depthSearchText.includes("depth > 1 is not supported")) {
+    fail("search (depth=2): unexpected error", depthSearchText);
+  } else {
+    assertContains("search (depth=2) returns graph output", depthSearchText, "Graph neighbors");
+    pass("search depth=2 parameter honored through MCP protocol");
+  }
+
+  // ── 8. negative test: unknown tool ──────────────────────────────────────
   console.log("\n── unknown tool (negative test) ──");
   try {
     const unknownResult = await client.callTool({ name: "nonexistent_tool_rna_smoke", arguments: {} });
