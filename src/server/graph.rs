@@ -633,6 +633,41 @@ impl RnaHandler {
                 return Err(e.context("LanceDB full persist failed during graph build"));
             }
             drop(_lance_guard);
+
+            // Post-persist sanity check: if any new roots were detected, verify they
+            // actually made it into LanceDB. A mismatch here indicates a partial write
+            // or concurrent overwrite -- log an error so the next scan can recover.
+            if has_new_root {
+                match get_stored_root_ids(&self.repo_root).await {
+                    Ok(stored_after) => {
+                        let stored_after_set: std::collections::HashSet<String> =
+                            stored_after.into_iter().collect();
+                        let missing: Vec<String> = live_slugs
+                            .iter()
+                            .filter(|s| !stored_after_set.contains(*s) && !RESERVED_ROOT_IDS.contains(&s.as_str()))
+                            .cloned()
+                            .collect();
+                        if !missing.is_empty() {
+                            tracing::error!(
+                                "Post-persist check FAILED: {} root(s) still missing from LanceDB after full rebuild: {}. \
+                                 The persist completed without error but the data is not visible. \
+                                 This may indicate a concurrent overwrite by another process. \
+                                 Next scan will retry.",
+                                missing.len(),
+                                missing.join(", ")
+                            );
+                        } else {
+                            tracing::info!(
+                                "Post-persist check: all {} live root(s) confirmed in LanceDB",
+                                live_slugs.len()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Post-persist root check failed (non-fatal): {}", e);
+                    }
+                }
+            }
         }
 
         // Persist succeeded (or deferred) -- commit scanner state for all roots

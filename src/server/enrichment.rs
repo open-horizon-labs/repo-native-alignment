@@ -440,16 +440,23 @@ impl RnaHandler {
                 // Fallback to bg_nodes if graph state is None (race: graph may
                 // not be stored in self.graph yet when this task first runs).
                 // This matches spawn_lsp_enrichment's fallback pattern.
-                let (enrich_nodes, enrich_index) = {
+                let (enrich_nodes, enrich_index, migration_fallback_nodes) = {
                     let guard = bg_graph.read().await;
                     if let Some(ref gs) = *guard {
-                        (gs.nodes.clone(), gs.index.clone())
+                        // MCP server path: bg_graph is set; if schema migration fires,
+                        // we'll snapshot from bg_graph after enrichment. No clone needed.
+                        (gs.nodes.clone(), gs.index.clone(), Vec::<Node>::new())
                     } else {
                         tracing::warn!(
                             "[background] Graph state not yet available, using {} passed-in nodes",
                             bg_nodes.len()
                         );
-                        (bg_nodes, crate::graph::index::GraphIndex::new())
+                        // CLI path: bg_graph is None (build_full_graph called directly).
+                        // Capture nodes for schema-migration fallback BEFORE enrichment
+                        // consumes them. If migration fires after enrichment, we need
+                        // the full set to rebuild LanceDB.
+                        let fallback = bg_nodes.clone();
+                        (bg_nodes, crate::graph::index::GraphIndex::new(), fallback)
                     }
                 };
 
@@ -550,11 +557,33 @@ impl RnaHandler {
                     };
                     match persist_result {
                         Ok(true) => {
-                            // Schema migrated -- tables were dropped, need full persist
+                            // Schema migrated -- tables were dropped, need full persist.
+                            // Prefer the live graph snapshot (MCP server path where
+                            // bg_graph is set). Fall back to migration_fallback_nodes
+                            // (CLI path where bg_graph is None, captured before enrichment).
                             tracing::info!("[background] LSP enrichment: schema migrated; performing full persist");
                             let snapshot = {
                                 let g = bg_graph.read().await;
-                                g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+                                if let Some(ref gs) = *g {
+                                    Some((gs.nodes.clone(), gs.edges.clone()))
+                                } else if !migration_fallback_nodes.is_empty() {
+                                    // CLI path: use the pre-enrichment node set.
+                                    // Edges are empty because LSP enrichment hadn't
+                                    // completed; the tree-sitter edges are already in
+                                    // migration_fallback_nodes via the initial persist.
+                                    tracing::warn!(
+                                        "[background] LSP enrichment: bg_graph is None after migration; \
+                                         falling back to {} pre-enrichment nodes for full persist",
+                                        migration_fallback_nodes.len()
+                                    );
+                                    Some((migration_fallback_nodes, Vec::new()))
+                                } else {
+                                    tracing::error!(
+                                        "[background] LSP enrichment: schema migrated but no nodes \
+                                         available for full persist — LanceDB tables are now empty"
+                                    );
+                                    None
+                                }
                             };
                             if let Some((nodes, edges)) = snapshot {
                                 let _lance_guard = bg_lance_write_lock.lock().await;
@@ -601,12 +630,16 @@ impl RnaHandler {
         tokio::spawn(async move {
             // Snapshot graph data under lock, then release before the slow
             // enrich_all call so write-side graph updates aren't blocked.
-            let (enrich_nodes, enrich_index) = {
+            let (enrich_nodes, enrich_index, migration_fallback_nodes) = {
                 let guard = bg_graph.read().await;
                 if let Some(ref gs) = *guard {
-                    (gs.nodes.clone(), gs.index.clone())
+                    // MCP server path: bg_graph is set; snapshot after enrichment will work.
+                    (gs.nodes.clone(), gs.index.clone(), Vec::<Node>::new())
                 } else {
-                    (bg_nodes, crate::graph::index::GraphIndex::new())
+                    // CLI / cache-hit path: bg_graph is None. Capture a clone for the
+                    // schema-migration fallback so LanceDB can be rebuilt if migration fires.
+                    let fallback = bg_nodes.clone();
+                    (bg_nodes, crate::graph::index::GraphIndex::new(), fallback)
                 }
             };
 
@@ -704,10 +737,28 @@ impl RnaHandler {
                 };
                 match persist_result {
                     Ok(true) => {
+                        // Schema migrated -- tables dropped; need full persist.
+                        // Use live snapshot from bg_graph if available (MCP server path);
+                        // fall back to migration_fallback_nodes (CLI / cache-hit path).
                         tracing::info!("[background] LSP enrichment (cache-hit): schema migrated; performing full persist");
                         let snapshot = {
                             let g = bg_graph.read().await;
-                            g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+                            if let Some(ref gs) = *g {
+                                Some((gs.nodes.clone(), gs.edges.clone()))
+                            } else if !migration_fallback_nodes.is_empty() {
+                                tracing::warn!(
+                                    "[background] LSP enrichment (cache-hit): bg_graph is None after migration; \
+                                     falling back to {} pre-enrichment nodes for full persist",
+                                    migration_fallback_nodes.len()
+                                );
+                                Some((migration_fallback_nodes, Vec::new()))
+                            } else {
+                                tracing::error!(
+                                    "[background] LSP enrichment (cache-hit): schema migrated but no nodes \
+                                     available for full persist — LanceDB tables are now empty"
+                                );
+                                None
+                            }
                         };
                         if let Some((nodes, edges)) = snapshot {
                             let _lance_guard = bg_lance_write_lock.lock().await;
