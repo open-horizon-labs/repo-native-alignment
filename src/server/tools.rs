@@ -41,10 +41,10 @@ pub struct Search {
     /// Traversal: "neighbors", "impact", "reachable", "tests_for"; omit for flat search
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
-    /// Max traversal depth (default: 1 neighbors, 3 impact/reachable)
+    /// Max reachability depth for impact/reachable modes (default: 3). Controls how far the graph walk reaches. Not used for neighbors mode — use depth instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hops: Option<u32>,
-    /// Multi-level neighbors traversal depth for neighbors mode (default: 1). Walk edges N levels deep, accumulating and deduplicating results per level. Only applies to neighbors mode; use hops for impact/reachable.
+    /// Multi-level neighbors traversal depth for neighbors mode (default: 1). Walk edges N levels deep, accumulating and deduplicating results per level. Only applies to neighbors mode; ignored for impact/reachable (use hops for those).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depth: Option<u32>,
     /// Neighbors direction: "outgoing" (default), "incoming", "both"
