@@ -207,6 +207,51 @@ impl PatternConfig {
 struct TomlConfig {
     scanner: Option<ScanConfig>,
     patterns: Option<PatternConfig>,
+    workspace: Option<WorkspaceSection>,
+}
+
+/// The `[workspace]` table in `.oh/config.toml`.
+#[derive(Debug, Deserialize, Default)]
+struct WorkspaceSection {
+    /// Slug → path mapping under `[workspace.roots]`.
+    #[serde(default)]
+    roots: std::collections::HashMap<String, String>,
+}
+
+/// Load the `[workspace.roots]` entries from `<repo_root>/.oh/config.toml`.
+///
+/// Returns a `Vec<(slug, path)>` in the order they appear in the TOML file
+/// (HashMap iteration is arbitrary, but stable enough for deterministic
+/// registration since each slug is unique within the map).
+///
+/// Returns an empty vec if the file does not exist or has no `[workspace.roots]`.
+pub fn load_declared_roots(repo_root: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
+    let config_path = repo_root.join(".oh").join("config.toml");
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    match toml::from_str::<TomlConfig>(&content) {
+        Ok(parsed) => {
+            let section = match parsed.workspace {
+                Some(w) => w,
+                None => return Vec::new(),
+            };
+            section
+                .roots
+                .into_iter()
+                .map(|(slug, path_str)| (slug, std::path::PathBuf::from(path_str)))
+                .collect()
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to parse [workspace.roots] in {}: {}",
+                config_path.display(),
+                e
+            );
+            Vec::new()
+        }
+    }
 }
 
 // ── Public types ────────────────────────────────────────────────────
@@ -1989,5 +2034,49 @@ exclude = ["dist/"]
         assert!(!suffixes.iter().any(|(_, h)| h == "manager"));
         assert!(!suffixes.iter().any(|(_, h)| h == "service"));
         assert!(suffixes.iter().any(|(_, h)| h == "factory"));
+    }
+
+    // ── load_declared_roots tests ───────────────────────────────────
+
+    #[test]
+    fn test_load_declared_roots_from_config_toml() {
+        let tmp = TempDir::new().unwrap();
+        let oh_dir = tmp.path().join(".oh");
+        fs::create_dir_all(&oh_dir).unwrap();
+        fs::write(
+            oh_dir.join("config.toml"),
+            "[workspace.roots]\ninfra = \"../k8s-configs\"\nprotos = \"/abs/protos\"\n",
+        )
+        .unwrap();
+
+        let roots = load_declared_roots(tmp.path());
+        assert_eq!(roots.len(), 2);
+        let slugs: Vec<&str> = roots.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(slugs.contains(&"infra"), "Expected 'infra' slug");
+        assert!(slugs.contains(&"protos"), "Expected 'protos' slug");
+
+        let infra_path = roots.iter().find(|(s, _)| s == "infra").unwrap();
+        assert_eq!(infra_path.1, std::path::PathBuf::from("../k8s-configs"));
+        let protos_path = roots.iter().find(|(s, _)| s == "protos").unwrap();
+        assert_eq!(protos_path.1, std::path::PathBuf::from("/abs/protos"));
+    }
+
+    #[test]
+    fn test_load_declared_roots_no_workspace_section() {
+        let tmp = TempDir::new().unwrap();
+        let oh_dir = tmp.path().join(".oh");
+        fs::create_dir_all(&oh_dir).unwrap();
+        fs::write(oh_dir.join("config.toml"), "[scanner]\nexclude = [\"benchmark/\"]\n").unwrap();
+
+        let roots = load_declared_roots(tmp.path());
+        assert!(roots.is_empty(), "No [workspace.roots] section should yield empty vec");
+    }
+
+    #[test]
+    fn test_load_declared_roots_no_config_file() {
+        let tmp = TempDir::new().unwrap();
+        // No .oh/ directory at all
+        let roots = load_declared_roots(tmp.path());
+        assert!(roots.is_empty(), "Missing config file should yield empty vec");
     }
 }

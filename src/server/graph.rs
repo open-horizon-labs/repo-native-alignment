@@ -147,7 +147,8 @@ impl RnaHandler {
             .with_primary_root(self.repo_root.clone())
             .with_worktrees(&self.repo_root)
             .with_claude_memory(&self.repo_root)
-            .with_agent_memories(&self.repo_root);
+            .with_agent_memories(&self.repo_root)
+            .with_declared_roots(&self.repo_root);
         let resolved_roots = workspace.resolved_roots();
 
         // Prune stale roots: compare discovered roots against what LanceDB has stored.
