@@ -161,8 +161,17 @@ impl RnaHandler {
         // Synthetic root IDs (e.g., "external" for LSP virtual nodes) are never
         // discovered by WorkspaceConfig but are valid -- skip them during stale pruning.
         const RESERVED_ROOT_IDS: &[&str] = &["external"];
+        // Track whether any live root is absent from LanceDB: a newly-declared root
+        // may have committed scanner state without ever being persisted to LanceDB
+        // (e.g., when the root was first discovered on a run where `any_root_changed`
+        // was already true for other reasons but LanceDB was not yet updated for this
+        // root). In that case `any_root_changed` stays false and the early-return path
+        // loads the cache without the new root's nodes. Force a rebuild if any slug is
+        // missing from the stored set.
+        let mut has_new_root = false;
         match get_stored_root_ids(&self.repo_root).await {
             Ok(stored) => {
+                let stored_set: std::collections::HashSet<String> = stored.iter().cloned().collect();
                 let stale: Vec<String> = stored
                     .into_iter()
                     .filter(|s| !live_slugs.contains(s))
@@ -178,6 +187,21 @@ impl RnaHandler {
                         tracing::warn!("Failed to prune stale roots at startup: {}", e);
                     }
                 }
+                // Detect new roots: any live slug not present in LanceDB means its
+                // nodes were never persisted and must be included in a fresh build.
+                let new_slugs: Vec<&str> = live_slugs
+                    .iter()
+                    .filter(|s| !stored_set.contains(*s) && !RESERVED_ROOT_IDS.contains(&s.as_str()))
+                    .map(|s| s.as_str())
+                    .collect();
+                if !new_slugs.is_empty() {
+                    tracing::info!(
+                        "Detected {} new root(s) not yet in LanceDB: {} -- forcing full rebuild",
+                        new_slugs.len(),
+                        new_slugs.join(", ")
+                    );
+                    has_new_root = true;
+                }
             }
             Err(e) => {
                 tracing::debug!("Could not query stored roots for stale pruning: {}", e);
@@ -185,7 +209,10 @@ impl RnaHandler {
         }
 
         // 1. Scan all roots to detect changes (per-root tracking)
-        let mut any_root_changed = false;
+        // Pre-seed with has_new_root so the early-return at step 2 is skipped when
+        // any declared root is absent from LanceDB (nodes committed to scanner state
+        // but never persisted).
+        let mut any_root_changed = has_new_root;
         let mut scanners: Vec<(String, Scanner, crate::scanner::ScanResult, PathBuf, bool)> = Vec::new();
 
         for resolved_root in &resolved_roots {

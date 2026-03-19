@@ -753,6 +753,120 @@ mod tests {
         }
     }
 
+    /// Regression test for #364: a newly-declared workspace root whose scanner
+    /// state was already committed (so no file-change delta) but whose nodes had
+    /// never been persisted to LanceDB must still be included in the next rebuild.
+    ///
+    /// The bug: `any_root_changed` was only set by file-change detection. A root
+    /// with committed scanner state but absent from LanceDB reported 0 changes,
+    /// keeping `any_root_changed = false` and triggering the early-return that
+    /// loaded the stale cache without the new root's nodes.
+    ///
+    /// The fix: compare live slugs against stored LanceDB slugs at startup;
+    /// if any slug is missing, pre-set `any_root_changed = true` to force a
+    /// full rebuild that includes the new root.
+    #[tokio::test]
+    async fn test_declared_root_persisted_even_when_scanner_state_already_committed() {
+        use tempfile::TempDir;
+
+        let primary = TempDir::new().unwrap();
+        let secondary = TempDir::new().unwrap();
+
+        // Primary root: one Rust file
+        std::fs::create_dir_all(primary.path().join("src")).unwrap();
+        std::fs::create_dir_all(primary.path().join(".oh/.cache")).unwrap();
+        std::fs::write(
+            primary.path().join("src/lib.rs"),
+            "pub fn primary_fn() {}\n",
+        )
+        .unwrap();
+
+        // Secondary root: one Rust file (will be declared later)
+        std::fs::create_dir_all(secondary.path().join("src")).unwrap();
+        std::fs::write(
+            secondary.path().join("src/lib.rs"),
+            "pub fn secondary_fn() {}\n",
+        )
+        .unwrap();
+
+        let handler = RnaHandler {
+            repo_root: primary.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        // Step 1: First build without declared root. Persists primary root to LanceDB.
+        let gs1 = handler.build_full_graph().await.unwrap();
+        assert!(
+            gs1.nodes.iter().any(|n| n.id.name == "primary_fn"),
+            "primary_fn should be present after first build"
+        );
+        assert!(
+            !gs1.nodes.iter().any(|n| n.id.name == "secondary_fn"),
+            "secondary_fn must not appear before the secondary root is declared"
+        );
+
+        // Step 2: Pre-commit the scanner state for the secondary root so that a
+        // subsequent scan sees 0 file changes for it — this simulates the exact
+        // scenario from #364 where the state was committed on a previous run.
+        let state_path = crate::roots::cache_state_path("secondary");
+        if let Some(parent) = state_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        {
+            // Build and commit scanner state so secondary shows 0 changes next scan.
+            let mut scanner = crate::scanner::Scanner::with_excludes_and_state_path(
+                secondary.path().to_path_buf(),
+                vec![],
+                state_path.clone(),
+            )
+            .unwrap();
+            let _ = scanner.scan().unwrap();
+            scanner.commit_state().unwrap();
+        }
+
+        // Step 3: Declare the secondary root in .oh/config.toml
+        let config_dir = primary.path().join(".oh");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            format!("[workspace.roots]\nsecondary = \"{}\"\n", secondary.path().display()),
+        )
+        .unwrap();
+
+        // Reset handler graph so next call triggers a fresh build_full_graph
+        {
+            let mut g = handler.graph.write().await;
+            *g = None;
+        }
+
+        // Step 4: Second build. Secondary slug is in live_slugs but not in stored
+        // LanceDB slugs (only primary was persisted). The fix must detect this,
+        // set any_root_changed = true, and include secondary_fn in the rebuilt graph.
+        let gs2 = handler.build_full_graph().await.unwrap();
+        assert!(
+            gs2.nodes.iter().any(|n| n.id.name == "primary_fn"),
+            "primary_fn must still be present after second build"
+        );
+        assert!(
+            gs2.nodes.iter().any(|n| n.id.name == "secondary_fn"),
+            "secondary_fn must be present after second build with declared root. \
+            Nodes: {:?}",
+            gs2.nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+        );
+
+        // Step 5: Verify LanceDB was updated: load fresh from lance and check
+        let persisted = crate::server::load_graph_from_lance(primary.path()).await.unwrap();
+        assert!(
+            persisted.nodes.iter().any(|n| n.id.name == "secondary_fn"),
+            "secondary_fn must be in LanceDB after second build. \
+            Stored nodes: {:?}",
+            persisted.nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+        );
+
+        // Cleanup: remove scanner state we wrote so other tests aren't affected
+        let _ = std::fs::remove_file(&state_path);
+    }
+
     #[test]
     fn test_enricher_registry_includes_markdown() {
         // Verify that EnricherRegistry::with_builtins() registers enrichers for
