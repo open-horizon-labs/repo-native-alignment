@@ -49,14 +49,14 @@ RNA's zero-dependency design is a deliberate architectural choice. `cargo instal
 
 ## Graph Quality
 
-| Edge source | LSP | RNA | CGR | CGC | CT |
-|-------------|-----|-----|-----|-----|-----|
-| Tree-sitter (syntactic) | None | 22 languages | 11 languages | 14 languages | 10 languages |
-| LSP (semantic) | Is the source (1 lang/server) | 37 language servers, call + type hierarchy | None | None | None |
-| SCIP (compiler) | None | Not needed — LSP covers the same edges | None | Pyright, tsc, scip-go, scip-rust | None |
-| Embedding similarity | None | MiniLM-L6-v2, cosine distance | UniXcoder | None | None |
-| Cross-language | No (one server per language) | Yes (unified graph) | Yes | Yes | Yes |
-| Multi-hop | No (agent must loop) | Yes (single call) | Yes | Yes | Yes |
+| Edge source | LSP | RNA | CGR | CGC | CT | Serena |
+|-------------|-----|-----|-----|-----|-----|--------|
+| Tree-sitter (syntactic) | None | 22 languages | 11 languages | 14 languages | 10 languages | None (uses LSP not tree-sitter) |
+| LSP (semantic) | Is the source (1 lang/server) | 37 language servers, call + type hierarchy | None | None | None | Is the source (30+ servers) |
+| SCIP (compiler) | None | Not needed — LSP covers the same edges | None | Pyright, tsc, scip-go, scip-rust | None | None |
+| Embedding similarity | None | MiniLM-L6-v2, cosine distance | UniXcoder | None | None | None |
+| Cross-language | No (one server per language) | Yes (unified graph) | Yes | Yes | Yes | Yes (separate servers) |
+| Multi-hop | No (agent must loop) | Yes (single call) | Yes | Yes | Yes | No (agent must loop) |
 
 LSP provides the raw semantic data — call hierarchy, type hierarchy, references — but only for one language at a time, one hop at a time. RNA consumes LSP as one enrichment source among several, fuses the results into a cross-language graph, and exposes multi-hop traversal. CGR and CGC skip LSP entirely, relying on tree-sitter (syntactic) or SCIP (compiler) for edges. RNA's two-tier approach (tree-sitter + LSP) gives the broadest coverage with the highest accuracy. 22 languages from tree-sitter, then 37 LSP servers add compiler-grade call hierarchies and type relationships that neither CGR nor CGC have.
 
@@ -64,14 +64,14 @@ LSP provides the raw semantic data — call hierarchy, type hierarchy, reference
 
 ## Semantic Search
 
-| | LSP | RNA | CGR | CGC | CT |
-|---|---|---|---|---|---|
-| **Model** | N/A | MiniLM-L6-v2 + Jina Reranker v1 Turbo | UniXcoder (code-specific) | None | None |
-| **Hardware** | N/A | Metal GPU on Apple Silicon, CPU fallback | CPU | N/A | N/A |
-| **What's embedded** | N/A | Function bodies, all markdown, commits | Function bodies | Nothing | Nothing |
-| **Indexed together** | N/A | Code + markdown + git history | Code only | N/A | N/A |
-| **Score normalization** | N/A | relevance-ranked, test files demoted | Raw similarity | N/A | N/A |
-| **Markdown** | N/A | Heading-scoped chunks with hierarchy | None | None | None |
+| | LSP | RNA | CGR | CGC | CT | Serena |
+|---|---|---|---|---|---|---|
+| **Model** | N/A | MiniLM-L6-v2 + Jina Reranker v1 Turbo | UniXcoder (code-specific) | None | None | N/A |
+| **Hardware** | N/A | Metal GPU on Apple Silicon, CPU fallback | CPU | N/A | N/A | N/A |
+| **What's embedded** | N/A | Function bodies, all markdown, commits | Function bodies | Nothing | Nothing | N/A |
+| **Indexed together** | N/A | Code + markdown + git history | Code only | N/A | N/A | N/A |
+| **Score normalization** | N/A | relevance-ranked, test files demoted | Raw similarity | N/A | N/A | N/A |
+| **Markdown** | N/A | Heading-scoped chunks with hierarchy | None | None | None | N/A |
 
 RNA's unique advantage: semantic search spans code AND business artifacts in the same vector space. "Find functions related to our payment reliability outcome" is a query only RNA can answer. Results are relevance-ranked: exact name > contains > signature-only, definitions before imports, production code before tests. CGR's UniXcoder is a code-specific model (better at pure code semantics), but RNA embeds function bodies, all markdown (chunked by heading), and commit messages together — breadth over specialization.
 
@@ -84,6 +84,8 @@ RNA's unique advantage: semantic search spans code AND business artifacts in the
 **CGC: 17 tools** — broad coverage including visualization, dead code detection, complexity analysis, file watching.
 
 **codeTree: 23 tools** — breadth-first structural analysis covering graph queries, skeleton views, clone detection, taint/dataflow analysis, dead code detection, doc suggestions, change impact, and repository map.
+
+**Serena: 44+ tools** — LSP-backed symbol navigation plus symbol-level code editing (`replace_symbol_body`, `rename_symbol`). Agents can not only read but write code at the symbol level.
 
 RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents have their own editors. codeTree takes the opposite approach — more tools covering more use cases (security, docs, code quality) but without embeddings, LSP enrichment, or business context.
 
@@ -118,6 +120,7 @@ RNA is read-only infrastructure — it serves agents, it doesn't act as one. Thi
 - **Repository map** — codeTree generates a compact codebase overview with entry points, hotspot files, and a suggested exploration path. RNA's `repo_map` covers this ground and adds automatically detected architectural subsystems (via Louvain community detection), cohesion scores, and subsystem interfaces — `repo_map` provides a structural architecture view, not just a symbol list.
 - **Code-specific embedding model** — CGR uses UniXcoder (trained on code). RNA uses MiniLM-L6-v2 (general-purpose text model) because it needs to embed code, markdown, and business artifacts in the same space. Trade-off: slightly less code-specific precision, much broader coverage.
 - **SCIP indexing** — CGC supports Pyright, tsc, scip-go, scip-rust for compiler-grade precision in 4 languages. RNA spiked SCIP (#114) and concluded LSP provides the same semantic edges without requiring separate build-time indexers.
+- **Symbol-aware code editing** — Serena has `replace_symbol_body` and `rename_symbol` tools that edit code at the symbol level, not just read it. RNA is read-only infrastructure; agents use their own editors for writes.
 
 ## Summary
 
@@ -129,3 +132,4 @@ Sources:
 - [Code-Graph-RAG salvage analysis](../.oh/sessions/cgr-salvage.md)
 - [CodeGraphContext salvage analysis](../.oh/sessions/codegraphcontext-salvage.md)
 - [codeTree salvage analysis](../.oh/sessions/codetree-salvage.md)
+- [Serena salvage analysis](../.oh/sessions/serena-salvage.md)
