@@ -58,6 +58,11 @@ pub struct RootConfig {
     /// Additional exclude patterns (merged with type presets).
     #[serde(default)]
     pub excludes: Vec<String>,
+    /// Optional user-specified slug. When set (e.g., for declared roots from
+    /// `.oh/config.toml`), this overrides the path-derived slug so agents can
+    /// reference the root by a stable name like "infra" or "protos".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug_override: Option<String>,
 }
 
 impl RootConfig {
@@ -68,6 +73,7 @@ impl RootConfig {
             root_type: RootType::CodeProject,
             git_aware: true,
             excludes: Vec::new(),
+            slug_override: None,
         }
     }
 
@@ -76,8 +82,15 @@ impl RootConfig {
         expand_tilde(&self.path)
     }
 
-    /// Generate a URL-safe slug from the path for use as root_id.
+    /// Generate a URL-safe slug for use as root_id.
+    ///
+    /// If the root was declared with an explicit slug (e.g., `infra = "../k8s"` in
+    /// `.oh/config.toml`), that slug is returned as-is. Otherwise the slug is
+    /// derived from the resolved path.
     pub fn slug(&self) -> String {
+        if let Some(ref s) = self.slug_override {
+            return s.clone();
+        }
         path_to_slug(&self.resolved_path())
     }
 
@@ -224,6 +237,7 @@ impl WorkspaceConfig {
                 root_type: RootType::Notes,
                 git_aware: false,
                 excludes: vec![],
+                slug_override: None,
             });
         }
         self
@@ -250,6 +264,87 @@ impl WorkspaceConfig {
         // project root and already covered by the CodeProject scan. Adding them as
         // separate Notes roots would duplicate index entries. Tagging is handled
         // purely by detect_oh_kind in the markdown extractor.
+        self
+    }
+
+    /// Register roots declared in `<repo_root>/.oh/config.toml` under
+    /// `[workspace.roots]`.
+    ///
+    /// Each entry maps a user-chosen slug to a path:
+    ///
+    /// ```toml
+    /// [workspace.roots]
+    /// infra   = "../k8s-configs"
+    /// protos  = "../shared-protos"
+    /// ```
+    ///
+    /// Relative paths are resolved relative to `repo_root`. Missing paths are
+    /// warned and skipped — they are not an error. Roots that are already present
+    /// (same resolved path) are skipped to avoid duplicates.
+    ///
+    /// Declared roots use the TOML key as their slug so agents can reference them
+    /// by stable name (`search(root="infra")`) regardless of path.
+    ///
+    /// The root type is `CodeProject` unless the path contains a `.oh/` directory,
+    /// in which case it is treated as a `CodeProject` root with alignment context.
+    /// (The type can be overridden later if needed; for now all declared roots are
+    /// `CodeProject` with `git_aware = true`.)
+    pub fn with_declared_roots(mut self, repo_root: &Path) -> Self {
+        use crate::scanner::load_declared_roots;
+
+        let declared = load_declared_roots(repo_root);
+        for (slug, raw_path) in declared {
+            // Resolve relative paths against repo_root
+            let path = if raw_path.is_absolute() {
+                raw_path.clone()
+            } else {
+                repo_root.join(&raw_path)
+            };
+            let resolved = expand_tilde(&path);
+
+            // Warn and skip missing paths
+            if !resolved.exists() {
+                tracing::warn!(
+                    "Declared workspace root '{}' at '{}' does not exist — skipping",
+                    slug,
+                    resolved.display()
+                );
+                continue;
+            }
+
+            // Canonicalize to remove any `..` components and resolve symlinks so
+            // duplicate detection and display are stable
+            // (e.g. `service/../k8s` → `k8s`, `/var/...` → `/private/var/...` on macOS).
+            let resolved = std::fs::canonicalize(&resolved).unwrap_or(resolved);
+
+            // Skip duplicates (same canonical path already registered).
+            // We canonicalize both sides so /var and /private/var compare equal.
+            if self.roots.iter().any(|r| {
+                let existing = std::fs::canonicalize(r.resolved_path())
+                    .unwrap_or_else(|_| r.resolved_path());
+                existing == resolved
+            }) {
+                tracing::debug!(
+                    "Declared workspace root '{}' at '{}' already registered — skipping",
+                    slug,
+                    resolved.display()
+                );
+                continue;
+            }
+
+            tracing::info!(
+                "Registering declared workspace root '{}' at '{}'",
+                slug,
+                resolved.display()
+            );
+            self.roots.push(RootConfig {
+                path: resolved,
+                root_type: RootType::CodeProject,
+                git_aware: true,
+                excludes: Vec::new(),
+                slug_override: Some(slug),
+            });
+        }
         self
     }
 
@@ -450,6 +545,7 @@ excludes = ["*.iso", "*.dmg"]
                 root_type: RootType::Notes,
                 git_aware: false,
                 excludes: vec![],
+                slug_override: None,
             }],
         };
 
@@ -471,6 +567,7 @@ excludes = ["*.iso", "*.dmg"]
                 root_type: RootType::Notes,
                 git_aware: false,
                 excludes: vec![],
+                slug_override: None,
             }],
         };
 
@@ -515,6 +612,7 @@ excludes = ["*.iso", "*.dmg"]
             root_type: RootType::Notes,
             git_aware: false,
             excludes: vec!["*.tmp".to_string()],
+            slug_override: None,
         };
 
         let excludes = root.effective_excludes();
@@ -581,6 +679,7 @@ excludes = ["*.iso", "*.dmg"]
                 root_type: RootType::Notes,
                 git_aware: false,
                 excludes: vec![],
+                slug_override: None,
             }],
         };
 
@@ -597,6 +696,7 @@ excludes = ["*.iso", "*.dmg"]
                 root_type: RootType::CodeProject,
                 git_aware: true,
                 excludes: vec![],
+                slug_override: None,
             }],
         };
 
@@ -779,6 +879,7 @@ excludes = ["*.iso", "*.dmg"]
                 root_type: RootType::Notes,
                 git_aware: false,
                 excludes: vec![],
+                slug_override: None,
             }],
         }
         .with_primary_root(tmp1.path().to_path_buf())
@@ -786,5 +887,157 @@ excludes = ["*.iso", "*.dmg"]
 
         // Primary + pre-existing Notes root, nothing added or removed
         assert_eq!(config.resolved_roots().len(), 2);
+    }
+
+    // ── with_declared_roots tests ────────────────────────────────────
+
+    #[test]
+    fn test_with_declared_roots_registers_existing_path() {
+        let repo_root = TempDir::new().unwrap();
+        let declared_dir = TempDir::new().unwrap();
+
+        // Write a .oh/config.toml with [workspace.roots]
+        let oh_dir = repo_root.path().join(".oh");
+        fs::create_dir_all(&oh_dir).unwrap();
+        fs::write(
+            oh_dir.join("config.toml"),
+            format!(
+                "[workspace.roots]\ninfra = \"{}\"\n",
+                declared_dir.path().display()
+            ),
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::default()
+            .with_primary_root(repo_root.path().to_path_buf())
+            .with_declared_roots(repo_root.path());
+
+        let resolved = config.resolved_roots();
+        // Primary + declared "infra" root
+        assert_eq!(resolved.len(), 2, "Expected primary + declared root");
+        let infra = resolved.iter().find(|r| r.slug == "infra");
+        assert!(infra.is_some(), "Declared root 'infra' should appear in resolved roots");
+        // Canonicalize both sides to handle macOS symlinks (/var -> /private/var)
+        let expected = std::fs::canonicalize(declared_dir.path())
+            .unwrap_or_else(|_| declared_dir.path().to_path_buf());
+        assert_eq!(infra.unwrap().path, expected);
+    }
+
+    #[test]
+    fn test_with_declared_roots_skips_missing_path() {
+        let repo_root = TempDir::new().unwrap();
+
+        let oh_dir = repo_root.path().join(".oh");
+        fs::create_dir_all(&oh_dir).unwrap();
+        fs::write(
+            oh_dir.join("config.toml"),
+            "[workspace.roots]\nprotos = \"/definitely/nonexistent/path/xyzzy\"\n",
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::default()
+            .with_primary_root(repo_root.path().to_path_buf())
+            .with_declared_roots(repo_root.path());
+
+        // Only the primary root; missing declared root was skipped
+        let resolved = config.resolved_roots();
+        assert_eq!(resolved.len(), 1, "Missing declared root must be skipped");
+        assert!(
+            resolved.iter().all(|r| r.slug != "protos"),
+            "Missing declared root must not appear"
+        );
+    }
+
+    #[test]
+    fn test_with_declared_roots_relative_path_resolution() {
+        // The declared root path is relative — resolved against repo_root
+        let parent = TempDir::new().unwrap();
+        let repo_dir = parent.path().join("my-service");
+        let sibling_dir = parent.path().join("k8s-configs");
+        fs::create_dir_all(&repo_dir).unwrap();
+        fs::create_dir_all(&sibling_dir).unwrap();
+
+        let oh_dir = repo_dir.join(".oh");
+        fs::create_dir_all(&oh_dir).unwrap();
+        // Use relative path "../k8s-configs"
+        fs::write(
+            oh_dir.join("config.toml"),
+            "[workspace.roots]\ninfra = \"../k8s-configs\"\n",
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::default()
+            .with_primary_root(repo_dir.clone())
+            .with_declared_roots(&repo_dir);
+
+        let resolved = config.resolved_roots();
+        assert_eq!(resolved.len(), 2, "Expected primary + resolved relative root");
+        let infra = resolved.iter().find(|r| r.slug == "infra");
+        assert!(infra.is_some(), "Declared relative root 'infra' should resolve");
+        // Canonicalize both sides to handle macOS symlinks (/var -> /private/var)
+        let expected = std::fs::canonicalize(&sibling_dir).unwrap_or(sibling_dir);
+        assert_eq!(infra.unwrap().path, expected);
+    }
+
+    #[test]
+    fn test_with_declared_roots_no_config_file_is_noop() {
+        let repo_root = TempDir::new().unwrap();
+        // No .oh/config.toml at all
+
+        let config = WorkspaceConfig::default()
+            .with_primary_root(repo_root.path().to_path_buf())
+            .with_declared_roots(repo_root.path());
+
+        let resolved = config.resolved_roots();
+        assert_eq!(resolved.len(), 1, "No config file should be a no-op");
+    }
+
+    #[test]
+    fn test_with_declared_roots_skips_duplicate_path() {
+        // A declared root pointing at the same path as the primary root should be skipped
+        let repo_root = TempDir::new().unwrap();
+
+        let oh_dir = repo_root.path().join(".oh");
+        fs::create_dir_all(&oh_dir).unwrap();
+        // Declare the repo root itself — duplicate
+        fs::write(
+            oh_dir.join("config.toml"),
+            format!(
+                "[workspace.roots]\nself-ref = \"{}\"\n",
+                repo_root.path().display()
+            ),
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::default()
+            .with_primary_root(repo_root.path().to_path_buf())
+            .with_declared_roots(repo_root.path());
+
+        let resolved = config.resolved_roots();
+        assert_eq!(resolved.len(), 1, "Duplicate path must be deduped");
+    }
+
+    #[test]
+    fn test_root_config_slug_uses_override_when_set() {
+        let root = RootConfig {
+            path: PathBuf::from("/tmp/some/project"),
+            root_type: RootType::CodeProject,
+            git_aware: true,
+            excludes: vec![],
+            slug_override: Some("infra".to_string()),
+        };
+        assert_eq!(root.slug(), "infra");
+    }
+
+    #[test]
+    fn test_root_config_slug_derives_from_path_when_no_override() {
+        let root = RootConfig {
+            path: PathBuf::from("/tmp/some/project"),
+            root_type: RootType::CodeProject,
+            git_aware: true,
+            excludes: vec![],
+            slug_override: None,
+        };
+        assert_eq!(root.slug(), "tmp-some-project");
     }
 }
