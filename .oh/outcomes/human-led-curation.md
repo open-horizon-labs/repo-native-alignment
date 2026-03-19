@@ -26,19 +26,24 @@ Metis accumulates. After 20+ sessions, no human can hold all of it in mind to de
 This is not a judgment problem — it's a *search and surface* problem. LLMs are good at
 that. The judgment (what to keep, what to promote, what to apply) stays human.
 
+## Complementary to agent-local notes
+
+Agent tools like Cursor rules and Cline rules accumulate session-local, auto-written notes. RNA metis is different: cross-session, cross-agent, curated by a human who decided it was worth remembering. The distinction: agent notes are a scratchpad; RNA metis is institutional memory.
+
+These are complementary layers, not competitors. An agent might write its own note about a specific file's quirk, and separately benefit from RNA metis about a systemic pattern. The value of RNA metis comes from the human judgment step — it's filtered, not accumulated.
+
 ## The Two Tools
 
-### oh_propose_themes
+### propose_themes (via `/distill` skill)
 - **Input:** metis corpus (all or filtered), optional focus (outcome/phase/tag)
 - **Process:** cluster by semantic similarity, extract recurring themes, surface metis IDs
 - **Output:** proposed theme groups with supporting entries, ranked by frequency/recency
 - **Human action:** review proposals, select what to compact or promote to guardrails
 
-### oh_propose_relevant
-- **Input:** current task description + active outcome + current phase
-- **Process:** semantic search + phase-tag filtering → ranked candidates
-- **Output:** short list (5-10) of metis/guardrails with relevance reasoning
-- **Human action:** select what to load into context; dismiss the rest
+### Contextual retrieval (via `search`)
+- `search(artifact_types=["metis"])` — query metis by relevance to current work
+- `search(artifact_types=["guardrail"])` — find applicable constraints
+- Agents reach for these when the skills prompt them to, or spontaneously
 
 ## Guardrails
 
@@ -48,6 +53,10 @@ that. The judgment (what to keep, what to promote, what to apply) stays human.
 - **Phase-aware:** oh_propose_relevant must weight phase tags heavily — cross-phase metis
   pollution is a known failure mode
 
+## Open question (#360)
+Agents can retrieve metis via `search(artifact_types=["metis"])`, but do they? The business context preamble already surfaces guardrails. Should relevant metis also appear there? And what does "agents are using metis" look like as an observable behavior?
+
 ## Signals
-- Human selects ≥1 proposed item in >50% of invocations (proposals are useful)
+- Human selects ≥1 proposed item in >50% of `/distill` invocations (proposals are useful)
 - Human dismisses all items in <20% of invocations (proposals are not noise)
+- Agents reference metis IDs in their reasoning (observable in session logs)
