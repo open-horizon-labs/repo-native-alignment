@@ -35,29 +35,32 @@ jobs:
 
   lint:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
     runs-on: namespace-profile-cached
     timeout-minutes: 5
     steps:
+      - name: Skip (no Rust changes)
+        if: needs.changes.outputs.rust != 'true'
+        run: echo "No Rust changes — skipping lint"
       - name: Checkout
+        if: needs.changes.outputs.rust == 'true'
         uses: actions/checkout@v4
       - name: No language-specific conditionals in generic.rs
+        if: needs.changes.outputs.rust == 'true'
         run: |
           if grep -n 'language_name ==' src/extract/generic.rs; then
             echo "FAIL: language-specific logic in generic.rs — use LangConfig fields"
             exit 1
           fi
       - name: No linear scans on graph node/edge collections (warn)
+        if: needs.changes.outputs.rust == 'true'
         run: |
-          # Warn (don't fail) about .iter().find() on graph collections.
-          # Goal: migrate to HashMap-based lookups in service.rs and helpers.rs.
-          # Line-based grep can't reliably exclude Rust test modules, so this is advisory.
           HITS=$(grep -rn 'graph_state\.nodes\.iter()\.find(\|gs\.nodes\.iter()\.find(' src/service.rs src/server/helpers.rs || true)
           if [ -n "$HITS" ]; then
             echo "WARN: nodes.iter().find() in production code — consider HashMap lookup"
             echo "$HITS"
           fi
       - name: No unnecessary clones of large collections
+        if: needs.changes.outputs.rust == 'true'
         run: |
           HITS=$(grep -rn '\.nodes\.clone()\|\.edges\.clone()' src/ --include='*.rs' | grep -v '#\[test\]' | grep -v '_test' || true)
           if [ -n "$HITS" ]; then
@@ -67,28 +70,36 @@ jobs:
 
   test:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
     runs-on: namespace-profile-cached
     timeout-minutes: 15
     steps:
+      - name: Skip (no Rust changes)
+        if: needs.changes.outputs.rust != 'true'
+        run: echo "No Rust changes — skipping tests"
       - name: Checkout
+        if: needs.changes.outputs.rust == 'true'
         uses: actions/checkout@v4
 
       - name: Install protoc
+        if: needs.changes.outputs.rust == 'true'
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust toolchain
+        if: needs.changes.outputs.rust == 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Setup sccache
+        if: needs.changes.outputs.rust == 'true'
         uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Configure Namespace sccache cache
+        if: needs.changes.outputs.rust == 'true'
         run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
 
       - name: Cache Rust downloads
+        if: needs.changes.outputs.rust == 'true'
         uses: namespacelabs/nscloud-cache-action@v1
         with:
           path: |
@@ -96,6 +107,7 @@ jobs:
             ~/.cargo/git
 
       - name: Run all tests (debug profile)
+        if: needs.changes.outputs.rust == 'true'
         env:
           RUSTC_WRAPPER: "sccache"
         run: cargo test --no-default-features
