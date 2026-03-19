@@ -108,6 +108,11 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
         if node_ids.is_empty() {
             return "Empty nodes list. Provide at least one stable node ID.".to_string();
         }
+        // depth > 1 is not supported for batched traversal (nodes=[...]).
+        // Use node= (single node) instead, or call search separately for each node.
+        if params.depth.unwrap_or(1) > 1 && params.mode.as_deref() == Some("neighbors") {
+            return "depth > 1 is not supported with nodes=[...] batched traversal. Use node= for a single entry point with depth traversal.".to_string();
+        }
         return search_batch(&node_ids, params, ctx);
     }
 
@@ -552,6 +557,8 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
     // under multiple relationship kinds, so we only deduplicate within a kind.
     use crate::server::handlers::run_traversal_grouped;
     let mut merged_groups: std::collections::BTreeMap<crate::graph::EdgeKind, Vec<String>> = std::collections::BTreeMap::new();
+    // Per-kind seen sets for O(1) membership checks (avoids O(N²) Vec.contains in hot path).
+    let mut merged_seen: std::collections::BTreeMap<crate::graph::EdgeKind, HashSet<String>> = std::collections::BTreeMap::new();
     let entry_set: HashSet<&str> = valid_entry_ids.iter().map(|s| s.as_str()).collect();
 
     // depth > 1 in neighbors mode: iterative BFS walking N levels deep.
@@ -572,9 +579,11 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
                 match run_traversal_grouped(&gs.index, node_id, mode, Some(1), params.direction.as_deref(), edge_filter_slice) {
                     Ok(groups) => {
                         for (kind, ids) in groups {
+                            let seen = merged_seen.entry(kind.clone()).or_default();
                             let entry = merged_groups.entry(kind).or_default();
                             for id in ids {
-                                if !visited.contains(&id) && !entry.contains(&id) {
+                                // visited: cross-level dedup; seen: intra-level O(1) per-kind dedup.
+                                if !visited.contains(&id) && seen.insert(id.clone()) {
                                     entry.push(id.clone());
                                     next_frontier.push(id.clone());
                                 }
@@ -595,9 +604,10 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
             match run_traversal_grouped(&gs.index, node_id, mode, params.hops, params.direction.as_deref(), edge_filter_slice) {
                 Ok(groups) => {
                     for (kind, ids) in groups {
+                        let seen = merged_seen.entry(kind.clone()).or_default();
                         let entry = merged_groups.entry(kind).or_default();
                         for id in ids {
-                            if !entry_set.contains(id.as_str()) && !entry.contains(&id) {
+                            if !entry_set.contains(id.as_str()) && seen.insert(id.clone()) {
                                 entry.push(id);
                             }
                         }
@@ -2507,16 +2517,41 @@ mod tests {
             node: Some(module.stable_id()),
             mode: Some("neighbors".into()),
             depth: Some(2),
+            compact: true,
             ..Default::default()
         };
         let result = search(&params, &ctx).await;
 
-        // shared_leaf should appear exactly once
-        let occurrences = result.matches("shared_leaf").count();
-        assert!(occurrences >= 1, "shared_leaf should appear at least once");
+        // shared_leaf should appear as exactly one result entry.
+        // Count stable ID occurrences (e.g., "local:src/diamond.rs:shared_leaf:function")
+        // to avoid false positives from name appearing multiple times on one result line.
+        let stable_id_occurrences = result.matches(":shared_leaf:").count();
+        assert_eq!(stable_id_occurrences, 1, "shared_leaf stable ID should appear exactly once (dedup failed), got {} occurrences: {}", stable_id_occurrences, &result[..result.len().min(500)]);
         // branch_a and branch_b should both appear
         assert!(result.contains("branch_a"), "branch_a should be in results");
         assert!(result.contains("branch_b"), "branch_b should be in results");
+    }
+
+    #[tokio::test]
+    async fn test_depth_batch_nodes_rejects_depth_greater_than_one() {
+        use crate::graph::EdgeKind;
+
+        // depth > 1 with nodes=[...] should return error message
+        let node_a = make_node("fn_a", NodeKind::Function, "src/a.rs");
+        let node_b = make_node("fn_b", NodeKind::Function, "src/b.rs");
+        let edges = vec![make_edge(&node_a, &node_b, EdgeKind::Calls)];
+        let gs = make_graph_state_with_edges(vec![node_a.clone(), node_b.clone()], edges);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+
+        let params = SearchParams {
+            nodes: Some(vec![node_a.stable_id()]),
+            mode: Some("neighbors".into()),
+            depth: Some(2),
+            ..Default::default()
+        };
+        let result = search(&params, &ctx).await;
+        assert!(result.contains("depth > 1 is not supported"), "Should return error for nodes+depth>1: {}", result);
     }
 
     // ── Adversarial depth traversal tests ────────────────────────────
