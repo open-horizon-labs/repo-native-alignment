@@ -213,11 +213,24 @@ async fn flat_code_symbol_search<'a>(
     let query_lower = query_str.to_lowercase();
     let complexity_search = params.min_complexity.is_some() || sort_by_complexity;
 
+    // Detect path/name split query (e.g. "auth/handlers/validate" → path="auth/handlers", name="validate").
+    // When present, embed search uses only the name part; name-matching filters by both.
+    let path_name = parse_path_name_query(query_str);
+    let (path_filter_lower, name_filter_lower): (Option<String>, Option<String>) =
+        if let Some((p, n)) = path_name {
+            (Some(p.to_lowercase()), Some(n.to_lowercase()))
+        } else {
+            (None, None)
+        };
+    // The string forwarded to the embed index: name-part only for path/name queries
+    // so the embedding attends to the symbol name rather than the slash-separated path.
+    let embed_query_str: &str = name_filter_lower.as_deref().unwrap_or(query_str);
+
     // Build O(1) lookup map: stable_id -> index into graph_state.nodes.
     // Replaces O(N) linear scans per result when resolving embed results.
     let node_index_map = graph_state.node_index_map();
 
-    // Closure: does a node pass all active filters?
+    // Closure: does a node pass path/name + all active filters?
     let node_passes_filters = |n: &Node| -> bool {
         if complexity_search && n.id.kind != NodeKind::Function { return false; }
         if let Some(ref kf) = params.kind { if n.id.kind.to_string().to_lowercase() != kf.to_lowercase() { return false; } }
@@ -233,6 +246,13 @@ async fn flat_code_symbol_search<'a>(
             let node_sub = n.metadata.get(crate::server::SUBSYSTEM_KEY).map(|s| s.as_str()).unwrap_or("");
             if !subsystem_matches(node_sub, sub) { return false; }
         }
+        // Path/name split filter: when query contained `/`, require both file-path
+        // and name to match their respective parts.
+        if let (Some(pf), Some(nf)) = (&path_filter_lower, &name_filter_lower) {
+            let file_match = n.id.file.to_string_lossy().to_lowercase().contains(pf.as_str());
+            let name_match = n.id.name.to_lowercase().contains(nf.as_str());
+            if !file_match || !name_match { return false; }
+        }
         true
     };
 
@@ -241,15 +261,18 @@ async fn flat_code_symbol_search<'a>(
     let rerank_over_fetch = if params.rerank { limit.max(20) } else { limit };
 
     // Try embed-ranked search for code symbols when query is non-empty.
+    // For path/name queries use only the name part so the embedding attends to
+    // the symbol name rather than a slash-delimited path string.
     let mut used_embed = false;
     let mut matches: Vec<&Node> = if !query_str.is_empty() {
         if let Some(embed_idx) = ctx.embed_index {
             // Over-fetch to allow for post-filtering (and reranking).
             let over_fetch = rerank_over_fetch * 3;
-            match embed_idx.search_with_mode(query_str, None, over_fetch, search_mode).await {
+            match embed_idx.search_with_mode(embed_query_str, None, over_fetch, search_mode).await {
                 Ok(SearchOutcome::Results(results)) => {
                     used_embed = true;
                     // Keep only code results, resolve to graph nodes via HashMap (O(1)), apply filters.
+                    // node_passes_filters already handles the path/name split check.
                     results.iter()
                         .filter(|r| r.kind.starts_with("code:"))
                         .filter_map(|r| graph_state.node_by_stable_id(&r.id, &node_index_map))
@@ -281,7 +304,9 @@ async fn flat_code_symbol_search<'a>(
     if !used_embed {
         matches = graph_state.nodes.iter().filter(|n| {
             if complexity_search && n.id.kind != NodeKind::Function { return false; }
-            if !query_lower.is_empty() {
+            if !query_lower.is_empty() && path_name.is_none() {
+                // Plain query: check name/signature directly here for early exit.
+                // Path/name queries are handled inside node_passes_filters.
                 let name_match = n.id.name.to_lowercase().contains(&query_lower) || n.signature.to_lowercase().contains(&query_lower);
                 if !name_match { return false; }
             }
@@ -300,15 +325,21 @@ async fn flat_code_symbol_search<'a>(
             .collect();
         let name_supplements: Vec<&Node> = graph_state.nodes.iter().filter(|n| {
             if seen.contains(&n.stable_id()) { return false; }
-            let name_match = n.id.name.to_lowercase().contains(&query_lower)
-                || n.signature.to_lowercase().contains(&query_lower);
-            if !name_match { return false; }
+            if path_name.is_none() {
+                // Plain query: check name/signature for early exit.
+                // Path/name queries are handled inside node_passes_filters.
+                let name_match = n.id.name.to_lowercase().contains(&query_lower)
+                    || n.signature.to_lowercase().contains(&query_lower);
+                if !name_match { return false; }
+            }
             node_passes_filters(n)
         }).collect();
         if !name_supplements.is_empty() {
             // Sort supplements by name-match quality, then cap to budget.
+            // For path/name queries use only the name part for ranking.
+            let sort_key = name_filter_lower.as_deref().unwrap_or(&query_lower);
             let mut sorted_supplements = name_supplements;
-            ranking::sort_symbol_matches(&mut sorted_supplements, &query_lower, &graph_state.index);
+            ranking::sort_symbol_matches(&mut sorted_supplements, sort_key, &graph_state.index);
             sorted_supplements.truncate(supplement_budget);
             // Evict tail embed results to make room so supplements survive
             // the final truncate(limit).
@@ -342,7 +373,9 @@ async fn flat_code_symbol_search<'a>(
     } else if !used_embed {
         // Only apply name-match ranking for fallback results; embed results
         // are already ranked by the embedding index.
-        ranking::sort_symbol_matches(&mut matches, &query_lower, &graph_state.index);
+        // For path/name queries use only the name part for ranking.
+        let sort_key = name_filter_lower.as_deref().unwrap_or(&query_lower);
+        ranking::sort_symbol_matches(&mut matches, sort_key, &graph_state.index);
     }
 
     // Cross-encoder reranking: re-score the top candidates using a cross-encoder
@@ -426,7 +459,30 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         // Resolve short IDs (without root prefix) to full stable IDs.
         // Search results display `src/file.rs:name:kind` but graph needs `root:src/file.rs:name:kind`.
         let resolved = ctx.graph_state.resolve_node_id(node_id);
-        (vec![resolved], String::new())
+        // If resolve_node_id couldn't find the node AND the node_id contains `/`,
+        // try path/name resolution before falling through.  This lets callers use
+        // `node="auth/handlers/validate"` without knowing the full stable ID.
+        if ctx.graph_state.index.get_node(&resolved).is_none()
+            && parse_path_name_query(node_id).is_some()
+        {
+            let name_matches = resolve_entry_points_by_name(node_id, top_k, params, ctx);
+            if !name_matches.is_empty() {
+                let mut header = format!("### Matched entry nodes for \"{}\" (path/name match)\n\n", node_id);
+                let strip = ctx.root_filter.as_deref();
+                let ids: Vec<String> = name_matches.iter().map(|n| {
+                    let stable_id = n.id.to_stable_id();
+                    let display = strip_root_prefix(&stable_id, strip);
+                    header.push_str(&format!("- `{}` -- {} {}\n", display, n.id.kind, n.id.name));
+                    stable_id
+                }).collect();
+                header.push('\n');
+                (ids, header)
+            } else {
+                (vec![resolved], String::new())
+            }
+        } else {
+            (vec![resolved], String::new())
+        }
     } else if let Some(query_text) = query {
         // Try name matching against graph nodes first (#290).
         // This ensures `search("SearchParams", kind: "struct", mode: "neighbors")`
@@ -862,26 +918,68 @@ pub async fn stats(repo_root: &Path, graph_state: &GraphState) -> StatsResult {
         languages: langs.into_iter().collect(), last_scan_age, artifact_count: artifacts.len(), outcome_count: outcomes, signal_count: signals, guardrail_count: guardrails, metis_count: metis }
 }
 
+/// Parse a path/name query like `"auth/handlers/validate"` into
+/// `Some(("auth/handlers", "validate"))`. Returns `None` if the query
+/// contains no `/` — plain queries must be handled by normal name matching.
+///
+/// Splits at the **last** `/` so that deep paths like `"src/auth/handlers/validate"`
+/// produce `path_part = "src/auth/handlers"` and `name_part = "validate"`.
+fn parse_path_name_query(query: &str) -> Option<(&str, &str)> {
+    let slash_pos = query.rfind('/')?;
+    let path_part = &query[..slash_pos];
+    let name_part = &query[slash_pos + 1..];
+    // Reject degenerate splits (empty name or empty path) — fall back to
+    // plain matching.
+    if path_part.is_empty() || name_part.is_empty() {
+        return None;
+    }
+    Some((path_part, name_part))
+}
+
 /// Resolve traversal entry points by exact name/signature matching against graph nodes.
 ///
 /// Applies kind, language, file, and root filters. Returns matching nodes sorted
 /// by name-match quality (exact > contains). This is used as the primary entry
 /// point resolution strategy for traversal queries (#290), with the embed index
 /// as a fallback for natural-language queries where name matching finds nothing.
+///
+/// When `query` contains `/`, the query is parsed as `path_part/name_part` and
+/// both the file path and name are filtered simultaneously. Plain queries (no `/`)
+/// behave identically to today.
 fn resolve_entry_points_by_name<'a>(
     query: &str,
     limit: usize,
     params: &SearchParams,
     ctx: &SearchContext<'a>,
 ) -> Vec<&'a Node> {
-    let query_lower = query.to_lowercase();
     let gs = ctx.graph_state;
 
+    // Detect path/name split query (e.g. "auth/handlers/validate").
+    let path_name = parse_path_name_query(query);
+    let (query_lower, path_filter_lower, name_filter_lower): (String, Option<String>, Option<String>) =
+        if let Some((path_part, name_part)) = path_name {
+            (
+                query.to_lowercase(),
+                Some(path_part.to_lowercase()),
+                Some(name_part.to_lowercase()),
+            )
+        } else {
+            (query.to_lowercase(), None, None)
+        };
+
     let mut matches: Vec<&Node> = gs.nodes.iter().filter(|n| {
-        // Name or signature must match.
-        let name_match = n.id.name.to_lowercase().contains(&query_lower)
-            || n.signature.to_lowercase().contains(&query_lower);
-        if !name_match { return false; }
+        // Name/file matching: path/name split vs. plain.
+        if let (Some(pf), Some(nf)) = (&path_filter_lower, &name_filter_lower) {
+            // Both file path and name must match.
+            let file_match = n.id.file.to_string_lossy().to_lowercase().contains(pf.as_str());
+            let name_match = n.id.name.to_lowercase().contains(nf.as_str());
+            if !file_match || !name_match { return false; }
+        } else {
+            // Plain name or signature match.
+            let name_match = n.id.name.to_lowercase().contains(&query_lower)
+                || n.signature.to_lowercase().contains(&query_lower);
+            if !name_match { return false; }
+        }
 
         // Apply filters (kind, language, file, root).
         if let Some(ref kf) = params.kind {
@@ -904,11 +1002,15 @@ fn resolve_entry_points_by_name<'a>(
     }).collect();
 
     // Sort: exact name match first, then contains.
+    // For path/name queries use the name part for exact-match comparison.
+    let effective_query = name_filter_lower.as_deref().unwrap_or(&query_lower);
     matches.sort_by(|a, b| {
-        let a_exact =
-            a.id.name.eq_ignore_ascii_case(query) || a.signature.eq_ignore_ascii_case(query);
-        let b_exact =
-            b.id.name.eq_ignore_ascii_case(query) || b.signature.eq_ignore_ascii_case(query);
+        let a_exact = a.id.name.to_lowercase() == effective_query
+            || a.id.name.eq_ignore_ascii_case(query)
+            || a.signature.eq_ignore_ascii_case(query);
+        let b_exact = b.id.name.to_lowercase() == effective_query
+            || b.id.name.eq_ignore_ascii_case(query)
+            || b.signature.eq_ignore_ascii_case(query);
         b_exact.cmp(&a_exact)
     });
 
@@ -1573,6 +1675,136 @@ mod tests {
         let results = resolve_entry_points_by_name("fn foo(config: &SearchParams)", 1, &params, &ctx);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id.name, "foo", "exact signature match should be kept with limit=1");
+    }
+
+    // ── parse_path_name_query tests ────────────────────────────────────
+
+    #[test]
+    fn test_parse_path_name_query_basic() {
+        let result = parse_path_name_query("auth/handlers/validate");
+        assert_eq!(result, Some(("auth/handlers", "validate")));
+    }
+
+    #[test]
+    fn test_parse_path_name_query_single_slash() {
+        let result = parse_path_name_query("src/validate");
+        assert_eq!(result, Some(("src", "validate")));
+    }
+
+    #[test]
+    fn test_parse_path_name_query_no_slash() {
+        let result = parse_path_name_query("validate");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_path_name_query_trailing_slash() {
+        // Empty name part — should return None (degenerate)
+        let result = parse_path_name_query("auth/handlers/");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_path_name_query_leading_slash() {
+        // Empty path part — should return None (degenerate)
+        let result = parse_path_name_query("/validate");
+        assert_eq!(result, None);
+    }
+
+    // ── Path/name split in resolve_entry_points_by_name ────────────────
+
+    /// search("auth/handlers/validate") returns only `validate` in auth/handlers files.
+    #[test]
+    fn test_resolve_entry_points_path_name_basic() {
+        let nodes = vec![
+            make_node("validate", NodeKind::Function, "src/auth/handlers/mod.rs"),
+            make_node("validate", NodeKind::Function, "src/billing/validate.rs"),
+            make_node("parse", NodeKind::Function, "src/auth/handlers/parse.rs"),
+        ];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams::default();
+
+        let results = resolve_entry_points_by_name("auth/handlers/validate", 10, &params, &ctx);
+        assert_eq!(results.len(), 1, "Only auth/handlers validate should match");
+        assert_eq!(results[0].id.name, "validate");
+        assert!(results[0].id.file.to_string_lossy().contains("auth/handlers"));
+    }
+
+    /// Plain queries (no `/`) still work identically to today.
+    #[test]
+    fn test_resolve_entry_points_plain_query_unchanged() {
+        let nodes = vec![
+            make_node("validate", NodeKind::Function, "src/auth/handlers/mod.rs"),
+            make_node("validate", NodeKind::Function, "src/billing/validate.rs"),
+        ];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams::default();
+
+        let results = resolve_entry_points_by_name("validate", 10, &params, &ctx);
+        assert_eq!(results.len(), 2, "Plain query should return all matching nodes");
+    }
+
+    /// Path/name query with no matches returns empty.
+    #[test]
+    fn test_resolve_entry_points_path_name_no_match() {
+        let nodes = vec![
+            make_node("validate", NodeKind::Function, "src/auth/handlers/mod.rs"),
+        ];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams::default();
+
+        // Path doesn't match: billing/validate vs src/auth/handlers/mod.rs
+        let results = resolve_entry_points_by_name("billing/validate", 10, &params, &ctx);
+        assert!(results.is_empty(), "No match when path doesn't fit");
+    }
+
+    // ── Path/name split in flat_code_symbol_search ─────────────────────
+
+    /// flat search with path/name query returns only nodes where both file and name match.
+    #[tokio::test]
+    async fn test_flat_search_path_name_basic() {
+        let nodes = vec![
+            make_node("validate", NodeKind::Function, "src/auth/handlers/mod.rs"),
+            make_node("validate", NodeKind::Function, "src/billing/validate.rs"),
+            make_node("parse", NodeKind::Function, "src/auth/handlers/parse.rs"),
+        ];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams { query: Some("auth/handlers/validate".into()), ..Default::default() };
+
+        let results = flat_code_symbol_search(
+            "auth/handlers/validate", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 1, "Only auth/handlers validate should match");
+        assert_eq!(results[0].id.name, "validate");
+        assert!(results[0].id.file.to_string_lossy().contains("auth/handlers"));
+    }
+
+    /// Plain queries (no `/`) remain unchanged in flat search.
+    #[tokio::test]
+    async fn test_flat_search_plain_query_unchanged() {
+        let nodes = vec![
+            make_node("validate", NodeKind::Function, "src/auth/handlers/mod.rs"),
+            make_node("validate", NodeKind::Function, "src/billing/validate.rs"),
+        ];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams { query: Some("validate".into()), ..Default::default() };
+
+        let results = flat_code_symbol_search(
+            "validate", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 2, "Plain query returns all matches");
     }
 
     // ── Subsystem filter tests ──────────────────────────────────────────
