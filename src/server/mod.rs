@@ -867,6 +867,129 @@ mod tests {
         let _ = std::fs::remove_file(&state_path);
     }
 
+    /// Regression test for #364 (round 3): newly-declared workspace root must persist
+    /// even when each scan creates a fresh handler (the CLI `scan --repo .` pattern).
+    ///
+    /// The existing test `test_declared_root_persisted_even_when_scanner_state_already_committed`
+    /// covers the same-handler case. This test covers the fresh-handler case that matches
+    /// actual CLI usage: each invocation is a separate process with its own `RnaHandler`.
+    ///
+    /// This ensures the fix works not just within a single server session but across
+    /// repeated `scan` commands — the production scenario that triggered the re-open.
+    #[tokio::test]
+    async fn test_declared_root_persists_across_fresh_handler_scans() {
+        use tempfile::TempDir;
+
+        let primary = TempDir::new().unwrap();
+        let secondary = TempDir::new().unwrap();
+
+        // Primary root: one Rust file
+        std::fs::create_dir_all(primary.path().join("src")).unwrap();
+        std::fs::create_dir_all(primary.path().join(".oh/.cache")).unwrap();
+        std::fs::write(
+            primary.path().join("src/lib.rs"),
+            "pub fn primary_fn() {}\n",
+        ).unwrap();
+
+        // Secondary root: one Rust file
+        std::fs::create_dir_all(secondary.path().join("src")).unwrap();
+        std::fs::write(
+            secondary.path().join("src/lib.rs"),
+            "pub fn secondary_fn() {}\n",
+        ).unwrap();
+
+        // Step 1: First build with fresh handler #1 -- no secondary declared.
+        {
+            let handler = RnaHandler {
+                repo_root: primary.path().to_path_buf(),
+                ..Default::default()
+            };
+            let gs1 = handler.build_full_graph().await.unwrap();
+            assert!(gs1.nodes.iter().any(|n| n.id.name == "primary_fn"));
+            assert!(!gs1.nodes.iter().any(|n| n.id.name == "secondary_fn"));
+        }
+        // Handler #1 dropped here -- simulates CLI process exit.
+
+        // Step 2: Pre-commit scanner state for secondary (simulates a previous scan
+        // that committed state but didn't persist nodes -- the #364 scenario).
+        let state_path = crate::roots::cache_state_path("secondary-fresh");
+        // Ensure cleanup runs even if the test panics.
+        struct CleanupFile(std::path::PathBuf);
+        impl Drop for CleanupFile {
+            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+        }
+        let _cleanup = CleanupFile(state_path.clone());
+        if let Some(parent) = state_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        {
+            let mut scanner = crate::scanner::Scanner::with_excludes_and_state_path(
+                secondary.path().to_path_buf(),
+                vec![],
+                state_path.clone(),
+            ).unwrap();
+            let _ = scanner.scan().unwrap();
+            scanner.commit_state().unwrap();
+        }
+
+        // Step 3: Declare secondary in config.
+        let config_dir = primary.path().join(".oh");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            format!("[workspace.roots]\nsecondary-fresh = \"{}\"\n", secondary.path().display()),
+        ).unwrap();
+
+        // Step 4: Second build with fresh handler #2 -- should persist secondary.
+        {
+            let handler2 = RnaHandler {
+                repo_root: primary.path().to_path_buf(),
+                ..Default::default()
+            };
+            let gs2 = handler2.build_full_graph().await.unwrap();
+            assert!(
+                gs2.nodes.iter().any(|n| n.id.name == "secondary_fn"),
+                "secondary_fn must be in-memory after second build with fresh handler"
+            );
+        }
+        // Handler #2 dropped -- simulates CLI process exit.
+
+        // Verify LanceDB was updated.
+        let persisted2 = crate::server::load_graph_from_lance(primary.path()).await.unwrap();
+        assert!(
+            persisted2.nodes.iter().any(|n| n.id.name == "secondary_fn"),
+            "secondary_fn must be in LanceDB after second build (fresh handler). \
+             Stored: {:?}",
+            persisted2.nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+        );
+
+        // Step 5: Third build with fresh handler #3 -- simulates "every scan" scenario.
+        // This verifies the fix is stable: secondary is already in LanceDB, so
+        // `has_new_root = false` and no spurious "forcing full rebuild" message.
+        {
+            let handler3 = RnaHandler {
+                repo_root: primary.path().to_path_buf(),
+                ..Default::default()
+            };
+            let gs3 = handler3.build_full_graph().await.unwrap();
+            assert!(
+                gs3.nodes.iter().any(|n| n.id.name == "secondary_fn"),
+                "secondary_fn must still be present on third build (no regression)"
+            );
+        }
+
+        // Verify LanceDB still has secondary after the third build.
+        let persisted3 = crate::server::load_graph_from_lance(primary.path()).await.unwrap();
+        assert!(
+            persisted3.nodes.iter().any(|n| n.id.name == "secondary_fn"),
+            "secondary_fn must remain in LanceDB after third build. \
+             Stored: {:?}",
+            persisted3.nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+        );
+
+        // Cleanup runs automatically when _cleanup is dropped (end of test scope).
+    }
+
     #[test]
     fn test_enricher_registry_includes_markdown() {
         // Verify that EnricherRegistry::with_builtins() registers enrichers for
