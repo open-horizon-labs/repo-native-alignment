@@ -28,7 +28,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search",
-    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Add `mode` for graph traversal (neighbors/impact/reachable/tests_for). Use `compact: true` to save tokens. Use `rerank: true` for natural language queries. Use `subsystem` to scope to a subsystem from repo_map. Use `target_subsystem` with mode to find cross-subsystem edges."
+    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Add `mode` for graph traversal (neighbors/impact/reachable/tests_for). Use `compact: true` to save tokens. Use `rerank: true` for natural language queries. Use `subsystem` to scope to a subsystem from repo_map. Use `target_subsystem` with mode to find cross-subsystem edges. Use `depth` with mode='neighbors' to walk N levels deep (e.g., module → members → their members)."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct Search {
@@ -44,6 +44,9 @@ pub struct Search {
     /// Max traversal depth (default: 1 neighbors, 3 impact/reachable)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hops: Option<u32>,
+    /// Multi-level neighbors traversal depth for neighbors mode (default: 1). Walk edges N levels deep, accumulating and deduplicating results per level. Only applies to neighbors mode; use hops for impact/reachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
     /// Neighbors direction: "outgoing" (default), "incoming", "both"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
@@ -247,6 +250,28 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(s.hops, Some(5));
+    }
+
+    #[test]
+    fn test_search_depth_parameter() {
+        let s = parse_search(json!({
+            "node": "test:src/lib.rs:my_module:module",
+            "mode": "neighbors",
+            "depth": 2
+        }))
+        .unwrap();
+        assert_eq!(s.depth, Some(2));
+        assert_eq!(s.mode, Some("neighbors".to_string()));
+    }
+
+    #[test]
+    fn test_search_depth_absent_defaults_none() {
+        let s = parse_search(json!({
+            "node": "test:src/lib.rs:foo:function",
+            "mode": "neighbors"
+        }))
+        .unwrap();
+        assert!(s.depth.is_none());
     }
 
     #[test]

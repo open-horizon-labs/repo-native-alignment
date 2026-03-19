@@ -40,7 +40,7 @@ struct SearchArgs {
     #[arg(default_value = "")] query: String, #[arg(long, default_value = ".")] repo: PathBuf,
     #[arg(long)] kind: Option<String>, #[arg(long)] language: Option<String>, #[arg(long)] file: Option<String>,
     #[arg(long, default_value_t = 20)] limit: usize, #[arg(long)] node: Option<String>, #[arg(long)] mode: Option<String>,
-    #[arg(long)] hops: Option<u32>, #[arg(long)] direction: Option<String>, #[arg(long)] edge_types: Option<String>,
+    #[arg(long)] hops: Option<u32>, #[arg(long)] depth: Option<u32>, #[arg(long)] direction: Option<String>, #[arg(long)] edge_types: Option<String>,
     #[arg(long)] sort_by: Option<String>, #[arg(long)] min_complexity: Option<u32>, #[arg(long)] synthetic: Option<bool>,
     #[arg(long)] compact: bool, #[arg(long)] nodes: Option<String>, #[arg(long)] search_mode: Option<String>,
     #[arg(long, default_value_t = true)] include_artifacts: bool, #[arg(long, default_value_t = true)] include_markdown: bool,
@@ -175,7 +175,7 @@ async fn async_main() -> anyhow::Result<()> {
             let embed_ref = embed_idx.as_ref();
             let params = SearchParams {
                 query: if args.query.is_empty() { None } else { Some(args.query.clone()) },
-                node: args.node.clone(), mode: args.mode.clone(), hops: args.hops, direction: args.direction.clone(),
+                node: args.node.clone(), mode: args.mode.clone(), hops: args.hops, depth: args.depth, direction: args.direction.clone(),
                 edge_types: args.edge_types.as_ref().map(|s| s.split(',').map(|t| t.trim().to_string()).collect()),
                 kind: args.kind.clone(), language: args.language.clone(), file: args.file.clone(),
                 limit: Some(args.limit), sort_by: args.sort_by.clone(), min_complexity: args.min_complexity,
