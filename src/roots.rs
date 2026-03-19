@@ -229,34 +229,27 @@ impl WorkspaceConfig {
         self
     }
 
-    /// Add agent memory directories as `Notes` roots when they exist alongside a project.
+    /// Wire in agent memory locations that live **outside** the project root.
     ///
-    /// Detects standard AI agent rule/memory locations under `repo_root`:
-    /// - `.serena/memories/` — Serena memory markdown files
+    /// Agent rule/memory files that live **inside** the project (`.cursorrules`,
+    /// `.clinerules`, `.cursor/**`, `.serena/memories/**`,
+    /// `.github/copilot-instructions.md`) are already picked up by the primary
+    /// `CodeProject` root scan and tagged via `detect_oh_kind` in the markdown
+    /// extractor. Adding them as a second root would double-index those files under
+    /// a different root slug, causing duplicate search results.
     ///
-    /// Files that live directly in the project root (`.cursorrules`, `.clinerules`,
-    /// `.cursor/rules`, `.github/copilot-instructions.md`) are already picked up by the
-    /// primary `CodeProject` root scan and tagged via `detect_oh_kind` in the markdown
-    /// extractor. Only paths that form a coherent subdirectory are registered as
-    /// separate `Notes` roots here.
-    ///
-    /// This is the counterpart to `with_claude_memory` for agent-specific notes.
-    pub fn with_agent_memories(mut self, repo_root: &Path) -> Self {
-        // .serena/memories/ — Serena accumulates per-project markdown notes here
-        let serena_dir = repo_root.join(".serena").join("memories");
-        if serena_dir.exists()
-            && !self
-                .roots
-                .iter()
-                .any(|r| r.resolved_path() == serena_dir)
-        {
-            self.roots.push(RootConfig {
-                path: serena_dir,
-                root_type: RootType::Notes,
-                git_aware: false,
-                excludes: vec![],
-            });
-        }
+    /// This method exists as the counterpart to `with_claude_memory` for the case
+    /// where an agent stores its memory **outside** the repository (like Claude
+    /// Code does at `~/.claude/projects/.../memory/`). If such a path is ever
+    /// detected it is added as a `Notes` root here. Currently no external
+    /// agent-memory locations are auto-detected, so this is a no-op — but it
+    /// keeps the call chain consistent and provides the extension point.
+    pub fn with_agent_memories(self, _repo_root: &Path) -> Self {
+        // All known agent-memory locations (.cursorrules, .clinerules, .cursor/**,
+        // .serena/memories/**, .github/copilot-instructions.md) are inside the
+        // project root and already covered by the CodeProject scan. Adding them as
+        // separate Notes roots would duplicate index entries. Tagging is handled
+        // purely by detect_oh_kind in the markdown extractor.
         self
     }
 
@@ -750,11 +743,15 @@ excludes = ["*.iso", "*.dmg"]
     }
 
     #[test]
-    fn test_with_agent_memories_adds_serena_when_present() {
+    fn test_with_agent_memories_is_noop_for_in_project_paths() {
+        // Agent memory files inside the project (.serena/memories/, .cursorrules, etc.)
+        // are already indexed by the CodeProject root scan and tagged via detect_oh_kind.
+        // with_agent_memories() must NOT add them as a second root (that would create
+        // duplicate index entries under a different root slug).
         let tmp = TempDir::new().unwrap();
         let repo_root = tmp.path();
 
-        // Create .serena/memories/ directory
+        // Even if .serena/memories/ exists, it should not be added as a Notes root.
         let serena_dir = repo_root.join(".serena").join("memories");
         fs::create_dir_all(&serena_dir).unwrap();
 
@@ -763,57 +760,31 @@ excludes = ["*.iso", "*.dmg"]
             .with_agent_memories(repo_root);
 
         let resolved = config.resolved_roots();
-        assert_eq!(resolved.len(), 2, "Primary + serena memories root");
-
-        let serena_root = resolved.iter().find(|r| r.path == serena_dir);
-        assert!(serena_root.is_some(), "Serena memories root should be present");
         assert_eq!(
-            serena_root.unwrap().config.root_type,
-            RootType::Notes,
-            "Serena memories should be a Notes root"
-        );
-        assert!(
-            !serena_root.unwrap().config.git_aware,
-            "Serena memories should not be git-aware"
+            resolved.len(),
+            1,
+            "with_agent_memories() must not add in-project paths as separate roots (causes duplicate indexing)"
         );
     }
 
     #[test]
-    fn test_with_agent_memories_skips_when_serena_absent() {
-        let tmp = TempDir::new().unwrap();
-        let config = WorkspaceConfig::default()
-            .with_primary_root(tmp.path().to_path_buf())
-            .with_agent_memories(tmp.path());
+    fn test_with_agent_memories_preserves_existing_roots() {
+        // with_agent_memories() is a pass-through — it must not disturb the chain
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
 
-        let resolved = config.resolved_roots();
-        assert_eq!(resolved.len(), 1, "Only primary root when .serena/memories/ absent");
-    }
-
-    #[test]
-    fn test_with_agent_memories_deduplicates() {
-        let tmp = TempDir::new().unwrap();
-        let repo_root = tmp.path();
-
-        let serena_dir = repo_root.join(".serena").join("memories");
-        fs::create_dir_all(&serena_dir).unwrap();
-
-        // Pre-populate serena dir so it won't be added again
         let config = WorkspaceConfig {
             roots: vec![RootConfig {
-                path: serena_dir.clone(),
+                path: tmp2.path().to_path_buf(),
                 root_type: RootType::Notes,
                 git_aware: false,
                 excludes: vec![],
             }],
         }
-        .with_primary_root(repo_root.to_path_buf())
-        .with_agent_memories(repo_root);
+        .with_primary_root(tmp1.path().to_path_buf())
+        .with_agent_memories(tmp1.path());
 
-        let serena_count = config
-            .roots
-            .iter()
-            .filter(|r| r.resolved_path() == serena_dir)
-            .count();
-        assert_eq!(serena_count, 1, "Serena dir should not be duplicated");
+        // Primary + pre-existing Notes root, nothing added or removed
+        assert_eq!(config.resolved_roots().len(), 2);
     }
 }
