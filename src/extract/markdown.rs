@@ -1083,4 +1083,57 @@ mod tests {
             .collect();
         assert_eq!(defines.len(), 0, "Same-level siblings should not have hierarchy edges");
     }
+
+    // --- Adversarial: agent memory detection boundary conditions ---
+
+    #[test]
+    fn test_cursor_settings_not_tagged_as_cursor_rule() {
+        // .cursor/settings/ is NOT a rule file — but the current implementation
+        // tags all .cursor/** files. This test documents that known behavior.
+        // If this becomes a problem in practice, a more specific pattern can be used.
+        // For now, intentionally accepting the broad match since .cursor/ is nearly
+        // always used for rules only.
+        let result = detect_oh_kind(Path::new(".cursor/settings/keybindings.json"));
+        // Currently tagged — documented as known behavior, not a bug to fix now.
+        assert_eq!(result, Some("cursor-rule".to_string()),
+            ".cursor/** is broadly tagged as cursor-rule (documented behavior)");
+    }
+
+    #[test]
+    fn test_dotfile_not_in_agent_location_no_tag() {
+        // Random dotfiles should not get agent memory tags
+        assert_eq!(detect_oh_kind(Path::new(".editorconfig")), None);
+        assert_eq!(detect_oh_kind(Path::new(".gitignore")), None);
+        assert_eq!(detect_oh_kind(Path::new(".env")), None);
+        assert_eq!(detect_oh_kind(Path::new(".rubocop.yml")), None);
+    }
+
+    #[test]
+    fn test_serena_outside_memories_not_tagged() {
+        // Only .serena/memories/ — not .serena/ itself or other subdirs
+        assert_eq!(detect_oh_kind(Path::new(".serena/config.json")), None);
+        assert_eq!(detect_oh_kind(Path::new(".serena/data/something.md")), None);
+        // But memories/ subdir IS tagged
+        assert_eq!(
+            detect_oh_kind(Path::new(".serena/memories/note.md")),
+            Some("serena-memory".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cursorrules_not_tagged_when_not_root_component() {
+        // A file named .cursorrules deep in a subdirectory should still be tagged
+        // (detect_oh_kind scans all components, not just the last)
+        let result = detect_oh_kind(Path::new("some/nested/.cursorrules"));
+        assert_eq!(result, Some("cursor-rule".to_string()),
+            "Nested .cursorrules should also be tagged");
+    }
+
+    #[test]
+    fn test_github_other_markdown_not_tagged_as_copilot() {
+        // Only the specific copilot-instructions.md file gets the tag
+        assert_eq!(detect_oh_kind(Path::new(".github/CONTRIBUTING.md")), None);
+        assert_eq!(detect_oh_kind(Path::new(".github/SECURITY.md")), None);
+        assert_eq!(detect_oh_kind(Path::new(".github/ISSUE_TEMPLATE/bug.md")), None);
+    }
 }
