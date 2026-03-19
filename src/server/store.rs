@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use anyhow::Context;
 use arrow_array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array};
 use arrow_array::builder::BooleanBuilder;
@@ -302,6 +304,20 @@ pub(crate) async fn delete_nodes_for_roots(repo_root: &Path, slugs: &[String]) -
     Ok(())
 }
 
+/// Returns `true` if the error looks like a LanceDB concurrent-write conflict.
+///
+/// LanceDB uses optimistic concurrency and surfaces conflicts as errors whose
+/// messages contain "conflict" or "concurrent" in their description.  We match on
+/// the string representation because the upstream error types are not exposed as a
+/// public enum.
+///
+/// Note: "commit" is intentionally excluded — it appears in many non-conflict contexts
+/// (git history, schema version strings, log messages) and would cause false positives.
+fn is_conflict_error(e: &anyhow::Error) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("conflict") || msg.contains("concurrent")
+}
+
 /// Persist graph nodes and edges to LanceDB tables.
 pub(crate) async fn persist_graph_to_lance(
     repo_root: &Path,
@@ -418,12 +434,30 @@ pub(crate) async fn persist_graph_to_lance(
             ],
         )?;
 
-        let _ = db.drop_table("symbols", &[]).await;
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        db.create_table("symbols", Box::new(batches))
-            .execute()
-            .await
-            .context("Failed to create symbols table")?;
+        // Retry on conflict: another process may be mid-write.
+        // Each attempt re-drops and re-creates so we always write a complete table.
+        let mut attempts: u64 = 0;
+        loop {
+            let _ = db.drop_table("symbols", &[]).await;
+            let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+            match db.create_table("symbols", Box::new(batches)).execute().await {
+                Ok(_) => break,
+                Err(e) => {
+                    let err = anyhow::anyhow!("{}", e);
+                    if is_conflict_error(&err) && attempts < 3 {
+                        attempts += 1;
+                        tracing::warn!(
+                            "LanceDB conflict on symbols table (attempt {}), retrying in {}ms",
+                            attempts,
+                            100 * attempts
+                        );
+                        tokio::time::sleep(Duration::from_millis(100 * attempts)).await;
+                    } else {
+                        return Err(err).context("Failed to create symbols table after retries");
+                    }
+                }
+            }
+        }
     }
 
     // ── Write edges table ──
@@ -461,12 +495,29 @@ pub(crate) async fn persist_graph_to_lance(
             ],
         )?;
 
-        let _ = db.drop_table("edges", &[]).await;
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        db.create_table("edges", Box::new(batches))
-            .execute()
-            .await
-            .context("Failed to create edges table")?;
+        // Retry on conflict: another process may be mid-write.
+        let mut attempts: u64 = 0;
+        loop {
+            let _ = db.drop_table("edges", &[]).await;
+            let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+            match db.create_table("edges", Box::new(batches)).execute().await {
+                Ok(_) => break,
+                Err(e) => {
+                    let err = anyhow::anyhow!("{}", e);
+                    if is_conflict_error(&err) && attempts < 3 {
+                        attempts += 1;
+                        tracing::warn!(
+                            "LanceDB conflict on edges table (attempt {}), retrying in {}ms",
+                            attempts,
+                            100 * attempts
+                        );
+                        tokio::time::sleep(Duration::from_millis(100 * attempts)).await;
+                    } else {
+                        return Err(err).context("Failed to create edges table after retries");
+                    }
+                }
+            }
+        }
     }
 
     // Create FTS index on symbols table for keyword search over all nodes
@@ -641,17 +692,34 @@ pub(crate) async fn persist_graph_incremental(
 
             match db.open_table("symbols").execute().await {
                 Ok(tbl) => {
-                    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-                    let mut merge = tbl.merge_insert(&["id"]);
-                    merge
-                        .when_matched_update_all(None)
-                        .when_not_matched_insert_all();
-                    // Note: no when_not_matched_by_source_delete — we only touch changed rows.
-                    // Untouched rows (unchanged files) are left alone.
-                    merge
-                        .execute(Box::new(batches))
-                        .await
-                        .context("Failed to merge_insert symbols table")?;
+                    // Retry on conflict: another process may be writing simultaneously.
+                    let mut attempts: u64 = 0;
+                    loop {
+                        let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+                        let mut merge = tbl.merge_insert(&["id"]);
+                        merge
+                            .when_matched_update_all(None)
+                            .when_not_matched_insert_all();
+                        // Note: no when_not_matched_by_source_delete — we only touch changed rows.
+                        // Untouched rows (unchanged files) are left alone.
+                        match merge.execute(Box::new(batches)).await {
+                            Ok(_) => break,
+                            Err(e) => {
+                                let err = anyhow::anyhow!("{}", e);
+                                if is_conflict_error(&err) && attempts < 3 {
+                                    attempts += 1;
+                                    tracing::warn!(
+                                        "LanceDB conflict on symbols merge_insert (attempt {}), retrying in {}ms",
+                                        attempts,
+                                        100 * attempts
+                                    );
+                                    tokio::time::sleep(Duration::from_millis(100 * attempts)).await;
+                                } else {
+                                    return Err(err).context("Failed to merge_insert symbols table after retries");
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(_) => {
                     // Table doesn't exist yet — create it (first incremental run after a fresh repo)
@@ -714,16 +782,33 @@ pub(crate) async fn persist_graph_incremental(
 
             match db.open_table("edges").execute().await {
                 Ok(tbl) => {
-                    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-                    let mut merge = tbl.merge_insert(&["id"]);
-                    merge
-                        .when_matched_update_all(None)
-                        .when_not_matched_insert_all();
-                    // Note: no when_not_matched_by_source_delete — untouched edges are preserved.
-                    merge
-                        .execute(Box::new(batches))
-                        .await
-                        .context("Failed to merge_insert edges table")?;
+                    // Retry on conflict: another process may be writing simultaneously.
+                    let mut attempts: u64 = 0;
+                    loop {
+                        let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+                        let mut merge = tbl.merge_insert(&["id"]);
+                        merge
+                            .when_matched_update_all(None)
+                            .when_not_matched_insert_all();
+                        // Note: no when_not_matched_by_source_delete — untouched edges are preserved.
+                        match merge.execute(Box::new(batches)).await {
+                            Ok(_) => break,
+                            Err(e) => {
+                                let err = anyhow::anyhow!("{}", e);
+                                if is_conflict_error(&err) && attempts < 3 {
+                                    attempts += 1;
+                                    tracing::warn!(
+                                        "LanceDB conflict on edges merge_insert (attempt {}), retrying in {}ms",
+                                        attempts,
+                                        100 * attempts
+                                    );
+                                    tokio::time::sleep(Duration::from_millis(100 * attempts)).await;
+                                } else {
+                                    return Err(err).context("Failed to merge_insert edges table after retries");
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(_) => {
                     // Table doesn't exist yet — create it
@@ -1051,5 +1136,87 @@ pub(crate) fn infer_language_from_path(path: &Path) -> String {
         Some("toml") => "toml".to_string(),
         Some("yaml") | Some("yml") => "yaml".to_string(),
         _ => "unknown".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::graph::{ExtractionSource, NodeKind};
+
+    fn make_test_node(name: &str) -> Node {
+        Node {
+            id: NodeId {
+                root: "local".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                name: name.to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            signature: format!("fn {name}()"),
+            line_start: 1,
+            line_end: 5,
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        }
+    }
+
+    /// Two concurrent calls to `persist_graph_incremental` targeting the same LanceDB table
+    /// must both succeed (or retry to success) — not return an unhandled conflict error.
+    #[tokio::test]
+    async fn test_concurrent_incremental_persist_both_succeed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+
+        // First write: establish the table so both concurrent writes hit merge_insert (not create).
+        let node_a = make_test_node("setup");
+        persist_graph_incremental(repo_root, &[node_a], &[], &[], &[])
+            .await
+            .expect("initial persist failed");
+
+        // Now fire two concurrent incremental persists to the same table.
+        let root1 = repo_root.to_path_buf();
+        let root2 = repo_root.to_path_buf();
+
+        let task1 = tokio::spawn(async move {
+            let nodes = vec![make_test_node("fn_task1")];
+            persist_graph_incremental(&root1, &nodes, &[], &[], &[]).await
+        });
+        let task2 = tokio::spawn(async move {
+            let nodes = vec![make_test_node("fn_task2")];
+            persist_graph_incremental(&root2, &nodes, &[], &[], &[]).await
+        });
+
+        let (r1, r2) = tokio::join!(task1, task2);
+        r1.expect("task1 panicked").expect("task1 returned error");
+        r2.expect("task2 panicked").expect("task2 returned error");
+    }
+
+    /// `is_conflict_error` correctly identifies conflict-like messages and ignores others.
+    #[test]
+    fn test_is_conflict_error_detection() {
+        // These should match.
+        let conflict = anyhow::anyhow!("write conflict detected");
+        assert!(is_conflict_error(&conflict));
+
+        let concurrent = anyhow::anyhow!("concurrent modification");
+        assert!(is_conflict_error(&concurrent));
+
+        let both = anyhow::anyhow!("concurrent write conflict");
+        assert!(is_conflict_error(&both));
+
+        // These should NOT match — "commit" excluded to avoid false positives in
+        // non-conflict contexts (git messages, schema strings, log lines).
+        let commit_only = anyhow::anyhow!("failed to commit transaction");
+        assert!(!is_conflict_error(&commit_only));
+
+        let unrelated = anyhow::anyhow!("table not found");
+        assert!(!is_conflict_error(&unrelated));
+
+        let io_err = anyhow::anyhow!("IO error: permission denied");
+        assert!(!is_conflict_error(&io_err));
     }
 }
