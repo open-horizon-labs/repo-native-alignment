@@ -174,7 +174,7 @@ async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchCon
         if let Ok(chunks) = crate::markdown::extract_markdown_chunks(ctx.repo_root) {
             let filtered_chunks: Vec<_> = if let Some(ref slug) = ctx.root_filter {
                 let workspace = crate::roots::WorkspaceConfig::load().with_primary_root(ctx.repo_root.to_path_buf()).with_worktrees(ctx.repo_root).with_claude_memory(ctx.repo_root).with_agent_memories(ctx.repo_root).with_declared_roots(ctx.repo_root);
-                let root_path = workspace.resolved_roots().into_iter().find(|r| r.slug == *slug).map(|r| r.path);
+                let root_path = workspace.resolved_roots().into_iter().find(|r| r.slug.eq_ignore_ascii_case(slug)).map(|r| r.path);
                 if let Some(rp) = root_path { chunks.into_iter().filter(|c| c.file_path.starts_with(&rp)).collect() } else { Vec::new() }
             } else { chunks };
             let scored = crate::markdown::search_chunks_ranked(&filtered_chunks, query_str);
