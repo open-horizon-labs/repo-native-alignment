@@ -31,6 +31,7 @@ impl RnaHandler {
                 .with_primary_root(repo_root.clone())
                 .with_worktrees(&repo_root)
                 .with_claude_memory(&repo_root)
+                .with_agent_memories(&repo_root)
                 .resolved_roots()
                 .into_iter()
                 .map(|r| r.slug)
@@ -87,11 +88,12 @@ impl RnaHandler {
                     tokio::time::sleep(tokio::time::Duration::from_secs(900)).await;
                 }
 
-                // Resolve current roots (primary + any live worktrees + claude memory).
+                // Resolve current roots (primary + any live worktrees + claude memory + agent memories).
                 let workspace = WorkspaceConfig::load()
                     .with_primary_root(repo_root.clone())
                     .with_worktrees(&repo_root)
-                    .with_claude_memory(&repo_root);
+                    .with_claude_memory(&repo_root)
+                    .with_agent_memories(&repo_root);
                 let resolved_roots = workspace.resolved_roots();
                 let current_root_slugs: std::collections::HashSet<String> =
                     resolved_roots.iter().map(|r| r.slug.clone()).collect();

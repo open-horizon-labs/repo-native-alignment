@@ -229,6 +229,30 @@ impl WorkspaceConfig {
         self
     }
 
+    /// Wire in agent memory locations that live **outside** the project root.
+    ///
+    /// Agent rule/memory files that live **inside** the project (`.cursorrules`,
+    /// `.clinerules`, `.cursor/**`, `.serena/memories/**`,
+    /// `.github/copilot-instructions.md`) are already picked up by the primary
+    /// `CodeProject` root scan and tagged via `detect_oh_kind` in the markdown
+    /// extractor. Adding them as a second root would double-index those files under
+    /// a different root slug, causing duplicate search results.
+    ///
+    /// This method exists as the counterpart to `with_claude_memory` for the case
+    /// where an agent stores its memory **outside** the repository (like Claude
+    /// Code does at `~/.claude/projects/.../memory/`). If such a path is ever
+    /// detected it is added as a `Notes` root here. Currently no external
+    /// agent-memory locations are auto-detected, so this is a no-op — but it
+    /// keeps the call chain consistent and provides the extension point.
+    pub fn with_agent_memories(self, _repo_root: &Path) -> Self {
+        // All known agent-memory locations (.cursorrules, .clinerules, .cursor/**,
+        // .serena/memories/**, .github/copilot-instructions.md) are inside the
+        // project root and already covered by the CodeProject scan. Adding them as
+        // separate Notes roots would duplicate index entries. Tagging is handled
+        // purely by detect_oh_kind in the markdown extractor.
+        self
+    }
+
     /// Get all roots with their resolved paths and slugs.
     pub fn resolved_roots(&self) -> Vec<ResolvedRoot> {
         self.roots
@@ -716,5 +740,51 @@ excludes = ["*.iso", "*.dmg"]
         // resolved_roots filters non-existent, so memory root won't appear
         let resolved = config.resolved_roots();
         assert_eq!(resolved.len(), 1, "Only primary root should be present");
+    }
+
+    #[test]
+    fn test_with_agent_memories_is_noop_for_in_project_paths() {
+        // Agent memory files inside the project (.serena/memories/, .cursorrules, etc.)
+        // are already indexed by the CodeProject root scan and tagged via detect_oh_kind.
+        // with_agent_memories() must NOT add them as a second root (that would create
+        // duplicate index entries under a different root slug).
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path();
+
+        // Even if .serena/memories/ exists, it should not be added as a Notes root.
+        let serena_dir = repo_root.join(".serena").join("memories");
+        fs::create_dir_all(&serena_dir).unwrap();
+
+        let config = WorkspaceConfig::default()
+            .with_primary_root(repo_root.to_path_buf())
+            .with_agent_memories(repo_root);
+
+        let resolved = config.resolved_roots();
+        assert_eq!(
+            resolved.len(),
+            1,
+            "with_agent_memories() must not add in-project paths as separate roots (causes duplicate indexing)"
+        );
+    }
+
+    #[test]
+    fn test_with_agent_memories_preserves_existing_roots() {
+        // with_agent_memories() is a pass-through — it must not disturb the chain
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+
+        let config = WorkspaceConfig {
+            roots: vec![RootConfig {
+                path: tmp2.path().to_path_buf(),
+                root_type: RootType::Notes,
+                git_aware: false,
+                excludes: vec![],
+            }],
+        }
+        .with_primary_root(tmp1.path().to_path_buf())
+        .with_agent_memories(tmp1.path());
+
+        // Primary + pre-existing Notes root, nothing added or removed
+        assert_eq!(config.resolved_roots().len(), 2);
     }
 }

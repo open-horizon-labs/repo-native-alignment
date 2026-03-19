@@ -263,6 +263,17 @@ repo-native-alignment scan --repo . --full
 
 Business artifacts (`outcomes/`, `signals/`, `guardrails/`, `metis/`) are committed to git — they're part of the project. `.cache/` is gitignored and rebuilt automatically on first query.
 
+RNA also indexes agent rule/memory files when they exist alongside a project:
+
+| File/Directory | `artifact_types` filter |
+|---|---|
+| `.cursorrules`, `.cursor/**` | `cursor-rule` |
+| `.clinerules` | `cline-rule` |
+| `.serena/memories/**` | `serena-memory` |
+| `.github/copilot-instructions.md` | `copilot-instruction` |
+
+These are auto-detected — no configuration needed. Use `search("coding rules", artifact_types=["cursor-rule", "cline-rule"])` to query across all agent rule sources.
+
 Outcomes declare `files:` patterns linking to code. Commits tag `[outcome:X]` linking to outcomes. These structural links power `outcome_progress`.
 
 ## Compared To
