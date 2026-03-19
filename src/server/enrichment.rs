@@ -335,6 +335,7 @@ impl RnaHandler {
 
                 // Purge removed worktree slugs from LanceDB.
                 if !removed_slugs.is_empty() {
+                    let _lance_guard = lance_write_lock.lock().await;
                     if let Err(e) = delete_nodes_for_roots(&repo_root, &removed_slugs).await {
                         tracing::warn!(
                             "Failed to delete LanceDB rows for removed worktrees: {}",
