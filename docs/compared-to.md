@@ -21,29 +21,29 @@ RNA uses LSP internally as one enrichment source (call hierarchy, type hierarchy
 
 ## At a Glance
 
-| | **LSP (baseline)** | **RNA** | **Code-Graph-RAG** | **CodeGraphContext** | **codeTree** |
-|---|---|---|---|---|---|
-| **Install** | Editor plugin or PATH binary | `cargo install` / binary | Docker + uv + Memgraph + API key | `pip install` + (KuzuDB\|Neo4j) | `pip install mcp-server-codetree` |
-| **External deps** | One server per language | None | Docker, Memgraph, LLM API | Graph DB (embedded or Docker) | None |
-| **Languages parsed** | 1 per server | 22 | 11 | 14 | 10 |
-| **Graph storage** | In-memory per session | embedded graph + vector index | Memgraph (Docker) | KuzuDB/FalkorDB/Neo4j | SQLite (embedded) |
-| **Embeddings** | None | MiniLM-L6-v2 on Metal GPU (local) | UniXcoder (local) | None | None |
-| **LSP integration** | Is LSP | 37 servers, batch enrichment | None | None | None |
-| **Query model** | Single-symbol, single-hop | Multi-hop, cross-language | Multi-hop | Multi-hop | Multi-hop |
-| **MCP tools** | N/A (protocol, not MCP) | 4 | 10 | 17 | 23 |
-| **CLI parity** | N/A | Full (shared service layer) | N/A | N/A | N/A |
-| **Cross-encoder reranking** | None | Jina Reranker v1 Turbo (opt-in) | None | None | None |
-| **Business context** | None | Outcomes, signals, guardrails, metis | None | None | None |
+| | **LSP (baseline)** | **RNA** | **Code-Graph-RAG** | **CodeGraphContext** | **codeTree** | **Serena** |
+|---|---|---|---|---|---|---|
+| **Install** | Editor plugin or PATH binary | `cargo install` / binary | Docker + uv + Memgraph + API key | `pip install` + (KuzuDB\|Neo4j) | `pip install mcp-server-codetree` | `pip install mcp-server-serena` |
+| **External deps** | One server per language | None | Docker, Memgraph, LLM API | Graph DB (embedded or Docker) | None | None (LSP servers auto-downloaded) |
+| **Languages parsed** | 1 per server | 22 | 11 | 14 | 10 | 30+ |
+| **Graph storage** | In-memory per session | embedded graph + vector index | Memgraph (Docker) | KuzuDB/FalkorDB/Neo4j | SQLite (embedded) | None (LSP only, no persistent graph) |
+| **Embeddings** | None | MiniLM-L6-v2 on Metal GPU (local) | UniXcoder (local) | None | None | None |
+| **LSP integration** | Is LSP | 37 servers, batch enrichment | None | None | None | 44+ tools via solidlsp |
+| **Query model** | Single-symbol, single-hop | Multi-hop, cross-language | Multi-hop | Multi-hop | Multi-hop | Single-symbol (LSP calls, not graph) |
+| **MCP tools** | N/A (protocol, not MCP) | 4 | 10 | 17 | 23 | 44+ |
+| **CLI parity** | N/A | Full (shared service layer) | N/A | N/A | N/A | N/A |
+| **Cross-encoder reranking** | None | Jina Reranker v1 Turbo (opt-in) | None | None | None | None |
+| **Business context** | None | Outcomes, signals, guardrails, metis | None | None | None | Agent memories (markdown files, agent-written) |
 
 ## Architecture Trade-offs
 
-| Axis | LSP | RNA | CGR | CGC | CT |
-|------|-----|-----|-----|-----|-----|
-| **Cold start** | Server init (seconds) | ~5-10s scan, ~2min embed | Index + Docker startup | Index + DB setup | ~1s scan + SQLite index |
-| **Warm restart** | Server re-init | <1s (on-disk cache). `scan --full` is incremental — re-extracts only changed files, re-runs LSP only on changed nodes. ~0.1s on no-change runs. | Memgraph persists | DB persists | SQLite persists (mtime invalidation) |
-| **Memory** | Per-server process | in-process (no external DB) | Docker container | External or embedded DB | In-process (SQLite) |
-| **Query latency** | ms per hop (N round-trips) | ms total (in-process, single call) | Network hop to Memgraph | Network hop or embedded | ms (embedded SQLite) |
-| **Offline capable** | Yes | Fully offline | Needs Docker | Depends on DB choice | Fully offline |
+| Axis | LSP | RNA | CGR | CGC | CT | Serena |
+|------|-----|-----|-----|-----|-----|--------|
+| **Cold start** | Server init (seconds) | ~5-10s scan, ~2min embed | Index + Docker startup | Index + DB setup | ~1s scan + SQLite index | LSP server init (seconds) |
+| **Warm restart** | Server re-init | <1s (on-disk cache). `scan --full` is incremental — re-extracts only changed files, re-runs LSP only on changed nodes. ~0.1s on no-change runs. | Memgraph persists | DB persists | SQLite persists (mtime invalidation) | LSP server re-init |
+| **Memory** | Per-server process | in-process (no external DB) | Docker container | External or embedded DB | In-process (SQLite) | Per-server process |
+| **Query latency** | ms per hop (N round-trips) | ms total (in-process, single call) | Network hop to Memgraph | Network hop or embedded | ms (embedded SQLite) | ms per hop (N LSP round-trips) |
+| **Offline capable** | Yes | Fully offline | Needs Docker | Depends on DB choice | Fully offline | Yes |
 
 RNA's zero-dependency design is a deliberate architectural choice. `cargo install` → works. No Docker, no external DB, no API key.
 

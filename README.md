@@ -268,13 +268,13 @@ Outcomes declare `files:` patterns linking to code. Commits tag `[outcome:X]` li
 
 See the [full comparison](docs/compared-to.md) for details, including LSP as the baseline.
 
-| | **RNA** | **Code-Graph-RAG** | **CodeGraphContext** |
-|---|---|---|---|
-| **Install** | Single binary | Docker + Memgraph + API key | pip + graph DB |
-| **External deps** | None | Docker, Memgraph, LLM API | Graph DB (KuzuDB/Neo4j) |
-| **Languages** | Tree-sitter + LSP | Tree-sitter only | Tree-sitter only |
-| **Embeddings** | MiniLM-L6-v2 on Metal GPU | UniXcoder | None |
-| **Business context** | Outcomes, signals, guardrails, metis | None | None |
+| | **RNA** | **Code-Graph-RAG** | **CodeGraphContext** | **Serena** |
+|---|---|---|---|---|
+| **Install** | Single binary | Docker + Memgraph + API key | pip + graph DB | `pip install mcp-server-serena` |
+| **External deps** | None | Docker, Memgraph, LLM API | Graph DB (KuzuDB/Neo4j) | None (language servers auto-downloaded) |
+| **Languages** | Tree-sitter + LSP | Tree-sitter only | Tree-sitter only | 30+ via LSP |
+| **Embeddings** | MiniLM-L6-v2 on Metal GPU | UniXcoder | None | None |
+| **Business context** | Outcomes, signals, guardrails, metis | None | None | Agent memories (auto-accumulated, not curated outcomes) |
 
 ## Optional: Companion Systems
 
