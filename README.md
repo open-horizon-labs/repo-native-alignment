@@ -201,7 +201,7 @@ protos  = "/abs/path/protos"  # absolute paths also work
 
 After declaring roots, restart RNA. Declared roots appear in `list_roots()` and are queryable by slug:
 
-```
+```text
 list_roots()                          # shows "infra", "protos", primary, worktrees
 search(root="infra", query="Deployment")  # only K8s manifest results
 search(root="all")                    # all declared + auto-discovered roots

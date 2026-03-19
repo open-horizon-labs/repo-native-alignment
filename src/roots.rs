@@ -85,11 +85,20 @@ impl RootConfig {
     /// Generate a URL-safe slug for use as root_id.
     ///
     /// If the root was declared with an explicit slug (e.g., `infra = "../k8s"` in
-    /// `.oh/config.toml`), that slug is returned as-is. Otherwise the slug is
-    /// derived from the resolved path.
+    /// `.oh/config.toml`), that slug is sanitized (path separators and unsafe chars
+    /// replaced with `-`) and returned. Otherwise the slug is derived from the
+    /// resolved path.
+    ///
+    /// Sanitization prevents path separators or `..` sequences from escaping the
+    /// cache directory (`cache_state_path()` uses the slug as a directory component).
     pub fn slug(&self) -> String {
         if let Some(ref s) = self.slug_override {
-            return s.clone();
+            let sanitized = sanitize_slug(s);
+            if !sanitized.is_empty() {
+                return sanitized;
+            }
+            // Override sanitizes to empty (e.g. `slug_override = ".."`).
+            // Fall through to path-derived slug so the root still gets a valid ID.
         }
         path_to_slug(&self.resolved_path())
     }
@@ -291,18 +300,42 @@ impl WorkspaceConfig {
     /// `CodeProject` with `git_aware = true`.)
     pub fn with_declared_roots(mut self, repo_root: &Path) -> Self {
         use crate::scanner::load_declared_roots;
+        use std::collections::{HashMap, HashSet};
 
         let declared = load_declared_roots(repo_root);
-        for (slug, raw_path) in declared {
-            // Resolve relative paths against repo_root
-            let path = if raw_path.is_absolute() {
-                raw_path.clone()
-            } else {
-                repo_root.join(&raw_path)
-            };
-            let resolved = expand_tilde(&path);
 
-            // Warn and skip missing paths
+        // Build seen-paths and seen-slugs sets once (O(N) up-front rather than O(N²)
+        // per-entry). Canonicalize existing roots once so we don't redo it per iteration.
+        let mut seen_paths: HashMap<PathBuf, String> = self
+            .roots
+            .iter()
+            .filter_map(|r| {
+                let canonical = std::fs::canonicalize(r.resolved_path())
+                    .unwrap_or_else(|_| r.resolved_path());
+                Some((canonical, r.slug()))
+            })
+            .collect();
+        let mut seen_slugs: HashSet<String> = self.roots.iter().map(|r| r.slug()).collect();
+
+        for (slug, raw_path) in declared {
+            // Sanitize the slug to prevent path-traversal via cache_state_path().
+            let slug = sanitize_slug(&slug);
+            if slug.is_empty() {
+                tracing::warn!("Declared workspace root has empty slug after sanitization — skipping");
+                continue;
+            }
+
+            // Expand `~` first, then decide absolute vs. relative.
+            // PathBuf::from("~/foo").is_absolute() is false on all platforms, so we
+            // must expand tilde before the absolute check.
+            let expanded = expand_tilde(&raw_path);
+            let resolved = if expanded.is_absolute() {
+                expanded
+            } else {
+                repo_root.join(&expanded)
+            };
+
+            // Warn and skip missing paths (not an error).
             if !resolved.exists() {
                 tracing::warn!(
                     "Declared workspace root '{}' at '{}' does not exist — skipping",
@@ -315,21 +348,24 @@ impl WorkspaceConfig {
             // Canonicalize to remove any `..` components and resolve symlinks so
             // duplicate detection and display are stable
             // (e.g. `service/../k8s` → `k8s`, `/var/...` → `/private/var/...` on macOS).
-            let resolved = std::fs::canonicalize(&resolved).unwrap_or(resolved);
+            let canonical = std::fs::canonicalize(&resolved).unwrap_or(resolved);
 
-            // Skip duplicates (same canonical path already registered).
-            // We canonicalize both sides so /var and /private/var compare equal.
-            let duplicate_slug = self.roots.iter().find_map(|r| {
-                let existing = std::fs::canonicalize(r.resolved_path())
-                    .unwrap_or_else(|_| r.resolved_path());
-                if existing == resolved { Some(r.slug()) } else { None }
-            });
-            if let Some(existing_slug) = duplicate_slug {
+            // Skip duplicate paths (O(1) with pre-built map).
+            if let Some(existing_slug) = seen_paths.get(&canonical) {
                 tracing::debug!(
                     "Declared workspace root '{}' at '{}' already registered as '{}' — skipping",
                     slug,
-                    resolved.display(),
+                    canonical.display(),
                     existing_slug
+                );
+                continue;
+            }
+
+            // Skip duplicate slugs (O(1) with pre-built set).
+            if seen_slugs.contains(&slug) {
+                tracing::warn!(
+                    "Declared workspace root slug '{}' is already in use — skipping duplicate",
+                    slug
                 );
                 continue;
             }
@@ -337,10 +373,12 @@ impl WorkspaceConfig {
             tracing::info!(
                 "Registering declared workspace root '{}' at '{}'",
                 slug,
-                resolved.display()
+                canonical.display()
             );
+            seen_paths.insert(canonical.clone(), slug.clone());
+            seen_slugs.insert(slug.clone());
             self.roots.push(RootConfig {
-                path: resolved,
+                path: canonical,
                 root_type: RootType::CodeProject,
                 git_aware: true,
                 excludes: Vec::new(),
@@ -429,6 +467,23 @@ fn expand_tilde(path: &Path) -> PathBuf {
 /// Get the user's home directory.
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Sanitize a user-supplied slug override so it is safe to use as a root_id
+/// and as a filesystem directory component (e.g. in `cache_state_path()`).
+///
+/// Any character that is not alphanumeric or `-` (including `/`, `.`, `..`)
+/// is replaced with `-` and empty segments collapsed. This prevents
+/// path-traversal when the slug is used as a directory name.
+///
+/// e.g. `../evil` → `evil`, `my/slug` → `my-slug`, `ok-slug` → `ok-slug`
+fn sanitize_slug(slug: &str) -> String {
+    slug.replace(|c: char| !c.is_alphanumeric() && c != '-', "-")
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_lowercase()
 }
 
 /// Convert a path to a URL-safe slug using the full canonical path.
@@ -1115,4 +1170,122 @@ excludes = ["*.iso", "*.dmg"]
             "Declared slug must not override auto-discovered root's path-derived slug"
         );
     }
+
+    #[test]
+    fn test_sanitize_slug_strips_path_separators() {
+        // Path traversal attempts must be neutralized
+        assert_eq!(sanitize_slug("../evil"), "evil");
+        assert_eq!(sanitize_slug("../../etc/passwd"), "etc-passwd");
+        assert_eq!(sanitize_slug("my/slug"), "my-slug");
+        assert_eq!(sanitize_slug("ok-slug"), "ok-slug");
+        assert_eq!(sanitize_slug("UPPER"), "upper");
+        assert_eq!(sanitize_slug("has.dots"), "has-dots");
+    }
+
+    #[test]
+    fn test_slug_override_is_sanitized() {
+        // slug() sanitizes the override so cache_state_path() cannot escape via path traversal
+        let root = RootConfig {
+            path: PathBuf::from("/tmp/project"),
+            root_type: RootType::CodeProject,
+            git_aware: true,
+            excludes: vec![],
+            slug_override: Some("../escape-attempt".to_string()),
+        };
+        // Path separator stripped — slug is safe to use as a directory component
+        assert_eq!(root.slug(), "escape-attempt");
+    }
+
+    #[test]
+    fn test_slug_override_empty_after_sanitization_falls_back_to_path() {
+        // When slug_override sanitizes to "" (e.g. ".." or "///"), slug() must
+        // fall back to the path-derived slug rather than returning an empty string.
+        let root = RootConfig {
+            path: PathBuf::from("/tmp/some-project"),
+            root_type: RootType::CodeProject,
+            git_aware: true,
+            excludes: vec![],
+            slug_override: Some("..".to_string()),
+        };
+        // ".." sanitizes to "" → falls back to path-derived slug
+        assert_eq!(root.slug(), "tmp-some-project");
+    }
+
+    #[test]
+    fn test_with_declared_roots_tilde_path() {
+        // A declared path starting with `~` must be resolved as home-relative,
+        // not as `<repo_root>/~/foo`. We only run this test when HOME is set.
+        let home = match std::env::var_os("HOME") {
+            Some(h) => PathBuf::from(h),
+            None => return,
+        };
+
+        let repo_root = TempDir::new().unwrap();
+
+        // Use a unique temp dir under $HOME to avoid stomping on any real path.
+        let tilde_subdir = match tempfile::Builder::new()
+            .prefix(".rna-test-tilde-")
+            .tempdir_in(&home)
+        {
+            Ok(d) => d,
+            Err(_) => return, // Can't create temp dir in HOME — skip
+        };
+        // Get the dir name to build the `~/...` path
+        let dir_name = tilde_subdir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let oh_dir = repo_root.path().join(".oh");
+        fs::create_dir_all(&oh_dir).unwrap();
+        fs::write(
+            oh_dir.join("config.toml"),
+            format!("[workspace.roots]\nhome-test = \"~/{}\"\n", dir_name),
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::default()
+            .with_primary_root(repo_root.path().to_path_buf())
+            .with_declared_roots(repo_root.path());
+
+        let resolved = config.resolved_roots();
+        let home_root = resolved.iter().find(|r| r.slug == "home-test");
+        assert!(
+            home_root.is_some(),
+            "~/... declared root should resolve via HOME, not be treated as repo-relative"
+        );
+    }
+
+    #[test]
+    fn test_with_declared_roots_duplicate_slug_second_skipped() {
+        // Two declared entries that sanitize to the same slug but point to different
+        // paths — the second must be skipped.
+        let repo_root = TempDir::new().unwrap();
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        let oh_dir = repo_root.path().join(".oh");
+        fs::create_dir_all(&oh_dir).unwrap();
+        // "my-slug" and "my.slug" both sanitize to "my-slug"
+        fs::write(
+            oh_dir.join("config.toml"),
+            format!(
+                "[workspace.roots]\n\"my-slug\" = \"{}\"\n\"my.slug\" = \"{}\"\n",
+                dir_a.path().display(),
+                dir_b.path().display()
+            ),
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::default()
+            .with_primary_root(repo_root.path().to_path_buf())
+            .with_declared_roots(repo_root.path());
+
+        let resolved = config.resolved_roots();
+        let my_slug_roots: Vec<_> = resolved.iter().filter(|r| r.slug == "my-slug").collect();
+        assert_eq!(my_slug_roots.len(), 1, "Duplicate sanitized slug must register exactly 1 root");
+    }
 }
+
