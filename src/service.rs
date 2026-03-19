@@ -1807,6 +1807,63 @@ mod tests {
         assert_eq!(results.len(), 2, "Plain query returns all matches");
     }
 
+    // ── Adversarial path/name tests ────────────────────────────────────
+
+    /// Adversarial: "//foo" — double slash degenerate case.
+    /// rfind gives slash_pos=1, path_part="/", name_part="foo". Path part "/" is
+    /// non-empty, so it parses. But every file path contains "/" (Unix paths), so
+    /// this would match all nodes named "foo". This is an edge case worth asserting.
+    #[test]
+    fn test_parse_path_name_query_double_slash() {
+        // "//foo" → slash_pos=1, path_part="/", name_part="foo"
+        // "/" is non-empty, so Some(("/", "foo")) — this is intentional: every file
+        // matches "/" as a path fragment. Document this by asserting the parsed result.
+        let result = parse_path_name_query("//foo");
+        assert_eq!(result, Some(("/", "foo")));
+    }
+
+    /// Adversarial: path/name fallback when path part matches nothing.
+    /// When path filter eliminates all candidates, result should be empty (no
+    /// silent fallback to plain name matching in resolve_entry_points_by_name).
+    #[test]
+    fn test_resolve_entry_points_path_name_empty_on_path_mismatch() {
+        let nodes = vec![
+            make_node("validate", NodeKind::Function, "src/billing/validate.rs"),
+            make_node("validate", NodeKind::Function, "src/payments/validate.rs"),
+        ];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams::default();
+
+        // "auth/handlers/validate" → path="auth/handlers", name="validate"
+        // Neither node is in auth/handlers → should return empty, not fall back to plain
+        let results = resolve_entry_points_by_name("auth/handlers/validate", 10, &params, &ctx);
+        assert!(results.is_empty(), "Must not fall back to plain name matching");
+    }
+
+    /// Adversarial: path/name where name part partially matches many nodes.
+    /// Verify path discriminates correctly.
+    #[tokio::test]
+    async fn test_flat_search_path_name_path_discriminates() {
+        let nodes = vec![
+            make_node("new", NodeKind::Function, "src/auth/handlers.rs"),
+            make_node("new", NodeKind::Function, "src/billing/invoice.rs"),
+            make_node("new", NodeKind::Function, "src/payments/gateway.rs"),
+        ];
+        let gs = make_graph_state(nodes);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams::default();
+
+        let results = flat_code_symbol_search(
+            "auth/new", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 1, "Path filter should discriminate to only auth node");
+        assert!(results[0].id.file.to_string_lossy().contains("auth"));
+    }
+
     // ── Subsystem filter tests ──────────────────────────────────────────
 
     #[tokio::test]
