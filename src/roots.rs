@@ -1042,4 +1042,77 @@ excludes = ["*.iso", "*.dmg"]
         };
         assert_eq!(root.slug(), "tmp-some-project");
     }
+
+    // ── Adversarial tests (dissent-seeded) ──────────────────────────
+
+    #[test]
+    fn test_with_declared_roots_two_slugs_same_path_second_skipped() {
+        // Dissent finding: two declared slugs pointing at the same path.
+        // The second should be silently skipped (duplicate-path detection).
+        let repo_root = TempDir::new().unwrap();
+        let shared_dir = TempDir::new().unwrap();
+
+        let oh_dir = repo_root.path().join(".oh");
+        fs::create_dir_all(&oh_dir).unwrap();
+        // Both "alias1" and "alias2" point at the same directory
+        fs::write(
+            oh_dir.join("config.toml"),
+            format!(
+                "[workspace.roots]\nalias1 = \"{path}\"\nalias2 = \"{path}\"\n",
+                path = shared_dir.path().display()
+            ),
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::default()
+            .with_primary_root(repo_root.path().to_path_buf())
+            .with_declared_roots(repo_root.path());
+
+        let resolved = config.resolved_roots();
+        // Primary + first declared root; second is a duplicate and must be skipped
+        assert_eq!(resolved.len(), 2, "Second slug for same path must be deduped");
+        // The one that IS present should be one of the two declared slugs
+        let declared: Vec<&str> = resolved.iter()
+            .map(|r| r.slug.as_str())
+            .filter(|s| *s == "alias1" || *s == "alias2")
+            .collect();
+        assert_eq!(declared.len(), 1, "Exactly one of the two slugs should be registered");
+    }
+
+    #[test]
+    fn test_with_declared_roots_declared_slug_after_worktree_covers_same_path() {
+        // Dissent finding: declared root slug that points to a path already
+        // auto-discovered as a worktree should be deduped (same path).
+        let repo_root = TempDir::new().unwrap();
+        let sibling_dir = TempDir::new().unwrap();
+
+        let oh_dir = repo_root.path().join(".oh");
+        fs::create_dir_all(&oh_dir).unwrap();
+        fs::write(
+            oh_dir.join("config.toml"),
+            format!(
+                "[workspace.roots]\nmy-alias = \"{}\"\n",
+                sibling_dir.path().display()
+            ),
+        )
+        .unwrap();
+
+        // Manually add the sibling as an auto-discovered root first (simulates worktree)
+        let config = WorkspaceConfig {
+            roots: vec![
+                RootConfig::code_project(repo_root.path().to_path_buf()),
+                RootConfig::code_project(sibling_dir.path().to_path_buf()),
+            ],
+        }
+        .with_declared_roots(repo_root.path());
+
+        let resolved = config.resolved_roots();
+        // Primary + sibling (already present); declared "my-alias" is deduped
+        assert_eq!(resolved.len(), 2, "Declared root that duplicates worktree path must be skipped");
+        // The slug used is the auto-discovered path-derived slug (not the declared slug)
+        assert!(
+            resolved.iter().all(|r| r.slug != "my-alias"),
+            "Declared slug must not override auto-discovered root's path-derived slug"
+        );
+    }
 }
