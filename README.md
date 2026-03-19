@@ -184,6 +184,30 @@ The system compounds from here. Agents use `search` to discover relevant context
 
 **Root scoping:** All query tools default to the primary workspace root (`--repo`). Pass `root: "all"` for cross-root search, or `root: "<slug>"` for a specific root. Non-code roots (.oh/ artifacts, commits, Notes) always pass through regardless of root filter.
 
+**Auto-discovered roots:** RNA automatically adds git worktrees and Claude Code memory as additional roots. Use `list_roots` to see what's active.
+
+**Declared roots:** Declare intentionally related repos by slug in `.oh/config.toml`:
+
+```toml
+# .oh/config.toml
+[scanner]
+exclude = ["benchmark/"]
+
+[workspace.roots]
+infra   = "../k8s-configs"    # relative to the repo containing .oh/
+protos  = "/abs/path/protos"  # absolute paths also work
+```
+
+After declaring roots, restart RNA. Declared roots appear in `list_roots()` and are queryable by slug:
+
+```
+list_roots()                          # shows "infra", "protos", primary, worktrees
+search(root="infra", query="Deployment")  # only K8s manifest results
+search(root="all")                    # all declared + auto-discovered roots
+```
+
+Missing paths warn and skip (not an error). Relative paths are resolved relative to the repo containing `.oh/config.toml`.
+
 ### CLI ↔ MCP Equivalence
 
 CLI and MCP share the same index. Run `scan --full` from the CLI to build the complete index (including call graph edges from your language server), then query via either interface. A pre-built index means the MCP server starts with warm data — no cold-start delay.
@@ -257,7 +281,7 @@ repo-native-alignment scan --repo . --full
 ├── signals/         <- how we measure progress
 ├── guardrails/      <- constraints that shape behavior
 ├── metis/           <- learnings that compound across sessions
-├── config.toml      <- scanner excludes, pattern detection, per-project tuning
+├── config.toml      <- scanner excludes, pattern detection, declared workspace roots
 └── .cache/          <- scan state, embedding index (gitignored)
 ```
 
