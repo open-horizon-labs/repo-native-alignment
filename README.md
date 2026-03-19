@@ -13,6 +13,7 @@ Local context discovery and alignment tool for coding agents. Makes the fractal,
 - "Find functions related to payment processing" → `search("payment processing")` → ranked results across code symbols, artifacts, commits, and markdown in one call
 - "How does scanning work?" → `search("scanning")` → implementation code, doc sections, and related artifacts together
 - "Where is the authentication handler?" → `search("AuthHandler")` → file, line, signature, complexity, graph edges
+- "Find the validate function in auth/handlers, not billing" → `search("auth/handlers/validate")` → path/name split: only symbols named `validate` in files matching `auth/handlers`
 - "What are the riskiest functions?" → `search(query="", min_complexity=20, sort_by="complexity")` → hotspots ranked by cyclomatic complexity
 - "What are the most important symbols?" → `search(sort_by="importance")` → top symbols ranked by PageRank
 - "Give me a map of this repo" → `repo_map()` → **subsystems** with cohesion scores and interfaces, top symbols, hotspot files, active outcomes, entry points
