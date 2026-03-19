@@ -2518,6 +2518,103 @@ mod tests {
         assert!(result.contains("branch_a"), "branch_a should be in results");
         assert!(result.contains("branch_b"), "branch_b should be in results");
     }
+
+    // ── Adversarial depth traversal tests ────────────────────────────
+
+    #[tokio::test]
+    async fn test_depth_cyclic_graph_does_not_loop() {
+        use crate::graph::EdgeKind;
+
+        // Cycle: A -> B -> A (back-edge)
+        // depth=3 should not loop infinitely; visited set must break cycle.
+        let node_a = make_node("cycle_a", NodeKind::Module, "src/cycle.rs");
+        let node_b = make_node("cycle_b", NodeKind::Function, "src/cycle.rs");
+
+        let edges = vec![
+            make_edge(&node_a, &node_b, EdgeKind::Calls),
+            make_edge(&node_b, &node_a, EdgeKind::Calls), // back-edge creating cycle
+        ];
+        let gs = make_graph_state_with_edges(
+            vec![node_a.clone(), node_b.clone()],
+            edges,
+        );
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+
+        // depth=3 should terminate (visited set breaks cycle after level 1)
+        let params = SearchParams {
+            node: Some(node_a.stable_id()),
+            mode: Some("neighbors".into()),
+            depth: Some(3),
+            ..Default::default()
+        };
+        let result = search(&params, &ctx).await;
+        // cycle_b should appear (level 1); cycle_a should NOT re-appear (it's in visited)
+        assert!(result.contains("cycle_b"), "cycle_b should appear in results");
+        // Result should be finite and not crash
+        assert!(result.len() < 100_000, "Output should be bounded even with cycles");
+    }
+
+    #[tokio::test]
+    async fn test_depth_with_non_neighbors_mode_uses_hops() {
+        use crate::graph::EdgeKind;
+
+        // depth should be silently ignored for impact mode (uses hops instead)
+        let node_a = make_node("caller_fn", NodeKind::Function, "src/a.rs");
+        let node_b = make_node("callee_fn", NodeKind::Function, "src/b.rs");
+        let edges = vec![make_edge(&node_a, &node_b, EdgeKind::Calls)];
+        let gs = make_graph_state_with_edges(vec![node_a.clone(), node_b.clone()], edges);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+
+        // impact mode with depth=2 — depth should be ignored, hops controls behavior
+        let params = SearchParams {
+            node: Some(node_b.stable_id()),
+            mode: Some("impact".into()),
+            depth: Some(2),  // Should be ignored for impact mode
+            ..Default::default()
+        };
+        let result = search(&params, &ctx).await;
+        // Should still find the impact (caller_fn) — just verifying no crash/silent error
+        assert!(!result.is_empty(), "impact mode with depth param should still produce output");
+        assert!(result.contains("Impact analysis"), "should be impact analysis output");
+    }
+
+    #[tokio::test]
+    async fn test_depth_with_edge_type_filter_limits_each_level() {
+        use crate::graph::EdgeKind;
+
+        // node_mod -[Defines]-> fn_a -[Calls]-> fn_b
+        // With edge_types=["defines"] and depth=2, fn_b should NOT appear
+        // because the Calls edge at level 2 is filtered out.
+        let node_mod = make_node("filtered_mod", NodeKind::Module, "src/filt.rs");
+        let fn_a = make_node("filtered_fn_a", NodeKind::Function, "src/filt.rs");
+        let fn_b = make_node("filtered_fn_b", NodeKind::Function, "src/filt.rs");
+
+        let edges = vec![
+            make_edge(&node_mod, &fn_a, EdgeKind::Defines),
+            make_edge(&fn_a, &fn_b, EdgeKind::Calls), // not Defines
+        ];
+        let gs = make_graph_state_with_edges(
+            vec![node_mod.clone(), fn_a.clone(), fn_b.clone()],
+            edges,
+        );
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+
+        let params = SearchParams {
+            node: Some(node_mod.stable_id()),
+            mode: Some("neighbors".into()),
+            depth: Some(2),
+            edge_types: Some(vec!["defines".to_string()]),
+            ..Default::default()
+        };
+        let result = search(&params, &ctx).await;
+        // fn_a should appear (Defines edge at level 1)
+        assert!(result.contains("filtered_fn_a"), "fn_a should appear (Defines edge at level 1)");
+        // fn_b should NOT appear (Calls edge at level 2 is filtered by edge_types=["defines"])
+        assert!(!result.contains("filtered_fn_b"), "fn_b should NOT appear (Calls edge is filtered)");
+    }
 }
 
 // ── Outcome progress ───────────────────────────────────────────────
