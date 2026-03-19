@@ -26,7 +26,7 @@ Serena's `solidlsp` is a synchronous wrapper over async LSP because asyncio dead
 Serena's `query_project` lets agents execute read-only tools against other registered projects without switching context. RNA has multi-root (scanning multiple paths into one graph) but not "query a different project while staying in this one."
 - **RNA approach:** `search(root="all")` already exists. Extend to accept a slug for a separately registered project root. Or expose a `list_queryable_projects` + `query_project` pattern at the MCP level.
 - **Effort:** Small — multi-root infrastructure already exists
-- **Payoff:** Agents working across microservices or monorepos can stay in one context
+- **Payoff:** Agents working across microservices or monorepos can stay in one context. Directly enables the domain-context-compiler outcome — this is how agents connect infrastructure config repos to code repos without merging them into a single index.
 
 ---
 
