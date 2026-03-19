@@ -1,2 +1,5 @@
 [scanner]
 exclude = ["benchmark/"]
+
+[workspace.roots]
+skills = "../skills"
