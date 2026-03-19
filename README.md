@@ -265,10 +265,10 @@ Business artifacts (`outcomes/`, `signals/`, `guardrails/`, `metis/`) are commit
 
 RNA also indexes agent rule/memory files when they exist alongside a project:
 
-| File/Directory | `artifact_types` filter |
+| Path pattern | `artifact_types` filter |
 |---|---|
 | `.cursorrules`, `.cursor/**` | `cursor-rule` |
-| `.clinerules` | `cline-rule` |
+| `.clinerules` (file) | `cline-rule` |
 | `.serena/memories/**` | `serena-memory` |
 | `.github/copilot-instructions.md` | `copilot-instruction` |
 
