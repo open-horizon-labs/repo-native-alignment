@@ -93,7 +93,12 @@ impl RootConfig {
     /// cache directory (`cache_state_path()` uses the slug as a directory component).
     pub fn slug(&self) -> String {
         if let Some(ref s) = self.slug_override {
-            return sanitize_slug(s);
+            let sanitized = sanitize_slug(s);
+            if !sanitized.is_empty() {
+                return sanitized;
+            }
+            // Override sanitizes to empty (e.g. `slug_override = ".."`).
+            // Fall through to path-derived slug so the root still gets a valid ID.
         }
         path_to_slug(&self.resolved_path())
     }
@@ -1192,6 +1197,21 @@ excludes = ["*.iso", "*.dmg"]
     }
 
     #[test]
+    fn test_slug_override_empty_after_sanitization_falls_back_to_path() {
+        // When slug_override sanitizes to "" (e.g. ".." or "///"), slug() must
+        // fall back to the path-derived slug rather than returning an empty string.
+        let root = RootConfig {
+            path: PathBuf::from("/tmp/some-project"),
+            root_type: RootType::CodeProject,
+            git_aware: true,
+            excludes: vec![],
+            slug_override: Some("..".to_string()),
+        };
+        // ".." sanitizes to "" → falls back to path-derived slug
+        assert_eq!(root.slug(), "tmp-some-project");
+    }
+
+    #[test]
     fn test_with_declared_roots_tilde_path() {
         // A declared path starting with `~` must be resolved as home-relative,
         // not as `<repo_root>/~/foo`. We only run this test when HOME is set.
@@ -1201,17 +1221,28 @@ excludes = ["*.iso", "*.dmg"]
         };
 
         let repo_root = TempDir::new().unwrap();
-        let tilde_subdir = home.join(".rna-test-declared-root-tilde");
-        if fs::create_dir_all(&tilde_subdir).is_err() {
-            return; // Can't create test dir in HOME — skip
-        }
-        let _cleanup = DeferRemove(tilde_subdir.clone());
+
+        // Use a unique temp dir under $HOME to avoid stomping on any real path.
+        let tilde_subdir = match tempfile::Builder::new()
+            .prefix(".rna-test-tilde-")
+            .tempdir_in(&home)
+        {
+            Ok(d) => d,
+            Err(_) => return, // Can't create temp dir in HOME — skip
+        };
+        // Get the dir name to build the `~/...` path
+        let dir_name = tilde_subdir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
 
         let oh_dir = repo_root.path().join(".oh");
         fs::create_dir_all(&oh_dir).unwrap();
         fs::write(
             oh_dir.join("config.toml"),
-            "[workspace.roots]\nhome-test = \"~/.rna-test-declared-root-tilde\"\n",
+            format!("[workspace.roots]\nhome-test = \"~/{}\"\n", dir_name),
         )
         .unwrap();
 
@@ -1258,13 +1289,3 @@ excludes = ["*.iso", "*.dmg"]
     }
 }
 
-/// Test helper: removes a directory on drop.
-#[cfg(test)]
-struct DeferRemove(PathBuf);
-
-#[cfg(test)]
-impl Drop for DeferRemove {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
