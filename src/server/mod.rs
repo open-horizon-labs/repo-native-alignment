@@ -913,6 +913,12 @@ mod tests {
         // Step 2: Pre-commit scanner state for secondary (simulates a previous scan
         // that committed state but didn't persist nodes -- the #364 scenario).
         let state_path = crate::roots::cache_state_path("secondary-fresh");
+        // Ensure cleanup runs even if the test panics.
+        struct CleanupFile(std::path::PathBuf);
+        impl Drop for CleanupFile {
+            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+        }
+        let _cleanup = CleanupFile(state_path.clone());
         if let Some(parent) = state_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -981,8 +987,7 @@ mod tests {
             persisted3.nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
         );
 
-        // Cleanup
-        let _ = std::fs::remove_file(&state_path);
+        // Cleanup runs automatically when _cleanup is dropped (end of test scope).
     }
 
     #[test]
