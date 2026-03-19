@@ -173,7 +173,7 @@ async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchCon
     if params.include_markdown && !query_str.is_empty() {
         if let Ok(chunks) = crate::markdown::extract_markdown_chunks(ctx.repo_root) {
             let filtered_chunks: Vec<_> = if let Some(ref slug) = ctx.root_filter {
-                let workspace = crate::roots::WorkspaceConfig::load().with_primary_root(ctx.repo_root.to_path_buf()).with_worktrees(ctx.repo_root).with_claude_memory(ctx.repo_root);
+                let workspace = crate::roots::WorkspaceConfig::load().with_primary_root(ctx.repo_root.to_path_buf()).with_worktrees(ctx.repo_root).with_claude_memory(ctx.repo_root).with_agent_memories(ctx.repo_root);
                 let root_path = workspace.resolved_roots().into_iter().find(|r| r.slug == *slug).map(|r| r.path);
                 if let Some(rp) = root_path { chunks.into_iter().filter(|c| c.file_path.starts_with(&rp)).collect() } else { Vec::new() }
             } else { chunks };
@@ -2114,7 +2114,7 @@ pub fn outcome_progress(params: &OutcomeProgressParams, ctx: &OutcomeProgressCon
 // ── List roots ──────────────────────────────────────────────────────
 
 pub fn list_roots(repo_root: &Path) -> String {
-    let workspace = crate::roots::WorkspaceConfig::load().with_primary_root(repo_root.to_path_buf()).with_worktrees(repo_root).with_claude_memory(repo_root);
+    let workspace = crate::roots::WorkspaceConfig::load().with_primary_root(repo_root.to_path_buf()).with_worktrees(repo_root).with_claude_memory(repo_root).with_agent_memories(repo_root);
     let resolved = workspace.resolved_roots();
     if resolved.is_empty() { return "No workspace roots configured.".to_string(); }
     let md: String = resolved.iter().enumerate()

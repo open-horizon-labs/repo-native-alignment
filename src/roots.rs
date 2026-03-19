@@ -229,6 +229,37 @@ impl WorkspaceConfig {
         self
     }
 
+    /// Add agent memory directories as `Notes` roots when they exist alongside a project.
+    ///
+    /// Detects standard AI agent rule/memory locations under `repo_root`:
+    /// - `.serena/memories/` — Serena memory markdown files
+    ///
+    /// Files that live directly in the project root (`.cursorrules`, `.clinerules`,
+    /// `.cursor/rules`, `.github/copilot-instructions.md`) are already picked up by the
+    /// primary `CodeProject` root scan and tagged via `detect_oh_kind` in the markdown
+    /// extractor. Only paths that form a coherent subdirectory are registered as
+    /// separate `Notes` roots here.
+    ///
+    /// This is the counterpart to `with_claude_memory` for agent-specific notes.
+    pub fn with_agent_memories(mut self, repo_root: &Path) -> Self {
+        // .serena/memories/ — Serena accumulates per-project markdown notes here
+        let serena_dir = repo_root.join(".serena").join("memories");
+        if serena_dir.exists()
+            && !self
+                .roots
+                .iter()
+                .any(|r| r.resolved_path() == serena_dir)
+        {
+            self.roots.push(RootConfig {
+                path: serena_dir,
+                root_type: RootType::Notes,
+                git_aware: false,
+                excludes: vec![],
+            });
+        }
+        self
+    }
+
     /// Get all roots with their resolved paths and slugs.
     pub fn resolved_roots(&self) -> Vec<ResolvedRoot> {
         self.roots
@@ -716,5 +747,73 @@ excludes = ["*.iso", "*.dmg"]
         // resolved_roots filters non-existent, so memory root won't appear
         let resolved = config.resolved_roots();
         assert_eq!(resolved.len(), 1, "Only primary root should be present");
+    }
+
+    #[test]
+    fn test_with_agent_memories_adds_serena_when_present() {
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path();
+
+        // Create .serena/memories/ directory
+        let serena_dir = repo_root.join(".serena").join("memories");
+        fs::create_dir_all(&serena_dir).unwrap();
+
+        let config = WorkspaceConfig::default()
+            .with_primary_root(repo_root.to_path_buf())
+            .with_agent_memories(repo_root);
+
+        let resolved = config.resolved_roots();
+        assert_eq!(resolved.len(), 2, "Primary + serena memories root");
+
+        let serena_root = resolved.iter().find(|r| r.path == serena_dir);
+        assert!(serena_root.is_some(), "Serena memories root should be present");
+        assert_eq!(
+            serena_root.unwrap().config.root_type,
+            RootType::Notes,
+            "Serena memories should be a Notes root"
+        );
+        assert!(
+            !serena_root.unwrap().config.git_aware,
+            "Serena memories should not be git-aware"
+        );
+    }
+
+    #[test]
+    fn test_with_agent_memories_skips_when_serena_absent() {
+        let tmp = TempDir::new().unwrap();
+        let config = WorkspaceConfig::default()
+            .with_primary_root(tmp.path().to_path_buf())
+            .with_agent_memories(tmp.path());
+
+        let resolved = config.resolved_roots();
+        assert_eq!(resolved.len(), 1, "Only primary root when .serena/memories/ absent");
+    }
+
+    #[test]
+    fn test_with_agent_memories_deduplicates() {
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path();
+
+        let serena_dir = repo_root.join(".serena").join("memories");
+        fs::create_dir_all(&serena_dir).unwrap();
+
+        // Pre-populate serena dir so it won't be added again
+        let config = WorkspaceConfig {
+            roots: vec![RootConfig {
+                path: serena_dir.clone(),
+                root_type: RootType::Notes,
+                git_aware: false,
+                excludes: vec![],
+            }],
+        }
+        .with_primary_root(repo_root.to_path_buf())
+        .with_agent_memories(repo_root);
+
+        let serena_count = config
+            .roots
+            .iter()
+            .filter(|r| r.resolved_path() == serena_dir)
+            .count();
+        assert_eq!(serena_count, 1, "Serena dir should not be duplicated");
     }
 }

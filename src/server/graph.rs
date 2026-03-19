@@ -141,12 +141,13 @@ impl RnaHandler {
         }
 
         // Load workspace config and merge with --repo as primary root.
-        // Also auto-detect any live git worktrees and Claude Code memory
-        // so all roots are indexed on the first full build.
+        // Also auto-detect any live git worktrees, Claude Code memory,
+        // and agent memory files so all roots are indexed on the first full build.
         let workspace = WorkspaceConfig::load()
             .with_primary_root(self.repo_root.clone())
             .with_worktrees(&self.repo_root)
-            .with_claude_memory(&self.repo_root);
+            .with_claude_memory(&self.repo_root)
+            .with_agent_memories(&self.repo_root);
         let resolved_roots = workspace.resolved_roots();
 
         // Prune stale roots: compare discovered roots against what LanceDB has stored.
