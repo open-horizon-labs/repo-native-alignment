@@ -304,18 +304,21 @@ pub(crate) async fn delete_nodes_for_roots(repo_root: &Path, slugs: &[String]) -
     Ok(())
 }
 
-/// Persist graph nodes and edges to LanceDB tables.
 /// Returns `true` if the error looks like a LanceDB concurrent-write conflict.
 ///
 /// LanceDB uses optimistic concurrency and surfaces conflicts as errors whose
-/// messages contain "conflict", "concurrent", or "commit" (the internal transaction
-/// terminology).  We match on the string representation because the upstream error
-/// types are not exposed as a public enum.
+/// messages contain "conflict" or "concurrent" in their description.  We match on
+/// the string representation because the upstream error types are not exposed as a
+/// public enum.
+///
+/// Note: "commit" is intentionally excluded — it appears in many non-conflict contexts
+/// (git history, schema version strings, log messages) and would cause false positives.
 fn is_conflict_error(e: &anyhow::Error) -> bool {
     let msg = e.to_string().to_lowercase();
-    msg.contains("conflict") || msg.contains("concurrent") || msg.contains("commit")
+    msg.contains("conflict") || msg.contains("concurrent")
 }
 
+/// Persist graph nodes and edges to LanceDB tables.
 pub(crate) async fn persist_graph_to_lance(
     repo_root: &Path,
     nodes: &[Node],
@@ -1195,14 +1198,20 @@ mod tests {
     /// `is_conflict_error` correctly identifies conflict-like messages and ignores others.
     #[test]
     fn test_is_conflict_error_detection() {
-        let conflict = anyhow::anyhow!("concurrent write conflict detected");
+        // These should match.
+        let conflict = anyhow::anyhow!("write conflict detected");
         assert!(is_conflict_error(&conflict));
-
-        let commit = anyhow::anyhow!("failed to commit transaction");
-        assert!(is_conflict_error(&commit));
 
         let concurrent = anyhow::anyhow!("concurrent modification");
         assert!(is_conflict_error(&concurrent));
+
+        let both = anyhow::anyhow!("concurrent write conflict");
+        assert!(is_conflict_error(&both));
+
+        // These should NOT match — "commit" excluded to avoid false positives in
+        // non-conflict contexts (git messages, schema strings, log lines).
+        let commit_only = anyhow::anyhow!("failed to commit transaction");
+        assert!(!is_conflict_error(&commit_only));
 
         let unrelated = anyhow::anyhow!("table not found");
         assert!(!is_conflict_error(&unrelated));
