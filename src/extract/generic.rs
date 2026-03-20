@@ -27,6 +27,7 @@ use anyhow::Result;
 
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 use crate::scanner::PatternConfig;
+use super::query::{CaptureSet, QueryExtractor, RouteQueryConfig};
 use super::string_literals::harvest_string_literals;
 use super::{ExtractionResult, Extractor};
 
@@ -114,6 +115,15 @@ pub struct LangConfig {
     /// Most languages use `"type_parameters"`, Go uses `"type_parameter_list"`.
     /// None = skip type parameter extraction for this language.
     pub type_param_node_kind: Option<&'static str>,
+    /// Optional tree-sitter query patterns for route decorator detection.
+    ///
+    /// Each entry is a [`RouteQueryConfig`] describing one query that matches
+    /// HTTP route decorators and emits [`NodeKind::ApiEndpoint`] nodes.
+    /// Empty slice = no route query extraction for this language.
+    ///
+    /// Queries run as an additional pass after the normal manual traversal
+    /// so that all existing symbol extraction is unaffected.
+    pub route_queries: &'static [RouteQueryConfig],
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +171,20 @@ impl GenericExtractor {
                 self.config.language_name,
                 outer_kind,
                 *content_child,
+                &mut nodes,
+            );
+        }
+
+        // Route query pass — runs after manual traversal; purely additive.
+        if !self.config.route_queries.is_empty() {
+            let language = (self.config.language_fn)();
+            run_route_queries(
+                self.config.route_queries,
+                &language,
+                tree.root_node(),
+                path,
+                source,
+                self.config.language_name,
                 &mut nodes,
             );
         }
@@ -1087,6 +1111,114 @@ fn parse_import_target(import_text: &str) -> String {
         .trim();
     // Take the first path segment.
     s.split([':','/','.']).next().unwrap_or("").trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Route query pass
+// ---------------------------------------------------------------------------
+
+/// Strip surrounding quotes from a path string capture.
+///
+/// Tree-sitter captures the full string literal including quotes (e.g.
+/// `"/users"` or `'/users'`). This strips the outer quote characters so
+/// metadata stores the bare path.
+fn strip_quotes(s: &str) -> String {
+    let s = s.trim();
+    if (s.starts_with('"') && s.ends_with('"'))
+        || (s.starts_with('\'') && s.ends_with('\''))
+        || (s.starts_with('`') && s.ends_with('`'))
+    {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Infer the HTTP method from a capture name text if possible.
+///
+/// For decorators like `@router.post(...)` the `@name` capture will end in
+/// `post`; we normalise that to the uppercase method string. Falls back to
+/// `default_method` when the text doesn't contain a recognisable verb.
+fn infer_method_from_name(name: &str, default: &str) -> String {
+    let lower = name.to_lowercase();
+    for method in &["get", "post", "put", "delete", "patch", "head", "options"] {
+        if lower.ends_with(method) || lower == *method {
+            return method.to_uppercase();
+        }
+    }
+    default.to_string()
+}
+
+/// Run all [`RouteQueryConfig`]s for a file and emit [`NodeKind::ApiEndpoint`]
+/// nodes for each matched route decorator.
+///
+/// Each matched capture set must have at least a `@path` capture. An optional
+/// `@method` capture overrides `default_method` for the HTTP verb.
+///
+/// Called from [`GenericExtractor::run`] after normal manual traversal, so it
+/// is purely additive — existing extraction is unaffected.
+fn run_route_queries(
+    route_query_configs: &[RouteQueryConfig],
+    language: &tree_sitter::Language,
+    root: tree_sitter::Node<'_>,
+    path: &Path,
+    source: &[u8],
+    language_name: &str,
+    nodes: &mut Vec<Node>,
+) {
+    for cfg in route_query_configs {
+        let extractor = match QueryExtractor::new(language, cfg.query) {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!("route query '{}' failed to compile: {}", cfg.label, err);
+                continue;
+            }
+        };
+
+        let captures: Vec<CaptureSet> = extractor.run(root, source);
+        for capture in captures {
+            let raw_path = match capture.get("path") {
+                Some(p) => p.to_string(),
+                None => continue,
+            };
+            let http_path = strip_quotes(&raw_path);
+            if http_path.is_empty() {
+                continue;
+            }
+
+            let method = if let Some(m) = capture.get("method") {
+                infer_method_from_name(m, cfg.default_method)
+            } else if let Some(n) = capture.get("name") {
+                infer_method_from_name(n, cfg.default_method)
+            } else {
+                cfg.default_method.to_string()
+            };
+
+            let name = format!("{} {}", method, http_path);
+            let mut metadata = BTreeMap::new();
+            metadata.insert("http_method".to_string(), method.clone());
+            metadata.insert("http_path".to_string(), http_path.clone());
+            metadata.insert("route_query_label".to_string(), cfg.label.to_string());
+            metadata.insert("synthetic".to_string(), "false".to_string());
+
+            let node = Node {
+                id: NodeId {
+                    root: String::new(),
+                    file: path.to_path_buf(),
+                    name: name.clone(),
+                    kind: NodeKind::ApiEndpoint,
+                },
+                language: language_name.to_string(),
+                line_start: capture.start_row + 1,
+                line_end: capture.start_row + 1,
+                signature: format!("[route_decorator] {} {}", method, http_path),
+                body: String::new(),
+                metadata,
+                source: ExtractionSource::TreeSitter,
+            };
+            nodes.push(node);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
