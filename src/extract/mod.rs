@@ -11,6 +11,7 @@ pub mod bash;
 pub mod configs;
 pub mod cpp;
 pub mod generic;
+pub mod query;
 pub mod csharp;
 pub mod string_literals;
 pub mod go;

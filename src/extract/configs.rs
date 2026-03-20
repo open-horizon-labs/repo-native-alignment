@@ -9,6 +9,210 @@
 
 use crate::graph::NodeKind;
 use super::generic::LangConfig;
+use super::query::RouteQueryConfig;
+
+// ---------------------------------------------------------------------------
+// Route query patterns
+// ---------------------------------------------------------------------------
+
+/// Python Flask/FastAPI/Starlette/Django-ninja route decorator query.
+///
+/// Matches decorators of the form:
+/// - `@app.route("/path")`
+/// - `@router.get("/path")`
+/// - `@app.post("/path")`
+/// etc.
+///
+/// The `@name` capture is the full function (attribute access or identifier),
+/// and `@path` is the first string argument.
+static PYTHON_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
+    label: "python-route-decorators",
+    query: r#"
+(decorator
+  (call
+    function: (_) @name
+    arguments: (argument_list
+      (string) @path))
+  (#match? @name "route$|get$|post$|put$|delete$|patch$|head$|options$"))
+"#,
+    default_method: "GET",
+};
+
+/// TypeScript NestJS / routing-controllers / tsoa decorator query.
+///
+/// Matches HTTP-method decorators on controller methods:
+/// - `@Get("/users")`
+/// - `@Post("/items")`
+/// - `@HttpGet("/path")`
+///
+/// NOTE: `@Controller("/prefix")` and `@Route("/prefix")` are intentionally
+/// excluded. These are class-level prefix annotations, not endpoint declarations.
+/// Emitting them as `ApiEndpoint` nodes would create incorrect `GET /prefix`
+/// nodes — the actual endpoints are the combination of prefix + method path.
+/// Path combination (#390) will address this when linking decorators to functions.
+static TYPESCRIPT_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
+    label: "typescript-route-decorators",
+    query: r#"
+(decorator
+  (call_expression
+    function: (identifier) @name
+    arguments: (arguments
+      (string) @path))
+  (#match? @name "^(Get|Post|Put|Delete|Patch|Head|Options|HttpGet|HttpPost|HttpPut|HttpDelete|HttpPatch)$"))
+"#,
+    default_method: "GET",
+};
+
+/// Java Spring MVC method-level route annotation query.
+///
+/// Matches annotations where the HTTP method is deterministic:
+/// - `@GetMapping("/users")`     → GET
+/// - `@PostMapping("/items")`    → POST
+/// - `@PutMapping("/items/{id}")` → PUT
+/// - `@DeleteMapping("/items/{id}")` → DELETE
+/// - `@PatchMapping("/items/{id}")` → PATCH
+///
+/// NOT included (deferred to #390 or later):
+/// - `@RequestMapping` — can specify any method or no method; class or method level
+/// - `@Path` (JAX-RS) — URL-only; HTTP method comes from separate `@GET/@POST/...`
+///
+/// These omitted patterns collapse to GET in `infer_method_from_name()`, producing
+/// incorrect metadata before multi-method and prefix expansion are implemented.
+static JAVA_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
+    label: "java-route-annotations",
+    query: r#"
+(annotation
+  name: (identifier) @name
+  arguments: (annotation_argument_list
+    (string_literal) @path)
+  (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)$"))
+"#,
+    default_method: "GET",
+};
+
+/// Go gin, echo, fiber, chi route registration query.
+///
+/// Matches method calls where the HTTP method is deterministic:
+/// - `router.GET("/path", handler)`    (gin, echo — uppercase)
+/// - `app.Get("/path", handler)`       (fiber — uppercase first letter)
+/// - `r.Get("/path", handler)`         (chi — lowercase first letter)
+///
+/// NOT included (deferred to #390 or later):
+/// - `HandleFunc` — method unconstrained unless `Methods("GET", ...)` is chained
+/// - `Handle`     — path matcher only, method unconstrained
+/// - `Any`        — matches all HTTP methods, not a single-method endpoint
+///
+/// These omitted patterns collapse to GET in `infer_method_from_name()`, producing
+/// incorrect metadata before multi-method and prefix expansion are implemented.
+static GO_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
+    label: "go-route-registration",
+    query: r#"
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @name)
+  arguments: (argument_list
+    [(interpreted_string_literal)(raw_string_literal)] @path)
+  (#match? @name "^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Get|Post|Put|Delete|Patch|Head|Options)$"))
+"#,
+    default_method: "GET",
+};
+
+/// Rust Actix-web / Rocket / Poem route attribute query.
+///
+/// Matches attribute macros where the HTTP method is deterministic:
+/// - `#[get("/users")]`    (Actix-web, Rocket)   → GET
+/// - `#[post("/items")]`   (Actix-web, Rocket)   → POST
+/// - `#[put("/items/{id}")]`  (Actix-web, Rocket) → PUT
+/// - `#[delete("/items/{id}")]` (Actix-web, Rocket) → DELETE
+/// - `#[patch("/items/{id}")]`  (Actix-web, Rocket) → PATCH
+/// - `#[head("/path")]`    (Actix-web)            → HEAD
+/// - `#[options("/path")]` (Actix-web)            → OPTIONS
+///
+/// NOT included (deferred to #390 or later):
+/// - `route(...)` — Actix-web multi-method: `#[route("/path", method="GET", method="POST")]`
+///   requires parsing the nested `method=` argument, not just the path
+/// - `connect`/`trace` — uncommon; include if demand emerges
+///
+/// Tree-sitter represents `#[get("/path")]` as:
+///   `(attribute_item (attribute (identifier) @name arguments: (token_tree (string_literal) @path)))`
+///
+/// Note: Axum uses `Router::route("/path", ...)` (function call style), not attribute macros.
+static RUST_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
+    label: "rust-route-attributes",
+    query: r#"
+(attribute_item
+  (attribute
+    (identifier) @name
+    arguments: (token_tree
+      (string_literal) @path))
+  (#match? @name "^(get|post|put|delete|patch|head|options)$"))
+"#,
+    default_method: "GET",
+};
+
+/// JavaScript / Node.js Express route registration query.
+///
+/// Matches method calls where the HTTP method is deterministic:
+/// - `app.get('/users', handler)`     (Express)    → GET
+/// - `router.post('/items', handler)` (Express)    → POST
+/// - `app.put('/items/:id', handler)` (Express)    → PUT
+/// - `app.delete('/items/:id', handler)` (Express) → DELETE
+/// - `app.patch('/items/:id', handler)` (Express)  → PATCH
+///
+/// NOT included (deferred to #390 or later):
+/// - `use`   — middleware mount; not a route endpoint
+/// - `all`   — matches all HTTP methods; not a single-method endpoint
+/// - `route` — creates a route group for chaining `.get().post()`; not a direct endpoint
+///
+/// These omitted patterns collapse to GET in `infer_method_from_name()`, producing
+/// incorrect metadata before multi-method and prefix expansion are implemented.
+///
+/// Tree-sitter JavaScript uses `member_expression` (not `selector_expression`
+/// like Go), with `property: (property_identifier)` for the method name.
+static JAVASCRIPT_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
+    label: "javascript-express-routes",
+    query: r#"
+(call_expression
+  function: (member_expression
+    property: (property_identifier) @name)
+  arguments: (arguments
+    (string) @path)
+  (#match? @name "^(get|post|put|delete|patch|head|options)$"))
+"#,
+    default_method: "GET",
+};
+
+/// Ruby Sinatra / Rails route method call query.
+///
+/// Matches route calls where the HTTP method is deterministic:
+/// - `get '/users' do ... end`    (Sinatra)  → GET
+/// - `post '/items' do ... end`   (Sinatra)  → POST
+/// - `put '/items/:id' do ...`    (Sinatra)  → PUT
+/// - `delete '/items/:id' do ...` (Sinatra)  → DELETE
+/// - `patch '/items/:id' do ...`  (Sinatra)  → PATCH
+///
+/// NOT included (deferred to #390 or later):
+/// - `match`      — matches multiple HTTP methods via `via:` option
+/// - `root`       — shorthand for `get '/'`; would need special handling
+/// - `resources`  — expands to 7 REST routes; requires expansion logic
+/// - `resource`   — singular resource expansion (similar to resources)
+/// - `namespace`/`scope`/`member`/`collection` — prefix/grouping; not endpoints
+///
+/// These omitted patterns expand into multiple routes or apply prefixes that
+/// cannot be collapsed to a single `{method, path}` pair without expansion logic.
+///
+/// Ruby's tree-sitter grammar represents bare method calls as `(call method: ...)`.
+static RUBY_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
+    label: "ruby-sinatra-rails-routes",
+    query: r#"
+(call
+  method: (identifier) @name
+  arguments: (argument_list
+    (string) @path)
+  (#match? @name "^(get|post|put|delete|patch|head|options)$"))
+"#,
+    default_method: "GET",
+};
 
 // ---------------------------------------------------------------------------
 // Python
@@ -42,6 +246,8 @@ pub static PYTHON_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &["decorator"],
     type_param_node_kind: None,  // Python uses runtime generics (typing.Generic), not tree-sitter type_parameters
+    route_queries: &[PYTHON_ROUTE_QUERY],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -85,6 +291,8 @@ pub static TYPESCRIPT_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &["decorator"],
     type_param_node_kind: Some("type_parameters"),
+    route_queries: &[TYPESCRIPT_ROUTE_QUERY],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -121,6 +329,8 @@ pub static JAVASCRIPT_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &["decorator"],
     type_param_node_kind: None,  // JavaScript has no generics
+    route_queries: &[JAVASCRIPT_ROUTE_QUERY],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -157,6 +367,8 @@ pub static GO_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &[],  // Go has no decorators/attributes
     type_param_node_kind: Some("type_parameter_list"),
+    route_queries: &[GO_ROUTE_QUERY],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -200,6 +412,8 @@ pub static JAVA_CONFIG: LangConfig = LangConfig {
     // The collect_decorators function handles this via Strategy 3 (child container).
     decorator_node_kinds: &["annotation", "marker_annotation"],
     type_param_node_kind: Some("type_parameters"),
+    route_queries: &[JAVA_ROUTE_QUERY],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -239,6 +453,8 @@ pub static KOTLIN_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &["annotation"],
     type_param_node_kind: Some("type_parameters"),
+    route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -281,6 +497,8 @@ pub static CSHARP_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &["attribute_list"],
     type_param_node_kind: Some("type_parameter_list"),
+    route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -322,6 +540,8 @@ pub static SWIFT_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &[],  // Swift attributes handled via @attribute syntax but tree-sitter-swift uses attribute nodes as children, not siblings
     type_param_node_kind: Some("type_parameters"),
+    route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -359,6 +579,8 @@ pub static ZIG_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &[],  // Zig has no decorators/attributes
     type_param_node_kind: None,  // Zig uses comptime generics, not tree-sitter type_parameters
+    route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -402,6 +624,8 @@ pub static CPP_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &[],  // C/C++ has no decorators (attributes like [[nodiscard]] are different)
     type_param_node_kind: Some("template_parameter_list"),
+    route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -431,6 +655,8 @@ pub static LUA_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &[],  // Lua has no decorators
     type_param_node_kind: None,  // Lua has no generics
+    route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -467,6 +693,8 @@ pub static RUBY_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &[],  // Ruby has no decorators (uses method calls instead)
     type_param_node_kind: None,  // Ruby has no generics
+    route_queries: &[RUBY_ROUTE_QUERY],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -498,4 +726,6 @@ pub static BASH_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &[],  // Bash has no decorators
     type_param_node_kind: None,  // Bash has no generics
+    route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
