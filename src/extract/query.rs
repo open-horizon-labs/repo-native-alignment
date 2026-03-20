@@ -40,6 +40,10 @@ use tree_sitter::{Language, Node, Query, QueryCursor, StreamingIterator};
 /// Each entry maps a capture name (e.g. `"path"`, `"name"`) to the matched
 /// source text. Captures that had no match for this particular match instance
 /// are absent from the map.
+///
+/// The `captures` field is private — access capture values via [`CaptureSet::get`].
+/// There is no public iterator over all captures; callers must know the expected
+/// capture names in advance (e.g. `"path"`, `"name"`, `"method"`).
 #[derive(Debug, Clone, Default)]
 pub struct CaptureSet {
     /// Byte offset of the first capture in this match (for position tracking).
@@ -48,6 +52,8 @@ pub struct CaptureSet {
     pub end_byte: usize,
     /// Row (0-indexed) of the first capture.
     pub start_row: usize,
+    /// Row (0-indexed) of the last capture's end.
+    pub end_row: usize,
     /// Named capture text values.
     captures: BTreeMap<String, String>,
 }
@@ -117,6 +123,7 @@ impl QueryExtractor {
                     set.start_byte = node.start_byte();
                     set.end_byte = node.end_byte();
                     set.start_row = node.start_position().row;
+                    set.end_row = node.end_position().row;
                     first = false;
                 } else {
                     if node.start_byte() < set.start_byte {
@@ -125,6 +132,7 @@ impl QueryExtractor {
                     }
                     if node.end_byte() > set.end_byte {
                         set.end_byte = node.end_byte();
+                        set.end_row = node.end_position().row;
                     }
                 }
 
@@ -202,9 +210,12 @@ def get_users():
 
         let first = &captures[0];
         let path = first.get("path").unwrap_or("");
-        assert!(
-            path.contains("/users"),
-            "path capture should contain '/users', got: {path:?}"
+        // CaptureSet::get() returns the raw source text of the capture including
+        // the surrounding quotes (e.g. `'"/users"'`). strip_quotes() in generic.rs
+        // strips these when building the ApiEndpoint node's http_path metadata.
+        assert_eq!(
+            path, "\"/users\"",
+            "path capture should be the raw string literal (with quotes)"
         );
     }
 
@@ -571,9 +582,12 @@ public class ItemController {
         assert!(path.contains("/items"), "expected '/items', got: {path:?}");
     }
 
-    /// Verify `@Path("/users")` is captured (JAX-RS).
+    /// Verify `@Path("/users")` is NOT captured by the narrowed Java pattern.
+    /// JAX-RS `@Path` is URL-only — the HTTP method comes from a separate
+    /// `@GET`, `@POST`, etc. annotation. Including `@Path` would produce
+    /// synthetic GET endpoints before prefix/method combination is implemented.
     #[test]
-    fn test_java_jaxrs_path_annotation() {
+    fn test_java_jaxrs_path_annotation_not_captured() {
         let source = r#"
 @Path("/users")
 public class UserResource {
@@ -581,12 +595,13 @@ public class UserResource {
     public Response getUsers() { return null; }
 }
 "#;
+        // Use the narrowed pattern — @Path is intentionally excluded
         let query_source = r#"
 (annotation
   name: (identifier) @name
   arguments: (annotation_argument_list
     (string_literal) @path)
-  (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|RequestMapping|Path)$"))
+  (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)$"))
 "#;
         let language: Language = tree_sitter_java::LANGUAGE.into();
         let extractor = QueryExtractor::new(&language, query_source).unwrap();
@@ -595,10 +610,8 @@ public class UserResource {
         let tree = parser.parse(source, None).unwrap();
 
         let captures = extractor.run(tree.root_node(), source.as_bytes());
-        assert!(!captures.is_empty(), "should detect @Path annotation");
-
-        let path = captures[0].get("path").unwrap_or("");
-        assert!(path.contains("/users"), "expected '/users', got: {path:?}");
+        // @Path not in the narrowed pattern — correctly excluded (deferred to #390)
+        assert!(captures.is_empty(), "@Path should not be captured by narrowed pattern");
     }
 
     /// Verify non-route annotations like `@Override` are not captured.
@@ -610,12 +623,13 @@ public class Foo {
     public String toString() { return "foo"; }
 }
 "#;
+        // Use the narrowed pattern (without RequestMapping/Path, which were deferred)
         let query_source = r#"
 (annotation
   name: (identifier) @name
   arguments: (annotation_argument_list
     (string_literal) @path)
-  (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|RequestMapping|Path)$"))
+  (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)$"))
 "#;
         let language: Language = tree_sitter_java::LANGUAGE.into();
         let extractor = QueryExtractor::new(&language, query_source).unwrap();
@@ -627,18 +641,53 @@ public class Foo {
         assert!(captures.is_empty(), "@Override should not be captured");
     }
 
-    // ── Go gorilla/mux and gin route detection ────────────────────────────
+    // ── Go gin route detection ────────────────────────────────────────────
 
-    /// Verify `r.HandleFunc("/users", handler)` is captured (gorilla/mux).
+    /// Verify `router.GET("/users", handler)` is captured (gin).
+    /// Note: `HandleFunc` (gorilla/mux) is intentionally excluded — it is
+    /// method-unconstrained unless `.Methods("GET", ...)` is chained separately.
+    /// Deferred to #390 when multi-method extraction is implemented.
     #[test]
-    fn test_go_gorilla_handle_func() {
+    fn test_go_gin_get_route_narrowed() {
         let source = r#"
 package main
 
-import "github.com/gorilla/mux"
+import "github.com/gin-gonic/gin"
 
 func main() {
-    r := mux.NewRouter()
+    router := gin.Default()
+    router.GET("/users", getUsers)
+}
+"#;
+        let query_source = r#"
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @name)
+  arguments: (argument_list
+    [(interpreted_string_literal)(raw_string_literal)] @path)
+  (#match? @name "^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Get|Post|Put|Delete|Patch|Head|Options)$"))
+"#;
+        let language: Language = tree_sitter_go::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(!captures.is_empty(), "should detect gin GET route");
+
+        let path = captures[0].get("path").unwrap_or("");
+        assert!(path.contains("/users"), "expected '/users', got: {path:?}");
+    }
+
+    /// Verify `r.HandleFunc("/users", handler)` is NOT captured by the narrowed pattern.
+    /// HandleFunc is method-unconstrained and was removed from the Go route query.
+    #[test]
+    fn test_go_gorilla_handle_func_not_captured() {
+        let source = r#"
+package main
+
+func main() {
     r.HandleFunc("/users", getUsers).Methods("GET")
 }
 "#;
@@ -648,7 +697,7 @@ func main() {
     field: (field_identifier) @name)
   arguments: (argument_list
     [(interpreted_string_literal)(raw_string_literal)] @path)
-  (#match? @name "^(HandleFunc|Handle|GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Any|Get|Post|Put|Delete|Patch|Head|Options)$"))
+  (#match? @name "^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Get|Post|Put|Delete|Patch|Head|Options)$"))
 "#;
         let language: Language = tree_sitter_go::LANGUAGE.into();
         let extractor = QueryExtractor::new(&language, query_source).unwrap();
@@ -657,10 +706,8 @@ func main() {
         let tree = parser.parse(source, None).unwrap();
 
         let captures = extractor.run(tree.root_node(), source.as_bytes());
-        assert!(!captures.is_empty(), "should detect HandleFunc call");
-
-        let path = captures[0].get("path").unwrap_or("");
-        assert!(path.contains("/users"), "expected '/users', got: {path:?}");
+        // HandleFunc not in the pattern — correctly excluded
+        assert!(captures.is_empty(), "HandleFunc should not be captured by narrowed pattern");
     }
 
     /// Verify `router.GET("/items", handler)` is captured (gin).

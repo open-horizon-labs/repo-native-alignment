@@ -63,17 +63,21 @@ static TYPESCRIPT_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
     default_method: "GET",
 };
 
-/// Java Spring Boot / JAX-RS route annotation query.
+/// Java Spring MVC method-level route annotation query.
 ///
-/// Matches method/class annotations of the form:
-/// - `@GetMapping("/users")`        (Spring MVC)
-/// - `@PostMapping("/items")`       (Spring MVC)
-/// - `@RequestMapping("/prefix")`   (Spring MVC, class or method level)
-/// - `@Path("/users")`              (JAX-RS)
+/// Matches annotations where the HTTP method is deterministic:
+/// - `@GetMapping("/users")`     → GET
+/// - `@PostMapping("/items")`    → POST
+/// - `@PutMapping("/items/{id}")` → PUT
+/// - `@DeleteMapping("/items/{id}")` → DELETE
+/// - `@PatchMapping("/items/{id}")` → PATCH
 ///
-/// Spring annotations take a string value as the first (often only) element
-/// of the `annotation_argument_list`. JAX-RS `@Path` takes a single string.
-/// Both map to `(annotation name: (identifier) @name arguments: (annotation_argument_list (string_literal) @path))`.
+/// NOT included (deferred to #390 or later):
+/// - `@RequestMapping` — can specify any method or no method; class or method level
+/// - `@Path` (JAX-RS) — URL-only; HTTP method comes from separate `@GET/@POST/...`
+///
+/// These omitted patterns collapse to GET in `infer_method_from_name()`, producing
+/// incorrect metadata before multi-method and prefix expansion are implemented.
 static JAVA_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
     label: "java-route-annotations",
     query: r#"
@@ -81,23 +85,25 @@ static JAVA_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
   name: (identifier) @name
   arguments: (annotation_argument_list
     (string_literal) @path)
-  (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|RequestMapping|Path)$"))
+  (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)$"))
 "#,
     default_method: "GET",
 };
 
-/// Go gorilla/mux, gin, echo, fiber, chi route registration query.
+/// Go gin, echo, fiber, chi route registration query.
 ///
-/// Matches method calls of the form:
-/// - `r.HandleFunc("/path", handler)`          (gorilla/mux)
-/// - `router.GET("/path", handler)`            (gin, echo)
-/// - `app.Get("/path", handler)`               (fiber — uppercase first letter)
-/// - `r.Get("/path", handler)`                 (chi)
-/// - `mux.Handle("/path", handler)`            (stdlib net/http ServeMux)
+/// Matches method calls where the HTTP method is deterministic:
+/// - `router.GET("/path", handler)`    (gin, echo — uppercase)
+/// - `app.Get("/path", handler)`       (fiber — uppercase first letter)
+/// - `r.Get("/path", handler)`         (chi — lowercase first letter)
 ///
-/// All are `call_expression` with a `selector_expression` function where the
-/// `field` (method name) is the route verb or registration function name.
-/// The first `argument_list` element is the path string.
+/// NOT included (deferred to #390 or later):
+/// - `HandleFunc` — method unconstrained unless `Methods("GET", ...)` is chained
+/// - `Handle`     — path matcher only, method unconstrained
+/// - `Any`        — matches all HTTP methods, not a single-method endpoint
+///
+/// These omitted patterns collapse to GET in `infer_method_from_name()`, producing
+/// incorrect metadata before multi-method and prefix expansion are implemented.
 static GO_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
     label: "go-route-registration",
     query: r#"
@@ -106,25 +112,31 @@ static GO_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
     field: (field_identifier) @name)
   arguments: (argument_list
     [(interpreted_string_literal)(raw_string_literal)] @path)
-  (#match? @name "^(HandleFunc|Handle|GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Any|Get|Post|Put|Delete|Patch|Head|Options)$"))
+  (#match? @name "^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Get|Post|Put|Delete|Patch|Head|Options)$"))
 "#,
     default_method: "GET",
 };
 
 /// Rust Actix-web / Rocket / Poem route attribute query.
 ///
-/// Matches outer attribute items of the form:
-/// - `#[get("/users")]`              (Actix-web, Rocket)
-/// - `#[post("/items")]`             (Actix-web, Rocket)
-/// - `#[route("/path", method="GET")]` (Actix-web multi-method)
-/// - `#[api_v2_operation]` — NOT matched (no path string)
+/// Matches attribute macros where the HTTP method is deterministic:
+/// - `#[get("/users")]`    (Actix-web, Rocket)   → GET
+/// - `#[post("/items")]`   (Actix-web, Rocket)   → POST
+/// - `#[put("/items/{id}")]`  (Actix-web, Rocket) → PUT
+/// - `#[delete("/items/{id}")]` (Actix-web, Rocket) → DELETE
+/// - `#[patch("/items/{id}")]`  (Actix-web, Rocket) → PATCH
+/// - `#[head("/path")]`    (Actix-web)            → HEAD
+/// - `#[options("/path")]` (Actix-web)            → OPTIONS
+///
+/// NOT included (deferred to #390 or later):
+/// - `route(...)` — Actix-web multi-method: `#[route("/path", method="GET", method="POST")]`
+///   requires parsing the nested `method=` argument, not just the path
+/// - `connect`/`trace` — uncommon; include if demand emerges
 ///
 /// Tree-sitter represents `#[get("/path")]` as:
 ///   `(attribute_item (attribute (identifier) @name arguments: (token_tree (string_literal) @path)))`
 ///
-/// Note: Axum uses `Router::route("/path", ...)` (function call style), which is
-/// covered by a separate functional-style query if needed. Attribute macros are the
-/// primary target here.
+/// Note: Axum uses `Router::route("/path", ...)` (function call style), not attribute macros.
 static RUST_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
     label: "rust-route-attributes",
     query: r#"
@@ -133,17 +145,27 @@ static RUST_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
     (identifier) @name
     arguments: (token_tree
       (string_literal) @path))
-  (#match? @name "^(get|post|put|delete|patch|head|options|route|connect|trace)$"))
+  (#match? @name "^(get|post|put|delete|patch|head|options)$"))
 "#,
     default_method: "GET",
 };
 
 /// JavaScript / Node.js Express route registration query.
 ///
-/// Matches method calls of the form:
-/// - `app.get('/users', handler)`     (Express)
-/// - `router.post('/items', handler)` (Express Router)
-/// - `app.use('/prefix', middleware)` (Express middleware mount)
+/// Matches method calls where the HTTP method is deterministic:
+/// - `app.get('/users', handler)`     (Express)    → GET
+/// - `router.post('/items', handler)` (Express)    → POST
+/// - `app.put('/items/:id', handler)` (Express)    → PUT
+/// - `app.delete('/items/:id', handler)` (Express) → DELETE
+/// - `app.patch('/items/:id', handler)` (Express)  → PATCH
+///
+/// NOT included (deferred to #390 or later):
+/// - `use`   — middleware mount; not a route endpoint
+/// - `all`   — matches all HTTP methods; not a single-method endpoint
+/// - `route` — creates a route group for chaining `.get().post()`; not a direct endpoint
+///
+/// These omitted patterns collapse to GET in `infer_method_from_name()`, producing
+/// incorrect metadata before multi-method and prefix expansion are implemented.
 ///
 /// Tree-sitter JavaScript uses `member_expression` (not `selector_expression`
 /// like Go), with `property: (property_identifier)` for the method name.
@@ -155,30 +177,39 @@ static JAVASCRIPT_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
     property: (property_identifier) @name)
   arguments: (arguments
     (string) @path)
-  (#match? @name "^(get|post|put|delete|patch|head|options|use|all|route)$"))
+  (#match? @name "^(get|post|put|delete|patch|head|options)$"))
 "#,
     default_method: "GET",
 };
 
 /// Ruby Sinatra / Rails route method call query.
 ///
-/// Matches top-level (or block-level) method calls of the form:
-/// - `get '/users' do ... end`        (Sinatra)
-/// - `post '/items' do ... end`       (Sinatra)
-/// - `get 'users', to: 'controller#action'`  (Rails routes.rb)
-/// - `resources :users`               (Rails — matched via simple_symbol)
+/// Matches route calls where the HTTP method is deterministic:
+/// - `get '/users' do ... end`    (Sinatra)  → GET
+/// - `post '/items' do ... end`   (Sinatra)  → POST
+/// - `put '/items/:id' do ...`    (Sinatra)  → PUT
+/// - `delete '/items/:id' do ...` (Sinatra)  → DELETE
+/// - `patch '/items/:id' do ...`  (Sinatra)  → PATCH
+///
+/// NOT included (deferred to #390 or later):
+/// - `match`      — matches multiple HTTP methods via `via:` option
+/// - `root`       — shorthand for `get '/'`; would need special handling
+/// - `resources`  — expands to 7 REST routes; requires expansion logic
+/// - `resource`   — singular resource expansion (similar to resources)
+/// - `namespace`/`scope`/`member`/`collection` — prefix/grouping; not endpoints
+///
+/// These omitted patterns expand into multiple routes or apply prefixes that
+/// cannot be collapsed to a single `{method, path}` pair without expansion logic.
 ///
 /// Ruby's tree-sitter grammar represents bare method calls as `(call method: ...)`.
-/// A string path is the first element of `argument_list`; Rails symbols are also
-/// captured for resource-style routes.
 static RUBY_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
     label: "ruby-sinatra-rails-routes",
     query: r#"
 (call
   method: (identifier) @name
   arguments: (argument_list
-    [(string)(simple_symbol)] @path)
-  (#match? @name "^(get|post|put|delete|patch|head|options|match|root|resources|resource|namespace|scope|member|collection)$"))
+    (string) @path)
+  (#match? @name "^(get|post|put|delete|patch|head|options)$"))
 "#,
     default_method: "GET",
 };

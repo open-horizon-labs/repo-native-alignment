@@ -1238,7 +1238,7 @@ fn run_route_queries(
                 },
                 language: language_name.to_string(),
                 line_start: capture.start_row + 1,
-                line_end: capture.start_row + 1,
+                line_end: capture.end_row + 1,
                 signature: format!("[route_decorator] {} {}", method, http_path),
                 body: String::new(),
                 metadata,
@@ -3004,5 +3004,49 @@ def helper():
             .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
             .collect();
         assert_eq!(api_nodes.len(), 1, "should have exactly 1 ApiEndpoint node");
+    }
+
+    /// Verify Java @PostMapping infers POST method through the full extraction pipeline.
+    #[test]
+    fn test_java_extractor_infers_post_method_for_post_mapping() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let ext = GenericExtractor::new(&JAVA_CONFIG);
+        let code = r#"
+public class ItemController {
+    @PostMapping("/items")
+    public Item create(@RequestBody Item item) {
+        return item;
+    }
+
+    @GetMapping("/items/{id}")
+    public Item get(@PathVariable Long id) {
+        return null;
+    }
+}
+"#;
+        let result = ext.run(Path::new("ItemController.java"), code).unwrap();
+        let api_nodes: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(api_nodes.len(), 2, "should emit 2 ApiEndpoint nodes");
+
+        let post_node = api_nodes.iter().find(|n| {
+            n.metadata.get("http_method").map(|m| m == "POST").unwrap_or(false)
+        });
+        assert!(
+            post_node.is_some(),
+            "should infer POST for @PostMapping, got: {:?}",
+            api_nodes.iter().map(|n| n.metadata.get("http_method")).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            post_node.unwrap().metadata.get("http_path"),
+            Some(&"/items".to_string()),
+            "POST endpoint path should be /items"
+        );
+
+        let get_node = api_nodes.iter().find(|n| {
+            n.metadata.get("http_method").map(|m| m == "GET").unwrap_or(false)
+        });
+        assert!(get_node.is_some(), "should infer GET for @GetMapping");
     }
 }
