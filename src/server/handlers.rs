@@ -47,20 +47,24 @@ impl RnaHandler {
         // Derive the active root slugs from the in-memory graph so that the
         // output reflects what is actually loaded (including declared roots
         // persisted to LanceDB) rather than re-discovering roots from config.
-        let active_slugs = match self.get_graph().await {
-            Ok(guard) => {
-                if let Some(graph_state) = guard.as_ref() {
-                    let index_map = graph_state.node_index_map();
-                    crate::server::state::GraphState::root_slugs_from_index_map(&index_map)
-                        .into_iter()
-                        .collect::<std::collections::HashSet<String>>()
-                } else {
-                    std::collections::HashSet::new()
-                }
-            }
-            Err(_) => std::collections::HashSet::new(),
+        let graph_guard = self.get_graph().await.ok();
+        let graph_state_ref = graph_guard.as_ref().and_then(|g| g.as_ref());
+
+        let active_slugs = if let Some(gs) = graph_state_ref {
+            let index_map = gs.node_index_map();
+            crate::server::state::GraphState::root_slugs_from_index_map(&index_map)
+                .into_iter()
+                .collect::<std::collections::HashSet<String>>()
+        } else {
+            std::collections::HashSet::new()
         };
-        let markdown = crate::service::list_roots_from_slugs(&self.repo_root, &active_slugs);
+
+        let markdown = crate::service::list_roots_from_slugs(
+            &self.repo_root,
+            &active_slugs,
+            graph_state_ref,
+            Some(&self.lsp_status),
+        );
         Ok(text_result(markdown))
     }
 

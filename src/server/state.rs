@@ -213,6 +213,9 @@ pub struct LspEnrichmentStatus {
     last_transition_at: std::sync::Mutex<std::time::Instant>,
     /// Name of the server found during probe (for diagnostics).
     server_name: std::sync::Mutex<Option<String>>,
+    /// LSP server binaries that were checked but not found on PATH during probe.
+    /// Used by list_roots to show "LSP available but not installed" for relevant languages.
+    missing_servers: std::sync::Mutex<Vec<String>>,
 }
 
 impl Default for LspEnrichmentStatus {
@@ -226,6 +229,7 @@ impl Default for LspEnrichmentStatus {
             created_at: now,
             last_transition_at: std::sync::Mutex::new(now),
             server_name: std::sync::Mutex::new(None),
+            missing_servers: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -347,6 +351,17 @@ impl LspEnrichmentStatus {
         self.server_name.lock().unwrap().clone()
     }
 
+    /// Get the number of edges added by the most recent enrichment pass.
+    pub fn edge_count(&self) -> usize {
+        self.edge_count.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Get LSP server binaries that were not found on PATH during probe.
+    /// Used by list_roots to show relevant missing servers for each root.
+    pub fn missing_server_names(&self) -> Vec<String> {
+        self.missing_servers.lock().unwrap().clone()
+    }
+
     /// Check if the SERVER_FOUND state has timed out (stuck for > 5 min).
     /// Returns true if timed out (and transitions to UNAVAILABLE).
     pub fn check_server_found_timeout(&self) -> bool {
@@ -382,18 +397,27 @@ impl LspEnrichmentStatus {
     /// Synchronously probe for known LSP server binaries on PATH.
     /// Fast (just `which` calls, no process spawning). Call at handler construction
     /// to distinguish "server exists but pending" from "no server available."
+    ///
+    /// All servers not found on PATH are recorded in `missing_servers` so
+    /// `list_roots` can show "LSP available but not installed" filtered to
+    /// languages present in a given root.
     pub fn probe_for_servers() -> Self {
         let status = Self::default();
 
-        // Check for common LSP servers. We only need ONE hit to know
-        // LSP enrichment will likely succeed.
+        // Check for all known LSP servers. We track both found and missing
+        // so list_roots can show relevant servers that could be installed.
         let known_servers = [
             "rust-analyzer",
             "pyright-langserver",
             "typescript-language-server",
             "gopls",
             "clangd",
+            "taplo",
+            "marksman",
         ];
+
+        let mut found_one = false;
+        let mut missing: Vec<String> = Vec::new();
 
         for server in &known_servers {
             let found = std::process::Command::new("which")
@@ -405,16 +429,25 @@ impl LspEnrichmentStatus {
                 .unwrap_or(false);
             if found {
                 tracing::info!("LSP probe: found '{}' on PATH", server);
-                status.set_server_name(server);
-                status.set_server_found();
-                return status;
+                if !found_one {
+                    status.set_server_name(server);
+                    status.set_server_found();
+                    found_one = true;
+                }
+            } else {
+                missing.push(server.to_string());
             }
         }
 
-        // No known servers found — mark unavailable immediately so the first
-        // query footer says "no server detected" instead of a misleading
-        // "LSP: pending..." that never resolves.
-        status.set_unavailable();
+        *status.missing_servers.lock().unwrap() = missing;
+
+        if !found_one {
+            // No known servers found — mark unavailable immediately so the first
+            // query footer says "no server detected" instead of a misleading
+            // "LSP: pending..." that never resolves.
+            status.set_unavailable();
+        }
+
         status
     }
 
