@@ -3254,11 +3254,16 @@ pub fn list_roots_from_slugs(
                 }
             }
 
-            // LSP available but not installed — use precomputed per-root languages.
+            // Languages line — show detected languages for this root.
             let empty_langs = std::collections::BTreeSet::new();
-            let root_langs: std::collections::HashSet<String> = root_langs_map
-                .get(&r.slug)
-                .unwrap_or(&empty_langs)
+            let root_lang_set = root_langs_map.get(&r.slug).unwrap_or(&empty_langs);
+            if graph_state.is_some() && !root_lang_set.is_empty() {
+                let lang_list: Vec<&str> = root_lang_set.iter().map(|s| s.as_str()).collect();
+                line.push_str(&format!("\n  Languages: {} (tree-sitter)", lang_list.join(", ")));
+            }
+
+            // LSP available but not installed — use precomputed per-root languages.
+            let root_langs: std::collections::HashSet<String> = root_lang_set
                 .iter()
                 .cloned()
                 .collect();
