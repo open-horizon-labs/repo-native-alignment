@@ -28,7 +28,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search",
-    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Add `mode` for graph traversal (neighbors/impact/reachable/tests_for). Use `compact: true` to save tokens. Use `rerank: true` for natural language queries. Use `subsystem` to scope to a subsystem from repo_map. Use `target_subsystem` with mode to find cross-subsystem edges. Use `depth` with mode='neighbors' to walk N levels deep (e.g., module → members → their members)."
+    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Add `mode` for graph traversal (neighbors/impact/reachable/tests_for/cycles/path). Use `compact: true` to save tokens. Use `rerank: true` for natural language queries. Use `subsystem` to scope to a subsystem from repo_map. Use `target_subsystem` with mode to find cross-subsystem edges. Use `depth` with mode='neighbors' to walk N levels deep (e.g., module → members → their members)."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct Search {
@@ -38,7 +38,7 @@ pub struct Search {
     /// Stable node ID from previous results
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
-    /// Traversal: "neighbors", "impact", "reachable", "tests_for"; omit for flat search
+    /// Traversal: "neighbors","impact","reachable","tests_for","cycles","path"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     /// Max reachability depth for impact/reachable modes (default: 3). Controls how far the graph walk reaches. Not used for neighbors mode — use depth instead.
@@ -529,7 +529,7 @@ mod tests {
             // Search
             "Search query (name, keyword, or natural language)",
             "Stable node ID from previous results",
-            r#"Traversal: "neighbors", "impact", "reachable", "tests_for"; omit for flat search"#,
+            r#"Traversal: "neighbors","impact","reachable","tests_for","cycles","path""#,
             "Max traversal depth (default: 1 neighbors, 3 impact/reachable)",
             r#"Neighbors direction: "outgoing" (default), "incoming", "both""#,
             "Edge filter: calls, depends_on, implements, defines, etc.",
