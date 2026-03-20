@@ -781,6 +781,10 @@ impl LspEnricher {
         // If the server supports serverStatus, we should keep waiting for
         // quiescent=true rather than bailing on a per-message timeout.
         let mut seen_server_status = false;
+        // Track the raw `quiescent` bit independently of `health`.
+        // We only care about "done indexing" for the Pass 3 guard; health="warning"
+        // (compile errors) does not mean RA is still indexing.
+        let mut saw_quiescent = false;
 
         while tokio::time::Instant::now() < deadline {
             // Use a short timeout only when we haven't seen serverStatus yet.
@@ -810,9 +814,25 @@ impl LspEnricher {
                                 let quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(false);
                                 tracing::info!("{} serverStatus: health={}, quiescent={}", self.server_command, health, quiescent);
 
+                                // Track the raw quiescent bit separately from health.
+                                // Pass 3 cares about "done indexing" (quiescent=true),
+                                // not about compilation health (which may be "warning" or "error").
+                                if quiescent {
+                                    saw_quiescent = true;
+                                }
+
                                 if Self::server_status_is_ready(&msg) {
                                     tracing::info!("{} ready (serverStatus: ok, quiescent)", self.server_command);
                                     server_ready = true;
+                                    break;
+                                }
+                                // If quiescent=true but health!=ok, the server is done indexing
+                                // but has errors/warnings. Still break — no point waiting further.
+                                if quiescent {
+                                    tracing::info!(
+                                        "{} quiescent=true (health={}), proceeding despite non-ok health",
+                                        self.server_command, health
+                                    );
                                     break;
                                 }
                                 tracing::info!("{} not yet ready, continuing to wait for indexing...", self.server_command);
@@ -870,13 +890,18 @@ impl LspEnricher {
         // thousands of textDocument/diagnostic requests to an unindexed server
         // floods its queue, which was the root cause of the #379 regression.
         //
+        // Use `saw_quiescent` (raw quiescent=true bit) rather than `server_ready`
+        // (which also requires health="ok"). This ensures Pass 3 runs for repos
+        // with compile errors (health="warning", quiescent=true) — the server IS
+        // done indexing, it just has errors. Pass 3 is safe in that case.
+        //
         // The guard only applies when the server supports `experimental/serverStatus`
         // (`seen_server_status = true`) but never sent quiescent=true before the
         // deadline. Servers that do NOT support serverStatus (pyright, marksman, etc.)
         // never set `seen_server_status`, so we treat them as quiescent (they're
         // assumed ready after the 5s fallback timeout and won't flood RA's queue).
-        state.was_quiescent = server_ready || !seen_server_status;
-        if seen_server_status && !server_ready {
+        state.was_quiescent = saw_quiescent || !seen_server_status;
+        if seen_server_status && !saw_quiescent {
             tracing::warn!(
                 "{} did not reach quiescent state — Pass 3 (diagnostics) will be skipped this session",
                 self.server_command
@@ -3153,38 +3178,42 @@ mod tests {
     /// Verify the was_quiescent logic: only servers that sent serverStatus but
     /// never reached quiescent=true trigger the Pass 3 skip.
     ///
-    /// The guard is `server_ready || !seen_server_status`:
-    /// - server_ready=true:  quiescent, Run Pass 3
-    /// - server_ready=false, seen_server_status=false: no serverStatus (pyright etc.), Run Pass 3
-    /// - server_ready=false, seen_server_status=true: RA timed out, SKIP Pass 3
+    /// The guard is `saw_quiescent || !seen_server_status`:
+    /// - saw_quiescent=true (any health): done indexing → Run Pass 3
+    /// - seen_server_status=false: no serverStatus (pyright etc.) → assumed ready → Run Pass 3
+    /// - saw_quiescent=false, seen_server_status=true: RA timed out → SKIP Pass 3
+    ///
+    /// Note: `saw_quiescent` tracks the raw `quiescent=true` bit, not `server_ready`
+    /// which also requires health="ok". This means health="warning" + quiescent=true
+    /// (compile errors but done indexing) correctly enables Pass 3.
     #[test]
     fn test_server_status_is_ready_drives_quiescence() {
+        // health=ok + quiescent=true: server_ready=true, saw_quiescent=true → Pass 3 runs
         let ready_msg = serde_json::json!({
             "method": "experimental/serverStatus",
             "params": { "health": "ok", "quiescent": true }
         });
         assert!(LspEnricher::server_status_is_ready(&ready_msg),
-            "health=ok + quiescent=true must be ready — was_quiescent = true, Pass 3 runs");
+            "health=ok + quiescent=true must be ready — saw_quiescent=true, Pass 3 runs");
 
-        // Non-ready messages: only when seen_server_status=true do these block Pass 3
+        // health="warning" + quiescent=true: server_ready=false but saw_quiescent=true → Pass 3 runs
+        // (compile errors but done indexing — diagnostics are needed precisely in this state)
+        let warning_quiescent = serde_json::json!({
+            "method": "experimental/serverStatus",
+            "params": { "health": "warning", "quiescent": true }
+        });
+        assert!(!LspEnricher::server_status_is_ready(&warning_quiescent),
+            "health=warning is not 'ready' (server_ready=false), but saw_quiescent=true \
+             means was_quiescent=true and Pass 3 will run correctly");
+
+        // quiescent=false: saw_quiescent stays false, Pass 3 blocked if deadline expires
         let not_quiescent = serde_json::json!({
             "method": "experimental/serverStatus",
             "params": { "health": "ok", "quiescent": false }
         });
         assert!(!LspEnricher::server_status_is_ready(&not_quiescent),
-            "quiescent=false is not ready — if this is the last message before deadline, \
-             seen_server_status=true and server_ready=false → was_quiescent=false, Pass 3 skipped");
-
-        // Verify the no-serverStatus fallback: was_quiescent = server_ready || !seen_server_status
-        // When seen_server_status=false (no serverStatus messages): was_quiescent = false || true = true
-        // Meaning servers without serverStatus support always get Pass 3 (correct behavior).
-        assert!(!LspEnricher::server_status_is_ready(&serde_json::json!({
-            "method": "experimental/serverStatus",
-            "params": { "health": "ok", "quiescent": false }
-        })),
-            "deadline-expired serverStatus must not set was_quiescent — \
-             server_ready stays false, and since seen_server_status=true, \
-             was_quiescent = false || !true = false");
+            "quiescent=false: saw_quiescent=false — if deadline expires with only these \
+             messages, seen_server_status=true and saw_quiescent=false → was_quiescent=false");
     }
 
     // -----------------------------------------------------------------------
