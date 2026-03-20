@@ -155,3 +155,66 @@ Add FTS index on `file_path` in LanceDB. Enables `search("src/embed.rs")` by pat
 **`relatedTests` is RNA-unique.** No other graph-based code tool exposes test-coverage as queryable edges. This is a genuine differentiator, not a catch-up feature.
 
 **The module hierarchy gap.** RNA knows functions exist in files. It does NOT know that `src/server/handler.rs` contains `crate::server::handler::process_request`. `parentModule` + `viewCrateGraph` fill this from above (crate) and from within (module ancestry). Together they complete the abstraction hierarchy: symbol → module → crate → workspace.
+
+---
+
+## Track 4: Tree-sitter Capabilities (Additional Research)
+
+### Already-have-data wins (zero new AST work)
+
+**`#[derive]` → Implements edges**
+`#[derive(Debug, Clone, Serialize)]` is already stored in `metadata["decorators"]`. Parse it post-extraction, emit `Implements(Debug)`, `Implements(Clone)`, `Implements(Serialize)` edges. Enables `search("which structs implement Serialize?")` without LSP.
+- Effort: Tiny (string parsing in Rust extractor)
+
+**`metadata["is_async"]` and `metadata["is_test"]` at extraction time**
+Currently computed at query/ranking time from decorator strings. Move detection to extraction. Enables `search(query="async handlers")` as a pre-filter, not post-filter.
+- Effort: Tiny
+
+### Medium effort, high value
+
+**Same-file call detection**
+After all nodes are collected for a file, resolve bare `foo()` calls against the same-file function name set. Emit `Calls` edges with `Confidence::Detected`. Start with Rust (already has `detect_topology_patterns` structure). Python and TypeScript follow.
+- Effort: Medium — second pass after extraction, filter against known_functions set
+- Key constraint: same-file only to avoid false positives
+
+**TypeScript class/interface hierarchy**
+`extends_clause` and `implements_clause` in TypeScript AST → `Implements` edges for class inheritance without LSP.
+- Effort: Small (add to TypeScript extractor)
+
+### New extractors
+
+**Dockerfile** — `FROM <image>` → DependsOn edge to base image node, `EXPOSE <port>` → ApiEndpoint-style port node. Connects deployment topology to the code graph.
+- Crate: `tree-sitter-dockerfile` 0.2.0
+
+**GraphQL** — types, queries, mutations, subscriptions as nodes. Bridges GraphQL schema to resolver code.
+- Crate: `tree-sitter-graphql` 0.1.0
+
+### Architectural note: adopt tree-sitter Query API
+RNA does manual AST traversal for all extraction. The tree-sitter `Query`/`QueryCursor` API with `#match?` and `#eq?` predicates would make route-decorator → ApiEndpoint extraction (closing the client→server gap) maintainable: one query per framework instead of hardcoded function names.
+
+---
+
+## API Endpoint → Handler: The Cross-Boundary Unlock
+
+The most impactful single item: connecting client code to server handlers across the HTTP boundary.
+
+**Data already in the graph (unconnected):**
+- `openapi.rs` → `NodeKind::Other("api_endpoint")` with `path` metadata
+- `string_literals.rs` → synthetic `Const` nodes for route strings (e.g., `"/payments"`)
+- Handler functions extracted by tree-sitter adjacent to route strings
+
+**What's missing:** A post-extraction enricher (`ApiLinkEnricher`) that matches `ApiEndpoint.path` values to nearby `Const` nodes with route-string values, then emits `Implements` edges to the enclosing function.
+
+**Full cross-layer path once connected:**
+```
+PaymentButton.onClick()
+  --[Calls]--> apiClient.post("/payments")     [client, string literal]
+  --[StringMatch]--> ApiEndpoint POST /payments  [from OpenAPI spec]
+  --[Implements]--> handle_create_payment()      [server handler]
+  --[Calls]--> charge_card()                     [domain logic]
+  --[Calls]--> db.insert()                       [storage]
+```
+
+Every edge exists except the two string-literal→endpoint joins. Two enrichers, ~100 lines total, no external dependencies.
+
+This is the **domain-context-compiler** outcome in its most concrete form: agents can trace from a UI button click to a database write across an HTTP boundary, entirely from repo-native data.
