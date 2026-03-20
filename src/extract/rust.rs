@@ -13,7 +13,34 @@ use crate::graph::{
 };
 
 use super::generic::{GenericExtractor, LangConfig};
+use super::query::RouteQueryConfig;
 use super::{ExtractionResult, Extractor};
+
+/// Rust Actix-web / Rocket / Poem route attribute macro query.
+///
+/// Matches outer attribute items of the form:
+/// - `#[get("/users")]`                (Actix-web, Rocket)
+/// - `#[post("/items")]`               (Actix-web, Rocket)
+/// - `#[route("/path", method = "GET")]` (Actix-web multi-method)
+///
+/// The tree-sitter structure is:
+///   `(attribute_item (attribute (identifier) @name arguments: (token_tree (string_literal) @path)))`
+///
+/// Note: Axum uses `Router::route("/path", ...)` (function call style). Those
+/// are not attribute macros and are handled as regular function calls in graph
+/// traversal. The query here targets attribute-macro style only.
+static RUST_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
+    label: "rust-route-attributes",
+    query: r#"
+(attribute_item
+  (attribute
+    (identifier) @name
+    arguments: (token_tree
+      (string_literal) @path))
+  (#match? @name "^(get|post|put|delete|patch|head|options|route|connect|trace)$"))
+"#,
+    default_method: "GET",
+};
 
 /// Static config for the generic traversal pass.
 /// Topology detection and any Rust-specific logic run on top of this.
@@ -57,7 +84,7 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &["attribute_item"],
     type_param_node_kind: Some("type_parameters"),
-    route_queries: &[],
+    route_queries: &[RUST_ROUTE_QUERY],
 };
 
 /// Rust tree-sitter extractor with topology pattern detection.

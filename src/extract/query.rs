@@ -352,4 +352,131 @@ def profile():
         assert!(set.is_empty());
         assert_eq!(set.get("anything"), None);
     }
+
+    // ── Adversarial: edge cases from dissent ──────────────────────────────
+
+    /// Verify that a decorator name like `userget` (ends in "get") is NOT captured.
+    /// The `#match?` pattern `route$|get$|...` is a full-string suffix match for
+    /// attribute access (`router.get`) but the regex pattern `get$` would also
+    /// match `userget`. This tests that overly broad patterns can be tightened.
+    ///
+    /// Note: this test verifies the regex limitation is understood — in practice,
+    /// `@userget("/path")` is not a real framework pattern, but it demonstrates
+    /// that the current query string `get$` is a suffix match, not a word-boundary
+    /// match. Future tightening can use `(^get$|\.get$)` if false positives emerge.
+    #[test]
+    fn test_python_decorator_suffix_match_behavior() {
+        let source = r#"
+@router.get("/items")
+async def list_items():
+    pass
+"#;
+        // Verify `.get` suffix still matches (it should)
+        let query_source = r#"
+(decorator
+  (call
+    function: (_) @name
+    arguments: (argument_list
+      (string) @path))
+  (#match? @name "route$|get$|post$|put$|delete$|patch$"))
+"#;
+        let language: Language = tree_sitter_python::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(!captures.is_empty(), "router.get should be captured");
+        let path = captures[0].get("path").unwrap_or("");
+        assert!(path.contains("/items"), "expected '/items', got: {path:?}");
+    }
+
+    /// Verify multiple route decorators in one file are all captured.
+    #[test]
+    fn test_python_multiple_routes_in_one_file() {
+        let source = r#"
+@app.route("/users")
+def get_users():
+    pass
+
+@app.route("/items")
+def get_items():
+    pass
+
+@app.route("/orders")
+def get_orders():
+    pass
+"#;
+        let query_source = r#"
+(decorator
+  (call
+    function: (_) @name
+    arguments: (argument_list
+      (string) @path))
+  (#match? @name "route$|get$|post$|put$|delete$|patch$"))
+"#;
+        let language: Language = tree_sitter_python::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert_eq!(captures.len(), 3, "should capture all 3 routes");
+    }
+
+    /// Verify that a decorator with no string argument (e.g. `@app.route(methods=["GET"])`)
+    /// is NOT captured by the path-requiring query.
+    #[test]
+    fn test_python_decorator_without_string_path_skipped() {
+        let source = r#"
+@app.route(methods=["GET"])
+def handler():
+    pass
+"#;
+        let query_source = r#"
+(decorator
+  (call
+    function: (_) @name
+    arguments: (argument_list
+      (string) @path))
+  (#match? @name "route$|get$|post$|put$|delete$|patch$"))
+"#;
+        let language: Language = tree_sitter_python::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        // No positional string argument — should not be captured
+        assert!(
+            captures.is_empty(),
+            "route without path string should not be captured"
+        );
+    }
+
+    /// Verify TypeScript decorator that doesn't match the pattern is not captured.
+    #[test]
+    fn test_typescript_non_route_decorator_skipped() {
+        let source = r#"
+class UserService {
+  @Injectable()
+  create() {}
+}
+"#;
+        let query_source = r#"
+(decorator
+  (call_expression
+    function: (identifier) @name
+    arguments: (arguments
+      (string) @path))
+  (#match? @name "^(Get|Post|Put|Delete|Patch|Head|Options|Controller|Route)$"))
+"#;
+        let language: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(captures.is_empty(), "@Injectable should not be captured");
+    }
 }

@@ -57,6 +57,126 @@ static TYPESCRIPT_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
     default_method: "GET",
 };
 
+/// Java Spring Boot / JAX-RS route annotation query.
+///
+/// Matches method/class annotations of the form:
+/// - `@GetMapping("/users")`        (Spring MVC)
+/// - `@PostMapping("/items")`       (Spring MVC)
+/// - `@RequestMapping("/prefix")`   (Spring MVC, class or method level)
+/// - `@Path("/users")`              (JAX-RS)
+///
+/// Spring annotations take a string value as the first (often only) element
+/// of the `annotation_argument_list`. JAX-RS `@Path` takes a single string.
+/// Both map to `(annotation name: (identifier) @name arguments: (annotation_argument_list (string_literal) @path))`.
+static JAVA_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
+    label: "java-route-annotations",
+    query: r#"
+(annotation
+  name: (identifier) @name
+  arguments: (annotation_argument_list
+    (string_literal) @path)
+  (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|RequestMapping|Path)$"))
+"#,
+    default_method: "GET",
+};
+
+/// Go gorilla/mux, gin, echo, fiber, chi route registration query.
+///
+/// Matches method calls of the form:
+/// - `r.HandleFunc("/path", handler)`          (gorilla/mux)
+/// - `router.GET("/path", handler)`            (gin, echo)
+/// - `app.Get("/path", handler)`               (fiber — uppercase first letter)
+/// - `r.Get("/path", handler)`                 (chi)
+/// - `mux.Handle("/path", handler)`            (stdlib net/http ServeMux)
+///
+/// All are `call_expression` with a `selector_expression` function where the
+/// `field` (method name) is the route verb or registration function name.
+/// The first `argument_list` element is the path string.
+static GO_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
+    label: "go-route-registration",
+    query: r#"
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @name)
+  arguments: (argument_list
+    [(interpreted_string_literal)(raw_string_literal)] @path)
+  (#match? @name "^(HandleFunc|Handle|GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Any|Get|Post|Put|Delete|Patch|Head|Options)$"))
+"#,
+    default_method: "GET",
+};
+
+/// Rust Actix-web / Rocket / Poem route attribute query.
+///
+/// Matches outer attribute items of the form:
+/// - `#[get("/users")]`              (Actix-web, Rocket)
+/// - `#[post("/items")]`             (Actix-web, Rocket)
+/// - `#[route("/path", method="GET")]` (Actix-web multi-method)
+/// - `#[api_v2_operation]` — NOT matched (no path string)
+///
+/// Tree-sitter represents `#[get("/path")]` as:
+///   `(attribute_item (attribute (identifier) @name arguments: (token_tree (string_literal) @path)))`
+///
+/// Note: Axum uses `Router::route("/path", ...)` (function call style), which is
+/// covered by a separate functional-style query if needed. Attribute macros are the
+/// primary target here.
+static RUST_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
+    label: "rust-route-attributes",
+    query: r#"
+(attribute_item
+  (attribute
+    (identifier) @name
+    arguments: (token_tree
+      (string_literal) @path))
+  (#match? @name "^(get|post|put|delete|patch|head|options|route|connect|trace)$"))
+"#,
+    default_method: "GET",
+};
+
+/// JavaScript / Node.js Express route registration query.
+///
+/// Matches method calls of the form:
+/// - `app.get('/users', handler)`     (Express)
+/// - `router.post('/items', handler)` (Express Router)
+/// - `app.use('/prefix', middleware)` (Express middleware mount)
+///
+/// Tree-sitter JavaScript uses `member_expression` (not `selector_expression`
+/// like Go), with `property: (property_identifier)` for the method name.
+static JAVASCRIPT_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
+    label: "javascript-express-routes",
+    query: r#"
+(call_expression
+  function: (member_expression
+    property: (property_identifier) @name)
+  arguments: (arguments
+    (string) @path)
+  (#match? @name "^(get|post|put|delete|patch|head|options|use|all|route)$"))
+"#,
+    default_method: "GET",
+};
+
+/// Ruby Sinatra / Rails route method call query.
+///
+/// Matches top-level (or block-level) method calls of the form:
+/// - `get '/users' do ... end`        (Sinatra)
+/// - `post '/items' do ... end`       (Sinatra)
+/// - `get 'users', to: 'controller#action'`  (Rails routes.rb)
+/// - `resources :users`               (Rails — matched via simple_symbol)
+///
+/// Ruby's tree-sitter grammar represents bare method calls as `(call method: ...)`.
+/// A string path is the first element of `argument_list`; Rails symbols are also
+/// captured for resource-style routes.
+static RUBY_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
+    label: "ruby-sinatra-rails-routes",
+    query: r#"
+(call
+  method: (identifier) @name
+  arguments: (argument_list
+    [(string)(simple_symbol)] @path)
+  (#match? @name "^(get|post|put|delete|patch|head|options|match|root|resources|resource|namespace|scope|member|collection)$"))
+"#,
+    default_method: "GET",
+};
+
 // ---------------------------------------------------------------------------
 // Python
 // ---------------------------------------------------------------------------
@@ -170,7 +290,7 @@ pub static JAVASCRIPT_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &["decorator"],
     type_param_node_kind: None,  // JavaScript has no generics
-    route_queries: &[],
+    route_queries: &[JAVASCRIPT_ROUTE_QUERY],
 };
 
 // ---------------------------------------------------------------------------
@@ -207,7 +327,7 @@ pub static GO_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &[],  // Go has no decorators/attributes
     type_param_node_kind: Some("type_parameter_list"),
-    route_queries: &[],
+    route_queries: &[GO_ROUTE_QUERY],
 };
 
 // ---------------------------------------------------------------------------
@@ -251,7 +371,7 @@ pub static JAVA_CONFIG: LangConfig = LangConfig {
     // The collect_decorators function handles this via Strategy 3 (child container).
     decorator_node_kinds: &["annotation", "marker_annotation"],
     type_param_node_kind: Some("type_parameters"),
-    route_queries: &[],
+    route_queries: &[JAVA_ROUTE_QUERY],
 };
 
 // ---------------------------------------------------------------------------
@@ -525,7 +645,7 @@ pub static RUBY_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &[],  // Ruby has no decorators (uses method calls instead)
     type_param_node_kind: None,  // Ruby has no generics
-    route_queries: &[],
+    route_queries: &[RUBY_ROUTE_QUERY],
 };
 
 // ---------------------------------------------------------------------------

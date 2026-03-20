@@ -2901,4 +2901,93 @@ struct PlainStruct {
             "Built-in defaults should include 'observer'"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Route query end-to-end tests (through GenericExtractor)
+    // -----------------------------------------------------------------------
+
+    /// Verify that the Python extractor emits ApiEndpoint nodes for Flask routes.
+    #[test]
+    fn test_python_extractor_emits_api_endpoint_for_flask_route() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let ext = GenericExtractor::new(&PYTHON_CONFIG);
+        let code = r#"
+@app.route("/users")
+def get_users():
+    pass
+
+@app.route("/items")
+def get_items():
+    pass
+"#;
+        let result = ext.run(Path::new("routes.py"), code).unwrap();
+        let api_nodes: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(api_nodes.len(), 2, "should emit 2 ApiEndpoint nodes, got: {:?}",
+            api_nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>());
+        assert!(
+            api_nodes.iter().any(|n| n.metadata.get("http_path").map(|p| p == "/users").unwrap_or(false)),
+            "should have ApiEndpoint for /users"
+        );
+    }
+
+    /// Verify that the TypeScript extractor emits ApiEndpoint nodes for NestJS routes.
+    #[test]
+    fn test_typescript_extractor_emits_api_endpoint_for_nestjs() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let ext = GenericExtractor::new(&TYPESCRIPT_CONFIG);
+        let code = r#"
+class UserController {
+  @Get("/users")
+  findAll() {}
+
+  @Post("/users")
+  create() {}
+}
+"#;
+        let result = ext.run(Path::new("user.controller.ts"), code).unwrap();
+        let api_nodes: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(api_nodes.len(), 2, "should emit 2 ApiEndpoint nodes");
+        assert!(
+            api_nodes.iter().any(|n| {
+                n.metadata.get("http_method").map(|m| m == "POST").unwrap_or(false)
+            }),
+            "should have POST endpoint"
+        );
+    }
+
+    /// Verify that the existing function extraction still works alongside route queries.
+    #[test]
+    fn test_python_route_query_does_not_break_function_extraction() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let ext = GenericExtractor::new(&PYTHON_CONFIG);
+        let code = r#"
+@app.route("/users")
+def get_users():
+    pass
+
+def helper():
+    pass
+"#;
+        let result = ext.run(Path::new("test.py"), code).unwrap();
+        let fn_nodes: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::Function)
+            .collect();
+        assert!(
+            fn_nodes.iter().any(|n| n.id.name == "get_users"),
+            "should still extract get_users function"
+        );
+        assert!(
+            fn_nodes.iter().any(|n| n.id.name == "helper"),
+            "should still extract helper function"
+        );
+        // Both functions extracted AND the ApiEndpoint node
+        let api_nodes: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(api_nodes.len(), 1, "should have exactly 1 ApiEndpoint node");
+    }
 }
