@@ -100,7 +100,11 @@ Address and plausibly fix ALL findings from review, dissent, AND CodeRabbit. No 
 
 **Sources to check:**
 - Step 1 review findings
-- Step 2 dissent findings
+- Step 2 dissent findings — **every Hidden Assumption must be explicitly resolved:**
+  - If the assumption is valid and acceptable: document WHY it's acceptable (scope decision, not an oversight)
+  - If the assumption is wrong or risky: FIX IT before proceeding
+  - "No risk" or "acceptable" verdicts from dissent are NOT automatic passes — they require explicit reasoning in the fix step
+  - **Scope limitations are NOT acceptable when the issue promises broader coverage.** If the feature is supposed to work for all languages, "we only implemented 2 languages" is a blocker, not an assumption.
 - **CodeRabbit PR review** — read all CodeRabbit comments with `gh pr view <PR> --comments` or `gh api repos/{owner}/{repo}/pulls/<PR>/comments`. CodeRabbit posts automated code review comments on every push. Treat these the same as review/dissent findings: fix, or explicitly mark N/A with reasoning.
 
 If nothing to fix across all three sources, skip. Otherwise commit with descriptive messages.
