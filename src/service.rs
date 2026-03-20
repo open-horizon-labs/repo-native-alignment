@@ -472,6 +472,12 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
 
         if let Some(node_id) = node {
             let resolved = gs.resolve_node_id(node_id);
+            if gs.index.get_node(&resolved).is_none() {
+                return format!(
+                    "Node `{}` not found in graph. Use search to find valid node IDs.{freshness}",
+                    strip_root_prefix(&resolved, strip),
+                );
+            }
             return match gs.index.cycle_for_node(&resolved, edge_filter_slice) {
                 Some(ring) => {
                     let labels: Vec<String> = ring.iter()
@@ -526,6 +532,19 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         let edge_filter_slice = edge_filter.as_deref();
         let freshness = format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
         let strip = ctx.root_filter.as_deref();
+
+        if gs.index.get_node(&from_id).is_none() {
+            return format!(
+                "Start node `{}` not found in graph. Use search to find valid node IDs.{freshness}",
+                strip_root_prefix(&from_id, strip),
+            );
+        }
+        if gs.index.get_node(&to_id).is_none() {
+            return format!(
+                "Destination node `{}` not found in graph. Use search to find valid node IDs.{freshness}",
+                strip_root_prefix(&to_id, strip),
+            );
+        }
 
         return match gs.index.shortest_path(&from_id, &to_id, edge_filter_slice) {
             None => format!(

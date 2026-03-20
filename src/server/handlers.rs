@@ -102,7 +102,7 @@ pub(crate) fn run_traversal(index: &GraphIndex, node_id: &str, mode: &str, hops:
         "impact" => { let max_hops = hops.unwrap_or(3) as usize; let default_filter = [EdgeKind::Calls, EdgeKind::ReferencedBy]; let filter = edge_filter.unwrap_or(&default_filter); Ok(index.impact(node_id, max_hops, Some(filter))) }
         "reachable" => { let max_hops = hops.unwrap_or(3) as usize; Ok(index.reachable(node_id, max_hops, edge_filter)) }
         "tests_for" => { if edge_filter.is_some() { return Err("edge_types is not supported with \"tests_for\" mode.".to_string()); } let calls_filter = &[EdgeKind::Calls]; Ok(index.neighbors(node_id, Some(calls_filter), Direction::Incoming)) }
-        other => Err(format!("Unknown mode: \"{}\". Use \"neighbors\", \"impact\", \"reachable\", \"tests_for\", \"cycles\", or \"path\".", other)),
+        other => Err(format!("Unknown mode: \"{}\". Use \"neighbors\", \"impact\", \"reachable\", or \"tests_for\".", other)),
     }
 }
 
@@ -174,7 +174,7 @@ pub(crate) fn run_traversal_grouped(
             }
             Ok(groups)
         }
-        other => Err(format!("Unknown mode: \"{}\". Use \"neighbors\", \"impact\", \"reachable\", \"tests_for\", \"cycles\", or \"path\".", other)),
+        other => Err(format!("Unknown mode: \"{}\". Use \"neighbors\", \"impact\", \"reachable\", or \"tests_for\".", other)),
     }
 }
 
