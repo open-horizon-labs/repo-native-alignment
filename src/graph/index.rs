@@ -3023,4 +3023,100 @@ mod tests {
         let path = index.shortest_path("a", "d", None);
         assert_eq!(path, Some(vec!["b".to_string(), "d".to_string()]));
     }
+
+    // ── Adversarial tests seeded from dissent ────────────────────────────
+    // Dissent finding: "no cycles" when LSP hasn't run (graph has only DependsOn
+    // edges from static analysis but no Calls edges). detect_cycles defaults to
+    // Calls+DependsOn filter so this should still work.
+
+    #[test]
+    fn test_detect_cycles_empty_graph_returns_empty() {
+        // Pre-mortem: graph with no nodes/edges → tarjan_scc should not panic.
+        let index = GraphIndex::new();
+        let rings = index.detect_cycles(None);
+        assert!(rings.is_empty());
+    }
+
+    #[test]
+    fn test_detect_cycles_calls_only_no_depends_on() {
+        // Dissent: default filter is Calls+DependsOn. If a cycle only exists via
+        // DependsOn and we filter to Calls-only, it must not appear.
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::DependsOn);
+        index.add_edge("b", "fn", "a", "fn", EdgeKind::DependsOn);
+
+        // Default filter (Calls+DependsOn): cycle found
+        let rings_default = index.detect_cycles(None);
+        assert_eq!(rings_default.len(), 1);
+
+        // Calls-only filter: no cycle
+        let rings_calls = index.detect_cycles(Some(&[EdgeKind::Calls]));
+        assert!(rings_calls.is_empty());
+    }
+
+    #[test]
+    fn test_detect_cycles_large_ring_all_nodes_present() {
+        // Dissent: large ring output. Verify all 20 nodes are in the ring.
+        let n = 20;
+        let mut index = GraphIndex::new();
+        for i in 0..n {
+            let from = format!("n{}", i);
+            let to   = format!("n{}", (i + 1) % n);
+            index.add_edge(&from, "fn", &to, "fn", EdgeKind::Calls);
+        }
+
+        let rings = index.detect_cycles(None);
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0].len(), n);
+        for i in 0..n {
+            assert!(rings[0].contains(&format!("n{}", i)), "n{} missing from ring", i);
+        }
+    }
+
+    #[test]
+    fn test_cycle_for_node_with_multiple_rings_returns_correct_one() {
+        // Adversarial: two rings, query a node in the second. Must return the
+        // correct ring, not the first one.
+        let mut index = GraphIndex::new();
+        // Ring 1: a -> b -> a
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "a", "fn", EdgeKind::Calls);
+        // Ring 2: x -> y -> z -> x
+        index.add_edge("x", "fn", "y", "fn", EdgeKind::Calls);
+        index.add_edge("y", "fn", "z", "fn", EdgeKind::Calls);
+        index.add_edge("z", "fn", "x", "fn", EdgeKind::Calls);
+
+        let ring = index.cycle_for_node("z", None).expect("z should be in a ring");
+        assert_eq!(ring.len(), 3);
+        assert!(ring.contains(&"x".to_string()));
+        assert!(ring.contains(&"y".to_string()));
+        assert!(ring.contains(&"z".to_string()));
+        assert!(!ring.contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn test_shortest_path_reverse_edge_is_none() {
+        // Dissent: directed edges — caller asking for path in wrong direction.
+        // a -> b exists; b -> a should be None.
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+
+        assert!(index.shortest_path("b", "a", None).is_none());
+    }
+
+    #[test]
+    fn test_shortest_path_unrelated_depends_on_not_followed() {
+        // Dissent: default Calls-only filter. DependsOn edges are NOT followed.
+        // a -Calls-> b, b -DependsOn-> c. From a to c: no path via Calls only.
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::DependsOn);
+
+        // Default (Calls only): no path
+        assert!(index.shortest_path("a", "c", None).is_none());
+
+        // With DependsOn included: path exists
+        let path = index.shortest_path("a", "c", Some(&[EdgeKind::Calls, EdgeKind::DependsOn]));
+        assert_eq!(path, Some(vec!["b".to_string(), "c".to_string()]));
+    }
 }
