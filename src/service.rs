@@ -2650,6 +2650,69 @@ mod tests {
         // fn_b should NOT appear (Calls edge at level 2 is filtered by edge_types=["defines"])
         assert!(!result.contains("filtered_fn_b"), "fn_b should NOT appear (Calls edge is filtered)");
     }
+
+    // ── list_roots_from_slugs tests ─────────────────────────────────────────
+
+    /// When active_slugs is empty, list_roots_from_slugs falls back to
+    /// config-only discovery (same behaviour as the old list_roots).
+    #[test]
+    fn test_list_roots_from_slugs_empty_falls_back_to_config() {
+        let repo = std::env::current_dir().unwrap();
+        let result = list_roots_from_slugs(&repo, &std::collections::HashSet::new());
+        // The primary root always exists (current dir is the RNA repo).
+        assert!(result.contains("## Workspace Roots"), "should produce a roots header");
+        assert!(result.contains("root(s)"), "should report root count");
+    }
+
+    /// When active_slugs contains the primary slug, only that root is shown
+    /// and the config-only fallback is NOT triggered.
+    #[test]
+    fn test_list_roots_from_slugs_filters_to_graph_slugs() {
+        let repo = std::env::current_dir().unwrap();
+        // Build the workspace to find the real primary slug.
+        let workspace = crate::roots::WorkspaceConfig::load()
+            .with_primary_root(repo.clone())
+            .with_worktrees(&repo)
+            .with_claude_memory(&repo)
+            .with_agent_memories(&repo)
+            .with_declared_roots(&repo);
+        let resolved = workspace.resolved_roots();
+        if resolved.is_empty() { return; } // can't test without at least one root
+
+        let primary_slug = resolved[0].slug.clone();
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert(primary_slug.clone());
+
+        let result = list_roots_from_slugs(&repo, &active_slugs);
+        assert!(result.contains("## Workspace Roots"), "should produce header");
+        assert!(result.contains("1 root(s)"), "should show exactly 1 root when only primary slug is active");
+        assert!(result.contains(&primary_slug), "should contain primary slug");
+    }
+
+    /// Orphaned slugs (present in graph but not in config) get a placeholder line.
+    #[test]
+    fn test_list_roots_from_slugs_orphaned_slug_placeholder() {
+        let repo = std::env::current_dir().unwrap();
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert("ghost-root".to_string());
+
+        let result = list_roots_from_slugs(&repo, &active_slugs);
+        assert!(result.contains("ghost-root"), "orphaned slug should appear");
+        assert!(result.contains("path unknown"), "orphaned slug should have placeholder text");
+    }
+
+    /// The "external" pseudo-slug is excluded from the output.
+    #[test]
+    fn test_list_roots_from_slugs_excludes_external() {
+        let repo = std::env::current_dir().unwrap();
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert("external".to_string());
+
+        let result = list_roots_from_slugs(&repo, &active_slugs);
+        // "external" is filtered out; with nothing else the result reports 0 roots
+        // or the fallback fires. Either way "external" must not appear as a root.
+        assert!(!result.contains("**external**"), "external pseudo-slug should be excluded");
+    }
 }
 
 // ── Outcome progress ───────────────────────────────────────────────
@@ -2693,14 +2756,63 @@ pub fn outcome_progress(params: &OutcomeProgressParams, ctx: &OutcomeProgressCon
 
 // ── List roots ──────────────────────────────────────────────────────
 
+/// List roots using a known set of active slugs from the in-memory graph.
+///
+/// When the graph is available, pass its root slugs here so that the output
+/// reflects what is actually loaded — including declared roots that were
+/// persisted to LanceDB and loaded at startup — rather than re-discovering
+/// roots from config at call time.
+///
+/// Roots are ordered: primary first, then others in slug-alphabetical order.
+/// Falls back to config-only discovery when `active_slugs` is empty (e.g.,
+/// graph not yet built).
+pub fn list_roots_from_slugs(repo_root: &Path, active_slugs: &std::collections::HashSet<String>) -> String {
+    let workspace = crate::roots::WorkspaceConfig::load()
+        .with_primary_root(repo_root.to_path_buf())
+        .with_worktrees(repo_root)
+        .with_claude_memory(repo_root)
+        .with_agent_memories(repo_root)
+        .with_declared_roots(repo_root);
+    let all_resolved = workspace.resolved_roots();
+
+    // If we have graph slugs, filter to only roots present in the graph.
+    // Unknown slugs (e.g., roots that exist in config but haven't been scanned)
+    // are excluded. If active_slugs is empty, fall back to all config-resolved roots.
+    let resolved: Vec<_> = if active_slugs.is_empty() {
+        all_resolved
+    } else {
+        all_resolved.into_iter().filter(|r| active_slugs.contains(&r.slug)).collect()
+    };
+
+    // Add any graph slugs not accounted for by config (edge case: a root was
+    // scanned but its config entry was later removed). Emit a placeholder line.
+    let config_slugs: std::collections::HashSet<_> = resolved.iter().map(|r| r.slug.clone()).collect();
+    let mut orphaned: Vec<_> = active_slugs.iter().filter(|s| !config_slugs.contains(*s) && *s != "external").cloned().collect();
+    orphaned.sort();
+
+    if resolved.is_empty() && orphaned.is_empty() {
+        return "No workspace roots configured.".to_string();
+    }
+
+    // Primary root is always first (index 0 in resolved_roots() output).
+    let primary_slug = resolved.first().map(|r| r.slug.as_str()).unwrap_or("");
+    let mut lines: Vec<String> = resolved.iter()
+        .map(|r| {
+            let primary = if r.slug == primary_slug { " (primary)" } else { "" };
+            format!("- **{}**{}: `{}` (type: {}, git: {})", r.slug, primary, r.path.display(), r.config.root_type, r.config.git_aware)
+        })
+        .collect();
+
+    for slug in &orphaned {
+        lines.push(format!("- **{}**: (path unknown — root was scanned but not in current config)", slug));
+    }
+
+    let total = lines.len();
+    format!("## Workspace Roots\n\n{} root(s)\n\n{}", total, lines.join("\n"))
+}
+
 pub fn list_roots(repo_root: &Path) -> String {
-    let workspace = crate::roots::WorkspaceConfig::load().with_primary_root(repo_root.to_path_buf()).with_worktrees(repo_root).with_claude_memory(repo_root).with_agent_memories(repo_root).with_declared_roots(repo_root);
-    let resolved = workspace.resolved_roots();
-    if resolved.is_empty() { return "No workspace roots configured.".to_string(); }
-    let md: String = resolved.iter().enumerate()
-        .map(|(i, r)| { let primary = if i == 0 { " (primary)" } else { "" }; format!("- **{}**{}: `{}` (type: {}, git: {})", r.slug, primary, r.path.display(), r.config.root_type, r.config.git_aware) })
-        .collect::<Vec<_>>().join("\n");
-    format!("## Workspace Roots\n\n{} root(s)\n\n{}", resolved.len(), md)
+    list_roots_from_slugs(repo_root, &std::collections::HashSet::new())
 }
 
 // ── Repo map ────────────────────────────────────────────────────────
