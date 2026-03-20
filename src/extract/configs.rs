@@ -40,10 +40,16 @@ static PYTHON_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
 
 /// TypeScript NestJS / routing-controllers / tsoa decorator query.
 ///
-/// Matches class-method decorators of the form:
+/// Matches HTTP-method decorators on controller methods:
 /// - `@Get("/users")`
 /// - `@Post("/items")`
-/// - `@Controller("/prefix")`
+/// - `@HttpGet("/path")`
+///
+/// NOTE: `@Controller("/prefix")` and `@Route("/prefix")` are intentionally
+/// excluded. These are class-level prefix annotations, not endpoint declarations.
+/// Emitting them as `ApiEndpoint` nodes would create incorrect `GET /prefix`
+/// nodes — the actual endpoints are the combination of prefix + method path.
+/// Path combination (#390) will address this when linking decorators to functions.
 static TYPESCRIPT_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
     label: "typescript-route-decorators",
     query: r#"
@@ -52,7 +58,7 @@ static TYPESCRIPT_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
     function: (identifier) @name
     arguments: (arguments
       (string) @path))
-  (#match? @name "^(Get|Post|Put|Delete|Patch|Head|Options|All|Controller|Route|HttpGet|HttpPost|HttpPut|HttpDelete|HttpPatch)$"))
+  (#match? @name "^(Get|Post|Put|Delete|Patch|Head|Options|HttpGet|HttpPost|HttpPut|HttpDelete|HttpPatch)$"))
 "#,
     default_method: "GET",
 };
@@ -210,6 +216,7 @@ pub static PYTHON_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &["decorator"],
     type_param_node_kind: None,  // Python uses runtime generics (typing.Generic), not tree-sitter type_parameters
     route_queries: &[PYTHON_ROUTE_QUERY],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -254,6 +261,7 @@ pub static TYPESCRIPT_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &["decorator"],
     type_param_node_kind: Some("type_parameters"),
     route_queries: &[TYPESCRIPT_ROUTE_QUERY],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -291,6 +299,7 @@ pub static JAVASCRIPT_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &["decorator"],
     type_param_node_kind: None,  // JavaScript has no generics
     route_queries: &[JAVASCRIPT_ROUTE_QUERY],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -328,6 +337,7 @@ pub static GO_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &[],  // Go has no decorators/attributes
     type_param_node_kind: Some("type_parameter_list"),
     route_queries: &[GO_ROUTE_QUERY],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -372,6 +382,7 @@ pub static JAVA_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &["annotation", "marker_annotation"],
     type_param_node_kind: Some("type_parameters"),
     route_queries: &[JAVA_ROUTE_QUERY],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -412,6 +423,7 @@ pub static KOTLIN_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &["annotation"],
     type_param_node_kind: Some("type_parameters"),
     route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -455,6 +467,7 @@ pub static CSHARP_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &["attribute_list"],
     type_param_node_kind: Some("type_parameter_list"),
     route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -497,6 +510,7 @@ pub static SWIFT_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &[],  // Swift attributes handled via @attribute syntax but tree-sitter-swift uses attribute nodes as children, not siblings
     type_param_node_kind: Some("type_parameters"),
     route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -535,6 +549,7 @@ pub static ZIG_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &[],  // Zig has no decorators/attributes
     type_param_node_kind: None,  // Zig uses comptime generics, not tree-sitter type_parameters
     route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -579,6 +594,7 @@ pub static CPP_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &[],  // C/C++ has no decorators (attributes like [[nodiscard]] are different)
     type_param_node_kind: Some("template_parameter_list"),
     route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -609,6 +625,7 @@ pub static LUA_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &[],  // Lua has no decorators
     type_param_node_kind: None,  // Lua has no generics
     route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -646,6 +663,7 @@ pub static RUBY_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &[],  // Ruby has no decorators (uses method calls instead)
     type_param_node_kind: None,  // Ruby has no generics
     route_queries: &[RUBY_ROUTE_QUERY],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };
 
 // ---------------------------------------------------------------------------
@@ -678,4 +696,5 @@ pub static BASH_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &[],  // Bash has no decorators
     type_param_node_kind: None,  // Bash has no generics
     route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
 };

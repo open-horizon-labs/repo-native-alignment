@@ -124,6 +124,18 @@ pub struct LangConfig {
     /// Queries run as an additional pass after the normal manual traversal
     /// so that all existing symbol extraction is unaffected.
     pub route_queries: &'static [RouteQueryConfig],
+    /// Lazily compiled [`QueryExtractor`]s for `route_queries`.
+    ///
+    /// Each slot corresponds to the `route_queries` entry at the same index.
+    /// A `None` slot indicates that the query at that index failed to compile
+    /// (log warning was emitted at compile time). Using `Option` preserves the
+    /// 1:1 correspondence between `route_queries[i]` and compiled slot `i`.
+    ///
+    /// Populated on the first call to `GenericExtractor::run()` for this
+    /// config and reused for all subsequent files. Since [`QueryExtractor`]
+    /// (and the underlying `tree_sitter::Query`) is `Send + Sync`, this is
+    /// safe to store in a static `OnceLock`.
+    pub compiled_route_queries: std::sync::OnceLock<Vec<Option<QueryExtractor>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -176,29 +188,27 @@ impl GenericExtractor {
         }
 
         // Route query pass — runs after manual traversal; purely additive.
-        // Queries are compiled once per `run()` call (not per file when reused
-        // via the same extractor instance), then applied to the parsed tree.
+        // Queries are compiled lazily on the first call via `compiled_route_queries`
+        // and cached for all subsequent files. This avoids per-file compilation.
         if !self.config.route_queries.is_empty() {
-            let language = (self.config.language_fn)();
-            // Compile all route queries upfront for this language. Each query
-            // is compiled at most once per `GenericExtractor::run()` invocation.
-            // Compilation is O(query_size) and not reused across files, but
-            // compiling ~2 small queries per file is negligible vs. full parse.
-            let compiled: Vec<(&RouteQueryConfig, QueryExtractor)> =
+            let compiled = self.config.compiled_route_queries.get_or_init(|| {
+                let language = (self.config.language_fn)();
                 self.config.route_queries.iter()
-                    .filter_map(|cfg| {
+                    .map(|cfg| {
                         match QueryExtractor::new(&language, cfg.query) {
-                            Ok(qe) => Some((cfg, qe)),
+                            Ok(qe) => Some(qe),
                             Err(err) => {
                                 tracing::warn!("route query '{}' failed to compile: {}", cfg.label, err);
                                 None
                             }
                         }
                     })
-                    .collect();
+                    .collect()
+            });
 
             run_route_queries(
-                &compiled,
+                self.config.route_queries,
+                compiled,
                 tree.root_node(),
                 path,
                 source,
@@ -1170,9 +1180,9 @@ fn infer_method_from_name(name: &str, default: &str) -> String {
 /// Run pre-compiled route queries against a file's syntax tree and emit
 /// [`NodeKind::ApiEndpoint`] nodes for each matched route decorator.
 ///
-/// Callers are responsible for compiling [`RouteQueryConfig`]s into
-/// [`QueryExtractor`]s before calling this function (typically once per
-/// `GenericExtractor::run()` invocation, not per-file).
+/// `configs` and `compiled` must have the same length and ordering — each
+/// `compiled[i]` is `Some(extractor)` if the query at `configs[i]` compiled
+/// successfully, or `None` if compilation failed. The `None` slots are skipped.
 ///
 /// Each matched capture set must have at least a `@path` capture. An optional
 /// `@method` capture overrides `default_method` for the HTTP verb.
@@ -1180,14 +1190,19 @@ fn infer_method_from_name(name: &str, default: &str) -> String {
 /// Called from [`GenericExtractor::run`] after normal manual traversal, so it
 /// is purely additive — existing extraction is unaffected.
 fn run_route_queries(
-    compiled: &[(&RouteQueryConfig, QueryExtractor)],
+    configs: &[RouteQueryConfig],
+    compiled: &[Option<QueryExtractor>],
     root: tree_sitter::Node<'_>,
     path: &Path,
     source: &[u8],
     language_name: &str,
     nodes: &mut Vec<Node>,
 ) {
-    for (cfg, extractor) in compiled {
+    for (cfg, maybe_extractor) in configs.iter().zip(compiled.iter()) {
+        let extractor = match maybe_extractor {
+            Some(e) => e,
+            None => continue, // compile failed; warning already emitted at init
+        };
         let captures: Vec<CaptureSet> = extractor.run(root, source);
         for capture in captures {
             let raw_path = match capture.get("path") {
