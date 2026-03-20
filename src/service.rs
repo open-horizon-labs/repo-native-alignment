@@ -2899,7 +2899,7 @@ mod tests {
 
         let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), Some(&lsp));
         assert!(result.contains("LSP: rust-analyzer"), "should show LSP server, got: {}", result);
-        assert!(result.contains("8,410 Calls edges"), "should show edge count with commas, got: {}", result);
+        assert!(result.contains("8,410 edges"), "should show edge count with commas, got: {}", result);
     }
 
     /// Missing LSP servers are shown only for relevant languages.
@@ -3012,7 +3012,7 @@ mod tests {
         lsp.set_complete(100); // Complete but no server_name set
 
         let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), Some(&lsp));
-        // Should not show "LSP:  (100 Calls edges)" with empty server name.
+        // Should not show "LSP:  (100 edges)" with empty server name.
         // The if let Some(ref name) guard prevents this.
         assert!(!result.contains("LSP:  ("), "should not show LSP line with empty server name, got: {}", result);
     }
@@ -3177,25 +3177,32 @@ pub fn list_roots_from_slugs(
         return "No workspace roots configured.".to_string();
     }
 
-    // Pre-compute per-root node/edge counts from graph state if available.
-    let root_stats: std::collections::HashMap<String, (usize, usize)> = if let Some(gs) = graph_state {
+    // Pre-compute per-root stats in a single pass over nodes and edges.
+    // This keeps list_roots_from_slugs O(nodes + edges + roots) rather than O(roots × nodes).
+    let (root_stats, root_langs_map): (
+        std::collections::HashMap<String, (usize, usize)>,
+        std::collections::HashMap<String, std::collections::BTreeSet<String>>,
+    ) = if let Some(gs) = graph_state {
         let mut node_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let mut edge_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut langs: std::collections::HashMap<String, std::collections::BTreeSet<String>> = std::collections::HashMap::new();
         for n in &gs.nodes {
             *node_counts.entry(n.id.root.clone()).or_insert(0) += 1;
+            langs.entry(n.id.root.clone()).or_default().insert(n.language.to_lowercase());
         }
         for e in &gs.edges {
             *edge_counts.entry(e.from.root.clone()).or_insert(0) += 1;
         }
-        // Merge into single map: (node_count, edge_count) per root
+        // Merge into stats map: (node_count, edge_count) per root
         let all_slugs: std::collections::HashSet<String> = node_counts.keys().chain(edge_counts.keys()).cloned().collect();
-        all_slugs.into_iter().map(|slug| {
+        let stats = all_slugs.into_iter().map(|slug| {
             let nc = node_counts.get(&slug).copied().unwrap_or(0);
             let ec = edge_counts.get(&slug).copied().unwrap_or(0);
             (slug, (nc, ec))
-        }).collect()
+        }).collect();
+        (stats, langs)
     } else {
-        std::collections::HashMap::new()
+        (std::collections::HashMap::new(), std::collections::HashMap::new())
     };
 
     // Last scan age (global — same scan covers all roots).
@@ -3241,20 +3248,20 @@ pub fn list_roots_from_slugs(
             // LSP working line.
             if lsp_complete {
                 if let Some(ref name) = lsp_server_name {
-                    line.push_str(&format!("\n  LSP: {} ({} Calls edges)",
+                    // edge_count() returns all LSP-enriched edges (Calls, ReferencedBy, Implements, etc.)
+                    line.push_str(&format!("\n  LSP: {} ({} edges)",
                         name, format_count(lsp_edge_count)));
                 }
             }
 
-            // LSP available but not installed — filtered to languages in this root.
-            let root_langs: std::collections::HashSet<String> = if let Some(gs) = graph_state {
-                gs.nodes.iter()
-                    .filter(|n| n.id.root == r.slug)
-                    .map(|n| n.language.to_lowercase())
-                    .collect()
-            } else {
-                std::collections::HashSet::new()
-            };
+            // LSP available but not installed — use precomputed per-root languages.
+            let empty_langs = std::collections::BTreeSet::new();
+            let root_langs: std::collections::HashSet<String> = root_langs_map
+                .get(&r.slug)
+                .unwrap_or(&empty_langs)
+                .iter()
+                .cloned()
+                .collect();
 
             let relevant_missing: Vec<&str> = missing_servers.iter()
                 .filter(|server| lsp_server_relevant_for_languages(server, &root_langs))
