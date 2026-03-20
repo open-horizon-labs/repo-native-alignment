@@ -194,8 +194,8 @@ mod tests {
 
     #[test]
     fn test_schema_version_constant() {
-        // SCHEMA_VERSION must be at least 12 (bumped for diagnostic columns)
-        assert!(SCHEMA_VERSION >= 12, "SCHEMA_VERSION should be >= 12");
+        // SCHEMA_VERSION must be at least 13 (bumped for ApiEndpoint http_method/http_path columns)
+        assert!(SCHEMA_VERSION >= 13, "SCHEMA_VERSION should be >= 13");
     }
 
     #[test]
@@ -227,6 +227,9 @@ mod tests {
         assert!(schema.field_with_name("diagnostic_message").is_ok());
         assert!(schema.field_with_name("diagnostic_range").is_ok());
         assert!(schema.field_with_name("diagnostic_timestamp").is_ok());
+        // ApiEndpoint columns (added for NodeKind::ApiEndpoint nodes)
+        assert!(schema.field_with_name("http_method").is_ok());
+        assert!(schema.field_with_name("http_path").is_ok());
         assert!(schema.field_with_name("updated_at").is_ok());
         // no vector column in base schema
         assert!(schema.field_with_name("vector").is_err());
