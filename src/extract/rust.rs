@@ -57,6 +57,7 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &["attribute_item"],
     type_param_node_kind: Some("type_parameters"),
+    docstring_in_body: false,
 };
 
 /// Rust tree-sitter extractor with topology pattern detection.

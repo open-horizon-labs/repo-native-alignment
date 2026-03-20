@@ -114,6 +114,16 @@ pub struct LangConfig {
     /// Most languages use `"type_parameters"`, Go uses `"type_parameter_list"`.
     /// None = skip type parameter extraction for this language.
     pub type_param_node_kind: Option<&'static str>,
+    /// Whether this language places its doc comment (docstring) as the first
+    /// expression_statement in the function/class body rather than as a
+    /// preceding comment sibling.
+    ///
+    /// `true` for Python (`"""docstring"""`), `false` for all other languages
+    /// (which use preceding line_comment / block_comment siblings).
+    ///
+    /// When `true`, `collect_doc_comment()` also checks the first string
+    /// literal in the node's `body` field child.
+    pub docstring_in_body: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +288,7 @@ fn collect_nodes(
             // comment markers (///, /**, //) to expose the plain intent text for
             // semantic search. Stored as metadata["doc_comment"].
             {
-                let doc_comment = collect_doc_comment(node, source, config.language_name);
+                let doc_comment = collect_doc_comment(node, source, config);
                 if !doc_comment.is_empty() {
                     metadata.insert("doc_comment".to_string(), doc_comment);
                 }
@@ -963,8 +973,9 @@ fn collect_decorators(
 fn collect_doc_comment(
     node: tree_sitter::Node,
     source: &[u8],
-    language_name: &str,
+    config: &LangConfig,
 ) -> String {
+    let language_name = config.language_name;
     // The node kinds that represent comments in each language.
     // All of these trigger the preceding-sibling walk.
     const COMMENT_KINDS: &[&str] = &[
@@ -997,10 +1008,11 @@ fn collect_doc_comment(
     // Preceding-sibling walk collects in reverse order; restore source order.
     comment_lines.reverse();
 
-    // Python docstring: the first expression_statement child whose value
-    // is a string literal, when it immediately follows `def`/`class`.
+    // Body docstring (Python style): the first expression_statement child
+    // whose value is a string literal. Controlled by config.docstring_in_body
+    // to avoid language-specific logic in generic.rs.
     // This handles `def foo(): """docstring""" ...`
-    if comment_lines.is_empty() && (language_name == "python") {
+    if comment_lines.is_empty() && config.docstring_in_body {
         if let Some(body_node) = node.child_by_field_name("body") {
             for i in 0..body_node.child_count() {
                 if let Some(child) = body_node.child(i as u32) {
