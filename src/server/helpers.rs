@@ -291,6 +291,22 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
                 }
             }
         }
+        // Diagnostic-specific metadata (only present on NodeKind::Other("diagnostic") nodes)
+        if let Some(severity) = n.metadata.get("diagnostic_severity") {
+            entry.push_str(&format!("\n  Severity: {}", severity));
+        }
+        if let Some(source) = n.metadata.get("diagnostic_source") {
+            entry.push_str(&format!("\n  Source: {}", source));
+        }
+        if let Some(msg) = n.metadata.get("diagnostic_message") {
+            entry.push_str(&format!("\n  Message: {}", msg));
+        }
+        if let Some(range) = n.metadata.get("diagnostic_range") {
+            entry.push_str(&format!("\n  Range: {}", range));
+        }
+        if let Some(ts) = n.metadata.get("diagnostic_timestamp") {
+            entry.push_str(&format!("\n  Captured: {}", ts));
+        }
         if !outgoing.is_empty() {
             entry.push_str(&format!("\n  Out: {} edge(s)", outgoing.len()));
         }

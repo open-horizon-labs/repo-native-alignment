@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search`.
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -28,6 +28,11 @@ pub const SCHEMA_VERSION: u32 = 11;
 /// - `value`         — constant value for Const nodes
 /// - `synthetic`     — true for synthetic/inferred constants (e.g. YAML scalar key-values)
 /// - `pattern_hint`  — design pattern detected from naming conventions (e.g. "factory", "observer")
+/// - `diagnostic_severity`  — "error" or "warning" (for NodeKind::Other("diagnostic") nodes)
+/// - `diagnostic_source`    — LSP server name (e.g. "rust-analyzer")
+/// - `diagnostic_message`   — full diagnostic message text
+/// - `diagnostic_range`     — "line:col-end_line:end_col" string
+/// - `diagnostic_timestamp` — unix timestamp (seconds) when diagnostic was captured
 ///
 /// bump SCHEMA_VERSION in store.rs when changing this
 pub fn symbols_schema() -> Schema {
@@ -55,6 +60,12 @@ pub fn symbols_schema() -> Schema {
         Field::new("type_params", DataType::Utf8, true),       // metadata["type_params"] — generic type parameters (e.g. "<T: Clone + Send>")
         Field::new("pattern_hint", DataType::Utf8, true),        // metadata["pattern_hint"] — design pattern from naming conventions (e.g. "factory", "observer")
         Field::new("is_static", DataType::Boolean, true),           // metadata["is_static"] — true for static/associated methods, false for instance methods
+        // Diagnostic columns — populated for NodeKind::Other("diagnostic") nodes
+        Field::new("diagnostic_severity", DataType::Utf8, true),    // "error" | "warning"
+        Field::new("diagnostic_source", DataType::Utf8, true),      // LSP server name
+        Field::new("diagnostic_message", DataType::Utf8, true),     // full diagnostic text
+        Field::new("diagnostic_range", DataType::Utf8, true),       // "line:col-end_line:end_col"
+        Field::new("diagnostic_timestamp", DataType::Utf8, true),   // unix timestamp string
         // Vector column is added dynamically when embeddings are computed,
         // since the dimension depends on the model. See `symbols_schema_with_vector`.
         Field::new("updated_at", DataType::Int64, false),
@@ -89,6 +100,12 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("type_params", DataType::Utf8, true),
         Field::new("pattern_hint", DataType::Utf8, true),
         Field::new("is_static", DataType::Boolean, true),
+        // Diagnostic columns — populated for NodeKind::Other("diagnostic") nodes
+        Field::new("diagnostic_severity", DataType::Utf8, true),
+        Field::new("diagnostic_source", DataType::Utf8, true),
+        Field::new("diagnostic_message", DataType::Utf8, true),
+        Field::new("diagnostic_range", DataType::Utf8, true),
+        Field::new("diagnostic_timestamp", DataType::Utf8, true),
         Field::new(
             "vector",
             DataType::FixedSizeList(
@@ -169,8 +186,8 @@ mod tests {
 
     #[test]
     fn test_schema_version_constant() {
-        // SCHEMA_VERSION must be at least 8 (bumped for type_params column)
-        assert!(SCHEMA_VERSION >= 8, "SCHEMA_VERSION should be >= 8");
+        // SCHEMA_VERSION must be at least 12 (bumped for diagnostic columns)
+        assert!(SCHEMA_VERSION >= 12, "SCHEMA_VERSION should be >= 12");
     }
 
     #[test]
@@ -196,6 +213,12 @@ mod tests {
         assert!(schema.field_with_name("decorators").is_ok());
         assert!(schema.field_with_name("type_params").is_ok());
         assert!(schema.field_with_name("is_static").is_ok());
+        // Diagnostic columns (added for NodeKind::Other("diagnostic") nodes)
+        assert!(schema.field_with_name("diagnostic_severity").is_ok());
+        assert!(schema.field_with_name("diagnostic_source").is_ok());
+        assert!(schema.field_with_name("diagnostic_message").is_ok());
+        assert!(schema.field_with_name("diagnostic_range").is_ok());
+        assert!(schema.field_with_name("diagnostic_timestamp").is_ok());
         assert!(schema.field_with_name("updated_at").is_ok());
         // no vector column in base schema
         assert!(schema.field_with_name("vector").is_err());
