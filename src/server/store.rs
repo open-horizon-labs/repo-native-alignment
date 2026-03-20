@@ -403,6 +403,22 @@ pub(crate) async fn persist_graph_to_lance(
                 None => is_static_builder.append_null(),
             }
         }
+        // Diagnostic metadata columns
+        let diag_severities: Vec<Option<String>> = nodes.iter()
+            .map(|n| n.metadata.get("diagnostic_severity").cloned())
+            .collect();
+        let diag_sources: Vec<Option<String>> = nodes.iter()
+            .map(|n| n.metadata.get("diagnostic_source").cloned())
+            .collect();
+        let diag_messages: Vec<Option<String>> = nodes.iter()
+            .map(|n| n.metadata.get("diagnostic_message").cloned())
+            .collect();
+        let diag_ranges: Vec<Option<String>> = nodes.iter()
+            .map(|n| n.metadata.get("diagnostic_range").cloned())
+            .collect();
+        let diag_timestamps: Vec<Option<String>> = nodes.iter()
+            .map(|n| n.metadata.get("diagnostic_timestamp").cloned())
+            .collect();
         let updated_ats: Vec<i64> = vec![now; nodes.len()];
 
         let batch = RecordBatch::try_new(
@@ -430,6 +446,11 @@ pub(crate) async fn persist_graph_to_lance(
                 Arc::new(StringArray::from(type_params_col)),
                 Arc::new(StringArray::from(pattern_hints)),
                 Arc::new(is_static_builder.finish()),
+                Arc::new(StringArray::from(diag_severities)),
+                Arc::new(StringArray::from(diag_sources)),
+                Arc::new(StringArray::from(diag_messages)),
+                Arc::new(StringArray::from(diag_ranges)),
+                Arc::new(StringArray::from(diag_timestamps)),
                 Arc::new(Int64Array::from(updated_ats)),
             ],
         )?;
@@ -659,6 +680,22 @@ pub(crate) async fn persist_graph_incremental(
                     None => is_static_builder.append_null(),
                 }
             }
+            // Diagnostic metadata columns
+            let diag_severities: Vec<Option<String>> = upsert_nodes.iter()
+                .map(|n| n.metadata.get("diagnostic_severity").cloned())
+                .collect();
+            let diag_sources: Vec<Option<String>> = upsert_nodes.iter()
+                .map(|n| n.metadata.get("diagnostic_source").cloned())
+                .collect();
+            let diag_messages: Vec<Option<String>> = upsert_nodes.iter()
+                .map(|n| n.metadata.get("diagnostic_message").cloned())
+                .collect();
+            let diag_ranges: Vec<Option<String>> = upsert_nodes.iter()
+                .map(|n| n.metadata.get("diagnostic_range").cloned())
+                .collect();
+            let diag_timestamps: Vec<Option<String>> = upsert_nodes.iter()
+                .map(|n| n.metadata.get("diagnostic_timestamp").cloned())
+                .collect();
             let updated_ats: Vec<i64> = vec![now; upsert_nodes.len()];
 
             let batch = RecordBatch::try_new(
@@ -686,6 +723,11 @@ pub(crate) async fn persist_graph_incremental(
                     Arc::new(StringArray::from(type_params_col)),
                     Arc::new(StringArray::from(pattern_hints)),
                     Arc::new(is_static_builder.finish()),
+                    Arc::new(StringArray::from(diag_severities)),
+                    Arc::new(StringArray::from(diag_sources)),
+                    Arc::new(StringArray::from(diag_messages)),
+                    Arc::new(StringArray::from(diag_ranges)),
+                    Arc::new(StringArray::from(diag_timestamps)),
                     Arc::new(Int64Array::from(updated_ats)),
                 ],
             )?;
@@ -899,6 +941,17 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             let is_static_col = batch.column_by_name("is_static")
                 .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
+            // Diagnostic metadata columns (nullable — only present on diagnostic nodes)
+            let diag_severity_col = batch.column_by_name("diagnostic_severity")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let diag_source_col = batch.column_by_name("diagnostic_source")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let diag_message_col = batch.column_by_name("diagnostic_message")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let diag_range_col = batch.column_by_name("diagnostic_range")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let diag_timestamp_col = batch.column_by_name("diagnostic_timestamp")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
             for i in 0..batch.num_rows() {
                 let file_path = PathBuf::from(file_paths.value(i));
@@ -976,6 +1029,46 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 if let Some(col) = is_static_col {
                     if !col.is_null(i) {
                         metadata.insert("is_static".to_string(), if col.value(i) { "true" } else { "false" }.to_string());
+                    }
+                }
+                if let Some(col) = diag_severity_col {
+                    if !col.is_null(i) {
+                        let val = col.value(i);
+                        if !val.is_empty() {
+                            metadata.insert("diagnostic_severity".to_string(), val.to_string());
+                        }
+                    }
+                }
+                if let Some(col) = diag_source_col {
+                    if !col.is_null(i) {
+                        let val = col.value(i);
+                        if !val.is_empty() {
+                            metadata.insert("diagnostic_source".to_string(), val.to_string());
+                        }
+                    }
+                }
+                if let Some(col) = diag_message_col {
+                    if !col.is_null(i) {
+                        let val = col.value(i);
+                        if !val.is_empty() {
+                            metadata.insert("diagnostic_message".to_string(), val.to_string());
+                        }
+                    }
+                }
+                if let Some(col) = diag_range_col {
+                    if !col.is_null(i) {
+                        let val = col.value(i);
+                        if !val.is_empty() {
+                            metadata.insert("diagnostic_range".to_string(), val.to_string());
+                        }
+                    }
+                }
+                if let Some(col) = diag_timestamp_col {
+                    if !col.is_null(i) {
+                        let val = col.value(i);
+                        if !val.is_empty() {
+                            metadata.insert("diagnostic_timestamp".to_string(), val.to_string());
+                        }
                     }
                 }
                 nodes.push(Node {

@@ -271,6 +271,13 @@ struct PipelinedTransport {
     /// non-async (just HashMap insert/remove) and we want minimal overhead
     /// under high concurrency.
     pending: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>>,
+    /// Buffer for textDocument/publishDiagnostics notifications.
+    /// Maps document URI to the most-recently-received diagnostics array.
+    /// The reader loop fills this as notifications arrive; enrichment reads it
+    /// via the shared Arc in `LspState.diagnostics_sink`.
+    /// This field is kept here to ensure the sink lives as long as the transport.
+    #[allow(dead_code)]
+    diagnostics_sink: Arc<std::sync::Mutex<HashMap<String, Vec<serde_json::Value>>>>,
     /// Handle to the background reader task (for cleanup).
     _reader_handle: tokio::task::JoinHandle<()>,
     /// The child process (kept alive; kill_on_drop).
@@ -278,9 +285,13 @@ struct PipelinedTransport {
 }
 
 impl PipelinedTransport {
-    /// Convert a sequential `LspTransport` into a pipelined one.
-    /// This consumes the transport and spawns a background reader task.
-    fn from_sequential(mut transport: LspTransport) -> Self {
+    /// Convert a sequential `LspTransport` into a pipelined one with a shared
+    /// diagnostics sink. The caller provides the sink so it can read captured
+    /// `textDocument/publishDiagnostics` notifications after enrichment.
+    fn from_sequential_with_diag_sink(
+        mut transport: LspTransport,
+        diagnostics_sink: Arc<std::sync::Mutex<HashMap<String, Vec<serde_json::Value>>>>,
+    ) -> Self {
         let stdin = transport.child.stdin.take().expect("stdin already taken");
         let reader = transport.reader;
         let next_id = transport.next_id;
@@ -289,14 +300,16 @@ impl PipelinedTransport {
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         let pending_clone = Arc::clone(&pending);
+        let diag_clone = Arc::clone(&diagnostics_sink);
         let reader_handle = tokio::spawn(async move {
-            Self::reader_loop(reader, pending_clone).await;
+            Self::reader_loop(reader, pending_clone, diag_clone).await;
         });
 
         Self {
             writer: Mutex::new(stdin),
             next_id: AtomicI64::new(next_id),
             pending,
+            diagnostics_sink,
             _reader_handle: reader_handle,
             _child: Arc::new(Mutex::new(transport.child)),
         }
@@ -304,9 +317,12 @@ impl PipelinedTransport {
 
     /// Background reader loop: reads messages from the LSP server and
     /// dispatches responses to waiting callers by request ID.
+    /// Also captures `textDocument/publishDiagnostics` notifications into
+    /// `diagnostics_sink` (keyed by document URI) for later consumption.
     async fn reader_loop(
         mut reader: BufReader<tokio::process::ChildStdout>,
         pending: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>>,
+        diagnostics_sink: Arc<std::sync::Mutex<HashMap<String, Vec<serde_json::Value>>>>,
     ) {
         loop {
             // Read a single Content-Length framed message
@@ -351,7 +367,7 @@ impl PipelinedTransport {
                 }
             }
 
-            // Notifications: log progress, ignore the rest
+            // Notifications: log progress, capture diagnostics, ignore the rest
             if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
                 match method {
                     "$/progress" => {
@@ -365,6 +381,24 @@ impl PipelinedTransport {
                         let health = msg.pointer("/params/health").and_then(|h| h.as_str()).unwrap_or("");
                         let quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(true);
                         tracing::debug!("PipelinedTransport serverStatus: health={}, quiescent={}", health, quiescent);
+                    }
+                    "textDocument/publishDiagnostics" => {
+                        // Capture diagnostics for later consumption.
+                        // params.uri: document URI
+                        // params.diagnostics: array of Diagnostic objects
+                        if let Some(uri) = msg.pointer("/params/uri").and_then(|u| u.as_str()) {
+                            let diags = msg.pointer("/params/diagnostics")
+                                .and_then(|d| d.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            let mut sink = diagnostics_sink.lock().unwrap();
+                            if diags.is_empty() {
+                                // Empty diagnostic list means this file is clean — remove any prior entry
+                                sink.remove(uri);
+                            } else {
+                                sink.insert(uri.to_string(), diags);
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -498,9 +532,16 @@ struct LspState {
     has_type_hierarchy: bool,
     /// Whether the language server supports textDocument/references requests.
     has_references: bool,
+    /// Whether the language server supports pull-based diagnostics
+    /// (`textDocument/diagnostic`, LSP 3.17+).
+    has_pull_diagnostics: bool,
     /// Consecutive type hierarchy failures. After MAX_TYPE_HIERARCHY_STRIKES,
     /// type hierarchy is disabled for the rest of the session.
     type_hierarchy_strikes: u32,
+    /// Shared diagnostics buffer populated by the pipelined transport's reader
+    /// loop from `textDocument/publishDiagnostics` notifications.
+    /// Maps document URI → list of LSP Diagnostic objects (JSON).
+    diagnostics_sink: Arc<std::sync::Mutex<HashMap<String, Vec<serde_json::Value>>>>,
 }
 
 /// After this many consecutive type hierarchy failures, disable type hierarchy
@@ -546,7 +587,9 @@ impl LspEnricher {
                 init_failed: false,
                 has_type_hierarchy: false,
                 has_references: false,
+                has_pull_diagnostics: false,
                 type_hierarchy_strikes: 0,
+                diagnostics_sink: Arc::new(std::sync::Mutex::new(HashMap::new())),
             }),
         }
     }
@@ -681,18 +724,25 @@ impl LspEnricher {
             .map(|v| !v.is_null())
             .unwrap_or(false);
 
+        // Check pull-based diagnostics capability (LSP 3.17+, "diagnosticProvider")
+        let has_pull_diagnostics = init_result
+            .pointer("/capabilities/diagnosticProvider")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+
         let init_result_parsed: InitializeResult = serde_json::from_value(init_result)
             .context("Failed to parse initialize result")?;
 
         let has_references = init_result_parsed.capabilities.references_provider.is_some();
         let has_implementation = init_result_parsed.capabilities.implementation_provider.is_some();
         tracing::info!(
-            "{} capabilities: references={}, implementation={}, type_hierarchy={}",
-            self.server_command, has_references, has_implementation, has_type_hierarchy
+            "{} capabilities: references={}, implementation={}, type_hierarchy={}, pull_diagnostics={}",
+            self.server_command, has_references, has_implementation, has_type_hierarchy, has_pull_diagnostics
         );
 
         state.has_type_hierarchy = has_type_hierarchy;
         state.has_references = has_references;
+        state.has_pull_diagnostics = has_pull_diagnostics;
 
         // Send initialized notification
         let transport = state.transport.as_mut().unwrap();
@@ -810,9 +860,12 @@ impl LspEnricher {
 
         tracing::info!("{} ready for {}", self.server_command, self.language);
 
-        // Convert to pipelined transport for concurrent request support
+        // Convert to pipelined transport for concurrent request support.
+        // Share the diagnostics sink so publishDiagnostics notifications received
+        // during enrichment are captured for later conversion to diagnostic nodes.
         if let Some(transport) = state.transport.take() {
-            let pipelined = PipelinedTransport::from_sequential(transport);
+            let diag_sink = Arc::clone(&state.diagnostics_sink);
+            let pipelined = PipelinedTransport::from_sequential_with_diag_sink(transport, diag_sink);
             tracing::info!("{} converted to pipelined transport", self.server_command);
             state.pipelined = Some(Arc::new(pipelined));
         }
@@ -1204,6 +1257,139 @@ impl LspEnricher {
         Ok(result.as_array().cloned().unwrap_or_default())
     }
 
+    /// Request pull-based diagnostics for a single file (LSP 3.17+).
+    /// Returns an empty Vec if the server returns null or an error.
+    async fn pull_diagnostics_p(
+        transport: &PipelinedTransport,
+        file_uri: &Uri,
+    ) -> Result<Vec<serde_json::Value>> {
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri.as_str() }
+        });
+        let result: serde_json::Value = transport
+            .request("textDocument/diagnostic", &params)
+            .await?;
+        if result.is_null() { return Ok(Vec::new()); }
+        // Response is a DocumentDiagnosticReport — either "full" or "unchanged"
+        // Full: { kind: "full", items: [...] }
+        // Unchanged: { kind: "unchanged", resultId: "..." }
+        let kind = result.get("kind").and_then(|k| k.as_str()).unwrap_or("full");
+        if kind == "unchanged" {
+            return Ok(Vec::new());
+        }
+        Ok(result.get("items").and_then(|i| i.as_array()).cloned().unwrap_or_default())
+    }
+
+    /// Convert raw LSP diagnostic severity integer to a lowercase string.
+    ///
+    /// Per LSP spec:
+    ///   1 = Error, 2 = Warning, 3 = Information, 4 = Hint
+    fn lsp_severity_to_str(severity: u64) -> &'static str {
+        match severity {
+            1 => "error",
+            2 => "warning",
+            3 => "information",
+            4 => "hint",
+            _ => "unknown",
+        }
+    }
+
+    /// Build diagnostic `Node`s from a set of LSP diagnostics for one file.
+    ///
+    /// Only Error and Warning severities are stored by default — Information
+    /// and Hint are too noisy and rarely actionable for code-understanding queries.
+    /// Files with zero Error/Warning diagnostics produce no nodes.
+    fn build_diagnostic_nodes(
+        file_uri: &str,
+        diagnostics: &[serde_json::Value],
+        root: &Path,
+        root_id: &str,
+        server_command: &str,
+        language: &str,
+        timestamp: &str,
+    ) -> Vec<Node> {
+        // Resolve file path from URI
+        let rel_path = {
+            let abs = match url::Url::parse(file_uri).ok().and_then(|u| u.to_file_path().ok()) {
+                Some(p) => p,
+                None => {
+                    if let Some(p) = file_uri.strip_prefix("file://") {
+                        PathBuf::from(p)
+                    } else {
+                        return Vec::new();
+                    }
+                }
+            };
+            abs.strip_prefix(root).unwrap_or(&abs).to_path_buf()
+        };
+
+        // Skip external paths
+        if rel_path.to_string_lossy().contains(".cargo") {
+            return Vec::new();
+        }
+
+        let mut nodes = Vec::new();
+
+        for diag in diagnostics {
+            let severity_int = diag.get("severity").and_then(|s| s.as_u64()).unwrap_or(1);
+            // Only store Error (1) and Warning (2). Severity 0 is not a valid LSP severity.
+            // Severity 3 (Information) and 4 (Hint) are too noisy for code-understanding queries.
+            if severity_int != 1 && severity_int != 2 {
+                continue;
+            }
+            let severity = Self::lsp_severity_to_str(severity_int);
+            let message = diag.get("message").and_then(|m| m.as_str()).unwrap_or("").trim().to_string();
+            if message.is_empty() {
+                continue;
+            }
+            let source = diag.get("source").and_then(|s| s.as_str()).unwrap_or(server_command);
+
+            let start_line = diag.pointer("/range/start/line").and_then(|l| l.as_u64()).unwrap_or(0) as usize + 1;
+            let start_char = diag.pointer("/range/start/character").and_then(|c| c.as_u64()).unwrap_or(0);
+            let end_line = diag.pointer("/range/end/line").and_then(|l| l.as_u64()).unwrap_or(0) as usize + 1;
+            let end_char = diag.pointer("/range/end/character").and_then(|c| c.as_u64()).unwrap_or(0);
+            let range_str = format!("{}:{}-{}:{}", start_line, start_char, end_line, end_char);
+
+            // Name: truncated message + line number for human readability in search results.
+            // Including the start line ensures that identical messages at different positions
+            // produce distinct NodeIds (preventing silent overwrites in LanceDB).
+            let name_snippet = if message.len() > 80 {
+                format!("{}...", &message[..77])
+            } else {
+                message.clone()
+            };
+            // Node name encodes severity + line + snippet for quick scanning and uniqueness
+            let node_name = format!("[{}:{}] {}", severity, start_line, name_snippet);
+
+            let mut metadata = std::collections::BTreeMap::new();
+            metadata.insert("diagnostic_severity".to_string(), severity.to_string());
+            metadata.insert("diagnostic_source".to_string(), source.to_string());
+            metadata.insert("diagnostic_message".to_string(), message.clone());
+            metadata.insert("diagnostic_range".to_string(), range_str);
+            metadata.insert("diagnostic_timestamp".to_string(), timestamp.to_string());
+
+            let node_id = NodeId {
+                root: root_id.to_string(),
+                file: rel_path.clone(),
+                name: node_name.clone(),
+                kind: NodeKind::Other("diagnostic".to_string()),
+            };
+
+            nodes.push(Node {
+                id: node_id,
+                language: language.to_string(),
+                line_start: start_line,
+                line_end: end_line,
+                signature: format!("{}: {}", severity, message),
+                body: String::new(),
+                metadata,
+                source: ExtractionSource::Lsp,
+            });
+        }
+
+        nodes
+    }
+
 }
 
 #[async_trait::async_trait]
@@ -1247,7 +1433,7 @@ impl Enricher for LspEnricher {
         }
 
         // Extract state under lock, then release the lock for concurrent work
-        let (transport, root, has_type_hierarchy, type_hierarchy_strikes, has_references) = {
+        let (transport, root, has_type_hierarchy, type_hierarchy_strikes, has_references, has_pull_diagnostics, diag_sink) = {
             let state = self.state.lock().await;
             let root = state
                 .root_path
@@ -1257,7 +1443,8 @@ impl Enricher for LspEnricher {
                 Some(t) => Arc::clone(t),
                 None => return Ok(result),
             };
-            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references)
+            let diag_sink = Arc::clone(&state.diagnostics_sink);
+            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references, state.has_pull_diagnostics, diag_sink)
         };
         // State lock is released here — concurrent tasks can proceed
 
@@ -1277,10 +1464,14 @@ impl Enricher for LspEnricher {
         // Functions (call hierarchy), Traits (implementations), and Other (document links).
         // Skip test functions — they don't have meaningful cross-file callers
         // and halve the total RPC count.
+        // Also skip diagnostic nodes (Other("diagnostic")) to prevent them from being
+        // re-enriched via the generic Other/documentLink path on subsequent passes —
+        // which would generate spurious DependsOn edges from diagnostics.
         let enrichable_nodes: Vec<&Node> = matching_nodes.iter()
             .filter(|n| matches!(n.id.kind,
                 NodeKind::Function | NodeKind::Trait | NodeKind::Other(_)
                 | NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const))
+            .filter(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "diagnostic"))
             .filter(|n| {
                 // Skip test functions (have #[test] or #[tokio::test] decorator)
                 if n.id.kind == NodeKind::Function {
@@ -1813,10 +2004,117 @@ impl Enricher for LspEnricher {
             state.has_type_hierarchy = has_type_hierarchy;
         }
 
+        // ------------------------------------------------------------------
+        // Pass 3: diagnostics.
+        //
+        // Strategy: prefer pull-based diagnostics (textDocument/diagnostic,
+        // LSP 3.17+) when the server advertised `diagnosticProvider`. For
+        // servers that only push (`textDocument/publishDiagnostics`), fall
+        // back to what the pipelined reader loop captured in `diag_sink`.
+        //
+        // Only Error and Warning severities produce nodes.
+        // Files with zero qualifying diagnostics produce no nodes (clean-file rule).
+        // ------------------------------------------------------------------
+        let diag_timestamp = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs().to_string())
+                .unwrap_or_else(|_| "0".to_string())
+        };
+
+        // Collect unique files from matching_nodes so we can request pull diagnostics
+        // for exactly the files we already enriched (no extra LSP sessions).
+        let unique_files: Vec<PathBuf> = {
+            let mut seen = std::collections::HashSet::new();
+            matching_nodes.iter()
+                .map(|n| n.id.file.clone())
+                .filter(|f| seen.insert(f.clone()))
+                .collect()
+        };
+
+        // Use the canonical root ID from the graph (from matching_nodes), not the filesystem
+        // path. This ensures diagnostic NodeIds live in the same namespace as all other nodes
+        // and are correctly handled by root-prefix stripping and stale-root pruning.
+        let root_id = matching_nodes
+            .first()
+            .map(|n| n.id.root.clone())
+            .unwrap_or_default();
+
+        if has_pull_diagnostics {
+            tracing::info!(
+                "LSP diagnostics pass: pull-based for {} files ({})",
+                unique_files.len(), self.server_command
+            );
+            // Pull diagnostics per unique file
+            for rel_file in &unique_files {
+                let abs_path = root.join(rel_file);
+                let file_uri = match path_to_uri(&abs_path) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                match Self::pull_diagnostics_p(&transport, &file_uri).await {
+                    Ok(diags) => {
+                        let nodes = Self::build_diagnostic_nodes(
+                            file_uri.as_str(),
+                            &diags,
+                            &root,
+                            &root_id,
+                            &self.server_command,
+                            &self.language,
+                            &diag_timestamp,
+                        );
+                        result.new_nodes.extend(nodes);
+                    }
+                    Err(e) => {
+                        tracing::debug!("textDocument/diagnostic failed for {}: {}", rel_file.display(), e);
+                    }
+                }
+            }
+        } else {
+            // Fall back to push-captured diagnostics from the reader loop.
+            // Limit to URIs that correspond to this pass's files — prevents
+            // re-emitting stale diagnostics for files no longer in matching_nodes.
+            let expected_uris: std::collections::HashSet<String> = unique_files
+                .iter()
+                .filter_map(|rel_file| path_to_uri(&root.join(rel_file)).ok().map(|u| u.to_string()))
+                .collect();
+
+            let captured: HashMap<String, Vec<serde_json::Value>> = {
+                let sink = diag_sink.lock().unwrap();
+                sink.clone()
+            };
+            let relevant_count = captured.keys().filter(|u| expected_uris.contains(*u)).count();
+            tracing::info!(
+                "LSP diagnostics pass: push-captured {}/{} relevant files with diagnostics ({})",
+                relevant_count, captured.len(), self.server_command
+            );
+            for (uri, diags) in &captured {
+                // Only convert diagnostics for files in this pass
+                if !expected_uris.contains(uri) {
+                    continue;
+                }
+                let nodes = Self::build_diagnostic_nodes(
+                    uri,
+                    diags,
+                    &root,
+                    &root_id,
+                    &self.server_command,
+                    &self.language,
+                    &diag_timestamp,
+                );
+                result.new_nodes.extend(nodes);
+            }
+        }
+
+        let diag_count = result.new_nodes.iter()
+            .filter(|n| matches!(&n.id.kind, NodeKind::Other(s) if s == "diagnostic"))
+            .count();
         tracing::info!(
-            "LSP enrichment complete for {}: {} edges added ({} attempted, {} errors)",
+            "LSP enrichment complete for {}: {} edges, {} diagnostic nodes ({} attempted, {} errors)",
             self.language,
             result.added_edges.len(),
+            diag_count,
             attempted,
             errors,
         );
@@ -2773,5 +3071,435 @@ mod tests {
             .count();
         assert!(calls_edges > 50,
             "expected >50 Calls edges, got {}", calls_edges);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for build_diagnostic_nodes (pure function, no LSP server needed)
+    // -----------------------------------------------------------------------
+
+    /// Verify that error and warning diagnostics produce nodes.
+    #[test]
+    fn test_build_diagnostic_nodes_basic() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 1,
+                "message": "type mismatch",
+                "source": "rust-analyzer",
+                "range": {
+                    "start": { "line": 141, "character": 4 },
+                    "end": { "line": 141, "character": 20 }
+                }
+            }),
+            serde_json::json!({
+                "severity": 2,
+                "message": "unused variable: `x`",
+                "source": "rust-analyzer",
+                "range": {
+                    "start": { "line": 88, "character": 8 },
+                    "end": { "line": 88, "character": 9 }
+                }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/service.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+
+        assert_eq!(nodes.len(), 2, "error and warning should produce 2 nodes");
+
+        // Check error node — name format is "[severity:line] message"
+        let error_node = nodes.iter().find(|n| n.id.name.starts_with("[error:142]")).unwrap();
+        assert_eq!(error_node.id.file, PathBuf::from("src/service.rs"));
+        assert_eq!(error_node.id.kind, NodeKind::Other("diagnostic".to_string()));
+        assert_eq!(error_node.line_start, 142); // 0-indexed line 141 -> 1-indexed 142
+        assert_eq!(error_node.metadata.get("diagnostic_severity").unwrap(), "error");
+        assert_eq!(error_node.metadata.get("diagnostic_message").unwrap(), "type mismatch");
+        assert_eq!(error_node.metadata.get("diagnostic_source").unwrap(), "rust-analyzer");
+        assert_eq!(error_node.metadata.get("diagnostic_range").unwrap(), "142:4-142:20");
+        assert_eq!(error_node.metadata.get("diagnostic_timestamp").unwrap(), "1700000000");
+
+        // Check warning node — name includes line number for uniqueness
+        let warn_node = nodes.iter().find(|n| n.id.name.starts_with("[warning:89]")).unwrap();
+        assert_eq!(warn_node.line_start, 89);
+        assert_eq!(warn_node.metadata.get("diagnostic_severity").unwrap(), "warning");
+    }
+
+    /// Verify that Information (3) and Hint (4) diagnostics are filtered out.
+    #[test]
+    fn test_build_diagnostic_nodes_filters_information_and_hint() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 3,
+                "message": "consider using async",
+                "range": { "start": { "line": 5, "character": 0 }, "end": { "line": 5, "character": 10 } }
+            }),
+            serde_json::json!({
+                "severity": 4,
+                "message": "hint: you might want to...",
+                "range": { "start": { "line": 10, "character": 0 }, "end": { "line": 10, "character": 5 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+
+        assert!(nodes.is_empty(), "information and hint diagnostics should not produce nodes");
+    }
+
+    /// Verify that an empty diagnostics list produces no nodes (zero-error files rule).
+    #[test]
+    fn test_build_diagnostic_nodes_empty_produces_no_nodes() {
+        let root = PathBuf::from("/project");
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &[],
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+        assert!(nodes.is_empty(), "zero diagnostics should produce no nodes");
+    }
+
+    /// Verify .cargo paths are filtered out.
+    #[test]
+    fn test_build_diagnostic_nodes_cargo_path_filtered() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 1,
+                "message": "some error",
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/.cargo/registry/tokio/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+        assert!(nodes.is_empty(), ".cargo paths should be filtered");
+    }
+
+    /// Verify that long messages are truncated in the node name but preserved in metadata.
+    #[test]
+    fn test_build_diagnostic_nodes_long_message_truncated_in_name() {
+        let root = PathBuf::from("/project");
+        let long_msg = "a".repeat(200);
+        let diags = vec![
+            serde_json::json!({
+                "severity": 1,
+                "message": long_msg,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+
+        assert_eq!(nodes.len(), 1);
+        let node = &nodes[0];
+        // Name should be truncated (max 80 chars message snippet + "[error:N] " prefix + "...")
+        assert!(node.id.name.len() < 200, "node name should be truncated for long messages");
+        assert!(node.id.name.ends_with("..."), "truncated name should end with ...");
+        // Name includes the line number for uniqueness
+        assert!(node.id.name.starts_with("[error:1]"), "name should include severity and line number");
+        // Full message preserved in metadata
+        assert_eq!(node.metadata.get("diagnostic_message").unwrap().len(), 200, "full message preserved in metadata");
+    }
+
+    /// Verify diagnostic node has ExtractionSource::Lsp.
+    #[test]
+    fn test_build_diagnostic_nodes_source_is_lsp() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 1,
+                "message": "error",
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+
+        assert_eq!(nodes[0].source, ExtractionSource::Lsp);
+    }
+
+    /// Verify severity_to_str handles all known severity values.
+    #[test]
+    fn test_lsp_severity_to_str() {
+        assert_eq!(LspEnricher::lsp_severity_to_str(1), "error");
+        assert_eq!(LspEnricher::lsp_severity_to_str(2), "warning");
+        assert_eq!(LspEnricher::lsp_severity_to_str(3), "information");
+        assert_eq!(LspEnricher::lsp_severity_to_str(4), "hint");
+        assert_eq!(LspEnricher::lsp_severity_to_str(0), "unknown");
+        assert_eq!(LspEnricher::lsp_severity_to_str(99), "unknown");
+    }
+
+    /// Verify diagnostic node metadata contains all required fields.
+    #[test]
+    fn test_build_diagnostic_nodes_has_all_metadata_fields() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 1,
+                "message": "test error",
+                "source": "my-lsp",
+                "range": { "start": { "line": 9, "character": 4 }, "end": { "line": 9, "character": 10 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "myroot",
+            "my-lsp",
+            "rust",
+            "1234567890",
+        );
+
+        assert_eq!(nodes.len(), 1);
+        let meta = &nodes[0].metadata;
+        assert!(meta.contains_key("diagnostic_severity"), "missing diagnostic_severity");
+        assert!(meta.contains_key("diagnostic_source"), "missing diagnostic_source");
+        assert!(meta.contains_key("diagnostic_message"), "missing diagnostic_message");
+        assert!(meta.contains_key("diagnostic_range"), "missing diagnostic_range");
+        assert!(meta.contains_key("diagnostic_timestamp"), "missing diagnostic_timestamp");
+        assert_eq!(meta.get("diagnostic_timestamp").unwrap(), "1234567890");
+        assert_eq!(nodes[0].id.root, "myroot");
+    }
+
+    /// Verify diagnostics with missing severity default to error (severity 1 = error).
+    #[test]
+    fn test_build_diagnostic_nodes_missing_severity_defaults_to_error() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                // No severity field — should default to 1 (error)
+                "message": "something bad",
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+
+        assert_eq!(nodes.len(), 1, "missing severity defaults to error which should produce a node");
+        assert_eq!(nodes[0].metadata.get("diagnostic_severity").unwrap(), "error");
+    }
+
+    // -----------------------------------------------------------------------
+    // Adversarial tests seeded from dissent findings
+    // -----------------------------------------------------------------------
+
+    /// Dissent finding #2: identical messages at different lines should produce
+    /// distinct NodeIds (no silent overwrites in LanceDB).
+    #[test]
+    fn test_build_diagnostic_nodes_same_message_different_lines_distinct_ids() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 2,
+                "message": "unused variable: `x`",
+                "range": { "start": { "line": 9, "character": 4 }, "end": { "line": 9, "character": 5 } }
+            }),
+            serde_json::json!({
+                "severity": 2,
+                "message": "unused variable: `x`",
+                "range": { "start": { "line": 24, "character": 4 }, "end": { "line": 24, "character": 5 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+
+        assert_eq!(nodes.len(), 2, "identical messages at different lines should produce 2 nodes");
+        // NodeIds must be distinct
+        let id0 = nodes[0].id.to_stable_id();
+        let id1 = nodes[1].id.to_stable_id();
+        assert_ne!(id0, id1, "different line positions should produce distinct NodeIds");
+        // Names should include the line number
+        assert!(nodes[0].id.name.contains(":10]") || nodes[0].id.name.contains(":25]"),
+            "name should include line 10 or 25: got '{}'", nodes[0].id.name);
+    }
+
+    /// Dissent finding #1: stale diagnostic nodes should be identifiable by timestamp.
+    /// Verify the timestamp is preserved and is a non-empty string.
+    #[test]
+    fn test_build_diagnostic_nodes_timestamp_preserved_for_staleness_detection() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 1,
+                "message": "an error",
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
+            }),
+        ];
+
+        let ts = "1700123456";
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            ts,
+        );
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].metadata.get("diagnostic_timestamp").unwrap(),
+            ts,
+            "timestamp must be preserved exactly for agent-side staleness filtering"
+        );
+    }
+
+    /// Adversarial: diagnostic with empty message should be skipped (not produce a node
+    /// with an empty name that breaks search).
+    #[test]
+    fn test_build_diagnostic_nodes_empty_message_skipped() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 1,
+                "message": "",  // empty
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
+            }),
+            serde_json::json!({
+                "severity": 1,
+                "message": "   ",  // whitespace-only (trimmed to empty)
+                "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 5 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+
+        assert!(nodes.is_empty(), "empty/whitespace messages should not produce nodes");
+    }
+
+    /// Adversarial: malformed range fields (null, missing, out of order).
+    /// Should produce a node with a safe default range, not panic.
+    #[test]
+    fn test_build_diagnostic_nodes_malformed_range_degrades_gracefully() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 1,
+                "message": "error with null range",
+                "range": null
+            }),
+            serde_json::json!({
+                "severity": 1,
+                "message": "error with no range"
+                // no "range" key at all
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+
+        // Should produce nodes despite malformed ranges (default to line 1)
+        assert_eq!(nodes.len(), 2, "malformed range should not prevent node creation");
+        for node in &nodes {
+            assert_eq!(node.line_start, 1, "missing range should default to line 1");
+        }
+    }
+
+    /// Adversarial: severity value 0 and very large values (out of spec).
+    /// Severity 0 is not defined in LSP spec — should be treated as "unknown" and
+    /// since it's not 1 or 2, should be filtered out.
+    #[test]
+    fn test_build_diagnostic_nodes_out_of_spec_severity_filtered() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 0,  // below spec minimum
+                "message": "unknown severity",
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
+            }),
+            serde_json::json!({
+                "severity": 100,  // far above spec maximum
+                "message": "unknown large severity",
+                "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 5 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+
+        assert!(nodes.is_empty(), "severity 0 and 100 should be filtered (only 1 and 2 are stored)");
     }
 }
