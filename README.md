@@ -181,7 +181,7 @@ The system compounds from here. Agents use `search` to discover relevant context
 | `search` | Code symbols, artifacts, commits, and markdown — flat or graph traversal (`mode`: neighbors, impact, reachable, tests_for). Scope to a subsystem (`subsystem=`), filter cross-subsystem edges (`target_subsystem=`), use `depth=2` with neighbors to walk N levels deep, use `compact: true` for ~25x fewer tokens, `rerank: true` for precision. Short node IDs resolve automatically. |
 | `repo_map` | Repository orientation: **detected subsystems** with their key interfaces, top symbols by importance, hotspot files, active outcomes, entry points. One call replaces an exploratory loop. |
 | `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols. Optional `include_impact: true` for risk-classified blast radius. |
-| `list_roots` | Show which workspace roots are configured and their scan status |
+| `list_roots` | Show configured workspace roots with scan recency, symbol/edge counts, and LSP enrichment status. Includes LSP servers available to install for each root's detected languages. |
 
 **Root scoping:** All query tools default to the primary workspace root (`--repo`). Pass `root: "all"` for cross-root search, or `root: "<slug>"` for a specific root. Non-code roots (.oh/ artifacts, commits, Notes) always pass through regardless of root filter.
 
