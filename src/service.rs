@@ -533,8 +533,13 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
                 strip_root_prefix(&from_id, strip),
                 strip_root_prefix(&to_id, strip),
             ),
+            Some(hops) if hops.is_empty() => format!(
+                "`{}` and `{}` are the same node — no path needed.{freshness}",
+                strip_root_prefix(&from_id, strip),
+                strip_root_prefix(&to_id, strip),
+            ),
             Some(hops) => {
-                let hop_count = hops.len() + 1; // includes start
+                let hop_count = hops.len(); // number of edges = number of directed calls
                 let all_nodes: Vec<String> = std::iter::once(from_id.clone())
                     .chain(hops.iter().cloned())
                     .collect();
