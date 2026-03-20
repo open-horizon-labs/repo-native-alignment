@@ -2784,6 +2784,23 @@ mod tests {
         assert!(result.contains("1 root(s)"), "should show exactly 1 root (external excluded)");
     }
 
+    /// Adversarial: empty slug + external + a real orphan all in active_slugs at once.
+    /// Only the real orphan should appear; empty and external must both be excluded.
+    #[test]
+    fn test_list_roots_from_slugs_empty_external_and_real_orphan_mixed() {
+        let repo = std::env::current_dir().unwrap();
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert("".to_string());
+        active_slugs.insert("external".to_string());
+        active_slugs.insert("only-real-zzz".to_string());
+
+        let result = list_roots_from_slugs(&repo, &active_slugs, None, None);
+        assert!(!result.contains("- ****: (path unknown"), "empty slug must be excluded");
+        assert!(!result.contains("**external**"), "external must be excluded");
+        assert!(result.contains("only-real-zzz"), "real orphan must appear");
+        assert!(result.contains("1 root(s)"), "should show exactly 1 root");
+    }
+
     // ── list_roots_from_slugs stats tests ────────────────────────────────────
 
     use crate::graph::{Edge, EdgeKind};
