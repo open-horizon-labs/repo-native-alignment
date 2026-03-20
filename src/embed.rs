@@ -617,7 +617,32 @@ impl EmbeddingIndex {
                     _ => build_code_embedding_text(&node.id.name, &node.body, &node.metadata),
                 }
             };
-            let text_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
+
+            // Scalar filter columns: populate for code nodes, None for commits/merges/artifacts
+            let (fp, lang, sub, cc) = if node.metadata.contains_key("oh_kind") {
+                (None, None, None, None)
+            } else {
+                let fp = Some(node.id.file.to_string_lossy().to_string());
+                let lang = if node.language.is_empty() { None } else { Some(node.language.clone()) };
+                let sub = node.metadata.get(crate::server::SUBSYSTEM_KEY).cloned();
+                let cc = node.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok());
+                (fp, lang, sub, cc)
+            };
+
+            // Include scalar filter values in the hash material so that changes
+            // to file_path/language/subsystem/cyclomatic invalidate the hash and
+            // force a re-embed. Without this, a subsystem reassignment would leave
+            // stale values in the LanceDB scalar filter columns, making .only_if()
+            // return incorrect results.
+            let hash_material = format!(
+                "{}\x00{}\x00{}\x00{}\x00{}",
+                text,
+                fp.as_deref().unwrap_or(""),
+                lang.as_deref().unwrap_or(""),
+                sub.as_deref().unwrap_or(""),
+                cc.unwrap_or(0),
+            );
+            let text_hash = blake3::hash(hash_material.as_bytes()).to_hex().to_string();
 
             let title = if node.metadata.contains_key("oh_kind") {
                 node.metadata.get("frontmatter.title")
@@ -633,17 +658,6 @@ impl EmbeddingIndex {
                 node.id.file.display(),
                 node.line_start
             );
-
-            // Scalar filter columns: populate for code nodes, None for commits/merges/artifacts
-            let (fp, lang, sub, cc) = if node.metadata.contains_key("oh_kind") {
-                (None, None, None, None)
-            } else {
-                let fp = Some(node.id.file.to_string_lossy().to_string());
-                let lang = if node.language.is_empty() { None } else { Some(node.language.clone()) };
-                let sub = node.metadata.get(crate::server::SUBSYSTEM_KEY).cloned();
-                let cc = node.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok());
-                (fp, lang, sub, cc)
-            };
 
             candidates.push(Candidate {
                 id: node.stable_id(),
@@ -983,6 +997,30 @@ impl EmbeddingIndex {
                 }
             };
 
+            // Scalar filter columns: populate for code nodes, None for oh/ artifacts.
+            // Compute before text_hash so they can be included in the hash material.
+            let (fp, lang, sub, cc) = if node.metadata.contains_key("oh_kind") {
+                (None, None, None, None)
+            } else {
+                let fp = Some(node.id.file.to_string_lossy().to_string());
+                let lang = if node.language.is_empty() { None } else { Some(node.language.clone()) };
+                let sub = node.metadata.get(crate::server::SUBSYSTEM_KEY).cloned();
+                let cc = node.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok());
+                (fp, lang, sub, cc)
+            };
+
+            // Include scalar filter values in the hash so changes to
+            // file_path/language/subsystem/cyclomatic invalidate the hash.
+            let hash_material = format!(
+                "{}\x00{}\x00{}\x00{}\x00{}",
+                text,
+                fp.as_deref().unwrap_or(""),
+                lang.as_deref().unwrap_or(""),
+                sub.as_deref().unwrap_or(""),
+                cc.unwrap_or(0),
+            );
+            let text_hash = blake3::hash(hash_material.as_bytes()).to_hex().to_string();
+
             let title = if node.metadata.contains_key("oh_kind") {
                 node.metadata.get("frontmatter.title")
                     .or(node.metadata.get("frontmatter.statement"))
@@ -997,18 +1035,6 @@ impl EmbeddingIndex {
                 node.id.file.display(),
                 node.line_start
             );
-            let text_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
-
-            // Scalar filter columns: populate for code nodes, None for oh/ artifacts
-            let (fp, lang, sub, cc) = if node.metadata.contains_key("oh_kind") {
-                (None, None, None, None)
-            } else {
-                let fp = Some(node.id.file.to_string_lossy().to_string());
-                let lang = if node.language.is_empty() { None } else { Some(node.language.clone()) };
-                let sub = node.metadata.get(crate::server::SUBSYSTEM_KEY).cloned();
-                let cc = node.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok());
-                (fp, lang, sub, cc)
-            };
 
             candidates.push(Candidate {
                 id: node.stable_id(),
