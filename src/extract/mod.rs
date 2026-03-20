@@ -39,6 +39,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::git::blame::BlameEnricher;
 use crate::graph::{Edge, Node};
 use crate::graph::index::GraphIndex;
 use crate::scanner::ScanResult;
@@ -127,6 +128,13 @@ pub trait Enricher: Send + Sync {
     /// Whether the enricher is ready to run.
     /// For LSP enrichers, this indicates the language server has finished indexing.
     fn is_ready(&self) -> bool;
+
+    /// Whether this enricher should run regardless of the languages detected in
+    /// the graph. Language-agnostic enrichers (e.g., git-blame) return `true`.
+    /// Default: `false` (only run when `languages()` overlaps graph languages).
+    fn runs_regardless_of_language(&self) -> bool {
+        false
+    }
 
     /// Enrich the graph with additional edges and metadata.
     ///
@@ -402,6 +410,9 @@ impl EnricherRegistry {
             registry.register(Box::new(enricher));
         }
 
+        // Language-agnostic enrichers run after language-specific ones.
+        registry.register(Box::new(BlameEnricher::new()));
+
         registry
     }
 
@@ -430,11 +441,14 @@ impl EnricherRegistry {
         );
 
         for enricher in &self.enrichers {
-            // Check if this enricher supports any language in the graph
-            let supported = enricher
-                .languages()
-                .iter()
-                .any(|lang| languages.iter().any(|l| l == lang));
+            // Check if this enricher supports any language in the graph, or
+            // if it explicitly opts in to running regardless of language
+            // (e.g., the git-blame enricher is language-agnostic).
+            let supported = enricher.runs_regardless_of_language()
+                || enricher
+                    .languages()
+                    .iter()
+                    .any(|lang| languages.iter().any(|l| l == lang));
             if !supported {
                 continue; // silently skip — too many servers to log each one
             }

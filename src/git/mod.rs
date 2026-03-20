@@ -1,3 +1,4 @@
+pub mod blame;
 pub mod pr_merges;
 
 use std::path::{Path, PathBuf};

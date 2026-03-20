@@ -129,6 +129,7 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
 async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchContext<'_>) -> String {
     let sort_by_complexity = params.sort_by.as_deref() == Some("complexity");
     let sort_by_importance = params.sort_by.as_deref() == Some("importance");
+    let sort_by_churn = params.sort_by.as_deref() == Some("churn");
     let complexity_search = params.min_complexity.is_some() || sort_by_complexity;
     let has_kind_filter = params.kind.is_some();
     let has_file_filter = params.file.is_some();
@@ -137,8 +138,8 @@ async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchCon
     let has_browse_filter = has_kind_filter || has_file_filter || has_synthetic_filter || has_subsystem_filter;
 
     let query_str = query.unwrap_or("");
-    if query_str.is_empty() && !complexity_search && !sort_by_importance && !has_browse_filter {
-        return "Empty query. Please describe what you're looking for (or use kind, file, synthetic, min_complexity, sort_by=\"complexity\", or sort_by=\"importance\").".to_string();
+    if query_str.is_empty() && !complexity_search && !sort_by_importance && !sort_by_churn && !has_browse_filter {
+        return "Empty query. Please describe what you're looking for (or use kind, file, synthetic, min_complexity, sort_by=\"complexity\", sort_by=\"importance\", or sort_by=\"churn\").".to_string();
     }
 
     let search_mode = parse_search_mode(params.search_mode.as_deref());
@@ -149,7 +150,7 @@ async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchCon
     // Try embedding-ranked code symbol search first; fall back to name/signature matching.
     let matches: Vec<&Node> = flat_code_symbol_search(
         query_str, search_mode, limit, params, graph_state, ctx,
-        sort_by_complexity, sort_by_importance,
+        sort_by_complexity, sort_by_importance, sort_by_churn,
     ).await;
 
     if !matches.is_empty() {
@@ -216,6 +217,7 @@ async fn flat_code_symbol_search<'a>(
     ctx: &SearchContext<'_>,
     sort_by_complexity: bool,
     sort_by_importance: bool,
+    sort_by_churn: bool,
 ) -> Vec<&'a Node> {
     let query_lower = query_str.to_lowercase();
     let complexity_search = params.min_complexity.is_some() || sort_by_complexity;
@@ -377,6 +379,19 @@ async fn flat_code_symbol_search<'a>(
                 (None, None) => std::cmp::Ordering::Equal,
             }
         });
+    } else if sort_by_churn {
+        // Sort by git churn_count descending (highest-churn symbols first).
+        // Nodes without blame metadata sort last.
+        matches.sort_by(|a, b| {
+            let ca = a.metadata.get("churn_count").and_then(|s| s.parse::<u64>().ok());
+            let cb = b.metadata.get("churn_count").and_then(|s| s.parse::<u64>().ok());
+            match (ca, cb) {
+                (Some(a), Some(b)) => b.cmp(&a),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        });
     } else if !used_embed {
         // Only apply name-match ranking for fallback results; embed results
         // are already ranked by the embedding index.
@@ -389,8 +404,8 @@ async fn flat_code_symbol_search<'a>(
     // model that attends to (query, document) pairs jointly. This produces more
     // precise relevance scores than bi-encoder similarity alone.
     // Skip reranking when an explicit sort_by mode is active (complexity,
-    // importance) -- the caller's sort request takes precedence.
-    let use_relevance_sort = !sort_by_complexity && !sort_by_importance;
+    // importance, churn) -- the caller's sort request takes precedence.
+    let use_relevance_sort = !sort_by_complexity && !sort_by_importance && !sort_by_churn;
     if params.rerank && use_relevance_sort && !query_str.is_empty() && matches.len() > 1 {
         use crate::rerank::{RerankCandidate, rerank_results};
 
@@ -1166,7 +1181,7 @@ mod tests {
         let params = SearchParams { query: Some("auth".into()), ..Default::default() };
 
         let results = flat_code_symbol_search(
-            "auth", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+            "auth", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false, false,
         ).await;
 
         assert_eq!(results.len(), 1);
@@ -1184,7 +1199,7 @@ mod tests {
         let params = SearchParams { query: Some("auth_token".into()), ..Default::default() };
 
         let results = flat_code_symbol_search(
-            "auth_token", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+            "auth_token", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false, false,
         ).await;
 
         assert_eq!(results.len(), 1);
@@ -1208,7 +1223,7 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "config", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+            "config", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false, false,
         ).await;
 
         assert_eq!(results.len(), 1);
@@ -1231,7 +1246,7 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false, false,
         ).await;
 
         assert_eq!(results.len(), 1);
@@ -1255,7 +1270,7 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "parse", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+            "parse", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false, false,
         ).await;
 
         assert_eq!(results.len(), 1);
@@ -1279,7 +1294,7 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, true, false,
+            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, true, false, false,
         ).await;
 
         assert_eq!(results.len(), 2);
@@ -1305,11 +1320,39 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, true,
+            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, true, false,
         ).await;
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id.name, "hub");
+    }
+
+    /// sort_by=churn works: nodes with higher churn_count sort first.
+    #[tokio::test]
+    async fn test_flat_search_sort_by_churn() {
+        let mut stable = make_node("stable_fn", NodeKind::Function, "a.rs");
+        stable.metadata.insert("churn_count".into(), "2".into());
+        let mut churned = make_node("churned_fn", NodeKind::Function, "b.rs");
+        churned.metadata.insert("churn_count".into(), "17".into());
+        let mut no_blame = make_node("no_blame_fn", NodeKind::Function, "c.rs");
+        // no_blame has no churn_count metadata — should sort last
+        let gs = make_graph_state(vec![stable, churned, no_blame.clone()]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            kind: Some("function".into()),
+            sort_by: Some("churn".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false, true,
+        ).await;
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].id.name, "churned_fn");  // highest churn first
+        assert_eq!(results[1].id.name, "stable_fn");   // lower churn second
+        assert_eq!(results[2].id.name, "no_blame_fn"); // no metadata last
     }
 
     /// search_mode is parsed correctly for all variants.
@@ -1373,7 +1416,7 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false, false,
         ).await;
 
         assert_eq!(results.len(), 1);
@@ -1405,7 +1448,7 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false, false,
         ).await;
 
         assert_eq!(results.len(), 1, "Only one node should pass all three filters");
@@ -1428,7 +1471,7 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "fn", SearchMode::Hybrid, 5, &params, &gs, &ctx, false, false,
+            "fn", SearchMode::Hybrid, 5, &params, &gs, &ctx, false, false, false,
         ).await;
 
         assert_eq!(results.len(), 5, "Should respect limit of 5 even with 20 matches");
@@ -1454,7 +1497,7 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false, false,
         ).await;
 
         assert_eq!(results.len(), 1, "Should only return nodes from matching root");
@@ -1478,7 +1521,7 @@ mod tests {
             ..Default::default()
         };
         let results = flat_code_symbol_search(
-            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false, false,
         ).await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id.name, "CONSTANT");
@@ -1490,7 +1533,7 @@ mod tests {
             ..Default::default()
         };
         let results2 = flat_code_symbol_search(
-            "", SearchMode::Hybrid, 10, &params2, &gs, &ctx, false, false,
+            "", SearchMode::Hybrid, 10, &params2, &gs, &ctx, false, false, false,
         ).await;
         assert_eq!(results2.len(), 1);
         assert_eq!(results2[0].id.name, "real_fn");
@@ -1520,7 +1563,7 @@ mod tests {
         // Single match means reranking block is skipped (len() > 1 guard),
         // so no model loading occurs.
         let results = flat_code_symbol_search(
-            "auth", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+            "auth", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false, false,
         ).await;
         assert!(!results.is_empty(), "Rerank=true should not prevent results from appearing");
     }
@@ -1539,7 +1582,7 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "foo", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+            "foo", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false, false,
         ).await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id.name, "foo");
@@ -1830,7 +1873,7 @@ mod tests {
         let params = SearchParams { query: Some("auth/handlers/validate".into()), ..Default::default() };
 
         let results = flat_code_symbol_search(
-            "auth/handlers/validate", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+            "auth/handlers/validate", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false, false,
         ).await;
 
         assert_eq!(results.len(), 1, "Only auth/handlers validate should match");
@@ -1851,7 +1894,7 @@ mod tests {
         let params = SearchParams { query: Some("validate".into()), ..Default::default() };
 
         let results = flat_code_symbol_search(
-            "validate", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+            "validate", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false, false,
         ).await;
 
         assert_eq!(results.len(), 2, "Plain query returns all matches");
@@ -1907,7 +1950,7 @@ mod tests {
         let params = SearchParams::default();
 
         let results = flat_code_symbol_search(
-            "auth/new", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+            "auth/new", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false, false,
         ).await;
 
         assert_eq!(results.len(), 1, "Path filter should discriminate to only auth node");
@@ -1935,7 +1978,7 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "scan", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+            "scan", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false, false,
         ).await;
 
         assert_eq!(results.len(), 1, "Only scanner-subsystem node should match");
@@ -1957,7 +2000,7 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false, false,
         ).await;
 
         assert_eq!(results.len(), 1, "Case-insensitive subsystem match should work");
