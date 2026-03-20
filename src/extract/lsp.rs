@@ -278,6 +278,12 @@ struct PipelinedTransport {
     /// This field is kept here to ensure the sink lives as long as the transport.
     #[allow(dead_code)]
     diagnostics_sink: Arc<std::sync::Mutex<HashMap<String, Vec<serde_json::Value>>>>,
+    /// Live quiescence flag updated by the background reader loop.
+    /// Set to true whenever `experimental/serverStatus { quiescent: true }` is
+    /// received — even after the initialization deadline. This allows later
+    /// `enrich()` calls to proceed once RA finishes indexing, instead of being
+    /// permanently blocked by a one-time timeout snapshot.
+    pub quiescent_flag: Arc<AtomicBool>,
     /// Handle to the background reader task (for cleanup).
     _reader_handle: tokio::task::JoinHandle<()>,
     /// The child process (kept alive; kill_on_drop).
@@ -286,11 +292,15 @@ struct PipelinedTransport {
 
 impl PipelinedTransport {
     /// Convert a sequential `LspTransport` into a pipelined one with a shared
-    /// diagnostics sink. The caller provides the sink so it can read captured
-    /// `textDocument/publishDiagnostics` notifications after enrichment.
+    /// diagnostics sink and quiescence flag. The caller provides the sink so it
+    /// can read captured `textDocument/publishDiagnostics` notifications after
+    /// enrichment. The `initial_quiescent` flag is set from the initialization
+    /// wait; the reader loop will continue updating it as later serverStatus
+    /// notifications arrive.
     fn from_sequential_with_diag_sink(
         mut transport: LspTransport,
         diagnostics_sink: Arc<std::sync::Mutex<HashMap<String, Vec<serde_json::Value>>>>,
+        initial_quiescent: bool,
     ) -> Self {
         let stdin = transport.child.stdin.take().expect("stdin already taken");
         let reader = transport.reader;
@@ -299,10 +309,13 @@ impl PipelinedTransport {
         let pending: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 
+        let quiescent_flag = Arc::new(AtomicBool::new(initial_quiescent));
+
         let pending_clone = Arc::clone(&pending);
         let diag_clone = Arc::clone(&diagnostics_sink);
+        let quiescent_clone = Arc::clone(&quiescent_flag);
         let reader_handle = tokio::spawn(async move {
-            Self::reader_loop(reader, pending_clone, diag_clone).await;
+            Self::reader_loop(reader, pending_clone, diag_clone, quiescent_clone).await;
         });
 
         Self {
@@ -310,6 +323,7 @@ impl PipelinedTransport {
             next_id: AtomicI64::new(next_id),
             pending,
             diagnostics_sink,
+            quiescent_flag,
             _reader_handle: reader_handle,
             _child: Arc::new(Mutex::new(transport.child)),
         }
@@ -319,10 +333,13 @@ impl PipelinedTransport {
     /// dispatches responses to waiting callers by request ID.
     /// Also captures `textDocument/publishDiagnostics` notifications into
     /// `diagnostics_sink` (keyed by document URI) for later consumption.
+    /// Updates `quiescent_flag` whenever `experimental/serverStatus { quiescent: true }`
+    /// is received — allowing later `enrich()` calls to proceed after RA finishes indexing.
     async fn reader_loop(
         mut reader: BufReader<tokio::process::ChildStdout>,
         pending: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>>,
         diagnostics_sink: Arc<std::sync::Mutex<HashMap<String, Vec<serde_json::Value>>>>,
+        quiescent_flag: Arc<AtomicBool>,
     ) {
         loop {
             // Read a single Content-Length framed message
@@ -381,6 +398,14 @@ impl PipelinedTransport {
                         let health = msg.pointer("/params/health").and_then(|h| h.as_str()).unwrap_or("");
                         let quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(true);
                         tracing::debug!("PipelinedTransport serverStatus: health={}, quiescent={}", health, quiescent);
+                        // Live-update the quiescent flag. Once RA becomes quiescent
+                        // (even after the initialization timeout), later enrich() calls
+                        // can proceed. This prevents the one-time timeout from permanently
+                        // blocking all subsequent enrichment for the session.
+                        if quiescent {
+                            quiescent_flag.store(true, Ordering::Release);
+                            tracing::info!("PipelinedTransport: server became quiescent (health={}), Pass 1 now enabled", health);
+                        }
                     }
                     "textDocument/publishDiagnostics" => {
                         // Capture diagnostics for later consumption.
@@ -913,9 +938,13 @@ impl LspEnricher {
         // Convert to pipelined transport for concurrent request support.
         // Share the diagnostics sink so publishDiagnostics notifications received
         // during enrichment are captured for later conversion to diagnostic nodes.
+        // Pass the initial quiescent state so the pipelined transport's quiescent_flag
+        // starts correct; the reader loop will live-update it for subsequent scans.
         if let Some(transport) = state.transport.take() {
             let diag_sink = Arc::clone(&state.diagnostics_sink);
-            let pipelined = PipelinedTransport::from_sequential_with_diag_sink(transport, diag_sink);
+            let pipelined = PipelinedTransport::from_sequential_with_diag_sink(
+                transport, diag_sink, state.was_quiescent
+            );
             tracing::info!("{} converted to pipelined transport", self.server_command);
             state.pipelined = Some(Arc::new(pipelined));
         }
@@ -1496,7 +1525,12 @@ impl Enricher for LspEnricher {
             return Err(e);
         }
 
-        // Extract state under lock, then release the lock for concurrent work
+        // Extract state under lock, then release the lock for concurrent work.
+        // was_quiescent is read from the pipelined transport's live quiescent_flag
+        // (not just the static snapshot from ensure_initialized). This allows later
+        // enrich() calls to proceed after RA finishes indexing, even if the first
+        // call timed out during initialization. The flag is updated by the background
+        // reader loop whenever `experimental/serverStatus { quiescent: true }` arrives.
         let (transport, root, has_type_hierarchy, type_hierarchy_strikes, has_references, has_pull_diagnostics, was_quiescent, diag_sink) = {
             let state = self.state.lock().await;
             let root = state
@@ -1508,7 +1542,10 @@ impl Enricher for LspEnricher {
                 None => return Ok(result),
             };
             let diag_sink = Arc::clone(&state.diagnostics_sink);
-            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references, state.has_pull_diagnostics, state.was_quiescent, diag_sink)
+            // Use live quiescent_flag from pipelined transport for session-wide accuracy.
+            // This allows RA to become quiescent after the init timeout and still be used.
+            let was_quiescent = transport.quiescent_flag.load(Ordering::Acquire);
+            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references, state.has_pull_diagnostics, was_quiescent, diag_sink)
         };
         // State lock is released here — concurrent tasks can proceed
 
