@@ -1152,9 +1152,12 @@ fn parse_import_target(import_text: &str) -> String {
 /// metadata stores the bare path.
 fn strip_quotes(s: &str) -> String {
     let s = s.trim();
-    if (s.starts_with('"') && s.ends_with('"'))
-        || (s.starts_with('\'') && s.ends_with('\''))
-        || (s.starts_with('`') && s.ends_with('`'))
+    // Guard: must be at least 2 chars so slicing `s[1..s.len()-1]` is safe.
+    // A single quote/backtick character would panic without this guard.
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"'))
+            || (s.starts_with('\'') && s.ends_with('\''))
+            || (s.starts_with('`') && s.ends_with('`')))
     {
         s[1..s.len() - 1].to_string()
     } else {
