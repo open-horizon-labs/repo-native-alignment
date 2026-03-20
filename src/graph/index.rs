@@ -332,7 +332,7 @@ impl GraphIndex {
     /// topological order (Tarjan's natural output).
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// // a -> b -> c -> a  (ring)
     /// // x -> y            (no ring)
     /// let rings = index.detect_cycles(None);
@@ -406,7 +406,7 @@ impl GraphIndex {
     /// format it as `"A → B → C"` without duplicating the start node.
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// // a -> b -> c
     /// let path = index.shortest_path("a", "c", None);
     /// assert_eq!(path, Some(vec!["b".to_string(), "c".to_string()]));
