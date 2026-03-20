@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
+use petgraph::algo::{dijkstra, tarjan_scc};
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef as PetgraphEdgeRef;
 use petgraph::Direction;
@@ -319,6 +320,185 @@ impl GraphIndex {
         }
 
         result
+    }
+
+    /// Detect strongly connected components (SCCs) in the coupling subgraph.
+    ///
+    /// Runs Tarjan's SCC algorithm on edges of the given types (defaults to
+    /// `Calls` and `DependsOn`). Returns only SCCs with more than one node —
+    /// those are circular dependency rings.
+    ///
+    /// Each inner `Vec<String>` is one ring, with node IDs in reverse
+    /// topological order (Tarjan's natural output).
+    ///
+    /// # Example
+    /// ```
+    /// // a -> b -> c -> a  (ring)
+    /// // x -> y            (no ring)
+    /// let rings = index.detect_cycles(None);
+    /// assert_eq!(rings.len(), 1);
+    /// assert_eq!(rings[0].len(), 3);
+    /// ```
+    pub fn detect_cycles(&self, edge_types: Option<&[EdgeKind]>) -> Vec<Vec<String>> {
+        let coupling_defaults = [EdgeKind::Calls, EdgeKind::DependsOn];
+        let filter = edge_types.unwrap_or(&coupling_defaults);
+
+        // Build a filtered subgraph containing only the requested edge types.
+        // petgraph's tarjan_scc operates on the graph directly, so we build a
+        // fresh DiGraph with only the filtered edges rather than mutating self.
+        let mut sub: DiGraph<String, ()> = DiGraph::new();
+        let mut sub_lookup: HashMap<String, NodeIndex> = HashMap::new();
+
+        let ensure_sub_node = |g: &mut DiGraph<String, ()>,
+                                lk: &mut HashMap<String, NodeIndex>,
+                                id: &str|
+         -> NodeIndex {
+            if let Some(&idx) = lk.get(id) {
+                idx
+            } else {
+                let idx = g.add_node(id.to_string());
+                lk.insert(id.to_string(), idx);
+                idx
+            }
+        };
+
+        for edge_ref in self.graph.edge_references() {
+            if !filter.contains(&edge_ref.weight().edge_type) {
+                continue;
+            }
+            let src_id = &self.graph[edge_ref.source()].id;
+            let tgt_id = &self.graph[edge_ref.target()].id;
+            let s = ensure_sub_node(&mut sub, &mut sub_lookup, src_id);
+            let t = ensure_sub_node(&mut sub, &mut sub_lookup, tgt_id);
+            sub.add_edge(s, t, ());
+        }
+
+        if sub.node_count() == 0 {
+            return Vec::new();
+        }
+
+        // tarjan_scc returns all SCCs (including size-1 trivial ones).
+        // Keep only rings (size > 1).
+        tarjan_scc(&sub)
+            .into_iter()
+            .filter(|scc| scc.len() > 1)
+            .map(|scc| scc.into_iter().map(|idx| sub[idx].clone()).collect())
+            .collect()
+    }
+
+    /// Return the SCC ring that contains `node_id`, if any.
+    ///
+    /// Returns `None` if the node has no cycle membership.
+    pub fn cycle_for_node(&self, node_id: &str, edge_types: Option<&[EdgeKind]>) -> Option<Vec<String>> {
+        self.detect_cycles(edge_types)
+            .into_iter()
+            .find(|ring| ring.contains(&node_id.to_string()))
+    }
+
+    /// Compute the shortest directed path between two nodes via Dijkstra.
+    ///
+    /// Traverses `Calls` edges by default; pass `edge_types` to restrict to
+    /// other edge kinds. Returns the path as an ordered list of node IDs
+    /// from `from_id` (exclusive) to `to_id` (inclusive), or `None` if no
+    /// path exists.
+    ///
+    /// The `from_id` node is not included in the result so callers can
+    /// format it as `"A → B → C"` without duplicating the start node.
+    ///
+    /// # Example
+    /// ```
+    /// // a -> b -> c
+    /// let path = index.shortest_path("a", "c", None);
+    /// assert_eq!(path, Some(vec!["b".to_string(), "c".to_string()]));
+    /// ```
+    pub fn shortest_path(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        edge_types: Option<&[EdgeKind]>,
+    ) -> Option<Vec<String>> {
+        let calls_default = [EdgeKind::Calls];
+        let filter = edge_types.unwrap_or(&calls_default);
+
+        let Some(&from_idx) = self.node_lookup.get(from_id) else {
+            return None;
+        };
+        let Some(&to_idx) = self.node_lookup.get(to_id) else {
+            return None;
+        };
+
+        if from_idx == to_idx {
+            return Some(Vec::new());
+        }
+
+        // Build filtered subgraph identical to detect_cycles approach.
+        // Map original NodeIndex -> sub NodeIndex so we can reconstruct the path.
+        let mut sub: DiGraph<String, ()> = DiGraph::new();
+        let mut orig_to_sub: HashMap<NodeIndex, NodeIndex> = HashMap::new();
+
+        let ensure_sub = |g: &mut DiGraph<String, ()>,
+                           map: &mut HashMap<NodeIndex, NodeIndex>,
+                           orig: NodeIndex,
+                           label: &str|
+         -> NodeIndex {
+            if let Some(&s) = map.get(&orig) {
+                s
+            } else {
+                let s = g.add_node(label.to_string());
+                map.insert(orig, s);
+                s
+            }
+        };
+
+        for edge_ref in self.graph.edge_references() {
+            if !filter.contains(&edge_ref.weight().edge_type) {
+                continue;
+            }
+            let src_orig = edge_ref.source();
+            let tgt_orig = edge_ref.target();
+            let src_label = &self.graph[src_orig].id;
+            let tgt_label = &self.graph[tgt_orig].id;
+            let s = ensure_sub(&mut sub, &mut orig_to_sub, src_orig, src_label);
+            let t = ensure_sub(&mut sub, &mut orig_to_sub, tgt_orig, tgt_label);
+            sub.add_edge(s, t, ());
+        }
+
+        let sub_from = *orig_to_sub.get(&from_idx)?;
+        let sub_to   = *orig_to_sub.get(&to_idx)?;
+
+        // Dijkstra with uniform edge weight 1. Returns distances from sub_from.
+        let distances = dijkstra(&sub, sub_from, Some(sub_to), |_| 1u32);
+
+        if !distances.contains_key(&sub_to) {
+            return None; // no path
+        }
+
+        // Reconstruct path by greedy predecessor walk: at each step, find a
+        // neighbour whose distance == current_dist - 1.
+        let mut path_nodes: Vec<NodeIndex> = Vec::new();
+        let mut current = sub_to;
+        loop {
+            path_nodes.push(current);
+            if current == sub_from {
+                break;
+            }
+            let cur_dist = distances[&current];
+            // Walk incoming edges to find a predecessor one hop closer.
+            let prev = sub
+                .edges_directed(current, Direction::Incoming)
+                .find(|e| distances.get(&e.source()).copied() == Some(cur_dist - 1))
+                .map(|e| e.source())?;
+            current = prev;
+        }
+
+        path_nodes.reverse();
+        // Return the path excluding the start node (from_id).
+        let result: Vec<String> = path_nodes
+            .into_iter()
+            .skip(1)
+            .map(|idx| sub[idx].clone())
+            .collect();
+        Some(result)
     }
 
     /// Compute edge-type weighted PageRank importance scores.
@@ -2648,5 +2828,199 @@ mod tests {
         let parent = &grouped[0];
         // Weighted average: (0.8*60 + 0.9*40) / 100 = 84/100 = 0.84
         assert!((parent.cohesion - 0.84).abs() < 0.01);
+    }
+
+    // ── detect_cycles / cycle_for_node tests ────────────────────────────
+
+    #[test]
+    fn test_detect_cycles_no_cycles() {
+        // a -> b -> c (DAG — no cycle)
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+
+        let rings = index.detect_cycles(None);
+        assert!(rings.is_empty(), "DAG should have no cycles");
+    }
+
+    #[test]
+    fn test_detect_cycles_simple_ring() {
+        // a -> b -> c -> a
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "a", "fn", EdgeKind::Calls);
+
+        let rings = index.detect_cycles(None);
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0].len(), 3);
+        // All three nodes are in the ring
+        for node in &["a", "b", "c"] {
+            assert!(rings[0].contains(&node.to_string()), "{} should be in ring", node);
+        }
+    }
+
+    #[test]
+    fn test_detect_cycles_two_independent_rings() {
+        // Ring 1: a -> b -> a
+        // Ring 2: x -> y -> z -> x
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "a", "fn", EdgeKind::Calls);
+        index.add_edge("x", "fn", "y", "fn", EdgeKind::Calls);
+        index.add_edge("y", "fn", "z", "fn", EdgeKind::Calls);
+        index.add_edge("z", "fn", "x", "fn", EdgeKind::Calls);
+
+        let rings = index.detect_cycles(None);
+        assert_eq!(rings.len(), 2);
+        let sizes: std::collections::HashSet<usize> = rings.iter().map(|r| r.len()).collect();
+        assert!(sizes.contains(&2), "should have a 2-node ring");
+        assert!(sizes.contains(&3), "should have a 3-node ring");
+    }
+
+    #[test]
+    fn test_detect_cycles_edge_type_filter() {
+        // a -Calls-> b -Calls-> a   (cycle via Calls)
+        // x -DependsOn-> y           (no cycle)
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "a", "fn", EdgeKind::Calls);
+        index.add_edge("x", "fn", "y", "fn", EdgeKind::DependsOn);
+
+        // Filtering to only DependsOn: no cycles
+        let rings = index.detect_cycles(Some(&[EdgeKind::DependsOn]));
+        assert!(rings.is_empty());
+
+        // Default filter (Calls + DependsOn): 1 cycle
+        let rings2 = index.detect_cycles(None);
+        assert_eq!(rings2.len(), 1);
+    }
+
+    #[test]
+    fn test_cycle_for_node_in_ring() {
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "a", "fn", EdgeKind::Calls);
+
+        let ring = index.cycle_for_node("b", None);
+        assert!(ring.is_some());
+        let ring = ring.unwrap();
+        assert_eq!(ring.len(), 3);
+    }
+
+    #[test]
+    fn test_cycle_for_node_not_in_ring() {
+        let mut index = GraphIndex::new();
+        // a -> b -> c -> a (ring), d -> e (no ring)
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "a", "fn", EdgeKind::Calls);
+        index.add_edge("d", "fn", "e", "fn", EdgeKind::Calls);
+
+        assert!(index.cycle_for_node("d", None).is_none());
+        assert!(index.cycle_for_node("e", None).is_none());
+    }
+
+    #[test]
+    fn test_cycle_for_node_nonexistent() {
+        let index = GraphIndex::new();
+        assert!(index.cycle_for_node("ghost", None).is_none());
+    }
+
+    // ── shortest_path tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_shortest_path_direct() {
+        // a -> b
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+
+        let path = index.shortest_path("a", "b", None);
+        assert_eq!(path, Some(vec!["b".to_string()]));
+    }
+
+    #[test]
+    fn test_shortest_path_multi_hop() {
+        // a -> b -> c -> d
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "d", "fn", EdgeKind::Calls);
+
+        let path = index.shortest_path("a", "d", None);
+        assert_eq!(path, Some(vec!["b".to_string(), "c".to_string(), "d".to_string()]));
+    }
+
+    #[test]
+    fn test_shortest_path_takes_shorter_route() {
+        // a -> b -> c  (long route)
+        // a -> c       (shortcut)
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("a", "fn", "c", "fn", EdgeKind::Calls);
+
+        let path = index.shortest_path("a", "c", None);
+        // Shortest path is a -> c (1 hop)
+        assert_eq!(path, Some(vec!["c".to_string()]));
+    }
+
+    #[test]
+    fn test_shortest_path_no_path() {
+        // a -> b, x -> y (disconnected)
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("x", "fn", "y", "fn", EdgeKind::Calls);
+
+        assert!(index.shortest_path("a", "y", None).is_none());
+        assert!(index.shortest_path("b", "a", None).is_none()); // wrong direction
+    }
+
+    #[test]
+    fn test_shortest_path_same_node() {
+        let mut index = GraphIndex::new();
+        index.ensure_node("a", "fn");
+
+        let path = index.shortest_path("a", "a", None);
+        assert_eq!(path, Some(vec![]));
+    }
+
+    #[test]
+    fn test_shortest_path_nonexistent_node() {
+        let index = GraphIndex::new();
+        assert!(index.shortest_path("ghost1", "ghost2", None).is_none());
+    }
+
+    #[test]
+    fn test_shortest_path_edge_type_filter() {
+        // a -Calls-> b -Calls-> c
+        // a -DependsOn-> c  (shortcut, different edge type)
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("a", "fn", "c", "fn", EdgeKind::DependsOn);
+
+        // Only Calls: 2-hop path a -> b -> c
+        let path = index.shortest_path("a", "c", Some(&[EdgeKind::Calls]));
+        assert_eq!(path, Some(vec!["b".to_string(), "c".to_string()]));
+
+        // Only DependsOn: direct a -> c
+        let path2 = index.shortest_path("a", "c", Some(&[EdgeKind::DependsOn]));
+        assert_eq!(path2, Some(vec!["c".to_string()]));
+    }
+
+    #[test]
+    fn test_shortest_path_through_cycle() {
+        // a -> b -> c -> a (cycle), but also b -> d
+        // shortest from a to d: a -> b -> d
+        let mut index = GraphIndex::new();
+        index.add_edge("a", "fn", "b", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "c", "fn", EdgeKind::Calls);
+        index.add_edge("c", "fn", "a", "fn", EdgeKind::Calls);
+        index.add_edge("b", "fn", "d", "fn", EdgeKind::Calls);
+
+        let path = index.shortest_path("a", "d", None);
+        assert_eq!(path, Some(vec!["b".to_string(), "d".to_string()]));
     }
 }
