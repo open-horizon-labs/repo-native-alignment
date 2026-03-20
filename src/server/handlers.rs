@@ -43,8 +43,24 @@ impl RnaHandler {
         Ok(text_result(markdown))
     }
 
-    pub(crate) fn handle_list_roots(&self) -> Result<CallToolResult, CallToolError> {
-        let markdown = crate::service::list_roots(&self.repo_root);
+    pub(crate) async fn handle_list_roots(&self) -> Result<CallToolResult, CallToolError> {
+        // Derive the active root slugs from the in-memory graph so that the
+        // output reflects what is actually loaded (including declared roots
+        // persisted to LanceDB) rather than re-discovering roots from config.
+        let active_slugs = match self.get_graph().await {
+            Ok(guard) => {
+                if let Some(graph_state) = guard.as_ref() {
+                    let index_map = graph_state.node_index_map();
+                    crate::server::state::GraphState::root_slugs_from_index_map(&index_map)
+                        .into_iter()
+                        .collect::<std::collections::HashSet<String>>()
+                } else {
+                    std::collections::HashSet::new()
+                }
+            }
+            Err(_) => std::collections::HashSet::new(),
+        };
+        let markdown = crate::service::list_roots_from_slugs(&self.repo_root, &active_slugs);
         Ok(text_result(markdown))
     }
 

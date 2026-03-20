@@ -282,7 +282,7 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
 
             "list_roots" => {
                 let _args: ListRoots = parse_args(params.arguments)?;
-                self.handle_list_roots()
+                self.handle_list_roots().await
             }
 
             "repo_map" => {

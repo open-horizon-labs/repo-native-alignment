@@ -199,7 +199,7 @@ infra   = "../k8s-configs"    # relative to the repo containing .oh/
 protos  = "/abs/path/protos"  # absolute paths also work
 ```
 
-After declaring roots, restart RNA. Declared roots appear in `list_roots()` and are queryable by slug:
+After declaring roots, run `scan` (or restart RNA). Declared roots appear in `list_roots()` and are queryable by slug — `list_roots()` reads from the server's in-memory graph, so it reflects whatever was loaded at last scan:
 
 ```text
 list_roots()                          # shows "infra", "protos", primary, worktrees
