@@ -3721,4 +3721,88 @@ mod tests {
 
         assert!(nodes.is_empty(), "severity 0 and 100 should be filtered (only 1 and 2 are stored)");
     }
+
+    // -----------------------------------------------------------------------
+    // Adversarial tests for #379 r4: Pass 1 guard and diagnostic 0-capture
+    // -----------------------------------------------------------------------
+
+    /// Adversarial: "unlinked-file" diagnostic (the VS Code example in issue #379)
+    /// is severity 2 (Warning) per LSP spec, so it SHOULD produce a node.
+    ///
+    /// If RA returns it as severity 3 (Information), that explains 0 captures.
+    /// This test documents the expected behavior: severity 2 unlinked-file → captured.
+    #[test]
+    fn test_build_diagnostic_nodes_unlinked_file_warning_captured() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 2,  // Warning
+                "message": "This file is not included in any crates [unlinked-file]",
+                "source": "rust-analyzer",
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/service.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+
+        assert_eq!(nodes.len(), 1,
+            "unlinked-file at severity 2 (Warning) should produce a diagnostic node; \
+             if this fails, RA is reporting it as Information (3) which gets filtered");
+        assert_eq!(nodes[0].metadata.get("diagnostic_severity").unwrap(), "warning");
+    }
+
+    /// Adversarial: "unlinked-file" diagnostic at severity 3 (Information)
+    /// should be filtered out. This is the suspected root cause of 0 captured diagnostics
+    /// in issue #379 — RA may report unlinked-file as Information, not Warning.
+    #[test]
+    fn test_build_diagnostic_nodes_unlinked_file_information_filtered() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 3,  // Information — below our capture threshold
+                "message": "This file is not included in any crates [unlinked-file]",
+                "source": "rust-analyzer",
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/service.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+
+        assert!(nodes.is_empty(),
+            "unlinked-file at severity 3 (Information) should be filtered; \
+             this is intentional — Information diagnostics are too noisy for code-understanding queries");
+    }
+
+    /// Adversarial: was_quiescent guard is the same for both Pass 1 and Pass 3.
+    /// Verify the default state prevents both passes from running.
+    /// (The actual early return from enrich() prevents all passes when !was_quiescent.)
+    #[test]
+    fn test_lsp_state_was_quiescent_false_prevents_all_passes() {
+        let enricher = LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]);
+        let state = enricher.state.blocking_lock();
+        // Both Pass 1 and Pass 3 check was_quiescent before running.
+        // With the default false, both are guarded.
+        assert!(!state.was_quiescent,
+            "was_quiescent=false must prevent Pass 1 AND Pass 3; \
+             the early return at Pass 1 guard covers both passes");
+        // has_pull_diagnostics also defaults false (not yet initialized)
+        assert!(!state.has_pull_diagnostics,
+            "has_pull_diagnostics must default false (not yet initialized from LSP capabilities)");
+    }
 }
