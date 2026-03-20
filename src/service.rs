@@ -2958,6 +2958,136 @@ mod tests {
         assert_eq!(format_count(12345), "12,345");
         assert_eq!(format_count(1234567), "1,234,567");
     }
+
+    // ── Adversarial tests seeded from dissent ─────────────────────────────────
+
+    /// Adversarial: graph state with no nodes for a root shows "0 symbols".
+    #[test]
+    fn test_list_roots_from_slugs_empty_root_shows_zero_symbols() {
+        let repo = std::env::current_dir().unwrap();
+        let workspace = crate::roots::WorkspaceConfig::load()
+            .with_primary_root(repo.clone())
+            .with_worktrees(&repo)
+            .with_claude_memory(&repo)
+            .with_agent_memories(&repo)
+            .with_declared_roots(&repo);
+        let resolved = workspace.resolved_roots();
+        if resolved.is_empty() { return; }
+
+        let primary_slug = resolved[0].slug.clone();
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert(primary_slug.clone());
+
+        // Graph state with nodes from a DIFFERENT root — primary root has 0 symbols.
+        let nodes = vec![make_node_for_root("other-root-xyz", "rust")];
+        let gs = make_test_graph_state(nodes, vec![]);
+
+        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None);
+        assert!(result.contains("0 symbols"), "root with no nodes should show 0 symbols, got: {}", result);
+        assert!(result.contains("0 edges"), "root with no edges should show 0 edges, got: {}", result);
+    }
+
+    /// Adversarial: LSP Complete but server_name is None — should not show an empty LSP line.
+    #[test]
+    fn test_list_roots_from_slugs_lsp_complete_no_server_name() {
+        let repo = std::env::current_dir().unwrap();
+        let workspace = crate::roots::WorkspaceConfig::load()
+            .with_primary_root(repo.clone())
+            .with_worktrees(&repo)
+            .with_claude_memory(&repo)
+            .with_agent_memories(&repo)
+            .with_declared_roots(&repo);
+        let resolved = workspace.resolved_roots();
+        if resolved.is_empty() { return; }
+
+        let primary_slug = resolved[0].slug.clone();
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert(primary_slug.clone());
+
+        let nodes = vec![make_node_for_root(&primary_slug, "rust")];
+        let gs = make_test_graph_state(nodes, vec![]);
+
+        // Complete state but no server name set.
+        let lsp = crate::server::state::LspEnrichmentStatus::default();
+        lsp.set_complete(100); // Complete but no server_name set
+
+        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), Some(&lsp));
+        // Should not show "LSP:  (100 Calls edges)" with empty server name.
+        // The if let Some(ref name) guard prevents this.
+        assert!(!result.contains("LSP:  ("), "should not show LSP line with empty server name, got: {}", result);
+    }
+
+    /// Adversarial: LSP Unavailable with relevant languages shows "LSP: none detected".
+    #[test]
+    fn test_list_roots_from_slugs_lsp_unavailable_shows_none_detected() {
+        let repo = std::env::current_dir().unwrap();
+        let workspace = crate::roots::WorkspaceConfig::load()
+            .with_primary_root(repo.clone())
+            .with_worktrees(&repo)
+            .with_claude_memory(&repo)
+            .with_agent_memories(&repo)
+            .with_declared_roots(&repo);
+        let resolved = workspace.resolved_roots();
+        if resolved.is_empty() { return; }
+
+        let primary_slug = resolved[0].slug.clone();
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert(primary_slug.clone());
+
+        let nodes = vec![make_node_for_root(&primary_slug, "rust")];
+        let gs = make_test_graph_state(nodes, vec![]);
+
+        let lsp = crate::server::state::LspEnrichmentStatus::default();
+        lsp.set_unavailable(); // All servers unavailable
+
+        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), Some(&lsp));
+        // When LSP unavailable and no relevant missing servers: show "LSP: none detected".
+        // (missing_servers is empty since we used default(), not probe_for_servers())
+        assert!(result.contains("LSP: none detected"), "should show 'LSP: none detected' when unavailable, got: {}", result);
+    }
+
+    /// Adversarial: cross-root edges counted only under 'from' root.
+    #[test]
+    fn test_list_roots_from_slugs_cross_root_edge_counted_under_from() {
+        let repo = std::env::current_dir().unwrap();
+        let workspace = crate::roots::WorkspaceConfig::load()
+            .with_primary_root(repo.clone())
+            .with_worktrees(&repo)
+            .with_claude_memory(&repo)
+            .with_agent_memories(&repo)
+            .with_declared_roots(&repo);
+        let resolved = workspace.resolved_roots();
+        if resolved.is_empty() { return; }
+
+        let primary_slug = resolved[0].slug.clone();
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert(primary_slug.clone());
+
+        let nodes = vec![make_node_for_root(&primary_slug, "rust")];
+        // Edge from primary_slug to "external" root.
+        let cross_edge = Edge {
+            from: NodeId {
+                root: primary_slug.clone(),
+                file: std::path::PathBuf::from("src/a.rs"),
+                name: "caller".to_string(),
+                kind: NodeKind::Function,
+            },
+            to: NodeId {
+                root: "external".to_string(),
+                file: std::path::PathBuf::from("external/b.rs"),
+                name: "callee".to_string(),
+                kind: NodeKind::Function,
+            },
+            kind: EdgeKind::Calls,
+            source: ExtractionSource::TreeSitter,
+            confidence: crate::graph::Confidence::Confirmed,
+        };
+        let gs = make_test_graph_state(nodes, vec![cross_edge]);
+
+        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None);
+        // Cross-root edge counted under primary_slug (from.root == primary_slug).
+        assert!(result.contains("1 edges"), "cross-root edge should be counted under from-root, got: {}", result);
+    }
 }
 
 // ── Outcome progress ───────────────────────────────────────────────
