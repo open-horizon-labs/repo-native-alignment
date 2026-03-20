@@ -1323,11 +1323,25 @@ impl LspEnricher {
         // Response is a DocumentDiagnosticReport — either "full" or "unchanged"
         // Full: { kind: "full", items: [...] }
         // Unchanged: { kind: "unchanged", resultId: "..." }
+        //
+        // rust-analyzer may also return a RelatedDocumentDiagnosticReport which
+        // wraps the same structure. Log the raw response at DEBUG level so we
+        // can diagnose unexpected shapes without noise in normal runs.
+        tracing::debug!(
+            "textDocument/diagnostic response for {}: {}",
+            file_uri.as_str(),
+            serde_json::to_string(&result).unwrap_or_else(|_| "<serialize error>".into())
+        );
         let kind = result.get("kind").and_then(|k| k.as_str()).unwrap_or("full");
         if kind == "unchanged" {
             return Ok(Vec::new());
         }
-        Ok(result.get("items").and_then(|i| i.as_array()).cloned().unwrap_or_default())
+        let items = result.get("items").and_then(|i| i.as_array()).cloned().unwrap_or_default();
+        tracing::debug!(
+            "textDocument/diagnostic: {} items (kind={}) for {}",
+            items.len(), kind, file_uri.as_str()
+        );
+        Ok(items)
     }
 
     /// Convert raw LSP diagnostic severity integer to a lowercase string.
@@ -1507,7 +1521,30 @@ impl Enricher for LspEnricher {
         // ------------------------------------------------------------------
         // Pass 1: call hierarchy, find_implementations, and document links.
         // Pipelined with adaptive concurrency (TCP slow-start).
+        //
+        // Guard: skip Pass 1 entirely when the server never reached quiescent
+        // state (i.e., the initialization deadline expired before indexing
+        // finished). When rust-analyzer hasn't indexed the workspace, every
+        // call-hierarchy request returns 0 results — triggering the zero-edge
+        // abort after ZERO_EDGE_ABORT_THRESHOLD nodes. This is indistinguishable
+        // from a misconfigured server and discards the entire enrichment run.
+        //
+        // On large repos (19K+ nodes across two roots) RA needs >120s to
+        // become quiescent. The same guard already protects Pass 3; apply it
+        // here too to prevent the zero-edge abort on timed-out servers.
         // ------------------------------------------------------------------
+        if !was_quiescent {
+            tracing::info!(
+                "LSP Pass 1 skipped: {} did not reach quiescent state during initialization",
+                self.server_command
+            );
+            tracing::info!(
+                "LSP enrichment complete for {}: 0 edges, 0 diagnostic nodes (0 attempted, 0 errors) — skipped (not quiescent)",
+                self.language,
+            );
+            return Ok(result);
+        }
+
         let pass1_start = std::time::Instant::now();
 
         // Filter to only nodes that need LSP requests:
@@ -2120,6 +2157,8 @@ impl Enricher for LspEnricher {
                 unique_files.len(), self.server_command
             );
             // Pull diagnostics per unique file
+            let mut pull_raw_total = 0usize;
+            let mut pull_files_with_diags = 0usize;
             for rel_file in &unique_files {
                 let abs_path = root.join(rel_file);
                 let file_uri = match path_to_uri(&abs_path) {
@@ -2128,6 +2167,14 @@ impl Enricher for LspEnricher {
                 };
                 match Self::pull_diagnostics_p(&transport, &file_uri).await {
                     Ok(diags) => {
+                        if !diags.is_empty() {
+                            pull_raw_total += diags.len();
+                            pull_files_with_diags += 1;
+                            tracing::debug!(
+                                "textDocument/diagnostic: {} raw items for {}",
+                                diags.len(), rel_file.display()
+                            );
+                        }
                         let nodes = Self::build_diagnostic_nodes(
                             file_uri.as_str(),
                             &diags,
@@ -2144,6 +2191,10 @@ impl Enricher for LspEnricher {
                     }
                 }
             }
+            tracing::info!(
+                "LSP diagnostics pass: pull complete — {} raw items from {} files with diagnostics (out of {} files)",
+                pull_raw_total, pull_files_with_diags, unique_files.len()
+            );
         } else {
             // Fall back to push-captured diagnostics from the reader loop.
             // Limit to URIs that correspond to this pass's files — prevents
@@ -3173,6 +3224,27 @@ mod tests {
         assert!(!state.was_quiescent,
             "was_quiescent must default to false — Pass 3 must be skipped until \
              the server explicitly reaches quiescent=true (regression guard for #379)");
+    }
+
+    /// Regression test for #379 round 4: Pass 1 (call hierarchy) must also be
+    /// skipped when `was_quiescent=false`.
+    ///
+    /// When RA hasn't indexed (deadline expired), Pass 1 returns 0 edges for
+    /// all ZERO_EDGE_ABORT_THRESHOLD nodes, triggering the zero-edge abort.
+    /// This is indistinguishable from a misconfigured server. The same guard
+    /// that protects Pass 3 must also protect Pass 1.
+    ///
+    /// This test verifies that `was_quiescent` defaults to false (so Pass 1
+    /// is skipped until RA explicitly becomes quiescent).
+    #[test]
+    fn test_lsp_state_was_quiescent_defaults_false_protects_pass1() {
+        let enricher = LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]);
+        let state = enricher.state.blocking_lock();
+        assert!(!state.was_quiescent,
+            "was_quiescent must default to false — Pass 1 (call hierarchy) must be skipped \
+             until the server explicitly reaches quiescent=true. Without this guard, the \
+             zero-edge abort fires on large repos where RA doesn't index within 120s \
+             (regression: #379 r4)");
     }
 
     /// Verify the was_quiescent logic: only servers that sent serverStatus but
