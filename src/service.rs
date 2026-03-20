@@ -500,7 +500,14 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         // No node specified: return all rings.
         let rings = gs.index.detect_cycles(edge_filter_slice);
         if rings.is_empty() {
-            return format!("## Circular dependency analysis\n\nNo cycles detected in the coupling graph (Calls + DependsOn edges).{freshness}");
+            let scope = match edge_filter_slice {
+                Some(kinds) if !kinds.is_empty() => {
+                    let labels: Vec<String> = kinds.iter().map(|k| format!("{k}")).collect();
+                    format!("filtered edges: {}", labels.join(", "))
+                }
+                _ => "default coupling graph (Calls + DependsOn)".to_string(),
+            };
+            return format!("## Circular dependency analysis\n\nNo cycles detected in the {scope}.{freshness}");
         }
         let mut out = format!("## Circular dependency analysis\n\n{} ring(s) detected\n\n", rings.len());
         for (i, ring) in rings.iter().enumerate() {
