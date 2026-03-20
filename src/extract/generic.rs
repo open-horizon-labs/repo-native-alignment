@@ -1164,13 +1164,20 @@ fn strip_quotes(s: &str) -> String {
 
 /// Infer the HTTP method from a capture name text if possible.
 ///
-/// For decorators like `@router.post(...)` the `@name` capture will end in
-/// `post`; we normalise that to the uppercase method string. Falls back to
-/// `default_method` when the text doesn't contain a recognisable verb.
+/// Handles two common naming conventions:
+/// - **Suffix verb** (Python/Go/Express/Ruby/TypeScript): `router.post`, `router.GET`, `Post`
+///   → `lower.ends_with(method)` or exact match
+/// - **Spring MVC Mapping** (Java): `PostMapping`, `GetMapping`, `PutMapping`
+///   → `lower == "{method}mapping"` (method + "Mapping")
+///
+/// Falls back to `default_method` when the text doesn't contain a recognisable verb.
 fn infer_method_from_name(name: &str, default: &str) -> String {
     let lower = name.to_lowercase();
     for method in &["get", "post", "put", "delete", "patch", "head", "options"] {
-        if lower.ends_with(method) || lower == *method {
+        if lower == *method
+            || lower.ends_with(method)
+            || lower == format!("{}mapping", method)
+        {
             return method.to_uppercase();
         }
     }
