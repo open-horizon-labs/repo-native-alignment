@@ -2713,6 +2713,50 @@ mod tests {
         // or the fallback fires. Either way "external" must not appear as a root.
         assert!(!result.contains("**external**"), "external pseudo-slug should be excluded");
     }
+
+    /// Adversarial: active_slugs contains a declared root but NOT the primary slug.
+    /// The primary root should still not appear (graph state is authoritative),
+    /// and the declared root should appear as-is.
+    #[test]
+    fn test_list_roots_from_slugs_primary_not_in_graph_excluded() {
+        let repo = std::env::current_dir().unwrap();
+        // Use a slug that is very unlikely to match the primary slug.
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert("definitely-not-primary-zzz".to_string());
+
+        let result = list_roots_from_slugs(&repo, &active_slugs);
+        // The placeholder line for the orphaned slug should appear.
+        assert!(result.contains("definitely-not-primary-zzz"), "non-primary orphan slug should appear");
+        // The primary root slug (repo-native-alignment or similar) should NOT appear
+        // since it's not in active_slugs.
+        // We can't assert a specific slug name here, but we can assert the count is 1.
+        assert!(result.contains("1 root(s)"), "should show exactly 1 root (the orphan)");
+    }
+
+    /// Adversarial: external slug mixed with legitimate slugs — only external is excluded.
+    #[test]
+    fn test_list_roots_from_slugs_external_mixed_with_real_slugs() {
+        let repo = std::env::current_dir().unwrap();
+        let workspace = crate::roots::WorkspaceConfig::load()
+            .with_primary_root(repo.clone())
+            .with_worktrees(&repo)
+            .with_claude_memory(&repo)
+            .with_agent_memories(&repo)
+            .with_declared_roots(&repo);
+        let resolved = workspace.resolved_roots();
+        if resolved.is_empty() { return; }
+
+        let primary_slug = resolved[0].slug.clone();
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert(primary_slug.clone());
+        active_slugs.insert("external".to_string());
+
+        let result = list_roots_from_slugs(&repo, &active_slugs);
+        // external should be excluded, primary should appear
+        assert!(!result.contains("**external**"), "external should be excluded");
+        assert!(result.contains(&primary_slug), "primary slug should appear");
+        assert!(result.contains("1 root(s)"), "should show exactly 1 root (external excluded)");
+    }
 }
 
 // ── Outcome progress ───────────────────────────────────────────────
