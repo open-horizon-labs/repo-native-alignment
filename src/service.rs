@@ -2701,6 +2701,32 @@ mod tests {
         assert!(result.contains("path unknown"), "orphaned slug should have placeholder text");
     }
 
+    /// An empty-string slug (stale LanceDB artifact from a pruned worktree) is excluded.
+    #[test]
+    fn test_list_roots_from_slugs_excludes_empty_slug() {
+        let repo = std::env::current_dir().unwrap();
+        let mut active_slugs = std::collections::HashSet::new();
+        // Simulate a ghost entry: empty slug from a pruned worktree
+        active_slugs.insert("".to_string());
+
+        let result = list_roots_from_slugs(&repo, &active_slugs, None, None);
+        // Empty slug must never appear as a root line "- ****: (path unknown ...)"
+        assert!(!result.contains("- ****: (path unknown"), "empty slug should be excluded from output");
+    }
+
+    /// Empty slug mixed with a real orphaned slug — only the real one appears.
+    #[test]
+    fn test_list_roots_from_slugs_empty_slug_mixed_with_real_orphan() {
+        let repo = std::env::current_dir().unwrap();
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert("".to_string());
+        active_slugs.insert("real-orphan-zzz".to_string());
+
+        let result = list_roots_from_slugs(&repo, &active_slugs, None, None);
+        assert!(!result.contains("- ****: (path unknown"), "empty slug should be excluded");
+        assert!(result.contains("real-orphan-zzz"), "real orphan slug should still appear");
+    }
+
     /// The "external" pseudo-slug is excluded from the output.
     #[test]
     fn test_list_roots_from_slugs_excludes_external() {
@@ -3170,7 +3196,7 @@ pub fn list_roots_from_slugs(
     // Add any graph slugs not accounted for by config (edge case: a root was
     // scanned but its config entry was later removed). Emit a placeholder line.
     let config_slugs: std::collections::HashSet<_> = resolved.iter().map(|r| r.slug.clone()).collect();
-    let mut orphaned: Vec<_> = active_slugs.iter().filter(|s| !config_slugs.contains(*s) && *s != "external").cloned().collect();
+    let mut orphaned: Vec<_> = active_slugs.iter().filter(|s| !s.is_empty() && !config_slugs.contains(*s) && *s != "external").cloned().collect();
     orphaned.sort();
 
     if resolved.is_empty() && orphaned.is_empty() {
