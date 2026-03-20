@@ -1332,8 +1332,9 @@ impl LspEnricher {
 
         for diag in diagnostics {
             let severity_int = diag.get("severity").and_then(|s| s.as_u64()).unwrap_or(1);
-            // Only store Error (1) and Warning (2)
-            if severity_int > 2 {
+            // Only store Error (1) and Warning (2). Severity 0 is not a valid LSP severity.
+            // Severity 3 (Information) and 4 (Hint) are too noisy for code-understanding queries.
+            if severity_int != 1 && severity_int != 2 {
                 continue;
             }
             let severity = Self::lsp_severity_to_str(severity_int);
@@ -3306,5 +3307,177 @@ mod tests {
 
         assert_eq!(nodes.len(), 1, "missing severity defaults to error which should produce a node");
         assert_eq!(nodes[0].metadata.get("diagnostic_severity").unwrap(), "error");
+    }
+
+    // -----------------------------------------------------------------------
+    // Adversarial tests seeded from dissent findings
+    // -----------------------------------------------------------------------
+
+    /// Dissent finding #2: identical messages at different lines should produce
+    /// distinct NodeIds (no silent overwrites in LanceDB).
+    #[test]
+    fn test_build_diagnostic_nodes_same_message_different_lines_distinct_ids() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 2,
+                "message": "unused variable: `x`",
+                "range": { "start": { "line": 9, "character": 4 }, "end": { "line": 9, "character": 5 } }
+            }),
+            serde_json::json!({
+                "severity": 2,
+                "message": "unused variable: `x`",
+                "range": { "start": { "line": 24, "character": 4 }, "end": { "line": 24, "character": 5 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+
+        assert_eq!(nodes.len(), 2, "identical messages at different lines should produce 2 nodes");
+        // NodeIds must be distinct
+        let id0 = nodes[0].id.to_stable_id();
+        let id1 = nodes[1].id.to_stable_id();
+        assert_ne!(id0, id1, "different line positions should produce distinct NodeIds");
+        // Names should include the line number
+        assert!(nodes[0].id.name.contains(":10]") || nodes[0].id.name.contains(":25]"),
+            "name should include line 10 or 25: got '{}'", nodes[0].id.name);
+    }
+
+    /// Dissent finding #1: stale diagnostic nodes should be identifiable by timestamp.
+    /// Verify the timestamp is preserved and is a non-empty string.
+    #[test]
+    fn test_build_diagnostic_nodes_timestamp_preserved_for_staleness_detection() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 1,
+                "message": "an error",
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
+            }),
+        ];
+
+        let ts = "1700123456";
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            ts,
+        );
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].metadata.get("diagnostic_timestamp").unwrap(),
+            ts,
+            "timestamp must be preserved exactly for agent-side staleness filtering"
+        );
+    }
+
+    /// Adversarial: diagnostic with empty message should be skipped (not produce a node
+    /// with an empty name that breaks search).
+    #[test]
+    fn test_build_diagnostic_nodes_empty_message_skipped() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 1,
+                "message": "",  // empty
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
+            }),
+            serde_json::json!({
+                "severity": 1,
+                "message": "   ",  // whitespace-only (trimmed to empty)
+                "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 5 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+
+        assert!(nodes.is_empty(), "empty/whitespace messages should not produce nodes");
+    }
+
+    /// Adversarial: malformed range fields (null, missing, out of order).
+    /// Should produce a node with a safe default range, not panic.
+    #[test]
+    fn test_build_diagnostic_nodes_malformed_range_degrades_gracefully() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 1,
+                "message": "error with null range",
+                "range": null
+            }),
+            serde_json::json!({
+                "severity": 1,
+                "message": "error with no range"
+                // no "range" key at all
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+
+        // Should produce nodes despite malformed ranges (default to line 1)
+        assert_eq!(nodes.len(), 2, "malformed range should not prevent node creation");
+        for node in &nodes {
+            assert_eq!(node.line_start, 1, "missing range should default to line 1");
+        }
+    }
+
+    /// Adversarial: severity value 0 and very large values (out of spec).
+    /// Severity 0 is not defined in LSP spec — should be treated as "unknown" and
+    /// since it's not 1 or 2, should be filtered out.
+    #[test]
+    fn test_build_diagnostic_nodes_out_of_spec_severity_filtered() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 0,  // below spec minimum
+                "message": "unknown severity",
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
+            }),
+            serde_json::json!({
+                "severity": 100,  // far above spec maximum
+                "message": "unknown large severity",
+                "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 5 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+
+        assert!(nodes.is_empty(), "severity 0 and 100 should be filtered (only 1 and 2 are stored)");
     }
 }
