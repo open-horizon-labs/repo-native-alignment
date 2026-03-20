@@ -45,8 +45,17 @@ impl SearchFilters {
         if let Some(ref file) = self.file {
             // LIKE-based path substring matching. The file_path column stores
             // the full path string, so '%pattern%' finds any containing path.
-            let escaped = file.replace('\'', "''").replace('%', r"\%").replace('_', r"\_");
-            parts.push(format!("file_path LIKE '%{}%'", escaped));
+            //
+            // Use '!' as the ESCAPE character (DataFusion requires an explicit
+            // ESCAPE clause — without it, backslash is not treated as an escape
+            // character). '!' is safe since it does not appear in typical file paths.
+            // Escape order matters: escape '!' first to avoid double-escaping.
+            let escaped = file
+                .replace('\'', "''")   // SQL single-quote escaping
+                .replace('!', "!!")    // Escape the ESCAPE character itself
+                .replace('%', "!%")    // Escape LIKE wildcard %
+                .replace('_', "!_");   // Escape LIKE single-char wildcard _
+            parts.push(format!("file_path LIKE '%{}%' ESCAPE '!'", escaped));
         }
 
         if let Some(ref lang) = self.language {
@@ -2625,6 +2634,22 @@ mod tests {
         let sql = filters.to_sql().expect("file filter should produce SQL");
         assert!(sql.contains("file_path LIKE"), "should use LIKE for file: {}", sql);
         assert!(sql.contains("src/embed.rs"), "should contain file pattern: {}", sql);
+        assert!(sql.contains("ESCAPE '!'"), "should include explicit ESCAPE clause for DataFusion: {}", sql);
+    }
+
+    #[test]
+    fn search_filters_file_wildcards_escaped() {
+        // Verify LIKE special characters are escaped with the '!' escape character
+        let filters = SearchFilters { file: Some("src%embed_rs".to_string()), ..Default::default() };
+        let sql = filters.to_sql().expect("should produce SQL");
+        // % should be escaped as !%
+        assert!(sql.contains("!%"), "% in file path should be escaped as !%: {}", sql);
+        // _ should be escaped as !_
+        assert!(sql.contains("!_"), "_ in file path should be escaped as !_: {}", sql);
+        // The escape character itself should be escaped as !!
+        let filters2 = SearchFilters { file: Some("src!embed.rs".to_string()), ..Default::default() };
+        let sql2 = filters2.to_sql().expect("should produce SQL");
+        assert!(sql2.contains("!!"), "! in file path should be escaped as !!: {}", sql2);
     }
 
     #[test]
