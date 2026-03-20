@@ -72,7 +72,9 @@ impl CaptureSet {
 /// Wraps a compiled tree-sitter `Query` and provides a simple `run()` method
 /// that returns [`CaptureSet`]s for each match.
 ///
-/// Compile once (via [`QueryExtractor::new`]) and reuse across files.
+/// Compile with [`QueryExtractor::new`] and reuse the same instance for all
+/// files in a scan pass. Creating one `QueryExtractor` per file compiles the
+/// query on every file — prefer creating it once before the file loop.
 pub struct QueryExtractor {
     query: Query,
 }
