@@ -1512,12 +1512,6 @@ impl Enricher for LspEnricher {
         };
         // State lock is released here — concurrent tasks can proceed
 
-        // Share matching_nodes across concurrent tasks via Arc<Vec<Node>> (owned copies)
-        let matching_nodes_owned: Arc<Vec<Node>> = Arc::new(
-            matching_nodes.iter().map(|n| (*n).clone()).collect()
-        );
-        let language = self.language.clone();
-
         // ------------------------------------------------------------------
         // Pass 1: call hierarchy, find_implementations, and document links.
         // Pipelined with adaptive concurrency (TCP slow-start).
@@ -1532,6 +1526,9 @@ impl Enricher for LspEnricher {
         // On large repos (19K+ nodes across two roots) RA needs >120s to
         // become quiescent. The same guard already protects Pass 3; apply it
         // here too to prevent the zero-edge abort on timed-out servers.
+        //
+        // Note: `matching_nodes_owned` and `language` are allocated after this
+        // guard to avoid a wasted Arc<Vec<Node>> clone when skipping all passes.
         // ------------------------------------------------------------------
         if !was_quiescent {
             tracing::info!(
@@ -1544,6 +1541,13 @@ impl Enricher for LspEnricher {
             );
             return Ok(result);
         }
+
+        // Share matching_nodes across concurrent tasks via Arc<Vec<Node>> (owned copies).
+        // Allocated after the was_quiescent guard to avoid cloning when all passes are skipped.
+        let matching_nodes_owned: Arc<Vec<Node>> = Arc::new(
+            matching_nodes.iter().map(|n| (*n).clone()).collect()
+        );
+        let language = self.language.clone();
 
         let pass1_start = std::time::Instant::now();
 
