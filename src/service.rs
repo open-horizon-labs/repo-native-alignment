@@ -3082,6 +3082,9 @@ pub fn list_roots_from_slugs(
     let lsp_complete = lsp_status
         .map(|s| s.current_state() == LspState::Complete)
         .unwrap_or(false);
+    let lsp_unavailable = lsp_status
+        .map(|s| s.current_state() == LspState::Unavailable)
+        .unwrap_or(false);
     let lsp_edge_count: usize = lsp_status.map(|s| s.edge_count()).unwrap_or(0);
     let missing_servers: Vec<String> = lsp_status
         .map(|s| s.missing_server_names())
@@ -3131,6 +3134,9 @@ pub fn list_roots_from_slugs(
             if !relevant_missing.is_empty() {
                 line.push_str(&format!("\n  LSP available but not installed: {}",
                     relevant_missing.join(", ")));
+            } else if lsp_unavailable && lsp_status.is_some() {
+                // No LSP found and no installable servers to suggest for this root's languages.
+                line.push_str("\n  LSP: none detected");
             }
 
             line
