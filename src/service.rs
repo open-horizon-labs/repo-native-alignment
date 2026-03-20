@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::embed::{EmbeddingIndex, SearchMode, SearchOutcome};
+use crate::embed::{EmbeddingIndex, SearchFilters, SearchMode, SearchOutcome};
 use crate::graph::{Node, NodeKind};
 use crate::ranking;
 use crate::server::helpers::{
@@ -267,15 +267,30 @@ async fn flat_code_symbol_search<'a>(
     // cross-encoder has a wider pool to re-score.
     let rerank_over_fetch = if params.rerank { limit.max(20) } else { limit };
 
+    // Build scalar pre-filters for LanceDB (#400).
+    // When filters are active, LanceDB applies them before vector scoring so
+    // only matching rows compete for the top-K slots. This gives correct
+    // "top-K within filter" semantics instead of "globally top-3K, then discard."
+    let embed_filters = SearchFilters {
+        subsystem: params.subsystem.clone(),
+        file: params.file.clone(),
+        language: params.language.clone(),
+        min_complexity: params.min_complexity,
+    };
+    let has_embed_filters = embed_filters.to_sql().is_some();
+
     // Try embed-ranked search for code symbols when query is non-empty.
     // For path/name queries use only the name part so the embedding attends to
     // the symbol name rather than a slash-delimited path string.
     let mut used_embed = false;
     let mut matches: Vec<&Node> = if !query_str.is_empty() {
         if let Some(embed_idx) = ctx.embed_index {
-            // Over-fetch to allow for post-filtering (and reranking).
-            let over_fetch = rerank_over_fetch * 3;
-            match embed_idx.search_with_mode(embed_query_str, None, over_fetch, search_mode).await {
+            // With scalar pre-filters active, fetch exactly rerank_over_fetch rows —
+            // only matching rows are scored, so no over-fetch needed.
+            // Without filters, keep the 3x over-fetch to allow for graph-side
+            // filtering (root filter, synthetic, kind filter) and reranking.
+            let over_fetch = if has_embed_filters { rerank_over_fetch } else { rerank_over_fetch * 3 };
+            match embed_idx.search_with_filters(embed_query_str, None, over_fetch, search_mode, &embed_filters).await {
                 Ok(SearchOutcome::Results(results)) => {
                     used_embed = true;
                     // Keep only code results, resolve to graph nodes via HashMap (O(1)), apply filters.
