@@ -1303,7 +1303,7 @@ impl LspEnricher {
         file_uri: &str,
         diagnostics: &[serde_json::Value],
         root: &Path,
-        repo_root_str: &str,
+        root_id: &str,
         server_command: &str,
         language: &str,
         timestamp: &str,
@@ -1369,7 +1369,7 @@ impl LspEnricher {
             metadata.insert("diagnostic_timestamp".to_string(), timestamp.to_string());
 
             let node_id = NodeId {
-                root: repo_root_str.to_string(),
+                root: root_id.to_string(),
                 file: rel_path.clone(),
                 name: node_name.clone(),
                 kind: NodeKind::Other("diagnostic".to_string()),
@@ -1464,10 +1464,14 @@ impl Enricher for LspEnricher {
         // Functions (call hierarchy), Traits (implementations), and Other (document links).
         // Skip test functions — they don't have meaningful cross-file callers
         // and halve the total RPC count.
+        // Also skip diagnostic nodes (Other("diagnostic")) to prevent them from being
+        // re-enriched via the generic Other/documentLink path on subsequent passes —
+        // which would generate spurious DependsOn edges from diagnostics.
         let enrichable_nodes: Vec<&Node> = matching_nodes.iter()
             .filter(|n| matches!(n.id.kind,
                 NodeKind::Function | NodeKind::Trait | NodeKind::Other(_)
                 | NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const))
+            .filter(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "diagnostic"))
             .filter(|n| {
                 // Skip test functions (have #[test] or #[tokio::test] decorator)
                 if n.id.kind == NodeKind::Function {
@@ -2029,7 +2033,13 @@ impl Enricher for LspEnricher {
                 .collect()
         };
 
-        let repo_root_str = repo_root.to_string_lossy().to_string();
+        // Use the canonical root ID from the graph (from matching_nodes), not the filesystem
+        // path. This ensures diagnostic NodeIds live in the same namespace as all other nodes
+        // and are correctly handled by root-prefix stripping and stale-root pruning.
+        let root_id = matching_nodes
+            .first()
+            .map(|n| n.id.root.clone())
+            .unwrap_or_default();
 
         if has_pull_diagnostics {
             tracing::info!(
@@ -2049,7 +2059,7 @@ impl Enricher for LspEnricher {
                             file_uri.as_str(),
                             &diags,
                             &root,
-                            &repo_root_str,
+                            &root_id,
                             &self.server_command,
                             &self.language,
                             &diag_timestamp,
@@ -2062,21 +2072,33 @@ impl Enricher for LspEnricher {
                 }
             }
         } else {
-            // Fall back to push-captured diagnostics from the reader loop
+            // Fall back to push-captured diagnostics from the reader loop.
+            // Limit to URIs that correspond to this pass's files — prevents
+            // re-emitting stale diagnostics for files no longer in matching_nodes.
+            let expected_uris: std::collections::HashSet<String> = unique_files
+                .iter()
+                .filter_map(|rel_file| path_to_uri(&root.join(rel_file)).ok().map(|u| u.to_string()))
+                .collect();
+
             let captured: HashMap<String, Vec<serde_json::Value>> = {
                 let sink = diag_sink.lock().unwrap();
                 sink.clone()
             };
+            let relevant_count = captured.keys().filter(|u| expected_uris.contains(*u)).count();
             tracing::info!(
-                "LSP diagnostics pass: push-captured {} files with diagnostics ({})",
-                captured.len(), self.server_command
+                "LSP diagnostics pass: push-captured {}/{} relevant files with diagnostics ({})",
+                relevant_count, captured.len(), self.server_command
             );
             for (uri, diags) in &captured {
+                // Only convert diagnostics for files in this pass
+                if !expected_uris.contains(uri) {
+                    continue;
+                }
                 let nodes = Self::build_diagnostic_nodes(
                     uri,
                     diags,
                     &root,
-                    &repo_root_str,
+                    &root_id,
                     &self.server_command,
                     &self.language,
                     &diag_timestamp,
