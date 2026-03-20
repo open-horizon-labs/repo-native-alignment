@@ -1349,15 +1349,16 @@ impl LspEnricher {
             let end_char = diag.pointer("/range/end/character").and_then(|c| c.as_u64()).unwrap_or(0);
             let range_str = format!("{}:{}-{}:{}", start_line, start_char, end_line, end_char);
 
-            // Name: truncated message for human readability in search results.
-            // Keep it short so the node name is usable as an identifier.
+            // Name: truncated message + line number for human readability in search results.
+            // Including the start line ensures that identical messages at different positions
+            // produce distinct NodeIds (preventing silent overwrites in LanceDB).
             let name_snippet = if message.len() > 80 {
                 format!("{}...", &message[..77])
             } else {
                 message.clone()
             };
-            // Node name encodes severity + snippet for quick scanning
-            let node_name = format!("[{}] {}", severity, name_snippet);
+            // Node name encodes severity + line + snippet for quick scanning and uniqueness
+            let node_name = format!("[{}:{}] {}", severity, start_line, name_snippet);
 
             let mut metadata = std::collections::BTreeMap::new();
             metadata.insert("diagnostic_severity".to_string(), severity.to_string());
@@ -3090,8 +3091,8 @@ mod tests {
 
         assert_eq!(nodes.len(), 2, "error and warning should produce 2 nodes");
 
-        // Check error node
-        let error_node = nodes.iter().find(|n| n.id.name.starts_with("[error]")).unwrap();
+        // Check error node — name format is "[severity:line] message"
+        let error_node = nodes.iter().find(|n| n.id.name.starts_with("[error:142]")).unwrap();
         assert_eq!(error_node.id.file, PathBuf::from("src/service.rs"));
         assert_eq!(error_node.id.kind, NodeKind::Other("diagnostic".to_string()));
         assert_eq!(error_node.line_start, 142); // 0-indexed line 141 -> 1-indexed 142
@@ -3101,8 +3102,8 @@ mod tests {
         assert_eq!(error_node.metadata.get("diagnostic_range").unwrap(), "142:4-142:20");
         assert_eq!(error_node.metadata.get("diagnostic_timestamp").unwrap(), "1700000000");
 
-        // Check warning node
-        let warn_node = nodes.iter().find(|n| n.id.name.starts_with("[warning]")).unwrap();
+        // Check warning node — name includes line number for uniqueness
+        let warn_node = nodes.iter().find(|n| n.id.name.starts_with("[warning:89]")).unwrap();
         assert_eq!(warn_node.line_start, 89);
         assert_eq!(warn_node.metadata.get("diagnostic_severity").unwrap(), "warning");
     }
@@ -3202,9 +3203,11 @@ mod tests {
 
         assert_eq!(nodes.len(), 1);
         let node = &nodes[0];
-        // Name should be truncated (max 80 chars message snippet + "[error] " prefix + "...")
+        // Name should be truncated (max 80 chars message snippet + "[error:N] " prefix + "...")
         assert!(node.id.name.len() < 200, "node name should be truncated for long messages");
         assert!(node.id.name.ends_with("..."), "truncated name should end with ...");
+        // Name includes the line number for uniqueness
+        assert!(node.id.name.starts_with("[error:1]"), "name should include severity and line number");
         // Full message preserved in metadata
         assert_eq!(node.metadata.get("diagnostic_message").unwrap().len(), 200, "full message preserved in metadata");
     }
