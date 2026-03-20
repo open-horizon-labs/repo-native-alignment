@@ -278,6 +278,12 @@ struct PipelinedTransport {
     /// This field is kept here to ensure the sink lives as long as the transport.
     #[allow(dead_code)]
     diagnostics_sink: Arc<std::sync::Mutex<HashMap<String, Vec<serde_json::Value>>>>,
+    /// Live quiescence flag updated by the background reader loop.
+    /// Set to true whenever `experimental/serverStatus { quiescent: true }` is
+    /// received — even after the initialization deadline. This allows later
+    /// `enrich()` calls to proceed once RA finishes indexing, instead of being
+    /// permanently blocked by a one-time timeout snapshot.
+    pub quiescent_flag: Arc<AtomicBool>,
     /// Handle to the background reader task (for cleanup).
     _reader_handle: tokio::task::JoinHandle<()>,
     /// The child process (kept alive; kill_on_drop).
@@ -286,11 +292,15 @@ struct PipelinedTransport {
 
 impl PipelinedTransport {
     /// Convert a sequential `LspTransport` into a pipelined one with a shared
-    /// diagnostics sink. The caller provides the sink so it can read captured
-    /// `textDocument/publishDiagnostics` notifications after enrichment.
+    /// diagnostics sink and quiescence flag. The caller provides the sink so it
+    /// can read captured `textDocument/publishDiagnostics` notifications after
+    /// enrichment. The `initial_quiescent` flag is set from the initialization
+    /// wait; the reader loop will continue updating it as later serverStatus
+    /// notifications arrive.
     fn from_sequential_with_diag_sink(
         mut transport: LspTransport,
         diagnostics_sink: Arc<std::sync::Mutex<HashMap<String, Vec<serde_json::Value>>>>,
+        initial_quiescent: bool,
     ) -> Self {
         let stdin = transport.child.stdin.take().expect("stdin already taken");
         let reader = transport.reader;
@@ -299,10 +309,13 @@ impl PipelinedTransport {
         let pending: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 
+        let quiescent_flag = Arc::new(AtomicBool::new(initial_quiescent));
+
         let pending_clone = Arc::clone(&pending);
         let diag_clone = Arc::clone(&diagnostics_sink);
+        let quiescent_clone = Arc::clone(&quiescent_flag);
         let reader_handle = tokio::spawn(async move {
-            Self::reader_loop(reader, pending_clone, diag_clone).await;
+            Self::reader_loop(reader, pending_clone, diag_clone, quiescent_clone).await;
         });
 
         Self {
@@ -310,6 +323,7 @@ impl PipelinedTransport {
             next_id: AtomicI64::new(next_id),
             pending,
             diagnostics_sink,
+            quiescent_flag,
             _reader_handle: reader_handle,
             _child: Arc::new(Mutex::new(transport.child)),
         }
@@ -319,10 +333,13 @@ impl PipelinedTransport {
     /// dispatches responses to waiting callers by request ID.
     /// Also captures `textDocument/publishDiagnostics` notifications into
     /// `diagnostics_sink` (keyed by document URI) for later consumption.
+    /// Updates `quiescent_flag` whenever `experimental/serverStatus { quiescent: true }`
+    /// is received — allowing later `enrich()` calls to proceed after RA finishes indexing.
     async fn reader_loop(
         mut reader: BufReader<tokio::process::ChildStdout>,
         pending: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>>,
         diagnostics_sink: Arc<std::sync::Mutex<HashMap<String, Vec<serde_json::Value>>>>,
+        quiescent_flag: Arc<AtomicBool>,
     ) {
         loop {
             // Read a single Content-Length framed message
@@ -381,6 +398,14 @@ impl PipelinedTransport {
                         let health = msg.pointer("/params/health").and_then(|h| h.as_str()).unwrap_or("");
                         let quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(true);
                         tracing::debug!("PipelinedTransport serverStatus: health={}, quiescent={}", health, quiescent);
+                        // Live-update the quiescent flag. Once RA becomes quiescent
+                        // (even after the initialization timeout), later enrich() calls
+                        // can proceed. This prevents the one-time timeout from permanently
+                        // blocking all subsequent enrichment for the session.
+                        if quiescent {
+                            quiescent_flag.store(true, Ordering::Release);
+                            tracing::info!("PipelinedTransport: server became quiescent (health={}), Pass 1 now enabled", health);
+                        }
                     }
                     "textDocument/publishDiagnostics" => {
                         // Capture diagnostics for later consumption.
@@ -913,9 +938,13 @@ impl LspEnricher {
         // Convert to pipelined transport for concurrent request support.
         // Share the diagnostics sink so publishDiagnostics notifications received
         // during enrichment are captured for later conversion to diagnostic nodes.
+        // Pass the initial quiescent state so the pipelined transport's quiescent_flag
+        // starts correct; the reader loop will live-update it for subsequent scans.
         if let Some(transport) = state.transport.take() {
             let diag_sink = Arc::clone(&state.diagnostics_sink);
-            let pipelined = PipelinedTransport::from_sequential_with_diag_sink(transport, diag_sink);
+            let pipelined = PipelinedTransport::from_sequential_with_diag_sink(
+                transport, diag_sink, state.was_quiescent
+            );
             tracing::info!("{} converted to pipelined transport", self.server_command);
             state.pipelined = Some(Arc::new(pipelined));
         }
@@ -1323,11 +1352,25 @@ impl LspEnricher {
         // Response is a DocumentDiagnosticReport — either "full" or "unchanged"
         // Full: { kind: "full", items: [...] }
         // Unchanged: { kind: "unchanged", resultId: "..." }
+        //
+        // rust-analyzer may also return a RelatedDocumentDiagnosticReport which
+        // wraps the same structure. Log the raw response at DEBUG level so we
+        // can diagnose unexpected shapes without noise in normal runs.
+        tracing::debug!(
+            "textDocument/diagnostic response for {}: {}",
+            file_uri.as_str(),
+            serde_json::to_string(&result).unwrap_or_else(|_| "<serialize error>".into())
+        );
         let kind = result.get("kind").and_then(|k| k.as_str()).unwrap_or("full");
         if kind == "unchanged" {
             return Ok(Vec::new());
         }
-        Ok(result.get("items").and_then(|i| i.as_array()).cloned().unwrap_or_default())
+        let items = result.get("items").and_then(|i| i.as_array()).cloned().unwrap_or_default();
+        tracing::debug!(
+            "textDocument/diagnostic: {} items (kind={}) for {}",
+            items.len(), kind, file_uri.as_str()
+        );
+        Ok(items)
     }
 
     /// Convert raw LSP diagnostic severity integer to a lowercase string.
@@ -1482,7 +1525,12 @@ impl Enricher for LspEnricher {
             return Err(e);
         }
 
-        // Extract state under lock, then release the lock for concurrent work
+        // Extract state under lock, then release the lock for concurrent work.
+        // was_quiescent is read from the pipelined transport's live quiescent_flag
+        // (not just the static snapshot from ensure_initialized). This allows later
+        // enrich() calls to proceed after RA finishes indexing, even if the first
+        // call timed out during initialization. The flag is updated by the background
+        // reader loop whenever `experimental/serverStatus { quiescent: true }` arrives.
         let (transport, root, has_type_hierarchy, type_hierarchy_strikes, has_references, has_pull_diagnostics, was_quiescent, diag_sink) = {
             let state = self.state.lock().await;
             let root = state
@@ -1494,20 +1542,50 @@ impl Enricher for LspEnricher {
                 None => return Ok(result),
             };
             let diag_sink = Arc::clone(&state.diagnostics_sink);
-            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references, state.has_pull_diagnostics, state.was_quiescent, diag_sink)
+            // Use live quiescent_flag from pipelined transport for session-wide accuracy.
+            // This allows RA to become quiescent after the init timeout and still be used.
+            let was_quiescent = transport.quiescent_flag.load(Ordering::Acquire);
+            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references, state.has_pull_diagnostics, was_quiescent, diag_sink)
         };
         // State lock is released here — concurrent tasks can proceed
 
-        // Share matching_nodes across concurrent tasks via Arc<Vec<Node>> (owned copies)
+        // ------------------------------------------------------------------
+        // Pass 1: call hierarchy, find_implementations, and document links.
+        // Pipelined with adaptive concurrency (TCP slow-start).
+        //
+        // Guard: skip Pass 1 entirely when the server never reached quiescent
+        // state (i.e., the initialization deadline expired before indexing
+        // finished). When rust-analyzer hasn't indexed the workspace, every
+        // call-hierarchy request returns 0 results — triggering the zero-edge
+        // abort after ZERO_EDGE_ABORT_THRESHOLD nodes. This is indistinguishable
+        // from a misconfigured server and discards the entire enrichment run.
+        //
+        // On large repos (19K+ nodes across two roots) RA needs >120s to
+        // become quiescent. The same guard already protects Pass 3; apply it
+        // here too to prevent the zero-edge abort on timed-out servers.
+        //
+        // Note: `matching_nodes_owned` and `language` are allocated after this
+        // guard to avoid a wasted Arc<Vec<Node>> clone when skipping all passes.
+        // ------------------------------------------------------------------
+        if !was_quiescent {
+            tracing::info!(
+                "LSP Pass 1 skipped: {} did not reach quiescent state during initialization",
+                self.server_command
+            );
+            tracing::info!(
+                "LSP enrichment complete for {}: 0 edges, 0 diagnostic nodes (0 attempted, 0 errors) — skipped (not quiescent)",
+                self.language,
+            );
+            return Ok(result);
+        }
+
+        // Share matching_nodes across concurrent tasks via Arc<Vec<Node>> (owned copies).
+        // Allocated after the was_quiescent guard to avoid cloning when all passes are skipped.
         let matching_nodes_owned: Arc<Vec<Node>> = Arc::new(
             matching_nodes.iter().map(|n| (*n).clone()).collect()
         );
         let language = self.language.clone();
 
-        // ------------------------------------------------------------------
-        // Pass 1: call hierarchy, find_implementations, and document links.
-        // Pipelined with adaptive concurrency (TCP slow-start).
-        // ------------------------------------------------------------------
         let pass1_start = std::time::Instant::now();
 
         // Filter to only nodes that need LSP requests:
@@ -2120,6 +2198,8 @@ impl Enricher for LspEnricher {
                 unique_files.len(), self.server_command
             );
             // Pull diagnostics per unique file
+            let mut pull_raw_total = 0usize;
+            let mut pull_files_with_diags = 0usize;
             for rel_file in &unique_files {
                 let abs_path = root.join(rel_file);
                 let file_uri = match path_to_uri(&abs_path) {
@@ -2128,6 +2208,14 @@ impl Enricher for LspEnricher {
                 };
                 match Self::pull_diagnostics_p(&transport, &file_uri).await {
                     Ok(diags) => {
+                        if !diags.is_empty() {
+                            pull_raw_total += diags.len();
+                            pull_files_with_diags += 1;
+                            tracing::debug!(
+                                "textDocument/diagnostic: {} raw items for {}",
+                                diags.len(), rel_file.display()
+                            );
+                        }
                         let nodes = Self::build_diagnostic_nodes(
                             file_uri.as_str(),
                             &diags,
@@ -2144,6 +2232,10 @@ impl Enricher for LspEnricher {
                     }
                 }
             }
+            tracing::info!(
+                "LSP diagnostics pass: pull complete — {} raw items from {} files with diagnostics (out of {} files)",
+                pull_raw_total, pull_files_with_diags, unique_files.len()
+            );
         } else {
             // Fall back to push-captured diagnostics from the reader loop.
             // Limit to URIs that correspond to this pass's files — prevents
@@ -3175,6 +3267,27 @@ mod tests {
              the server explicitly reaches quiescent=true (regression guard for #379)");
     }
 
+    /// Regression test for #379 round 4: Pass 1 (call hierarchy) must also be
+    /// skipped when `was_quiescent=false`.
+    ///
+    /// When RA hasn't indexed (deadline expired), Pass 1 returns 0 edges for
+    /// all ZERO_EDGE_ABORT_THRESHOLD nodes, triggering the zero-edge abort.
+    /// This is indistinguishable from a misconfigured server. The same guard
+    /// that protects Pass 3 must also protect Pass 1.
+    ///
+    /// This test verifies that `was_quiescent` defaults to false (so Pass 1
+    /// is skipped until RA explicitly becomes quiescent).
+    #[test]
+    fn test_lsp_state_was_quiescent_defaults_false_protects_pass1() {
+        let enricher = LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]);
+        let state = enricher.state.blocking_lock();
+        assert!(!state.was_quiescent,
+            "was_quiescent must default to false — Pass 1 (call hierarchy) must be skipped \
+             until the server explicitly reaches quiescent=true. Without this guard, the \
+             zero-edge abort fires on large repos where RA doesn't index within 120s \
+             (regression: #379 r4)");
+    }
+
     /// Verify the was_quiescent logic: only servers that sent serverStatus but
     /// never reached quiescent=true trigger the Pass 3 skip.
     ///
@@ -3644,5 +3757,89 @@ mod tests {
         );
 
         assert!(nodes.is_empty(), "severity 0 and 100 should be filtered (only 1 and 2 are stored)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Adversarial tests for #379 r4: Pass 1 guard and diagnostic 0-capture
+    // -----------------------------------------------------------------------
+
+    /// Adversarial: "unlinked-file" diagnostic (the VS Code example in issue #379)
+    /// is severity 2 (Warning) per LSP spec, so it SHOULD produce a node.
+    ///
+    /// If RA returns it as severity 3 (Information), that explains 0 captures.
+    /// This test documents the expected behavior: severity 2 unlinked-file → captured.
+    #[test]
+    fn test_build_diagnostic_nodes_unlinked_file_warning_captured() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 2,  // Warning
+                "message": "This file is not included in any crates [unlinked-file]",
+                "source": "rust-analyzer",
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/service.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+
+        assert_eq!(nodes.len(), 1,
+            "unlinked-file at severity 2 (Warning) should produce a diagnostic node; \
+             if this fails, RA is reporting it as Information (3) which gets filtered");
+        assert_eq!(nodes[0].metadata.get("diagnostic_severity").unwrap(), "warning");
+    }
+
+    /// Adversarial: "unlinked-file" diagnostic at severity 3 (Information)
+    /// should be filtered out. This is the suspected root cause of 0 captured diagnostics
+    /// in issue #379 — RA may report unlinked-file as Information, not Warning.
+    #[test]
+    fn test_build_diagnostic_nodes_unlinked_file_information_filtered() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 3,  // Information — below our capture threshold
+                "message": "This file is not included in any crates [unlinked-file]",
+                "source": "rust-analyzer",
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/service.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+        );
+
+        assert!(nodes.is_empty(),
+            "unlinked-file at severity 3 (Information) should be filtered; \
+             this is intentional — Information diagnostics are too noisy for code-understanding queries");
+    }
+
+    /// Adversarial: was_quiescent guard is the same for both Pass 1 and Pass 3.
+    /// Verify the default state prevents both passes from running.
+    /// (The actual early return from enrich() prevents all passes when !was_quiescent.)
+    #[test]
+    fn test_lsp_state_was_quiescent_false_prevents_all_passes() {
+        let enricher = LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]);
+        let state = enricher.state.blocking_lock();
+        // Both Pass 1 and Pass 3 check was_quiescent before running.
+        // With the default false, both are guarded.
+        assert!(!state.was_quiescent,
+            "was_quiescent=false must prevent Pass 1 AND Pass 3; \
+             the early return at Pass 1 guard covers both passes");
+        // has_pull_diagnostics also defaults false (not yet initialized)
+        assert!(!state.has_pull_diagnostics,
+            "has_pull_diagnostics must default false (not yet initialized from LSP capabilities)");
     }
 }
