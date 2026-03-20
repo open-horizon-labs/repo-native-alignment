@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search`.
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -33,6 +33,8 @@ pub const SCHEMA_VERSION: u32 = 12;
 /// - `diagnostic_message`   — full diagnostic message text
 /// - `diagnostic_range`     — "line:col-end_line:end_col" string
 /// - `diagnostic_timestamp` — unix timestamp (seconds) when diagnostic was captured
+/// - `http_method`  — HTTP verb for ApiEndpoint nodes ("GET", "POST", etc.)
+/// - `http_path`    — HTTP path for ApiEndpoint nodes ("/users", "/items/{id}", etc.)
 ///
 /// bump SCHEMA_VERSION in store.rs when changing this
 pub fn symbols_schema() -> Schema {
@@ -66,6 +68,9 @@ pub fn symbols_schema() -> Schema {
         Field::new("diagnostic_message", DataType::Utf8, true),     // full diagnostic text
         Field::new("diagnostic_range", DataType::Utf8, true),       // "line:col-end_line:end_col"
         Field::new("diagnostic_timestamp", DataType::Utf8, true),   // unix timestamp string
+        // ApiEndpoint columns — populated for NodeKind::ApiEndpoint nodes
+        Field::new("http_method", DataType::Utf8, true),    // "GET" | "POST" | "PUT" | etc.
+        Field::new("http_path", DataType::Utf8, true),      // "/users" | "/items/{id}" | etc.
         // Vector column is added dynamically when embeddings are computed,
         // since the dimension depends on the model. See `symbols_schema_with_vector`.
         Field::new("updated_at", DataType::Int64, false),
@@ -106,6 +111,9 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("diagnostic_message", DataType::Utf8, true),
         Field::new("diagnostic_range", DataType::Utf8, true),
         Field::new("diagnostic_timestamp", DataType::Utf8, true),
+        // ApiEndpoint columns — populated for NodeKind::ApiEndpoint nodes
+        Field::new("http_method", DataType::Utf8, true),
+        Field::new("http_path", DataType::Utf8, true),
         Field::new(
             "vector",
             DataType::FixedSizeList(

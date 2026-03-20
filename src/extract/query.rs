@@ -479,4 +479,406 @@ class UserService {
         let captures = extractor.run(tree.root_node(), source.as_bytes());
         assert!(captures.is_empty(), "@Injectable should not be captured");
     }
+
+    // ── Java Spring Boot / JAX-RS route detection ─────────────────────────
+
+    /// Verify `@GetMapping("/users")` is captured (Spring MVC).
+    #[test]
+    fn test_java_spring_get_mapping() {
+        let source = r#"
+public class UserController {
+    @GetMapping("/users")
+    public List<User> getUsers() { return null; }
+}
+"#;
+        let query_source = r#"
+(annotation
+  name: (identifier) @name
+  arguments: (annotation_argument_list
+    (string_literal) @path)
+  (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|RequestMapping|Path)$"))
+"#;
+        let language: Language = tree_sitter_java::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(!captures.is_empty(), "should detect @GetMapping annotation");
+
+        let path = captures[0].get("path").unwrap_or("");
+        assert!(path.contains("/users"), "expected '/users', got: {path:?}");
+    }
+
+    /// Verify `@PostMapping("/items")` is captured (Spring MVC).
+    #[test]
+    fn test_java_spring_post_mapping() {
+        let source = r#"
+@RestController
+public class ItemController {
+    @PostMapping("/items")
+    public Item createItem(@RequestBody Item item) { return item; }
+}
+"#;
+        let query_source = r#"
+(annotation
+  name: (identifier) @name
+  arguments: (annotation_argument_list
+    (string_literal) @path)
+  (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|RequestMapping|Path)$"))
+"#;
+        let language: Language = tree_sitter_java::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(!captures.is_empty(), "should detect @PostMapping annotation");
+
+        let path = captures[0].get("path").unwrap_or("");
+        assert!(path.contains("/items"), "expected '/items', got: {path:?}");
+    }
+
+    /// Verify `@Path("/users")` is captured (JAX-RS).
+    #[test]
+    fn test_java_jaxrs_path_annotation() {
+        let source = r#"
+@Path("/users")
+public class UserResource {
+    @GET
+    public Response getUsers() { return null; }
+}
+"#;
+        let query_source = r#"
+(annotation
+  name: (identifier) @name
+  arguments: (annotation_argument_list
+    (string_literal) @path)
+  (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|RequestMapping|Path)$"))
+"#;
+        let language: Language = tree_sitter_java::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(!captures.is_empty(), "should detect @Path annotation");
+
+        let path = captures[0].get("path").unwrap_or("");
+        assert!(path.contains("/users"), "expected '/users', got: {path:?}");
+    }
+
+    /// Verify non-route annotations like `@Override` are not captured.
+    #[test]
+    fn test_java_non_route_annotation_skipped() {
+        let source = r#"
+public class Foo {
+    @Override
+    public String toString() { return "foo"; }
+}
+"#;
+        let query_source = r#"
+(annotation
+  name: (identifier) @name
+  arguments: (annotation_argument_list
+    (string_literal) @path)
+  (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|RequestMapping|Path)$"))
+"#;
+        let language: Language = tree_sitter_java::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(captures.is_empty(), "@Override should not be captured");
+    }
+
+    // ── Go gorilla/mux and gin route detection ────────────────────────────
+
+    /// Verify `r.HandleFunc("/users", handler)` is captured (gorilla/mux).
+    #[test]
+    fn test_go_gorilla_handle_func() {
+        let source = r#"
+package main
+
+import "github.com/gorilla/mux"
+
+func main() {
+    r := mux.NewRouter()
+    r.HandleFunc("/users", getUsers).Methods("GET")
+}
+"#;
+        let query_source = r#"
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @name)
+  arguments: (argument_list
+    [(interpreted_string_literal)(raw_string_literal)] @path)
+  (#match? @name "^(HandleFunc|Handle|GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Any|Get|Post|Put|Delete|Patch|Head|Options)$"))
+"#;
+        let language: Language = tree_sitter_go::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(!captures.is_empty(), "should detect HandleFunc call");
+
+        let path = captures[0].get("path").unwrap_or("");
+        assert!(path.contains("/users"), "expected '/users', got: {path:?}");
+    }
+
+    /// Verify `router.GET("/items", handler)` is captured (gin).
+    #[test]
+    fn test_go_gin_get_route() {
+        let source = r#"
+package main
+
+import "github.com/gin-gonic/gin"
+
+func main() {
+    router := gin.Default()
+    router.GET("/items", getItems)
+}
+"#;
+        let query_source = r#"
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @name)
+  arguments: (argument_list
+    [(interpreted_string_literal)(raw_string_literal)] @path)
+  (#match? @name "^(HandleFunc|Handle|GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Any|Get|Post|Put|Delete|Patch|Head|Options)$"))
+"#;
+        let language: Language = tree_sitter_go::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(!captures.is_empty(), "should detect gin GET route");
+
+        let path = captures[0].get("path").unwrap_or("");
+        assert!(path.contains("/items"), "expected '/items', got: {path:?}");
+    }
+
+    // ── Rust Actix-web / Rocket route detection ───────────────────────────
+
+    /// Verify `#[get("/users")]` is captured (Actix-web / Rocket).
+    #[test]
+    fn test_rust_actix_get_attribute() {
+        let source = r#"
+use actix_web::get;
+
+#[get("/users")]
+async fn get_users() -> impl Responder {
+    HttpResponse::Ok().json(vec!["alice", "bob"])
+}
+"#;
+        let query_source = r#"
+(attribute_item
+  (attribute
+    (identifier) @name
+    arguments: (token_tree
+      (string_literal) @path))
+  (#match? @name "^(get|post|put|delete|patch|head|options|route|connect|trace)$"))
+"#;
+        let language: Language = tree_sitter_rust::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(!captures.is_empty(), "should detect #[get] route attribute");
+
+        let path = captures[0].get("path").unwrap_or("");
+        assert!(path.contains("/users"), "expected '/users', got: {path:?}");
+    }
+
+    /// Verify `#[post("/items")]` is captured (Actix-web / Rocket).
+    #[test]
+    fn test_rust_actix_post_attribute() {
+        let source = r#"
+#[post("/items")]
+async fn create_item(item: web::Json<Item>) -> impl Responder {
+    HttpResponse::Created().json(item.into_inner())
+}
+"#;
+        let query_source = r#"
+(attribute_item
+  (attribute
+    (identifier) @name
+    arguments: (token_tree
+      (string_literal) @path))
+  (#match? @name "^(get|post|put|delete|patch|head|options|route|connect|trace)$"))
+"#;
+        let language: Language = tree_sitter_rust::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(!captures.is_empty(), "should detect #[post] route attribute");
+
+        let path = captures[0].get("path").unwrap_or("");
+        assert!(path.contains("/items"), "expected '/items', got: {path:?}");
+    }
+
+    /// Verify `#[derive(Debug)]` is not captured as a route.
+    #[test]
+    fn test_rust_derive_attribute_skipped() {
+        let source = r#"
+#[derive(Debug, Clone)]
+struct User {
+    name: String,
+}
+"#;
+        let query_source = r#"
+(attribute_item
+  (attribute
+    (identifier) @name
+    arguments: (token_tree
+      (string_literal) @path))
+  (#match? @name "^(get|post|put|delete|patch|head|options|route|connect|trace)$"))
+"#;
+        let language: Language = tree_sitter_rust::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(captures.is_empty(), "#[derive] should not be captured as route");
+    }
+
+    // ── Ruby Sinatra / Rails route detection ──────────────────────────────
+
+    /// Verify `get '/users' do` is captured (Sinatra).
+    #[test]
+    fn test_ruby_sinatra_get_route() {
+        let source = r#"
+get '/users' do
+  User.all.to_json
+end
+"#;
+        let query_source = r#"
+(call
+  method: (identifier) @name
+  arguments: (argument_list
+    [(string)(simple_symbol)] @path)
+  (#match? @name "^(get|post|put|delete|patch|head|options|match|root|resources|resource|namespace|scope|member|collection)$"))
+"#;
+        let language: Language = tree_sitter_ruby::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(!captures.is_empty(), "should detect Sinatra get route");
+
+        let path = captures[0].get("path").unwrap_or("");
+        assert!(path.contains("/users"), "expected '/users', got: {path:?}");
+    }
+
+    /// Verify `post '/items' do` is captured (Sinatra).
+    #[test]
+    fn test_ruby_sinatra_post_route() {
+        let source = r#"
+post '/items' do
+  Item.create(params[:item]).to_json
+end
+"#;
+        let query_source = r#"
+(call
+  method: (identifier) @name
+  arguments: (argument_list
+    [(string)(simple_symbol)] @path)
+  (#match? @name "^(get|post|put|delete|patch|head|options|match|root|resources|resource|namespace|scope|member|collection)$"))
+"#;
+        let language: Language = tree_sitter_ruby::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(!captures.is_empty(), "should detect Sinatra post route");
+
+        let path = captures[0].get("path").unwrap_or("");
+        assert!(path.contains("/items"), "expected '/items', got: {path:?}");
+    }
+
+    // ── JavaScript Express.js route detection ─────────────────────────────
+
+    /// Verify `app.get('/users', handler)` is captured (Express.js).
+    #[test]
+    fn test_javascript_express_get_route() {
+        let source = r#"
+const express = require('express');
+const app = express();
+
+app.get('/users', (req, res) => {
+  res.json([]);
+});
+"#;
+        let query_source = r#"
+(call_expression
+  function: (member_expression
+    property: (property_identifier) @name)
+  arguments: (arguments
+    (string) @path)
+  (#match? @name "^(get|post|put|delete|patch|head|options|use|all|route)$"))
+"#;
+        let language: Language = tree_sitter_javascript::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(!captures.is_empty(), "should detect Express app.get route");
+
+        let path = captures[0].get("path").unwrap_or("");
+        assert!(path.contains("/users"), "expected '/users', got: {path:?}");
+    }
+
+    /// Verify `router.post('/items', handler)` is captured (Express Router).
+    #[test]
+    fn test_javascript_express_router_post() {
+        let source = r#"
+const router = require('express').Router();
+
+router.post('/items', async (req, res) => {
+  const item = await Item.create(req.body);
+  res.status(201).json(item);
+});
+"#;
+        let query_source = r#"
+(call_expression
+  function: (member_expression
+    property: (property_identifier) @name)
+  arguments: (arguments
+    (string) @path)
+  (#match? @name "^(get|post|put|delete|patch|head|options|use|all|route)$"))
+"#;
+        let language: Language = tree_sitter_javascript::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(!captures.is_empty(), "should detect Express router.post route");
+
+        let path = captures[0].get("path").unwrap_or("");
+        assert!(path.contains("/items"), "expected '/items', got: {path:?}");
+    }
 }
