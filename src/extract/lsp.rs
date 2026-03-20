@@ -869,8 +869,14 @@ impl LspEnricher {
         // only safe to run when the server has finished indexing; sending
         // thousands of textDocument/diagnostic requests to an unindexed server
         // floods its queue, which was the root cause of the #379 regression.
-        state.was_quiescent = server_ready;
-        if !server_ready {
+        //
+        // The guard only applies when the server supports `experimental/serverStatus`
+        // (`seen_server_status = true`) but never sent quiescent=true before the
+        // deadline. Servers that do NOT support serverStatus (pyright, marksman, etc.)
+        // never set `seen_server_status`, so we treat them as quiescent (they're
+        // assumed ready after the 5s fallback timeout and won't flood RA's queue).
+        state.was_quiescent = server_ready || !seen_server_status;
+        if seen_server_status && !server_ready {
             tracing::warn!(
                 "{} did not reach quiescent state — Pass 3 (diagnostics) will be skipped this session",
                 self.server_command
@@ -3144,8 +3150,13 @@ mod tests {
              the server explicitly reaches quiescent=true (regression guard for #379)");
     }
 
-    /// Verify the server_status_is_ready function drives was_quiescent correctly:
-    /// only health=ok + quiescent=true should count as ready.
+    /// Verify the was_quiescent logic: only servers that sent serverStatus but
+    /// never reached quiescent=true trigger the Pass 3 skip.
+    ///
+    /// The guard is `server_ready || !seen_server_status`:
+    /// - server_ready=true:  quiescent, Run Pass 3
+    /// - server_ready=false, seen_server_status=false: no serverStatus (pyright etc.), Run Pass 3
+    /// - server_ready=false, seen_server_status=true: RA timed out, SKIP Pass 3
     #[test]
     fn test_server_status_is_ready_drives_quiescence() {
         let ready_msg = serde_json::json!({
@@ -3153,22 +3164,27 @@ mod tests {
             "params": { "health": "ok", "quiescent": true }
         });
         assert!(LspEnricher::server_status_is_ready(&ready_msg),
-            "health=ok + quiescent=true must be ready (was_quiescent will be set to true)");
+            "health=ok + quiescent=true must be ready — was_quiescent = true, Pass 3 runs");
 
-        // Non-ready messages: was_quiescent must stay false
+        // Non-ready messages: only when seen_server_status=true do these block Pass 3
         let not_quiescent = serde_json::json!({
             "method": "experimental/serverStatus",
             "params": { "health": "ok", "quiescent": false }
         });
         assert!(!LspEnricher::server_status_is_ready(&not_quiescent),
-            "quiescent=false must NOT set was_quiescent — Pass 3 would run on an unindexed server");
+            "quiescent=false is not ready — if this is the last message before deadline, \
+             seen_server_status=true and server_ready=false → was_quiescent=false, Pass 3 skipped");
 
-        let deadline_expired = serde_json::json!({
+        // Verify the no-serverStatus fallback: was_quiescent = server_ready || !seen_server_status
+        // When seen_server_status=false (no serverStatus messages): was_quiescent = false || true = true
+        // Meaning servers without serverStatus support always get Pass 3 (correct behavior).
+        assert!(!LspEnricher::server_status_is_ready(&serde_json::json!({
             "method": "experimental/serverStatus",
             "params": { "health": "ok", "quiescent": false }
-        });
-        assert!(!LspEnricher::server_status_is_ready(&deadline_expired),
-            "deadline-expired message must NOT set was_quiescent");
+        })),
+            "deadline-expired serverStatus must not set was_quiescent — \
+             server_ready stays false, and since seen_server_status=true, \
+             was_quiescent = false || !true = false");
     }
 
     // -----------------------------------------------------------------------
