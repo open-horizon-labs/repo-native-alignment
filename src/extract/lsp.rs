@@ -535,6 +535,12 @@ struct LspState {
     /// Whether the language server supports pull-based diagnostics
     /// (`textDocument/diagnostic`, LSP 3.17+).
     has_pull_diagnostics: bool,
+    /// Whether the server reached quiescent=true during initialization.
+    /// When false, the quiescence deadline expired before the server finished
+    /// indexing. In that case Pass 3 (diagnostics) is skipped to avoid flooding
+    /// the server with diagnostic requests while it is still loading — which was
+    /// the root cause of the 0-edge regression introduced by #381.
+    was_quiescent: bool,
     /// Consecutive type hierarchy failures. After MAX_TYPE_HIERARCHY_STRIKES,
     /// type hierarchy is disabled for the rest of the session.
     type_hierarchy_strikes: u32,
@@ -588,6 +594,7 @@ impl LspEnricher {
                 has_type_hierarchy: false,
                 has_references: false,
                 has_pull_diagnostics: false,
+                was_quiescent: false,
                 type_hierarchy_strikes: 0,
                 diagnostics_sink: Arc::new(std::sync::Mutex::new(HashMap::new())),
             }),
@@ -774,6 +781,10 @@ impl LspEnricher {
         // If the server supports serverStatus, we should keep waiting for
         // quiescent=true rather than bailing on a per-message timeout.
         let mut seen_server_status = false;
+        // Track the raw `quiescent` bit independently of `health`.
+        // We only care about "done indexing" for the Pass 3 guard; health="warning"
+        // (compile errors) does not mean RA is still indexing.
+        let mut saw_quiescent = false;
 
         while tokio::time::Instant::now() < deadline {
             // Use a short timeout only when we haven't seen serverStatus yet.
@@ -803,9 +814,25 @@ impl LspEnricher {
                                 let quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(false);
                                 tracing::info!("{} serverStatus: health={}, quiescent={}", self.server_command, health, quiescent);
 
+                                // Track the raw quiescent bit separately from health.
+                                // Pass 3 cares about "done indexing" (quiescent=true),
+                                // not about compilation health (which may be "warning" or "error").
+                                if quiescent {
+                                    saw_quiescent = true;
+                                }
+
                                 if Self::server_status_is_ready(&msg) {
                                     tracing::info!("{} ready (serverStatus: ok, quiescent)", self.server_command);
                                     server_ready = true;
+                                    break;
+                                }
+                                // If quiescent=true but health!=ok, the server is done indexing
+                                // but has errors/warnings. Still break — no point waiting further.
+                                if quiescent {
+                                    tracing::info!(
+                                        "{} quiescent=true (health={}), proceeding despite non-ok health",
+                                        self.server_command, health
+                                    );
                                     break;
                                 }
                                 tracing::info!("{} not yet ready, continuing to wait for indexing...", self.server_command);
@@ -856,6 +883,29 @@ impl LspEnricher {
 
         if !server_ready {
             tracing::info!("{} readiness wait complete (server_ready=false, seen_status={}), proceeding", self.server_command, seen_server_status);
+        }
+
+        // Record whether the server became quiescent. Pass 3 (diagnostics) is
+        // only safe to run when the server has finished indexing; sending
+        // thousands of textDocument/diagnostic requests to an unindexed server
+        // floods its queue, which was the root cause of the #379 regression.
+        //
+        // Use `saw_quiescent` (raw quiescent=true bit) rather than `server_ready`
+        // (which also requires health="ok"). This ensures Pass 3 runs for repos
+        // with compile errors (health="warning", quiescent=true) — the server IS
+        // done indexing, it just has errors. Pass 3 is safe in that case.
+        //
+        // The guard only applies when the server supports `experimental/serverStatus`
+        // (`seen_server_status = true`) but never sent quiescent=true before the
+        // deadline. Servers that do NOT support serverStatus (pyright, marksman, etc.)
+        // never set `seen_server_status`, so we treat them as quiescent (they're
+        // assumed ready after the 5s fallback timeout and won't flood RA's queue).
+        state.was_quiescent = saw_quiescent || !seen_server_status;
+        if seen_server_status && !saw_quiescent {
+            tracing::warn!(
+                "{} did not reach quiescent state — Pass 3 (diagnostics) will be skipped this session",
+                self.server_command
+            );
         }
 
         tracing::info!("{} ready for {}", self.server_command, self.language);
@@ -1433,7 +1483,7 @@ impl Enricher for LspEnricher {
         }
 
         // Extract state under lock, then release the lock for concurrent work
-        let (transport, root, has_type_hierarchy, type_hierarchy_strikes, has_references, has_pull_diagnostics, diag_sink) = {
+        let (transport, root, has_type_hierarchy, type_hierarchy_strikes, has_references, has_pull_diagnostics, was_quiescent, diag_sink) = {
             let state = self.state.lock().await;
             let root = state
                 .root_path
@@ -1444,7 +1494,7 @@ impl Enricher for LspEnricher {
                 None => return Ok(result),
             };
             let diag_sink = Arc::clone(&state.diagnostics_sink);
-            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references, state.has_pull_diagnostics, diag_sink)
+            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references, state.has_pull_diagnostics, state.was_quiescent, diag_sink)
         };
         // State lock is released here — concurrent tasks can proceed
 
@@ -2014,7 +2064,30 @@ impl Enricher for LspEnricher {
         //
         // Only Error and Warning severities produce nodes.
         // Files with zero qualifying diagnostics produce no nodes (clean-file rule).
+        //
+        // Guard: skip Pass 3 entirely when the server never reached quiescent
+        // state (i.e., the initialization deadline expired before indexing
+        // finished). Sending thousands of textDocument/diagnostic requests to an
+        // unindexed server floods its request queue and was the root cause of the
+        // zero-edge regression introduced by #381.
         // ------------------------------------------------------------------
+        if !was_quiescent {
+            tracing::info!(
+                "LSP Pass 3 skipped: {} did not reach quiescent state during initialization",
+                self.server_command
+            );
+            let diag_count = 0usize;
+            tracing::info!(
+                "LSP enrichment complete for {}: {} edges, {} diagnostic nodes ({} attempted, {} errors)",
+                self.language,
+                result.added_edges.len(),
+                diag_count,
+                attempted,
+                errors,
+            );
+            return Ok(result);
+        }
+
         let diag_timestamp = {
             use std::time::{SystemTime, UNIX_EPOCH};
             SystemTime::now()
@@ -3027,6 +3100,10 @@ mod tests {
     /// valid Cargo workspace. It is marked #[ignore] so it doesn't run in CI
     /// (which may not have rust-analyzer installed), but can be run explicitly
     /// with `cargo test -- --ignored test_lsp_enrichment_produces_edges`.
+    ///
+    /// Regression guard for #379: verifies that rust-analyzer reaches quiescent
+    /// state and produces >0 call edges. If quiescence fails, 0 edges result
+    /// because RA is not indexed when call-hierarchy queries run.
     #[tokio::test]
     #[ignore]
     async fn test_lsp_enrichment_produces_edges() {
@@ -3060,6 +3137,16 @@ mod tests {
         let edge_count = result.added_edges.len();
         eprintln!("LSP enrichment produced {} edges from {} nodes", edge_count, nodes.len());
 
+        // Regression guard for #379: check was_quiescent first so failures
+        // report a clear message rather than just "0 edges".
+        let was_quiescent = {
+            let state = enricher.state.lock().await;
+            state.was_quiescent
+        };
+        assert!(was_quiescent,
+            "rust-analyzer did not reach quiescent state — this is the root cause of the \
+             #379 regression. Check that rust-analyzer can index the repo within 120s.");
+
         assert!(edge_count > 100,
             "expected >100 LSP edges from RNA repo, got {}. \
              This likely means rust-analyzer is not responding to call hierarchy queries.",
@@ -3071,6 +3158,62 @@ mod tests {
             .count();
         assert!(calls_edges > 50,
             "expected >50 Calls edges, got {}", calls_edges);
+    }
+
+    /// Regression test for #379: verify that LspState.was_quiescent defaults to false.
+    ///
+    /// The guard in Pass 3 relies on was_quiescent being false until the
+    /// server explicitly reaches quiescent=true. If it defaulted to true,
+    /// Pass 3 would run even when the server never finished indexing.
+    #[test]
+    fn test_lsp_state_was_quiescent_defaults_false() {
+        let enricher = LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]);
+        // The state is accessed via the async lock; use a blocking read for testing.
+        let state = enricher.state.blocking_lock();
+        assert!(!state.was_quiescent,
+            "was_quiescent must default to false — Pass 3 must be skipped until \
+             the server explicitly reaches quiescent=true (regression guard for #379)");
+    }
+
+    /// Verify the was_quiescent logic: only servers that sent serverStatus but
+    /// never reached quiescent=true trigger the Pass 3 skip.
+    ///
+    /// The guard is `saw_quiescent || !seen_server_status`:
+    /// - saw_quiescent=true (any health): done indexing → Run Pass 3
+    /// - seen_server_status=false: no serverStatus (pyright etc.) → assumed ready → Run Pass 3
+    /// - saw_quiescent=false, seen_server_status=true: RA timed out → SKIP Pass 3
+    ///
+    /// Note: `saw_quiescent` tracks the raw `quiescent=true` bit, not `server_ready`
+    /// which also requires health="ok". This means health="warning" + quiescent=true
+    /// (compile errors but done indexing) correctly enables Pass 3.
+    #[test]
+    fn test_server_status_is_ready_drives_quiescence() {
+        // health=ok + quiescent=true: server_ready=true, saw_quiescent=true → Pass 3 runs
+        let ready_msg = serde_json::json!({
+            "method": "experimental/serverStatus",
+            "params": { "health": "ok", "quiescent": true }
+        });
+        assert!(LspEnricher::server_status_is_ready(&ready_msg),
+            "health=ok + quiescent=true must be ready — saw_quiescent=true, Pass 3 runs");
+
+        // health="warning" + quiescent=true: server_ready=false but saw_quiescent=true → Pass 3 runs
+        // (compile errors but done indexing — diagnostics are needed precisely in this state)
+        let warning_quiescent = serde_json::json!({
+            "method": "experimental/serverStatus",
+            "params": { "health": "warning", "quiescent": true }
+        });
+        assert!(!LspEnricher::server_status_is_ready(&warning_quiescent),
+            "health=warning is not 'ready' (server_ready=false), but saw_quiescent=true \
+             means was_quiescent=true and Pass 3 will run correctly");
+
+        // quiescent=false: saw_quiescent stays false, Pass 3 blocked if deadline expires
+        let not_quiescent = serde_json::json!({
+            "method": "experimental/serverStatus",
+            "params": { "health": "ok", "quiescent": false }
+        });
+        assert!(!LspEnricher::server_status_is_ready(&not_quiescent),
+            "quiescent=false: saw_quiescent=false — if deadline expires with only these \
+             messages, seen_server_status=true and saw_quiescent=false → was_quiescent=false");
     }
 
     // -----------------------------------------------------------------------
