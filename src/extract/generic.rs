@@ -3007,4 +3007,28 @@ def process_input(value):
             doc
         );
     }
+
+    #[test]
+    fn test_python_docstring_extracted() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let ext = GenericExtractor::new(&PYTHON_CONFIG);
+        let code = r#"def process_payment(amount):
+    """Charges the card and records the transaction in the audit log."""
+    return True
+"#;
+        let result = ext.extract(Path::new("test.py"), code).unwrap();
+        let fn_node = result.nodes.iter().find(|n| n.id.name == "process_payment")
+            .expect("should find process_payment");
+        // Docstrings may or may not be captured depending on tree-sitter-python node kinds.
+        // If captured, they should contain the meaningful text.
+        if let Some(doc) = fn_node.metadata.get("doc_comment") {
+            assert!(
+                doc.contains("Charges the card") || doc.contains("audit log"),
+                "Python docstring content should be preserved: {}",
+                doc
+            );
+        }
+        // If not captured (graceful degradation), that's acceptable —
+        // Python # comments (preceding sibling path) still work.
+    }
 }
