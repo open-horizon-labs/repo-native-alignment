@@ -1353,12 +1353,26 @@ impl EmbeddingIndex {
             }
         };
 
-        // When scalar pre-filters are active, we fetch exactly `limit` rows
-        // (the filter ensures only matching rows are scored). Without filters,
-        // keep the 3x over-fetch to allow artifact-type post-filtering.
-        let has_scalar_filters = filters.to_sql().is_some();
-        let over_fetch = if has_scalar_filters { limit } else { limit * 3 };
+        // Determine over-fetch multiplier.
+        //
+        // When scalar pre-filters are active, only matching rows participate
+        // in vector ranking — no need to over-fetch for post-Rust filtering.
+        // However, two Rust-side steps still reduce result count after the DB query:
+        //   1. artifact_types post-filter (lines below): skips rows whose kind
+        //      does not match the requested types.
+        //   2. test-path demotion: does not reduce count but reorders results.
+        //
+        // Keep a 2x over-fetch when artifact_types filtering is also active,
+        // so the caller receives `limit` results after that Rust-side step.
+        // Without filters, keep the 3x over-fetch (baseline behavior).
         let pre_filter_sql = filters.to_sql();
+        let has_scalar_filters = pre_filter_sql.is_some();
+        let has_post_filter = artifact_types.is_some_and(|t| !t.is_empty());
+        let over_fetch = match (has_scalar_filters, has_post_filter) {
+            (true, false) => limit,       // scalar-only: exact fetch
+            (true, true)  => limit * 2,  // scalar + artifact_type: 2x for post-filter loss
+            _             => limit * 3,  // no scalar filters: baseline 3x
+        };
 
         use futures::TryStreamExt;
 

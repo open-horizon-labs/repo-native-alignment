@@ -988,7 +988,9 @@ fn collect_doc_comment(
     let mut comment_lines: Vec<String> = Vec::new();
 
     // Walk preceding siblings in reverse (closest to definition first),
-    // collecting contiguous comment nodes. Stop at non-comment, non-whitespace.
+    // collecting contiguous comment nodes. Skip attribute/decorator nodes
+    // transparently — they often sit between a doc comment and the symbol
+    // (e.g. `/// doc \n #[test] \n fn foo()`).
     let mut sibling = node.prev_sibling();
     while let Some(sib) = sibling {
         let kind = sib.kind();
@@ -999,8 +1001,13 @@ fn collect_doc_comment(
                 comment_lines.push(cleaned);
             }
             sibling = sib.prev_sibling();
+        } else if config.decorator_node_kinds.contains(&kind) {
+            // Attribute/decorator node between comment and symbol — skip
+            // transparently without breaking, so we continue collecting
+            // comments above the decorator.
+            sibling = sib.prev_sibling();
         } else {
-            // Stop at the first non-comment sibling (don't skip code).
+            // Stop at the first non-comment, non-decorator sibling.
             break;
         }
     }
@@ -1057,11 +1064,13 @@ fn strip_comment_markers(raw: &str, _language_name: &str) -> String {
             .trim_start_matches("///")
             .trim_start_matches("//!")
             .trim_start_matches("/**")
-            .trim_start_matches("*/")
+            .trim_start_matches("/*")
             .trim_start_matches("//")
             .trim_start_matches('*')
             // Python/shell comments
             .trim_start_matches('#')
+            // Block comment closing delimiter (e.g. "Returns the result. */")
+            .trim_end_matches("*/")
             .trim();
         if !stripped.is_empty() {
             if !result.is_empty() { result.push(' '); }
@@ -2992,6 +3001,36 @@ pub fn no_doc() -> u32 {
         assert!(!result.contains("/**"), "block start should be stripped: {}", result);
         assert!(!result.contains("*/"), "block end should be stripped: {}", result);
         assert!(result.contains("Returns the result"), "content should be preserved: {}", result);
+    }
+
+    #[test]
+    fn test_strip_comment_markers_single_line_block() {
+        let raw = "/** Returns the computed value. */";
+        let result = strip_comment_markers(raw, "java");
+        assert!(!result.contains("/**"), "opening delimiter should be stripped: {}", result);
+        assert!(!result.contains("*/"), "closing delimiter should be stripped: {}", result);
+        assert!(result.contains("Returns the computed value"), "content should be preserved: {}", result);
+    }
+
+    #[test]
+    fn test_rust_doc_comment_with_attribute_between() {
+        use crate::extract::rust::RustExtractor;
+        let ext = RustExtractor::new();
+        let code = r#"
+/// This function is a test helper.
+#[test]
+fn my_test_helper() {}
+"#;
+        let result = ext.extract(Path::new("test.rs"), code).unwrap();
+        let fn_node = result.nodes.iter().find(|n| n.id.name == "my_test_helper")
+            .expect("should find my_test_helper");
+        let doc = fn_node.metadata.get("doc_comment")
+            .expect("should extract doc comment even with #[test] attribute between comment and fn");
+        assert!(
+            doc.contains("test helper"),
+            "doc comment should be extracted through attribute: {}",
+            doc
+        );
     }
 
     #[test]
