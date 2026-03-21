@@ -225,6 +225,9 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
         if n.metadata.get("visibility").map(|s| s == "pub").unwrap_or(false) {
             entry.push_str(" pub");
         }
+        if n.metadata.get("exported").map(|s| s == "true").unwrap_or(false) {
+            entry.push_str(" __all__");
+        }
         if let Some(decorators) = n.metadata.get("decorators") {
             entry.push_str(&format!(" [{}]", decorators));
         }
@@ -282,6 +285,9 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
         }
         if let Some(vis) = n.metadata.get("visibility") {
             entry.push_str(&format!("\n  Visibility: {}", vis));
+        }
+        if n.metadata.get("exported").map(|s| s == "true").unwrap_or(false) {
+            entry.push_str("\n  Exported: yes (__all__)");
         }
         if let Some(decorators) = n.metadata.get("decorators") {
             entry.push_str(&format!("\n  Decorators: {}", decorators));

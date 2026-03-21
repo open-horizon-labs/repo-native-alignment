@@ -252,6 +252,7 @@ pub static PYTHON_CONFIG: LangConfig = LangConfig {
     call_expr_kinds: Some(("call", "function")),
     pub_visibility_modifier: None,
     has_all_export: true,
+    test_name_prefix: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -301,6 +302,7 @@ pub static TYPESCRIPT_CONFIG: LangConfig = LangConfig {
     call_expr_kinds: Some(("call_expression", "function")),
     pub_visibility_modifier: None,
     has_all_export: false,
+    test_name_prefix: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -343,6 +345,7 @@ pub static JAVASCRIPT_CONFIG: LangConfig = LangConfig {
     call_expr_kinds: Some(("call_expression", "function")),
     pub_visibility_modifier: None,
     has_all_export: false,
+    test_name_prefix: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -385,6 +388,7 @@ pub static GO_CONFIG: LangConfig = LangConfig {
     call_expr_kinds: Some(("call_expression", "function")),
     pub_visibility_modifier: None,
     has_all_export: false,
+    test_name_prefix: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -434,6 +438,7 @@ pub static JAVA_CONFIG: LangConfig = LangConfig {
     call_expr_kinds: Some(("method_invocation", "name")),
     pub_visibility_modifier: None,
     has_all_export: false,
+    test_name_prefix: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -479,6 +484,7 @@ pub static KOTLIN_CONFIG: LangConfig = LangConfig {
     call_expr_kinds: Some(("call_expression", "calleeExpression")),
     pub_visibility_modifier: None,
     has_all_export: false,
+    test_name_prefix: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -527,6 +533,7 @@ pub static CSHARP_CONFIG: LangConfig = LangConfig {
     call_expr_kinds: Some(("invocation_expression", "function")),
     pub_visibility_modifier: None,
     has_all_export: false,
+    test_name_prefix: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -574,6 +581,7 @@ pub static SWIFT_CONFIG: LangConfig = LangConfig {
     call_expr_kinds: Some(("call_expression", "function")),
     pub_visibility_modifier: None,
     has_all_export: false,
+    test_name_prefix: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -617,6 +625,7 @@ pub static ZIG_CONFIG: LangConfig = LangConfig {
     call_expr_kinds: None,
     pub_visibility_modifier: None,
     has_all_export: false,
+    test_name_prefix: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -666,6 +675,7 @@ pub static CPP_CONFIG: LangConfig = LangConfig {
     call_expr_kinds: Some(("call_expression", "function")),
     pub_visibility_modifier: None,
     has_all_export: false,
+    test_name_prefix: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -701,6 +711,7 @@ pub static LUA_CONFIG: LangConfig = LangConfig {
     call_expr_kinds: None,
     pub_visibility_modifier: None,
     has_all_export: false,
+    test_name_prefix: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -743,6 +754,7 @@ pub static RUBY_CONFIG: LangConfig = LangConfig {
     call_expr_kinds: Some(("call", "method")),
     pub_visibility_modifier: None,
     has_all_export: false,
+    test_name_prefix: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -780,4 +792,5 @@ pub static BASH_CONFIG: LangConfig = LangConfig {
     call_expr_kinds: None,
     pub_visibility_modifier: None,
     has_all_export: false,
+    test_name_prefix: false,
 };

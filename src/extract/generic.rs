@@ -167,6 +167,11 @@ pub struct LangConfig {
     /// Whether to detect `__all__ = [...]` assignments as public API exports (#409).
     /// Set `true` only for Python (the only language using this convention).
     pub has_all_export: bool,
+    /// Whether `fn/def test_*` name prefix marks a function as a test (#390).
+    /// Set `true` only for Python (PEP/pytest convention).
+    /// Rust, Java, TypeScript use decorator/attribute patterns — their `test_helper()`
+    /// functions are NOT tests by naming alone.
+    pub test_name_prefix: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +388,9 @@ fn collect_nodes(
                             metadata.insert("is_async".to_string(), "true".to_string());
                         }
                         // is_test: check decorator tokens for test patterns.
-                        let is_test = is_test_by_decorator(&decorators, &name);
+                        // Pass config.test_name_prefix so only languages that opt in
+                        // (Python) use the test_* naming convention.
+                        let is_test = is_test_by_decorator(&decorators, &name, config.test_name_prefix);
                         if is_test {
                             metadata.insert("is_test".to_string(), "true".to_string());
                         }
@@ -395,8 +402,8 @@ fn collect_nodes(
                     if is_async {
                         metadata.insert("is_async".to_string(), "true".to_string());
                     }
-                    // Name-based test detection (Python test_* convention, etc.)
-                    if is_test_by_decorator("", &name) {
+                    // Name-based test detection (only for languages that opt in via config).
+                    if is_test_by_decorator("", &name, config.test_name_prefix) {
                         metadata.insert("is_test".to_string(), "true".to_string());
                     }
                 }
@@ -406,8 +413,8 @@ fn collect_nodes(
                 if is_async {
                     metadata.insert("is_async".to_string(), "true".to_string());
                 }
-                // Name-based test detection.
-                if is_test_by_decorator("", &name) {
+                // Name-based test detection (only for languages that opt in via config).
+                if is_test_by_decorator("", &name, config.test_name_prefix) {
                     metadata.insert("is_test".to_string(), "true".to_string());
                 }
             }
@@ -1598,14 +1605,15 @@ fn detect_is_async(node: tree_sitter::Node, source: &[u8]) -> bool {
 /// for known test patterns across languages:
 /// - Rust:       `#[test]`, `#[tokio::test]`, `#[async_std::test]`
 /// - Python:     `@pytest.mark.parametrize`, `@unittest.skip*`
-/// - TypeScript: `it("...", ...)`, `test("...", ...)` — not decorator-based,
-///               detected by `def test_*` name convention instead.
+/// - TypeScript: decorator-based test frameworks (`@test`)
 /// - Java/JUnit: `@Test`, `@ParameterizedTest`, `@RepeatedTest`
 ///
-/// Also checks Python-style `def test_*` naming convention.
-fn is_test_by_decorator(decorators: &str, fn_name: &str) -> bool {
-    // Name-based convention: Python `def test_*`.
-    if fn_name.starts_with("test_") || fn_name == "test" {
+/// The `use_name_prefix` parameter controls whether `test_*` naming convention
+/// is applied. Set `true` only for Python (PEP/pytest convention). Rust/Java/TS
+/// `test_helper()` functions should NOT be marked as tests by name alone.
+fn is_test_by_decorator(decorators: &str, fn_name: &str, use_name_prefix: bool) -> bool {
+    // Name-based convention: Python `def test_*` (only when language opts in).
+    if use_name_prefix && (fn_name.starts_with("test_") || fn_name == "test") {
         return true;
     }
     if decorators.is_empty() {
@@ -1678,7 +1686,13 @@ fn emit_decorator_implements_edges(nodes: &[Node], path: &Path) -> Vec<Edge> {
                         from: node.id.clone(),
                         to: NodeId {
                             root: String::new(),
-                            file: path.to_path_buf(),
+                            // Empty file: decorator-derived Implements targets are
+                            // pseudo-traits (Debug, Clone, Injectable, etc.) that may
+                            // not exist as nodes in this repo. Using an empty path keeps
+                            // the edge dangling/unresolved without pinning it to the
+                            // current file (which might define an unrelated symbol
+                            // with the same name).
+                            file: std::path::PathBuf::new(),
                             name: trait_name,
                             kind: NodeKind::Trait,
                         },
@@ -2084,16 +2098,24 @@ fn collect_use_targets_inner(node: tree_sitter::Node, source: &[u8], targets: &m
         // `self` keyword in use list — skip
         "self" => {}
         // use_wildcard: `foo::*` — stop, no edges
-        "use_wildcard" | "scoped_use_list" => {
-            // scoped_use_list: `foo::{A, B}` — recurse to find identifiers
-            if kind == "scoped_use_list" {
+        "use_wildcard" => {}
+        // scoped_use_list: `crate::foo::{A, B}` — recurse only into the `list` field,
+        // NOT the `path` field (which would include the namespace prefix "foo" as a target).
+        "scoped_use_list" => {
+            // The `list` field is the `{A, B}` part; `path` is the `crate::foo` prefix.
+            // Only collect targets from the list, not from the path.
+            if let Some(list) = node.child_by_field_name("list") {
+                collect_use_targets_inner(list, source, targets);
+            } else {
+                // Fallback: iterate children but skip the path field
                 for i in 0..node.child_count() {
                     if let Some(child) = node.child(i as u32) {
-                        collect_use_targets_inner(child, source, targets);
+                        if child.kind() == "use_list" {
+                            collect_use_targets_inner(child, source, targets);
+                        }
                     }
                 }
             }
-            // use_wildcard: stop
         }
         // use_list: `{A, B, C}` — recurse into items
         "use_list" => {

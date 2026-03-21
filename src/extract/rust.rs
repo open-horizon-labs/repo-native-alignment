@@ -90,6 +90,7 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
     call_expr_kinds: Some(("call_expression", "function")),
     pub_visibility_modifier: Some("visibility_modifier"),
     has_all_export: false,
+    test_name_prefix: false,
 };
 
 /// Rust tree-sitter extractor with topology pattern detection.
