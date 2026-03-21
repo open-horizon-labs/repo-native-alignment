@@ -589,6 +589,22 @@ impl RnaHandler {
             }
         }
 
+        // 4d. TestedBy naming-convention pass: emit TestedBy edges from test
+        //     functions to the production functions they exercise, using only
+        //     function names (no LSP required).  Runs here so that edges are
+        //     present after every tree-sitter-only scan, not just when LSP
+        //     finishes initialising.
+        {
+            let tested_by_edges = crate::extract::naming_convention::tested_by_pass(&all_nodes);
+            if !tested_by_edges.is_empty() {
+                tracing::info!(
+                    "TestedBy naming-convention pass: {} edge(s)",
+                    tested_by_edges.len()
+                );
+                all_edges.extend(tested_by_edges);
+            }
+        }
+
         // 5. Build petgraph index
         let mut index = GraphIndex::new();
         index.rebuild_from_edges(&all_edges);
@@ -907,6 +923,20 @@ impl RnaHandler {
                 );
                 graph.nodes.extend(manifest_result.nodes);
                 graph.edges.extend(manifest_result.edges);
+            }
+        }
+
+        // Re-run TestedBy naming-convention pass over the full node set so
+        // that test/production pairs where only one side changed are still
+        // linked.  Duplicate edges are harmless (stable_id dedup at persist).
+        {
+            let tested_by_edges = crate::extract::naming_convention::tested_by_pass(&graph.nodes);
+            if !tested_by_edges.is_empty() {
+                tracing::info!(
+                    "TestedBy naming-convention pass (incremental): {} edge(s)",
+                    tested_by_edges.len()
+                );
+                graph.edges.extend(tested_by_edges);
             }
         }
 
