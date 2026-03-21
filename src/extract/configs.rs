@@ -879,7 +879,7 @@ pub static PHP_CONFIG: LangConfig = LangConfig {
     route_queries: &[],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: Some(("function_call_expression", "function")),
-    pub_visibility_modifier: Some("public"),
+    pub_visibility_modifier: None,  // PHP has no re-export semantics like Rust's `pub use`
     has_all_export: false,
     test_name_prefix: false,
 };

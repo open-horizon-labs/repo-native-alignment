@@ -29,10 +29,8 @@ impl CExtractor {
 
 impl Extractor for CExtractor {
     fn extensions(&self) -> &[&str] {
-        // NOTE: .c and .h files only — .cpp/.cc/.cxx/.hpp go to CppExtractor.
-        // The CppExtractor already handles .c and .h via the cpp grammar which
-        // is a superset, but we add a dedicated C extractor for pure C files
-        // that registers with the C grammar for better accuracy.
+        // .c and .h files — dedicated C grammar (tree-sitter-c).
+        // .cpp/.cc/.cxx/.hpp/.hxx are handled by CppExtractor (tree-sitter-cpp).
         &["c", "h"]
     }
 
