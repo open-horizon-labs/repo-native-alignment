@@ -11,6 +11,7 @@ pub mod api_link;
 pub mod directory_module;
 pub mod manifest;
 pub mod naming_convention;
+pub mod nextjs_routing;
 pub mod bash;
 pub mod c;
 pub mod configs;
