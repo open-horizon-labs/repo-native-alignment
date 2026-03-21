@@ -645,6 +645,30 @@ impl RnaHandler {
             }
         }
 
+        // 4f. Next.js file-path routing pass: emit ApiEndpoint nodes for
+        //     Next.js App Router and Pages Router API routes.  Path-pattern
+        //     matching only — no tree-sitter needed.  Runs after tree-sitter
+        //     extraction so that Implements edges can link to Function nodes.
+        {
+            let nextjs_roots: Vec<(String, std::path::PathBuf)> = resolved_roots
+                .iter()
+                .map(|r| (r.slug.clone(), r.path.clone()))
+                .collect();
+            let nextjs_result = crate::extract::nextjs_routing::nextjs_routing_pass(
+                &nextjs_roots,
+                &all_nodes,
+            );
+            if !nextjs_result.nodes.is_empty() || !nextjs_result.edges.is_empty() {
+                tracing::info!(
+                    "Next.js routing pass: {} ApiEndpoint node(s), {} Implements edge(s)",
+                    nextjs_result.nodes.len(),
+                    nextjs_result.edges.len()
+                );
+                all_nodes.extend(nextjs_result.nodes);
+                all_edges.extend(nextjs_result.edges);
+            }
+        }
+
         // 5. Build petgraph index
         let mut index = GraphIndex::new();
         index.rebuild_from_edges(&all_edges);
@@ -1011,11 +1035,34 @@ impl RnaHandler {
             }
         }
 
+        // Re-run Next.js routing pass with the full node set so that
+        // new/changed route files produce ApiEndpoint nodes and Implements
+        // edges. Include in upsert delta so nodes/edges are persisted.
+        {
+            let nextjs_roots = vec![(primary_slug.clone(), self.repo_root.clone())];
+            let nextjs_result = crate::extract::nextjs_routing::nextjs_routing_pass(
+                &nextjs_roots,
+                &graph.nodes,
+            );
+            if !nextjs_result.nodes.is_empty() || !nextjs_result.edges.is_empty() {
+                tracing::info!(
+                    "Next.js routing pass (incremental): {} ApiEndpoint node(s), {} Implements edge(s)",
+                    nextjs_result.nodes.len(),
+                    nextjs_result.edges.len()
+                );
+                // Include in upsert delta so nodes/edges are persisted to LanceDB.
+                upsert_node_ids.extend(nextjs_result.nodes.iter().map(|n| n.stable_id()));
+                upsert_edges.extend(nextjs_result.edges.iter().cloned());
+                graph.nodes.extend(nextjs_result.nodes);
+                graph.edges.extend(nextjs_result.edges);
+            }
+        }
+
         // Deduplicate graph.nodes and graph.edges in-place before rebuilding the
         // petgraph index.  Post-extraction passes (api_link, manifest, tested_by,
-        // directory_module) re-run over the full node/edge set on every incremental
-        // scan, which causes the same entries to be appended repeatedly.  After N
-        // scans each entry appears N times, causing:
+        // directory_module, nextjs_routing) re-run over the full node/edge set on
+        // every incremental scan, which causes the same entries to be appended
+        // repeatedly.  After N scans each entry appears N times, causing:
         //   - graph.nodes: duplicate package nodes from manifest_pass (memory growth,
         //     stale data exposed to search/query tools)
         //   - graph.edges: N-multiplied edges → inflated PageRank weights
