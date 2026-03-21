@@ -404,7 +404,14 @@ fn drop_all_lance_tables(db_path: &Path) {
     if let Ok(entries) = std::fs::read_dir(db_path) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.file_name().map(|n| n == "schema_version").unwrap_or(false) {
+            // Preserve both version files: schema_version is rewritten below;
+            // extraction_version must survive so the next extraction-version bump
+            // still triggers its scan-state reset correctly.
+            if path
+                .file_name()
+                .map(|n| n == "schema_version" || n == "extraction_version")
+                .unwrap_or(false)
+            {
                 continue;
             }
             if path.is_dir() {
@@ -1696,7 +1703,9 @@ mod tests {
         assert!(!is_schema_mismatch_error(&not_found));
     }
 
-    /// `drop_all_lance_tables` removes table directories and resets the schema_version file.
+    /// `drop_all_lance_tables` removes table directories, resets the schema_version file,
+    /// and preserves the extraction_version file so the next version bump still triggers
+    /// its scan-state reset correctly.
     #[test]
     fn test_drop_all_lance_tables_clears_dirs_and_resets_version() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1707,6 +1716,8 @@ mod tests {
         std::fs::create_dir_all(db_path.join("symbols.lance")).unwrap();
         std::fs::create_dir_all(db_path.join("edges.lance")).unwrap();
         std::fs::write(db_path.join("schema_version"), "9").unwrap();
+        // extraction_version must survive the cleanup.
+        std::fs::write(db_path.join("extraction_version"), "42").unwrap();
 
         drop_all_lance_tables(&db_path);
 
@@ -1717,6 +1728,11 @@ mod tests {
         // schema_version should be reset to SCHEMA_VERSION.
         let written = std::fs::read_to_string(db_path.join("schema_version")).unwrap();
         assert_eq!(written, SCHEMA_VERSION.to_string());
+
+        // extraction_version must be preserved so subsequent extraction-version bumps
+        // still trigger their scan-state reset correctly.
+        let ev = std::fs::read_to_string(db_path.join("extraction_version")).unwrap();
+        assert_eq!(ev, "42", "extraction_version must survive drop_all_lance_tables");
     }
 
     /// After a schema mismatch during incremental persist, `persist_graph_incremental`
