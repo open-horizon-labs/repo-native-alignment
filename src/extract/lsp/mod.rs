@@ -2706,6 +2706,55 @@ mod tests {
         assert_eq!(rel, PathBuf::from("src/main.rs"));
     }
 
+    /// Verify that percent-encoded characters in file URIs are decoded correctly.
+    ///
+    /// LSP servers return URIs like `file:///path/with%20spaces/main.rs` when the
+    /// workspace lives under a directory whose name contains characters that require
+    /// percent-encoding in a URI (spaces, parentheses, etc.).  Without decoding,
+    /// `strip_prefix` would fail and we would silently drop graph edges.
+    #[test]
+    fn test_uri_to_relative_path_percent_encoded() {
+        // Space encoded as %20
+        let root = PathBuf::from("/home/user/my project");
+        let uri = Uri::from_str("file:///home/user/my%20project/src/main.rs").unwrap();
+        let rel = uri_to_relative_path(&uri, &root);
+        assert_eq!(rel, PathBuf::from("src/main.rs"));
+
+        // Parentheses encoded as %28 / %29 — common on macOS with versioned dirs
+        let root2 = PathBuf::from("/home/user/project (v2)");
+        let uri2 = Uri::from_str("file:///home/user/project%20%28v2%29/lib.rs").unwrap();
+        let rel2 = uri_to_relative_path(&uri2, &root2);
+        assert_eq!(rel2, PathBuf::from("lib.rs"));
+    }
+
+    /// Adversarial: verify fallback and edge-case behaviour of uri_to_relative_path.
+    ///
+    /// Seeded from dissent findings:
+    /// 1. URI outside the workspace root — should return an absolute-looking path rather than panic.
+    /// 2. URI with a non-file scheme that passes url::Url::parse but fails to_file_path() —
+    ///    the fallback raw-strip code should be reached.
+    /// 3. Normal file URI to a file outside the root — strip_prefix fails, fallback returns absolute.
+    #[test]
+    fn test_uri_to_relative_path_adversarial() {
+        let root = PathBuf::from("/home/user/project");
+
+        // 1. Encoded URI for a file outside the workspace root — should return the decoded
+        //    absolute path (strip_prefix fails, but we still decode correctly).
+        let outside_uri = Uri::from_str("file:///tmp/other%20project/foo.rs").unwrap();
+        let result = uri_to_relative_path(&outside_uri, &root);
+        // Should be the decoded absolute path, NOT contain %20
+        let result_str = result.to_string_lossy();
+        assert!(!result_str.contains("%20"), "fallback should not contain raw percent-encoding: {result_str}");
+        assert!(result_str.contains("other project"), "path should be decoded: {result_str}");
+
+        // 2. Encoded root path matches exactly the file — relative should be empty/current dir.
+        let root2 = PathBuf::from("/home/user/my project");
+        let exact_uri = Uri::from_str("file:///home/user/my%20project").unwrap();
+        let rel2 = uri_to_relative_path(&exact_uri, &root2);
+        // strip_prefix of identical path yields "" which is PathBuf::new()
+        assert_eq!(rel2, PathBuf::from(""));
+    }
+
     // -----------------------------------------------------------------------
     // Tests for resolve_type_hierarchy_item (pure function, no LSP server needed)
     // -----------------------------------------------------------------------

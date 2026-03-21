@@ -69,8 +69,26 @@ pub(super) fn find_enclosing_symbol(nodes: &[&Node], file: &Path, line: usize) -
 }
 
 /// Extract a relative file path from an LSP URI, relative to a given root.
+///
+/// Uses `url::Url::to_file_path()` to properly percent-decode URI segments
+/// (e.g. `%20` → space, `%28` → `(`), matching the behaviour of
+/// `resolve_type_hierarchy_item`.  Falls back to a raw strip of the `file://`
+/// prefix for non-standard URIs that the `url` crate cannot parse.
 pub(super) fn uri_to_relative_path(uri: &Uri, root: &Path) -> PathBuf {
     let uri_str = uri.as_str();
+
+    // Primary path: use url::Url for correct percent-decoding.
+    if let Ok(parsed) = url::Url::parse(uri_str) {
+        if let Ok(abs_path) = parsed.to_file_path() {
+            let rel = abs_path.strip_prefix(root).unwrap_or(&abs_path);
+            return rel.to_path_buf();
+        }
+        tracing::debug!(uri = uri_str, "uri_to_relative_path: url::Url parsed but to_file_path() failed; falling back to raw strip");
+    } else {
+        tracing::debug!(uri = uri_str, "uri_to_relative_path: url::Url::parse failed; falling back to raw strip");
+    }
+
+    // Fallback for non-standard URIs: strip the scheme prefix without decoding.
     if let Some(file_path_str) = uri_str.strip_prefix("file://") {
         let abs_path = PathBuf::from(file_path_str);
         if let Ok(rel) = abs_path.strip_prefix(root) {
@@ -78,7 +96,7 @@ pub(super) fn uri_to_relative_path(uri: &Uri, root: &Path) -> PathBuf {
         }
         return abs_path;
     }
-    // Fallback: use the path component
+
     PathBuf::from(uri.path().as_str())
 }
 
