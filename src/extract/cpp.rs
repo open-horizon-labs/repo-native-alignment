@@ -219,7 +219,7 @@ mod tests {
 #define MAX_BUFFER_SIZE 1024
 #define VERSION "1.0.0"
 "#;
-        let result = extractor.extract(Path::new("src/config.h"), code).unwrap();
+        let result = extractor.extract(Path::new("src/config.hpp"), code).unwrap();
 
         let macros: Vec<_> = result
             .nodes
@@ -241,7 +241,7 @@ mod tests {
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define SQUARE(x) ((x) * (x))
 "#;
-        let result = extractor.extract(Path::new("src/util.h"), code).unwrap();
+        let result = extractor.extract(Path::new("src/util.hpp"), code).unwrap();
 
         let macros: Vec<_> = result
             .nodes
@@ -273,7 +273,7 @@ int compute(int x) {
 
 #define LOG(msg) printf("%s\n", msg)
 "#;
-        let result = extractor.extract(Path::new("src/util.c"), code).unwrap();
+        let result = extractor.extract(Path::new("src/util.cpp"), code).unwrap();
 
         let macros: Vec<_> = result
             .nodes
@@ -304,7 +304,7 @@ int useful_function(int x);
 
 #endif
 "#;
-        let result = extractor.extract(Path::new("src/my_header.h"), code).unwrap();
+        let result = extractor.extract(Path::new("src/my_header.hpp"), code).unwrap();
 
         let macros: Vec<_> = result
             .nodes
@@ -330,7 +330,7 @@ int compute(int x) {
     return x * 2;
 }
 "#;
-        let result = extractor.extract(Path::new("src/dual.c"), code).unwrap();
+        let result = extractor.extract(Path::new("src/dual.cpp"), code).unwrap();
 
         let macros: Vec<_> = result
             .nodes
@@ -354,7 +354,7 @@ int compute(int x) {
     fn test_cpp_empty_define() {
         let extractor = CppExtractor;
         let code = "#define FEATURE_ENABLED\n";
-        let result = extractor.extract(Path::new("src/config.h"), code).unwrap();
+        let result = extractor.extract(Path::new("src/config.hpp"), code).unwrap();
 
         let macros: Vec<_> = result
             .nodes
@@ -375,7 +375,7 @@ int compute(int x) {
         printf("%d %d\n", x, y); \
     } while(0)
 "#;
-        let result = extractor.extract(Path::new("src/util.h"), code).unwrap();
+        let result = extractor.extract(Path::new("src/util.hpp"), code).unwrap();
 
         let macros: Vec<_> = result
             .nodes
