@@ -611,6 +611,13 @@ mod tests {
 
         let msgs = progress2.lock().unwrap();
 
+        // The second run must enter the incremental path (LanceDB cache was written by first run).
+        assert!(
+            msgs.iter().any(|m| m.contains("Loaded cached graph")),
+            "second run should start from cached graph (incremental entry). Messages: {:?}",
+            *msgs
+        );
+
         // Must NOT report "no changes" -- that was the bug.
         assert!(
             !msgs.iter().any(|m| m.contains("incremental, no changes")),
