@@ -801,4 +801,151 @@ mod tests {
             "Go should capture string literals"
         );
     }
+
+    // ── pick_lsp_root_for_nodes adversarial tests ────────────────────────
+
+    fn make_test_node(file: &str, lang: &str) -> crate::graph::Node {
+        crate::graph::Node {
+            id: crate::graph::NodeId {
+                root: "primary".to_string(),
+                file: PathBuf::from(file),
+                name: "test".to_string(),
+                kind: crate::graph::NodeKind::Function,
+            },
+            language: lang.to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            body: String::new(),
+            metadata: Default::default(),
+            source: crate::graph::ExtractionSource::TreeSitter,
+        }
+    }
+
+    #[test]
+    fn test_pick_lsp_root_prefers_config_file_over_node_count() {
+        // Adversarial: ai_service/ has MORE TypeScript files than client/,
+        // but only client/ has tsconfig.json. Config-file heuristic must win.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let primary = tmp.path().to_path_buf();
+        let client_dir = primary.join("client");
+        let ai_service_dir = primary.join("ai_service");
+        std::fs::create_dir_all(&client_dir).unwrap();
+        std::fs::create_dir_all(&ai_service_dir).unwrap();
+        // Only client/ has tsconfig.json
+        std::fs::write(client_dir.join("tsconfig.json"), "{}").unwrap();
+
+        // Make ai_service have MORE TypeScript nodes (dissent scenario)
+        let mut nodes: Vec<crate::graph::Node> = Vec::new();
+        for i in 0..100 {
+            nodes.push(make_test_node(&format!("ai_service/test_{}.ts", i), "typescript"));
+        }
+        for i in 0..50 {
+            nodes.push(make_test_node(&format!("client/src/component_{}.tsx", i), "typescript"));
+        }
+
+        let lsp_roots = vec![
+            ("client".to_string(), client_dir.clone()),
+            ("ai-service".to_string(), ai_service_dir.clone()),
+        ];
+
+        // Without config file hint: ai_service wins by count
+        let result_no_hint = pick_lsp_root_for_nodes(&nodes, &primary, &lsp_roots, None);
+        assert_eq!(
+            result_no_hint, ai_service_dir.as_path(),
+            "Without hint, node-count picks ai_service (100 > 50 nodes)"
+        );
+
+        // With tsconfig.json hint: client wins by config file presence
+        let result_with_hint = pick_lsp_root_for_nodes(&nodes, &primary, &lsp_roots, Some("tsconfig.json"));
+        assert_eq!(
+            result_with_hint, client_dir.as_path(),
+            "With tsconfig.json hint, client/ wins even with fewer nodes"
+        );
+    }
+
+    #[test]
+    fn test_pick_lsp_root_falls_back_to_count_when_no_config_file() {
+        // When config file hint is provided but no root has the file,
+        // fallback to node count.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let primary = tmp.path().to_path_buf();
+        let client_dir = primary.join("client");
+        let ai_service_dir = primary.join("ai_service");
+        std::fs::create_dir_all(&client_dir).unwrap();
+        std::fs::create_dir_all(&ai_service_dir).unwrap();
+        // Neither has tsconfig.json
+
+        let mut nodes: Vec<crate::graph::Node> = Vec::new();
+        for i in 0..20 {
+            nodes.push(make_test_node(&format!("client/src/component_{}.tsx", i), "typescript"));
+        }
+        for i in 0..5 {
+            nodes.push(make_test_node(&format!("ai_service/test_{}.ts", i), "typescript"));
+        }
+
+        let lsp_roots = vec![
+            ("client".to_string(), client_dir.clone()),
+            ("ai-service".to_string(), ai_service_dir.clone()),
+        ];
+
+        // Config file not found in any root → fallback to count
+        let result = pick_lsp_root_for_nodes(&nodes, &primary, &lsp_roots, Some("tsconfig.json"));
+        assert_eq!(
+            result, client_dir.as_path(),
+            "When no root has tsconfig.json, node-count fallback picks client (20 > 5 nodes)"
+        );
+    }
+
+    #[test]
+    fn test_pick_lsp_root_returns_primary_when_no_match() {
+        // If no lsp_root covers any node, return primary_root.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let primary = tmp.path().to_path_buf();
+        let unrelated_dir = primary.join("unrelated");
+        std::fs::create_dir_all(&unrelated_dir).unwrap();
+
+        let nodes = vec![
+            make_test_node("client/src/App.tsx", "typescript"),
+        ];
+        let lsp_roots = vec![
+            ("unrelated".to_string(), unrelated_dir.clone()),
+        ];
+
+        // Node is in client/ but lsp_root is unrelated/ → no match → primary root
+        let result = pick_lsp_root_for_nodes(&nodes, &primary, &lsp_roots, Some("tsconfig.json"));
+        assert_eq!(
+            result, primary.as_path(),
+            "When no root matches any node, primary root is returned"
+        );
+    }
+
+    #[test]
+    fn test_pick_lsp_root_two_roots_same_config_first_wins() {
+        // Dissent scenario: two roots both have tsconfig.json — first one wins.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let primary = tmp.path().to_path_buf();
+        let client_dir = primary.join("client");
+        let client_v2_dir = primary.join("client-v2");
+        std::fs::create_dir_all(&client_dir).unwrap();
+        std::fs::create_dir_all(&client_v2_dir).unwrap();
+        std::fs::write(client_dir.join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(client_v2_dir.join("tsconfig.json"), "{}").unwrap();
+
+        let nodes = vec![
+            make_test_node("client/src/App.tsx", "typescript"),
+            make_test_node("client-v2/src/App.tsx", "typescript"),
+        ];
+        let lsp_roots = vec![
+            ("client".to_string(), client_dir.clone()),
+            ("client-v2".to_string(), client_v2_dir.clone()),
+        ];
+
+        // Both have tsconfig.json and matching nodes — first wins
+        let result = pick_lsp_root_for_nodes(&nodes, &primary, &lsp_roots, Some("tsconfig.json"));
+        assert_eq!(
+            result, client_dir.as_path(),
+            "When both roots have tsconfig.json, first in list wins"
+        );
+    }
 }
