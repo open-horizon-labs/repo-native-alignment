@@ -121,12 +121,18 @@ fn scan_root(root_slug: &str, root_path: &Path, existing_nodes: &[Node]) -> Next
         // Normalise path separators to '/' for cross-platform matching.
         let rel_forward: String = rel_str.replace('\\', "/");
 
+        // Strip optional leading "src/" for path derivation (the stripped form
+        // is used for both detection AND HTTP path derivation, but the original
+        // rel_path is used as the NodeId file path so the node matches tree-sitter
+        // extracted nodes which use the original relative path).
+        let rel_for_matching = rel_forward.strip_prefix("src/").unwrap_or(&rel_forward);
+
         if is_app_router_route(&rel_forward) {
             process_app_router_file(
                 root_slug,
                 root_path,
                 rel_path,
-                &rel_forward,
+                rel_for_matching,
                 abs_path,
                 &fn_index,
                 &mut result,
@@ -135,7 +141,7 @@ fn scan_root(root_slug: &str, root_path: &Path, existing_nodes: &[Node]) -> Next
             process_pages_router_file(
                 root_slug,
                 rel_path,
-                &rel_forward,
+                rel_for_matching,
                 abs_path,
                 &fn_index,
                 &mut result,
@@ -151,8 +157,11 @@ fn scan_root(root_slug: &str, root_path: &Path, existing_nodes: &[Node]) -> Next
 // ---------------------------------------------------------------------------
 
 /// Returns `true` if the relative path looks like a Next.js App Router API
-/// route: `app/api/**/route.{ts,tsx,js,jsx}`.
+/// route: `app/api/**/route.{ts,tsx,js,jsx}` (or `src/app/api/…`).
 fn is_app_router_route(rel: &str) -> bool {
+    // Strip optional leading "src/" prefix (common Next.js layout)
+    let rel = rel.strip_prefix("src/").unwrap_or(rel);
+
     // Must be inside app/api/ and the filename must be route.{ts,tsx,js,jsx}
     let Some(idx) = rel.rfind('/') else { return false; };
     let filename = &rel[idx + 1..];
@@ -165,9 +174,12 @@ fn is_app_router_route(rel: &str) -> bool {
 }
 
 /// Returns `true` if the relative path looks like a Next.js Pages Router API
-/// route: `pages/api/**/*.{ts,tsx,js}` (excluding `_app`, `_document`,
-/// index files used as layout helpers, and `node_modules`).
+/// route: `pages/api/**/*.{ts,tsx,js}` (or `src/pages/api/…`), excluding
+/// `_app`, `_document`, test files, and `.d.ts` declaration files.
 fn is_pages_router_route(rel: &str) -> bool {
+    // Strip optional leading "src/" prefix
+    let rel = rel.strip_prefix("src/").unwrap_or(rel);
+
     if !rel.starts_with("pages/api/") && rel != "pages/api" {
         return false;
     }
@@ -182,7 +194,7 @@ fn is_pages_router_route(rel: &str) -> bool {
     let is_noise = filename.starts_with('_')
         || filename.contains(".test.")
         || filename.contains(".spec.")
-        || filename.contains(".d.ts");
+        || filename.ends_with(".d.ts");
 
     is_api_file && !is_noise
 }
@@ -676,6 +688,9 @@ mod tests {
         assert!(is_app_router_route("app/api/payments/route.tsx"));
         assert!(is_app_router_route("app/api/payments/route.js"));
         assert!(is_app_router_route("app/api/route.ts"));
+        // With src/ prefix (common Next.js layout)
+        assert!(is_app_router_route("src/app/api/payments/route.ts"));
+        assert!(is_app_router_route("src/app/api/route.ts"));
         // NOT routes
         assert!(!is_app_router_route("app/api/payments/page.tsx"));
         assert!(!is_app_router_route("src/api/payments.ts"));
@@ -686,11 +701,12 @@ mod tests {
         assert!(is_pages_router_route("pages/api/payments.ts"));
         assert!(is_pages_router_route("pages/api/payments.js"));
         assert!(is_pages_router_route("pages/api/users/[id].ts"));
+        // With src/ prefix
+        assert!(is_pages_router_route("src/pages/api/payments.ts"));
         // NOT routes
         assert!(!is_pages_router_route("pages/api/_app.ts"));
         assert!(!is_pages_router_route("pages/api/payments.test.ts"));
         assert!(!is_pages_router_route("pages/api/types.d.ts"));
-        assert!(!is_pages_router_route("src/pages/api/payments.ts"));
     }
 
     // -----------------------------------------------------------------------
