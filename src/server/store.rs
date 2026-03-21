@@ -260,6 +260,7 @@ pub fn parse_edge_kind(s: &str) -> Option<EdgeKind> {
         "serves" => EdgeKind::Serves,
         "tested_by" => EdgeKind::TestedBy,
         "belongs_to" => EdgeKind::BelongsTo,
+        "re_exports" => EdgeKind::ReExports,
         _ => return None,
     })
 }
