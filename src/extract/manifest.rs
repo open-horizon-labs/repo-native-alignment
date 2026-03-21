@@ -346,11 +346,24 @@ pub fn parse_pyproject_toml(
     emit_package_graph(package_name, &dep_names, manifest_file, "python", root_slug)
 }
 
-/// Extract the first `key = "value"` in a TOML-ish block.
+/// Extract the first `key = "value"` within the `[project]` TOML section.
 /// Handles both `key = "value"` and `key = 'value'` forms.
+///
+/// Only matches inside the `[project]` table to avoid picking up identically-
+/// named keys from `[tool.poetry]` or other sections that appear before
+/// `[project]` in some pyproject.toml layouts.
 fn extract_toml_string(content: &str, key: &str) -> Option<String> {
+    let mut in_project = false;
     for line in content.lines() {
         let trimmed = line.trim();
+        // Section header: update section tracking.
+        if trimmed.starts_with('[') {
+            in_project = trimmed == "[project]";
+            continue;
+        }
+        if !in_project {
+            continue;
+        }
         if let Some(rest) = trimmed.strip_prefix(key) {
             let rest = rest.trim();
             if let Some(rest) = rest.strip_prefix('=') {
@@ -368,18 +381,26 @@ fn extract_toml_string(content: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Extract a TOML inline array or multi-line array for `key = [...]`.
+/// Extract a TOML inline array or multi-line array for `key = [...]`
+/// within the `[project]` section only.
 fn extract_toml_string_array(content: &str, key: &str) -> Vec<String> {
     let mut result = Vec::new();
 
-    // Locate the key
-    let mut lines = content.lines().peekable();
+    let mut in_project = false;
     let mut inside_array = false;
 
-    while let Some(line) = lines.next() {
+    for line in content.lines() {
         let trimmed = line.trim();
 
         if !inside_array {
+            // Section header: update section tracking.
+            if trimmed.starts_with('[') {
+                in_project = trimmed == "[project]";
+                continue;
+            }
+            if !in_project {
+                continue;
+            }
             // Look for `key = [` or `key = ["...`
             if let Some(rest) = trimmed.strip_prefix(key) {
                 let rest = rest.trim();
@@ -400,7 +421,7 @@ fn extract_toml_string_array(content: &str, key: &str) -> Vec<String> {
                 }
             }
         } else {
-            // Continuation line
+            // Continuation line inside the array.
             if trimmed.starts_with(']') {
                 break;
             }
@@ -852,5 +873,45 @@ dependencies = ["Pillow[jpeg]>=9.0"]
         let (nodes, edges) = parse_pyproject_toml(content, &manifest("pyproject.toml"), "root");
         assert!(nodes.iter().any(|n| n.id.name == "Pillow"), "extras should be stripped");
         assert_eq!(edges.len(), 1);
+    }
+
+    /// Poetry projects often have [tool.poetry] before [project].
+    /// extract_toml_string must not pick up [tool.poetry].name as the package name.
+    #[test]
+    fn test_pyproject_toml_poetry_section_before_project_uses_correct_name() {
+        let content = r#"
+[tool.poetry]
+name = "poetry-name"
+version = "1.0"
+
+[project]
+name = "pep621-name"
+dependencies = ["requests"]
+"#;
+        let (nodes, _) = parse_pyproject_toml(content, &manifest("pyproject.toml"), "root");
+        assert!(
+            nodes.iter().any(|n| n.id.name == "pep621-name"),
+            "should use [project].name, not [tool.poetry].name"
+        );
+        assert!(
+            !nodes.iter().any(|n| n.id.name == "poetry-name"),
+            "should not pick up [tool.poetry].name"
+        );
+    }
+
+    /// Ensure [project].dependencies is not confused with [tool.foo].dependencies.
+    #[test]
+    fn test_pyproject_toml_dependencies_only_from_project_section() {
+        let content = r#"
+[tool.foo]
+dependencies = ["wrong-dep"]
+
+[project]
+name = "mypkg"
+dependencies = ["correct-dep"]
+"#;
+        let (_, edges) = parse_pyproject_toml(content, &manifest("pyproject.toml"), "root");
+        assert_eq!(edges.len(), 1, "only [project].dependencies should be used");
+        assert_eq!(edges[0].to.name, "correct-dep");
     }
 }
