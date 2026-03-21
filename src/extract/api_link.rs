@@ -310,4 +310,108 @@ mod tests {
     fn test_normalize_path_static_segments_unchanged() {
         assert_eq!(normalize_path("/api/v1/payments"), "/api/v1/payments");
     }
+
+    // -----------------------------------------------------------------------
+    // Adversarial tests
+    // -----------------------------------------------------------------------
+
+    /// A Const node without `synthetic: true` metadata must NOT be linked,
+    /// even if its name looks like a URL path. This prevents linking declared
+    /// constants (e.g. `const REDIRECT_PATH: &str = "/admin"`) to endpoints.
+    #[test]
+    fn test_non_synthetic_const_not_linked() {
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+        use crate::graph::{ExtractionSource, NodeId, NodeKind};
+        let non_synthetic = crate::graph::Node {
+            id: NodeId {
+                root: String::new(),
+                file: PathBuf::from("consts.rs"),
+                name: "/admin".to_string(),
+                kind: NodeKind::Const,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "const ADMIN_PATH: &str = \"/admin\"".to_string(),
+            body: String::new(),
+            metadata: {
+                let mut m = BTreeMap::new();
+                m.insert("synthetic".to_string(), "false".to_string()); // declared constant
+                m
+            },
+            source: ExtractionSource::TreeSitter,
+        };
+        let mut result = ExtractionResult::default();
+        result.nodes.push(non_synthetic);
+        result.nodes.push(make_endpoint("GET", "/admin", "routes.py"));
+
+        api_link_pass(&mut result);
+
+        assert!(
+            result.edges.is_empty(),
+            "declared constant should NOT link to endpoint, got: {:?}", result.edges
+        );
+    }
+
+    /// `looks_like_url_path` does match short paths like `"/ok"` — that is
+    /// intentional. The upstream `harvest_string_literals` filter (len > 3)
+    /// ensures such short values never reach `api_link_pass` as Const nodes.
+    /// This test documents the boundary: `"/ok"` matches the predicate,
+    /// but `"/ok"` (len=3) would have been filtered before reaching this pass.
+    #[test]
+    fn test_short_url_path_matches_predicate_but_filtered_upstream() {
+        // "/ok" technically satisfies looks_like_url_path (starts with '/', len > 1)
+        assert!(looks_like_url_path("/ok"), "/ok passes looks_like_url_path");
+        // But harvest_string_literals filters len > 3, so "/ok" (len=3) would not appear.
+        // If it somehow does appear (future code change), api_link_pass would try to
+        // match it. That's acceptable — a 3-char URL is unlikely to match any endpoint.
+        // This test is a documentation test, not a constraint test.
+    }
+
+    /// Mismatched paths (/payments vs /payments/:id) must NOT produce edges.
+    #[test]
+    fn test_path_mismatch_no_edge() {
+        let mut result = ExtractionResult::default();
+        result.nodes.push(make_const("/payments", "client.py"));
+        result.nodes.push(make_endpoint("GET", "/payments/{id}", "routes.py"));
+
+        api_link_pass(&mut result);
+
+        assert!(
+            result.edges.is_empty(),
+            "/payments should NOT match /payments/{{id}}: got {:?}", result.edges
+        );
+    }
+
+    /// Empty `http_path` in ApiEndpoint metadata must not panic or match anything.
+    #[test]
+    fn test_api_endpoint_without_http_path_metadata_does_not_panic() {
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+        use crate::graph::{ExtractionSource, NodeId, NodeKind};
+        let no_path_ep = crate::graph::Node {
+            id: NodeId {
+                root: String::new(),
+                file: PathBuf::from("routes.py"),
+                name: "GET ".to_string(),
+                kind: NodeKind::ApiEndpoint,
+            },
+            language: "python".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "[route_decorator] GET ".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(), // no http_path key
+            source: ExtractionSource::TreeSitter,
+        };
+        let mut result = ExtractionResult::default();
+        result.nodes.push(make_const("/payments", "client.py"));
+        result.nodes.push(no_path_ep);
+
+        // Must not panic
+        api_link_pass(&mut result);
+        // No match expected since the endpoint has no http_path
+        assert!(result.edges.is_empty());
+    }
 }
