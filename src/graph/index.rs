@@ -1629,6 +1629,33 @@ mod tests {
         assert_eq!(neighbors[0], bar_id);
     }
 
+    /// Adversarial test for #446: simulate N incremental scans where the same
+    /// edges are appended on every scan. After N rebuilds, edge_count() must
+    /// remain stable at the unique-edge count regardless of how many duplicates
+    /// are in the input.
+    #[test]
+    fn test_rebuild_dedup_stable_across_simulated_scans() {
+        let base = vec![
+            make_edge("foo", "bar", EdgeKind::Calls),
+            make_edge("bar", "baz", EdgeKind::DependsOn),
+        ];
+
+        // Simulate 5 incremental scans: each scan appends the same 2 edges again.
+        let mut accumulated: Vec<Edge> = Vec::new();
+        for _ in 0..5 {
+            accumulated.extend(base.iter().cloned());
+        }
+        // After 5 scans we have 10 edges in the Vec (5×2), all duplicates.
+        assert_eq!(accumulated.len(), 10);
+
+        let mut index = GraphIndex::new();
+        index.rebuild_from_edges(&accumulated);
+
+        // Petgraph must contain only 2 unique edges, not 10.
+        assert_eq!(index.edge_count(), 2);
+        assert_eq!(index.node_count(), 3);
+    }
+
     #[test]
     fn test_get_node() {
         let mut index = GraphIndex::new();
