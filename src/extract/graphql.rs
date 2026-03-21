@@ -573,17 +573,21 @@ fn extract_type_text(node: tree_sitter::Node<'_>, source: &[u8]) -> String {
 }
 
 /// Strip GraphQL type modifiers (!, []) to get the bare type name.
+///
+/// Handles arbitrary nesting: `[[User!]!]!` → `User`.
 fn strip_type_modifiers(type_str: &str) -> &str {
-    let s = type_str.trim();
-    // Strip outer non-null
-    let s = s.trim_end_matches('!');
-    let s = s.trim();
-    // Strip list wrapper
-    if s.starts_with('[') && s.ends_with(']') {
-        s[1..s.len() - 1].trim_end_matches('!').trim()
-    } else {
-        s.trim_end_matches('!')
+    let mut s = type_str.trim();
+    loop {
+        let prev = s;
+        s = s.trim_end_matches('!').trim();
+        if s.starts_with('[') && s.ends_with(']') {
+            s = s[1..s.len() - 1].trim();
+        }
+        if s == prev {
+            break;
+        }
     }
+    s
 }
 
 /// Returns true if the name is a built-in GraphQL scalar type.
@@ -921,6 +925,9 @@ type Tag {
         assert_eq!(strip_type_modifiers("[User!]!"), "User");
         assert_eq!(strip_type_modifiers("[User]"), "User");
         assert_eq!(strip_type_modifiers("User"), "User");
+        // Nested list types (rare but valid GraphQL)
+        assert_eq!(strip_type_modifiers("[[User!]!]!"), "User");
+        assert_eq!(strip_type_modifiers("[[String]]"), "String");
     }
 
     #[test]
