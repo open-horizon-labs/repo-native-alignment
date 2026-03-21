@@ -7,6 +7,7 @@
 //! The `ExtractorRegistry` dispatches by file extension, then calls `can_handle()`
 //! for fine-grained checks. Multiple extractors can handle the same file.
 
+pub mod api_link;
 pub mod bash;
 pub mod configs;
 pub mod cpp;
@@ -282,11 +283,18 @@ impl ExtractorRegistry {
             result.merge(file_result);
         }
 
+        // Post-extraction pass: link URL-path string-literal Const nodes to
+        // matching ApiEndpoint nodes via DependsOn edges.
+        let pre_link_edges = result.edges.len();
+        api_link::api_link_pass(&mut result);
+        let link_edges = result.edges.len() - pre_link_edges;
+
         tracing::info!(
-            "ExtractorRegistry: completed extraction in {:?} ({} node(s), {} edge(s))",
+            "ExtractorRegistry: completed extraction in {:?} ({} node(s), {} edge(s), {} api-link edge(s))",
             extraction_start.elapsed(),
             result.nodes.len(),
-            result.edges.len()
+            result.edges.len(),
+            link_edges,
         );
 
         result
