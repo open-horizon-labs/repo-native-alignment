@@ -895,12 +895,14 @@ pub static SCALA_CONFIG: LangConfig = LangConfig {
     node_kinds: &[
         ("function_definition",  NodeKind::Function),
         ("function_declaration", NodeKind::Function),
-        ("class_definition",     NodeKind::Struct),
-        ("object_definition",    NodeKind::Struct),
+        ("class_definition",     NodeKind::Struct),  // includes case classes (modifier child)
+        ("object_definition",    NodeKind::Struct),  // Scala object (singleton)
         ("enum_definition",      NodeKind::Enum),
         ("trait_definition",     NodeKind::Trait),
         ("val_definition",       NodeKind::Field),
         ("var_definition",       NodeKind::Field),
+        // NOTE: case_class_pattern is for pattern matching, NOT class definitions.
+        // Case class definitions use class_definition with a `case` modifier child.
     ],
     scope_parent_kinds: &["class_definition", "object_definition", "trait_definition", "enum_definition"],
     const_value_field: None,
@@ -939,7 +941,8 @@ pub static DART_CONFIG: LangConfig = LangConfig {
     node_kinds: &[
         ("function_signature",          NodeKind::Function),
         ("method_signature",            NodeKind::Function),
-        ("local_function_declaration",  NodeKind::Function),
+        // NOTE: local_function_declaration has no `name` field in tree-sitter-dart;
+        // its child function_signature is what carries the name and is captured above.
         ("class_declaration",           NodeKind::Struct),
         ("mixin_declaration",           NodeKind::Struct),
         ("enum_declaration",            NodeKind::Enum),
