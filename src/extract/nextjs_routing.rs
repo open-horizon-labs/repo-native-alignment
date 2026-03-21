@@ -174,7 +174,7 @@ fn is_app_router_route(rel: &str) -> bool {
 }
 
 /// Returns `true` if the relative path looks like a Next.js Pages Router API
-/// route: `pages/api/**/*.{ts,tsx,js}` (or `src/pages/api/…`), excluding
+/// route: `pages/api/**/*.{ts,tsx,js,jsx}` (or `src/pages/api/…`), excluding
 /// `_app`, `_document`, test files, and `.d.ts` declaration files.
 fn is_pages_router_route(rel: &str) -> bool {
     // Strip optional leading "src/" prefix
@@ -186,10 +186,12 @@ fn is_pages_router_route(rel: &str) -> bool {
     let Some(idx) = rel.rfind('/') else { return false; };
     let filename = &rel[idx + 1..];
 
-    // Must end in .ts, .tsx, or .js — not test files
+    // Must end in .ts, .tsx, .js, or .jsx — not test files
+    // .jsx is rare for API routes but included for consistency with App Router.
     let is_api_file = filename.ends_with(".ts")
         || filename.ends_with(".tsx")
-        || filename.ends_with(".js");
+        || filename.ends_with(".js")
+        || filename.ends_with(".jsx");
 
     let is_noise = filename.starts_with('_')
         || filename.contains(".test.")
@@ -330,8 +332,17 @@ fn derive_app_router_path(rel: &str) -> String {
 }
 
 /// Case-insensitive strip_prefix helper (used for src/App/api variants).
+///
+/// This helper is only ever called with ASCII prefixes (file path segments like
+/// "app/api/"), so slicing by `prefix.len()` bytes is safe. Non-ASCII file paths
+/// would not match a Next.js app/api/ prefix pattern anyway.
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.to_lowercase().starts_with(&prefix.to_lowercase()) {
+    let lower_s = s.to_lowercase();
+    let lower_prefix = prefix.to_lowercase();
+    if lower_s.starts_with(&lower_prefix) {
+        // Safe: both s and prefix are ASCII file path segments.
+        // prefix.len() == lower_prefix.len() for ASCII, so we can slice
+        // the original string by the prefix byte length.
         Some(&s[prefix.len()..])
     } else {
         None
@@ -482,6 +493,9 @@ fn strip_ts_extension(s: &str) -> &str {
 /// - `export const DELETE =`
 /// - `export const PATCH: NextRequest =`
 ///
+/// Uses word-boundary checks to avoid false positives like `function GETTER`
+/// matching `GET`, or `const DELETED` matching `DELETE`.
+///
 /// Returns a deduplicated list of HTTP methods found.
 pub fn find_exported_http_methods(content: &str) -> Vec<String> {
     const HTTP_METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
@@ -496,17 +510,48 @@ pub fn find_exported_http_methods(content: &str) -> Vec<String> {
             if found.iter().any(|m| m == method) {
                 continue; // already found
             }
-            // Match: export function METHOD, export async function METHOD, export const METHOD
-            if trimmed.contains(&format!("function {}", method))
-                || trimmed.contains(&format!("const {} ", method))
-                || trimmed.contains(&format!("const {}=", method))
-                || trimmed.contains(&format!("const {}:", method))
-            {
+            if line_exports_http_method(trimmed, method) {
                 found.push(method.to_string());
             }
         }
     }
     found
+}
+
+/// Returns `true` if `line` declares an export for the given HTTP `method`
+/// with a proper word boundary after the method name.
+///
+/// Handles:
+/// - `export function GET(` — exact word boundary `(`
+/// - `export async function GET(` — same
+/// - `export const GET =` — space or `=` after method
+/// - `export const GET:` — TypeScript type annotation
+///
+/// Rejects false positives:
+/// - `export function GETTER()` — `G`, `E`, `T` followed by non-boundary char
+/// - `export const GETALL = ...` — method name followed by another letter
+fn line_exports_http_method(line: &str, method: &str) -> bool {
+    // For `function METHOD`: require the char after METHOD to be '(' or whitespace
+    let fn_pattern = format!("function {}", method);
+    if let Some(pos) = line.find(&fn_pattern) {
+        let after = &line[pos + fn_pattern.len()..];
+        let next = after.chars().next();
+        if matches!(next, Some('(') | Some(' ') | Some('\t') | None) {
+            return true;
+        }
+    }
+
+    // For `const METHOD`: require the char after METHOD to be ' ', '=', ':', or nothing
+    let const_pattern = format!("const {}", method);
+    if let Some(pos) = line.find(&const_pattern) {
+        let after = &line[pos + const_pattern.len()..];
+        let next = after.chars().next();
+        if matches!(next, Some(' ') | Some('=') | Some(':') | None) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Find the approximate start/end line numbers (1-indexed) of an exported
@@ -520,10 +565,7 @@ fn find_method_lines(content: &str, method: &str) -> (usize, usize) {
         if !trimmed.starts_with("export") {
             continue;
         }
-        if trimmed.contains(&format!("function {}", method))
-            || trimmed.contains(&format!("const {} ", method))
-            || trimmed.contains(&format!("const {}=", method))
-            || trimmed.contains(&format!("const {}:", method))
+        if line_exports_http_method(trimmed, method)
         {
             let line_num = idx + 1;
             return (line_num, line_num);
@@ -700,6 +742,7 @@ mod tests {
     fn test_is_pages_router_route() {
         assert!(is_pages_router_route("pages/api/payments.ts"));
         assert!(is_pages_router_route("pages/api/payments.js"));
+        assert!(is_pages_router_route("pages/api/payments.jsx"));
         assert!(is_pages_router_route("pages/api/users/[id].ts"));
         // With src/ prefix
         assert!(is_pages_router_route("src/pages/api/payments.ts"));
@@ -754,6 +797,29 @@ export function helper() {}
 "#;
         let methods = find_exported_http_methods(content);
         assert!(methods.is_empty(), "should find no HTTP methods");
+    }
+
+    #[test]
+    fn test_find_exported_http_methods_no_false_positives() {
+        // GETTER should NOT match GET; DELETED should NOT match DELETE
+        let content = r#"
+export function GETTER() {}
+export const DELETED = async () => {}
+export const POSTFIX = "something"
+"#;
+        let methods = find_exported_http_methods(content);
+        assert!(
+            !methods.contains(&"GET".to_string()),
+            "GETTER should not match GET, got: {:?}", methods
+        );
+        assert!(
+            !methods.contains(&"DELETE".to_string()),
+            "DELETED should not match DELETE, got: {:?}", methods
+        );
+        assert!(
+            !methods.contains(&"POST".to_string()),
+            "POSTFIX should not match POST, got: {:?}", methods
+        );
     }
 
     // -----------------------------------------------------------------------
