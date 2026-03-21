@@ -203,11 +203,89 @@ impl PatternConfig {
     }
 }
 
+/// Minimum LSP diagnostic severity to store as graph nodes.
+///
+/// Corresponds to LSP DiagnosticSeverity integers:
+///   1 = Error, 2 = Warning, 3 = Information, 4 = Hint
+///
+/// The variant name is the floor — all severities with integer ≤ the floor are stored.
+/// Default is `Warning` (store Error + Warning, filter Information + Hint).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DiagnosticMinSeverity {
+    /// Store only errors (severity 1).
+    Error,
+    /// Store errors and warnings (severity ≤ 2). **Default.**
+    Warning,
+    /// Store errors, warnings, and information (severity ≤ 3).
+    Information,
+    /// Store all diagnostics including hints (severity ≤ 4).
+    Hint,
+}
+
+impl Default for DiagnosticMinSeverity {
+    fn default() -> Self {
+        Self::Warning
+    }
+}
+
+impl DiagnosticMinSeverity {
+    /// Return the maximum LSP severity integer that should be stored.
+    ///
+    /// LSP encodes severity as ascending integers where 1 = most severe.
+    /// A diagnostic is kept when `severity_int <= self.max_severity_int()`.
+    pub fn max_severity_int(&self) -> u64 {
+        match self {
+            Self::Error => 1,
+            Self::Warning => 2,
+            Self::Information => 3,
+            Self::Hint => 4,
+        }
+    }
+}
+
+/// LSP-specific configuration loaded from `.oh/config.toml` under `[lsp]`.
+///
+/// # Example `.oh/config.toml`
+///
+/// ```toml
+/// [lsp]
+/// # "error"       — errors only
+/// # "warning"     — errors + warnings (default)
+/// # "information" — errors + warnings + information
+/// # "hint"        — all diagnostics
+/// diagnostic_min_severity = "hint"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LspConfig {
+    /// Minimum severity to store as diagnostic nodes. Defaults to `Warning`.
+    #[serde(default)]
+    pub diagnostic_min_severity: DiagnosticMinSeverity,
+}
+
+impl LspConfig {
+    /// Load from `.oh/config.toml` if it exists, otherwise return defaults.
+    pub fn load(repo_root: &Path) -> Self {
+        let config_path = repo_root.join(".oh").join("config.toml");
+        match std::fs::read_to_string(&config_path) {
+            Ok(content) => match toml::from_str::<TomlConfig>(&content) {
+                Ok(parsed) => parsed.lsp.unwrap_or_default(),
+                Err(e) => {
+                    tracing::warn!("Failed to parse {}: {}", config_path.display(), e);
+                    Self::default()
+                }
+            },
+            Err(_) => Self::default(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct TomlConfig {
     scanner: Option<ScanConfig>,
     patterns: Option<PatternConfig>,
     workspace: Option<WorkspaceSection>,
+    lsp: Option<LspConfig>,
 }
 
 /// The `[workspace]` table in `.oh/config.toml`.

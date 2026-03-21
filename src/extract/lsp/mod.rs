@@ -40,6 +40,7 @@ use crate::graph::index::GraphIndex;
 use crate::graph::{
     Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
 };
+use crate::scanner::LspConfig;
 
 use super::{EnrichmentResult, Enricher};
 
@@ -931,9 +932,12 @@ impl LspEnricher {
 
     /// Build diagnostic `Node`s from a set of LSP diagnostics for one file.
     ///
-    /// Only Error and Warning severities are stored by default — Information
-    /// and Hint are too noisy and rarely actionable for code-understanding queries.
-    /// Files with zero Error/Warning diagnostics produce no nodes.
+    /// `max_severity_int` is the maximum LSP severity integer to store (inclusive).
+    /// LSP encodes severity as 1=Error, 2=Warning, 3=Information, 4=Hint.
+    /// Default (from `DiagnosticMinSeverity::Warning`) is 2 — store Error and Warning only.
+    ///
+    /// Severity 0 is not a valid LSP value and is always filtered. Severities above
+    /// `max_severity_int` are dropped.
     fn build_diagnostic_nodes(
         file_uri: &str,
         diagnostics: &[serde_json::Value],
@@ -942,6 +946,7 @@ impl LspEnricher {
         server_command: &str,
         language: &str,
         timestamp: &str,
+        max_severity_int: u64,
     ) -> Vec<Node> {
         // Resolve file path from URI
         let rel_path = {
@@ -967,9 +972,10 @@ impl LspEnricher {
 
         for diag in diagnostics {
             let severity_int = diag.get("severity").and_then(|s| s.as_u64()).unwrap_or(1);
-            // Only store Error (1) and Warning (2). Severity 0 is not a valid LSP severity.
-            // Severity 3 (Information) and 4 (Hint) are too noisy for code-understanding queries.
-            if severity_int != 1 && severity_int != 2 {
+            // Severity 0 is not a valid LSP value — always skip.
+            // Keep diagnostics whose severity integer is within the configured floor.
+            // (Lower integer = higher severity: 1=Error, 2=Warning, 3=Information, 4=Hint)
+            if severity_int == 0 || severity_int > max_severity_int {
                 continue;
             }
             let severity = Self::lsp_severity_to_str(severity_int);
@@ -2238,6 +2244,11 @@ impl Enricher for LspEnricher {
             .map(|n| n.id.root.clone())
             .unwrap_or_default();
 
+        // Load diagnostic severity threshold from .oh/config.toml [lsp] section.
+        // Defaults to Warning (severity ≤ 2) if no config is present.
+        let lsp_config = LspConfig::load(repo_root);
+        let max_severity_int = lsp_config.diagnostic_min_severity.max_severity_int();
+
         if has_pull_diagnostics {
             tracing::info!(
                 "LSP diagnostics pass: pull-based for {} files ({})",
@@ -2270,6 +2281,7 @@ impl Enricher for LspEnricher {
                             &self.server_command,
                             &self.language,
                             &diag_timestamp,
+                            max_severity_int,
                         );
                         result.new_nodes.extend(nodes);
                     }
@@ -2313,6 +2325,7 @@ impl Enricher for LspEnricher {
                     &self.server_command,
                     &self.language,
                     &diag_timestamp,
+                    max_severity_int,
                 );
                 result.new_nodes.extend(nodes);
             }
@@ -3412,6 +3425,7 @@ mod tests {
             "rust-analyzer",
             "rust",
             "1700000000",
+            2,
         );
 
         assert_eq!(nodes.len(), 2, "error and warning should produce 2 nodes");
@@ -3458,6 +3472,7 @@ mod tests {
             "rust-analyzer",
             "rust",
             "1700000000",
+            2,
         );
 
         assert!(nodes.is_empty(), "information and hint diagnostics should not produce nodes");
@@ -3475,6 +3490,7 @@ mod tests {
             "rust-analyzer",
             "rust",
             "1700000000",
+            2,
         );
         assert!(nodes.is_empty(), "zero diagnostics should produce no nodes");
     }
@@ -3499,6 +3515,7 @@ mod tests {
             "rust-analyzer",
             "rust",
             "1700000000",
+            2,
         );
         assert!(nodes.is_empty(), ".cargo paths should be filtered");
     }
@@ -3524,6 +3541,7 @@ mod tests {
             "rust-analyzer",
             "rust",
             "1700000000",
+            2,
         );
 
         assert_eq!(nodes.len(), 1);
@@ -3557,6 +3575,7 @@ mod tests {
             "rust-analyzer",
             "rust",
             "1700000000",
+            2,
         );
 
         assert_eq!(nodes[0].source, ExtractionSource::Lsp);
@@ -3594,6 +3613,7 @@ mod tests {
             "my-lsp",
             "rust",
             "1234567890",
+            2,
         );
 
         assert_eq!(nodes.len(), 1);
@@ -3627,6 +3647,7 @@ mod tests {
             "rust-analyzer",
             "rust",
             "1700000000",
+            2,
         );
 
         assert_eq!(nodes.len(), 1, "missing severity defaults to error which should produce a node");
@@ -3663,6 +3684,7 @@ mod tests {
             "rust-analyzer",
             "rust",
             "1700000000",
+            2,
         );
 
         assert_eq!(nodes.len(), 2, "identical messages at different lines should produce 2 nodes");
@@ -3697,6 +3719,7 @@ mod tests {
             "rust-analyzer",
             "rust",
             ts,
+            2,
         );
 
         assert_eq!(nodes.len(), 1);
@@ -3733,6 +3756,7 @@ mod tests {
             "rust-analyzer",
             "rust",
             "1700000000",
+            2,
         );
 
         assert!(nodes.is_empty(), "empty/whitespace messages should not produce nodes");
@@ -3764,6 +3788,7 @@ mod tests {
             "rust-analyzer",
             "rust",
             "1700000000",
+            2,
         );
 
         // Should produce nodes despite malformed ranges (default to line 1)
@@ -3800,6 +3825,7 @@ mod tests {
             "rust-analyzer",
             "rust",
             "1700000000",
+            2,
         );
 
         assert!(nodes.is_empty(), "severity 0 and 100 should be filtered (only 1 and 2 are stored)");
@@ -3834,6 +3860,7 @@ mod tests {
             "rust-analyzer",
             "rust",
             "1700000000",
+            2,
         );
 
         assert_eq!(nodes.len(), 1,
@@ -3865,11 +3892,144 @@ mod tests {
             "rust-analyzer",
             "rust",
             "1700000000",
+            2,
         );
 
         assert!(nodes.is_empty(),
             "unlinked-file at severity 3 (Information) should be filtered; \
              this is intentional — Information diagnostics are too noisy for code-understanding queries");
+    }
+
+    /// When max_severity_int=4 (hint level), Information (3) diagnostics are captured.
+    /// This exercises diagnostic_min_severity = "information" in .oh/config.toml.
+    #[test]
+    fn test_build_diagnostic_nodes_information_captured_when_threshold_is_information() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 3,  // Information
+                "message": "consider using async",
+                "range": { "start": { "line": 5, "character": 0 }, "end": { "line": 5, "character": 5 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+            3, // max_severity_int = Information
+        );
+
+        assert_eq!(nodes.len(), 1, "information diagnostic should be captured at threshold=3");
+        assert_eq!(
+            nodes[0].metadata.get("diagnostic_severity").unwrap(),
+            "information"
+        );
+    }
+
+    /// When max_severity_int=4 (hint level), Hint (4) diagnostics like unlinked-file
+    /// and inactive-code are captured.
+    /// This exercises diagnostic_min_severity = "hint" in .oh/config.toml.
+    #[test]
+    fn test_build_diagnostic_nodes_hint_captured_when_threshold_is_hint() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 4,  // Hint
+                "message": "This file is not included in any crates [unlinked-file]",
+                "source": "rust-analyzer",
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }
+            }),
+            serde_json::json!({
+                "severity": 4,  // Hint
+                "message": "code is inactive due to #[cfg] directives [inactive-code]",
+                "source": "rust-analyzer",
+                "range": { "start": { "line": 10, "character": 0 }, "end": { "line": 15, "character": 0 } }
+            }),
+        ];
+
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/service.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+            4, // max_severity_int = Hint
+        );
+
+        assert_eq!(nodes.len(), 2, "hint-level diagnostics should be captured at threshold=4");
+        for node in &nodes {
+            assert_eq!(
+                node.metadata.get("diagnostic_severity").unwrap(),
+                "hint"
+            );
+        }
+    }
+
+    /// Severity 0 is always invalid and must be filtered regardless of threshold.
+    #[test]
+    fn test_build_diagnostic_nodes_severity_zero_always_filtered() {
+        let root = PathBuf::from("/project");
+        let diags = vec![
+            serde_json::json!({
+                "severity": 0,
+                "message": "invalid severity",
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
+            }),
+        ];
+
+        // Even with hint-level threshold (4), severity 0 must be filtered
+        let nodes = LspEnricher::build_diagnostic_nodes(
+            "file:///project/src/lib.rs",
+            &diags,
+            &root,
+            "/project",
+            "rust-analyzer",
+            "rust",
+            "1700000000",
+            4, // hint level — most permissive threshold
+        );
+
+        assert!(nodes.is_empty(), "severity 0 is not a valid LSP value and must always be filtered");
+    }
+
+    /// DiagnosticMinSeverity::max_severity_int returns the correct floor for each variant.
+    #[test]
+    fn test_diagnostic_min_severity_max_int() {
+        use crate::scanner::DiagnosticMinSeverity;
+        assert_eq!(DiagnosticMinSeverity::Error.max_severity_int(), 1);
+        assert_eq!(DiagnosticMinSeverity::Warning.max_severity_int(), 2);
+        assert_eq!(DiagnosticMinSeverity::Information.max_severity_int(), 3);
+        assert_eq!(DiagnosticMinSeverity::Hint.max_severity_int(), 4);
+    }
+
+    /// Default DiagnosticMinSeverity is Warning.
+    #[test]
+    fn test_diagnostic_min_severity_default_is_warning() {
+        use crate::scanner::DiagnosticMinSeverity;
+        assert_eq!(DiagnosticMinSeverity::default(), DiagnosticMinSeverity::Warning);
+    }
+
+    /// LspConfig deserializes "hint" correctly.
+    #[test]
+    fn test_lsp_config_deserializes_hint() {
+        use crate::scanner::{DiagnosticMinSeverity, LspConfig};
+        let config: LspConfig = toml::from_str(r#"diagnostic_min_severity = "hint""#).unwrap();
+        assert_eq!(config.diagnostic_min_severity, DiagnosticMinSeverity::Hint);
+    }
+
+    /// LspConfig default (empty section) is Warning.
+    #[test]
+    fn test_lsp_config_default_is_warning() {
+        use crate::scanner::{DiagnosticMinSeverity, LspConfig};
+        let config = LspConfig::default();
+        assert_eq!(config.diagnostic_min_severity, DiagnosticMinSeverity::Warning);
     }
 
     /// Adversarial: was_quiescent guard is the same for both Pass 1 and Pass 3.
