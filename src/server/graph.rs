@@ -954,8 +954,8 @@ impl RnaHandler {
 
         // Re-run manifest pass with the primary root so that changes to
         // package.json, pyproject.toml, requirements.txt, or go.mod are
-        // reflected in the incremental graph. Package nodes from previous
-        // passes are harmlessly overwritten (same stable_id, same data).
+        // reflected in the incremental graph. Duplicate package nodes from
+        // repeated runs are deduplicated below before the petgraph rebuild.
         {
             let root_pairs = vec![(primary_slug.clone(), self.repo_root.clone())];
             let manifest_result = crate::extract::manifest::manifest_pass(&root_pairs);
@@ -1011,16 +1011,27 @@ impl RnaHandler {
             }
         }
 
-        // Deduplicate graph.edges in-place before rebuilding the petgraph index.
-        // Post-extraction passes (api_link, manifest, tested_by, directory_module) re-run
-        // over the full node set on every incremental scan, which causes the same edges to
-        // be appended to graph.edges repeatedly.  After N scans each edge appears
-        // N times, inflating PageRank weights for the connected nodes.
+        // Deduplicate graph.nodes and graph.edges in-place before rebuilding the
+        // petgraph index.  Post-extraction passes (api_link, manifest, tested_by,
+        // directory_module) re-run over the full node/edge set on every incremental
+        // scan, which causes the same entries to be appended repeatedly.  After N
+        // scans each entry appears N times, causing:
+        //   - graph.nodes: duplicate package nodes from manifest_pass (memory growth,
+        //     stale data exposed to search/query tools)
+        //   - graph.edges: N-multiplied edges → inflated PageRank weights
         //
-        // We use Edge::stable_id() (encodes from→kind→to) as the dedup key.
+        // Node dedup: keep the LAST occurrence (newest data). Reverse, retain first
+        // seen (which is now the newest), then reverse back to restore order.
+        // Edge dedup: keep the FIRST occurrence (stable_id is topology-only; all
+        // duplicates are structurally identical).
         {
-            let mut seen = std::collections::HashSet::new();
-            graph.edges.retain(|e| seen.insert(e.stable_id()));
+            let mut seen_nodes = std::collections::HashSet::new();
+            graph.nodes.reverse();
+            graph.nodes.retain(|n| seen_nodes.insert(n.stable_id()));
+            graph.nodes.reverse();
+
+            let mut seen_edges = std::collections::HashSet::new();
+            graph.edges.retain(|e| seen_edges.insert(e.stable_id()));
         }
 
         // Rebuild petgraph index
