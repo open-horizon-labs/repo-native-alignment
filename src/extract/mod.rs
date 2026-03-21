@@ -10,13 +10,19 @@
 pub mod api_link;
 pub mod manifest;
 pub mod bash;
+pub mod c;
 pub mod configs;
 pub mod cpp;
+pub mod dart;
 pub mod dockerfile;
+pub mod elixir;
 pub mod generic;
 pub mod graphql;
+pub mod html;
 pub mod query;
 pub mod csharp;
+pub mod php;
+pub mod scala;
 pub mod string_literals;
 pub mod go;
 pub mod hcl;
@@ -175,11 +181,21 @@ impl ExtractorRegistry {
         registry.register(Box::new(bash::BashExtractor::new()));
         registry.register(Box::new(ruby::RubyExtractor::new()));
         registry.register(Box::new(cpp::CppExtractor::new()));
+        registry.register(Box::new(c::CExtractor::new()));
         registry.register(Box::new(csharp::CSharpExtractor::new()));
         registry.register(Box::new(kotlin::KotlinExtractor::new()));
         registry.register(Box::new(zig::ZigExtractor::new()));
         registry.register(Box::new(lua::LuaExtractor::new()));
         registry.register(Box::new(swift::SwiftExtractor::new()));
+        // Web languages
+        registry.register(Box::new(php::PhpExtractor::new()));
+        registry.register(Box::new(html::HtmlExtractor::new()));
+        // JVM languages
+        registry.register(Box::new(scala::ScalaExtractor::new()));
+        // Flutter/mobile
+        registry.register(Box::new(dart::DartExtractor::new()));
+        // Functional/dynamic
+        registry.register(Box::new(elixir::ElixirExtractor::new()));
         // Infrastructure / config
         registry.register(Box::new(dockerfile::DockerfileExtractor::new()));
         registry.register(Box::new(hcl::HclExtractor::new()));
@@ -539,7 +555,7 @@ mod tests {
     #[test]
     fn test_registry_with_builtins_has_extractors() {
         let registry = ExtractorRegistry::with_builtins();
-        assert_eq!(registry.len(), 24); // rust, python, typescript, javascript, go, java, bash, ruby, cpp, csharp, kotlin, zig, lua, swift, dockerfile, hcl, json, toml, yaml, markdown, proto, sql, openapi, graphql
+        assert_eq!(registry.len(), 30); // rust, python, typescript, javascript, go, java, bash, ruby, cpp, c, csharp, kotlin, zig, lua, swift, php, html, scala, dart, elixir, dockerfile, hcl, json, toml, yaml, markdown, proto, sql, openapi, graphql
     }
 
     #[test]

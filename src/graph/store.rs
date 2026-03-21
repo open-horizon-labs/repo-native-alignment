@@ -26,7 +26,8 @@ pub const SCHEMA_VERSION: u32 = 15;
 /// Unlike SCHEMA_VERSION (which invalidates LanceDB tables), EXTRACTION_VERSION
 /// invalidates the scanner's mtime/hash state — forcing full re-extraction without
 /// dropping LanceDB tables. Bumped to 1 for doc_comment metadata extraction (#401).
-pub const EXTRACTION_VERSION: u32 = 2;
+/// Bumped to 3 for new C, PHP, HTML, Scala, Dart, Elixir extractors (#435).
+pub const EXTRACTION_VERSION: u32 = 3;
 
 /// Arrow schema for the `symbols` table.
 ///

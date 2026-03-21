@@ -635,7 +635,10 @@ pub static ZIG_CONFIG: LangConfig = LangConfig {
 pub static CPP_CONFIG: LangConfig = LangConfig {
     language_fn: || tree_sitter_cpp::LANGUAGE.into(),
     language_name: "cpp",
-    extensions: &["cpp", "cc", "cxx", "c", "h", "hpp"],
+    // .h is kept here because headers are shared between C and C++.
+    // tree-sitter-cpp handles C headers correctly as a superset.
+    // .c files go to C_CONFIG / CExtractor (tree-sitter-c).
+    extensions: &["cpp", "cc", "cxx", "h", "hpp", "hxx"],
     node_kinds: &[
         ("function_definition",  NodeKind::Function),
         ("class_specifier",      NodeKind::Struct),
@@ -786,6 +789,190 @@ pub static BASH_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &[],  // Bash has no decorators
     type_param_node_kind: None,  // Bash has no generics
+    docstring_in_body: false,
+    route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
+    call_expr_kinds: None,
+    pub_visibility_modifier: None,
+    has_all_export: false,
+    test_name_prefix: false,
+};
+
+// ---------------------------------------------------------------------------
+// C (distinct from C++ — uses tree-sitter-c grammar)
+// ---------------------------------------------------------------------------
+
+pub static C_CONFIG: LangConfig = LangConfig {
+    language_fn: || tree_sitter_c::LANGUAGE.into(),
+    language_name: "c",
+    // Only .c files — .h stays with CPP_CONFIG (tree-sitter-cpp handles C/C++ headers).
+    extensions: &["c"],
+    node_kinds: &[
+        ("function_definition",  NodeKind::Function),
+        ("struct_specifier",     NodeKind::Struct),
+        ("union_specifier",      NodeKind::Struct),
+        ("enum_specifier",       NodeKind::Enum),
+        ("preproc_def",              NodeKind::Macro),
+        ("preproc_function_def",     NodeKind::Macro),
+        ("field_declaration",    NodeKind::Field),
+        ("enumerator",           NodeKind::Field),
+    ],
+    scope_parent_kinds: &["struct_specifier", "union_specifier", "enum_specifier"],
+    const_value_field: None,
+    full_text_name_kinds: &[],
+    string_literal_kinds: &[("string_literal", Some("string_content"))],
+    param_container_field: None,
+    param_type_field: None,
+    return_type_field: Some("type"),
+    type_requires_uppercase: true,
+    branch_node_types: &[
+        "if_statement", "else_clause",
+        "switch_statement", "case_statement",
+        "for_statement", "while_statement", "do_statement",
+        "binary_expression",
+        "conditional_expression",
+    ],
+    decorator_node_kinds: &[],
+    type_param_node_kind: None,
+    docstring_in_body: false,
+    route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
+    call_expr_kinds: Some(("call_expression", "function")),
+    pub_visibility_modifier: None,
+    has_all_export: false,
+    test_name_prefix: false,
+};
+
+// ---------------------------------------------------------------------------
+// PHP
+// ---------------------------------------------------------------------------
+
+pub static PHP_CONFIG: LangConfig = LangConfig {
+    language_fn: || tree_sitter_php::LANGUAGE_PHP.into(),
+    language_name: "php",
+    extensions: &["php"],
+    node_kinds: &[
+        ("function_definition",  NodeKind::Function),
+        ("method_declaration",   NodeKind::Function),
+        ("class_declaration",    NodeKind::Struct),
+        ("trait_declaration",    NodeKind::Struct),
+        ("interface_declaration",NodeKind::Trait),
+        ("namespace_definition", NodeKind::Module),
+    ],
+    // namespace_definition is included so that classes/functions inside a namespace
+    // are scoped under it (e.g., "App\Http\Controller::index" not just "index").
+    scope_parent_kinds: &["namespace_definition", "class_declaration", "trait_declaration", "interface_declaration"],
+    const_value_field: None,
+    full_text_name_kinds: &[],
+    string_literal_kinds: &[("encapsed_string", Some("string_content")), ("string", None)],
+    param_container_field: None,
+    param_type_field: None,
+    return_type_field: None,
+    type_requires_uppercase: true,
+    branch_node_types: &[
+        "if_statement", "else_clause", "elseif_clause",
+        "switch_statement", "case_statement",
+        "for_statement", "foreach_statement", "while_statement", "do_statement",
+        "binary_expression",
+        "conditional_expression",
+        "try_statement", "catch_clause",
+        "match_expression",
+    ],
+    decorator_node_kinds: &["attribute_list"],
+    type_param_node_kind: None,
+    docstring_in_body: false,
+    route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
+    call_expr_kinds: Some(("function_call_expression", "function")),
+    pub_visibility_modifier: None,  // PHP has no re-export semantics like Rust's `pub use`
+    has_all_export: false,
+    test_name_prefix: false,
+};
+
+// ---------------------------------------------------------------------------
+// Scala
+// ---------------------------------------------------------------------------
+
+pub static SCALA_CONFIG: LangConfig = LangConfig {
+    language_fn: || tree_sitter_scala::LANGUAGE.into(),
+    language_name: "scala",
+    extensions: &["scala", "sc"],
+    node_kinds: &[
+        ("function_definition",  NodeKind::Function),
+        ("function_declaration", NodeKind::Function),
+        ("class_definition",     NodeKind::Struct),  // includes case classes (modifier child)
+        ("object_definition",    NodeKind::Struct),  // Scala object (singleton)
+        ("enum_definition",      NodeKind::Enum),
+        ("trait_definition",     NodeKind::Trait),
+        ("val_definition",       NodeKind::Field),
+        ("var_definition",       NodeKind::Field),
+        // NOTE: case_class_pattern is for pattern matching, NOT class definitions.
+        // Case class definitions use class_definition with a `case` modifier child.
+    ],
+    scope_parent_kinds: &["class_definition", "object_definition", "trait_definition", "enum_definition"],
+    const_value_field: None,
+    full_text_name_kinds: &[],
+    string_literal_kinds: &[("string", None), ("interpolated_string", None)],
+    param_container_field: None,
+    param_type_field: None,
+    return_type_field: None,
+    type_requires_uppercase: true,
+    branch_node_types: &[
+        "if_expression", "else_clause",
+        "match_expression", "case_clause",
+        "for_expression", "while_expression", "do_expression",
+        "binary_expression",
+        "try_expression", "catch_clause",
+    ],
+    decorator_node_kinds: &["annotation"],
+    type_param_node_kind: Some("type_parameters"),
+    docstring_in_body: false,
+    route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
+    call_expr_kinds: Some(("call_expression", "function")),
+    pub_visibility_modifier: None,
+    has_all_export: false,
+    test_name_prefix: false,
+};
+
+// ---------------------------------------------------------------------------
+// Dart
+// ---------------------------------------------------------------------------
+
+pub static DART_CONFIG: LangConfig = LangConfig {
+    language_fn: || tree_sitter_dart::LANGUAGE.into(),
+    language_name: "dart",
+    extensions: &["dart"],
+    node_kinds: &[
+        ("function_signature",          NodeKind::Function),
+        ("method_signature",            NodeKind::Function),
+        // NOTE: local_function_declaration has no `name` field in tree-sitter-dart;
+        // its child function_signature is what carries the name and is captured above.
+        ("class_declaration",           NodeKind::Struct),
+        ("mixin_declaration",           NodeKind::Struct),
+        ("enum_declaration",            NodeKind::Enum),
+        ("extension_declaration",       NodeKind::Trait),
+    ],
+    scope_parent_kinds: &["class_declaration", "mixin_declaration", "enum_declaration", "extension_declaration"],
+    const_value_field: None,
+    full_text_name_kinds: &[],
+    string_literal_kinds: &[
+        ("string_literal_double_quotes", None),
+        ("string_literal_single_quotes", None),
+    ],
+    param_container_field: None,
+    param_type_field: None,
+    return_type_field: None,
+    type_requires_uppercase: true,
+    branch_node_types: &[
+        "if_statement", "else_clause",
+        "switch_statement", "switch_statement_case",
+        "for_statement", "while_statement", "do_statement",
+        "conditional_expression",
+        "try_statement", "catch_clause",
+    ],
+    decorator_node_kinds: &["annotation"],
+    type_param_node_kind: Some("type_parameters"),
     docstring_in_body: false,
     route_queries: &[],
     compiled_route_queries: std::sync::OnceLock::new(),
