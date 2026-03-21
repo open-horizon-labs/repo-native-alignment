@@ -71,9 +71,23 @@ pub struct LspEnricher {
     extensions: Vec<String>,
     /// Optional initialization settings (sent in initialize params).
     init_settings: Option<serde_json::Value>,
+    /// Config file this enricher relies on (e.g., "tsconfig.json" for TypeScript).
+    /// Used by pick_lsp_root to prefer lsp_roots that contain this file.
+    config_file: Option<&'static str>,
     ready: AtomicBool,
     /// Protected by mutex because enrich takes &self but we need to mutate transport state.
     state: Mutex<LspState>,
+    /// Override the LSP server working directory (`rootUri` / `current_dir`).
+    ///
+    /// When set, the language server is started from this directory instead of `repo_root`.
+    /// This is used for monorepo subdirectory roots: typescript-language-server for
+    /// `client/` should start from `client/` (where `tsconfig.json` lives) even though
+    /// the nodes' file paths are relative to the primary repo root.
+    ///
+    /// Note: this only affects server startup. File path construction for LSP requests
+    /// always uses `repo_root` (passed to `enrich()`), which ensures file URIs point to
+    /// the correct absolute paths.
+    startup_root_override: std::sync::OnceLock<PathBuf>,
 }
 
 struct LspState {
@@ -145,6 +159,7 @@ impl LspEnricher {
             server_args: args.iter().map(|s| s.to_string()).collect(),
             extensions: extensions.iter().map(|s| s.to_string()).collect(),
             init_settings: None,
+            config_file: None,
             ready: AtomicBool::new(false),
             state: Mutex::new(LspState {
                 transport: None,
@@ -159,7 +174,23 @@ impl LspEnricher {
                 type_hierarchy_strikes: 0,
                 diagnostics_sink: Arc::new(std::sync::Mutex::new(HashMap::new())),
             }),
+            startup_root_override: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Override the LSP server startup working directory.
+    ///
+    /// When called before the first `enrich()` call, the language server will be
+    /// started with `current_dir = lsp_root` and `rootUri = file:///<lsp_root>`.
+    /// This is used for monorepo subdirectory roots (e.g., `client/`) where the
+    /// language server needs to find `tsconfig.json` / `pyproject.toml` in the
+    /// subdirectory.
+    ///
+    /// File path construction for LSP requests is unaffected — it uses `repo_root`
+    /// from `enrich()`, which produces correct absolute file URIs.
+    pub fn with_startup_root(self, lsp_root: PathBuf) -> Self {
+        let _ = self.startup_root_override.set(lsp_root);
+        self
     }
 
     /// Create a new LSP enricher with custom initialization settings.
@@ -167,6 +198,15 @@ impl LspEnricher {
     /// Settings are sent as `initializationOptions` in the LSP initialize request.
     pub fn with_settings(mut self, settings: serde_json::Value) -> Self {
         self.init_settings = Some(settings);
+        self
+    }
+
+    /// Set the config file hint for lsp_root selection.
+    ///
+    /// When a monorepo has multiple subdirectory roots, this hint is used to
+    /// prefer the root that contains this file (e.g., `tsconfig.json` for TypeScript).
+    pub fn with_config_file(mut self, config_file: &'static str) -> Self {
+        self.config_file = Some(config_file);
         self
     }
 
@@ -227,14 +267,35 @@ impl LspEnricher {
             ));
         }
 
-        tracing::info!(
-            "Starting {} for {} LSP enrichment...",
-            self.server_command,
-            self.language
-        );
+        // Use startup_root_override if set (monorepo subdirectory roots), otherwise
+        // fall back to repo_root. The startup root determines the LSP server's
+        // `current_dir` and `rootUri`, letting language servers find their config
+        // files (e.g. typescript-language-server finds `client/tsconfig.json` when
+        // started from `client/`). File path construction for LSP requests still
+        // uses `repo_root` (the primary root) via `state.root_path` below.
+        let startup_root = self
+            .startup_root_override
+            .get()
+            .map(|p| p.as_path())
+            .unwrap_or(repo_root);
+
+        if startup_root != repo_root {
+            tracing::info!(
+                "Starting {} for {} LSP enrichment from '{}' (startup root override)...",
+                self.server_command,
+                self.language,
+                startup_root.display(),
+            );
+        } else {
+            tracing::info!(
+                "Starting {} for {} LSP enrichment...",
+                self.server_command,
+                self.language
+            );
+        }
 
         let transport =
-            match LspTransport::spawn(&self.server_command, &self.server_args, repo_root).await {
+            match LspTransport::spawn(&self.server_command, &self.server_args, startup_root).await {
                 Ok(t) => t,
                 Err(e) => {
                     state.init_failed = true;
@@ -248,11 +309,15 @@ impl LspEnricher {
                 }
             };
 
+        // Always store the primary repo_root in root_path — this is used for
+        // constructing absolute file paths in LSP requests (root.join(node.id.file)).
+        // The startup root is only for server initialization; file paths remain
+        // relative to the primary root.
         state.transport = Some(transport);
         state.root_path = Some(repo_root.to_path_buf());
 
-        // Send initialize request
-        let root_uri = path_to_uri(repo_root)?;
+        // Send initialize request using the startup root as rootUri.
+        let root_uri = path_to_uri(startup_root)?;
 
         #[allow(deprecated)] // root_uri is deprecated in favor of workspace_folders
         let mut init_params = InitializeParams {
@@ -1472,6 +1537,16 @@ impl Enricher for LspEnricher {
         &self.display_name
     }
 
+    fn set_startup_root(&self, lsp_root: std::path::PathBuf) {
+        // OnceLock::set returns Err if already set; we silently ignore that since
+        // the server may already be initialized (first call wins).
+        let _ = self.startup_root_override.set(lsp_root);
+    }
+
+    fn config_file_hint(&self) -> Option<&str> {
+        self.config_file
+    }
+
     async fn enrich(&self, nodes: &[Node], _index: &GraphIndex, repo_root: &Path) -> Result<EnrichmentResult> {
         let mut result = EnrichmentResult::default();
 
@@ -2603,7 +2678,7 @@ mod tests {
 
         // Enrich with no nodes should work fine for all enrichers
         let index = GraphIndex::new();
-        let result = registry.enrich_all(&[], &index, &["rust".to_string(), "python".to_string()], std::path::Path::new(".")).await;
+        let result = registry.enrich_all(&[], &index, &["rust".to_string(), "python".to_string()], std::path::Path::new("."), &[]).await;
         assert!(result.added_edges.is_empty());
     }
 

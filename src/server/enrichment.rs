@@ -113,6 +113,11 @@ impl RnaHandler {
                 let mut per_root_scans: Vec<(String, crate::scanner::ScanResult, PathBuf, Scanner)> =
                     Vec::new();
                 for resolved_root in &resolved_roots {
+                    // Skip lsp_only roots: their files are already covered by the primary root
+                    // scan. Running a scanner over them would produce duplicate extraction.
+                    if resolved_root.config.lsp_only {
+                        continue;
+                    }
                     let root_slug = resolved_root.slug.clone();
                     let root_path = resolved_root.path.clone();
                     let excludes = resolved_root.config.effective_excludes();
@@ -364,6 +369,7 @@ impl RnaHandler {
         let bg_lsp_status = self.lsp_status.clone();
         let bg_embed_status = self.embed_status.clone();
         let bg_lance_write_lock = Arc::clone(&self.lance_write_lock);
+        let bg_lsp_only_roots = Arc::clone(&self.lsp_only_roots);
         let bg_nodes = all_nodes.to_vec();
         let bg_languages: Vec<String> = all_nodes
             .iter()
@@ -469,7 +475,7 @@ impl RnaHandler {
 
                 let enricher_registry = EnricherRegistry::with_builtins();
                 let enrichment = enricher_registry
-                    .enrich_all(&enrich_nodes, &enrich_index, &bg_languages, &lsp_repo_root)
+                    .enrich_all(&enrich_nodes, &enrich_index, &bg_languages, &lsp_repo_root, &bg_lsp_only_roots)
                     .await;
 
                 if !enrichment.any_enricher_ran {
@@ -617,6 +623,7 @@ impl RnaHandler {
         let bg_graph = self.graph.clone();
         let bg_lsp_status = self.lsp_status.clone();
         let bg_lance_write_lock = Arc::clone(&self.lance_write_lock);
+        let bg_lsp_only_roots = Arc::clone(&self.lsp_only_roots);
         let bg_nodes: Vec<Node> = nodes.to_vec();
         let bg_languages: Vec<String> = nodes
             .iter()
@@ -650,7 +657,7 @@ impl RnaHandler {
 
             let enricher_registry = EnricherRegistry::with_builtins();
             let enrichment = enricher_registry
-                .enrich_all(&enrich_nodes, &enrich_index, &bg_languages, &bg_repo_root)
+                .enrich_all(&enrich_nodes, &enrich_index, &bg_languages, &bg_repo_root, &bg_lsp_only_roots)
                 .await;
 
             if !enrichment.any_enricher_ran {
@@ -808,6 +815,7 @@ impl RnaHandler {
         let bg_lsp_status = self.lsp_status.clone();
         let bg_embed_index = self.embed_index.clone();
         let bg_lance_write_lock = Arc::clone(&self.lance_write_lock);
+        let bg_lsp_only_roots = Arc::clone(&self.lsp_only_roots);
 
         self.lsp_status.set_running();
 
@@ -822,7 +830,7 @@ impl RnaHandler {
             let has_supported_language = languages.iter().any(|l| supported.contains(l));
 
             let enrichment = enricher_registry
-                .enrich_all(&changed_nodes, &index, &languages, &bg_repo_root)
+                .enrich_all(&changed_nodes, &index, &languages, &bg_repo_root, &bg_lsp_only_roots)
                 .await;
 
             if !enrichment.any_enricher_ran {
@@ -1186,7 +1194,7 @@ impl RnaHandler {
             guard.as_ref().unwrap().index.clone()
         };
         let enrichment = enricher_registry
-            .enrich_all(&changed_nodes, &graph_index, &languages, &self.repo_root)
+            .enrich_all(&changed_nodes, &graph_index, &languages, &self.repo_root, &self.lsp_only_roots)
             .await;
         let lsp_time = t2.elapsed();
 
@@ -1383,7 +1391,7 @@ impl RnaHandler {
             let t2 = std::time::Instant::now();
             let enricher_registry = EnricherRegistry::with_builtins();
             let enrichment = enricher_registry
-                .enrich_all(&graph_state.nodes, &graph_state.index, &languages, &self.repo_root)
+                .enrich_all(&graph_state.nodes, &graph_state.index, &languages, &self.repo_root, &self.lsp_only_roots)
                 .await;
             let elapsed = t2.elapsed();
             (enrichment, elapsed)
@@ -1524,7 +1532,7 @@ impl RnaHandler {
 
         let enricher_registry = EnricherRegistry::with_builtins();
         let enrichment = enricher_registry
-            .enrich_all(&all_nodes, &graph_index, &languages, &self.repo_root)
+            .enrich_all(&all_nodes, &graph_index, &languages, &self.repo_root, &self.lsp_only_roots)
             .await;
 
         if !enrichment.any_enricher_ran {

@@ -7,6 +7,7 @@ use rust_mcp_sdk::schema::{Implementation, InitializeResult, ServerCapabilities}
 use rust_mcp_sdk::ToMcpServerHandler;
 
 use repo_native_alignment::server::{self, RnaHandler};
+use repo_native_alignment::roots::WorkspaceConfig;
 use repo_native_alignment::service::{self, GraphParams, OutcomeProgressContext, OutcomeProgressParams, RepoMapContext, RepoMapParams, SearchContext, SearchParams};
 use repo_native_alignment::setup::{self, SetupArgs};
 use repo_native_alignment::smoke_test::{self, TestArgs};
@@ -123,9 +124,13 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::Scan(args)) => {
             init_tracing("info", log_path.as_deref());
             let repo_root = args.path.unwrap_or_else(|| args.repo.clone()).canonicalize()?;
-            if args.full { eprintln!("Full pipeline scan: {}", repo_root.display()); let handler = RnaHandler { repo_root: repo_root.clone(), ..Default::default() }; handler.run_pipeline_foreground(|msg| { eprintln!("{}", msg); }).await?; return Ok(()); }
+            let lsp_only_roots_scan = WorkspaceConfig::load()
+                .with_primary_root(repo_root.clone())
+                .with_declared_roots(&repo_root)
+                .lsp_only_roots();
+            if args.full { eprintln!("Full pipeline scan: {}", repo_root.display()); let handler = RnaHandler { repo_root: repo_root.clone(), lsp_only_roots: Arc::new(lsp_only_roots_scan), ..Default::default() }; handler.run_pipeline_foreground(|msg| { eprintln!("{}", msg); }).await?; return Ok(()); }
             eprintln!("Scanning: {}", repo_root.display()); let t0 = std::time::Instant::now();
-            let handler = RnaHandler { repo_root: repo_root.clone(), ..Default::default() }; let graph = handler.build_full_graph().await?;
+            let handler = RnaHandler { repo_root: repo_root.clone(), lsp_only_roots: Arc::new(lsp_only_roots_scan), ..Default::default() }; let graph = handler.build_full_graph().await?;
             let embed_count = match repo_native_alignment::embed::EmbeddingIndex::new(&repo_root).await {
                 Ok(idx) => { eprintln!("  Embedding {} symbols...", graph.nodes.iter().filter(|n| n.id.root != "external").count());
                     loop { match idx.search("_probe_", None, 1).await { Ok(repo_native_alignment::embed::SearchOutcome::Results(_)) => break 1, _ => { tokio::time::sleep(std::time::Duration::from_secs(2)).await } } } }
@@ -239,7 +244,15 @@ async fn async_main() -> anyhow::Result<()> {
         None => {}
     }
     let repo_root = cli.repo.canonicalize()?;
-    let handler = RnaHandler { repo_root: repo_root.clone(), ..Default::default() };
+    let lsp_only_roots = WorkspaceConfig::load()
+        .with_primary_root(repo_root.clone())
+        .with_declared_roots(&repo_root)
+        .lsp_only_roots();
+    let handler = RnaHandler {
+        repo_root: repo_root.clone(),
+        lsp_only_roots: Arc::new(lsp_only_roots),
+        ..Default::default()
+    };
     match cli.transport.as_str() {
         "stdio" => { init_tracing("warn", log_path.as_deref());
             let transport = rust_mcp_sdk::StdioTransport::new(Default::default()).map_err(|e| anyhow::anyhow!("{:?}", e))?;

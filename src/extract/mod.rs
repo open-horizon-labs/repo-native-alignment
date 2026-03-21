@@ -150,6 +150,28 @@ pub trait Enricher: Send + Sync {
 
     /// Human-readable name for this enricher (for diagnostics).
     fn name(&self) -> &str;
+
+    /// Set the LSP server startup working directory.
+    ///
+    /// When called before the first `enrich()` call, the language server is started
+    /// with `current_dir = lsp_root` and `rootUri = file:///<lsp_root>`. Used for
+    /// monorepo subdirectory roots (e.g. `client = "client"`) so language servers
+    /// can find their config files (tsconfig.json, pyproject.toml) in the subdirectory.
+    ///
+    /// Default implementation is a no-op. `LspEnricher` overrides this.
+    fn set_startup_root(&self, _lsp_root: std::path::PathBuf) {}
+
+    /// Config file name this enricher relies on for project-level configuration.
+    ///
+    /// Used by `enrich_all` to prefer lsp_roots that contain this file when selecting
+    /// the LSP server startup directory. For example, typescript-language-server relies
+    /// on `tsconfig.json`, pyright on `pyproject.toml`.
+    ///
+    /// Returns `None` if the enricher has no specific config file preference
+    /// (it will fall back to the node-count heuristic).
+    ///
+    /// Default: `None` (no preference).
+    fn config_file_hint(&self) -> Option<&str> { None }
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +356,99 @@ impl Default for ExtractorRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// LSP root selection helper
+// ---------------------------------------------------------------------------
+
+/// Pick the best LSP working directory for a set of nodes given a list of candidate roots.
+///
+/// When a monorepo has subdirectory roots (e.g. `client = "client"`), we want the language
+/// server to start from the subdirectory (where `tsconfig.json` lives) rather than the repo
+/// root.
+///
+/// ## Selection algorithm
+///
+/// 1. **Config file preference (first):** if `config_file_hint` is provided (e.g., `"tsconfig.json"`),
+///    prefer the first lsp_root that contains that file. This handles the case where one
+///    subdirectory (e.g. `client/`) has `tsconfig.json` but another (e.g. `ai_service/`) does not,
+///    even if `ai_service/` has more TypeScript test files by count.
+///
+/// 2. **Node count fallback:** if no candidate root has the config file, fall back to
+///    the root that covers the most nodes.
+///
+/// 3. **Primary root default:** if no candidate matches any node, return `primary_root`.
+fn pick_lsp_root_for_nodes<'a>(
+    nodes: &[crate::graph::Node],
+    primary_root: &'a Path,
+    lsp_roots: &'a [(String, std::path::PathBuf)],
+    config_file_hint: Option<&str>,
+) -> &'a Path {
+    if lsp_roots.is_empty() {
+        return primary_root;
+    }
+
+    // Step 1: If we have a config file hint, prefer the first lsp_root that contains it
+    // AND has at least one matching node. This catches the common case where only one
+    // subdirectory has tsconfig.json / pyproject.toml.
+    if let Some(config_file) = config_file_hint {
+        for (_slug, root_path) in lsp_roots {
+            let has_config = root_path.join(config_file).exists();
+            let has_nodes = nodes.iter().any(|n| {
+                let abs_file = primary_root.join(&n.id.file);
+                abs_file.starts_with(root_path)
+            });
+            if has_config && has_nodes {
+                tracing::info!(
+                    "pick_lsp_root: selected '{}' (has {} and matching nodes)",
+                    root_path.display(),
+                    config_file,
+                );
+                return root_path.as_path();
+            }
+        }
+    }
+
+    // Step 2: Node-count fallback.
+    let mut best_root: &Path = primary_root;
+    let mut best_count: usize = 0;
+    let mut best_depth: usize = 0; // tie-break: longer path = more specific
+
+    for (_slug, root_path) in lsp_roots {
+        let count = nodes
+            .iter()
+            .filter(|n| {
+                // Node file paths are relative to their root, so prepend primary_root to get the
+                // absolute path, then check if it starts with the candidate lsp_root.
+                let abs_file = primary_root.join(&n.id.file);
+                abs_file.starts_with(root_path)
+            })
+            .count();
+
+        let depth = root_path.components().count();
+        if count > best_count || (count == best_count && count > 0 && depth > best_depth) {
+            best_count = count;
+            best_depth = depth;
+            best_root = root_path.as_path();
+        }
+    }
+
+    if best_count > 0 {
+        tracing::info!(
+            "pick_lsp_root: selected '{}' by node count ({} matching nodes out of {})",
+            best_root.display(),
+            best_count,
+            nodes.len(),
+        );
+    } else {
+        tracing::info!(
+            "pick_lsp_root: no lsp_root matched, using primary root '{}'",
+            primary_root.display(),
+        );
+    }
+    best_root
+}
+
+// ---------------------------------------------------------------------------
 // EnricherRegistry
 // ---------------------------------------------------------------------------
 
@@ -424,6 +539,18 @@ impl EnricherRegistry {
             } else {
                 enricher
             };
+            // Add config file hints for lsp_root selection in monorepos.
+            // When a monorepo has multiple subdirectory roots, the enricher prefers
+            // the root that contains this file over the raw node-count heuristic.
+            let enricher = match lang {
+                "typescript" | "deno" => enricher.with_config_file("tsconfig.json"),
+                "python"              => enricher.with_config_file("pyproject.toml"),
+                "go"                  => enricher.with_config_file("go.mod"),
+                "rust"                => enricher.with_config_file("Cargo.toml"),
+                "java"                => enricher.with_config_file("pom.xml"),
+                "kotlin"              => enricher.with_config_file("build.gradle.kts"),
+                _                     => enricher,
+            };
             registry.register(Box::new(enricher));
         }
 
@@ -438,6 +565,11 @@ impl EnricherRegistry {
     /// Run all enrichers that support the given languages present in the graph.
     ///
     /// `repo_root` must be the actual project root (from `--repo`), not `cwd`.
+    /// `lsp_roots` is an optional list of `(slug, path)` for subdirectory roots declared
+    /// in `[workspace.roots]`. When provided, each enricher picks the most-specific
+    /// matching root as its LSP working directory. This lets typescript-language-server
+    /// start from `client/` (where `tsconfig.json` lives) rather than the repo root.
+    ///
     /// Returns a merged `EnrichmentResult` from all enrichers.
     pub async fn enrich_all(
         &self,
@@ -445,6 +577,7 @@ impl EnricherRegistry {
         index: &GraphIndex,
         languages: &[String],
         repo_root: &Path,
+        lsp_roots: &[(String, std::path::PathBuf)],
     ) -> EnrichmentResult {
         let mut result = EnrichmentResult::default();
 
@@ -462,6 +595,24 @@ impl EnricherRegistry {
                 .any(|lang| languages.iter().any(|l| l == lang));
             if !supported {
                 continue; // silently skip — too many servers to log each one
+            }
+
+            // Configure the LSP server startup working directory if lsp_roots are available.
+            // This is a one-time operation (OnceLock, first call wins) that sets the
+            // working directory for the language server startup (current_dir + rootUri).
+            // It must be called BEFORE the first enrich() so ensure_initialized picks it up.
+            //
+            // Only set if we found a more-specific root than the primary root.
+            if !lsp_roots.is_empty() {
+                let best = pick_lsp_root_for_nodes(
+                    nodes,
+                    repo_root,
+                    lsp_roots,
+                    enricher.config_file_hint(),
+                );
+                if best != repo_root {
+                    enricher.set_startup_root(best.to_path_buf());
+                }
             }
 
             match enricher.enrich(nodes, index, repo_root).await {
@@ -649,6 +800,153 @@ mod tests {
             go_result.nodes.iter().any(|n| n.id.kind == crate::graph::NodeKind::Const
                 && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("true")),
             "Go should capture string literals"
+        );
+    }
+
+    // ── pick_lsp_root_for_nodes adversarial tests ────────────────────────
+
+    fn make_test_node(file: &str, lang: &str) -> crate::graph::Node {
+        crate::graph::Node {
+            id: crate::graph::NodeId {
+                root: "primary".to_string(),
+                file: PathBuf::from(file),
+                name: "test".to_string(),
+                kind: crate::graph::NodeKind::Function,
+            },
+            language: lang.to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            body: String::new(),
+            metadata: Default::default(),
+            source: crate::graph::ExtractionSource::TreeSitter,
+        }
+    }
+
+    #[test]
+    fn test_pick_lsp_root_prefers_config_file_over_node_count() {
+        // Adversarial: ai_service/ has MORE TypeScript files than client/,
+        // but only client/ has tsconfig.json. Config-file heuristic must win.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let primary = tmp.path().to_path_buf();
+        let client_dir = primary.join("client");
+        let ai_service_dir = primary.join("ai_service");
+        std::fs::create_dir_all(&client_dir).unwrap();
+        std::fs::create_dir_all(&ai_service_dir).unwrap();
+        // Only client/ has tsconfig.json
+        std::fs::write(client_dir.join("tsconfig.json"), "{}").unwrap();
+
+        // Make ai_service have MORE TypeScript nodes (dissent scenario)
+        let mut nodes: Vec<crate::graph::Node> = Vec::new();
+        for i in 0..100 {
+            nodes.push(make_test_node(&format!("ai_service/test_{}.ts", i), "typescript"));
+        }
+        for i in 0..50 {
+            nodes.push(make_test_node(&format!("client/src/component_{}.tsx", i), "typescript"));
+        }
+
+        let lsp_roots = vec![
+            ("client".to_string(), client_dir.clone()),
+            ("ai-service".to_string(), ai_service_dir.clone()),
+        ];
+
+        // Without config file hint: ai_service wins by count
+        let result_no_hint = pick_lsp_root_for_nodes(&nodes, &primary, &lsp_roots, None);
+        assert_eq!(
+            result_no_hint, ai_service_dir.as_path(),
+            "Without hint, node-count picks ai_service (100 > 50 nodes)"
+        );
+
+        // With tsconfig.json hint: client wins by config file presence
+        let result_with_hint = pick_lsp_root_for_nodes(&nodes, &primary, &lsp_roots, Some("tsconfig.json"));
+        assert_eq!(
+            result_with_hint, client_dir.as_path(),
+            "With tsconfig.json hint, client/ wins even with fewer nodes"
+        );
+    }
+
+    #[test]
+    fn test_pick_lsp_root_falls_back_to_count_when_no_config_file() {
+        // When config file hint is provided but no root has the file,
+        // fallback to node count.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let primary = tmp.path().to_path_buf();
+        let client_dir = primary.join("client");
+        let ai_service_dir = primary.join("ai_service");
+        std::fs::create_dir_all(&client_dir).unwrap();
+        std::fs::create_dir_all(&ai_service_dir).unwrap();
+        // Neither has tsconfig.json
+
+        let mut nodes: Vec<crate::graph::Node> = Vec::new();
+        for i in 0..20 {
+            nodes.push(make_test_node(&format!("client/src/component_{}.tsx", i), "typescript"));
+        }
+        for i in 0..5 {
+            nodes.push(make_test_node(&format!("ai_service/test_{}.ts", i), "typescript"));
+        }
+
+        let lsp_roots = vec![
+            ("client".to_string(), client_dir.clone()),
+            ("ai-service".to_string(), ai_service_dir.clone()),
+        ];
+
+        // Config file not found in any root → fallback to count
+        let result = pick_lsp_root_for_nodes(&nodes, &primary, &lsp_roots, Some("tsconfig.json"));
+        assert_eq!(
+            result, client_dir.as_path(),
+            "When no root has tsconfig.json, node-count fallback picks client (20 > 5 nodes)"
+        );
+    }
+
+    #[test]
+    fn test_pick_lsp_root_returns_primary_when_no_match() {
+        // If no lsp_root covers any node, return primary_root.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let primary = tmp.path().to_path_buf();
+        let unrelated_dir = primary.join("unrelated");
+        std::fs::create_dir_all(&unrelated_dir).unwrap();
+
+        let nodes = vec![
+            make_test_node("client/src/App.tsx", "typescript"),
+        ];
+        let lsp_roots = vec![
+            ("unrelated".to_string(), unrelated_dir.clone()),
+        ];
+
+        // Node is in client/ but lsp_root is unrelated/ → no match → primary root
+        let result = pick_lsp_root_for_nodes(&nodes, &primary, &lsp_roots, Some("tsconfig.json"));
+        assert_eq!(
+            result, primary.as_path(),
+            "When no root matches any node, primary root is returned"
+        );
+    }
+
+    #[test]
+    fn test_pick_lsp_root_two_roots_same_config_first_wins() {
+        // Dissent scenario: two roots both have tsconfig.json — first one wins.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let primary = tmp.path().to_path_buf();
+        let client_dir = primary.join("client");
+        let client_v2_dir = primary.join("client-v2");
+        std::fs::create_dir_all(&client_dir).unwrap();
+        std::fs::create_dir_all(&client_v2_dir).unwrap();
+        std::fs::write(client_dir.join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(client_v2_dir.join("tsconfig.json"), "{}").unwrap();
+
+        let nodes = vec![
+            make_test_node("client/src/App.tsx", "typescript"),
+            make_test_node("client-v2/src/App.tsx", "typescript"),
+        ];
+        let lsp_roots = vec![
+            ("client".to_string(), client_dir.clone()),
+            ("client-v2".to_string(), client_v2_dir.clone()),
+        ];
+
+        // Both have tsconfig.json and matching nodes — first wins
+        let result = pick_lsp_root_for_nodes(&nodes, &primary, &lsp_roots, Some("tsconfig.json"));
+        assert_eq!(
+            result, client_dir.as_path(),
+            "When both roots have tsconfig.json, first in list wins"
         );
     }
 }
