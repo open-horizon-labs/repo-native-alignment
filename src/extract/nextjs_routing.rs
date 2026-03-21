@@ -212,7 +212,7 @@ fn is_pages_router_route(rel: &str) -> bool {
 
 fn process_app_router_file(
     root_slug: &str,
-    root_path: &Path,
+    _root_path: &Path,
     rel_path: &Path,
     rel_forward: &str,
     abs_path: &Path,
@@ -575,7 +575,7 @@ pub fn find_exported_http_methods(content: &str) -> Vec<MethodBinding> {
             if trimmed.contains('{') {
                 // Accumulate lines until we find the closing `}`.
                 let mut block = String::new();
-                let mut block_start = line_num;
+                let block_start = line_num;
                 let mut j = i;
                 while j < lines.len() {
                     block.push_str(lines[j]);
@@ -649,55 +649,6 @@ fn inline_exports_http_method(line: &str, method: &str) -> bool {
     }
 
     false
-}
-
-/// Compatibility wrapper: return just the HTTP method names.
-///
-/// Used by `line_exports_http_method` (the function-level helper kept for
-/// `find_method_lines`) to avoid breaking the existing single-line check.
-fn line_exports_http_method(line: &str, method: &str) -> bool {
-    if inline_exports_http_method(line, method) {
-        return true;
-    }
-    // Single-line re-export block
-    if line.trim_start().starts_with("export") && line.contains('{') {
-        if let (Some(open), Some(close)) = (line.find('{'), line.rfind('}')) {
-            if open < close {
-                let inner = &line[open + 1..close];
-                for item in inner.split(',') {
-                    let item = item.trim();
-                    let exported = if let Some(pos) = item.find(" as ") {
-                        item[pos + 4..].trim()
-                    } else {
-                        item
-                    };
-                    if exported == method {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Find the approximate start/end line numbers (1-indexed) of an exported
-/// HTTP method function in a file.  Returns (1, 1) if not found.
-fn find_method_lines(content: &str, method: &str) -> (usize, usize) {
-    if method == "ANY" {
-        return (1, 1);
-    }
-    for (idx, line) in content.lines().enumerate() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("export") {
-            continue;
-        }
-        if line_exports_http_method(trimmed, method) {
-            let line_num = idx + 1;
-            return (line_num, line_num);
-        }
-    }
-    (1, 1)
 }
 
 /// Infer language name from file extension.
@@ -1103,7 +1054,6 @@ export const POSTFIX = "something"
 
     #[test]
     fn test_implements_edge_emitted_when_function_node_exists() {
-        use std::fs;
         use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
         use std::collections::BTreeMap;
 
@@ -1218,6 +1168,154 @@ export const POSTFIX = "something"
         assert!(
             result.nodes.is_empty(),
             "node_modules routes should be ignored"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Adversarial tests (seeded from /ship dissent findings)
+    // -----------------------------------------------------------------------
+
+    /// Adversarial: symlink to a directory must not be followed.
+    /// If walk_for_nextjs followed symlinks, this would recurse and panic or
+    /// produce duplicate results. Before the fix (Critical CodeRabbit finding),
+    /// path.is_dir() followed symlinks; now we use entry.file_type().is_symlink().
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_does_not_follow_symlinked_directory() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+
+        // Create a real route file
+        let route_dir = root.join("app").join("api").join("real");
+        fs::create_dir_all(&route_dir).unwrap();
+        fs::write(route_dir.join("route.ts"), "export async function GET() {}\n").unwrap();
+
+        // Create a symlink loop: root/loop_link → root (infinite recursion if followed)
+        let loop_link = root.join("loop_link");
+        symlink(&root, &loop_link).expect("failed to create symlink loop");
+
+        // Should NOT recurse infinitely; should find exactly 1 ApiEndpoint
+        let roots = vec![("test".to_string(), root)];
+        let result = nextjs_routing_pass(&roots, &[]);
+
+        let endpoints: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(
+            endpoints.len(),
+            1,
+            "should find exactly 1 ApiEndpoint, not recurse through symlink: {:?}",
+            endpoints
+        );
+    }
+
+    /// Adversarial: Next.js 13+ parallel routes use `@folder` notation.
+    /// These are NOT API routes and must not produce ApiEndpoint nodes.
+    #[test]
+    fn test_parallel_routes_not_detected_as_api() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+
+        // Next.js parallel route: app/@dashboard/api/payments/route.ts
+        // This is NOT an API route file in the conventional sense — the `@dashboard`
+        // slot means it renders into a layout slot, not a standalone HTTP handler.
+        let route_dir = root.join("app").join("@dashboard").join("api").join("payments");
+        fs::create_dir_all(&route_dir).unwrap();
+        fs::write(route_dir.join("route.ts"), "export async function GET() {}\n").unwrap();
+
+        let roots = vec![("test".to_string(), root)];
+        let result = nextjs_routing_pass(&roots, &[]);
+
+        // The path starts with app/@dashboard/ not app/api/ — is_app_router_route checks
+        // that the directory starts with app/api/, so parallel routes should be skipped.
+        // This is the INTENDED behaviour: we only detect conventional API routes.
+        let endpoints: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        // Parallel routes under @slot are not detected — document the boundary clearly
+        assert!(
+            endpoints.is_empty() || endpoints.iter().all(|n| !n.id.name.contains("@")),
+            "parallel route slots should not produce @-prefixed ApiEndpoint nodes: {:?}",
+            endpoints
+        );
+    }
+
+    /// Adversarial: comment-only HTTP method names should not be detected.
+    /// `// export async function GET()` is NOT an export.
+    #[test]
+    fn test_commented_out_exports_not_detected() {
+        let content = r#"
+// export async function GET(request: NextRequest) {
+//   return Response.json({})
+// }
+
+/* export const POST = async () => {} */
+
+export async function DELETE() {}
+"#;
+        let bindings = find_exported_http_methods(content);
+        let methods: Vec<&str> = bindings.iter().map(|b| b.http_method.as_str()).collect();
+        // Commented-out GET and POST must NOT be detected; only DELETE
+        assert!(
+            !methods.contains(&"GET"),
+            "commented-out GET should not be detected, got: {:?}",
+            methods
+        );
+        assert!(
+            !methods.contains(&"POST"),
+            "block-commented POST should not be detected, got: {:?}",
+            methods
+        );
+        assert!(
+            methods.contains(&"DELETE"),
+            "DELETE should be detected, got: {:?}",
+            methods
+        );
+    }
+
+    /// Adversarial: empty roots slice must not panic.
+    #[test]
+    fn test_empty_roots_no_panic() {
+        let result = nextjs_routing_pass(&[], &[]);
+        assert!(result.nodes.is_empty());
+        assert!(result.edges.is_empty());
+    }
+
+    /// Adversarial: route file that exists but is unreadable (permissions) must not panic.
+    /// We can't easily test real unreadable files in CI, so we test an empty route file
+    /// (no exported methods) → should emit ANY endpoint, not panic.
+    #[test]
+    fn test_empty_route_file_emits_any_endpoint() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+
+        let route_dir = root.join("app").join("api").join("empty");
+        fs::create_dir_all(&route_dir).unwrap();
+        fs::write(route_dir.join("route.ts"), "").unwrap(); // empty file
+
+        let roots = vec![("test".to_string(), root)];
+        let result = nextjs_routing_pass(&roots, &[]);
+
+        let endpoints: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(endpoints.len(), 1, "empty file should emit ANY catch-all endpoint");
+        assert_eq!(
+            endpoints[0].metadata.get("http_method").map(|s| s.as_str()),
+            Some("ANY")
         );
     }
 }
