@@ -13,10 +13,12 @@ jobs:
   build-fast:
     runs-on: namespace-profile-tahoe
     timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Patch version from tag
         run: |
@@ -62,7 +64,7 @@ jobs:
           tar czf repo-native-alignment-darwin-arm64-fast.tar.gz -C target/aarch64-apple-darwin/release repo-native-alignment
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: repo-native-alignment-darwin-arm64-fast
           path: repo-native-alignment-darwin-arm64-fast.tar.gz
@@ -72,9 +74,11 @@ jobs:
     needs: build-fast
     runs-on: namespace-profile-tahoe
     timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Patch version from tag
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -111,7 +115,7 @@ jobs:
           strip target/aarch64-apple-darwin/release/repo-native-alignment
           tar czf repo-native-alignment-darwin-arm64.tar.gz -C target/aarch64-apple-darwin/release repo-native-alignment
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: repo-native-alignment-darwin-arm64
           path: repo-native-alignment-darwin-arm64.tar.gz
@@ -120,9 +124,11 @@ jobs:
   build-linux:
     runs-on: namespace-profile-cached
     timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Patch version from tag
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -153,7 +159,7 @@ jobs:
           strip target/x86_64-unknown-linux-gnu/release/repo-native-alignment
           tar czf repo-native-alignment-linux-x86_64.tar.gz -C target/x86_64-unknown-linux-gnu/release repo-native-alignment
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: repo-native-alignment-linux-x86_64
           path: repo-native-alignment-linux-x86_64.tar.gz
@@ -164,12 +170,12 @@ jobs:
 
     steps:
       - name: Checkout (for tag annotation)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
 
       - name: Upload to GitHub Release
         env:
@@ -202,7 +208,7 @@ jobs:
 
     steps:
       - name: Checkout main
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: main
 

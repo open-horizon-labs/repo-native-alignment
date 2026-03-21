@@ -19,8 +19,8 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           filters: |
@@ -43,7 +43,7 @@ jobs:
         run: echo "No Rust changes — skipping lint"
       - name: Checkout
         if: needs.changes.outputs.rust == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: No language-specific conditionals in generic.rs
         if: needs.changes.outputs.rust == 'true'
         run: |
@@ -72,13 +72,15 @@ jobs:
     needs: changes
     runs-on: namespace-profile-cached
     timeout-minutes: 15
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Skip (no Rust changes)
         if: needs.changes.outputs.rust != 'true'
         run: echo "No Rust changes — skipping tests"
       - name: Checkout
         if: needs.changes.outputs.rust == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install protoc
         if: needs.changes.outputs.rust == 'true'
@@ -117,9 +119,11 @@ jobs:
     if: needs.changes.outputs.rust == 'true' && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false))
     runs-on: namespace-profile-cached
     timeout-minutes: 20
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install protoc
         uses: arduino/setup-protoc@v3
@@ -170,9 +174,9 @@ jobs:
           echo "$OUTPUT" | grep -q "neighbors\|No results" || { echo "FAIL: graph returned unexpected output"; exit 1; }
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "24"
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install MCP TypeScript SDK
@@ -187,10 +191,12 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: namespace-profile-tahoe
     timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install protoc
         uses: arduino/setup-protoc@v3
@@ -225,10 +231,8 @@ jobs:
           tar czf repo-native-alignment-darwin-arm64-fast.tar.gz -C target/aarch64-apple-darwin/release repo-native-alignment
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: repo-native-alignment-darwin-arm64-fast
           path: repo-native-alignment-darwin-arm64-fast.tar.gz
           retention-days: 30
-
-
