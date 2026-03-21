@@ -71,6 +71,9 @@ pub struct LspEnricher {
     extensions: Vec<String>,
     /// Optional initialization settings (sent in initialize params).
     init_settings: Option<serde_json::Value>,
+    /// Config file this enricher relies on (e.g., "tsconfig.json" for TypeScript).
+    /// Used by pick_lsp_root to prefer lsp_roots that contain this file.
+    config_file: Option<&'static str>,
     ready: AtomicBool,
     /// Protected by mutex because enrich takes &self but we need to mutate transport state.
     state: Mutex<LspState>,
@@ -156,6 +159,7 @@ impl LspEnricher {
             server_args: args.iter().map(|s| s.to_string()).collect(),
             extensions: extensions.iter().map(|s| s.to_string()).collect(),
             init_settings: None,
+            config_file: None,
             ready: AtomicBool::new(false),
             state: Mutex::new(LspState {
                 transport: None,
@@ -194,6 +198,15 @@ impl LspEnricher {
     /// Settings are sent as `initializationOptions` in the LSP initialize request.
     pub fn with_settings(mut self, settings: serde_json::Value) -> Self {
         self.init_settings = Some(settings);
+        self
+    }
+
+    /// Set the config file hint for lsp_root selection.
+    ///
+    /// When a monorepo has multiple subdirectory roots, this hint is used to
+    /// prefer the root that contains this file (e.g., `tsconfig.json` for TypeScript).
+    pub fn with_config_file(mut self, config_file: &'static str) -> Self {
+        self.config_file = Some(config_file);
         self
     }
 
@@ -1528,6 +1541,10 @@ impl Enricher for LspEnricher {
         // OnceLock::set returns Err if already set; we silently ignore that since
         // the server may already be initialized (first call wins).
         let _ = self.startup_root_override.set(lsp_root);
+    }
+
+    fn config_file_hint(&self) -> Option<&str> {
+        self.config_file
     }
 
     async fn enrich(&self, nodes: &[Node], _index: &GraphIndex, repo_root: &Path) -> Result<EnrichmentResult> {

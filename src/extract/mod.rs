@@ -159,6 +159,18 @@ pub trait Enricher: Send + Sync {
     ///
     /// Default implementation is a no-op. `LspEnricher` overrides this.
     fn set_startup_root(&self, _lsp_root: std::path::PathBuf) {}
+
+    /// Config file name this enricher relies on for project-level configuration.
+    ///
+    /// Used by `enrich_all` to prefer lsp_roots that contain this file when selecting
+    /// the LSP server startup directory. For example, typescript-language-server relies
+    /// on `tsconfig.json`, pyright on `pyproject.toml`.
+    ///
+    /// Returns `None` if the enricher has no specific config file preference
+    /// (it will fall back to the node-count heuristic).
+    ///
+    /// Default: `None` (no preference).
+    fn config_file_hint(&self) -> Option<&str> { None }
 }
 
 // ---------------------------------------------------------------------------
@@ -351,25 +363,51 @@ impl Default for ExtractorRegistry {
 ///
 /// When a monorepo has subdirectory roots (e.g. `client = "client"`), we want the language
 /// server to start from the subdirectory (where `tsconfig.json` lives) rather than the repo
-/// root. This function picks the most-specific root path that covers the most nodes.
+/// root.
 ///
-/// Algorithm:
-/// 1. For each candidate root, count how many nodes have files under that root.
-/// 2. Return the root with the highest count (longest-prefix wins ties because
-///    a more-specific path will have a strictly longer prefix, so it can only match
-///    a subset of what the parent root matches — ties in count therefore go to the
-///    shorter path, i.e. the primary root, which is the safe default).
-/// 3. Fall back to `primary_root` if no candidate matches any node.
+/// ## Selection algorithm
+///
+/// 1. **Config file preference (first):** if `config_file_hint` is provided (e.g., `"tsconfig.json"`),
+///    prefer the first lsp_root that contains that file. This handles the case where one
+///    subdirectory (e.g. `client/`) has `tsconfig.json` but another (e.g. `ai_service/`) does not,
+///    even if `ai_service/` has more TypeScript test files by count.
+///
+/// 2. **Node count fallback:** if no candidate root has the config file, fall back to
+///    the root that covers the most nodes.
+///
+/// 3. **Primary root default:** if no candidate matches any node, return `primary_root`.
 fn pick_lsp_root_for_nodes<'a>(
     nodes: &[crate::graph::Node],
     primary_root: &'a Path,
     lsp_roots: &'a [(String, std::path::PathBuf)],
+    config_file_hint: Option<&str>,
 ) -> &'a Path {
     if lsp_roots.is_empty() {
         return primary_root;
     }
 
-    // Count matches per candidate root.
+    // Step 1: If we have a config file hint, prefer the first lsp_root that contains it
+    // AND has at least one matching node. This catches the common case where only one
+    // subdirectory has tsconfig.json / pyproject.toml.
+    if let Some(config_file) = config_file_hint {
+        for (_slug, root_path) in lsp_roots {
+            let has_config = root_path.join(config_file).exists();
+            let has_nodes = nodes.iter().any(|n| {
+                let abs_file = primary_root.join(&n.id.file);
+                abs_file.starts_with(root_path)
+            });
+            if has_config && has_nodes {
+                tracing::info!(
+                    "pick_lsp_root: selected '{}' (has {} and matching nodes)",
+                    root_path.display(),
+                    config_file,
+                );
+                return root_path.as_path();
+            }
+        }
+    }
+
+    // Step 2: Node-count fallback.
     let mut best_root: &Path = primary_root;
     let mut best_count: usize = 0;
     let mut best_depth: usize = 0; // tie-break: longer path = more specific
@@ -395,7 +433,7 @@ fn pick_lsp_root_for_nodes<'a>(
 
     if best_count > 0 {
         tracing::info!(
-            "pick_lsp_root: selected '{}' ({} matching nodes out of {})",
+            "pick_lsp_root: selected '{}' by node count ({} matching nodes out of {})",
             best_root.display(),
             best_count,
             nodes.len(),
@@ -500,6 +538,18 @@ impl EnricherRegistry {
             } else {
                 enricher
             };
+            // Add config file hints for lsp_root selection in monorepos.
+            // When a monorepo has multiple subdirectory roots, the enricher prefers
+            // the root that contains this file over the raw node-count heuristic.
+            let enricher = match lang {
+                "typescript" | "deno" => enricher.with_config_file("tsconfig.json"),
+                "python"              => enricher.with_config_file("pyproject.toml"),
+                "go"                  => enricher.with_config_file("go.mod"),
+                "rust"                => enricher.with_config_file("Cargo.toml"),
+                "java"                => enricher.with_config_file("pom.xml"),
+                "kotlin"              => enricher.with_config_file("build.gradle.kts"),
+                _                     => enricher,
+            };
             registry.register(Box::new(enricher));
         }
 
@@ -553,7 +603,12 @@ impl EnricherRegistry {
             //
             // Only set if we found a more-specific root than the primary root.
             if !lsp_roots.is_empty() {
-                let best = pick_lsp_root_for_nodes(nodes, repo_root, lsp_roots);
+                let best = pick_lsp_root_for_nodes(
+                    nodes,
+                    repo_root,
+                    lsp_roots,
+                    enricher.config_file_hint(),
+                );
                 if best != repo_root {
                     enricher.set_startup_root(best.to_path_buf());
                 }
