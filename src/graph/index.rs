@@ -132,11 +132,21 @@ impl GraphIndex {
 
     /// Rebuild the graph from a slice of `Edge` structs (e.g., loaded from LanceDB).
     /// Clears the existing graph first.
+    ///
+    /// Duplicate edges (same `from → kind → to` triple) are silently skipped.
+    /// This guards against incremental-scan passes that re-run over the full
+    /// node set and append the same edges on every scan, which would otherwise
+    /// cause progressive PageRank skew.
     pub fn rebuild_from_edges(&mut self, edges: &[Edge]) {
         self.graph.clear();
         self.node_lookup.clear();
 
+        let mut seen: HashSet<String> = HashSet::new();
         for edge in edges {
+            let id = edge.stable_id();
+            if !seen.insert(id) {
+                continue; // duplicate — skip
+            }
             let from_id = edge.from.to_stable_id();
             let to_id = edge.to.to_stable_id();
             self.add_edge(
@@ -1588,6 +1598,35 @@ mod tests {
         assert_eq!(index.node_count(), 2); // new_x and new_y
         assert!(index.get_node("old_a").is_none());
         assert!(index.get_node("old_b").is_none());
+    }
+
+    /// Regression test for #446: duplicate edges in the input slice must not
+    /// cause duplicate petgraph edges, which would inflate PageRank scores on
+    /// repeated incremental scans.
+    #[test]
+    fn test_rebuild_from_edges_deduplicates() {
+        // Two identical edges plus one distinct edge.
+        let dup = make_edge("foo", "bar", EdgeKind::Calls);
+        let edges = vec![
+            dup.clone(),
+            dup.clone(), // exact duplicate — should be silently dropped
+            make_edge("bar", "baz", EdgeKind::DependsOn),
+        ];
+
+        let mut index = GraphIndex::new();
+        index.rebuild_from_edges(&edges);
+
+        // 3 unique nodes
+        assert_eq!(index.node_count(), 3);
+        // Only 2 unique edges despite 3 items in the input slice
+        assert_eq!(index.edge_count(), 2);
+
+        // Outgoing neighbors of foo should contain bar exactly once
+        let foo_id = make_node_id("foo").to_stable_id();
+        let bar_id = make_node_id("bar").to_stable_id();
+        let neighbors = index.neighbors(&foo_id, None, Direction::Outgoing);
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0], bar_id);
     }
 
     #[test]
