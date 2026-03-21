@@ -544,14 +544,17 @@ fn sanitize_slug(slug: &str) -> String {
 /// two worktrees share the same directory name.
 /// e.g., `/Users/foo/src/my-project` -> `users-foo-src-my-project`
 fn path_to_slug(path: &Path) -> String {
-    path.to_string_lossy()
-        .trim_start_matches('/')
-        .to_lowercase()
-        .replace(|c: char| !c.is_alphanumeric() && c != '-', "-")
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
+    // Use only the directory name (basename) so slugs are portable across
+    // machines and user home directories.
+    // e.g. /Users/muness/src/Innovation-Connector -> "innovation-connector"
+    // NOTE: Two paths with the same basename get the same slug. For worktrees
+    // with identical branch names under different projects this could collide;
+    // users can set [workspace] name = "..." in .oh/config.toml to disambiguate.
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    sanitize_slug(&name)
 }
 
 /// Compute the Claude Code auto-memory directory for a given repo root.
@@ -736,18 +739,19 @@ excludes = ["*.iso", "*.dmg"]
 
     #[test]
     fn test_path_to_slug() {
-        assert_eq!(path_to_slug(Path::new("/Users/foo/src/my-project")), "users-foo-src-my-project");
-        assert_eq!(path_to_slug(Path::new("/home/user/zettelkasten")), "home-user-zettelkasten");
-        assert_eq!(path_to_slug(Path::new("/tmp/My Project Name")), "tmp-my-project-name");
+        // Uses basename only — portable (no /Users/muness/ prefix)
+        assert_eq!(path_to_slug(Path::new("/Users/foo/src/my-project")), "my-project");
+        assert_eq!(path_to_slug(Path::new("/home/user/zettelkasten")), "zettelkasten");
+        assert_eq!(path_to_slug(Path::new("/tmp/My Project Name")), "my-project-name");
     }
 
     #[test]
     fn test_path_to_slug_uniqueness_for_same_basename() {
-        // Two worktrees at different parent paths with the same directory name
-        // must get distinct slugs.
+        // Two paths with the same basename get the SAME slug (known limitation).
+        // Users can set [workspace] name = "..." in .oh/config.toml to disambiguate.
         let slug_a = path_to_slug(Path::new("/work/projectA/feat-x"));
         let slug_b = path_to_slug(Path::new("/work/projectB/feat-x"));
-        assert_ne!(slug_a, slug_b);
+        assert_eq!(slug_a, slug_b); // both "feat-x" — use config name to disambiguate
     }
 
     #[test]
@@ -1156,7 +1160,7 @@ excludes = ["*.iso", "*.dmg"]
             slug_override: None,
             lsp_only: false,
         };
-        assert_eq!(root.slug(), "tmp-some-project");
+        assert_eq!(root.slug(), "project"); // basename of /tmp/some/project
     }
 
     // ── Adversarial tests (dissent-seeded) ──────────────────────────
@@ -1271,7 +1275,7 @@ excludes = ["*.iso", "*.dmg"]
             lsp_only: false,
         };
         // ".." sanitizes to "" → falls back to path-derived slug
-        assert_eq!(root.slug(), "tmp-some-project");
+        assert_eq!(root.slug(), "some-project"); // basename of /tmp/some-project
     }
 
     #[test]

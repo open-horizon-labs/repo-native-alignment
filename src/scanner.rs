@@ -21,7 +21,16 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_EXCLUDES: &[&str] = &[
     "node_modules/",
+    ".next/",        // Next.js build output
+    ".nuxt/",        // Nuxt.js build output
+    ".svelte-kit/",  // SvelteKit build output
+    "out/",          // Next.js static export
     ".venv/",
+    "venv/",
+    ".env/",
+    "env/",
+    "virtualenv/",
+    ".tox/",
     "target*/",
     "build/",
     "__pycache__/",
@@ -32,6 +41,9 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     "vendor/",
     ".build/",
     ".cache/",
+    "coverage/",     // test coverage output
+    ".gradle/",
+    ".mvn/",
     "*.pyc",
     "*.o",
     "*.so",
