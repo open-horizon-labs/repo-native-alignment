@@ -549,6 +549,102 @@ mod tests {
         }
     }
 
+    /// Regression test: bumping EXTRACTION_VERSION must force full re-extraction even on
+    /// the foreground incremental path (run_pipeline_foreground with a cached LanceDB graph).
+    ///
+    /// The bug was that run_pipeline_foreground_incremental called check_and_migrate_schema
+    /// but NOT check_and_migrate_extraction_version, so a version bump went undetected and
+    /// the scan reported "incremental, no changes".
+    #[tokio::test]
+    async fn test_extraction_version_bump_forces_full_rebuild_on_incremental_path() {
+        use tempfile::TempDir;
+        use std::sync::Mutex;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn stable_function() {}\n",
+        )
+        .unwrap();
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            ..Default::default()
+        };
+
+        // First run: full rebuild, writes EXTRACTION_VERSION to the version file.
+        let result1 = handler
+            .run_pipeline_foreground(|_| {})
+            .await
+            .expect("first run should succeed");
+        assert!(result1.node_count > 0, "should have extracted nodes on first run");
+
+        // Verify the extraction_version file was written.
+        let version_file = root.join(".oh").join(".cache").join("lance").join("extraction_version");
+        assert!(version_file.exists(), "extraction_version file should exist after first run");
+
+        // Simulate a version bump: overwrite the stored version with a stale value.
+        // This mimics what happens when a new binary with a higher EXTRACTION_VERSION
+        // is run against a repo whose cache was built with an older version.
+        std::fs::write(&version_file, "0").unwrap();
+
+        // Second run: should detect the version mismatch and take the full rebuild path.
+        let handler2 = RnaHandler {
+            repo_root: root.to_path_buf(),
+            ..Default::default()
+        };
+
+        let progress2: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let p2 = progress2.clone();
+        let result2 = handler2
+            .run_pipeline_foreground(move |msg| {
+                p2.lock().unwrap().push(msg.to_string());
+            })
+            .await
+            .expect("second run should succeed after extraction version migration");
+
+        assert!(result2.node_count > 0, "should have nodes after version bump rebuild");
+
+        let msgs = progress2.lock().unwrap();
+
+        // The second run must enter the incremental path (LanceDB cache was written by first run).
+        assert!(
+            msgs.iter().any(|m| m.contains("Loaded cached graph")),
+            "second run should start from cached graph (incremental entry). Messages: {:?}",
+            *msgs
+        );
+
+        // Must NOT report "no changes" -- that was the bug.
+        assert!(
+            !msgs.iter().any(|m| m.contains("incremental, no changes")),
+            "should NOT report 'incremental, no changes' after extraction version bump. Messages: {:?}",
+            *msgs
+        );
+
+        // Must report the extraction version upgrade message.
+        assert!(
+            msgs.iter().any(|m| m.contains("Extraction version upgrade detected")),
+            "should report extraction version upgrade. Messages: {:?}",
+            *msgs
+        );
+
+        // Verify the version file now holds the current EXTRACTION_VERSION.
+        let stored: u32 = std::fs::read_to_string(&version_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            stored,
+            crate::graph::store::EXTRACTION_VERSION,
+            "extraction_version file should be updated to current EXTRACTION_VERSION"
+        );
+    }
+
     // ── effective_root_filter / node_passes_root_filter tests ──────────
 
     #[test]
