@@ -27,10 +27,10 @@ impl CppExtractor {
 
 impl Extractor for CppExtractor {
     fn extensions(&self) -> &[&str] {
-        // NOTE: .c and .h files are handled by the dedicated CExtractor (tree-sitter-c).
-        // C++ files only — C grammar is a strict subset of C++ grammar, so this split
-        // avoids duplicate node emission for pure C files.
-        &["cpp", "cc", "cxx", "hpp", "hxx"]
+        // .h is included here because header files are commonly shared between C and C++.
+        // tree-sitter-cpp is a superset of tree-sitter-c and handles pure C headers correctly.
+        // Only .c files go exclusively to the CExtractor (dedicated C grammar).
+        &["cpp", "cc", "cxx", "h", "hpp", "hxx"]
     }
 
     fn name(&self) -> &str {

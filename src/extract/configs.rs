@@ -635,8 +635,10 @@ pub static ZIG_CONFIG: LangConfig = LangConfig {
 pub static CPP_CONFIG: LangConfig = LangConfig {
     language_fn: || tree_sitter_cpp::LANGUAGE.into(),
     language_name: "cpp",
-    // NOTE: .c and .h are now handled by C_CONFIG / CExtractor (tree-sitter-c).
-    extensions: &["cpp", "cc", "cxx", "hpp", "hxx"],
+    // .h is kept here because headers are shared between C and C++.
+    // tree-sitter-cpp handles C headers correctly as a superset.
+    // .c files go to C_CONFIG / CExtractor (tree-sitter-c).
+    extensions: &["cpp", "cc", "cxx", "h", "hpp", "hxx"],
     node_kinds: &[
         ("function_definition",  NodeKind::Function),
         ("class_specifier",      NodeKind::Struct),
@@ -803,7 +805,8 @@ pub static BASH_CONFIG: LangConfig = LangConfig {
 pub static C_CONFIG: LangConfig = LangConfig {
     language_fn: || tree_sitter_c::LANGUAGE.into(),
     language_name: "c",
-    extensions: &["c", "h"],
+    // Only .c files — .h stays with CPP_CONFIG (tree-sitter-cpp handles C/C++ headers).
+    extensions: &["c"],
     node_kinds: &[
         ("function_definition",  NodeKind::Function),
         ("struct_specifier",     NodeKind::Struct),
@@ -856,7 +859,9 @@ pub static PHP_CONFIG: LangConfig = LangConfig {
         ("interface_declaration",NodeKind::Trait),
         ("namespace_definition", NodeKind::Module),
     ],
-    scope_parent_kinds: &["class_declaration", "trait_declaration", "interface_declaration"],
+    // namespace_definition is included so that classes/functions inside a namespace
+    // are scoped under it (e.g., "App\Http\Controller::index" not just "index").
+    scope_parent_kinds: &["namespace_definition", "class_declaration", "trait_declaration", "interface_declaration"],
     const_value_field: None,
     full_text_name_kinds: &[],
     string_literal_kinds: &[("encapsed_string", Some("string_content")), ("string", None)],

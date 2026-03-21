@@ -29,9 +29,10 @@ impl CExtractor {
 
 impl Extractor for CExtractor {
     fn extensions(&self) -> &[&str] {
-        // .c and .h files — dedicated C grammar (tree-sitter-c).
-        // .cpp/.cc/.cxx/.hpp/.hxx are handled by CppExtractor (tree-sitter-cpp).
-        &["c", "h"]
+        // Only .c files — pure C source files use tree-sitter-c grammar.
+        // .h files stay with CppExtractor (tree-sitter-cpp is a superset of C and
+        // handles headers shared between C and C++ correctly).
+        &["c"]
     }
 
     fn name(&self) -> &str {
@@ -161,7 +162,7 @@ typedef struct {
     float b;
 } Color;
 "#;
-        let result = extractor.extract(Path::new("src/types.h"), code).unwrap();
+        let result = extractor.extract(Path::new("src/types.c"), code).unwrap();
         let structs: Vec<_> = result
             .nodes
             .iter()
@@ -177,7 +178,7 @@ typedef struct {
 #define MAX_SIZE 1024
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 "#;
-        let result = extractor.extract(Path::new("src/defs.h"), code).unwrap();
+        let result = extractor.extract(Path::new("src/defs.c"), code).unwrap();
         let macros: Vec<_> = result
             .nodes
             .iter()
@@ -193,7 +194,8 @@ typedef struct {
     fn test_c_extractor_extensions() {
         let extractor = CExtractor::new();
         assert!(extractor.extensions().contains(&"c"));
-        assert!(extractor.extensions().contains(&"h"));
+        // .h files are handled by CppExtractor (tree-sitter-cpp is a superset of C)
+        assert!(!extractor.extensions().contains(&"h"));
         assert_eq!(extractor.name(), "c-tree-sitter");
     }
 
@@ -207,7 +209,7 @@ enum Color {
     BLUE
 };
 "#;
-        let result = extractor.extract(Path::new("src/color.h"), code).unwrap();
+        let result = extractor.extract(Path::new("src/color.c"), code).unwrap();
         let enums: Vec<_> = result
             .nodes
             .iter()
