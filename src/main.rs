@@ -193,7 +193,16 @@ async fn async_main() -> anyhow::Result<()> {
                 target_subsystem: args.target_subsystem.clone(),
             };
             let root_filter = resolve_root_filter(args.root.as_deref(), &repo_root);
-            let ctx = SearchContext { graph_state: &gs, embed_index: embed_ref, repo_root: &repo_root, lsp_status: None, embed_status: None, root_filter, non_code_slugs: std::collections::HashSet::new() };
+            // Include lsp_only subdirectory root slugs in non_code_slugs so they're not
+            // filtered out by the default root filter (which scopes to the primary root slug).
+            let non_code_slugs: std::collections::HashSet<String> = repo_native_alignment::roots::WorkspaceConfig::load()
+                .with_primary_root(repo_root.clone())
+                .with_declared_roots(&repo_root)
+                .lsp_only_roots()
+                .into_iter()
+                .map(|(slug, _)| slug)
+                .collect();
+            let ctx = SearchContext { graph_state: &gs, embed_index: embed_ref, repo_root: &repo_root, lsp_status: None, embed_status: None, root_filter, non_code_slugs };
             println!("{}", service::search(&params, &ctx).await); return Ok(());
         }
         Some(Commands::Graph(args)) => {
