@@ -716,20 +716,31 @@ fn language_from_path(path: &Path) -> String {
 /// Walk `root` recursively, calling `callback` for each regular file.
 /// Skips well-known noise directories: `node_modules`, `.git`, `dist`,
 /// `build`, `.next`, `coverage`, `target`, `.oh`, `.claude`.
+///
+/// Symlinks are intentionally skipped for both files and directories to avoid
+/// infinite recursion from directory link cycles and to prevent accidentally
+/// walking large external trees linked into the project.
 fn walk_for_nextjs(root: &Path, callback: &mut impl FnMut(&Path)) {
     let Ok(entries) = std::fs::read_dir(root) else { return; };
     for entry in entries.flatten() {
+        // Use file_type() rather than path.is_dir()/is_file() so that symlinks
+        // are not followed — path.is_dir() follows symlinks and can recurse into
+        // cycles or large external trees.
+        let Ok(ft) = entry.file_type() else { continue; };
+        if ft.is_symlink() {
+            continue;
+        }
         let path = entry.path();
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
-        if path.is_dir() {
+        if ft.is_dir() {
             if should_skip_dir(name) {
                 continue;
             }
             walk_for_nextjs(&path, callback);
-        } else if path.is_file() {
+        } else if ft.is_file() {
             callback(&path);
         }
     }
