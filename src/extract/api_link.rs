@@ -85,10 +85,17 @@ pub fn normalize_path(path: &str) -> String {
 pub fn api_link_pass(result: &mut ExtractionResult) {
     // Collect URL-shaped Const nodes and ApiEndpoint nodes separately so we
     // don't borrow `result.nodes` mutably while iterating.
+    // Only match synthetic Const nodes (string literals from harvest_string_literals).
+    // Non-synthetic Const nodes are actual declared constants whose names may
+    // coincidentally start with '/' but are not URL path strings.
     let url_consts: Vec<_> = result
         .nodes
         .iter()
-        .filter(|n| n.id.kind == NodeKind::Const && looks_like_url_path(&n.id.name))
+        .filter(|n| {
+            n.id.kind == NodeKind::Const
+                && n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false)
+                && looks_like_url_path(&n.id.name)
+        })
         .map(|n| (n.id.clone(), normalize_path(&n.id.name)))
         .collect();
 

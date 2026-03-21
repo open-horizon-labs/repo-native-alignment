@@ -1200,6 +1200,7 @@ fn infer_method_from_name(name: &str, default: &str) -> String {
 ///
 /// Called from [`GenericExtractor::run`] after normal manual traversal, so it
 /// is purely additive — existing extraction is unaffected.
+
 /// How many lines after the last decorator row to search for the handler
 /// function definition. One extra line accommodates languages (e.g., Go)
 /// where the function signature starts directly below the decorator.
