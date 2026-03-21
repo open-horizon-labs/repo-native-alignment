@@ -29,7 +29,7 @@
 //!
 //! Examples:
 //! - `test_process_payment` → `TestedBy` → `process_payment`
-//! - `TestHandleRequest` → `TestedBy` → `handle_request` (case-insensitive)
+//! - `TestHandleRequest` → `TestedBy` → `HandleRequest` (case-insensitive lowercasing only)
 //! - `it_should_parse_config` → `TestedBy` → `parse_config`
 //!
 //! # Placement
@@ -71,20 +71,26 @@ pub fn tested_by_pass(all_nodes: &[Node]) -> Vec<Edge> {
         return Vec::new();
     }
 
+    // Pre-compute lowercase names for all production functions once.
+    // This avoids the O(T × P) repeated `to_lowercase()` allocations that
+    // would occur inside the nested loop below.  Filtering short names here
+    // also keeps the inner list tight.
+    let prod_indexed: Vec<(String, &Node)> = prod_fns
+        .iter()
+        .filter(|n| n.id.name.len() >= 4) // skip very short names ("new", "get", …)
+        .map(|n| (n.id.name.to_lowercase(), *n))
+        .collect();
+
+    if prod_indexed.is_empty() {
+        return Vec::new();
+    }
+
     let mut edges: Vec<Edge> = Vec::new();
 
     for test_fn in &test_fns {
         let test_name_lower = test_fn.id.name.to_lowercase();
 
-        for prod_fn in &prod_fns {
-            // Guard: skip very short production names — they match too broadly.
-            // "new", "get", "run", "put" are all < 4 chars.
-            if prod_fn.id.name.len() < 4 {
-                continue;
-            }
-
-            let prod_name_lower = prod_fn.id.name.to_lowercase();
-
+        for (prod_name_lower, prod_fn) in &prod_indexed {
             if test_name_lower.contains(prod_name_lower.as_str()) {
                 // Defensive: never emit a self-edge.  The split above
                 // (is_test_function / !is_test_function) makes this
