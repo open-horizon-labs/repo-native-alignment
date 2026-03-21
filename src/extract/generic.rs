@@ -431,7 +431,8 @@ fn collect_nodes(
             // Python __all__ = [...] detection (#409).
             // When a module-level assignment is named `__all__`, it declares
             // the public API surface. Mark it with `exported = "true"`.
-            if node_kind == NodeKind::Const && name == "__all__" && config.language_name == "python" {
+            // `__all__` is a Python convention; no other supported language uses it.
+            if node_kind == NodeKind::Const && name == "__all__" {
                 metadata.insert("exported".to_string(), "true".to_string());
             }
 
