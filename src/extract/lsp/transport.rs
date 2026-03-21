@@ -83,6 +83,9 @@ pub(super) fn uri_to_relative_path(uri: &Uri, root: &Path) -> PathBuf {
             let rel = abs_path.strip_prefix(root).unwrap_or(&abs_path);
             return rel.to_path_buf();
         }
+        tracing::debug!(uri = uri_str, "uri_to_relative_path: url::Url parsed but to_file_path() failed; falling back to raw strip");
+    } else {
+        tracing::debug!(uri = uri_str, "uri_to_relative_path: url::Url::parse failed; falling back to raw strip");
     }
 
     // Fallback for non-standard URIs: strip the scheme prefix without decoding.
