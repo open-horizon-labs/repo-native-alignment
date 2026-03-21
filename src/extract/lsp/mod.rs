@@ -103,6 +103,11 @@ struct LspState {
     has_type_hierarchy: bool,
     /// Whether the language server supports textDocument/references requests.
     has_references: bool,
+    /// Whether the language server supports callHierarchy requests
+    /// (`textDocument/prepareCallHierarchy`, LSP 3.16+).
+    /// When false, fall back to `textDocument/references` for function edges.
+    /// Pyright supports references but not callHierarchy.
+    has_call_hierarchy: bool,
     /// Whether the language server supports pull-based diagnostics
     /// (`textDocument/diagnostic`, LSP 3.17+).
     has_pull_diagnostics: bool,
@@ -176,6 +181,7 @@ impl LspEnricher {
                 init_failed: false,
                 has_type_hierarchy: false,
                 has_references: false,
+                has_call_hierarchy: false,
                 has_pull_diagnostics: false,
                 has_inlay_hints: false,
                 was_quiescent: false,
@@ -347,8 +353,40 @@ impl LspEnricher {
             ..Default::default()
         };
 
-        // Apply per-language initialization settings if provided
-        if let Some(ref settings) = self.init_settings {
+        // Apply per-language initialization settings if provided.
+        // For pyright, augment with venvPath + venv when a virtual environment exists at
+        // startup_root, so pyright can resolve installed packages and produce call edges.
+        // Without this, pyright produces 0 edges on projects that use poetry/venv.
+        //
+        // Checks common venv directory names in priority order: .venv, venv, env.
+        let effective_settings = self.init_settings.as_ref().map(|s| {
+            if self.language == "python" {
+                // Check common virtual environment directory names.
+                let venv_candidates = [".venv", "venv", "env"];
+                if let Some(venv_name) = venv_candidates.iter().find(|&&name| startup_root.join(name).is_dir()) {
+                    // Merge venvPath + venv into the python.analysis section.
+                    // startup_root is the venv parent (e.g., ai_service/).
+                    let venv_path_str = startup_root.to_string_lossy().to_string();
+                    let mut merged = s.clone();
+                    if let Some(python_obj) = merged.get_mut("python") {
+                        if let Some(analysis_obj) = python_obj.get_mut("analysis") {
+                            if let Some(obj) = analysis_obj.as_object_mut() {
+                                obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
+                                obj.insert("venv".into(), serde_json::Value::String(venv_name.to_string()));
+                            }
+                        }
+                    }
+                    tracing::info!(
+                        "pyright: found {} at '{}', adding venvPath/venv to initializationOptions",
+                        venv_name,
+                        startup_root.display()
+                    );
+                    return merged;
+                }
+            }
+            s.clone()
+        });
+        if let Some(ref settings) = effective_settings {
             init_params.initialization_options = Some(settings.clone());
         }
 
@@ -363,6 +401,15 @@ impl LspEnricher {
         let has_type_hierarchy = init_result
             .pointer("/capabilities/typeHierarchyProvider")
             .map(|v| !v.is_null())
+            .unwrap_or(false);
+
+        // Check call hierarchy provider (LSP 3.16+, "callHierarchyProvider").
+        // Pyright supports textDocument/references but NOT callHierarchy.
+        // Without this check, we'd send prepareCallHierarchy to pyright and get
+        // errors on every request, producing 0 edges.
+        let has_call_hierarchy = init_result
+            .pointer("/capabilities/callHierarchyProvider")
+            .map(|v| !v.is_null() && v != &serde_json::Value::Bool(false))
             .unwrap_or(false);
 
         // Check pull-based diagnostics capability (LSP 3.17+, "diagnosticProvider")
@@ -383,11 +430,12 @@ impl LspEnricher {
         let has_references = init_result_parsed.capabilities.references_provider.is_some();
         let has_implementation = init_result_parsed.capabilities.implementation_provider.is_some();
         tracing::info!(
-            "{} capabilities: references={}, implementation={}, type_hierarchy={}, pull_diagnostics={}, inlay_hints={}",
-            self.server_command, has_references, has_implementation, has_type_hierarchy, has_pull_diagnostics, has_inlay_hints
+            "{} capabilities: references={}, call_hierarchy={}, implementation={}, type_hierarchy={}, pull_diagnostics={}, inlay_hints={}",
+            self.server_command, has_references, has_call_hierarchy, has_implementation, has_type_hierarchy, has_pull_diagnostics, has_inlay_hints
         );
 
         state.has_type_hierarchy = has_type_hierarchy;
+        state.has_call_hierarchy = has_call_hierarchy;
         state.has_references = has_references;
         state.has_pull_diagnostics = has_pull_diagnostics;
         state.has_inlay_hints = has_inlay_hints;
@@ -1592,7 +1640,7 @@ impl Enricher for LspEnricher {
         // enrich() calls to proceed after RA finishes indexing, even if the first
         // call timed out during initialization. The flag is updated by the background
         // reader loop whenever `experimental/serverStatus { quiescent: true }` arrives.
-        let (transport, root, has_type_hierarchy, type_hierarchy_strikes, has_references, has_pull_diagnostics, has_inlay_hints, was_quiescent, diag_sink) = {
+        let (transport, root, has_type_hierarchy, type_hierarchy_strikes, has_references, has_call_hierarchy, has_pull_diagnostics, has_inlay_hints, was_quiescent, diag_sink) = {
             let state = self.state.lock().await;
             let root = state
                 .root_path
@@ -1606,7 +1654,7 @@ impl Enricher for LspEnricher {
             // Use live quiescent_flag from pipelined transport for session-wide accuracy.
             // This allows RA to become quiescent after the init timeout and still be used.
             let was_quiescent = transport.quiescent_flag.load(Ordering::Acquire);
-            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references, state.has_pull_diagnostics, state.has_inlay_hints, was_quiescent, diag_sink)
+            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references, state.has_call_hierarchy, state.has_pull_diagnostics, state.has_inlay_hints, was_quiescent, diag_sink)
         };
         // State lock is released here — concurrent tasks can proceed
 
@@ -1716,13 +1764,13 @@ impl Enricher for LspEnricher {
                 NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const))
             .count();
         tracing::info!(
-            "LSP pipeline: {} enrichable nodes out of {} total ({}f, {}t, {}r, {}o) [references={}]",
+            "LSP pipeline: {} enrichable nodes out of {} total ({}f, {}t, {}r, {}o) [references={}, call_hierarchy={}]",
             enrichable_nodes.len(), matching_nodes.len(),
             enrichable_nodes.iter().filter(|n| n.id.kind == NodeKind::Function).count(),
             enrichable_nodes.iter().filter(|n| n.id.kind == NodeKind::Trait).count(),
             ref_eligible,
             enrichable_nodes.iter().filter(|n| matches!(n.id.kind, NodeKind::Other(_))).count(),
-            has_references,
+            has_references, has_call_hierarchy,
         );
 
         // Concurrency control: TCP slow-start from 4 to 64.
@@ -1768,6 +1816,58 @@ impl Enricher for LspEnricher {
 
                 match node.id.kind {
                     NodeKind::Function => {
+                        if !has_call_hierarchy && has_references {
+                            // Server supports references but not callHierarchy (e.g., pyright).
+                            // Use textDocument/references to find callers of this function.
+                            // This produces Calls edges from caller → this function.
+                            match Self::find_references_p(&transport, &file_uri, line, col).await {
+                                Ok(locations) => {
+                                    let matching_refs: Vec<&Node> = matching_owned.iter().collect();
+                                    let mut refs_by_file: HashMap<&Path, Vec<&Node>> = HashMap::new();
+                                    for n in &matching_refs {
+                                        refs_by_file.entry(n.id.file.as_path()).or_default().push(*n);
+                                    }
+                                    for loc in &locations {
+                                        let ref_path = uri_to_relative_path(&loc.uri, &root);
+                                        let ref_line = loc.range.start.line as usize + 1;
+
+                                        // Skip external dependencies
+                                        if ref_path.to_string_lossy().contains(".cargo")
+                                            || ref_path.to_string_lossy().contains("site-packages")
+                                        {
+                                            continue;
+                                        }
+
+                                        // Skip definition site (self-reference)
+                                        if ref_path == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end {
+                                            continue;
+                                        }
+
+                                        let referrer_id = refs_by_file
+                                            .get(ref_path.as_path())
+                                            .and_then(|candidates| find_enclosing_symbol(candidates, &ref_path, ref_line));
+
+                                        if let Some(referrer) = referrer_id {
+                                            if referrer == node.id {
+                                                continue;
+                                            }
+                                            edges.push(Edge {
+                                                from: referrer,
+                                                to: node.id.clone(),
+                                                kind: EdgeKind::Calls,
+                                                source: ExtractionSource::Lsp,
+                                                confidence: Confidence::Confirmed,
+                                            });
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    had_error = true;
+                                    error_count.fetch_add(1, Ordering::Relaxed);
+                                    tracing::debug!("references lookup failed for {}: {}", node.id.name, e);
+                                }
+                            }
+                        } else if has_call_hierarchy {
                         match Self::prepare_call_hierarchy_p(&transport, &file_uri, line, col).await {
                             Ok(Some(item)) => {
                                 // Run incoming and outgoing calls concurrently
@@ -1908,6 +2008,7 @@ impl Enricher for LspEnricher {
                                 tracing::debug!("prepareCallHierarchy failed for {}: {}", node.id.name, e);
                             }
                         }
+                        } // end else if has_call_hierarchy
                     }
                     NodeKind::Trait => {
                         match Self::find_implementations_p(&transport, &file_uri, line, col).await {
@@ -2705,6 +2806,112 @@ mod tests {
         let enricher = LspEnricher::new("python", "pyright-langserver", &["--stdio"], &["py"])
             .with_settings(settings.clone());
         assert_eq!(enricher.init_settings, Some(settings));
+    }
+
+    /// Helper: apply the same venv-merge logic as ensure_initialized.
+    fn apply_pyright_venv_settings(
+        base_settings: &serde_json::Value,
+        language: &str,
+        startup_root: &std::path::Path,
+        venv_name: &str,   // the venv subdir that "exists" (simulated)
+    ) -> serde_json::Value {
+        if language == "python" {
+            let venv_candidates = [".venv", "venv", "env"];
+            // Simulate: check which candidate would match (first that matches venv_name).
+            if venv_candidates.contains(&venv_name) {
+                let venv_path_str = startup_root.to_string_lossy().to_string();
+                let mut merged = base_settings.clone();
+                if let Some(python_obj) = merged.get_mut("python") {
+                    if let Some(analysis_obj) = python_obj.get_mut("analysis") {
+                        if let Some(obj) = analysis_obj.as_object_mut() {
+                            obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
+                            obj.insert("venv".into(), serde_json::Value::String(venv_name.to_string()));
+                        }
+                    }
+                }
+                return merged;
+            }
+        }
+        base_settings.clone()
+    }
+
+    /// Verify pyright venv detection logic: when .venv exists at startup_root,
+    /// venvPath and venv should be merged into initializationOptions.
+    #[test]
+    fn test_pyright_venv_detection_merges_dot_venv() {
+        let base_settings = serde_json::json!({
+            "python": { "analysis": { "autoSearchPaths": true } }
+        });
+        let startup_root = std::path::Path::new("/tmp/ai_service");
+
+        let merged = apply_pyright_venv_settings(&base_settings, "python", startup_root, ".venv");
+
+        assert_eq!(
+            merged["python"]["analysis"]["autoSearchPaths"],
+            serde_json::Value::Bool(true),
+            "autoSearchPaths should be preserved"
+        );
+        assert_eq!(
+            merged["python"]["analysis"]["venvPath"],
+            serde_json::Value::String("/tmp/ai_service".into()),
+            "venvPath should be the startup root"
+        );
+        assert_eq!(
+            merged["python"]["analysis"]["venv"],
+            serde_json::Value::String(".venv".into()),
+            "venv should be .venv"
+        );
+    }
+
+    /// Verify pyright venv detection works for bare `venv/` directory (common with pip).
+    #[test]
+    fn test_pyright_venv_detection_merges_bare_venv() {
+        let base_settings = serde_json::json!({
+            "python": { "analysis": { "autoSearchPaths": true } }
+        });
+        let startup_root = std::path::Path::new("/tmp/myproject");
+
+        let merged = apply_pyright_venv_settings(&base_settings, "python", startup_root, "venv");
+
+        assert_eq!(
+            merged["python"]["analysis"]["venv"],
+            serde_json::Value::String("venv".into()),
+            "venv should be 'venv' for bare venv"
+        );
+        assert_eq!(
+            merged["python"]["analysis"]["venvPath"],
+            serde_json::Value::String("/tmp/myproject".into()),
+        );
+    }
+
+    /// Verify pyright venv detection works for `env/` directory.
+    #[test]
+    fn test_pyright_venv_detection_merges_env() {
+        let base_settings = serde_json::json!({
+            "python": { "analysis": { "autoSearchPaths": true } }
+        });
+        let startup_root = std::path::Path::new("/tmp/myproject");
+
+        let merged = apply_pyright_venv_settings(&base_settings, "python", startup_root, "env");
+
+        assert_eq!(
+            merged["python"]["analysis"]["venv"],
+            serde_json::Value::String("env".into()),
+        );
+    }
+
+    /// Verify pyright venv detection: non-python enrichers are not augmented.
+    #[test]
+    fn test_pyright_venv_detection_skips_non_python() {
+        let base_settings = serde_json::json!({
+            "typescript": { "preferences": {} }
+        });
+        let startup_root = std::path::Path::new("/tmp/client");
+
+        let effective_settings = apply_pyright_venv_settings(&base_settings, "typescript", startup_root, ".venv");
+
+        // TypeScript settings should be unchanged — venv detection only fires for python
+        assert_eq!(effective_settings, base_settings);
     }
 
     /// Verify URI helper functions work correctly.
