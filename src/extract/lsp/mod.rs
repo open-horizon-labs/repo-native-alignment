@@ -348,13 +348,16 @@ impl LspEnricher {
         };
 
         // Apply per-language initialization settings if provided.
-        // For pyright, augment with venvPath + venv when a .venv exists at startup_root,
-        // so pyright can resolve installed packages and produce call edges.
+        // For pyright, augment with venvPath + venv when a virtual environment exists at
+        // startup_root, so pyright can resolve installed packages and produce call edges.
         // Without this, pyright produces 0 edges on projects that use poetry/venv.
+        //
+        // Checks common venv directory names in priority order: .venv, venv, env.
         let effective_settings = self.init_settings.as_ref().map(|s| {
             if self.language == "python" {
-                let venv_dir = startup_root.join(".venv");
-                if venv_dir.exists() {
+                // Check common virtual environment directory names.
+                let venv_candidates = [".venv", "venv", "env"];
+                if let Some(venv_name) = venv_candidates.iter().find(|&&name| startup_root.join(name).exists()) {
                     // Merge venvPath + venv into the python.analysis section.
                     // startup_root is the venv parent (e.g., ai_service/).
                     let venv_path_str = startup_root.to_string_lossy().to_string();
@@ -363,12 +366,13 @@ impl LspEnricher {
                         if let Some(analysis_obj) = python_obj.get_mut("analysis") {
                             if let Some(obj) = analysis_obj.as_object_mut() {
                                 obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
-                                obj.insert("venv".into(), serde_json::Value::String(".venv".into()));
+                                obj.insert("venv".into(), serde_json::Value::String(venv_name.to_string()));
                             }
                         }
                     }
                     tracing::info!(
-                        "pyright: found .venv at '{}', adding venvPath/venv to initializationOptions",
+                        "pyright: found {} at '{}', adding venvPath/venv to initializationOptions",
+                        venv_name,
                         startup_root.display()
                     );
                     return merged;
@@ -2735,38 +2739,44 @@ mod tests {
         assert_eq!(enricher.init_settings, Some(settings));
     }
 
+    /// Helper: apply the same venv-merge logic as ensure_initialized.
+    fn apply_pyright_venv_settings(
+        base_settings: &serde_json::Value,
+        language: &str,
+        startup_root: &std::path::Path,
+        venv_name: &str,   // the venv subdir that "exists" (simulated)
+    ) -> serde_json::Value {
+        if language == "python" {
+            let venv_candidates = [".venv", "venv", "env"];
+            // Simulate: check which candidate would match (first that matches venv_name).
+            if venv_candidates.contains(&venv_name) {
+                let venv_path_str = startup_root.to_string_lossy().to_string();
+                let mut merged = base_settings.clone();
+                if let Some(python_obj) = merged.get_mut("python") {
+                    if let Some(analysis_obj) = python_obj.get_mut("analysis") {
+                        if let Some(obj) = analysis_obj.as_object_mut() {
+                            obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
+                            obj.insert("venv".into(), serde_json::Value::String(venv_name.to_string()));
+                        }
+                    }
+                }
+                return merged;
+            }
+        }
+        base_settings.clone()
+    }
+
     /// Verify pyright venv detection logic: when .venv exists at startup_root,
     /// venvPath and venv should be merged into initializationOptions.
     #[test]
-    fn test_pyright_venv_detection_merges_settings() {
-        // Simulate the logic from ensure_initialized that merges venv settings.
-        // This tests the data transformation without needing a running LSP server.
+    fn test_pyright_venv_detection_merges_dot_venv() {
         let base_settings = serde_json::json!({
             "python": { "analysis": { "autoSearchPaths": true } }
         });
         let startup_root = std::path::Path::new("/tmp/ai_service");
-        let language = "python";
 
-        // Apply the same merge logic as ensure_initialized
-        let merged = {
-            let venv_dir = startup_root.join(".venv");
-            // Simulate: .venv exists (we don't actually create it, just test the merge logic)
-            // by directly applying the merge
-            let venv_path_str = startup_root.to_string_lossy().to_string();
-            let mut merged = base_settings.clone();
-            if let Some(python_obj) = merged.get_mut("python") {
-                if let Some(analysis_obj) = python_obj.get_mut("analysis") {
-                    if let Some(obj) = analysis_obj.as_object_mut() {
-                        obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str.clone()));
-                        obj.insert("venv".into(), serde_json::Value::String(".venv".into()));
-                    }
-                }
-            }
-            let _ = venv_dir; // consumed
-            merged
-        };
+        let merged = apply_pyright_venv_settings(&base_settings, "python", startup_root, ".venv");
 
-        assert_eq!(language, "python");
         assert_eq!(
             merged["python"]["analysis"]["autoSearchPaths"],
             serde_json::Value::Bool(true),
@@ -2784,25 +2794,54 @@ mod tests {
         );
     }
 
+    /// Verify pyright venv detection works for bare `venv/` directory (common with pip).
+    #[test]
+    fn test_pyright_venv_detection_merges_bare_venv() {
+        let base_settings = serde_json::json!({
+            "python": { "analysis": { "autoSearchPaths": true } }
+        });
+        let startup_root = std::path::Path::new("/tmp/myproject");
+
+        let merged = apply_pyright_venv_settings(&base_settings, "python", startup_root, "venv");
+
+        assert_eq!(
+            merged["python"]["analysis"]["venv"],
+            serde_json::Value::String("venv".into()),
+            "venv should be 'venv' for bare venv"
+        );
+        assert_eq!(
+            merged["python"]["analysis"]["venvPath"],
+            serde_json::Value::String("/tmp/myproject".into()),
+        );
+    }
+
+    /// Verify pyright venv detection works for `env/` directory.
+    #[test]
+    fn test_pyright_venv_detection_merges_env() {
+        let base_settings = serde_json::json!({
+            "python": { "analysis": { "autoSearchPaths": true } }
+        });
+        let startup_root = std::path::Path::new("/tmp/myproject");
+
+        let merged = apply_pyright_venv_settings(&base_settings, "python", startup_root, "env");
+
+        assert_eq!(
+            merged["python"]["analysis"]["venv"],
+            serde_json::Value::String("env".into()),
+        );
+    }
+
     /// Verify pyright venv detection: non-python enrichers are not augmented.
     #[test]
     fn test_pyright_venv_detection_skips_non_python() {
         let base_settings = serde_json::json!({
             "typescript": { "preferences": {} }
         });
-        let language = "typescript";
+        let startup_root = std::path::Path::new("/tmp/client");
 
-        // The effective_settings logic should not augment non-python enrichers
-        let effective_settings = {
-            if language == "python" {
-                // Would augment — but we're not python
-                unreachable!("should not be called for typescript");
-            } else {
-                base_settings.clone()
-            }
-        };
+        let effective_settings = apply_pyright_venv_settings(&base_settings, "typescript", startup_root, ".venv");
 
-        // TypeScript settings should be unchanged
+        // TypeScript settings should be unchanged — venv detection only fires for python
         assert_eq!(effective_settings, base_settings);
     }
 
