@@ -103,6 +103,11 @@ struct LspState {
     has_type_hierarchy: bool,
     /// Whether the language server supports textDocument/references requests.
     has_references: bool,
+    /// Whether the language server supports callHierarchy requests
+    /// (`textDocument/prepareCallHierarchy`, LSP 3.16+).
+    /// When false, fall back to `textDocument/references` for function edges.
+    /// Pyright supports references but not callHierarchy.
+    has_call_hierarchy: bool,
     /// Whether the language server supports pull-based diagnostics
     /// (`textDocument/diagnostic`, LSP 3.17+).
     has_pull_diagnostics: bool,
@@ -176,6 +181,7 @@ impl LspEnricher {
                 init_failed: false,
                 has_type_hierarchy: false,
                 has_references: false,
+                has_call_hierarchy: false,
                 has_pull_diagnostics: false,
                 has_inlay_hints: false,
                 was_quiescent: false,
@@ -397,6 +403,15 @@ impl LspEnricher {
             .map(|v| !v.is_null())
             .unwrap_or(false);
 
+        // Check call hierarchy provider (LSP 3.16+, "callHierarchyProvider").
+        // Pyright supports textDocument/references but NOT callHierarchy.
+        // Without this check, we'd send prepareCallHierarchy to pyright and get
+        // errors on every request, producing 0 edges.
+        let has_call_hierarchy = init_result
+            .pointer("/capabilities/callHierarchyProvider")
+            .map(|v| !v.is_null() && v != &serde_json::Value::Bool(false))
+            .unwrap_or(false);
+
         // Check pull-based diagnostics capability (LSP 3.17+, "diagnosticProvider")
         let has_pull_diagnostics = init_result
             .pointer("/capabilities/diagnosticProvider")
@@ -415,11 +430,12 @@ impl LspEnricher {
         let has_references = init_result_parsed.capabilities.references_provider.is_some();
         let has_implementation = init_result_parsed.capabilities.implementation_provider.is_some();
         tracing::info!(
-            "{} capabilities: references={}, implementation={}, type_hierarchy={}, pull_diagnostics={}, inlay_hints={}",
-            self.server_command, has_references, has_implementation, has_type_hierarchy, has_pull_diagnostics, has_inlay_hints
+            "{} capabilities: references={}, call_hierarchy={}, implementation={}, type_hierarchy={}, pull_diagnostics={}, inlay_hints={}",
+            self.server_command, has_references, has_call_hierarchy, has_implementation, has_type_hierarchy, has_pull_diagnostics, has_inlay_hints
         );
 
         state.has_type_hierarchy = has_type_hierarchy;
+        state.has_call_hierarchy = has_call_hierarchy;
         state.has_references = has_references;
         state.has_pull_diagnostics = has_pull_diagnostics;
         state.has_inlay_hints = has_inlay_hints;
@@ -1624,7 +1640,7 @@ impl Enricher for LspEnricher {
         // enrich() calls to proceed after RA finishes indexing, even if the first
         // call timed out during initialization. The flag is updated by the background
         // reader loop whenever `experimental/serverStatus { quiescent: true }` arrives.
-        let (transport, root, has_type_hierarchy, type_hierarchy_strikes, has_references, has_pull_diagnostics, has_inlay_hints, was_quiescent, diag_sink) = {
+        let (transport, root, has_type_hierarchy, type_hierarchy_strikes, has_references, has_call_hierarchy, has_pull_diagnostics, has_inlay_hints, was_quiescent, diag_sink) = {
             let state = self.state.lock().await;
             let root = state
                 .root_path
@@ -1638,7 +1654,7 @@ impl Enricher for LspEnricher {
             // Use live quiescent_flag from pipelined transport for session-wide accuracy.
             // This allows RA to become quiescent after the init timeout and still be used.
             let was_quiescent = transport.quiescent_flag.load(Ordering::Acquire);
-            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references, state.has_pull_diagnostics, state.has_inlay_hints, was_quiescent, diag_sink)
+            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references, state.has_call_hierarchy, state.has_pull_diagnostics, state.has_inlay_hints, was_quiescent, diag_sink)
         };
         // State lock is released here — concurrent tasks can proceed
 
@@ -1748,13 +1764,13 @@ impl Enricher for LspEnricher {
                 NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const))
             .count();
         tracing::info!(
-            "LSP pipeline: {} enrichable nodes out of {} total ({}f, {}t, {}r, {}o) [references={}]",
+            "LSP pipeline: {} enrichable nodes out of {} total ({}f, {}t, {}r, {}o) [references={}, call_hierarchy={}]",
             enrichable_nodes.len(), matching_nodes.len(),
             enrichable_nodes.iter().filter(|n| n.id.kind == NodeKind::Function).count(),
             enrichable_nodes.iter().filter(|n| n.id.kind == NodeKind::Trait).count(),
             ref_eligible,
             enrichable_nodes.iter().filter(|n| matches!(n.id.kind, NodeKind::Other(_))).count(),
-            has_references,
+            has_references, has_call_hierarchy,
         );
 
         // Concurrency control: TCP slow-start from 4 to 64.
@@ -1800,6 +1816,58 @@ impl Enricher for LspEnricher {
 
                 match node.id.kind {
                     NodeKind::Function => {
+                        if !has_call_hierarchy && has_references {
+                            // Server supports references but not callHierarchy (e.g., pyright).
+                            // Use textDocument/references to find callers of this function.
+                            // This produces Calls edges from caller → this function.
+                            match Self::find_references_p(&transport, &file_uri, line, col).await {
+                                Ok(locations) => {
+                                    let matching_refs: Vec<&Node> = matching_owned.iter().collect();
+                                    let mut refs_by_file: HashMap<&Path, Vec<&Node>> = HashMap::new();
+                                    for n in &matching_refs {
+                                        refs_by_file.entry(n.id.file.as_path()).or_default().push(*n);
+                                    }
+                                    for loc in &locations {
+                                        let ref_path = uri_to_relative_path(&loc.uri, &root);
+                                        let ref_line = loc.range.start.line as usize + 1;
+
+                                        // Skip external dependencies
+                                        if ref_path.to_string_lossy().contains(".cargo")
+                                            || ref_path.to_string_lossy().contains("site-packages")
+                                        {
+                                            continue;
+                                        }
+
+                                        // Skip definition site (self-reference)
+                                        if ref_path == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end {
+                                            continue;
+                                        }
+
+                                        let referrer_id = refs_by_file
+                                            .get(ref_path.as_path())
+                                            .and_then(|candidates| find_enclosing_symbol(candidates, &ref_path, ref_line));
+
+                                        if let Some(referrer) = referrer_id {
+                                            if referrer == node.id {
+                                                continue;
+                                            }
+                                            edges.push(Edge {
+                                                from: referrer,
+                                                to: node.id.clone(),
+                                                kind: EdgeKind::Calls,
+                                                source: ExtractionSource::Lsp,
+                                                confidence: Confidence::Confirmed,
+                                            });
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    had_error = true;
+                                    error_count.fetch_add(1, Ordering::Relaxed);
+                                    tracing::debug!("references lookup failed for {}: {}", node.id.name, e);
+                                }
+                            }
+                        } else if has_call_hierarchy {
                         match Self::prepare_call_hierarchy_p(&transport, &file_uri, line, col).await {
                             Ok(Some(item)) => {
                                 // Run incoming and outgoing calls concurrently
@@ -1940,6 +2008,7 @@ impl Enricher for LspEnricher {
                                 tracing::debug!("prepareCallHierarchy failed for {}: {}", node.id.name, e);
                             }
                         }
+                        } // end else if has_call_hierarchy
                     }
                     NodeKind::Trait => {
                         match Self::find_implementations_p(&transport, &file_uri, line, col).await {
