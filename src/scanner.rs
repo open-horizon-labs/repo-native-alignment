@@ -2157,4 +2157,68 @@ exclude = ["dist/"]
         let roots = load_declared_roots(tmp.path());
         assert!(roots.is_empty(), "Missing config file should yield empty vec");
     }
+
+    // ── LspConfig integration tests ─────────────────────────────────
+
+    #[test]
+    fn test_lsp_config_load_hint_from_toml_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".oh")).unwrap();
+        fs::write(
+            root.join(".oh/config.toml"),
+            "[lsp]\ndiagnostic_min_severity = \"hint\"\n",
+        ).unwrap();
+
+        let config = LspConfig::load(root);
+        assert_eq!(config.diagnostic_min_severity, DiagnosticMinSeverity::Hint);
+        assert_eq!(config.diagnostic_min_severity.max_severity_int(), 4);
+    }
+
+    #[test]
+    fn test_lsp_config_load_missing_file_returns_warning_default() {
+        let tmp = TempDir::new().unwrap();
+        let config = LspConfig::load(tmp.path());
+        assert_eq!(config.diagnostic_min_severity, DiagnosticMinSeverity::Warning);
+    }
+
+    #[test]
+    fn test_lsp_config_load_no_lsp_section_returns_warning_default() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".oh")).unwrap();
+        fs::write(
+            root.join(".oh/config.toml"),
+            "[scanner]\nexclude = [\"benchmark/\"]\n",
+        ).unwrap();
+
+        let config = LspConfig::load(root);
+        assert_eq!(config.diagnostic_min_severity, DiagnosticMinSeverity::Warning,
+            "missing [lsp] section should default to Warning");
+    }
+
+    #[test]
+    fn test_lsp_config_load_all_severity_levels() {
+        for (toml_value, expected_max) in &[
+            ("error", 1u64),
+            ("warning", 2),
+            ("information", 3),
+            ("hint", 4),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            fs::create_dir_all(root.join(".oh")).unwrap();
+            fs::write(
+                root.join(".oh/config.toml"),
+                format!("[lsp]\ndiagnostic_min_severity = \"{toml_value}\"\n"),
+            ).unwrap();
+
+            let config = LspConfig::load(root);
+            assert_eq!(
+                config.diagnostic_min_severity.max_severity_int(),
+                *expected_max,
+                "severity '{toml_value}' should map to max_severity_int={expected_max}"
+            );
+        }
+    }
 }
