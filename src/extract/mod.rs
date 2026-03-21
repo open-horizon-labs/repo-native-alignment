@@ -8,6 +8,7 @@
 //! for fine-grained checks. Multiple extractors can handle the same file.
 
 pub mod api_link;
+pub mod manifest;
 pub mod bash;
 pub mod configs;
 pub mod cpp;
