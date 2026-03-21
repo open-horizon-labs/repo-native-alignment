@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search`.
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// Extraction version for source-level extraction logic.
 ///
@@ -26,7 +26,7 @@ pub const SCHEMA_VERSION: u32 = 13;
 /// Unlike SCHEMA_VERSION (which invalidates LanceDB tables), EXTRACTION_VERSION
 /// invalidates the scanner's mtime/hash state — forcing full re-extraction without
 /// dropping LanceDB tables. Bumped to 1 for doc_comment metadata extraction (#401).
-pub const EXTRACTION_VERSION: u32 = 1;
+pub const EXTRACTION_VERSION: u32 = 2;
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -74,6 +74,10 @@ pub fn symbols_schema() -> Schema {
         Field::new("type_params", DataType::Utf8, true),       // metadata["type_params"] — generic type parameters (e.g. "<T: Clone + Send>")
         Field::new("pattern_hint", DataType::Utf8, true),        // metadata["pattern_hint"] — design pattern from naming conventions (e.g. "factory", "observer")
         Field::new("is_static", DataType::Boolean, true),           // metadata["is_static"] — true for static/associated methods, false for instance methods
+        Field::new("is_async", DataType::Boolean, true),             // metadata["is_async"] — true for async functions (#390)
+        Field::new("is_test", DataType::Boolean, true),              // metadata["is_test"] — true for test functions (#390)
+        Field::new("visibility", DataType::Utf8, true),              // metadata["visibility"] — "pub" for public re-exports (#409)
+        Field::new("exported", DataType::Boolean, true),             // metadata["exported"] — true for Python __all__ exports (#409)
         // Diagnostic columns — populated for NodeKind::Other("diagnostic") nodes
         Field::new("diagnostic_severity", DataType::Utf8, true),    // "error" | "warning"
         Field::new("diagnostic_source", DataType::Utf8, true),      // LSP server name
@@ -117,6 +121,10 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("type_params", DataType::Utf8, true),
         Field::new("pattern_hint", DataType::Utf8, true),
         Field::new("is_static", DataType::Boolean, true),
+        Field::new("is_async", DataType::Boolean, true),
+        Field::new("is_test", DataType::Boolean, true),
+        Field::new("visibility", DataType::Utf8, true),
+        Field::new("exported", DataType::Boolean, true),
         // Diagnostic columns — populated for NodeKind::Other("diagnostic") nodes
         Field::new("diagnostic_severity", DataType::Utf8, true),
         Field::new("diagnostic_source", DataType::Utf8, true),

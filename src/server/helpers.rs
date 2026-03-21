@@ -216,6 +216,15 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
         if n.metadata.get("is_static").map(|s| s == "true").unwrap_or(false) {
             entry.push_str(" static");
         }
+        if n.metadata.get("is_async").map(|s| s == "true").unwrap_or(false) {
+            entry.push_str(" async");
+        }
+        if n.metadata.get("is_test").map(|s| s == "true").unwrap_or(false) {
+            entry.push_str(" test");
+        }
+        if n.metadata.get("visibility").map(|s| s == "pub").unwrap_or(false) {
+            entry.push_str(" pub");
+        }
         if let Some(decorators) = n.metadata.get("decorators") {
             entry.push_str(&format!(" [{}]", decorators));
         }
@@ -264,6 +273,15 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
         }
         if let Some(is_static) = n.metadata.get("is_static") {
             entry.push_str(&format!("\n  Static: {}", if is_static == "true" { "yes" } else { "no" }));
+        }
+        if n.metadata.get("is_async").map(|s| s == "true").unwrap_or(false) {
+            entry.push_str("\n  Async: yes");
+        }
+        if n.metadata.get("is_test").map(|s| s == "true").unwrap_or(false) {
+            entry.push_str("\n  Test: yes");
+        }
+        if let Some(vis) = n.metadata.get("visibility") {
+            entry.push_str(&format!("\n  Visibility: {}", vis));
         }
         if let Some(decorators) = n.metadata.get("decorators") {
             entry.push_str(&format!("\n  Decorators: {}", decorators));
