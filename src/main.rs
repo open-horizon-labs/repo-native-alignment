@@ -207,8 +207,22 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Commands::Graph(args)) => {
             init_tracing("warn", log_path.as_deref());
-            let repo_root = args.repo.canonicalize()?; eprintln!("Scanning {}...", repo_root.display());
-            let handler = RnaHandler { repo_root: repo_root.clone(), ..Default::default() }; let gs = handler.build_full_graph().await?;
+            let repo_root = args.repo.canonicalize()?;
+            // Load graph from LanceDB cache -- do NOT rebuild.
+            // If cache doesn't exist, tell the user to run `rna scan`.
+            let lance_path = repo_root.join(".oh").join(".cache").join("lance");
+            let gs = if lance_path.exists() {
+                match server::load_graph_from_lance(&repo_root).await {
+                    Ok(state) => state,
+                    Err(e) => {
+                        eprintln!("Failed to load cached index: {}. Run `repo-native-alignment scan --path .` first.", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                eprintln!("No index found. Run `repo-native-alignment scan --path .` first.");
+                std::process::exit(1);
+            };
             let gp = GraphParams { node: args.node.clone(), mode: args.mode.clone(), direction: args.direction.clone(),
                 edge_types: args.edge_types.as_ref().map(|s| s.split(',').map(|t| t.trim().to_string()).collect()), max_hops: args.max_hops };
             match service::graph_query(&gp, &gs) { Ok(output) => println!("{}", output), Err(msg) => { eprintln!("Error: {}", msg); std::process::exit(1); } }
