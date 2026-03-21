@@ -569,6 +569,26 @@ impl RnaHandler {
             }
         }
 
+        // 4c. Manifest pass: emit package nodes + DependsOn edges for JS/TS,
+        //     Python, and Go projects by parsing package.json, pyproject.toml,
+        //     requirements.txt, and go.mod files.
+        {
+            let root_pairs: Vec<(String, std::path::PathBuf)> = resolved_roots
+                .iter()
+                .map(|r| (r.slug.clone(), r.path.clone()))
+                .collect();
+            let manifest_result = crate::extract::manifest::manifest_pass(&root_pairs);
+            if !manifest_result.nodes.is_empty() || !manifest_result.edges.is_empty() {
+                tracing::info!(
+                    "Manifest pass: {} package node(s), {} DependsOn edge(s)",
+                    manifest_result.nodes.len(),
+                    manifest_result.edges.len()
+                );
+                all_nodes.extend(manifest_result.nodes);
+                all_edges.extend(manifest_result.edges);
+            }
+        }
+
         // 5. Build petgraph index
         let mut index = GraphIndex::new();
         index.rebuild_from_edges(&all_edges);
