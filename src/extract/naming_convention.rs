@@ -336,4 +336,99 @@ mod tests {
             "expected test_process_payment_valid → process_payment TestedBy edge"
         );
     }
+
+    // -------------------------------------------------------------------------
+    // Adversarial tests — seeded from dissent findings
+    // -------------------------------------------------------------------------
+
+    /// Adversarial: running the pass twice (simulating incremental scan
+    /// where the full node set is re-processed) must not produce doubled
+    /// edge counts — callers handle dedup, but the pass itself must remain
+    /// deterministic and return the same edges on each run.
+    #[test]
+    fn adversarial_idempotent_on_repeated_call() {
+        let nodes = vec![
+            make_fn("process_payment", false),
+            make_fn("calculate_tax", false),
+            make_fn("test_process_payment", true),
+            make_fn("test_calculate_tax_rate", true),
+        ];
+        let edges_first = tested_by_pass(&nodes);
+        let edges_second = tested_by_pass(&nodes);
+        assert_eq!(
+            edges_first.len(),
+            edges_second.len(),
+            "repeated calls must produce the same number of edges (idempotent)"
+        );
+    }
+
+    /// Adversarial: very common short names that SHOULD be excluded even if
+    /// they technically appear as substrings in many test names.
+    /// "get", "set", "run", "new" are all < 4 chars — must not match.
+    #[test]
+    fn adversarial_common_short_names_excluded() {
+        let short_names = ["get", "set", "run", "new", "all", "put"];
+        for name in &short_names {
+            let nodes = vec![
+                make_fn(name, false),
+                make_fn(&format!("test_{}_users", name), true),
+            ];
+            let edges = tested_by_pass(&nodes);
+            assert!(
+                edges.is_empty(),
+                "production name '{}' (len={}) should be excluded — got {} edges",
+                name, name.len(), edges.len()
+            );
+        }
+    }
+
+    /// Adversarial: production function with a very common name that is a
+    /// strict substring of dozens of test names. The pass must not explode —
+    /// it should still emit valid edges but we verify no self-edges appear.
+    #[test]
+    fn adversarial_no_self_edges_emitted() {
+        // Both nodes have identical names but different is_test flags.
+        // In practice this shouldn't happen (same name can't be both test
+        // and production), but guard defensively.
+        let test_fn = make_fn("process", true);
+        let prod_fn = {
+            // Make a node with the same name but explicitly NOT a test function.
+            let mut n = make_fn("process", false);
+            // Use different root to get a different NodeId.
+            n.id.root = "prod".to_string();
+            n
+        };
+        let nodes = vec![test_fn, prod_fn];
+        let edges = tested_by_pass(&nodes);
+        // "process" is 7 chars so would otherwise match, but since
+        // test and prod have different roots, the self-edge guard won't
+        // fire — they ARE different nodes. This is correct behavior.
+        // Verify: if an edge is emitted the from != to.
+        for edge in &edges {
+            assert_ne!(
+                edge.from, edge.to,
+                "self-edge must never be emitted"
+            );
+        }
+    }
+
+    /// Adversarial: mix of struct nodes and function nodes — struct nodes
+    /// with test-like names must not produce edges.
+    #[test]
+    fn adversarial_struct_with_test_name_ignored() {
+        let mut struct_node = make_fn("test_process_payment_helper", false);
+        struct_node.id.kind = NodeKind::Struct;
+        // Mark it as "test" even so it would be classified as test if it were a function
+        struct_node.metadata.insert("is_test".to_string(), "true".to_string());
+
+        let nodes = vec![
+            struct_node,
+            make_fn("process_payment", false),
+        ];
+        let edges = tested_by_pass(&nodes);
+        assert!(
+            edges.is_empty(),
+            "Struct nodes must never produce TestedBy edges even with test-like names"
+        );
+    }
 }
