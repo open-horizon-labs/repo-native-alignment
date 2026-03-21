@@ -363,7 +363,7 @@ impl LspEnricher {
             if self.language == "python" {
                 // Check common virtual environment directory names.
                 let venv_candidates = [".venv", "venv", "env"];
-                if let Some(venv_name) = venv_candidates.iter().find(|&&name| startup_root.join(name).exists()) {
+                if let Some(venv_name) = venv_candidates.iter().find(|&&name| startup_root.join(name).is_dir()) {
                     // Merge venvPath + venv into the python.analysis section.
                     // startup_root is the venv parent (e.g., ai_service/).
                     let venv_path_str = startup_root.to_string_lossy().to_string();
