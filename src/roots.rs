@@ -73,7 +73,7 @@ pub struct RootConfig {
     ///   starting language servers for nodes whose files live under this subdirectory.
     ///   This lets typescript-language-server find `client/tsconfig.json` instead of
     ///   failing to find it at the repo root.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub lsp_only: bool,
 }
 
@@ -479,6 +479,15 @@ pub fn default_excludes_for_type(root_type: &RootType) -> Vec<String> {
         ],
         RootType::Custom => vec![],
     }
+}
+
+/// Returns `true` if `b` is `false`. Used as `skip_serializing_if` predicate for
+/// `bool` fields that should be omitted when `false` (i.e. the default).
+///
+/// `serde(skip_serializing_if)` requires `fn(&T) -> bool`, so we cannot use
+/// `std::ops::Not::not` directly (which takes `bool` by value, not `&bool`).
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────

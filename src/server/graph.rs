@@ -175,8 +175,13 @@ impl RnaHandler {
         // Prune stale roots: compare discovered roots against what LanceDB has stored.
         // Worktrees removed while the server was offline leave orphaned rows that cause
         // duplicate results (see #198).
+        // Exclude lsp_only roots: they have no extracted nodes and never get persisted to
+        // LanceDB. Including them in live_slugs would cause has_new_root to fire on every
+        // startup (the root is "live" but has no stored nodes), triggering unnecessary cold
+        // rebuilds.
         let live_slugs: std::collections::HashSet<String> = resolved_roots
             .iter()
+            .filter(|r| !r.config.lsp_only)
             .map(|r| r.slug.clone())
             .collect();
         // Synthetic root IDs (e.g., "external" for LSP virtual nodes) are never
