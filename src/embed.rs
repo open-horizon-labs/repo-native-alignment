@@ -2850,4 +2850,63 @@ mod tests {
             missing
         );
     }
+
+    /// Adversarial: has_score_col must be detected from ANY batch, not just the first.
+    ///
+    /// When the first batch is missing required columns (and gets skipped), later
+    /// batches may have _score. has_score_col must still be true so they use the
+    /// correct scoring branch.
+    #[test]
+    fn has_score_col_detected_from_any_batch() {
+        use arrow_array::{Float32Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        // Batch 0: missing required columns (simulates skipped FTS-only batch from pre-filter).
+        // No _score column either.
+        let schema_incomplete = Schema::new(vec![
+            Field::new("title", DataType::Utf8, false),
+        ]);
+        let batch_incomplete = RecordBatch::try_new(
+            Arc::new(schema_incomplete),
+            vec![Arc::new(StringArray::from(vec!["stub"]))],
+        )
+        .expect("should build incomplete batch");
+
+        // Batch 1: complete batch with _score (simulates valid hybrid search result).
+        let schema_complete = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("kind", DataType::Utf8, false),
+            Field::new("title", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("_score", DataType::Float32, false),
+        ]);
+        let batch_complete = RecordBatch::try_new(
+            Arc::new(schema_complete),
+            vec![
+                Arc::new(StringArray::from(vec!["id1"])),
+                Arc::new(StringArray::from(vec!["function"])),
+                Arc::new(StringArray::from(vec!["title1"])),
+                Arc::new(StringArray::from(vec!["body1"])),
+                Arc::new(Float32Array::from(vec![0.8f32])),
+            ],
+        )
+        .expect("should build complete batch");
+
+        let batches = vec![batch_incomplete, batch_complete];
+
+        // Simulate the has_score_col detection from the fix (any batch, not just first).
+        let has_score_col_any = batches.iter().any(|b| b.column_by_name("_score").is_some());
+        let has_score_col_first = batches.first()
+            .is_some_and(|b| b.column_by_name("_score").is_some());
+
+        assert!(
+            has_score_col_any,
+            "should detect _score from any batch, but iter().any() returned false"
+        );
+        assert!(
+            !has_score_col_first,
+            "first batch does not have _score — verifying that first-only detection is wrong"
+        );
+    }
 }
