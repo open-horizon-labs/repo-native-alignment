@@ -165,6 +165,12 @@ pub enum EdgeKind {
     Affected,
     /// PR serves this outcome (from commit tags or file patterns).
     Serves,
+    /// A test function covers a production symbol.
+    /// Direction: test_fn → production_fn
+    TestedBy,
+    /// A symbol belongs to a module/package node.
+    /// Direction: symbol → module
+    BelongsTo,
 }
 
 impl fmt::Display for EdgeKind {
@@ -183,6 +189,8 @@ impl fmt::Display for EdgeKind {
             EdgeKind::Modified => write!(f, "modified"),
             EdgeKind::Affected => write!(f, "affected"),
             EdgeKind::Serves => write!(f, "serves"),
+            EdgeKind::TestedBy => write!(f, "tested_by"),
+            EdgeKind::BelongsTo => write!(f, "belongs_to"),
         }
     }
 }

@@ -560,6 +560,9 @@ struct LspState {
     /// Whether the language server supports pull-based diagnostics
     /// (`textDocument/diagnostic`, LSP 3.17+).
     has_pull_diagnostics: bool,
+    /// Whether the language server supports inlay hints
+    /// (`textDocument/inlayHint`, LSP 3.17+).
+    has_inlay_hints: bool,
     /// Whether the server reached quiescent=true during initialization.
     /// When false, the quiescence deadline expired before the server finished
     /// indexing. In that case Pass 3 (diagnostics) is skipped to avoid flooding
@@ -619,6 +622,7 @@ impl LspEnricher {
                 has_type_hierarchy: false,
                 has_references: false,
                 has_pull_diagnostics: false,
+                has_inlay_hints: false,
                 was_quiescent: false,
                 type_hierarchy_strikes: 0,
                 diagnostics_sink: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -762,19 +766,26 @@ impl LspEnricher {
             .map(|v| !v.is_null())
             .unwrap_or(false);
 
+        // Check inlay hints capability (LSP 3.17+, "inlayHintProvider")
+        let has_inlay_hints = init_result
+            .pointer("/capabilities/inlayHintProvider")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+
         let init_result_parsed: InitializeResult = serde_json::from_value(init_result)
             .context("Failed to parse initialize result")?;
 
         let has_references = init_result_parsed.capabilities.references_provider.is_some();
         let has_implementation = init_result_parsed.capabilities.implementation_provider.is_some();
         tracing::info!(
-            "{} capabilities: references={}, implementation={}, type_hierarchy={}, pull_diagnostics={}",
-            self.server_command, has_references, has_implementation, has_type_hierarchy, has_pull_diagnostics
+            "{} capabilities: references={}, implementation={}, type_hierarchy={}, pull_diagnostics={}, inlay_hints={}",
+            self.server_command, has_references, has_implementation, has_type_hierarchy, has_pull_diagnostics, has_inlay_hints
         );
 
         state.has_type_hierarchy = has_type_hierarchy;
         state.has_references = has_references;
         state.has_pull_diagnostics = has_pull_diagnostics;
+        state.has_inlay_hints = has_inlay_hints;
 
         // Send initialized notification
         let transport = state.transport.as_mut().unwrap();
@@ -1483,6 +1494,355 @@ impl LspEnricher {
         nodes
     }
 
+    // ---------------------------------------------------------------------------
+    // #395: TestedBy edges via naming conventions
+    // ---------------------------------------------------------------------------
+
+    /// Scan test functions and emit `TestedBy` edges to production functions whose
+    /// name appears as a substring in the test function name.
+    ///
+    /// Example: `test_process_payment` → `TestedBy` edge to `process_payment`.
+    ///
+    /// This is language-agnostic and covers Python, Go, TypeScript, Java, Ruby, etc.
+    /// Convention patterns recognised:
+    ///   Rust:       `test_<fn>`, `<fn>_test`, `<fn>_should_*`
+    ///   Go:         `Test<Fn>`, `Benchmark<Fn>`
+    ///   Python:     `test_<fn>`, `<fn>_test`
+    ///   TypeScript: `it("...fn...")`, `describe("...fn...")`  — name-based only
+    ///   General:    any test function whose name contains the production name
+    fn emit_tested_by_edges(
+        matching_nodes: &[&Node],
+        result: &mut EnrichmentResult,
+    ) {
+        // Split into test and production functions
+        let test_fns: Vec<&Node> = matching_nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Function)
+            .filter(|n| crate::ranking::is_test_function(n))
+            .copied()
+            .collect();
+
+        let prod_fns: Vec<&Node> = matching_nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Function)
+            .filter(|n| !crate::ranking::is_test_function(n))
+            .copied()
+            .collect();
+
+        if test_fns.is_empty() || prod_fns.is_empty() {
+            return;
+        }
+
+        let mut edges_added = 0usize;
+
+        for test_fn in &test_fns {
+            let test_name_lower = test_fn.id.name.to_lowercase();
+
+            for prod_fn in &prod_fns {
+                // Skip very short production function names to avoid false positives
+                // (e.g. "new", "get", "run" would match too many tests)
+                if prod_fn.id.name.len() < 4 {
+                    continue;
+                }
+
+                let prod_name_lower = prod_fn.id.name.to_lowercase();
+
+                // Check whether the test name contains the production name as a
+                // word-boundary match. We accept underscore or camelCase boundaries.
+                if test_name_lower.contains(prod_name_lower.as_str()) {
+                    // Guard: avoid emitting TestedBy to itself (shouldn't happen
+                    // since we split on is_test_function, but be defensive)
+                    if test_fn.id == prod_fn.id {
+                        continue;
+                    }
+
+                    tracing::debug!(
+                        "TestedBy (naming): {} covers {}",
+                        test_fn.id.name, prod_fn.id.name
+                    );
+
+                    result.added_edges.push(Edge {
+                        from: test_fn.id.clone(),
+                        to: prod_fn.id.clone(),
+                        kind: EdgeKind::TestedBy,
+                        source: ExtractionSource::Lsp,
+                        confidence: Confidence::Detected,
+                    });
+                    edges_added += 1;
+                }
+            }
+        }
+
+        if edges_added > 0 {
+            tracing::info!(
+                "TestedBy pass: {} edges from {} test functions covering {} production functions",
+                edges_added, test_fns.len(), prod_fns.len()
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // #396: BelongsTo edges via rust-analyzer/parentModule (Rust) or directory
+    // ---------------------------------------------------------------------------
+
+    /// Request `rust-analyzer/parentModule` for a file, returning the module path
+    /// as a string (e.g., `"crate::server::handlers"`).
+    async fn ra_parent_module(
+        transport: &PipelinedTransport,
+        file_uri: &Uri,
+    ) -> Result<Option<String>> {
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri.as_str() }
+        });
+
+        let result: serde_json::Value = transport
+            .request("rust-analyzer/parentModule", &params)
+            .await?;
+
+        if result.is_null() {
+            return Ok(None);
+        }
+
+        // rust-analyzer returns an array of LocationLinks; the first gives the
+        // parent module's URI which we use as the module path.
+        if let Some(arr) = result.as_array() {
+            if let Some(first) = arr.first() {
+                // The target URI gives us the parent file path; derive module name
+                // from the file name (e.g. `src/server/mod.rs` → `server`)
+                if let Some(uri_str) = first.get("targetUri").and_then(|u| u.as_str()) {
+                    // Extract the module name from the URI: strip file:// and get basename
+                    let path = if let Some(p) = uri_str.strip_prefix("file://") {
+                        PathBuf::from(p)
+                    } else {
+                        PathBuf::from(uri_str)
+                    };
+                    let module_name = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| if s == "mod" {
+                            // For mod.rs, use the directory name
+                            path.parent()
+                                .and_then(|p| p.file_name())
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(s)
+                                .to_string()
+                        } else {
+                            s.to_string()
+                        });
+                    return Ok(module_name);
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Emit `BelongsTo` edges from all symbols in a file to a module node.
+    ///
+    /// For Rust files, tries `rust-analyzer/parentModule` first.
+    /// Falls back to directory-based module detection for all languages.
+    ///
+    /// Module nodes use `NodeKind::Module` and are created as virtual nodes
+    /// if they don't already exist.
+    async fn emit_belongs_to_edges(
+        transport: &PipelinedTransport,
+        file_nodes: &[&Node],
+        rel_file: &Path,
+        root: &Path,
+        is_rust: bool,
+        result: &mut EnrichmentResult,
+    ) {
+        if file_nodes.is_empty() {
+            return;
+        }
+
+        // Derive a module name for this file.
+        // Priority: (1) rust-analyzer/parentModule for Rust, (2) directory-based fallback.
+        let module_name: Option<String> = if is_rust {
+            let abs_path = root.join(rel_file);
+            if let Ok(file_uri) = path_to_uri(&abs_path) {
+                Self::ra_parent_module(transport, &file_uri).await.ok().flatten()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Fallback: derive module name from the immediate parent directory
+        let module_name = module_name.or_else(|| {
+            // For files directly in the root or without a parent dir, use the
+            // file stem as the module name (e.g. `main.rs` → `main`)
+            rel_file
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    rel_file
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                })
+        });
+
+        let module_name = match module_name {
+            Some(n) if !n.is_empty() => n,
+            _ => return,
+        };
+
+        // Derive a stable module path from the directory path
+        let module_path = rel_file
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(""));
+
+        // Use the first node's root as the module node root
+        let root_id = file_nodes[0].id.root.clone();
+
+        // Create a virtual module node (may already exist in the graph — dedup is
+        // handled at persist time by stable_id uniqueness)
+        let module_node_id = NodeId {
+            root: root_id.clone(),
+            file: module_path.clone(),
+            name: module_name.clone(),
+            kind: NodeKind::Module,
+        };
+
+        result.new_nodes.push(Node {
+            id: module_node_id.clone(),
+            language: file_nodes[0].language.clone(),
+            line_start: 0,
+            line_end: 0,
+            signature: format!("mod {}", module_name),
+            body: String::new(),
+            metadata: std::collections::BTreeMap::new(),
+            source: ExtractionSource::Lsp,
+        });
+
+        // Emit BelongsTo edges from each symbol in this file to the module node
+        for node in file_nodes {
+            // Skip module nodes (avoid self-loop) and diagnostic nodes (transient, not structural)
+            if node.id.kind == NodeKind::Module {
+                continue;
+            }
+            if matches!(&node.id.kind, NodeKind::Other(s) if s == "diagnostic") {
+                continue;
+            }
+            result.added_edges.push(Edge {
+                from: node.id.clone(),
+                to: module_node_id.clone(),
+                kind: EdgeKind::BelongsTo,
+                source: ExtractionSource::Lsp,
+                confidence: Confidence::Detected,
+            });
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // #408: Inlay hints — inferred types in embeddings
+    // ---------------------------------------------------------------------------
+
+    /// Request `textDocument/inlayHint` for a file range and return a compact
+    /// string of inferred type names suitable for embedding.
+    ///
+    /// Supported by: rust-analyzer, TypeScript LS, Pyright, gopls.
+    async fn inlay_hints_for_file(
+        transport: &PipelinedTransport,
+        file_uri: &Uri,
+        line_count: u32,
+    ) -> Result<Vec<serde_json::Value>> {
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri.as_str() },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": line_count, "character": 0 }
+            }
+        });
+
+        let result: serde_json::Value = transport
+            .request("textDocument/inlayHint", &params)
+            .await?;
+
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+
+        Ok(result.as_array().cloned().unwrap_or_default())
+    }
+
+    /// Extract type names from inlay hints and group them by the function/symbol
+    /// that contains each hint's line position.
+    ///
+    /// Returns a map from node stable_id → compact type string.
+    fn group_inlay_hints_by_node(
+        hints: &[serde_json::Value],
+        file_nodes: &[&Node],
+    ) -> HashMap<String, String> {
+        let mut node_types: HashMap<String, Vec<String>> = HashMap::new();
+
+        for hint in hints {
+            // Only capture type hints (kind=1) — parameter hints (kind=2) add noise
+            let kind = hint.get("kind").and_then(|k| k.as_u64()).unwrap_or(1);
+            if kind != 1 {
+                continue;
+            }
+
+            let hint_line = hint
+                .pointer("/position/line")
+                .and_then(|l| l.as_u64())
+                .map(|l| l as usize + 1)  // Convert to 1-indexed
+                .unwrap_or(0);
+
+            if hint_line == 0 {
+                continue;
+            }
+
+            // Extract the label text (may be a string or array of InlayHintLabelPart)
+            let label = match hint.get("label") {
+                Some(serde_json::Value::String(s)) => s.trim().to_string(),
+                Some(serde_json::Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|p| p.get("value").and_then(|v| v.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(""),
+                _ => continue,
+            };
+
+            // Strip leading ": " annotation prefix that rust-analyzer emits
+            let label = label.trim_start_matches(": ").trim().to_string();
+
+            if label.is_empty() || label.len() > 64 {
+                continue;
+            }
+
+            // Find the narrowest enclosing function/impl/struct for this hint line
+            let enclosing = file_nodes
+                .iter()
+                .filter(|n| matches!(n.id.kind, NodeKind::Function | NodeKind::Impl | NodeKind::Struct))
+                .filter(|n| n.line_start <= hint_line && n.line_end >= hint_line)
+                .min_by_key(|n| n.line_end - n.line_start);
+
+            if let Some(node) = enclosing {
+                node_types
+                    .entry(node.id.to_stable_id())
+                    .or_default()
+                    .push(label);
+            }
+        }
+
+        // Deduplicate and format each node's types as a space-separated string
+        node_types
+            .into_iter()
+            .map(|(id, mut types)| {
+                types.sort();
+                types.dedup();
+                (id, types.join(" "))
+            })
+            .collect()
+    }
 }
 
 #[async_trait::async_trait]
@@ -1531,7 +1891,7 @@ impl Enricher for LspEnricher {
         // enrich() calls to proceed after RA finishes indexing, even if the first
         // call timed out during initialization. The flag is updated by the background
         // reader loop whenever `experimental/serverStatus { quiescent: true }` arrives.
-        let (transport, root, has_type_hierarchy, type_hierarchy_strikes, has_references, has_pull_diagnostics, was_quiescent, diag_sink) = {
+        let (transport, root, has_type_hierarchy, type_hierarchy_strikes, has_references, has_pull_diagnostics, has_inlay_hints, was_quiescent, diag_sink) = {
             let state = self.state.lock().await;
             let root = state
                 .root_path
@@ -1545,7 +1905,7 @@ impl Enricher for LspEnricher {
             // Use live quiescent_flag from pipelined transport for session-wide accuracy.
             // This allows RA to become quiescent after the init timeout and still be used.
             let was_quiescent = transport.quiescent_flag.load(Ordering::Acquire);
-            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references, state.has_pull_diagnostics, was_quiescent, diag_sink)
+            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references, state.has_pull_diagnostics, state.has_inlay_hints, was_quiescent, diag_sink)
         };
         // State lock is released here — concurrent tasks can proceed
 
@@ -2035,6 +2395,32 @@ impl Enricher for LspEnricher {
         );
 
         // ------------------------------------------------------------------
+        // Pass 1b: TestedBy edges via naming conventions (#395).
+        //
+        // Language-agnostic: scan all test functions in matching_nodes and
+        // emit TestedBy edges to production functions whose name appears as
+        // a substring in the test function name.
+        //
+        // Example: `test_process_payment` → TestedBy → `process_payment`
+        //
+        // This runs unconditionally after Pass 1 (it's pure graph analysis,
+        // no LSP requests needed). It complements the call-hierarchy approach
+        // already used by `mode="tests_for"`.
+        // ------------------------------------------------------------------
+        {
+            let pass1b_start = std::time::Instant::now();
+            let edges_before = result.added_edges.len();
+            Self::emit_tested_by_edges(&matching_nodes, &mut result);
+            let tested_by_count = result.added_edges.len() - edges_before;
+            if tested_by_count > 0 {
+                tracing::info!(
+                    "LSP Pass 1b complete in {:?}: {} TestedBy edges",
+                    pass1b_start.elapsed(), tested_by_count
+                );
+            }
+        }
+
+        // ------------------------------------------------------------------
         // Pass 2: type hierarchy (sequential — strike counting needs order)
         // ------------------------------------------------------------------
         let mut has_type_hierarchy = has_type_hierarchy;
@@ -2130,6 +2516,135 @@ impl Enricher for LspEnricher {
             let mut state = self.state.lock().await;
             state.type_hierarchy_strikes = type_hierarchy_strikes;
             state.has_type_hierarchy = has_type_hierarchy;
+        }
+
+        // ------------------------------------------------------------------
+        // Pass 4: BelongsTo edges — module hierarchy (#396).
+        //
+        // Per unique file: emit BelongsTo edges from all symbols to a module
+        // node. For Rust, tries rust-analyzer/parentModule first; falls back
+        // to directory-based module detection for all other languages.
+        //
+        // This runs unconditionally (no quiescence dependency) since:
+        //   - Directory-based fallback never hits the LSP server
+        //   - rust-analyzer/parentModule is cheap (one request per file, not per symbol)
+        // ------------------------------------------------------------------
+        {
+            let pass4_start = std::time::Instant::now();
+            let edges_before = result.added_edges.len();
+
+            // Group matching_nodes by file
+            let mut nodes_by_file: HashMap<PathBuf, Vec<&Node>> = HashMap::new();
+            for n in &matching_nodes {
+                nodes_by_file.entry(n.id.file.clone()).or_default().push(n);
+            }
+
+            let is_rust = self.language == "rust";
+
+            for (rel_file, file_nodes) in &nodes_by_file {
+                Self::emit_belongs_to_edges(
+                    &transport,
+                    file_nodes,
+                    rel_file,
+                    &root,
+                    is_rust,
+                    &mut result,
+                ).await;
+            }
+
+            // Remove duplicate module nodes (same stable_id emitted for multiple files in same dir)
+            let mut deduplicated_new_nodes = Vec::with_capacity(result.new_nodes.len());
+            let mut module_stable_ids_seen = std::collections::HashSet::new();
+            for node in result.new_nodes.drain(..) {
+                if matches!(node.id.kind, NodeKind::Module) {
+                    let sid = node.id.to_stable_id();
+                    if module_stable_ids_seen.insert(sid) {
+                        deduplicated_new_nodes.push(node);
+                    }
+                    // else: skip duplicate
+                } else {
+                    deduplicated_new_nodes.push(node);
+                }
+            }
+            result.new_nodes = deduplicated_new_nodes;
+
+            let belongs_to_count = result.added_edges.len() - edges_before;
+            let module_node_count = result.new_nodes.iter()
+                .filter(|n| matches!(n.id.kind, NodeKind::Module))
+                .count();
+            if belongs_to_count > 0 {
+                tracing::info!(
+                    "LSP Pass 4 complete in {:?}: {} BelongsTo edges, {} module nodes",
+                    pass4_start.elapsed(), belongs_to_count, module_node_count
+                );
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Pass 5: InlayHints — inferred types in embeddings (#408).
+        //
+        // For language servers that support inlayHint (rust-analyzer,
+        // TypeScript LS, Pyright, gopls): request inlay hints per file,
+        // extract type annotations, and patch node metadata so
+        // build_code_embedding_text() includes them.
+        //
+        // Only runs if the server advertised inlayHintProvider capability.
+        // ------------------------------------------------------------------
+        if has_inlay_hints {
+            let pass5_start = std::time::Instant::now();
+            let mut hint_patches = 0usize;
+
+            // Unique files (recompute since nodes_by_file was consumed above)
+            let mut nodes_by_file2: HashMap<PathBuf, Vec<&Node>> = HashMap::new();
+            for n in &matching_nodes {
+                nodes_by_file2.entry(n.id.file.clone()).or_default().push(n);
+            }
+
+            for (rel_file, file_nodes) in &nodes_by_file2 {
+                let abs_path = root.join(rel_file);
+                let file_uri = match path_to_uri(&abs_path) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+
+                // Use max line_end as the range end for the request
+                let max_line = file_nodes
+                    .iter()
+                    .map(|n| n.line_end as u32)
+                    .max()
+                    .unwrap_or(0);
+
+                match Self::inlay_hints_for_file(&transport, &file_uri, max_line + 1).await {
+                    Ok(hints) if !hints.is_empty() => {
+                        let type_map = Self::group_inlay_hints_by_node(&hints, file_nodes);
+                        for (stable_id, type_str) in type_map {
+                            result.updated_nodes.push((
+                                stable_id,
+                                {
+                                    let mut patch = std::collections::BTreeMap::new();
+                                    patch.insert("inferred_types".to_string(), type_str);
+                                    patch
+                                },
+                            ));
+                            hint_patches += 1;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            "textDocument/inlayHint failed for {}: {}",
+                            rel_file.display(), e
+                        );
+                    }
+                }
+            }
+
+            if hint_patches > 0 {
+                tracing::info!(
+                    "LSP Pass 5 complete in {:?}: {} nodes patched with inferred_types",
+                    pass5_start.elapsed(), hint_patches
+                );
+            }
         }
 
         // ------------------------------------------------------------------
@@ -3841,5 +4356,222 @@ mod tests {
         // has_pull_diagnostics also defaults false (not yet initialized)
         assert!(!state.has_pull_diagnostics,
             "has_pull_diagnostics must default false (not yet initialized from LSP capabilities)");
+        // has_inlay_hints also defaults false (not yet initialized)
+        assert!(!state.has_inlay_hints,
+            "has_inlay_hints must default false (not yet initialized from LSP capabilities)");
+    }
+
+    // -----------------------------------------------------------------------
+    // #395 TestedBy: naming convention tests
+    // -----------------------------------------------------------------------
+
+    fn make_fn_node(file: &str, name: &str, is_test: bool) -> Node {
+        let mut metadata = BTreeMap::new();
+        if is_test {
+            // ranking::is_test_function checks `token.trim() == "test"` (without brackets)
+            metadata.insert("decorators".to_string(), "test".to_string());
+        }
+        Node {
+            id: NodeId {
+                root: String::new(),
+                file: PathBuf::from(file),
+                name: name.to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 10,
+            signature: format!("fn {}()", name),
+            body: String::new(),
+            metadata,
+            source: ExtractionSource::TreeSitter,
+        }
+    }
+
+    /// Basic naming convention match: test_<fn> → <fn>
+    #[test]
+    fn test_tested_by_naming_basic() {
+        let test_fn = make_fn_node("src/lib.rs", "test_process_payment", true);
+        let prod_fn = make_fn_node("src/lib.rs", "process_payment", false);
+        let matching: Vec<&Node> = vec![&test_fn, &prod_fn];
+
+        let mut result = EnrichmentResult::default();
+        LspEnricher::emit_tested_by_edges(&matching, &mut result);
+
+        let tested_by: Vec<_> = result.added_edges.iter()
+            .filter(|e| e.kind == EdgeKind::TestedBy)
+            .collect();
+        assert_eq!(tested_by.len(), 1, "expected 1 TestedBy edge");
+        assert_eq!(tested_by[0].from.name, "test_process_payment");
+        assert_eq!(tested_by[0].to.name, "process_payment");
+        assert_eq!(tested_by[0].confidence, Confidence::Detected);
+    }
+
+    /// Short production function names (< 4 chars) are skipped to avoid false positives
+    #[test]
+    fn test_tested_by_skips_short_names() {
+        let test_fn = make_fn_node("src/lib.rs", "test_run", true);
+        let prod_fn = make_fn_node("src/lib.rs", "run", false);
+        let matching: Vec<&Node> = vec![&test_fn, &prod_fn];
+
+        let mut result = EnrichmentResult::default();
+        LspEnricher::emit_tested_by_edges(&matching, &mut result);
+
+        let tested_by: Vec<_> = result.added_edges.iter()
+            .filter(|e| e.kind == EdgeKind::TestedBy)
+            .collect();
+        assert!(tested_by.is_empty(), "should not emit TestedBy for short production names like 'run'");
+    }
+
+    /// No test functions → no TestedBy edges
+    #[test]
+    fn test_tested_by_no_test_functions() {
+        let fn1 = make_fn_node("src/lib.rs", "process_payment", false);
+        let fn2 = make_fn_node("src/lib.rs", "calculate_tax", false);
+        let matching: Vec<&Node> = vec![&fn1, &fn2];
+
+        let mut result = EnrichmentResult::default();
+        LspEnricher::emit_tested_by_edges(&matching, &mut result);
+
+        let tested_by: Vec<_> = result.added_edges.iter()
+            .filter(|e| e.kind == EdgeKind::TestedBy)
+            .collect();
+        assert!(tested_by.is_empty());
+    }
+
+    /// CamelCase convention: TestHandleRequest → HandleRequest (Go style)
+    /// Both test and production are camelCase — substring match works after lowercasing
+    #[test]
+    fn test_tested_by_camel_case() {
+        // Go convention: TestHandleRequest → HandleRequest
+        // After lowercasing: "testhandlerequest".contains("handlerequest") == true
+        let test_node = Node {
+            id: NodeId {
+                root: String::new(),
+                file: PathBuf::from("src/handler_test.rs"),  // _test. suffix → is_test_file
+                name: "TestHandleRequest".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "go".to_string(),
+            line_start: 1,
+            line_end: 10,
+            signature: "func TestHandleRequest(t *testing.T)".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        // Production function with same camelCase name (no underscores)
+        let prod_fn = make_fn_node("src/handler.rs", "HandleRequest", false);
+        let matching: Vec<&Node> = vec![&test_node, &prod_fn];
+
+        let mut result = EnrichmentResult::default();
+        LspEnricher::emit_tested_by_edges(&matching, &mut result);
+
+        let tested_by: Vec<_> = result.added_edges.iter()
+            .filter(|e| e.kind == EdgeKind::TestedBy)
+            .collect();
+        assert_eq!(tested_by.len(), 1,
+            "TestHandleRequest should match HandleRequest via case-insensitive substring");
+    }
+
+    // -----------------------------------------------------------------------
+    // #408 InlayHints: group_inlay_hints_by_node tests
+    // -----------------------------------------------------------------------
+
+    fn make_fn_node_with_lines(file: &str, name: &str, line_start: usize, line_end: usize) -> Node {
+        Node {
+            id: NodeId {
+                root: String::new(),
+                file: PathBuf::from(file),
+                name: name.to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            line_start,
+            line_end,
+            signature: format!("fn {}()", name),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        }
+    }
+
+    /// Type hints within a function's line range are attributed to it
+    #[test]
+    fn test_group_inlay_hints_basic() {
+        let fn_node = make_fn_node_with_lines("src/lib.rs", "process_order", 5, 20);
+        let file_nodes: Vec<&Node> = vec![&fn_node];
+
+        let hints = vec![
+            serde_json::json!({
+                "kind": 1,
+                "position": { "line": 9, "character": 10 },  // 0-indexed → 1-indexed line 10
+                "label": ": f64"
+            }),
+            serde_json::json!({
+                "kind": 1,
+                "position": { "line": 12, "character": 10 },  // line 13
+                "label": [{ "value": ": OrderTotal" }]
+            }),
+        ];
+
+        let type_map = LspEnricher::group_inlay_hints_by_node(&hints, &file_nodes);
+        let stable_id = fn_node.id.to_stable_id();
+        assert!(type_map.contains_key(&stable_id),
+            "hints within fn lines should be attributed to the function");
+        let types_str = &type_map[&stable_id];
+        assert!(types_str.contains("f64"), "should contain f64");
+        assert!(types_str.contains("OrderTotal"), "should contain OrderTotal");
+    }
+
+    /// Parameter hints (kind=2) are filtered out
+    #[test]
+    fn test_group_inlay_hints_filters_param_hints() {
+        let fn_node = make_fn_node_with_lines("src/lib.rs", "do_thing", 1, 10);
+        let file_nodes: Vec<&Node> = vec![&fn_node];
+
+        let hints = vec![
+            serde_json::json!({
+                "kind": 2,  // parameter hint — should be ignored
+                "position": { "line": 4, "character": 5 },
+                "label": "amount:"
+            }),
+        ];
+
+        let type_map = LspEnricher::group_inlay_hints_by_node(&hints, &file_nodes);
+        assert!(type_map.is_empty(), "parameter hints (kind=2) should be filtered");
+    }
+
+    /// Type hints outside all function ranges produce no entries
+    #[test]
+    fn test_group_inlay_hints_outside_function_range() {
+        let fn_node = make_fn_node_with_lines("src/lib.rs", "small_fn", 5, 8);
+        let file_nodes: Vec<&Node> = vec![&fn_node];
+
+        let hints = vec![
+            serde_json::json!({
+                "kind": 1,
+                "position": { "line": 20, "character": 5 },  // 0-indexed line 20 → 1-indexed 21
+                "label": ": String"
+            }),
+        ];
+
+        let type_map = LspEnricher::group_inlay_hints_by_node(&hints, &file_nodes);
+        assert!(type_map.is_empty(),
+            "hints outside all function line ranges should produce no entries");
+    }
+
+    // -----------------------------------------------------------------------
+    // EdgeKind: new variants roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_edge_kind_tested_by_display() {
+        assert_eq!(EdgeKind::TestedBy.to_string(), "tested_by");
+    }
+
+    #[test]
+    fn test_edge_kind_belongs_to_display() {
+        assert_eq!(EdgeKind::BelongsTo.to_string(), "belongs_to");
     }
 }

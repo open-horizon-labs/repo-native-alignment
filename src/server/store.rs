@@ -258,6 +258,8 @@ pub fn parse_edge_kind(s: &str) -> Option<EdgeKind> {
         "modified" => EdgeKind::Modified,
         "affected" => EdgeKind::Affected,
         "serves" => EdgeKind::Serves,
+        "tested_by" => EdgeKind::TestedBy,
+        "belongs_to" => EdgeKind::BelongsTo,
         _ => return None,
     })
 }
