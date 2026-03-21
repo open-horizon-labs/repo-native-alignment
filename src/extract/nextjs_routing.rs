@@ -288,32 +288,35 @@ fn process_app_router_file(
 
 /// Derive the HTTP path from an App Router route file path.
 ///
-/// Example:
-/// `app/api/payments/route.ts` → `/payments`
-/// `app/api/users/[id]/route.ts` → `/users/{id}`
-/// `app/api/v2/items/[...slug]/route.ts` → `/v2/items/{slug}`
+/// Per Next.js App Router routing conventions the URL path mirrors the directory
+/// structure under `app/` — the `api` segment IS part of the URL path.
+///
+/// | File path | HTTP path |
+/// |-----------|-----------|
+/// | `app/api/route.ts` | `/api` |
+/// | `app/api/payments/route.ts` | `/api/payments` |
+/// | `app/api/users/[id]/route.ts` | `/api/users/{id}` |
+/// | `app/api/v2/items/[...slug]/route.ts` | `/api/v2/items/{slug}` |
+///
+/// `rel` must already have any leading `src/` stripped by the caller
+/// (i.e. it is the path as seen from the root `app/` directory).
 fn derive_app_router_path(rel: &str) -> String {
-    // Strip "app/api" prefix (handle optional leading component like "src/app/api")
-    let after_api = if let Some(s) = rel.strip_prefix("app/api/") {
+    // Strip only "app/" prefix — "api/" and all subdirectory segments stay as
+    // part of the URL path.
+    let after_app = if let Some(s) = rel.strip_prefix("app/") {
         s
-    } else if rel == "app/api/route.ts"
-        || rel == "app/api/route.tsx"
-        || rel == "app/api/route.js"
-        || rel == "app/api/route.jsx"
-    {
-        // route directly under app/api — no sub-path
-        return "/".to_string();
-    } else if let Some(s) = strip_prefix_ci(rel, "app/api/") {
+    } else if let Some(s) = strip_prefix_ci(rel, "app/") {
         s
     } else {
         return String::new();
     };
 
-    // Remove the trailing "route.{ext}" filename
-    let dir_part = match after_api.rfind('/') {
-        Some(idx) => &after_api[..idx],
+    // Remove the trailing "route.{ext}" filename.
+    let dir_part = match after_app.rfind('/') {
+        Some(idx) => &after_app[..idx],
         None => {
-            // The file IS directly under app/api/ (e.g., app/api/route.ts)
+            // Path like "app/route.ts" — directly under app/ with no subdir.
+            // This is unusual but map to "/" to be safe.
             return "/".to_string();
         }
     };
@@ -521,14 +524,19 @@ pub fn find_exported_http_methods(content: &str) -> Vec<String> {
 /// Returns `true` if `line` declares an export for the given HTTP `method`
 /// with a proper word boundary after the method name.
 ///
-/// Handles:
+/// Handles inline exports:
 /// - `export function GET(` — exact word boundary `(`
 /// - `export async function GET(` — same
 /// - `export const GET =` — space or `=` after method
 /// - `export const GET:` — TypeScript type annotation
 ///
+/// Handles re-export syntax:
+/// - `export { GET }` — direct re-export
+/// - `export { handler as GET }` — aliased re-export
+/// - `export { GET, POST }` — multiple re-exports on one line
+///
 /// Rejects false positives:
-/// - `export function GETTER()` — `G`, `E`, `T` followed by non-boundary char
+/// - `export function GETTER()` — followed by non-boundary char
 /// - `export const GETALL = ...` — method name followed by another letter
 fn line_exports_http_method(line: &str, method: &str) -> bool {
     // For `function METHOD`: require the char after METHOD to be '(' or whitespace
@@ -548,6 +556,31 @@ fn line_exports_http_method(line: &str, method: &str) -> bool {
         let next = after.chars().next();
         if matches!(next, Some(' ') | Some('=') | Some(':') | None) {
             return true;
+        }
+    }
+
+    // For re-export syntax `export { ... }` or `export { ... } from '...'`:
+    // Match `METHOD` as a standalone identifier (not a prefix of another word),
+    // or as an alias `X as METHOD`.
+    if line.trim_start().starts_with("export") && line.contains('{') {
+        // Extract the content inside the first `{...}` block.
+        if let (Some(open), Some(close)) = (line.find('{'), line.rfind('}')) {
+            if open < close {
+                let inner = &line[open + 1..close];
+                for item in inner.split(',') {
+                    let item = item.trim();
+                    // Handle `handler as METHOD` or `METHOD`
+                    let exported_name = if let Some(pos) = item.find(" as ") {
+                        item[pos + 4..].trim()
+                    } else {
+                        item
+                    };
+                    // Word-boundary check: exported_name must equal method exactly
+                    if exported_name == method {
+                        return true;
+                    }
+                }
+            }
         }
     }
 
@@ -645,9 +678,10 @@ mod tests {
 
     #[test]
     fn test_app_router_simple_path() {
+        // app/api/ is part of the URL path per Next.js App Router conventions
         assert_eq!(
             derive_app_router_path("app/api/payments/route.ts"),
-            "/payments"
+            "/api/payments"
         );
     }
 
@@ -655,7 +689,7 @@ mod tests {
     fn test_app_router_nested_path() {
         assert_eq!(
             derive_app_router_path("app/api/users/profile/route.ts"),
-            "/users/profile"
+            "/api/users/profile"
         );
     }
 
@@ -663,7 +697,7 @@ mod tests {
     fn test_app_router_dynamic_segment() {
         assert_eq!(
             derive_app_router_path("app/api/users/[id]/route.ts"),
-            "/users/{id}"
+            "/api/users/{id}"
         );
     }
 
@@ -671,7 +705,7 @@ mod tests {
     fn test_app_router_catch_all_segment() {
         assert_eq!(
             derive_app_router_path("app/api/files/[...slug]/route.ts"),
-            "/files/{slug}"
+            "/api/files/{slug}"
         );
     }
 
@@ -679,13 +713,14 @@ mod tests {
     fn test_app_router_optional_catch_all() {
         assert_eq!(
             derive_app_router_path("app/api/files/[[...slug]]/route.ts"),
-            "/files/{slug}"
+            "/api/files/{slug}"
         );
     }
 
     #[test]
     fn test_app_router_root_route() {
-        assert_eq!(derive_app_router_path("app/api/route.ts"), "/");
+        // app/api/route.ts → /api (the root of the API namespace)
+        assert_eq!(derive_app_router_path("app/api/route.ts"), "/api");
     }
 
     #[test]
@@ -822,6 +857,30 @@ export const POSTFIX = "something"
         );
     }
 
+    #[test]
+    fn test_find_exported_http_methods_reexport_syntax() {
+        // Direct re-export: `export { GET }`
+        let content1 = "export { GET }\n";
+        let methods1 = find_exported_http_methods(content1);
+        assert!(methods1.contains(&"GET".to_string()), "should detect export {{ GET }}");
+
+        // Aliased re-export: `export { handler as POST }`
+        let content2 = "export { handler as POST }\n";
+        let methods2 = find_exported_http_methods(content2);
+        assert!(methods2.contains(&"POST".to_string()), "should detect export {{ handler as POST }}");
+
+        // Multiple re-exports: `export { GET, POST }`
+        let content3 = "export { GET, POST }\n";
+        let methods3 = find_exported_http_methods(content3);
+        assert!(methods3.contains(&"GET".to_string()), "should detect GET in multi-export");
+        assert!(methods3.contains(&"POST".to_string()), "should detect POST in multi-export");
+
+        // Re-export with FROM: `export { GET } from './handler'`
+        let content4 = "export { GET } from './handler'\n";
+        let methods4 = find_exported_http_methods(content4);
+        assert!(methods4.contains(&"GET".to_string()), "should detect export {{ GET }} from ...");
+    }
+
     // -----------------------------------------------------------------------
     // Segment conversion tests
     // -----------------------------------------------------------------------
@@ -880,7 +939,7 @@ export const POSTFIX = "something"
             .iter()
             .map(|n| n.metadata.get("http_path").cloned().unwrap_or_default())
             .collect();
-        assert!(paths.iter().all(|p| p == "/payments"), "all should have path /payments");
+        assert!(paths.iter().all(|p| p == "/api/payments"), "all should have path /api/payments");
 
         let methods: std::collections::HashSet<_> = endpoints
             .iter()
