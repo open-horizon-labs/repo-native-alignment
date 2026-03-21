@@ -75,6 +75,11 @@ pub struct RnaHandler {
     /// Background enrichment and scanner-triggered incremental updates both write
     /// to the same LanceDB tables; concurrent writes cause "conflict" errors (#344).
     pub lance_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Subdirectory roots that are `lsp_only` — used as LSP working directories
+    /// without re-extracting their files (already covered by the primary root scan).
+    /// Populated from `[workspace.roots]` entries whose paths are subdirectories of `repo_root`.
+    /// Each entry is `(slug, absolute_path)`.
+    pub lsp_only_roots: Arc<Vec<(String, PathBuf)>>,
 }
 
 impl Default for RnaHandler {
@@ -92,6 +97,7 @@ impl Default for RnaHandler {
             embed_status: Arc::new(EmbeddingStatus::default()),
             non_code_root_slugs_cache: std::sync::Mutex::new(None),
             lance_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            lsp_only_roots: Arc::new(Vec::new()),
         }
     }
 }

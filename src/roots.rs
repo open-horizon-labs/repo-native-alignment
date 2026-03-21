@@ -63,6 +63,18 @@ pub struct RootConfig {
     /// reference the root by a stable name like "infra" or "protos".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slug_override: Option<String>,
+    /// When true, this root is a subdirectory of the primary root.
+    ///
+    /// Subdirectory roots (e.g. `client = "client"` where `client/` lives inside
+    /// the primary repo) are handled differently:
+    /// - **No tree-sitter extraction** — files are already covered by the primary root scan.
+    ///   Skipping re-extraction prevents duplicate nodes in search results.
+    /// - **LSP working directory** — the subdirectory path is passed as `rootUri` when
+    ///   starting language servers for nodes whose files live under this subdirectory.
+    ///   This lets typescript-language-server find `client/tsconfig.json` instead of
+    ///   failing to find it at the repo root.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lsp_only: bool,
 }
 
 impl RootConfig {
@@ -74,6 +86,7 @@ impl RootConfig {
             git_aware: true,
             excludes: Vec::new(),
             slug_override: None,
+            lsp_only: false,
         }
     }
 
@@ -247,6 +260,7 @@ impl WorkspaceConfig {
                 git_aware: false,
                 excludes: vec![],
                 slug_override: None,
+                lsp_only: false,
             });
         }
         self
@@ -303,6 +317,9 @@ impl WorkspaceConfig {
         use std::collections::{HashMap, HashSet};
 
         let declared = load_declared_roots(repo_root);
+
+        // Canonicalize the primary root once for subdirectory detection.
+        let canonical_primary = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
 
         // Build seen-paths and seen-slugs sets once (O(N) up-front rather than O(N²)
         // per-entry). Canonicalize existing roots once so we don't redo it per iteration.
@@ -370,11 +387,25 @@ impl WorkspaceConfig {
                 continue;
             }
 
-            tracing::info!(
-                "Registering declared workspace root '{}' at '{}'",
-                slug,
-                canonical.display()
-            );
+            // Detect subdirectory roots: if the declared path is a subdirectory of the
+            // primary root, mark it as `lsp_only`. Such roots already have their files
+            // covered by the primary root's tree-sitter extraction, so we only need them
+            // as an LSP working directory (e.g. so typescript-language-server can find
+            // `client/tsconfig.json` by starting from `client/` instead of the repo root).
+            let is_subdir = canonical.starts_with(&canonical_primary) && canonical != canonical_primary;
+            if is_subdir {
+                tracing::info!(
+                    "Registering declared subdirectory root '{}' at '{}' as lsp-only (files covered by primary root)",
+                    slug,
+                    canonical.display()
+                );
+            } else {
+                tracing::info!(
+                    "Registering declared workspace root '{}' at '{}'",
+                    slug,
+                    canonical.display()
+                );
+            }
             seen_paths.insert(canonical.clone(), slug.clone());
             seen_slugs.insert(slug.clone());
             self.roots.push(RootConfig {
@@ -383,9 +414,22 @@ impl WorkspaceConfig {
                 git_aware: true,
                 excludes: Vec::new(),
                 slug_override: Some(slug),
+                lsp_only: is_subdir,
             });
         }
         self
+    }
+
+    /// Get all lsp-only (subdirectory) roots as `(slug, path)` pairs.
+    ///
+    /// These are roots whose files are already covered by the primary root scan
+    /// but need their own LSP working directory.
+    pub fn lsp_only_roots(&self) -> Vec<(String, PathBuf)> {
+        self.roots
+            .iter()
+            .filter(|r| r.lsp_only)
+            .map(|r| (r.slug(), r.resolved_path()))
+            .collect()
     }
 
     /// Get all roots with their resolved paths and slugs.
@@ -603,6 +647,7 @@ excludes = ["*.iso", "*.dmg"]
                 git_aware: false,
                 excludes: vec![],
                 slug_override: None,
+                lsp_only: false,
             }],
         };
 
@@ -625,6 +670,7 @@ excludes = ["*.iso", "*.dmg"]
                 git_aware: false,
                 excludes: vec![],
                 slug_override: None,
+                lsp_only: false,
             }],
         };
 
@@ -670,6 +716,7 @@ excludes = ["*.iso", "*.dmg"]
             git_aware: false,
             excludes: vec!["*.tmp".to_string()],
             slug_override: None,
+            lsp_only: false,
         };
 
         let excludes = root.effective_excludes();
@@ -737,6 +784,7 @@ excludes = ["*.iso", "*.dmg"]
                 git_aware: false,
                 excludes: vec![],
                 slug_override: None,
+                lsp_only: false,
             }],
         };
 
@@ -754,6 +802,7 @@ excludes = ["*.iso", "*.dmg"]
                 git_aware: true,
                 excludes: vec![],
                 slug_override: None,
+                lsp_only: false,
             }],
         };
 
@@ -937,6 +986,7 @@ excludes = ["*.iso", "*.dmg"]
                 git_aware: false,
                 excludes: vec![],
                 slug_override: None,
+                lsp_only: false,
             }],
         }
         .with_primary_root(tmp1.path().to_path_buf())
@@ -1082,6 +1132,7 @@ excludes = ["*.iso", "*.dmg"]
             git_aware: true,
             excludes: vec![],
             slug_override: Some("infra".to_string()),
+            lsp_only: false,
         };
         assert_eq!(root.slug(), "infra");
     }
@@ -1094,6 +1145,7 @@ excludes = ["*.iso", "*.dmg"]
             git_aware: true,
             excludes: vec![],
             slug_override: None,
+            lsp_only: false,
         };
         assert_eq!(root.slug(), "tmp-some-project");
     }
@@ -1191,6 +1243,7 @@ excludes = ["*.iso", "*.dmg"]
             git_aware: true,
             excludes: vec![],
             slug_override: Some("../escape-attempt".to_string()),
+            lsp_only: false,
         };
         // Path separator stripped — slug is safe to use as a directory component
         assert_eq!(root.slug(), "escape-attempt");
@@ -1206,6 +1259,7 @@ excludes = ["*.iso", "*.dmg"]
             git_aware: true,
             excludes: vec![],
             slug_override: Some("..".to_string()),
+            lsp_only: false,
         };
         // ".." sanitizes to "" → falls back to path-derived slug
         assert_eq!(root.slug(), "tmp-some-project");
@@ -1286,6 +1340,95 @@ excludes = ["*.iso", "*.dmg"]
         let resolved = config.resolved_roots();
         let my_slug_roots: Vec<_> = resolved.iter().filter(|r| r.slug == "my-slug").collect();
         assert_eq!(my_slug_roots.len(), 1, "Duplicate sanitized slug must register exactly 1 root");
+    }
+
+    // ── Subdirectory (lsp_only) root tests ──────────────────────────
+
+    #[test]
+    fn test_subdirectory_root_is_marked_lsp_only() {
+        // A declared root whose path is a subdirectory of the primary root
+        // must be marked `lsp_only = true` so it doesn't re-extract files.
+        let repo_root = TempDir::new().unwrap();
+        let client_dir = repo_root.path().join("client");
+        fs::create_dir_all(&client_dir).unwrap();
+
+        let oh_dir = repo_root.path().join(".oh");
+        fs::create_dir_all(&oh_dir).unwrap();
+        // Relative path "client" resolves to <repo_root>/client — a subdirectory
+        fs::write(
+            oh_dir.join("config.toml"),
+            "[workspace.roots]\nclient = \"client\"\n",
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::default()
+            .with_primary_root(repo_root.path().to_path_buf())
+            .with_declared_roots(repo_root.path());
+
+        // The declared root should be present and marked lsp_only
+        let client_root = config.roots.iter().find(|r| r.slug_override.as_deref() == Some("client"));
+        assert!(client_root.is_some(), "Declared subdirectory root 'client' must be registered");
+        assert!(
+            client_root.unwrap().lsp_only,
+            "Subdirectory root 'client' must be marked lsp_only"
+        );
+    }
+
+    #[test]
+    fn test_sibling_root_is_not_lsp_only() {
+        // A declared root whose path is a sibling directory (not inside primary root)
+        // must NOT be marked `lsp_only` — it needs its own extraction.
+        let parent = TempDir::new().unwrap();
+        let repo_dir = parent.path().join("my-service");
+        let sibling_dir = parent.path().join("k8s-configs");
+        fs::create_dir_all(&repo_dir).unwrap();
+        fs::create_dir_all(&sibling_dir).unwrap();
+
+        let oh_dir = repo_dir.join(".oh");
+        fs::create_dir_all(&oh_dir).unwrap();
+        fs::write(
+            oh_dir.join("config.toml"),
+            "[workspace.roots]\ninfra = \"../k8s-configs\"\n",
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::default()
+            .with_primary_root(repo_dir.clone())
+            .with_declared_roots(&repo_dir);
+
+        let infra_root = config.roots.iter().find(|r| r.slug_override.as_deref() == Some("infra"));
+        assert!(infra_root.is_some(), "Declared sibling root 'infra' must be registered");
+        assert!(
+            !infra_root.unwrap().lsp_only,
+            "Sibling root 'infra' must NOT be marked lsp_only"
+        );
+    }
+
+    #[test]
+    fn test_lsp_only_roots_method_returns_subdirectory_roots() {
+        let repo_root = TempDir::new().unwrap();
+        let client_dir = repo_root.path().join("client");
+        let ai_service_dir = repo_root.path().join("ai_service");
+        fs::create_dir_all(&client_dir).unwrap();
+        fs::create_dir_all(&ai_service_dir).unwrap();
+
+        let oh_dir = repo_root.path().join(".oh");
+        fs::create_dir_all(&oh_dir).unwrap();
+        fs::write(
+            oh_dir.join("config.toml"),
+            "[workspace.roots]\nclient = \"client\"\nai_service = \"ai_service\"\n",
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::default()
+            .with_primary_root(repo_root.path().to_path_buf())
+            .with_declared_roots(repo_root.path());
+
+        let lsp_roots = config.lsp_only_roots();
+        assert_eq!(lsp_roots.len(), 2, "Both subdirectory roots should be lsp_only");
+        let slugs: Vec<&str> = lsp_roots.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(slugs.contains(&"client"), "client should be in lsp_only_roots");
+        assert!(slugs.contains(&"ai-service"), "ai_service (sanitized) should be in lsp_only_roots");
     }
 }
 

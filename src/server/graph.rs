@@ -237,6 +237,16 @@ impl RnaHandler {
         let mut scanners: Vec<(String, Scanner, crate::scanner::ScanResult, PathBuf, bool)> = Vec::new();
 
         for resolved_root in &resolved_roots {
+            // Skip lsp_only roots: their files are already covered by the primary root
+            // scan. Running a separate scanner over them would produce duplicate nodes.
+            if resolved_root.config.lsp_only {
+                tracing::debug!(
+                    "Skipping extraction for lsp_only root '{}' at '{}' (files covered by primary root)",
+                    resolved_root.slug,
+                    resolved_root.path.display()
+                );
+                continue;
+            }
             let root_slug = &resolved_root.slug;
             let root_path = &resolved_root.path;
             let excludes = resolved_root.config.effective_excludes();

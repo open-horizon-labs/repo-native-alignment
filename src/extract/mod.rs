@@ -333,6 +333,67 @@ impl Default for ExtractorRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// LSP root selection helper
+// ---------------------------------------------------------------------------
+
+/// Pick the best LSP working directory for a set of nodes given a list of candidate roots.
+///
+/// When a monorepo has subdirectory roots (e.g. `client = "client"`), we want the language
+/// server to start from the subdirectory (where `tsconfig.json` lives) rather than the repo
+/// root. This function picks the most-specific root path that covers the most nodes.
+///
+/// Algorithm:
+/// 1. For each candidate root, count how many nodes have files under that root.
+/// 2. Return the root with the highest count (longest-prefix wins ties because
+///    a more-specific path will have a strictly longer prefix, so it can only match
+///    a subset of what the parent root matches — ties in count therefore go to the
+///    shorter path, i.e. the primary root, which is the safe default).
+/// 3. Fall back to `primary_root` if no candidate matches any node.
+fn pick_lsp_root_for_nodes<'a>(
+    nodes: &[crate::graph::Node],
+    primary_root: &'a Path,
+    lsp_roots: &'a [(String, std::path::PathBuf)],
+) -> &'a Path {
+    if lsp_roots.is_empty() {
+        return primary_root;
+    }
+
+    // Count matches per candidate root.
+    let mut best_root: &Path = primary_root;
+    let mut best_count: usize = 0;
+    let mut best_depth: usize = 0; // tie-break: longer path = more specific
+
+    for (_slug, root_path) in lsp_roots {
+        let count = nodes
+            .iter()
+            .filter(|n| {
+                // Node file paths are relative to their root, so prepend primary_root to get the
+                // absolute path, then check if it starts with the candidate lsp_root.
+                let abs_file = primary_root.join(&n.id.file);
+                abs_file.starts_with(root_path)
+            })
+            .count();
+
+        let depth = root_path.components().count();
+        if count > best_count || (count == best_count && count > 0 && depth > best_depth) {
+            best_count = count;
+            best_depth = depth;
+            best_root = root_path.as_path();
+        }
+    }
+
+    if best_count > 0 {
+        tracing::debug!(
+            "pick_lsp_root: selected '{}' ({} matching nodes)",
+            best_root.display(),
+            best_count,
+        );
+    }
+    best_root
+}
+
+// ---------------------------------------------------------------------------
 // EnricherRegistry
 // ---------------------------------------------------------------------------
 
@@ -437,6 +498,11 @@ impl EnricherRegistry {
     /// Run all enrichers that support the given languages present in the graph.
     ///
     /// `repo_root` must be the actual project root (from `--repo`), not `cwd`.
+    /// `lsp_roots` is an optional list of `(slug, path)` for subdirectory roots declared
+    /// in `[workspace.roots]`. When provided, each enricher picks the most-specific
+    /// matching root as its LSP working directory. This lets typescript-language-server
+    /// start from `client/` (where `tsconfig.json` lives) rather than the repo root.
+    ///
     /// Returns a merged `EnrichmentResult` from all enrichers.
     pub async fn enrich_all(
         &self,
@@ -444,6 +510,7 @@ impl EnricherRegistry {
         index: &GraphIndex,
         languages: &[String],
         repo_root: &Path,
+        lsp_roots: &[(String, std::path::PathBuf)],
     ) -> EnrichmentResult {
         let mut result = EnrichmentResult::default();
 
@@ -463,7 +530,17 @@ impl EnricherRegistry {
                 continue; // silently skip — too many servers to log each one
             }
 
-            match enricher.enrich(nodes, index, repo_root).await {
+            // Pick the best LSP working directory for this enricher.
+            // If there are lsp_roots (declared subdirectory roots), find the most-specific
+            // one that covers the majority of the nodes this enricher will process.
+            // "Most specific" = longest path prefix match.
+            let effective_root: &Path = if lsp_roots.is_empty() {
+                repo_root
+            } else {
+                pick_lsp_root_for_nodes(nodes, repo_root, lsp_roots)
+            };
+
+            match enricher.enrich(nodes, index, effective_root).await {
                 Ok(enrichment) => {
                     // If enrich() returned Ok, the server was available and ran.
                     result.any_enricher_ran = true;

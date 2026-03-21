@@ -2603,7 +2603,7 @@ mod tests {
 
         // Enrich with no nodes should work fine for all enrichers
         let index = GraphIndex::new();
-        let result = registry.enrich_all(&[], &index, &["rust".to_string(), "python".to_string()], std::path::Path::new(".")).await;
+        let result = registry.enrich_all(&[], &index, &["rust".to_string(), "python".to_string()], std::path::Path::new("."), &[]).await;
         assert!(result.added_edges.is_empty());
     }
 
