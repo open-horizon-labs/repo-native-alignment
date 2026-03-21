@@ -937,9 +937,8 @@ impl RnaHandler {
 
         // Re-run API link pass with the full (existing + new) node set so that
         // cross-file links are created when only one side of a match was updated.
-        // Duplicate edges from the previous pass are deduplicated by the LanceDB
-        // merge_insert upsert path and are harmless in the in-memory graph
-        // (stable_id-keyed dedup happens at persist time).
+        // Duplicate edges from the previous pass are deduplicated below before
+        // rebuild_from_edges so they don't cause PageRank skew.
         {
             let api_link_edges = crate::extract::api_link::api_link_pass(&graph.nodes);
             if !api_link_edges.is_empty() {
@@ -1010,6 +1009,18 @@ impl RnaHandler {
                 graph.edges.extend(dir_result.edges);
                 graph.nodes.extend(dir_result.nodes);
             }
+        }
+
+        // Deduplicate graph.edges in-place before rebuilding the petgraph index.
+        // Post-extraction passes (api_link, manifest, tested_by, directory_module) re-run
+        // over the full node set on every incremental scan, which causes the same edges to
+        // be appended to graph.edges repeatedly.  After N scans each edge appears
+        // N times, inflating PageRank weights for the connected nodes.
+        //
+        // We use Edge::stable_id() (encodes from→kind→to) as the dedup key.
+        {
+            let mut seen = std::collections::HashSet::new();
+            graph.edges.retain(|e| seen.insert(e.stable_id()));
         }
 
         // Rebuild petgraph index
