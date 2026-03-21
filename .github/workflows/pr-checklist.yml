@@ -1,0 +1,36 @@
+name: PR Checklist
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  checklist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Check for unchecked items
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            const body = pr.body || '';
+            const unchecked = (body.match(/^- \[ \] /gm) || []).length;
+            const checked = (body.match(/^- \[x\] /gmi) || []).length;
+            const total = unchecked + checked;
+
+            if (total === 0) {
+              console.log('No checklist items found — passing.');
+              return;
+            }
+
+            console.log(`Checklist: ${checked}/${total} complete`);
+
+            if (unchecked > 0) {
+              core.setFailed(`${unchecked} unchecked item(s) in PR description. Complete all checklist items before merging.`);
+            }
