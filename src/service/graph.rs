@@ -26,12 +26,25 @@ pub fn graph_query(params: &GraphParams, graph_state: &GraphState) -> Result<Str
     let resolved_node = graph_state.resolve_node_id(&params.node);
     let result_ids = run_traversal(&graph_state.index, &resolved_node, &params.mode, params.max_hops.map(|h| h as u32), Some(params.direction.as_str()), edge_filter_slice)?;
     let node_index_map = graph_state.node_index_map();
-    // Filter out hidden node kinds (Module, PrMerge) before counting and rendering.
-    // This ensures the reported count matches the displayed entries.
+    // When the user explicitly requests `belongs_to` edges, Module nodes are the
+    // intended targets and should be shown, not hidden.  For all other queries,
+    // Module and PrMerge nodes are structural scaffolding and remain hidden.
+    let show_module_nodes = params.edge_types
+        .as_ref()
+        .map(|types| types.iter().any(|t| t.trim().eq_ignore_ascii_case("belongs_to")))
+        .unwrap_or(false);
     let displayable: Vec<_> = result_ids.iter()
         .filter(|id| {
             graph_state.node_by_stable_id(id, &node_index_map)
-                .map(|n| !matches!(n.id.kind, NodeKind::Module | NodeKind::PrMerge))
+                .map(|n| {
+                    if matches!(n.id.kind, NodeKind::PrMerge) {
+                        return false; // always hidden
+                    }
+                    if matches!(n.id.kind, NodeKind::Module) {
+                        return show_module_nodes; // shown only when belongs_to requested
+                    }
+                    true
+                })
                 .unwrap_or(true) // Unknown IDs: include (rendered as bare ID below)
         })
         .collect();

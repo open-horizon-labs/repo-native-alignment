@@ -605,6 +605,31 @@ impl RnaHandler {
             }
         }
 
+        // 4e. Directory-module pass: emit BelongsTo edges from every symbol to
+        //     a virtual NodeKind::Module node derived from its directory path.
+        //     Runs unconditionally for all languages — no LSP required.
+        //     The LSP enricher's Pass 4 (rust-analyzer/parentModule) provides
+        //     more accurate Rust module paths and runs later as an override.
+        //
+        //     Deduplication note: for clean-root cache-reuse builds, the cached
+        //     node set already contains module nodes from the previous run.  This
+        //     pass will re-emit them with identical stable_ids — LanceDB's
+        //     merge_insert upsert path handles the dedup at persist time, and
+        //     GraphIndex's ensure_node deduplicates in the petgraph index.  The
+        //     same approach is used by api_link_pass and tested_by_pass.
+        {
+            let dir_result = crate::extract::directory_module::directory_module_pass(&all_nodes);
+            if !dir_result.edges.is_empty() {
+                tracing::info!(
+                    "Directory module pass: {} BelongsTo edge(s), {} module node(s)",
+                    dir_result.edges.len(),
+                    dir_result.nodes.len(),
+                );
+                all_nodes.extend(dir_result.nodes);
+                all_edges.extend(dir_result.edges);
+            }
+        }
+
         // 5. Build petgraph index
         let mut index = GraphIndex::new();
         index.rebuild_from_edges(&all_edges);
@@ -946,6 +971,29 @@ impl RnaHandler {
                 // Include in upsert delta so these edges are persisted to LanceDB.
                 upsert_edges.extend(tested_by_edges.iter().cloned());
                 graph.edges.extend(tested_by_edges);
+            }
+        }
+
+        // Re-run directory-module pass over the full node set so that
+        // BelongsTo edges are always present without requiring LSP quiescence.
+        // Include in upsert delta so edges are persisted to LanceDB.
+        {
+            let dir_result =
+                crate::extract::directory_module::directory_module_pass(&graph.nodes);
+            if !dir_result.edges.is_empty() {
+                tracing::info!(
+                    "Directory module pass (incremental): {} BelongsTo edge(s), {} module node(s)",
+                    dir_result.edges.len(),
+                    dir_result.nodes.len(),
+                );
+                // Also add the new module nodes to the upsert delta so they
+                // are persisted to LanceDB.  Without this, upsert_nodes is
+                // rebuilt only from upsert_node_ids and the module rows would
+                // be missing — leaving BelongsTo edges pointing at ghost nodes.
+                upsert_node_ids.extend(dir_result.nodes.iter().map(|n| n.stable_id()));
+                upsert_edges.extend(dir_result.edges.iter().cloned());
+                graph.edges.extend(dir_result.edges);
+                graph.nodes.extend(dir_result.nodes);
             }
         }
 
