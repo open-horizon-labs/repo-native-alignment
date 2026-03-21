@@ -13,7 +13,8 @@ use crate::scanner::Scanner;
 use super::helpers;
 use super::state::GraphState;
 use super::store::{
-    delete_nodes_for_roots, persist_graph_incremental, persist_graph_to_lance,
+    check_and_migrate_extraction_version, delete_nodes_for_roots, persist_graph_incremental,
+    persist_graph_to_lance,
 };
 use super::{PipelineResult, RnaHandler};
 
@@ -1026,6 +1027,37 @@ impl RnaHandler {
             tracing::info!("Schema migrated during incremental pre-flight -- falling back to full rebuild");
             on_progress("Schema migration detected -- rebuilding from scratch.");
             return self.run_pipeline_foreground_full(on_progress, pipeline_start).await;
+        }
+
+        // Pre-flight: check extraction version. If it changed (e.g., EXTRACTION_VERSION
+        // bumped in a new binary), clear scan-state files and fall back to full rebuild so
+        // all files are re-extracted with the updated extraction logic.
+        // Without this check the incremental path skips build_full_graph_inner (which
+        // contains the extraction-version guard) and reports "incremental, no changes".
+        {
+            let workspace = WorkspaceConfig::load()
+                .with_primary_root(self.repo_root.clone())
+                .with_worktrees(&self.repo_root)
+                .with_declared_roots(&self.repo_root);
+            let secondary_slugs: Vec<String> = workspace
+                .resolved_roots()
+                .iter()
+                .filter(|r| r.path != self.repo_root)
+                .map(|r| r.slug.clone())
+                .collect();
+            match check_and_migrate_extraction_version(&db_path, &self.repo_root, &secondary_slugs) {
+                Ok(true) => {
+                    tracing::info!(
+                        "Extraction version migrated during incremental pre-flight -- falling back to full rebuild"
+                    );
+                    on_progress("Extraction version upgrade detected -- rebuilding from scratch.");
+                    return self.run_pipeline_foreground_full(on_progress, pipeline_start).await;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!("Extraction version check failed (proceeding): {}", e);
+                }
+            }
         }
 
         // Phase 1: Scan to detect changes.
