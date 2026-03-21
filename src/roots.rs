@@ -544,14 +544,15 @@ fn sanitize_slug(slug: &str) -> String {
 /// two worktrees share the same directory name.
 /// e.g., `/Users/foo/src/my-project` -> `users-foo-src-my-project`
 fn path_to_slug(path: &Path) -> String {
-    path.to_string_lossy()
-        .trim_start_matches('/')
-        .to_lowercase()
-        .replace(|c: char| !c.is_alphanumeric() && c != '-', "-")
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
+    // Use only the directory name (last component) so slugs are portable across
+    // machines and user home directories. Full paths like /Users/muness/src/foo
+    // produce machine-specific slugs like "users-muness-src-foo"; just "foo" is
+    // stable regardless of where the repo is checked out.
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    sanitize_slug(&name)
 }
 
 /// Compute the Claude Code auto-memory directory for a given repo root.
