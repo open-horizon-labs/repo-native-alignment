@@ -1047,18 +1047,12 @@ impl RnaHandler {
                 .filter(|r| r.path != self.repo_root)
                 .map(|r| r.slug.clone())
                 .collect();
-            match check_and_migrate_extraction_version(&db_path, &self.repo_root, &secondary_slugs) {
-                Ok(true) => {
-                    tracing::info!(
-                        "Extraction version migrated during incremental pre-flight -- falling back to full rebuild"
-                    );
-                    on_progress("Extraction version upgrade detected -- rebuilding from scratch.");
-                    return self.run_pipeline_foreground_full(on_progress, pipeline_start).await;
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!("Extraction version check failed (proceeding): {}", e);
-                }
+            if check_and_migrate_extraction_version(&db_path, &self.repo_root, &secondary_slugs)? {
+                tracing::info!(
+                    "Extraction version migrated during incremental pre-flight -- falling back to full rebuild"
+                );
+                on_progress("Extraction version upgrade detected -- rebuilding from scratch.");
+                return self.run_pipeline_foreground_full(on_progress, pipeline_start).await;
             }
         }
 
