@@ -1225,7 +1225,8 @@ impl LspEnricher {
             all_crates.insert(to.clone());
         }
 
-        // Create a crate node for each unique crate
+        // Create a crate node for each unique crate.
+        // body = crate name so build_code_embedding_text produces meaningful embeddings.
         for crate_name in &all_crates {
             let node_id = NodeId {
                 root: root_id.to_string(),
@@ -1239,7 +1240,7 @@ impl LspEnricher {
                 line_start: 0,
                 line_end: 0,
                 signature: format!("crate {}", crate_name),
-                body: String::new(),
+                body: crate_name.clone(),
                 metadata: std::collections::BTreeMap::new(),
                 source: ExtractionSource::Lsp,
             });
@@ -4513,6 +4514,11 @@ mod tests {
             .filter(|n| matches!(&n.id.kind, NodeKind::Other(s) if s == "crate"))
             .collect();
         assert_eq!(crate_nodes.len(), 2);
+
+        // Bodies should be non-empty (crate name as body for embedding quality)
+        for n in &crate_nodes {
+            assert!(!n.body.is_empty(), "crate node body should be the crate name");
+        }
 
         // Should have 1 DependsOn edge
         let dep_edges: Vec<_> = result.added_edges.iter()
