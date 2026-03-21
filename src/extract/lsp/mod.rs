@@ -1135,10 +1135,10 @@ impl LspEnricher {
     /// ```
     ///
     /// Only workspace crates are included by default (`full: false`).
-    /// Returns a list of `(from_crate_name, to_crate_name)` dependency pairs.
+    /// Returns `(crate_names, dep_pairs)` — see [`parse_crate_graph_dot`] for details.
     async fn fetch_crate_graph(
         transport: &PipelinedTransport,
-    ) -> Result<Vec<(String, String)>> {
+    ) -> Result<(Vec<String>, Vec<(String, String)>)> {
         let params = serde_json::json!({ "full": false });
         let result = transport
             .request("rust-analyzer/viewCrateGraph", &params)
@@ -1146,18 +1146,21 @@ impl LspEnricher {
 
         let dot = match result.as_str() {
             Some(s) => s.to_string(),
-            None => return Ok(Vec::new()),
+            None => return Ok((Vec::new(), Vec::new())),
         };
 
         Ok(Self::parse_crate_graph_dot(&dot))
     }
 
-    /// Parse a DOT digraph string from `rust-analyzer/viewCrateGraph` and
-    /// return a list of `(from_crate_name, to_crate_name)` dependency pairs.
+    /// Parse a DOT digraph string from `rust-analyzer/viewCrateGraph`.
     ///
-    /// Also returns singleton node entries for crates with no outgoing edges
-    /// by including all node label definitions.
-    fn parse_crate_graph_dot(dot: &str) -> Vec<(String, String)> {
+    /// Returns `(crate_names, dep_pairs)` where:
+    /// - `crate_names`: all crate names found in the graph (including isolated crates)
+    /// - `dep_pairs`: resolved `(from_crate, to_crate)` dependency pairs
+    ///
+    /// Isolated crates (no dependencies) are included in `crate_names` so they
+    /// still get a crate node even when there are no dependency edges.
+    fn parse_crate_graph_dot(dot: &str) -> (Vec<String>, Vec<(String, String)>) {
         // Maps DOT node ID (e.g. "_0") to crate name (e.g. "my_crate")
         let mut id_to_name: HashMap<String, String> = HashMap::new();
         let mut edges: Vec<(String, String)> = Vec::new();
@@ -1197,29 +1200,37 @@ impl LspEnricher {
             }
         }
 
-        // Resolve IDs to names
-        edges.into_iter()
+        // All crate names (including isolated crates with no edges)
+        let mut crate_names: Vec<String> = id_to_name.values().cloned().collect();
+        crate_names.sort();
+        crate_names.dedup();
+
+        // Resolve edge IDs to crate names
+        let resolved_edges = edges.into_iter()
             .filter_map(|(from_id, to_id)| {
                 let from = id_to_name.get(&from_id)?;
                 let to = id_to_name.get(&to_id)?;
                 Some((from.clone(), to.clone()))
             })
-            .collect()
+            .collect();
+
+        (crate_names, resolved_edges)
     }
 
     /// Emit crate nodes and `DependsOn` edges from a parsed crate graph.
     ///
-    /// Creates a `NodeKind::Other("crate")` node for every crate name, then
-    /// emits a `DependsOn` edge for each dependency relationship.
+    /// Creates a `NodeKind::Other("crate")` node for every crate name (including
+    /// isolated crates with no edges), then emits a `DependsOn` edge for each
+    /// dependency relationship.
     fn emit_crate_graph_edges(
+        crate_names: &[String],
         pairs: &[(String, String)],
         root_id: &str,
         result: &mut EnrichmentResult,
     ) {
-        use std::collections::HashSet;
-
-        // Collect all unique crate names
-        let mut all_crates: HashSet<String> = HashSet::new();
+        // Collect all unique crate names (isolated crates from crate_names + crates in edges)
+        let mut all_crates: std::collections::BTreeSet<String> =
+            crate_names.iter().cloned().collect();
         for (from, to) in pairs {
             all_crates.insert(from.clone());
             all_crates.insert(to.clone());
@@ -1613,16 +1624,16 @@ impl Enricher for LspEnricher {
                 .unwrap_or_default();
 
             match Self::fetch_crate_graph(&transport).await {
-                Ok(pairs) if !pairs.is_empty() => {
+                Ok((crate_names, pairs)) if !crate_names.is_empty() => {
                     let pair_count = pairs.len();
-                    Self::emit_crate_graph_edges(&pairs, &root_id, &mut result);
+                    Self::emit_crate_graph_edges(&crate_names, &pairs, &root_id, &mut result);
                     tracing::info!(
-                        "LSP Pass 0 complete in {:?}: {} crate DependsOn edges",
-                        pass0_start.elapsed(), pair_count
+                        "LSP Pass 0 complete in {:?}: {} crate nodes, {} DependsOn edges",
+                        pass0_start.elapsed(), crate_names.len(), pair_count
                     );
                 }
                 Ok(_) => {
-                    tracing::debug!("LSP Pass 0: viewCrateGraph returned no edges");
+                    tracing::debug!("LSP Pass 0: viewCrateGraph returned no crates");
                 }
                 Err(e) => {
                     tracing::debug!("LSP Pass 0: viewCrateGraph failed: {}", e);
@@ -4461,7 +4472,8 @@ mod tests {
     _1 [shape=box label="dep_crate"]
     _0 -> _1
 }"#;
-        let pairs = LspEnricher::parse_crate_graph_dot(dot);
+        let (crate_names, pairs) = LspEnricher::parse_crate_graph_dot(dot);
+        assert_eq!(crate_names.len(), 2);
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "my_crate");
         assert_eq!(pairs[0].1, "dep_crate");
@@ -4476,7 +4488,8 @@ mod tests {
     _0 -> _1
     _0 -> _2
 }"#;
-        let pairs = LspEnricher::parse_crate_graph_dot(dot);
+        let (crate_names, pairs) = LspEnricher::parse_crate_graph_dot(dot);
+        assert_eq!(crate_names.len(), 3);
         assert_eq!(pairs.len(), 2);
         let from_names: Vec<&str> = pairs.iter().map(|(f, _)| f.as_str()).collect();
         assert!(from_names.iter().all(|&f| f == "rna"));
@@ -4488,7 +4501,8 @@ mod tests {
     #[test]
     fn test_parse_crate_graph_dot_empty() {
         let dot = "digraph rust_analyzer_crate_graph {}";
-        let pairs = LspEnricher::parse_crate_graph_dot(dot);
+        let (crate_names, pairs) = LspEnricher::parse_crate_graph_dot(dot);
+        assert!(crate_names.is_empty());
         assert!(pairs.is_empty());
     }
 
@@ -4497,17 +4511,21 @@ mod tests {
         let dot = r#"digraph rust_analyzer_crate_graph {
     _0 [shape=box label="standalone_crate"]
 }"#;
-        let pairs = LspEnricher::parse_crate_graph_dot(dot);
+        let (crate_names, pairs) = LspEnricher::parse_crate_graph_dot(dot);
+        // Isolated crate should be in crate_names even with no edges
+        assert_eq!(crate_names, vec!["standalone_crate"],
+            "isolated crate should appear in crate_names");
         assert!(pairs.is_empty(), "no edges should produce empty pairs");
     }
 
     #[test]
     fn test_emit_crate_graph_edges_nodes_and_edges() {
+        let crate_names = vec!["crate_a".to_string(), "crate_b".to_string()];
         let pairs = vec![
             ("crate_a".to_string(), "crate_b".to_string()),
         ];
         let mut result = EnrichmentResult::default();
-        LspEnricher::emit_crate_graph_edges(&pairs, "my_root", &mut result);
+        LspEnricher::emit_crate_graph_edges(&crate_names, &pairs, "my_root", &mut result);
 
         // Should have 2 crate nodes
         let crate_nodes: Vec<_> = result.new_nodes.iter()
@@ -4534,15 +4552,16 @@ mod tests {
     // Adversarial tests for #405: DOT parser edge cases and emit robustness
     // -----------------------------------------------------------------------
 
-    /// Malformed DOT: edge references unknown node IDs — should produce no pairs
+    /// Malformed DOT: edge references unknown node IDs — should produce no pairs but preserve known crate
     #[test]
     fn test_parse_crate_graph_dot_dangling_edge() {
         let dot = r#"digraph rust_analyzer_crate_graph {
     _0 [shape=box label="known_crate"]
     _0 -> _99
 }"#;
-        let pairs = LspEnricher::parse_crate_graph_dot(dot);
-        // _99 has no label; should filter out since id_to_name lookup returns None
+        let (crate_names, pairs) = LspEnricher::parse_crate_graph_dot(dot);
+        // _99 has no label; edge should be filtered out but known_crate node is preserved
+        assert_eq!(crate_names, vec!["known_crate"], "known crate should still be in crate_names");
         assert!(pairs.is_empty(), "dangling edge to unknown node should produce no pairs");
     }
 
@@ -4554,7 +4573,8 @@ mod tests {
     _1 [shape=box label="another_crate-2"]
     _0 -> _1
 }"#;
-        let pairs = LspEnricher::parse_crate_graph_dot(dot);
+        let (crate_names, pairs) = LspEnricher::parse_crate_graph_dot(dot);
+        assert_eq!(crate_names.len(), 2);
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "my-crate");
         assert_eq!(pairs[0].1, "another_crate-2");
@@ -4571,7 +4591,8 @@ mod tests {
     _0 -> _2
     _1 -> _2
 }"#;
-        let pairs = LspEnricher::parse_crate_graph_dot(dot);
+        let (crate_names, pairs) = LspEnricher::parse_crate_graph_dot(dot);
+        assert_eq!(crate_names.len(), 3);
         assert_eq!(pairs.len(), 3, "diamond graph should have 3 edges");
         let has_app_core = pairs.iter().any(|(f, t)| f == "app" && t == "core");
         let has_app_utils = pairs.iter().any(|(f, t)| f == "app" && t == "utils");
@@ -4584,16 +4605,18 @@ mod tests {
     /// Empty DOT string should not panic
     #[test]
     fn test_parse_crate_graph_dot_completely_empty_string() {
-        let pairs = LspEnricher::parse_crate_graph_dot("");
+        let (crate_names, pairs) = LspEnricher::parse_crate_graph_dot("");
+        assert!(crate_names.is_empty());
         assert!(pairs.is_empty());
     }
 
     /// Crate nodes use `file: Cargo.toml` — verify the file path anchoring
     #[test]
     fn test_emit_crate_graph_edges_file_anchor() {
+        let crate_names = vec!["crate_a".to_string(), "crate_b".to_string()];
         let pairs = vec![("crate_a".to_string(), "crate_b".to_string())];
         let mut result = EnrichmentResult::default();
-        LspEnricher::emit_crate_graph_edges(&pairs, "root", &mut result);
+        LspEnricher::emit_crate_graph_edges(&crate_names, &pairs, "root", &mut result);
 
         for node in &result.new_nodes {
             if matches!(&node.id.kind, NodeKind::Other(s) if s == "crate") {
@@ -4604,5 +4627,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Isolated crate (no edges) should still produce a crate node
+    #[test]
+    fn test_emit_crate_graph_edges_isolated_crate_gets_node() {
+        // Single isolated crate with no edges
+        let crate_names = vec!["solo_crate".to_string()];
+        let pairs: Vec<(String, String)> = vec![];
+        let mut result = EnrichmentResult::default();
+        LspEnricher::emit_crate_graph_edges(&crate_names, &pairs, "root", &mut result);
+
+        let crate_nodes: Vec<_> = result.new_nodes.iter()
+            .filter(|n| matches!(&n.id.kind, NodeKind::Other(s) if s == "crate"))
+            .collect();
+        assert_eq!(crate_nodes.len(), 1, "isolated crate should get a node");
+        assert_eq!(crate_nodes[0].id.name, "solo_crate");
+        assert!(result.added_edges.is_empty(), "no edges for isolated crate");
     }
 }
