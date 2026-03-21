@@ -1216,6 +1216,16 @@ fn run_route_queries(
     nodes: &mut Vec<Node>,
     edges: &mut Vec<crate::graph::Edge>,
 ) {
+    // Pre-index Function nodes in this file by line_start for O(1) handler lookup.
+    // Built once before the outer loop so it doesn't scale with O(routes × nodes).
+    // Only includes nodes already in `nodes` (tree-sitter extracted Functions) —
+    // ApiEndpoint nodes emitted during this pass are not yet present and need not be.
+    let fn_by_line: std::collections::HashMap<usize, NodeId> = nodes
+        .iter()
+        .filter(|n| n.id.kind == NodeKind::Function && n.id.file == path)
+        .map(|n| (n.line_start, n.id.clone()))
+        .collect();
+
     for (cfg, maybe_extractor) in configs.iter().zip(compiled.iter()) {
         let extractor = match maybe_extractor {
             Some(e) => e,
@@ -1263,21 +1273,15 @@ fn run_route_queries(
                 kind: NodeKind::ApiEndpoint,
             };
 
-            // Find the handler function: same file, Function kind, line_start in
-            // the search window immediately below the decorator.
-            let handler = nodes
-                .iter()
-                .find(|n| {
-                    n.id.kind == NodeKind::Function
-                        && n.id.file == path
-                        && n.line_start >= search_start
-                        && n.line_start <= search_end
-                });
+            // Find the handler function in the pre-built index: scan the narrow
+            // window [search_start, search_end] instead of the entire node list.
+            let handler = (search_start..=search_end)
+                .find_map(|line| fn_by_line.get(&line));
 
-            if let Some(h) = handler {
+            if let Some(handler_id) = handler {
                 edges.push(crate::graph::Edge {
                     from: endpoint_node_id.clone(),
-                    to: h.id.clone(),
+                    to: handler_id.clone(),
                     kind: crate::graph::EdgeKind::Implements,
                     source: ExtractionSource::TreeSitter,
                     confidence: crate::graph::Confidence::Detected,

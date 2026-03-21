@@ -283,18 +283,11 @@ impl ExtractorRegistry {
             result.merge(file_result);
         }
 
-        // Post-extraction pass: link URL-path string-literal Const nodes to
-        // matching ApiEndpoint nodes via DependsOn edges.
-        let pre_link_edges = result.edges.len();
-        api_link::api_link_pass(&mut result);
-        let link_edges = result.edges.len() - pre_link_edges;
-
         tracing::info!(
-            "ExtractorRegistry: completed extraction in {:?} ({} node(s), {} edge(s), {} api-link edge(s))",
+            "ExtractorRegistry: completed extraction in {:?} ({} node(s), {} edge(s))",
             extraction_start.elapsed(),
             result.nodes.len(),
             result.edges.len(),
-            link_edges,
         );
 
         result

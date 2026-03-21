@@ -34,9 +34,9 @@
 //! comparison so that a `"/users/:id"` string literal matches a
 //! `GET /users/{id}` endpoint.
 
-use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, NodeKind};
+use std::collections::HashMap;
 
-use super::ExtractionResult;
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 /// Returns `true` if `s` looks like a URL path: starts with `/` and has length
 /// greater than 1 (excludes the root `/` alone, which matches everything).
@@ -77,51 +77,58 @@ pub fn normalize_path(path: &str) -> String {
 /// Post-extraction pass: link string-literal `Const` nodes that look like URL
 /// paths to matching `ApiEndpoint` nodes via `DependsOn` edges.
 ///
-/// Call this after all per-file extraction is complete so both node types are
-/// available. The pass is O(C × A) where C is the number of URL-shaped `Const`
-/// nodes and A is the number of `ApiEndpoint` nodes — both are typically small.
+/// Call this **after all nodes from all roots have been merged** (i.e., in
+/// `build_full_graph` after `all_nodes` is fully populated), not per-file or
+/// per-delta. The reason: the `Const` caller may be in a different file from
+/// the `ApiEndpoint` it references, and incremental scans only process changed
+/// files. Running this pass on the full node set ensures cross-file links are
+/// always created correctly.
 ///
-/// Edges are appended to `result.edges` in-place.
-pub fn api_link_pass(result: &mut ExtractionResult) {
-    // Collect URL-shaped Const nodes and ApiEndpoint nodes separately so we
-    // don't borrow `result.nodes` mutably while iterating.
+/// Complexity: O(C + E) using a HashMap keyed by normalised path, where C is
+/// the count of URL-shaped `Const` nodes and E is the count of `ApiEndpoint`
+/// nodes — both are typically small.
+///
+/// Returns the new edges to add.
+pub fn api_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
+    // Build a HashMap from normalised endpoint path → endpoint NodeId.
+    // Multiple endpoints can share the same normalised path (e.g., GET and
+    // POST both at /users/{id} after normalisation), so we store a Vec.
+    let mut endpoint_map: HashMap<String, Vec<NodeId>> = HashMap::new();
+    for node in all_nodes {
+        if node.id.kind != NodeKind::ApiEndpoint {
+            continue;
+        }
+        if let Some(http_path) = node.metadata.get("http_path") {
+            let norm = normalize_path(http_path);
+            endpoint_map.entry(norm).or_default().push(node.id.clone());
+        }
+    }
+
+    if endpoint_map.is_empty() {
+        return Vec::new();
+    }
+
+    let mut edges = Vec::new();
+
     // Only match synthetic Const nodes (string literals from harvest_string_literals).
     // Non-synthetic Const nodes are actual declared constants whose names may
     // coincidentally start with '/' but are not URL path strings.
-    let url_consts: Vec<_> = result
-        .nodes
-        .iter()
-        .filter(|n| {
-            n.id.kind == NodeKind::Const
-                && n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false)
-                && looks_like_url_path(&n.id.name)
-        })
-        .map(|n| (n.id.clone(), normalize_path(&n.id.name)))
-        .collect();
+    for node in all_nodes {
+        if node.id.kind != NodeKind::Const {
+            continue;
+        }
+        if !node.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false) {
+            continue;
+        }
+        if !looks_like_url_path(&node.id.name) {
+            continue;
+        }
 
-    if url_consts.is_empty() {
-        return;
-    }
-
-    let endpoints: Vec<_> = result
-        .nodes
-        .iter()
-        .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
-        .filter_map(|n| {
-            let http_path = n.metadata.get("http_path")?;
-            Some((n.id.clone(), normalize_path(http_path)))
-        })
-        .collect();
-
-    if endpoints.is_empty() {
-        return;
-    }
-
-    for (const_id, const_norm) in &url_consts {
-        for (ep_id, ep_norm) in &endpoints {
-            if const_norm == ep_norm {
-                result.edges.push(Edge {
-                    from: const_id.clone(),
+        let norm = normalize_path(&node.id.name);
+        if let Some(ep_ids) = endpoint_map.get(&norm) {
+            for ep_id in ep_ids {
+                edges.push(Edge {
+                    from: node.id.clone(),
                     to: ep_id.clone(),
                     kind: EdgeKind::DependsOn,
                     source: ExtractionSource::TreeSitter,
@@ -130,6 +137,8 @@ pub fn api_link_pass(result: &mut ExtractionResult) {
             }
         }
     }
+
+    edges
 }
 
 // ---------------------------------------------------------------------------
@@ -197,14 +206,14 @@ mod tests {
     /// Exact path match: `/payments` Const → `POST /payments` ApiEndpoint.
     #[test]
     fn test_exact_path_match_emits_depends_on_edge() {
-        let mut result = ExtractionResult::default();
-        result.nodes.push(make_const("/payments", "client.py"));
-        result.nodes.push(make_endpoint("POST", "/payments", "routes.py"));
+        let nodes = vec![
+            make_const("/payments", "client.py"),
+            make_endpoint("POST", "/payments", "routes.py"),
+        ];
+        let edges = api_link_pass(&nodes);
 
-        api_link_pass(&mut result);
-
-        assert_eq!(result.edges.len(), 1, "should emit exactly 1 DependsOn edge");
-        let edge = &result.edges[0];
+        assert_eq!(edges.len(), 1, "should emit exactly 1 DependsOn edge");
+        let edge = &edges[0];
         assert_eq!(edge.kind, EdgeKind::DependsOn);
         assert_eq!(edge.from.kind, NodeKind::Const);
         assert_eq!(edge.from.name, "/payments");
@@ -215,75 +224,85 @@ mod tests {
     /// Express-style `:id` matches Spring-style `{id}` via normalisation.
     #[test]
     fn test_param_normalization_colon_matches_braces() {
-        let mut result = ExtractionResult::default();
-        result.nodes.push(make_const("/users/:id", "client.js"));
-        result.nodes.push(make_endpoint("GET", "/users/{id}", "routes.py"));
+        let nodes = vec![
+            make_const("/users/:id", "client.js"),
+            make_endpoint("GET", "/users/{id}", "routes.py"),
+        ];
+        let edges = api_link_pass(&nodes);
 
-        api_link_pass(&mut result);
-
-        assert_eq!(result.edges.len(), 1, "should match :id to {{id}} via normalisation");
+        assert_eq!(edges.len(), 1, "should match :id to {{id}} via normalisation");
     }
 
     /// Next.js `[id]` bracket style also normalises correctly.
     #[test]
     fn test_param_normalization_brackets() {
-        let mut result = ExtractionResult::default();
-        result.nodes.push(make_const("/users/[id]", "pages.tsx"));
-        result.nodes.push(make_endpoint("GET", "/users/{id}", "routes.py"));
+        let nodes = vec![
+            make_const("/users/[id]", "pages.tsx"),
+            make_endpoint("GET", "/users/{id}", "routes.py"),
+        ];
+        let edges = api_link_pass(&nodes);
 
-        api_link_pass(&mut result);
-
-        assert_eq!(result.edges.len(), 1, "should match [id] to {{id}} via normalisation");
+        assert_eq!(edges.len(), 1, "should match [id] to {{id}} via normalisation");
     }
 
     /// Non-URL strings (e.g. MIME types) must NOT produce edges.
     #[test]
     fn test_non_path_string_does_not_link() {
-        let mut result = ExtractionResult::default();
-        result.nodes.push(make_const("application/json", "client.py"));
-        result.nodes.push(make_endpoint("POST", "/payments", "routes.py"));
-
-        api_link_pass(&mut result);
+        let nodes = vec![
+            make_const("application/json", "client.py"),
+            make_endpoint("POST", "/payments", "routes.py"),
+        ];
+        let edges = api_link_pass(&nodes);
 
         assert!(
-            result.edges.is_empty(),
-            "non-path string should produce no edge, got: {:?}", result.edges
+            edges.is_empty(),
+            "non-path string should produce no edge, got: {:?}", edges
         );
     }
 
     /// No endpoints → no edges even if there are URL-shaped strings.
     #[test]
     fn test_no_endpoints_no_edges() {
-        let mut result = ExtractionResult::default();
-        result.nodes.push(make_const("/payments", "client.py"));
-
-        api_link_pass(&mut result);
-
-        assert!(result.edges.is_empty());
+        let nodes = vec![make_const("/payments", "client.py")];
+        let edges = api_link_pass(&nodes);
+        assert!(edges.is_empty());
     }
 
     /// No URL-shaped Const nodes → no edges even if there are endpoints.
     #[test]
     fn test_no_url_consts_no_edges() {
-        let mut result = ExtractionResult::default();
-        result.nodes.push(make_endpoint("GET", "/users", "routes.py"));
-
-        api_link_pass(&mut result);
-
-        assert!(result.edges.is_empty());
+        let nodes = vec![make_endpoint("GET", "/users", "routes.py")];
+        let edges = api_link_pass(&nodes);
+        assert!(edges.is_empty());
     }
 
     /// Multiple Const nodes can link to the same endpoint.
     #[test]
     fn test_multiple_consts_link_to_same_endpoint() {
-        let mut result = ExtractionResult::default();
-        result.nodes.push(make_const("/payments", "client_a.py"));
-        result.nodes.push(make_const("/payments", "client_b.py"));
-        result.nodes.push(make_endpoint("POST", "/payments", "routes.py"));
+        let nodes = vec![
+            make_const("/payments", "client_a.py"),
+            make_const("/payments", "client_b.py"),
+            make_endpoint("POST", "/payments", "routes.py"),
+        ];
+        let edges = api_link_pass(&nodes);
 
-        api_link_pass(&mut result);
+        assert_eq!(edges.len(), 2, "both Const nodes should link to the endpoint");
+    }
 
-        assert_eq!(result.edges.len(), 2, "both Const nodes should link to the endpoint");
+    /// Cross-file: Const in one file links to ApiEndpoint in a different file.
+    /// This is the case that fails when api_link_pass runs per-delta instead
+    /// of on the full merged node set.
+    #[test]
+    fn test_cross_file_const_links_to_endpoint() {
+        let nodes = vec![
+            make_const("/orders", "src/client/orders_client.py"),
+            make_endpoint("POST", "/orders", "src/api/orders_routes.py"),
+        ];
+        let edges = api_link_pass(&nodes);
+
+        assert_eq!(edges.len(), 1, "cross-file const should link to endpoint");
+        assert_eq!(edges[0].from.name, "/orders");
+        assert_eq!(edges[0].to.name, "POST /orders");
     }
 
     /// `normalize_path` handles multiple parameters in one path.
@@ -342,15 +361,12 @@ mod tests {
             },
             source: ExtractionSource::TreeSitter,
         };
-        let mut result = ExtractionResult::default();
-        result.nodes.push(non_synthetic);
-        result.nodes.push(make_endpoint("GET", "/admin", "routes.py"));
-
-        api_link_pass(&mut result);
+        let nodes = vec![non_synthetic, make_endpoint("GET", "/admin", "routes.py")];
+        let edges = api_link_pass(&nodes);
 
         assert!(
-            result.edges.is_empty(),
-            "declared constant should NOT link to endpoint, got: {:?}", result.edges
+            edges.is_empty(),
+            "declared constant should NOT link to endpoint, got: {:?}", edges
         );
     }
 
@@ -372,15 +388,15 @@ mod tests {
     /// Mismatched paths (/payments vs /payments/:id) must NOT produce edges.
     #[test]
     fn test_path_mismatch_no_edge() {
-        let mut result = ExtractionResult::default();
-        result.nodes.push(make_const("/payments", "client.py"));
-        result.nodes.push(make_endpoint("GET", "/payments/{id}", "routes.py"));
-
-        api_link_pass(&mut result);
+        let nodes = vec![
+            make_const("/payments", "client.py"),
+            make_endpoint("GET", "/payments/{id}", "routes.py"),
+        ];
+        let edges = api_link_pass(&nodes);
 
         assert!(
-            result.edges.is_empty(),
-            "/payments should NOT match /payments/{{id}}: got {:?}", result.edges
+            edges.is_empty(),
+            "/payments should NOT match /payments/{{id}}: got {:?}", edges
         );
     }
 
@@ -405,13 +421,11 @@ mod tests {
             metadata: BTreeMap::new(), // no http_path key
             source: ExtractionSource::TreeSitter,
         };
-        let mut result = ExtractionResult::default();
-        result.nodes.push(make_const("/payments", "client.py"));
-        result.nodes.push(no_path_ep);
+        let nodes = vec![make_const("/payments", "client.py"), no_path_ep];
 
         // Must not panic
-        api_link_pass(&mut result);
+        let edges = api_link_pass(&nodes);
         // No match expected since the endpoint has no http_path
-        assert!(result.edges.is_empty());
+        assert!(edges.is_empty());
     }
 }
