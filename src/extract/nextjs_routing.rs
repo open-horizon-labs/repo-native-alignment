@@ -12,23 +12,28 @@
 //!
 //! # Conventions supported
 //!
-//! ## App Router (`app/api/**/route.{ts,tsx,js}`)
+//! ## App Router (`app/api/**/route.{ts,tsx,js,jsx}`)
+//!
+//! Per Next.js App Router conventions the `api/` segment is part of the URL:
 //!
 //! ```text
-//! app/api/payments/route.ts  →  /payments   (exported GET, POST, …)
-//! app/api/users/[id]/route.ts → /users/{id}  (exported GET, PUT, DELETE, …)
+//! app/api/payments/route.ts    →  /api/payments   (exported GET, POST, …)
+//! app/api/users/[id]/route.ts  →  /api/users/{id}  (exported GET, PUT, DELETE, …)
+//! app/api/route.ts             →  /api             (root of API namespace)
 //! ```
 //!
 //! One `ApiEndpoint` node is emitted per exported HTTP-method function found
-//! in the file (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`).  An `Implements`
-//! edge links each endpoint node to the corresponding `Function` node already
-//! present in `existing_nodes`.
+//! in the file (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`).
+//! Exports can be inline (`export function GET(…)`, `export const GET = …`)
+//! or re-exported (`export { GET }`, `export { handler as GET }`).
+//! An `Implements` edge links each endpoint node to the corresponding
+//! `Function` node already present in `existing_nodes`.
 //!
-//! ## Pages Router (`pages/api/**/*.{ts,tsx,js}`)
+//! ## Pages Router (`pages/api/**/*.{ts,tsx,js,jsx}`)
 //!
 //! ```text
-//! pages/api/payments.ts  →  ANY /api/payments
-//! pages/api/users/[id].ts → ANY /api/users/{id}
+//! pages/api/payments.ts       →  ANY /api/payments
+//! pages/api/users/[id].ts     →  ANY /api/users/{id}
 //! ```
 //!
 //! One `ApiEndpoint` node (method = `ANY`) is emitted per file.  An
@@ -39,7 +44,7 @@
 //!
 //! | Pattern | Input segment | Output segment |
 //! |---------|---------------|----------------|
-//! | App Router strip | `app/api/payments/route.ts` | `/payments` |
+//! | App Router strip | `app/api/payments/route.ts` | `/api/payments` |
 //! | Pages Router strip | `pages/api/payments.ts` | `/api/payments` |
 //! | Dynamic segments | `[id]` | `{id}` |
 //! | Catch-all | `[...slug]` | `{slug}` |
@@ -232,20 +237,39 @@ fn process_app_router_file(
         }
     };
 
-    let methods = find_exported_http_methods(&content);
+    let bindings = find_exported_http_methods(&content);
 
     // If no recognized methods found, emit a catch-all ANY endpoint so the
-    // route is at least visible in the graph.
-    let effective_methods: Vec<&str> = if methods.is_empty() {
-        vec!["ANY"]
-    } else {
-        methods.iter().map(|s| s.as_str()).collect()
-    };
+    // route is at least visible in the graph even if we can't parse methods.
+    if bindings.is_empty() {
+        let name = format!("ANY {}", http_path);
+        let mut metadata = BTreeMap::new();
+        metadata.insert("http_method".to_string(), "ANY".to_string());
+        metadata.insert("http_path".to_string(), http_path.clone());
+        metadata.insert("source_convention".to_string(), "nextjs_app_router".to_string());
+        result.nodes.push(Node {
+            id: NodeId {
+                root: root_slug.to_string(),
+                file: rel_path.to_path_buf(),
+                name,
+                kind: NodeKind::ApiEndpoint,
+            },
+            language: language_from_path(abs_path),
+            line_start: 1,
+            line_end: 1,
+            signature: format!("[nextjs_app_router] ANY {}", http_path),
+            body: String::new(),
+            metadata,
+            source: ExtractionSource::TreeSitter,
+        });
+        return;
+    }
 
-    for method in effective_methods {
+    for binding in &bindings {
+        let method = &binding.http_method;
         let name = format!("{} {}", method, http_path);
         let mut metadata = BTreeMap::new();
-        metadata.insert("http_method".to_string(), method.to_string());
+        metadata.insert("http_method".to_string(), method.clone());
         metadata.insert("http_path".to_string(), http_path.clone());
         metadata.insert("source_convention".to_string(), "nextjs_app_router".to_string());
 
@@ -256,28 +280,24 @@ fn process_app_router_file(
             kind: NodeKind::ApiEndpoint,
         };
 
-        // Emit Implements edge to the handler function if it exists.
-        if method != "ANY" {
-            if let Some(handler_id) = fn_index.get(&(rel_path.to_path_buf(), method.to_string())) {
-                result.edges.push(Edge {
-                    from: endpoint_id.clone(),
-                    to: handler_id.clone(),
-                    kind: EdgeKind::Implements,
-                    source: ExtractionSource::TreeSitter,
-                    confidence: Confidence::Detected,
-                });
-            }
+        // Emit Implements edge to the handler function.
+        // Use `local_name` so that aliased re-exports like `export { handler as GET }`
+        // correctly link to the `handler` Function node (not a non-existent `GET` node).
+        if let Some(handler_id) = fn_index.get(&(rel_path.to_path_buf(), binding.local_name.clone())) {
+            result.edges.push(Edge {
+                from: endpoint_id.clone(),
+                to: handler_id.clone(),
+                kind: EdgeKind::Implements,
+                source: ExtractionSource::TreeSitter,
+                confidence: Confidence::Detected,
+            });
         }
-
-        // Determine representative line numbers from the file (approximate).
-        // Use line 1 since we don't have tree-sitter positions here.
-        let (line_start, line_end) = find_method_lines(&content, method);
 
         result.nodes.push(Node {
             id: endpoint_id,
             language: language_from_path(abs_path),
-            line_start,
-            line_end,
+            line_start: binding.line,
+            line_end: binding.line,
             signature: format!("[nextjs_app_router] {} {}", method, http_path),
             body: String::new(),
             metadata,
@@ -488,58 +508,126 @@ fn strip_ts_extension(s: &str) -> &str {
     s
 }
 
-/// Detect exported HTTP-method functions in a TypeScript/JavaScript file.
+/// A binding between an exported HTTP method name and the local function name.
 ///
-/// Matches patterns like:
-/// - `export function GET(`
-/// - `export async function POST(`
-/// - `export const DELETE =`
-/// - `export const PATCH: NextRequest =`
-///
-/// Uses word-boundary checks to avoid false positives like `function GETTER`
-/// matching `GET`, or `const DELETED` matching `DELETE`.
-///
-/// Returns a deduplicated list of HTTP methods found.
-pub fn find_exported_http_methods(content: &str) -> Vec<String> {
-    const HTTP_METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
-
-    let mut found: Vec<String> = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("export") {
-            continue;
-        }
-        for method in HTTP_METHODS {
-            if found.iter().any(|m| m == method) {
-                continue; // already found
-            }
-            if line_exports_http_method(trimmed, method) {
-                found.push(method.to_string());
-            }
-        }
-    }
-    found
+/// | Export form | `http_method` | `local_name` | `line` |
+/// |-------------|--------------|-------------|--------|
+/// | `export function GET() {}` | `"GET"` | `"GET"` | 1-indexed line of export |
+/// | `export const GET = …` | `"GET"` | `"GET"` | same |
+/// | `export { GET }` | `"GET"` | `"GET"` | same |
+/// | `export { handler as GET }` | `"GET"` | `"handler"` | same |
+#[derive(Debug, Clone, PartialEq)]
+pub struct MethodBinding {
+    /// HTTP method exported from the file (e.g. `"GET"`, `"POST"`).
+    pub http_method: String,
+    /// Local identifier to look up in the tree-sitter node index.
+    /// For inline exports this equals `http_method`.
+    /// For `export { handler as GET }` this is `"handler"`.
+    pub local_name: String,
+    /// 1-indexed line number of the export statement.
+    pub line: usize,
 }
 
-/// Returns `true` if `line` declares an export for the given HTTP `method`
-/// with a proper word boundary after the method name.
+/// Scan `content` for HTTP-method exports and return one `MethodBinding` per
+/// unique method found.
 ///
-/// Handles inline exports:
-/// - `export function GET(` — exact word boundary `(`
-/// - `export async function GET(` — same
-/// - `export const GET =` — space or `=` after method
-/// - `export const GET:` — TypeScript type annotation
+/// Supported forms:
+/// - `export function GET(…)`
+/// - `export async function POST(…)`
+/// - `export const DELETE = …`
+/// - `export const PATCH: NextRequestHandler = …`
+/// - `export { GET }` — direct single-line re-export
+/// - `export { handler as GET, handler as POST }` — aliased single-line
+/// - Multiline `export {\n  handler as GET,\n  handler as POST\n}` blocks
 ///
-/// Handles re-export syntax:
-/// - `export { GET }` — direct re-export
-/// - `export { handler as GET }` — aliased re-export
-/// - `export { GET, POST }` — multiple re-exports on one line
+/// Uses word-boundary checks to prevent `GETTER` matching `GET`, etc.
 ///
-/// Rejects false positives:
-/// - `export function GETTER()` — followed by non-boundary char
-/// - `export const GETALL = ...` — method name followed by another letter
-fn line_exports_http_method(line: &str, method: &str) -> bool {
-    // For `function METHOD`: require the char after METHOD to be '(' or whitespace
+/// Returns deduplicated bindings in source order.
+pub fn find_exported_http_methods(content: &str) -> Vec<MethodBinding> {
+    const HTTP_METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
+
+    let mut bindings: Vec<MethodBinding> = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+        let line_num = i + 1; // 1-indexed
+
+        if trimmed.starts_with("export") {
+            // --- Inline: `export function GET` / `export async function GET`
+            // --- Inline: `export const GET = …` / `export const GET: …`
+            for &method in HTTP_METHODS {
+                if bindings.iter().any(|b| b.http_method == method) {
+                    continue;
+                }
+                if inline_exports_http_method(trimmed, method) {
+                    bindings.push(MethodBinding {
+                        http_method: method.to_string(),
+                        local_name: method.to_string(),
+                        line: line_num,
+                    });
+                }
+            }
+
+            // --- Re-export block: `export { … }` (single or multiline)
+            if trimmed.contains('{') {
+                // Accumulate lines until we find the closing `}`.
+                let mut block = String::new();
+                let mut block_start = line_num;
+                let mut j = i;
+                while j < lines.len() {
+                    block.push_str(lines[j]);
+                    block.push('\n');
+                    if lines[j].contains('}') {
+                        break;
+                    }
+                    j += 1;
+                }
+                // Extract the inner content of `{ … }`
+                if let (Some(open), Some(close)) = (block.find('{'), block.rfind('}')) {
+                    if open < close {
+                        let inner = &block[open + 1..close];
+                        for item in inner.split(',') {
+                            let item = item.trim().trim_end_matches(',').trim();
+                            if item.is_empty() {
+                                continue;
+                            }
+                            // `handler as METHOD` or just `METHOD`
+                            let (local, exported) = if let Some(pos) = item.find(" as ") {
+                                (item[..pos].trim(), item[pos + 4..].trim())
+                            } else {
+                                (item, item)
+                            };
+                            // Check if exported name is an HTTP method
+                            if HTTP_METHODS.contains(&exported)
+                                && !bindings.iter().any(|b| b.http_method == exported)
+                            {
+                                bindings.push(MethodBinding {
+                                    http_method: exported.to_string(),
+                                    local_name: local.to_string(),
+                                    line: block_start,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    bindings
+}
+
+/// Returns `true` if a single `line` declares an inline export for the given
+/// HTTP `method` (function or const form) with proper word-boundary checks.
+///
+/// Does NOT handle re-export blocks — those are handled by the multiline
+/// collector in `find_exported_http_methods`.
+fn inline_exports_http_method(line: &str, method: &str) -> bool {
+    // `export function METHOD` / `export async function METHOD`
     let fn_pattern = format!("function {}", method);
     if let Some(pos) = line.find(&fn_pattern) {
         let after = &line[pos + fn_pattern.len()..];
@@ -549,7 +637,8 @@ fn line_exports_http_method(line: &str, method: &str) -> bool {
         }
     }
 
-    // For `const METHOD`: require the char after METHOD to be ' ', '=', ':', or nothing
+    // `export const METHOD =` / `export const METHOD:` — even if line has `{` later
+    // (e.g., `export const DELETE = async (req) => { … }`)
     let const_pattern = format!("const {}", method);
     if let Some(pos) = line.find(&const_pattern) {
         let after = &line[pos + const_pattern.len()..];
@@ -559,31 +648,36 @@ fn line_exports_http_method(line: &str, method: &str) -> bool {
         }
     }
 
-    // For re-export syntax `export { ... }` or `export { ... } from '...'`:
-    // Match `METHOD` as a standalone identifier (not a prefix of another word),
-    // or as an alias `X as METHOD`.
+    false
+}
+
+/// Compatibility wrapper: return just the HTTP method names.
+///
+/// Used by `line_exports_http_method` (the function-level helper kept for
+/// `find_method_lines`) to avoid breaking the existing single-line check.
+fn line_exports_http_method(line: &str, method: &str) -> bool {
+    if inline_exports_http_method(line, method) {
+        return true;
+    }
+    // Single-line re-export block
     if line.trim_start().starts_with("export") && line.contains('{') {
-        // Extract the content inside the first `{...}` block.
         if let (Some(open), Some(close)) = (line.find('{'), line.rfind('}')) {
             if open < close {
                 let inner = &line[open + 1..close];
                 for item in inner.split(',') {
                     let item = item.trim();
-                    // Handle `handler as METHOD` or `METHOD`
-                    let exported_name = if let Some(pos) = item.find(" as ") {
+                    let exported = if let Some(pos) = item.find(" as ") {
                         item[pos + 4..].trim()
                     } else {
                         item
                     };
-                    // Word-boundary check: exported_name must equal method exactly
-                    if exported_name == method {
+                    if exported == method {
                         return true;
                     }
                 }
             }
         }
     }
-
     false
 }
 
@@ -598,8 +692,7 @@ fn find_method_lines(content: &str, method: &str) -> (usize, usize) {
         if !trimmed.starts_with("export") {
             continue;
         }
-        if line_exports_http_method(trimmed, method)
-        {
+        if line_exports_http_method(trimmed, method) {
             let line_num = idx + 1;
             return (line_num, line_num);
         }
@@ -791,6 +884,10 @@ mod tests {
     // find_exported_http_methods tests
     // -----------------------------------------------------------------------
 
+    fn methods_in(bindings: &[MethodBinding]) -> Vec<&str> {
+        bindings.iter().map(|b| b.http_method.as_str()).collect()
+    }
+
     #[test]
     fn test_find_exported_http_methods_function_style() {
         let content = r#"
@@ -805,10 +902,13 @@ export async function POST(request: NextRequest) {
     return Response.json({ created: true })
 }
 "#;
-        let methods = find_exported_http_methods(content);
-        assert!(methods.contains(&"GET".to_string()), "should find GET");
-        assert!(methods.contains(&"POST".to_string()), "should find POST");
-        assert_eq!(methods.len(), 2);
+        let bindings = find_exported_http_methods(content);
+        let methods = methods_in(&bindings);
+        assert!(methods.contains(&"GET"), "should find GET");
+        assert!(methods.contains(&"POST"), "should find POST");
+        assert_eq!(bindings.len(), 2);
+        // Inline exports: local_name == http_method
+        assert!(bindings.iter().all(|b| b.local_name == b.http_method));
     }
 
     #[test]
@@ -820,8 +920,8 @@ export const DELETE = async (req: Request) => {
     return NextResponse.json({ deleted: true })
 }
 "#;
-        let methods = find_exported_http_methods(content);
-        assert!(methods.contains(&"DELETE".to_string()), "should find DELETE");
+        let bindings = find_exported_http_methods(content);
+        assert!(methods_in(&bindings).contains(&"DELETE"), "should find DELETE");
     }
 
     #[test]
@@ -830,8 +930,8 @@ export const DELETE = async (req: Request) => {
 // This file has no HTTP method exports
 export function helper() {}
 "#;
-        let methods = find_exported_http_methods(content);
-        assert!(methods.is_empty(), "should find no HTTP methods");
+        let bindings = find_exported_http_methods(content);
+        assert!(bindings.is_empty(), "should find no HTTP methods");
     }
 
     #[test]
@@ -842,43 +942,49 @@ export function GETTER() {}
 export const DELETED = async () => {}
 export const POSTFIX = "something"
 "#;
-        let methods = find_exported_http_methods(content);
-        assert!(
-            !methods.contains(&"GET".to_string()),
-            "GETTER should not match GET, got: {:?}", methods
-        );
-        assert!(
-            !methods.contains(&"DELETE".to_string()),
-            "DELETED should not match DELETE, got: {:?}", methods
-        );
-        assert!(
-            !methods.contains(&"POST".to_string()),
-            "POSTFIX should not match POST, got: {:?}", methods
-        );
+        let bindings = find_exported_http_methods(content);
+        let methods = methods_in(&bindings);
+        assert!(!methods.contains(&"GET"), "GETTER should not match GET, got: {:?}", methods);
+        assert!(!methods.contains(&"DELETE"), "DELETED should not match DELETE, got: {:?}", methods);
+        assert!(!methods.contains(&"POST"), "POSTFIX should not match POST, got: {:?}", methods);
     }
 
     #[test]
     fn test_find_exported_http_methods_reexport_syntax() {
         // Direct re-export: `export { GET }`
         let content1 = "export { GET }\n";
-        let methods1 = find_exported_http_methods(content1);
-        assert!(methods1.contains(&"GET".to_string()), "should detect export {{ GET }}");
+        let b1 = find_exported_http_methods(content1);
+        assert!(methods_in(&b1).contains(&"GET"), "should detect export {{ GET }}");
+        // local_name == http_method for direct re-export
+        assert_eq!(b1[0].local_name, "GET");
 
         // Aliased re-export: `export { handler as POST }`
         let content2 = "export { handler as POST }\n";
-        let methods2 = find_exported_http_methods(content2);
-        assert!(methods2.contains(&"POST".to_string()), "should detect export {{ handler as POST }}");
+        let b2 = find_exported_http_methods(content2);
+        assert!(methods_in(&b2).contains(&"POST"), "should detect export {{ handler as POST }}");
+        // local_name should be "handler"
+        assert_eq!(b2[0].local_name, "handler", "local_name should be the original function name");
 
         // Multiple re-exports: `export { GET, POST }`
         let content3 = "export { GET, POST }\n";
-        let methods3 = find_exported_http_methods(content3);
-        assert!(methods3.contains(&"GET".to_string()), "should detect GET in multi-export");
-        assert!(methods3.contains(&"POST".to_string()), "should detect POST in multi-export");
+        let b3 = find_exported_http_methods(content3);
+        assert!(methods_in(&b3).contains(&"GET"), "should detect GET in multi-export");
+        assert!(methods_in(&b3).contains(&"POST"), "should detect POST in multi-export");
 
         // Re-export with FROM: `export { GET } from './handler'`
         let content4 = "export { GET } from './handler'\n";
-        let methods4 = find_exported_http_methods(content4);
-        assert!(methods4.contains(&"GET".to_string()), "should detect export {{ GET }} from ...");
+        let b4 = find_exported_http_methods(content4);
+        assert!(methods_in(&b4).contains(&"GET"), "should detect export {{ GET }} from ...");
+
+        // Multiline export block
+        let content5 = "export {\n  handler as GET,\n  handler as POST\n}\n";
+        let b5 = find_exported_http_methods(content5);
+        assert!(methods_in(&b5).contains(&"GET"), "should detect GET from multiline block");
+        assert!(methods_in(&b5).contains(&"POST"), "should detect POST from multiline block");
+        // local_name should be "handler" for aliased exports
+        for b in &b5 {
+            assert_eq!(b.local_name, "handler", "local_name for aliased multiline should be 'handler'");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1028,6 +1134,54 @@ export const POSTFIX = "something"
 
         assert_eq!(implements_edges.len(), 1, "should emit 1 Implements edge");
         assert_eq!(implements_edges[0].to.name, "GET");
+    }
+
+    #[test]
+    fn test_implements_edge_aliased_reexport() {
+        // `export { handler as GET }` — the Implements edge must link to `handler`, not `GET`
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+
+        let route_dir = root.join("app").join("api").join("orders");
+        std::fs::create_dir_all(&route_dir).unwrap();
+        std::fs::write(
+            route_dir.join("route.ts"),
+            "async function handler() {}\nexport { handler as GET }\n",
+        ).unwrap();
+
+        // Tree-sitter would produce a Function node named "handler"
+        let handler_node = Node {
+            id: NodeId {
+                root: "test".to_string(),
+                file: PathBuf::from("app/api/orders/route.ts"),
+                name: "handler".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "typescript".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "async function handler()".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let roots = vec![("test".to_string(), root)];
+        let result = nextjs_routing_pass(&roots, &[handler_node]);
+
+        let endpoints: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint).collect();
+        assert_eq!(endpoints.len(), 1, "should emit 1 ApiEndpoint node");
+        assert_eq!(endpoints[0].id.name, "GET /api/orders");
+
+        let implements_edges: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Implements).collect();
+        assert_eq!(implements_edges.len(), 1, "should emit 1 Implements edge");
+        assert_eq!(implements_edges[0].to.name, "handler",
+            "Implements edge should link to 'handler' (local_name), not 'GET'");
     }
 
     #[test]
