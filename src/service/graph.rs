@@ -25,12 +25,20 @@ pub fn graph_query(params: &GraphParams, graph_state: &GraphState) -> Result<Str
     // Resolve short IDs (without root prefix) to full stable IDs.
     let resolved_node = graph_state.resolve_node_id(&params.node);
     let result_ids = run_traversal(&graph_state.index, &resolved_node, &params.mode, params.max_hops.map(|h| h as u32), Some(params.direction.as_str()), edge_filter_slice)?;
-    if result_ids.is_empty() { return Ok(format!("No results for `{}` ({}).", params.node, params.mode)); }
     let node_index_map = graph_state.node_index_map();
-    let mut lines = vec![format!("## {} `{}`\n\n{} result(s)\n", params.mode, params.node, result_ids.len())];
-    for id in &result_ids {
+    // Filter out hidden node kinds (Module, PrMerge) before counting and rendering.
+    // This ensures the reported count matches the displayed entries.
+    let displayable: Vec<_> = result_ids.iter()
+        .filter(|id| {
+            graph_state.node_by_stable_id(id, &node_index_map)
+                .map(|n| !matches!(n.id.kind, NodeKind::Module | NodeKind::PrMerge))
+                .unwrap_or(true) // Unknown IDs: include (rendered as bare ID below)
+        })
+        .collect();
+    if displayable.is_empty() { return Ok(format!("No results for `{}` ({}).", params.node, params.mode)); }
+    let mut lines = vec![format!("## {} `{}`\n\n{} result(s)\n", params.mode, params.node, displayable.len())];
+    for id in &displayable {
         if let Some(node) = graph_state.node_by_stable_id(id, &node_index_map) {
-            if matches!(node.id.kind, NodeKind::Module | NodeKind::PrMerge) { continue; }
             lines.push(format!("- **{}** `{}` ({}) `{}`:{}-{}", node.id.kind, node.id.name, node.language, node.id.file.display(), node.line_start, node.line_end));
             if !node.signature.is_empty() { lines.push(format!("  Sig: `{}`", node.signature)); }
         } else { lines.push(format!("- `{}`", id)); }
@@ -56,10 +64,19 @@ pub async fn stats(repo_root: &Path, graph_state: &GraphState) -> StatsResult {
     let metis = artifacts.iter().filter(|a| a.kind == crate::types::OhArtifactKind::Metis).count();
     let embed_available = matches!(crate::embed::EmbeddingIndex::new(repo_root).await, Ok(idx) if matches!(idx.search("_probe_", None, 1).await, Ok(SearchOutcome::Results(_))));
     let lance_path = repo_root.join(".oh").join(".cache").join("lance");
-    let last_scan_age = std::fs::metadata(&lance_path).and_then(|m| m.modified()).ok()
-        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-        .map(|d| { let s = std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() - d.as_secs();
-            if s < 60 { "just now".into() } else if s < 3600 { format!("{}m ago", s/60) } else if s < 86400 { format!("{}h ago", s/3600) } else { format!("{}d ago", s/86400) } })
+    // Use duration_since(modified) rather than epoch-second subtraction to avoid
+    // underflow when the file has a future mtime (clock skew, restored caches).
+    let last_scan_age = std::fs::metadata(&lance_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+        .map(|age| {
+            let s = age.as_secs();
+            if s < 60 { "just now".into() }
+            else if s < 3600 { format!("{}m ago", s / 60) }
+            else if s < 86400 { format!("{}h ago", s / 3600) }
+            else { format!("{}d ago", s / 86400) }
+        })
         .unwrap_or_else(|| "unknown".to_string());
     StatsResult { node_count: graph_state.nodes.len(), edge_count: graph_state.edges.len(), embeddings_available: embed_available,
         languages: langs.into_iter().collect(), last_scan_age, artifact_count: artifacts.len(), outcome_count: outcomes, signal_count: signals, guardrail_count: guardrails, metis_count: metis }

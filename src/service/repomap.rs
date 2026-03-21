@@ -75,9 +75,9 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
             // root_filter) as the denominator for giant-cluster detection. This
             // avoids unrelated roots skewing the cutoff in multi-root mode.
             let filtered_node_count = node_file_map.len();
-            // Filter out giant clusters that contain >50% of the filtered nodes --
+            // Filter out giant clusters that contain >50% of the filtered nodes (strictly)
             // they are not informative (everything is lumped together).
-            subsystems.retain(|s| (s.symbol_count as f64) < (filtered_node_count as f64 * 0.5));
+            subsystems.retain(|s| (s.symbol_count as f64) <= (filtered_node_count as f64 * 0.5));
 
             // Deduplicate names: when multiple clusters share a name, append
             // a distinguishing suffix derived from the most-common file directory

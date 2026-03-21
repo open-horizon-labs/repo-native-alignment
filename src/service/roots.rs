@@ -33,6 +33,11 @@ pub fn list_roots_from_slugs(
         .with_declared_roots(repo_root);
     let all_resolved = workspace.resolved_roots();
 
+    // Capture the primary slug from the full config list (index 0 in resolved_roots()).
+    // Filtering below may exclude the primary root if it isn't in active_slugs, but
+    // we still need its slug to correctly tag any other roots that do appear.
+    let primary_slug_from_config = all_resolved.first().map(|r| r.slug.clone()).unwrap_or_default();
+
     // If we have graph slugs, filter to only roots present in the graph.
     // Unknown slugs (e.g., roots that exist in config but haven't been scanned)
     // are excluded. If active_slugs is empty, fall back to all config-resolved roots.
@@ -102,8 +107,10 @@ pub fn list_roots_from_slugs(
         .map(|s| s.missing_server_names())
         .unwrap_or_default();
 
-    // Primary root is always first (index 0 in resolved_roots() output).
-    let primary_slug = resolved.first().map(|r| r.slug.as_str()).unwrap_or("");
+    // Use the primary slug from the full config list, not the filtered one.
+    // If the real primary root isn't in active_slugs, we still want (primary) to be
+    // tagged correctly for any displayed root that happens to be primary.
+    let primary_slug = primary_slug_from_config.as_str();
     let mut lines: Vec<String> = resolved.iter()
         .map(|r| {
             let primary = if r.slug == primary_slug { " (primary)" } else { "" };

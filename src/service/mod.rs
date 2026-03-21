@@ -24,7 +24,13 @@ pub use roots::{list_roots, list_roots_from_slugs};
 pub use search::search;
 
 /// Interface-agnostic search parameters.
-#[derive(Debug, Default)]
+///
+/// The manual `Default` impl intentionally sets `include_artifacts` and
+/// `include_markdown` to `true`, matching the MCP tool's `default_true()`
+/// defaults. `derive(Default)` would leave them `false`, diverging from
+/// `from_mcp_search()` and silently disabling artifact/markdown search for
+/// any code that constructs `SearchParams::default()`.
+#[derive(Debug)]
 pub struct SearchParams {
     pub query: Option<String>,
     pub node: Option<String>,
@@ -49,6 +55,39 @@ pub struct SearchParams {
     pub artifact_types: Option<Vec<String>>,
     pub subsystem: Option<String>,
     pub target_subsystem: Option<String>,
+}
+
+impl Default for SearchParams {
+    fn default() -> Self {
+        Self {
+            query: None,
+            node: None,
+            mode: None,
+            hops: None,
+            depth: None,
+            direction: None,
+            edge_types: None,
+            kind: None,
+            language: None,
+            file: None,
+            limit: None,
+            sort_by: None,
+            min_complexity: None,
+            synthetic: None,
+            compact: false,
+            nodes: None,
+            search_mode: None,
+            rerank: false,
+            // Default to true to match MCP tool defaults (`default_true()` on the
+            // `Search` struct). `derive(Default)` would leave these `false`, causing
+            // `SearchParams::default()` callers to silently get code-only search.
+            include_artifacts: true,
+            include_markdown: true,
+            artifact_types: None,
+            subsystem: None,
+            target_subsystem: None,
+        }
+    }
 }
 
 impl SearchParams {
