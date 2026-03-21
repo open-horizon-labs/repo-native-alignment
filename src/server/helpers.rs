@@ -71,10 +71,11 @@ pub fn format_freshness_full(
         .unwrap_or_default();
 
     format!(
-        "\n\n*Index: {} symbols · last scan {} · schema v{}{}{}*",
+        "\n\n*Index: {} symbols · last scan {} · schema v{} · extract v{}{}{}*",
         node_count,
         age,
         crate::graph::store::SCHEMA_VERSION,
+        crate::graph::store::EXTRACTION_VERSION,
         embed_part,
         lsp_part,
     )

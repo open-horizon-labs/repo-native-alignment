@@ -16,6 +16,18 @@ use arrow_schema::{DataType, Field, Schema};
 /// Also surfaced in the index freshness footer on `search`.
 pub const SCHEMA_VERSION: u32 = 13;
 
+/// Extraction version for source-level extraction logic.
+///
+/// Bump this whenever tree-sitter extraction changes produce new or different
+/// metadata (e.g., new fields like `doc_comment`, changed parsing logic).
+/// When mismatched against the stored version, the server clears all scan-state
+/// files so every file is re-extracted from scratch on the next build.
+///
+/// Unlike SCHEMA_VERSION (which invalidates LanceDB tables), EXTRACTION_VERSION
+/// invalidates the scanner's mtime/hash state — forcing full re-extraction without
+/// dropping LanceDB tables. Bumped to 1 for doc_comment metadata extraction (#401).
+pub const EXTRACTION_VERSION: u32 = 1;
+
 /// Arrow schema for the `symbols` table.
 ///
 /// Stores code symbols (functions, structs, traits, etc.) with embeddings
@@ -196,6 +208,12 @@ mod tests {
     fn test_schema_version_constant() {
         // SCHEMA_VERSION must be at least 13 (bumped for ApiEndpoint http_method/http_path columns)
         assert!(SCHEMA_VERSION >= 13, "SCHEMA_VERSION should be >= 13");
+    }
+
+    #[test]
+    fn test_extraction_version_constant() {
+        // EXTRACTION_VERSION must be at least 1 (bumped for doc_comment extraction #401)
+        assert!(EXTRACTION_VERSION >= 1, "EXTRACTION_VERSION should be >= 1");
     }
 
     #[test]

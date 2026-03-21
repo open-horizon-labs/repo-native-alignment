@@ -84,6 +84,7 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &["attribute_item"],
     type_param_node_kind: Some("type_parameters"),
+    docstring_in_body: false,
     route_queries: &[RUST_ROUTE_QUERY],
     compiled_route_queries: std::sync::OnceLock::new(),
 };

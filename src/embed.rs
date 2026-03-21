@@ -2,13 +2,78 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arrow_array::{Array as ArrowArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{Array as ArrowArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
 
 use crate::git;
 use crate::ranking;
+
+/// Scalar pre-filters for embedding search (#400).
+///
+/// These filters are pushed into LanceDB as `.only_if()` predicates
+/// before vector scoring, so only matching rows participate in ranking.
+/// This ensures "top-K within subsystem" rather than "globally top-3K,
+/// then discard non-matching" — a great match ranked 4001st globally
+/// is now visible when filtering to a subsystem or file path.
+#[derive(Debug, Clone, Default)]
+pub struct SearchFilters {
+    /// Filter to symbols in this subsystem (exact match on `subsystem` column).
+    pub subsystem: Option<String>,
+    /// Filter to symbols in files whose path contains this substring
+    /// (LIKE '%...%' on `file_path` column).
+    pub file: Option<String>,
+    /// Filter to symbols in this language (exact match on `language` column).
+    pub language: Option<String>,
+    /// Filter to symbols with cyclomatic complexity >= this value.
+    pub min_complexity: Option<u32>,
+}
+
+impl SearchFilters {
+    /// Build a LanceDB SQL filter expression from the active filters.
+    /// Returns `None` if no filters are set.
+    pub fn to_sql(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+
+        if let Some(ref sub) = self.subsystem {
+            // Escape single quotes in subsystem name
+            let escaped = sub.replace('\'', "''");
+            parts.push(format!("subsystem = '{}'", escaped));
+        }
+
+        if let Some(ref file) = self.file {
+            // LIKE-based path substring matching. The file_path column stores
+            // the full path string, so '%pattern%' finds any containing path.
+            //
+            // Use '!' as the ESCAPE character (DataFusion requires an explicit
+            // ESCAPE clause — without it, backslash is not treated as an escape
+            // character). '!' is safe since it does not appear in typical file paths.
+            // Escape order matters: escape '!' first to avoid double-escaping.
+            let escaped = file
+                .replace('\'', "''")   // SQL single-quote escaping
+                .replace('!', "!!")    // Escape the ESCAPE character itself
+                .replace('%', "!%")    // Escape LIKE wildcard %
+                .replace('_', "!_");   // Escape LIKE single-char wildcard _
+            parts.push(format!("file_path LIKE '%{}%' ESCAPE '!'", escaped));
+        }
+
+        if let Some(ref lang) = self.language {
+            let escaped = lang.replace('\'', "''");
+            parts.push(format!("language = '{}'", escaped));
+        }
+
+        if let Some(min_cc) = self.min_complexity {
+            parts.push(format!("cyclomatic >= {}", min_cc));
+        }
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" AND "))
+        }
+    }
+}
 
 /// Search mode for the embedding index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -59,7 +124,8 @@ fn truncate_chars(s: &str, max_chars: usize) -> &str {
     }
 }
 
-/// Build the Arrow schema for the embedding table, including the `text_hash` column.
+/// Build the Arrow schema for the embedding table, including the `text_hash` column
+/// and scalar filter columns for pre-filtering before vector ranking (#400).
 fn embedding_schema(dim: usize) -> Schema {
     Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -67,6 +133,13 @@ fn embedding_schema(dim: usize) -> Schema {
         Field::new("title", DataType::Utf8, false),
         Field::new("body", DataType::Utf8, false),
         Field::new("text_hash", DataType::Utf8, true),
+        // Scalar filter columns — enable .only_if() pre-filtering before vector ranking.
+        // Eliminates the 3x over-fetch hack: search(file='src/embed.rs') now filters
+        // within LanceDB before scoring rather than post-filtering Rust results.
+        Field::new("file_path", DataType::Utf8, true),  // file path for path-based filtering
+        Field::new("language", DataType::Utf8, true),   // programming language
+        Field::new("subsystem", DataType::Utf8, true),  // detected subsystem cluster
+        Field::new("cyclomatic", DataType::Int32, true), // cyclomatic complexity (functions only)
         Field::new(
             "vector",
             DataType::FixedSizeList(
@@ -80,11 +153,17 @@ fn embedding_schema(dim: usize) -> Schema {
 
 /// Build embedding text for a code node within the MiniLM-L6-v2 token budget.
 ///
-/// Layout: `name body_excerpt [metadata]`
+/// Layout: `name [doc_comment] body_excerpt [metadata]`
 ///
 /// `body` already includes the signature (it's the full AST node text),
 /// so we don't push the signature separately.  The body is truncated so
 /// the total stays within [`CODE_EMBED_CHAR_BUDGET`].
+///
+/// When `metadata["doc_comment"]` is present, it is prepended before the
+/// body to improve semantic search quality: doc comments describe *intent*
+/// (e.g. "Charges the card, records the transaction") while code describes
+/// implementation. This makes queries like "what handles charging?" surface
+/// the right function even when the function body uses different terminology.
 fn build_code_embedding_text(
     name: &str,
     body: &str,
@@ -99,16 +178,21 @@ fn build_code_embedding_text(
     let after_name = CODE_EMBED_CHAR_BUDGET.saturating_sub(name_chars + 1);
 
     // Estimate metadata cost in chars (not bytes) and cap to leave room for body
+    // Skip doc_comment here — it's handled separately below as a body prefix.
     let meta_estimate: usize = metadata
         .iter()
+        .filter(|(k, _)| k.as_str() != "doc_comment")
         .map(|(k, v)| k.chars().count() + v.chars().count() + 3) // " key: value"
         .sum();
     let meta_budget = after_name.saturating_sub(min_body_budget).min(meta_estimate);
 
-    // Truncate metadata entries to fit within meta_budget
+    // Truncate metadata entries to fit within meta_budget (exclude doc_comment)
     let mut meta_parts: Vec<String> = Vec::new();
     let mut meta_used = 0usize;
     for (key, value) in metadata {
+        if key == "doc_comment" {
+            continue; // handled as body prefix below
+        }
         let entry = format!(" {}: {}", key, value);
         let entry_chars = entry.chars().count();
         if meta_used + entry_chars > meta_budget {
@@ -118,12 +202,27 @@ fn build_code_embedding_text(
         meta_parts.push(entry);
     }
 
-    // Body gets everything remaining after name and actual metadata used
+    // Body gets everything remaining after name and actual metadata used.
+    // Prepend doc_comment (truncated) before the code body: intent before implementation.
     let body_budget = after_name.saturating_sub(meta_used);
 
-    if body_budget > 0 && !body.is_empty() {
-        t.push(' ');
-        t.push_str(truncate_chars(body, body_budget));
+    if body_budget > 0 {
+        // Build combined doc + body text, giving doc_comment up to half the body budget.
+        let doc_comment = metadata.get("doc_comment").map(|s| s.as_str()).unwrap_or("");
+        if !doc_comment.is_empty() {
+            let doc_budget = body_budget / 2;
+            let remaining_body_budget = body_budget.saturating_sub(doc_budget.min(doc_comment.chars().count()) + 1);
+            let doc_truncated = truncate_chars(doc_comment, doc_budget);
+            t.push(' ');
+            t.push_str(doc_truncated);
+            if !body.is_empty() && remaining_body_budget > 0 {
+                t.push(' ');
+                t.push_str(truncate_chars(body, remaining_body_budget));
+            }
+        } else if !body.is_empty() {
+            t.push(' ');
+            t.push_str(truncate_chars(body, body_budget));
+        }
     }
 
     for part in &meta_parts {
@@ -404,8 +503,23 @@ impl EmbeddingIndex {
             tracing::warn!("FTS index on body failed (hybrid search degraded): {e:#}");
             return;
         }
+        // file_path index: enables path-based pre-filtering before ranking.
+        // search(file='src/embed.rs') no longer over-fetches globally — it
+        // filters within the file path before vector scoring.
+        if let Err(e) = table
+            .create_index(
+                &["file_path"],
+                lancedb::index::Index::FTS(Default::default()),
+            )
+            .replace(true)
+            .execute()
+            .await
+        {
+            tracing::warn!("FTS index on file_path failed (path-based filtering degraded): {e:#}");
+            return;
+        }
         tracing::info!(
-            "EmbeddingIndex: FTS indexes on title+body created in {:?}",
+            "EmbeddingIndex: FTS indexes on title+body+file_path created in {:?}",
             fts_start.elapsed()
         );
     }
@@ -463,7 +577,7 @@ impl EmbeddingIndex {
             }
         };
 
-        // Build candidate data: id, kind, title, body, text, text_hash
+        // Build candidate data: id, kind, title, body, text, text_hash + scalar filter columns
         struct Candidate {
             id: String,
             kind: String,
@@ -471,6 +585,11 @@ impl EmbeddingIndex {
             body: String,
             text: String,
             text_hash: String,
+            // Scalar filter columns (#400)
+            file_path: Option<String>,
+            language: Option<String>,
+            subsystem: Option<String>,
+            cyclomatic: Option<i32>,
         }
 
         let mut candidates: Vec<Candidate> = Vec::with_capacity(nodes.len());
@@ -498,7 +617,32 @@ impl EmbeddingIndex {
                     _ => build_code_embedding_text(&node.id.name, &node.body, &node.metadata),
                 }
             };
-            let text_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
+
+            // Scalar filter columns: populate for code nodes, None for commits/merges/artifacts
+            let (fp, lang, sub, cc) = if node.metadata.contains_key("oh_kind") {
+                (None, None, None, None)
+            } else {
+                let fp = Some(node.id.file.to_string_lossy().to_string());
+                let lang = if node.language.is_empty() { None } else { Some(node.language.clone()) };
+                let sub = node.metadata.get(crate::server::SUBSYSTEM_KEY).cloned();
+                let cc = node.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok());
+                (fp, lang, sub, cc)
+            };
+
+            // Include scalar filter values in the hash material so that changes
+            // to file_path/language/subsystem/cyclomatic invalidate the hash and
+            // force a re-embed. Without this, a subsystem reassignment would leave
+            // stale values in the LanceDB scalar filter columns, making .only_if()
+            // return incorrect results.
+            let hash_material = format!(
+                "{}\x00{}\x00{}\x00{}\x00{}",
+                text,
+                fp.as_deref().unwrap_or(""),
+                lang.as_deref().unwrap_or(""),
+                sub.as_deref().unwrap_or(""),
+                cc.unwrap_or(0),
+            );
+            let text_hash = blake3::hash(hash_material.as_bytes()).to_hex().to_string();
 
             let title = if node.metadata.contains_key("oh_kind") {
                 node.metadata.get("frontmatter.title")
@@ -522,6 +666,10 @@ impl EmbeddingIndex {
                 body: body_display,
                 text,
                 text_hash,
+                file_path: fp,
+                language: lang,
+                subsystem: sub,
+                cyclomatic: cc,
             });
         }
 
@@ -554,6 +702,10 @@ impl EmbeddingIndex {
         let mut bodies: Vec<String> = Vec::new();
         let mut texts: Vec<String> = Vec::new();
         let mut text_hashes: Vec<String> = Vec::new();
+        let mut file_paths: Vec<Option<String>> = Vec::new();
+        let mut languages: Vec<Option<String>> = Vec::new();
+        let mut subsystems: Vec<Option<String>> = Vec::new();
+        let mut cyclomatics: Vec<Option<i32>> = Vec::new();
 
         for c in to_embed {
             ids.push(c.id);
@@ -562,6 +714,10 @@ impl EmbeddingIndex {
             bodies.push(c.body);
             texts.push(c.text);
             text_hashes.push(c.text_hash);
+            file_paths.push(c.file_path);
+            languages.push(c.language);
+            subsystems.push(c.subsystem);
+            cyclomatics.push(c.cyclomatic);
         }
 
         let count = texts.len();
@@ -578,6 +734,10 @@ impl EmbeddingIndex {
         let title_array = Arc::new(StringArray::from(titles)) as Arc<dyn arrow_array::Array>;
         let body_array = Arc::new(StringArray::from(bodies)) as Arc<dyn arrow_array::Array>;
         let text_hash_array = Arc::new(StringArray::from(text_hashes)) as Arc<dyn arrow_array::Array>;
+        let file_path_array = Arc::new(StringArray::from(file_paths)) as Arc<dyn arrow_array::Array>;
+        let language_array = Arc::new(StringArray::from(languages)) as Arc<dyn arrow_array::Array>;
+        let subsystem_array = Arc::new(StringArray::from(subsystems)) as Arc<dyn arrow_array::Array>;
+        let cyclomatic_array = Arc::new(Int32Array::from(cyclomatics)) as Arc<dyn arrow_array::Array>;
         let values = Arc::new(Float32Array::from(flat_embeddings));
         let list_field = Arc::new(Field::new("item", DataType::Float32, true));
         let vector_array = Arc::new(arrow_array::FixedSizeListArray::try_new(
@@ -586,7 +746,9 @@ impl EmbeddingIndex {
 
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![id_array, kind_array, title_array, body_array, text_hash_array, vector_array],
+            vec![id_array, kind_array, title_array, body_array, text_hash_array,
+                 file_path_array, language_array, subsystem_array, cyclomatic_array,
+                 vector_array],
         )?;
 
         // Delete existing rows for these IDs, then add() fresh.
@@ -701,7 +863,7 @@ impl EmbeddingIndex {
         // Batch size for streaming writes to LanceDB (#110, #298).
         const WRITE_BATCH_SIZE: usize = 2048;
 
-        // Build candidate structs: id, kind, title, body, text, text_hash.
+        // Build candidate structs: id, kind, title, body, text, text_hash + scalar filter columns.
         // We collect metadata eagerly but defer embedding to streaming batches
         // so we never hold all embedding vectors in memory simultaneously (#298).
         struct Candidate {
@@ -711,6 +873,11 @@ impl EmbeddingIndex {
             body: String,
             text: String,
             text_hash: String,
+            // Scalar filter columns (#400): None for commits/merges, Some for code nodes
+            file_path: Option<String>,
+            language: Option<String>,
+            subsystem: Option<String>,
+            cyclomatic: Option<i32>,
         }
 
         let mut candidates: Vec<Candidate> = Vec::new();
@@ -736,6 +903,10 @@ impl EmbeddingIndex {
                         body: body.clone(),
                         text: body,
                         text_hash,
+                        file_path: None,
+                        language: None,
+                        subsystem: None,
+                        cyclomatic: None,
                     });
                 }
                 commits.len()
@@ -773,6 +944,10 @@ impl EmbeddingIndex {
                         body: body.clone(),
                         text: body,
                         text_hash,
+                        file_path: None,
+                        language: None,
+                        subsystem: None,
+                        cyclomatic: None,
                     });
                 }
                 seen_merge_shas.len()
@@ -822,6 +997,30 @@ impl EmbeddingIndex {
                 }
             };
 
+            // Scalar filter columns: populate for code nodes, None for oh/ artifacts.
+            // Compute before text_hash so they can be included in the hash material.
+            let (fp, lang, sub, cc) = if node.metadata.contains_key("oh_kind") {
+                (None, None, None, None)
+            } else {
+                let fp = Some(node.id.file.to_string_lossy().to_string());
+                let lang = if node.language.is_empty() { None } else { Some(node.language.clone()) };
+                let sub = node.metadata.get(crate::server::SUBSYSTEM_KEY).cloned();
+                let cc = node.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok());
+                (fp, lang, sub, cc)
+            };
+
+            // Include scalar filter values in the hash so changes to
+            // file_path/language/subsystem/cyclomatic invalidate the hash.
+            let hash_material = format!(
+                "{}\x00{}\x00{}\x00{}\x00{}",
+                text,
+                fp.as_deref().unwrap_or(""),
+                lang.as_deref().unwrap_or(""),
+                sub.as_deref().unwrap_or(""),
+                cc.unwrap_or(0),
+            );
+            let text_hash = blake3::hash(hash_material.as_bytes()).to_hex().to_string();
+
             let title = if node.metadata.contains_key("oh_kind") {
                 node.metadata.get("frontmatter.title")
                     .or(node.metadata.get("frontmatter.statement"))
@@ -836,7 +1035,6 @@ impl EmbeddingIndex {
                 node.id.file.display(),
                 node.line_start
             );
-            let text_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
 
             candidates.push(Candidate {
                 id: node.stable_id(),
@@ -845,6 +1043,10 @@ impl EmbeddingIndex {
                 body: body_display,
                 text,
                 text_hash,
+                file_path: fp,
+                language: lang,
+                subsystem: sub,
+                cyclomatic: cc,
             });
         }
 
@@ -868,19 +1070,28 @@ impl EmbeddingIndex {
         let table_exists = self.has_table().await
             .context("Failed to check embedding table before full reindex")?;
 
-        // If the table exists but has an old schema (no text_hash column),
-        // drop it and treat as fresh. merge_insert does not support schema
-        // evolution (adding new columns).
+        // If the table exists but has an old schema (missing text_hash or file_path columns),
+        // drop it and treat as fresh. LanceDB does not support adding nullable columns
+        // to existing tables via add() — a schema mismatch is a fatal error at write time.
         let (table_exists, to_embed) = if table_exists {
             let table = self.db.open_table(&self.table_name).execute().await
                 .context("Failed to open embedding table for hash check")?;
+
+            // Check for file_path column (added in #400/schema v2 of embedding table).
+            // If missing, force a full rebuild to pick up scalar filter columns.
+            let has_file_path_col = table.schema().await
+                .map(|s| s.column_with_name("file_path").is_some())
+                .unwrap_or(false);
+
             let all_ids: Vec<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
             let existing_hashes = self.query_text_hashes(&table, &all_ids).await;
 
-            if existing_hashes.is_none() {
-                // Old schema without text_hash column. Drop and rebuild.
+            if existing_hashes.is_none() || !has_file_path_col {
+                // Old schema: missing text_hash or scalar filter columns. Drop and rebuild.
                 tracing::info!(
-                    "EmbeddingIndex: dropping old-schema table (missing text_hash column)"
+                    "EmbeddingIndex: dropping old-schema table (missing text_hash={}, file_path={})",
+                    existing_hashes.is_some(),
+                    has_file_path_col,
                 );
                 if let Err(e) = self.db.drop_table(&self.table_name, &[]).await {
                     tracing::debug!("EmbeddingIndex: drop_table failed (proceeding with create): {}", e);
@@ -963,6 +1174,10 @@ impl EmbeddingIndex {
                 let batch_titles: Vec<String> = batch_candidates.iter().map(|c| c.title.clone()).collect();
                 let batch_bodies: Vec<String> = batch_candidates.iter().map(|c| c.body.clone()).collect();
                 let batch_text_hashes: Vec<String> = batch_candidates.iter().map(|c| c.text_hash.clone()).collect();
+                let batch_file_paths: Vec<Option<String>> = batch_candidates.iter().map(|c| c.file_path.clone()).collect();
+                let batch_languages: Vec<Option<String>> = batch_candidates.iter().map(|c| c.language.clone()).collect();
+                let batch_subsystems: Vec<Option<String>> = batch_candidates.iter().map(|c| c.subsystem.clone()).collect();
+                let batch_cyclomatics: Vec<Option<i32>> = batch_candidates.iter().map(|c| c.cyclomatic).collect();
 
                 let schema = Arc::new(embedding_schema(dim));
 
@@ -971,6 +1186,10 @@ impl EmbeddingIndex {
                 let title_array = Arc::new(StringArray::from(batch_titles)) as Arc<dyn arrow_array::Array>;
                 let body_array = Arc::new(StringArray::from(batch_bodies)) as Arc<dyn arrow_array::Array>;
                 let text_hash_array = Arc::new(StringArray::from(batch_text_hashes)) as Arc<dyn arrow_array::Array>;
+                let file_path_array = Arc::new(StringArray::from(batch_file_paths)) as Arc<dyn arrow_array::Array>;
+                let language_array = Arc::new(StringArray::from(batch_languages)) as Arc<dyn arrow_array::Array>;
+                let subsystem_array = Arc::new(StringArray::from(batch_subsystems)) as Arc<dyn arrow_array::Array>;
+                let cyclomatic_array = Arc::new(Int32Array::from(batch_cyclomatics)) as Arc<dyn arrow_array::Array>;
                 let values = Arc::new(Float32Array::from(flat_embeddings));
                 let list_field = Arc::new(Field::new("item", DataType::Float32, true));
                 let vector_array = Arc::new(arrow_array::FixedSizeListArray::try_new(
@@ -979,7 +1198,9 @@ impl EmbeddingIndex {
 
                 let batch = RecordBatch::try_new(
                     schema.clone(),
-                    vec![id_array, kind_array, title_array, body_array, text_hash_array, vector_array],
+                    vec![id_array, kind_array, title_array, body_array, text_hash_array,
+                         file_path_array, language_array, subsystem_array, cyclomatic_array,
+                         vector_array],
                 )?;
 
                 if !table_exists && batch_idx == 0 {
@@ -1135,6 +1356,22 @@ impl EmbeddingIndex {
         limit: usize,
         mode: SearchMode,
     ) -> Result<SearchOutcome> {
+        self.search_with_filters(query, artifact_types, limit, mode, &SearchFilters::default()).await
+    }
+
+    /// Search with an explicit [`SearchMode`] and scalar pre-filters (#400).
+    ///
+    /// Scalar filters (subsystem, file, language, min_complexity) are pushed
+    /// into LanceDB as `.only_if()` predicates before vector ranking, ensuring
+    /// "top-K within filter" semantics rather than "globally top-K, then discard."
+    pub async fn search_with_filters(
+        &self,
+        query: &str,
+        artifact_types: Option<&[String]>,
+        limit: usize,
+        mode: SearchMode,
+        filters: &SearchFilters,
+    ) -> Result<SearchOutcome> {
         let table = match self
             .db
             .open_table(&self.table_name)
@@ -1151,7 +1388,26 @@ impl EmbeddingIndex {
             }
         };
 
-        let over_fetch = limit * 3; // over-fetch to allow type filtering
+        // Determine over-fetch multiplier.
+        //
+        // When scalar pre-filters are active, only matching rows participate
+        // in vector ranking — no need to over-fetch for post-Rust filtering.
+        // However, two Rust-side steps still reduce result count after the DB query:
+        //   1. artifact_types post-filter (lines below): skips rows whose kind
+        //      does not match the requested types.
+        //   2. test-path demotion: does not reduce count but reorders results.
+        //
+        // Keep a 2x over-fetch when artifact_types filtering is also active,
+        // so the caller receives `limit` results after that Rust-side step.
+        // Without filters, keep the 3x over-fetch (baseline behavior).
+        let pre_filter_sql = filters.to_sql();
+        let has_scalar_filters = pre_filter_sql.is_some();
+        let has_post_filter = artifact_types.is_some_and(|t| !t.is_empty());
+        let over_fetch = match (has_scalar_filters, has_post_filter) {
+            (true, false) => limit,       // scalar-only: exact fetch
+            (true, true)  => limit * 2,  // scalar + artifact_type: 2x for post-filter loss
+            _             => limit * 3,  // no scalar filters: baseline 3x
+        };
 
         use futures::TryStreamExt;
 
@@ -1159,11 +1415,14 @@ impl EmbeddingIndex {
             SearchMode::Keyword => {
                 // Pure BM25 full-text search — no embedding needed.
                 let fts_query = FullTextSearchQuery::new(query.to_string());
-                let results = table
+                let mut q = table
                     .query()
                     .full_text_search(fts_query)
-                    .limit(over_fetch)
-                    .execute()
+                    .limit(over_fetch);
+                if let Some(ref sql) = pre_filter_sql {
+                    q = q.only_if(sql.clone());
+                }
+                let results = q.execute()
                     .await
                     .context("FTS keyword search failed")?;
                 results.try_collect().await?
@@ -1171,11 +1430,14 @@ impl EmbeddingIndex {
             SearchMode::Semantic => {
                 // Pure vector search — original behavior.
                 let query_embedding = embed_texts(vec![query.to_string()]).await?;
-                let search = table
+                let mut search = table
                     .vector_search(query_embedding[0].clone())
                     .context("Failed to create vector search")?
                     .distance_type(lancedb::DistanceType::Cosine)
                     .limit(over_fetch);
+                if let Some(ref sql) = pre_filter_sql {
+                    search = search.only_if(sql.clone());
+                }
                 let results = search.execute().await.context("Vector search failed")?;
                 results.try_collect().await?
             }
@@ -1186,10 +1448,14 @@ impl EmbeddingIndex {
                 let query_embedding = embed_texts(vec![query.to_string()]).await?;
                 let fts_query = FullTextSearchQuery::new(query.to_string());
 
-                let hybrid_result = table
+                let mut q = table
                     .query()
                     .full_text_search(fts_query)
-                    .limit(over_fetch)
+                    .limit(over_fetch);
+                if let Some(ref sql) = pre_filter_sql {
+                    q = q.only_if(sql.clone());
+                }
+                let hybrid_result = q
                     .nearest_to(query_embedding[0].as_slice())
                     .context("Failed to create hybrid search")?
                     .distance_type(lancedb::DistanceType::Cosine)
@@ -1205,11 +1471,14 @@ impl EmbeddingIndex {
                             "Hybrid search failed ({}), falling back to vector-only",
                             e
                         );
-                        let search = table
+                        let mut search = table
                             .vector_search(query_embedding[0].clone())
                             .context("Failed to create fallback vector search")?
                             .distance_type(lancedb::DistanceType::Cosine)
                             .limit(over_fetch);
+                        if let Some(ref sql) = pre_filter_sql {
+                            search = search.only_if(sql.clone());
+                        }
                         let results = search.execute().await.context("Fallback vector search failed")?;
                         results.try_collect().await?
                     }
@@ -1317,7 +1586,7 @@ mod tests {
     use super::{
         truncate_chars, build_code_embedding_text, build_artifact_embedding_text, CODE_EMBED_CHAR_BUDGET,
         BATCH_FLOOR, BATCH_CEILING, BATCH_YIELD_MS, BACKOFF_THRESHOLD,
-        EmbeddingIndex,
+        EmbeddingIndex, SearchFilters,
     };
     use std::collections::BTreeMap;
 
@@ -2307,5 +2576,148 @@ mod tests {
         assert!(text.starts_with("ctx-assembly"), "should start with frontmatter id, got: {}", text);
         assert!(text.contains("status: active"), "should contain frontmatter fields");
         assert!(text.contains("Body text here."), "should contain body text");
+    }
+
+    // ── #401: doc comment in embedding text ───────────────────────────────
+
+    #[test]
+    fn doc_comment_prepended_before_body_in_embedding() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "doc_comment".to_string(),
+            "Charges the card and records the transaction in the audit log.".to_string(),
+        );
+
+        let text = build_code_embedding_text("process_payment", "fn process_payment() {}", &metadata);
+
+        // Doc comment should appear before the function body
+        let doc_pos = text.find("Charges the card").expect("doc comment should be present");
+        let body_pos = text.find("fn process_payment").expect("body should be present");
+        assert!(
+            doc_pos < body_pos,
+            "doc comment (pos {}) should appear before body (pos {}): {}",
+            doc_pos,
+            body_pos,
+            text,
+        );
+    }
+
+    #[test]
+    fn doc_comment_not_duplicated_in_metadata_section() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("doc_comment".to_string(), "Returns the computed value.".to_string());
+        metadata.insert("cyclomatic".to_string(), "3".to_string());
+
+        let text = build_code_embedding_text("compute_result", "fn compute_result() {}", &metadata);
+
+        // doc_comment should appear once (as body prefix), not twice (not in metadata section)
+        let count = text.matches("Returns the computed value").count();
+        assert_eq!(count, 1, "doc_comment should appear exactly once, found {} times in: {}", count, text);
+    }
+
+    #[test]
+    fn doc_comment_within_budget() {
+        let doc = "This is a very long doc comment describing the function's purpose in great detail.".repeat(10);
+        let mut metadata = BTreeMap::new();
+        metadata.insert("doc_comment".to_string(), doc);
+
+        let text = build_code_embedding_text("my_fn", "fn my_fn() {}", &metadata);
+        assert!(
+            text.chars().count() <= CODE_EMBED_CHAR_BUDGET,
+            "embedding with doc comment exceeded budget: {} chars",
+            text.chars().count()
+        );
+    }
+
+    #[test]
+    fn embedding_without_doc_comment_unchanged() {
+        // When no doc_comment key, behavior should be identical to the original
+        let metadata = BTreeMap::new();
+        let text = build_code_embedding_text("process_payment", "fn process_payment() {}", &metadata);
+        // Name should be first, body should follow
+        assert!(text.starts_with("process_payment"), "should start with name");
+        assert!(text.contains("fn process_payment"), "should contain body");
+    }
+
+    // ── #400: SearchFilters SQL generation ────────────────────────────────
+
+    #[test]
+    fn search_filters_empty_returns_none() {
+        let filters = SearchFilters::default();
+        assert!(filters.to_sql().is_none(), "empty filters should produce None");
+    }
+
+    #[test]
+    fn search_filters_subsystem_only() {
+        let filters = SearchFilters { subsystem: Some("server".to_string()), ..Default::default() };
+        let sql = filters.to_sql().expect("subsystem filter should produce SQL");
+        assert_eq!(sql, "subsystem = 'server'");
+    }
+
+    #[test]
+    fn search_filters_file_only() {
+        let filters = SearchFilters { file: Some("src/embed.rs".to_string()), ..Default::default() };
+        let sql = filters.to_sql().expect("file filter should produce SQL");
+        assert!(sql.contains("file_path LIKE"), "should use LIKE for file: {}", sql);
+        assert!(sql.contains("src/embed.rs"), "should contain file pattern: {}", sql);
+        assert!(sql.contains("ESCAPE '!'"), "should include explicit ESCAPE clause for DataFusion: {}", sql);
+    }
+
+    #[test]
+    fn search_filters_file_wildcards_escaped() {
+        // Verify LIKE special characters are escaped with the '!' escape character
+        let filters = SearchFilters { file: Some("src%embed_rs".to_string()), ..Default::default() };
+        let sql = filters.to_sql().expect("should produce SQL");
+        // % should be escaped as !%
+        assert!(sql.contains("!%"), "% in file path should be escaped as !%: {}", sql);
+        // _ should be escaped as !_
+        assert!(sql.contains("!_"), "_ in file path should be escaped as !_: {}", sql);
+        // The escape character itself should be escaped as !!
+        let filters2 = SearchFilters { file: Some("src!embed.rs".to_string()), ..Default::default() };
+        let sql2 = filters2.to_sql().expect("should produce SQL");
+        assert!(sql2.contains("!!"), "! in file path should be escaped as !!: {}", sql2);
+    }
+
+    #[test]
+    fn search_filters_language_only() {
+        let filters = SearchFilters { language: Some("rust".to_string()), ..Default::default() };
+        let sql = filters.to_sql().expect("language filter should produce SQL");
+        assert_eq!(sql, "language = 'rust'");
+    }
+
+    #[test]
+    fn search_filters_min_complexity_only() {
+        let filters = SearchFilters { min_complexity: Some(5), ..Default::default() };
+        let sql = filters.to_sql().expect("min_complexity filter should produce SQL");
+        assert_eq!(sql, "cyclomatic >= 5");
+    }
+
+    #[test]
+    fn search_filters_combined() {
+        let filters = SearchFilters {
+            subsystem: Some("embed".to_string()),
+            file: Some("embed.rs".to_string()),
+            language: Some("rust".to_string()),
+            min_complexity: Some(3),
+        };
+        let sql = filters.to_sql().expect("combined filters should produce SQL");
+        assert!(sql.contains("subsystem = 'embed'"), "missing subsystem: {}", sql);
+        assert!(sql.contains("file_path LIKE"), "missing file_path: {}", sql);
+        assert!(sql.contains("language = 'rust'"), "missing language: {}", sql);
+        assert!(sql.contains("cyclomatic >= 3"), "missing cyclomatic: {}", sql);
+        // Should be joined with AND
+        assert!(sql.contains(" AND "), "should use AND: {}", sql);
+    }
+
+    #[test]
+    fn search_filters_sql_injection_escaped() {
+        // Single quotes in subsystem name should be escaped
+        let filters = SearchFilters {
+            subsystem: Some("server's module".to_string()),
+            ..Default::default()
+        };
+        let sql = filters.to_sql().expect("should produce SQL");
+        assert!(sql.contains("server''s module"), "single quotes should be doubled: {}", sql);
+        assert!(!sql.contains("server's module"), "raw single quote should not appear: {}", sql);
     }
 }
