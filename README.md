@@ -203,6 +203,14 @@ The system compounds from here. Agents use `search` to discover relevant context
 [scanner]
 exclude = ["benchmark/"]
 
+[lsp]
+# Minimum severity to store as diagnostic nodes.
+# "error"       = errors only
+# "warning"     = errors + warnings (default)
+# "information" = errors + warnings + information
+# "hint"        = all diagnostics (captures unlinked-file, inactive-code)
+diagnostic_min_severity = "hint"
+
 [workspace.roots]
 infra   = "../k8s-configs"    # relative to the repo containing .oh/
 protos  = "/abs/path/protos"  # absolute paths also work
@@ -291,7 +299,7 @@ repo-native-alignment scan --repo . --full
 ├── signals/         <- how we measure progress
 ├── guardrails/      <- constraints that shape behavior
 ├── metis/           <- learnings that compound across sessions
-├── config.toml      <- scanner excludes, pattern detection, declared workspace roots
+├── config.toml      <- scanner excludes, LSP severity threshold, pattern detection, declared workspace roots
 └── .cache/          <- scan state, embedding index (gitignored)
 ```
 

@@ -61,18 +61,31 @@ impl ScanConfig {
     /// Load from `.oh/config.toml` if it exists, otherwise return defaults.
     pub fn load(repo_root: &Path) -> Self {
         let config_path = repo_root.join(".oh").join("config.toml");
-        match std::fs::read_to_string(&config_path) {
-            Ok(content) => {
-                // Parse [scanner] section from TOML
-                match toml::from_str::<TomlConfig>(&content) {
-                    Ok(parsed) => parsed.scanner.unwrap_or_default(),
-                    Err(e) => {
-                        tracing::warn!("Failed to parse {}: {}", config_path.display(), e);
-                        Self::default()
-                    }
-                }
+        let content = match std::fs::read_to_string(&config_path) {
+            Ok(c) => c,
+            Err(_) => return Self::default(),
+        };
+        // Parse into a generic Value first to isolate section parse errors.
+        // A bad [lsp] or [patterns] section must not cause [scanner] to fall back.
+        let value: toml::Value = match toml::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Failed to parse {}: {}", config_path.display(), e);
+                return Self::default();
             }
-            Err(_) => Self::default(),
+        };
+        match value.get("scanner") {
+            Some(v) => match v.clone().try_into::<Self>() {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse [scanner] section in {}: {}",
+                        config_path.display(), e
+                    );
+                    Self::default()
+                }
+            },
+            None => Self::default(),
         }
     }
 
@@ -154,17 +167,34 @@ pub const DEFAULT_PATTERN_SUFFIXES: &[(&str, &str)] = &[
 
 impl PatternConfig {
     /// Load from `.oh/config.toml` if it exists, otherwise return defaults.
+    ///
+    /// Parses the file into a `toml::Value` first to isolate section parse errors.
+    /// A bad `[lsp]` or `[scanner]` section must not cause `[patterns]` to fall back.
     pub fn load(repo_root: &Path) -> Self {
         let config_path = repo_root.join(".oh").join("config.toml");
-        match std::fs::read_to_string(&config_path) {
-            Ok(content) => match toml::from_str::<TomlConfig>(&content) {
-                Ok(parsed) => parsed.patterns.unwrap_or_default(),
+        let content = match std::fs::read_to_string(&config_path) {
+            Ok(c) => c,
+            Err(_) => return Self::default(),
+        };
+        let value: toml::Value = match toml::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Failed to parse {}: {}", config_path.display(), e);
+                return Self::default();
+            }
+        };
+        match value.get("patterns") {
+            Some(v) => match v.clone().try_into::<Self>() {
+                Ok(cfg) => cfg,
                 Err(e) => {
-                    tracing::warn!("Failed to parse {}: {}", config_path.display(), e);
+                    tracing::warn!(
+                        "Failed to parse [patterns] section in {}: {}",
+                        config_path.display(), e
+                    );
                     Self::default()
                 }
             },
-            Err(_) => Self::default(),
+            None => Self::default(),
         }
     }
 
@@ -203,11 +233,102 @@ impl PatternConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct TomlConfig {
-    scanner: Option<ScanConfig>,
-    patterns: Option<PatternConfig>,
-    workspace: Option<WorkspaceSection>,
+/// Minimum LSP diagnostic severity to store as graph nodes.
+///
+/// Corresponds to LSP DiagnosticSeverity integers:
+///   1 = Error, 2 = Warning, 3 = Information, 4 = Hint
+///
+/// The variant name is the floor — all severities with integer ≤ the floor are stored.
+/// Default is `Warning` (store Error + Warning, filter Information + Hint).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DiagnosticMinSeverity {
+    /// Store only errors (severity 1).
+    Error,
+    /// Store errors and warnings (severity ≤ 2). **Default.**
+    Warning,
+    /// Store errors, warnings, and information (severity ≤ 3).
+    Information,
+    /// Store all diagnostics including hints (severity ≤ 4).
+    Hint,
+}
+
+impl Default for DiagnosticMinSeverity {
+    fn default() -> Self {
+        Self::Warning
+    }
+}
+
+impl DiagnosticMinSeverity {
+    /// Return the maximum LSP severity integer that should be stored.
+    ///
+    /// LSP encodes severity as ascending integers where 1 = most severe.
+    /// A diagnostic is kept when `severity_int <= self.max_severity_int()`.
+    pub fn max_severity_int(&self) -> u64 {
+        match self {
+            Self::Error => 1,
+            Self::Warning => 2,
+            Self::Information => 3,
+            Self::Hint => 4,
+        }
+    }
+}
+
+/// LSP-specific configuration loaded from `.oh/config.toml` under `[lsp]`.
+///
+/// # Example `.oh/config.toml`
+///
+/// ```toml
+/// [lsp]
+/// # "error"       — errors only
+/// # "warning"     — errors + warnings (default)
+/// # "information" — errors + warnings + information
+/// # "hint"        — all diagnostics
+/// diagnostic_min_severity = "hint"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LspConfig {
+    /// Minimum severity to store as diagnostic nodes. Defaults to `Warning`.
+    #[serde(default)]
+    pub diagnostic_min_severity: DiagnosticMinSeverity,
+}
+
+impl LspConfig {
+    /// Load from `.oh/config.toml` if it exists, otherwise return defaults.
+    ///
+    /// Parses the file into a `toml::Value` first, then extracts only the `[lsp]`
+    /// table and deserializes it. This isolates `[lsp]` parse errors from the
+    /// rest of the config — a typo in `diagnostic_min_severity` does NOT cause
+    /// `ScanConfig::load()` or `PatternConfig::load()` to fall back to defaults.
+    pub fn load(repo_root: &Path) -> Self {
+        let config_path = repo_root.join(".oh").join("config.toml");
+        let content = match std::fs::read_to_string(&config_path) {
+            Ok(c) => c,
+            Err(_) => return Self::default(),
+        };
+        // Parse into a generic Value to avoid cross-section failure coupling.
+        let value: toml::Value = match toml::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Failed to parse {}: {}", config_path.display(), e);
+                return Self::default();
+            }
+        };
+        // Extract only the [lsp] table, return default if absent or malformed.
+        match value.get("lsp") {
+            Some(lsp_value) => match lsp_value.clone().try_into::<Self>() {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse [lsp] section in {}: {}",
+                        config_path.display(), e
+                    );
+                    Self::default()
+                }
+            },
+            None => Self::default(),
+        }
+    }
 }
 
 /// The `[workspace]` table in `.oh/config.toml`.
@@ -231,27 +352,38 @@ pub fn load_declared_roots(repo_root: &std::path::Path) -> Vec<(String, std::pat
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    match toml::from_str::<TomlConfig>(&content) {
-        Ok(parsed) => {
-            let section = match parsed.workspace {
-                Some(w) => w,
-                None => return Vec::new(),
-            };
-            section
-                .roots
-                .into_iter()
-                .map(|(slug, path_str)| (slug, std::path::PathBuf::from(path_str)))
-                .collect()
-        }
+    // Parse into a generic Value to isolate section parse errors.
+    let value: toml::Value = match toml::from_str(&content) {
+        Ok(v) => v,
         Err(e) => {
             tracing::warn!(
                 "Failed to parse [workspace.roots] in {}: {}",
                 config_path.display(),
                 e
             );
-            Vec::new()
+            return Vec::new();
         }
-    }
+    };
+    let workspace_value = match value.get("workspace") {
+        Some(v) => v.clone(),
+        None => return Vec::new(),
+    };
+    let section: WorkspaceSection = match workspace_value.try_into() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to parse [workspace] section in {}: {}",
+                config_path.display(),
+                e
+            );
+            return Vec::new();
+        }
+    };
+    section
+        .roots
+        .into_iter()
+        .map(|(slug, path_str)| (slug, std::path::PathBuf::from(path_str)))
+        .collect()
 }
 
 // ── Public types ────────────────────────────────────────────────────
@@ -2078,5 +2210,93 @@ exclude = ["dist/"]
         // No .oh/ directory at all
         let roots = load_declared_roots(tmp.path());
         assert!(roots.is_empty(), "Missing config file should yield empty vec");
+    }
+
+    // ── LspConfig integration tests ─────────────────────────────────
+
+    #[test]
+    fn test_lsp_config_load_hint_from_toml_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".oh")).unwrap();
+        fs::write(
+            root.join(".oh/config.toml"),
+            "[lsp]\ndiagnostic_min_severity = \"hint\"\n",
+        ).unwrap();
+
+        let config = LspConfig::load(root);
+        assert_eq!(config.diagnostic_min_severity, DiagnosticMinSeverity::Hint);
+        assert_eq!(config.diagnostic_min_severity.max_severity_int(), 4);
+    }
+
+    #[test]
+    fn test_lsp_config_load_missing_file_returns_warning_default() {
+        let tmp = TempDir::new().unwrap();
+        let config = LspConfig::load(tmp.path());
+        assert_eq!(config.diagnostic_min_severity, DiagnosticMinSeverity::Warning);
+    }
+
+    #[test]
+    fn test_lsp_config_load_no_lsp_section_returns_warning_default() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".oh")).unwrap();
+        fs::write(
+            root.join(".oh/config.toml"),
+            "[scanner]\nexclude = [\"benchmark/\"]\n",
+        ).unwrap();
+
+        let config = LspConfig::load(root);
+        assert_eq!(config.diagnostic_min_severity, DiagnosticMinSeverity::Warning,
+            "missing [lsp] section should default to Warning");
+    }
+
+    #[test]
+    fn test_lsp_config_load_all_severity_levels() {
+        for (toml_value, expected_max) in &[
+            ("error", 1u64),
+            ("warning", 2),
+            ("information", 3),
+            ("hint", 4),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            fs::create_dir_all(root.join(".oh")).unwrap();
+            fs::write(
+                root.join(".oh/config.toml"),
+                format!("[lsp]\ndiagnostic_min_severity = \"{toml_value}\"\n"),
+            ).unwrap();
+
+            let config = LspConfig::load(root);
+            assert_eq!(
+                config.diagnostic_min_severity.max_severity_int(),
+                *expected_max,
+                "severity '{toml_value}' should map to max_severity_int={expected_max}"
+            );
+        }
+    }
+
+    /// A typo in [lsp] (e.g. "warn" instead of "warning") must NOT cause
+    /// ScanConfig::load() to fall back to defaults. Isolated section parsing.
+    #[test]
+    fn test_lsp_config_invalid_value_does_not_affect_scan_config() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".oh")).unwrap();
+        // "warn" is not a valid DiagnosticMinSeverity — [lsp] parse fails
+        fs::write(
+            root.join(".oh/config.toml"),
+            "[scanner]\nexclude = [\"benchmark/\"]\n\n[lsp]\ndiagnostic_min_severity = \"warn\"\n",
+        ).unwrap();
+
+        // LspConfig falls back to default (Warning) — its own section failed
+        let lsp = LspConfig::load(root);
+        assert_eq!(lsp.diagnostic_min_severity, DiagnosticMinSeverity::Warning,
+            "bad [lsp] value should fall back to Warning default");
+
+        // ScanConfig must still see its exclude, not fall back to empty
+        let scan = ScanConfig::load(root);
+        assert!(scan.exclude.contains(&"benchmark/".to_string()),
+            "bad [lsp] section must not cause ScanConfig to fall back to defaults");
     }
 }
