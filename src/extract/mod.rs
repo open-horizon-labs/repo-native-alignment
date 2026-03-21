@@ -11,6 +11,7 @@ pub mod api_link;
 pub mod bash;
 pub mod configs;
 pub mod cpp;
+pub mod dockerfile;
 pub mod generic;
 pub mod query;
 pub mod csharp;
@@ -178,6 +179,7 @@ impl ExtractorRegistry {
         registry.register(Box::new(lua::LuaExtractor::new()));
         registry.register(Box::new(swift::SwiftExtractor::new()));
         // Infrastructure / config
+        registry.register(Box::new(dockerfile::DockerfileExtractor::new()));
         registry.register(Box::new(hcl::HclExtractor::new()));
         registry.register(Box::new(json_extractor::JsonExtractor::new()));
         registry.register(Box::new(toml_extractor::TomlExtractor::new()));
