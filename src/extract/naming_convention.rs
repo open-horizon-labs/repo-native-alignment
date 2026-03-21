@@ -278,4 +278,62 @@ mod tests {
         assert_eq!(edges[0].source, ExtractionSource::TreeSitter,
             "source must be TreeSitter (not LSP) for the tree-sitter pass");
     }
+
+    /// Integration test: extract a real Rust file and verify tested_by_pass
+    /// produces TestedBy edges without LSP.
+    #[test]
+    fn test_integration_with_real_rust_extractor() {
+        use crate::extract::ExtractorRegistry;
+        use std::path::Path;
+
+        let registry = ExtractorRegistry::with_builtins();
+        let code = r#"
+pub fn process_payment(amount: u64) -> bool {
+    amount > 0
+}
+
+pub fn calculate_tax(amount: u64) -> u64 {
+    amount / 10
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_process_payment_valid() {
+        assert!(process_payment(100));
+    }
+
+    #[test]
+    fn test_calculate_tax_basic() {
+        assert_eq!(calculate_tax(100), 10);
+    }
+}
+"#;
+        let result = registry.extract_file(Path::new("src/payment.rs"), code);
+
+        // Run the naming-convention pass over the extracted nodes
+        let edges = tested_by_pass(&result.nodes);
+
+        let tested_by: Vec<_> = edges.iter()
+            .filter(|e| e.kind == EdgeKind::TestedBy)
+            .collect();
+
+        assert!(
+            !tested_by.is_empty(),
+            "expected TestedBy edges from naming convention pass on real Rust code; \
+             got 0. Nodes extracted: {:?}",
+            result.nodes.iter().map(|n| (&n.id.name, &n.id.kind)).collect::<Vec<_>>()
+        );
+
+        // Verify at least one expected edge
+        let has_payment_edge = tested_by.iter().any(|e|
+            e.from.name.contains("process_payment") && e.to.name == "process_payment"
+        );
+        assert!(
+            has_payment_edge,
+            "expected test_process_payment_valid → process_payment TestedBy edge"
+        );
+    }
 }
