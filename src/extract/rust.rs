@@ -87,6 +87,9 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
     docstring_in_body: false,
     route_queries: &[RUST_ROUTE_QUERY],
     compiled_route_queries: std::sync::OnceLock::new(),
+    call_expr_kinds: Some(("call_expression", "function")),
+    pub_visibility_modifier: Some("visibility_modifier"),
+    has_all_export: false,
 };
 
 /// Rust tree-sitter extractor with topology pattern detection.

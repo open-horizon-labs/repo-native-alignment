@@ -146,6 +146,27 @@ pub struct LangConfig {
     /// (and the underlying `tree_sitter::Query`) is `Send + Sync`, this is
     /// safe to store in a static `OnceLock`.
     pub compiled_route_queries: std::sync::OnceLock<Vec<Option<QueryExtractor>>>,
+    /// Tree-sitter (call_expression_kind, callee_field_name) for same-file call detection (#407).
+    /// `None` = same-file call detection disabled for this language.
+    ///
+    /// Examples:
+    /// - Rust: `Some(("call_expression", "function"))`
+    /// - Python: `Some(("call", "function"))`
+    /// - TypeScript: `Some(("call_expression", "function"))`
+    /// - Java: `Some(("method_invocation", "name"))`
+    pub call_expr_kinds: Option<(&'static str, &'static str)>,
+    /// Tree-sitter node kind for a visibility modifier that signals a public re-export (#409).
+    /// When set, Import nodes with this child are marked `visibility=pub` and a `ReExports` edge
+    /// is emitted. `None` = no visibility modifier in this language's AST (or not applicable).
+    ///
+    /// Examples:
+    /// - Rust: `Some("visibility_modifier")`
+    /// - TypeScript/JavaScript: `None` (export keyword is part of the node text, not a child)
+    /// - Python/Go/Java: `None`
+    pub pub_visibility_modifier: Option<&'static str>,
+    /// Whether to detect `__all__ = [...]` assignments as public API exports (#409).
+    /// Set `true` only for Python (the only language using this convention).
+    pub has_all_export: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -428,11 +449,9 @@ fn collect_nodes(
                 metadata.insert("pattern_hint".to_string(), hint);
             }
 
-            // Python __all__ = [...] detection (#409).
-            // When a module-level assignment is named `__all__`, it declares
-            // the public API surface. Mark it with `exported = "true"`.
-            // `__all__` is a Python convention; no other supported language uses it.
-            if node_kind == NodeKind::Const && name == "__all__" {
+            // Public API export flag for `__all__ = [...]` (#409).
+            // Only set when LangConfig.has_all_export is true (Python only).
+            if node_kind == NodeKind::Const && name == "__all__" && config.has_all_export {
                 metadata.insert("exported".to_string(), "true".to_string());
             }
 
@@ -458,10 +477,10 @@ fn collect_nodes(
 
             // Public API surface detection (#409).
             // Rust: `pub use` → visibility=pub + ReExports edge.
-            // Python: `__all__ = [...]` on an assignment → exported=true.
-            // TypeScript: `export { X }` → visibility=pub + ReExports edge.
+            // TypeScript/JavaScript: `export { X }` → visibility=pub + ReExports edge.
+            // Language-specific behavior is driven by LangConfig fields (no language_name checks).
             if node_kind == NodeKind::Import {
-                detect_public_api(node, source, config.language_name, path, &name, &mut metadata, edges);
+                detect_public_api(node, source, config, path, &name, &mut metadata, edges);
             }
 
             // Import edge.
@@ -1614,9 +1633,9 @@ fn is_test_by_decorator(decorators: &str, fn_name: &str) -> bool {
                 || lower == "repeatedtest"
                 // Rust integration: rstest
                 || lower == "rstest"
-                // Python pytest
+                // Python pytest — only mark.* forms are test markers.
+                // @pytest.fixture, @pytest.param etc. are NOT test functions.
                 || lower.starts_with("pytest.mark.")
-                || lower.starts_with("pytest.")
         })
 }
 
@@ -1767,6 +1786,9 @@ fn parse_decorator_trait_names(dec: &str) -> Option<Vec<String>> {
         // Route/endpoint decorators (already handled by route_queries pass)
         "app", "router", "route", "get", "post", "put", "delete", "patch",
         "head", "options", "blueprint", "api",
+        // Spring MVC / Spring Boot HTTP method mapping annotations
+        "getmapping", "postmapping", "putmapping", "deletemapping", "patchmapping",
+        "headmapping", "optionsmapping", "tracemapping", "requestmapping",
         // Pytest / test lifecycle
         "fixture", "mark", "pytest",
         // DI / framework lifecycle decorators that don't map to trait impls
@@ -1839,6 +1861,7 @@ fn parse_decorator_trait_names(dec: &str) -> Option<Vec<String>> {
 /// - The callee name exactly matches a `NodeKind::Function` defined in `nodes`
 /// - The call is inside an enclosing function defined in this file
 /// - The callee is not the caller itself (no self-loops)
+/// - `config.call_expr_kinds` is Some (language opts in to call detection)
 ///
 /// Cross-file calls and method calls (e.g. `self.foo()`) are left to LSP.
 fn detect_same_file_calls(
@@ -1848,6 +1871,11 @@ fn detect_same_file_calls(
     config: &LangConfig,
     nodes: &[Node],
 ) -> Vec<Edge> {
+    // Language must opt in to call detection via LangConfig.call_expr_kinds.
+    if config.call_expr_kinds.is_none() {
+        return Vec::new();
+    }
+
     // Build a set of function names defined in this file for O(1) lookup.
     let file_fns: std::collections::HashSet<&str> = nodes
         .iter()
@@ -1862,24 +1890,6 @@ fn detect_same_file_calls(
     let mut edges = Vec::new();
     collect_calls(root, path, source, config, &file_fns, &None, &mut edges);
     edges
-}
-
-/// Detect the tree-sitter node kinds used for call expressions in each language.
-/// Returns the call node kind and the field/child that holds the function name.
-fn call_node_kind_for(language: &str) -> Option<(&'static str, &'static str)> {
-    match language {
-        "rust" => Some(("call_expression", "function")),
-        "python" => Some(("call", "function")),
-        "typescript" | "javascript" | "tsx" | "jsx" => Some(("call_expression", "function")),
-        "go" => Some(("call_expression", "function")),
-        "java" => Some(("method_invocation", "name")),
-        "kotlin" => Some(("call_expression", "calleeExpression")),
-        "csharp" => Some(("invocation_expression", "function")),
-        "ruby" => Some(("call", "method")),
-        "swift" => Some(("call_expression", "function")),
-        "cpp" | "c" => Some(("call_expression", "function")),
-        _ => None,
-    }
 }
 
 /// Recursive walk that collects Calls edges for same-file function calls.
@@ -1909,35 +1919,42 @@ fn collect_calls(
 
     // If we're inside a function, check for call expressions.
     if let Some(caller_name) = enclosing {
-        if let Some((call_kind, name_field)) = call_node_kind_for(config.language_name) {
+        if let Some((call_kind, name_field)) = config.call_expr_kinds {
             if kind == call_kind {
-                // Extract callee name from the designated field.
-                // For Rust/TS: function field → may be an `identifier` directly,
-                // or a `scoped_identifier` / `field_expression` — take only bare identifiers.
-                if let Some(callee_node) = node.child_by_field_name(name_field) {
-                    let callee_kind = callee_node.kind();
-                    // Only resolve bare identifiers — skip method chains, scoped paths, etc.
-                    if callee_kind == "identifier" || callee_kind == "simple_identifier" {
-                        if let Ok(callee_name) = callee_node.utf8_text(source) {
-                            let callee_name = callee_name.trim();
-                            if file_fns.contains(callee_name) && callee_name != caller_name {
-                                edges.push(Edge {
-                                    from: NodeId {
-                                        root: String::new(),
-                                        file: path.to_path_buf(),
-                                        name: caller_name.to_string(),
-                                        kind: NodeKind::Function,
-                                    },
-                                    to: NodeId {
-                                        root: String::new(),
-                                        file: path.to_path_buf(),
-                                        name: callee_name.to_string(),
-                                        kind: NodeKind::Function,
-                                    },
-                                    kind: EdgeKind::Calls,
-                                    source: ExtractionSource::TreeSitter,
-                                    confidence: Confidence::Detected,
-                                });
+                // Reject qualified calls: Java `obj.helper()` has an `object` field;
+                // Ruby `obj.method()` has a `receiver` field. Skip these — they are
+                // method dispatches, not bare same-file function calls.
+                let is_qualified = node.child_by_field_name("object").is_some()
+                    || node.child_by_field_name("receiver").is_some();
+                if !is_qualified {
+                    // Extract callee name from the designated field.
+                    // For Rust/TS: function field → may be an `identifier` directly,
+                    // or a `scoped_identifier` / `field_expression` — take only bare identifiers.
+                    if let Some(callee_node) = node.child_by_field_name(name_field) {
+                        let callee_kind = callee_node.kind();
+                        // Only resolve bare identifiers — skip method chains, scoped paths, etc.
+                        if callee_kind == "identifier" || callee_kind == "simple_identifier" {
+                            if let Ok(callee_name) = callee_node.utf8_text(source) {
+                                let callee_name = callee_name.trim();
+                                if file_fns.contains(callee_name) && callee_name != caller_name {
+                                    edges.push(Edge {
+                                        from: NodeId {
+                                            root: String::new(),
+                                            file: path.to_path_buf(),
+                                            name: caller_name.to_string(),
+                                            kind: NodeKind::Function,
+                                        },
+                                        to: NodeId {
+                                            root: String::new(),
+                                            file: path.to_path_buf(),
+                                            name: callee_name.to_string(),
+                                            kind: NodeKind::Function,
+                                        },
+                                        kind: EdgeKind::Calls,
+                                        source: ExtractionSource::TreeSitter,
+                                        confidence: Confidence::Detected,
+                                    });
+                                }
                             }
                         }
                     }
@@ -1960,94 +1977,195 @@ fn collect_calls(
 
 /// Detect public re-exports on an Import node and emit metadata + edges.
 ///
-/// - **Rust `pub use`**: sets `metadata["visibility"] = "pub"` and emits a `ReExports` edge.
-/// - **Python `__all__ = [...]`**: sets `metadata["exported"] = "true"` on the Const node
-///   (handled separately — this function handles Import nodes).
-/// - **TypeScript `export { X }`**: sets `metadata["visibility"] = "pub"` and emits `ReExports`.
+/// Behavior is driven by `LangConfig` fields — no language-name string comparisons:
+/// - When `config.pub_visibility_modifier` is set: check for that child node → `pub use` (Rust)
+/// - When `config.pub_visibility_modifier` is None but the node text starts with `export`: TS/JS
+///
+/// The `pub_visibility_modifier = None` + `export` text fallback covers TypeScript/JavaScript
+/// where the export keyword is part of the statement, not a separate child modifier.
 fn detect_public_api(
     node: tree_sitter::Node,
     source: &[u8],
-    language: &str,
+    config: &LangConfig,
     path: &Path,
     name: &str,
     metadata: &mut BTreeMap<String, String>,
     edges: &mut Vec<Edge>,
 ) {
-    match language {
-        "rust" => detect_pub_use_rust(node, source, path, name, metadata, edges),
-        "typescript" | "javascript" | "tsx" | "jsx" => {
-            detect_export_ts(node, source, path, name, metadata, edges)
-        }
-        _ => {}
+    if let Some(vis_modifier) = config.pub_visibility_modifier {
+        // Language uses a visibility modifier child node (Rust: visibility_modifier).
+        detect_pub_use_with_modifier(node, source, vis_modifier, path, name, metadata, edges);
+    } else {
+        // Language uses `export` keyword in node text (TypeScript/JavaScript).
+        detect_export_ts(node, source, path, name, metadata, edges);
     }
 }
 
-/// Rust: detect `pub use ...` and emit `ReExports` edge.
+/// Detect `pub use ...` using a visibility modifier child node and AST traversal.
 ///
-/// In tree-sitter-rust, `use_declaration` has a `visibility_modifier` child
-/// when the declaration is prefixed with `pub`.
-fn detect_pub_use_rust(
+/// Used by languages where `pub` visibility is expressed as a separate AST child
+/// (e.g., Rust's `visibility_modifier`). The `vis_modifier` parameter is the
+/// tree-sitter node kind to look for (from `LangConfig.pub_visibility_modifier`).
+///
+/// Uses AST traversal to extract the exact visibility text and all re-exported
+/// identifiers, rather than raw text splitting.
+fn detect_pub_use_with_modifier(
     node: tree_sitter::Node,
     source: &[u8],
+    vis_modifier: &str,
     path: &Path,
     name: &str,
     metadata: &mut BTreeMap<String, String>,
     edges: &mut Vec<Edge>,
 ) {
-    let is_pub = (0..node.child_count()).any(|i| {
-        node.child(i as u32)
-            .map(|c| c.kind() == "visibility_modifier")
-            .unwrap_or(false)
-    });
-    if !is_pub {
-        // Double check by looking at the raw text (some grammars don't emit visibility_modifier
-        // as a separate node for use_declaration).
-        let text = node.utf8_text(source).unwrap_or("").trim();
-        if !text.starts_with("pub ") && !text.starts_with("pub(") {
-            return;
+    // Find the visibility_modifier child and read its exact text.
+    // Captures pub, pub(crate), pub(super), pub(in ...) accurately.
+    let vis_text = (0..node.child_count())
+        .find_map(|i| {
+            let child = node.child(i as u32)?;
+            if child.kind() == vis_modifier {
+                child.utf8_text(source).ok().map(|t| t.trim().to_string())
+            } else {
+                None
+            }
+        });
+    let Some(vis) = vis_text else {
+        return;
+    };
+
+    // Store exact visibility string (pub, pub(crate), pub(super), etc.)
+    metadata.insert("visibility".to_string(), vis);
+
+    // Walk the use_declaration AST to collect re-exported identifiers.
+    // This handles `pub use foo::Bar`, `pub use foo::{A, B}`, and `pub use foo::*`.
+    let target_names = collect_use_targets(node, source);
+    for target in target_names {
+        if target.is_empty() || target == "self" {
+            continue;
+        }
+        edges.push(Edge {
+            from: NodeId {
+                root: String::new(),
+                file: path.to_path_buf(),
+                name: name.to_string(),
+                kind: NodeKind::Import,
+            },
+            to: NodeId {
+                root: String::new(),
+                file: path.to_path_buf(),
+                name: target,
+                kind: NodeKind::Module,
+            },
+            kind: EdgeKind::ReExports,
+            source: ExtractionSource::TreeSitter,
+            confidence: Confidence::Detected,
+        });
+    }
+}
+
+/// Walk a `use_declaration` AST node and collect all re-exported identifier names.
+///
+/// Handles:
+/// - `use foo::Bar` → `["Bar"]`
+/// - `use foo::{A, B, C}` → `["A", "B", "C"]`
+/// - `use foo::*` → `[]` (wildcard — skip edge)
+/// - `use foo::{self}` → `[]` (self re-export — skip edge)
+fn collect_use_targets(node: tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut targets = Vec::new();
+    collect_use_targets_inner(node, source, &mut targets);
+    targets
+}
+
+fn collect_use_targets_inner(node: tree_sitter::Node, source: &[u8], targets: &mut Vec<String>) {
+    let kind = node.kind();
+    match kind {
+        // Wildcard: `::*` — stop, no edge
+        "*" => {}
+        // `self` keyword in use list — skip
+        "self" => {}
+        // use_wildcard: `foo::*` — stop, no edges
+        "use_wildcard" | "scoped_use_list" => {
+            // scoped_use_list: `foo::{A, B}` — recurse to find identifiers
+            if kind == "scoped_use_list" {
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i as u32) {
+                        collect_use_targets_inner(child, source, targets);
+                    }
+                }
+            }
+            // use_wildcard: stop
+        }
+        // use_list: `{A, B, C}` — recurse into items
+        "use_list" => {
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    collect_use_targets_inner(child, source, targets);
+                }
+            }
+        }
+        // use_as_clause: `Bar as Baz` — take the alias (Baz) as the exported name
+        "use_as_clause" => {
+            // The second named child is the alias
+            if let Some(alias) = node.child_by_field_name("alias") {
+                if let Ok(text) = alias.utf8_text(source) {
+                    let t = text.trim().to_string();
+                    if !t.is_empty() && t != "self" && t != "_" {
+                        targets.push(t);
+                    }
+                }
+            }
+        }
+        // scoped_identifier: `crate::foo::Bar` — take the last segment
+        "scoped_identifier" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                if let Ok(text) = name_node.utf8_text(source) {
+                    let t = text.trim().to_string();
+                    if !t.is_empty() && t != "self" && t != "*" {
+                        targets.push(t);
+                    }
+                }
+            } else {
+                // Fallback: recurse
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i as u32) {
+                        collect_use_targets_inner(child, source, targets);
+                    }
+                }
+            }
+        }
+        // identifier: bare name (e.g. the "Bar" in `use crate::foo::Bar`)
+        "identifier" => {
+            if let Ok(text) = node.utf8_text(source) {
+                let t = text.trim().to_string();
+                if !t.is_empty() && t != "self" && t != "_" {
+                    targets.push(t);
+                }
+            }
+        }
+        // use_declaration: recurse to find the path inside
+        "use_declaration" => {
+            if let Some(arg) = node.child_by_field_name("argument") {
+                collect_use_targets_inner(arg, source, targets);
+            } else {
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i as u32) {
+                        let k = child.kind();
+                        if k != "use" && k != "pub" && k != ";" && k != "::" {
+                            collect_use_targets_inner(child, source, targets);
+                        }
+                    }
+                }
+            }
+        }
+        // Everything else: recurse
+        _ => {
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    collect_use_targets_inner(child, source, targets);
+                }
+            }
         }
     }
-
-    metadata.insert("visibility".to_string(), "pub".to_string());
-
-    // Extract the re-exported symbol name for the edge target.
-    // `pub use crate::foo::Bar;` → target name "Bar"
-    // `pub use crate::foo::*;` → wildcard, skip edge.
-    let text = node.utf8_text(source).unwrap_or("").trim();
-    if text.contains("::*") || text.ends_with("*;") {
-        // Wildcard re-export — we can't enumerate targets statically.
-        return;
-    }
-    // Last path segment before semicolon.
-    let target = text
-        .trim_end_matches(';')
-        .trim_end_matches('}')
-        .split([' ', ':', '/', '{'])
-        .filter(|s| !s.is_empty() && s.chars().next().map_or(false, |c| c.is_alphanumeric() || c == '_'))
-        .last()
-        .unwrap_or("")
-        .trim();
-    if target.is_empty() || target == "self" {
-        return;
-    }
-
-    edges.push(Edge {
-        from: NodeId {
-            root: String::new(),
-            file: path.to_path_buf(),
-            name: name.to_string(),
-            kind: NodeKind::Import,
-        },
-        to: NodeId {
-            root: String::new(),
-            file: path.to_path_buf(),
-            name: target.to_string(),
-            kind: NodeKind::Module,
-        },
-        kind: EdgeKind::ReExports,
-        source: ExtractionSource::TreeSitter,
-        confidence: Confidence::Detected,
-    });
 }
 
 /// TypeScript/JavaScript: detect `export { X }` and `export const/let/var/function` re-exports.
@@ -4653,6 +4771,116 @@ def test_add(x, y):
         let parts = split_decorators(decorators);
         assert_eq!(parts.len(), 1, "derive with multiple traits should stay as 1 decorator");
         assert_eq!(parts[0], "#[derive(Debug, Clone)]");
+    }
+
+    /// CR2: `@pytest.fixture` should NOT mark a function as is_test.
+    /// Only `@pytest.mark.*` are test markers.
+    #[test]
+    fn test_pytest_fixture_not_is_test() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = "@pytest.fixture\ndef my_fixture():\n    return 42\n";
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(Path::new("conftest.py"), code)
+            .unwrap();
+        let fn_node = result.nodes.iter().find(|n| n.id.name == "my_fixture").unwrap();
+        assert!(
+            fn_node.metadata.get("is_test").is_none(),
+            "@pytest.fixture should NOT set is_test, got: {:?}",
+            fn_node.metadata.get("is_test")
+        );
+    }
+
+    /// CR3: Spring @GetMapping should not emit Implements(GetMapping).
+    #[test]
+    fn test_spring_getmapping_no_implements_edge() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let code = r#"class ApiController {
+    @GetMapping("/users")
+    List<User> getUsers() { return List.of(); }
+}
+"#;
+        let result = GenericExtractor::new(&JAVA_CONFIG)
+            .run(Path::new("ApiController.java"), code)
+            .unwrap();
+        let impl_edges: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Implements && e.to.name.to_lowercase().contains("mapping"))
+            .collect();
+        assert!(
+            impl_edges.is_empty(),
+            "@GetMapping should not emit Implements edge, got: {:?}",
+            impl_edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// CR4: Java receiver-based calls (obj.helper()) must NOT emit Calls edges.
+    #[test]
+    fn test_java_qualified_call_no_same_file_edge() {
+        use crate::extract::configs::JAVA_CONFIG;
+        // obj.helper() — qualified, should not emit
+        let code = r#"class Foo {
+    void helper() {}
+    void main() {
+        Foo obj = new Foo();
+        obj.helper();
+    }
+}
+"#;
+        let result = GenericExtractor::new(&JAVA_CONFIG)
+            .run(Path::new("Foo.java"), code)
+            .unwrap();
+        let qualified_calls: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Calls && e.to.name == "helper")
+            .collect();
+        // `obj.helper()` is a qualified call — should NOT produce a same-file Calls edge
+        assert!(
+            qualified_calls.is_empty(),
+            "Java obj.helper() should NOT emit Calls edge, got: {:?}", qualified_calls
+        );
+    }
+
+    /// CR5: pub use visibility text is exact (pub, pub(crate), etc.)
+    #[test]
+    fn test_pub_use_visibility_exact_text() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "pub(crate) use crate::foo::Bar;\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("lib.rs"), code)
+            .unwrap();
+        let pub_imports: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::Import && n.metadata.contains_key("visibility"))
+            .collect();
+        assert!(
+            !pub_imports.is_empty(),
+            "pub(crate) use should set visibility metadata"
+        );
+        // Visibility should contain the exact text, not just "pub"
+        let vis = pub_imports[0].metadata.get("visibility").unwrap();
+        assert!(
+            vis.contains("pub"),
+            "visibility should contain 'pub', got: {}", vis
+        );
+    }
+
+    /// CR5: pub use with braces emits ReExports for each name.
+    #[test]
+    fn test_pub_use_braces_emits_multiple_re_exports() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "pub use crate::foo::{Alpha, Beta};\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("lib.rs"), code)
+            .unwrap();
+        let re_exports: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::ReExports)
+            .collect();
+        let names: Vec<&str> = re_exports.iter().map(|e| e.to.name.as_str()).collect();
+        assert!(
+            names.contains(&"Alpha"),
+            "pub use {{Alpha, Beta}} should emit ReExports for Alpha, got: {:?}", names
+        );
+        assert!(
+            names.contains(&"Beta"),
+            "pub use {{Alpha, Beta}} should emit ReExports for Beta, got: {:?}", names
+        );
     }
 
     /// Adversarial: `is_async` should NOT be set on a function whose BODY contains
