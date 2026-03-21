@@ -13,6 +13,7 @@ pub mod configs;
 pub mod cpp;
 pub mod dockerfile;
 pub mod generic;
+pub mod graphql;
 pub mod query;
 pub mod csharp;
 pub mod string_literals;
@@ -189,6 +190,7 @@ impl ExtractorRegistry {
         registry.register(Box::new(proto::ProtoExtractor::new()));
         registry.register(Box::new(sql::SqlExtractor::new()));
         registry.register(Box::new(openapi::OpenApiExtractor::new()));
+        registry.register(Box::new(graphql::GraphQlExtractor::new()));
         registry
     }
 
@@ -536,7 +538,7 @@ mod tests {
     #[test]
     fn test_registry_with_builtins_has_extractors() {
         let registry = ExtractorRegistry::with_builtins();
-        assert_eq!(registry.len(), 23); // rust, python, typescript, javascript, go, java, bash, ruby, cpp, csharp, kotlin, zig, lua, swift, dockerfile, hcl, json, toml, yaml, markdown, proto, sql, openapi
+        assert_eq!(registry.len(), 24); // rust, python, typescript, javascript, go, java, bash, ruby, cpp, csharp, kotlin, zig, lua, swift, dockerfile, hcl, json, toml, yaml, markdown, proto, sql, openapi, graphql
     }
 
     #[test]
