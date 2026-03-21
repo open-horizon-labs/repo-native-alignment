@@ -27,6 +27,7 @@ use anyhow::Result;
 
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 use crate::scanner::PatternConfig;
+use super::query::{CaptureSet, QueryExtractor, RouteQueryConfig};
 use super::string_literals::harvest_string_literals;
 use super::{ExtractionResult, Extractor};
 
@@ -124,6 +125,27 @@ pub struct LangConfig {
     /// When `true`, `collect_doc_comment()` also checks the first string
     /// literal in the node's `body` field child.
     pub docstring_in_body: bool,
+    /// Optional tree-sitter query patterns for route decorator detection.
+    ///
+    /// Each entry is a [`RouteQueryConfig`] describing one query that matches
+    /// HTTP route decorators and emits [`NodeKind::ApiEndpoint`] nodes.
+    /// Empty slice = no route query extraction for this language.
+    ///
+    /// Queries run as an additional pass after the normal manual traversal
+    /// so that all existing symbol extraction is unaffected.
+    pub route_queries: &'static [RouteQueryConfig],
+    /// Lazily compiled [`QueryExtractor`]s for `route_queries`.
+    ///
+    /// Each slot corresponds to the `route_queries` entry at the same index.
+    /// A `None` slot indicates that the query at that index failed to compile
+    /// (log warning was emitted at compile time). Using `Option` preserves the
+    /// 1:1 correspondence between `route_queries[i]` and compiled slot `i`.
+    ///
+    /// Populated on the first call to `GenericExtractor::run()` for this
+    /// config and reused for all subsequent files. Since [`QueryExtractor`]
+    /// (and the underlying `tree_sitter::Query`) is `Send + Sync`, this is
+    /// safe to store in a static `OnceLock`.
+    pub compiled_route_queries: std::sync::OnceLock<Vec<Option<QueryExtractor>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +193,36 @@ impl GenericExtractor {
                 self.config.language_name,
                 outer_kind,
                 *content_child,
+                &mut nodes,
+            );
+        }
+
+        // Route query pass — runs after manual traversal; purely additive.
+        // Queries are compiled lazily on the first call via `compiled_route_queries`
+        // and cached for all subsequent files. This avoids per-file compilation.
+        if !self.config.route_queries.is_empty() {
+            let compiled = self.config.compiled_route_queries.get_or_init(|| {
+                let language = (self.config.language_fn)();
+                self.config.route_queries.iter()
+                    .map(|cfg| {
+                        match QueryExtractor::new(&language, cfg.query) {
+                            Ok(qe) => Some(qe),
+                            Err(err) => {
+                                tracing::warn!("route query '{}' failed to compile: {}", cfg.label, err);
+                                None
+                            }
+                        }
+                    })
+                    .collect()
+            });
+
+            run_route_queries(
+                self.config.route_queries,
+                compiled,
+                tree.root_node(),
+                path,
+                source,
+                self.config.language_name,
                 &mut nodes,
             );
         }
@@ -1238,6 +1290,124 @@ fn parse_import_target(import_text: &str) -> String {
         .trim();
     // Take the first path segment.
     s.split([':','/','.']).next().unwrap_or("").trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Route query pass
+// ---------------------------------------------------------------------------
+
+/// Strip surrounding quotes from a path string capture.
+///
+/// Tree-sitter captures the full string literal including quotes (e.g.
+/// `"/users"` or `'/users'`). This strips the outer quote characters so
+/// metadata stores the bare path.
+fn strip_quotes(s: &str) -> String {
+    let s = s.trim();
+    // Guard: must be at least 2 chars so slicing `s[1..s.len()-1]` is safe.
+    // A single quote/backtick character would panic without this guard.
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"'))
+            || (s.starts_with('\'') && s.ends_with('\''))
+            || (s.starts_with('`') && s.ends_with('`')))
+    {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Infer the HTTP method from a capture name text if possible.
+///
+/// Handles two common naming conventions:
+/// - **Suffix verb** (Python/Go/Express/Ruby/TypeScript): `router.post`, `router.GET`, `Post`
+///   → `lower.ends_with(method)` or exact match
+/// - **Spring MVC Mapping** (Java): `PostMapping`, `GetMapping`, `PutMapping`
+///   → `lower == "{method}mapping"` (method + "Mapping")
+///
+/// Falls back to `default_method` when the text doesn't contain a recognisable verb.
+fn infer_method_from_name(name: &str, default: &str) -> String {
+    let lower = name.to_lowercase();
+    for method in &["get", "post", "put", "delete", "patch", "head", "options"] {
+        if lower == *method
+            || lower.ends_with(method)
+            || lower == format!("{}mapping", method)
+        {
+            return method.to_uppercase();
+        }
+    }
+    default.to_string()
+}
+
+/// Run pre-compiled route queries against a file's syntax tree and emit
+/// [`NodeKind::ApiEndpoint`] nodes for each matched route decorator.
+///
+/// `configs` and `compiled` must have the same length and ordering — each
+/// `compiled[i]` is `Some(extractor)` if the query at `configs[i]` compiled
+/// successfully, or `None` if compilation failed. The `None` slots are skipped.
+///
+/// Each matched capture set must have at least a `@path` capture. An optional
+/// `@method` capture overrides `default_method` for the HTTP verb.
+///
+/// Called from [`GenericExtractor::run`] after normal manual traversal, so it
+/// is purely additive — existing extraction is unaffected.
+fn run_route_queries(
+    configs: &[RouteQueryConfig],
+    compiled: &[Option<QueryExtractor>],
+    root: tree_sitter::Node<'_>,
+    path: &Path,
+    source: &[u8],
+    language_name: &str,
+    nodes: &mut Vec<Node>,
+) {
+    for (cfg, maybe_extractor) in configs.iter().zip(compiled.iter()) {
+        let extractor = match maybe_extractor {
+            Some(e) => e,
+            None => continue, // compile failed; warning already emitted at init
+        };
+        let captures: Vec<CaptureSet> = extractor.run(root, source);
+        for capture in captures {
+            let raw_path = match capture.get("path") {
+                Some(p) => p.to_string(),
+                None => continue,
+            };
+            let http_path = strip_quotes(&raw_path);
+            if http_path.is_empty() {
+                continue;
+            }
+
+            let method = if let Some(m) = capture.get("method") {
+                infer_method_from_name(m, cfg.default_method)
+            } else if let Some(n) = capture.get("name") {
+                infer_method_from_name(n, cfg.default_method)
+            } else {
+                cfg.default_method.to_string()
+            };
+
+            let name = format!("{} {}", method, http_path);
+            let mut metadata = BTreeMap::new();
+            metadata.insert("http_method".to_string(), method.clone());
+            metadata.insert("http_path".to_string(), http_path.clone());
+            metadata.insert("route_query_label".to_string(), cfg.label.to_string());
+            metadata.insert("synthetic".to_string(), "false".to_string());
+
+            let node = Node {
+                id: NodeId {
+                    root: String::new(),
+                    file: path.to_path_buf(),
+                    name: name.clone(),
+                    kind: NodeKind::ApiEndpoint,
+                },
+                language: language_name.to_string(),
+                line_start: capture.start_row + 1,
+                line_end: capture.end_row + 1,
+                signature: format!("[route_decorator] {} {}", method, http_path),
+                body: String::new(),
+                metadata,
+                source: ExtractionSource::TreeSitter,
+            };
+            nodes.push(node);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3081,5 +3251,138 @@ def process_input(value):
         }
         // If not captured (graceful degradation), that's acceptable —
         // Python # comments (preceding sibling path) still work.
+    }
+
+    // -----------------------------------------------------------------------
+    // Route query end-to-end tests (through GenericExtractor)
+    // -----------------------------------------------------------------------
+
+    /// Verify that the Python extractor emits ApiEndpoint nodes for Flask routes.
+    #[test]
+    fn test_python_extractor_emits_api_endpoint_for_flask_route() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let ext = GenericExtractor::new(&PYTHON_CONFIG);
+        let code = r#"
+@app.route("/users")
+def get_users():
+    pass
+
+@app.route("/items")
+def get_items():
+    pass
+"#;
+        let result = ext.run(Path::new("routes.py"), code).unwrap();
+        let api_nodes: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(api_nodes.len(), 2, "should emit 2 ApiEndpoint nodes, got: {:?}",
+            api_nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>());
+        assert!(
+            api_nodes.iter().any(|n| n.metadata.get("http_path").map(|p| p == "/users").unwrap_or(false)),
+            "should have ApiEndpoint for /users"
+        );
+    }
+
+    /// Verify that the TypeScript extractor emits ApiEndpoint nodes for NestJS routes.
+    #[test]
+    fn test_typescript_extractor_emits_api_endpoint_for_nestjs() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let ext = GenericExtractor::new(&TYPESCRIPT_CONFIG);
+        let code = r#"
+class UserController {
+  @Get("/users")
+  findAll() {}
+
+  @Post("/users")
+  create() {}
+}
+"#;
+        let result = ext.run(Path::new("user.controller.ts"), code).unwrap();
+        let api_nodes: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(api_nodes.len(), 2, "should emit 2 ApiEndpoint nodes");
+        assert!(
+            api_nodes.iter().any(|n| {
+                n.metadata.get("http_method").map(|m| m == "POST").unwrap_or(false)
+            }),
+            "should have POST endpoint"
+        );
+    }
+
+    /// Verify that the existing function extraction still works alongside route queries.
+    #[test]
+    fn test_python_route_query_does_not_break_function_extraction() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let ext = GenericExtractor::new(&PYTHON_CONFIG);
+        let code = r#"
+@app.route("/users")
+def get_users():
+    pass
+
+def helper():
+    pass
+"#;
+        let result = ext.run(Path::new("test.py"), code).unwrap();
+        let fn_nodes: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::Function)
+            .collect();
+        assert!(
+            fn_nodes.iter().any(|n| n.id.name == "get_users"),
+            "should still extract get_users function"
+        );
+        assert!(
+            fn_nodes.iter().any(|n| n.id.name == "helper"),
+            "should still extract helper function"
+        );
+        // Both functions extracted AND the ApiEndpoint node
+        let api_nodes: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(api_nodes.len(), 1, "should have exactly 1 ApiEndpoint node");
+    }
+
+    /// Verify Java @PostMapping infers POST method through the full extraction pipeline.
+    #[test]
+    fn test_java_extractor_infers_post_method_for_post_mapping() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let ext = GenericExtractor::new(&JAVA_CONFIG);
+        let code = r#"
+public class ItemController {
+    @PostMapping("/items")
+    public Item create(@RequestBody Item item) {
+        return item;
+    }
+
+    @GetMapping("/items/{id}")
+    public Item get(@PathVariable Long id) {
+        return null;
+    }
+}
+"#;
+        let result = ext.run(Path::new("ItemController.java"), code).unwrap();
+        let api_nodes: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(api_nodes.len(), 2, "should emit 2 ApiEndpoint nodes");
+
+        let post_node = api_nodes.iter().find(|n| {
+            n.metadata.get("http_method").map(|m| m == "POST").unwrap_or(false)
+        });
+        assert!(
+            post_node.is_some(),
+            "should infer POST for @PostMapping, got: {:?}",
+            api_nodes.iter().map(|n| n.metadata.get("http_method")).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            post_node.unwrap().metadata.get("http_path"),
+            Some(&"/items".to_string()),
+            "POST endpoint path should be /items"
+        );
+
+        let get_node = api_nodes.iter().find(|n| {
+            n.metadata.get("http_method").map(|m| m == "GET").unwrap_or(false)
+        });
+        assert!(get_node.is_some(), "should infer GET for @GetMapping");
     }
 }

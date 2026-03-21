@@ -472,6 +472,132 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
     let mode = params.mode.as_deref().unwrap_or("neighbors");
     let top_k = params.limit.unwrap_or(1).clamp(1, 50);
 
+    // ── cycles mode ─────────────────────────────────────────────────────────
+    // No entry-point resolution needed: we run tarjan_scc over the full graph.
+    // If `node` is provided, return only the ring containing that node.
+    // Otherwise return all rings (useful for a global circular-dependency audit).
+    if mode == "cycles" {
+        let gs = ctx.graph_state;
+        let edge_filter = params.edge_types.as_ref().map(|types| {
+            types.iter().filter_map(|t| parse_edge_kind(t)).collect::<Vec<_>>()
+        });
+        let edge_filter_slice = edge_filter.as_deref();
+        let freshness = format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
+        let strip = ctx.root_filter.as_deref();
+
+        if let Some(node_id) = node {
+            let resolved = gs.resolve_node_id(node_id);
+            if gs.index.get_node(&resolved).is_none() {
+                return format!(
+                    "Node `{}` not found in graph. Use search to find valid node IDs.{freshness}",
+                    strip_root_prefix(&resolved, strip),
+                );
+            }
+            return match gs.index.cycle_for_node(&resolved, edge_filter_slice) {
+                Some(ring) => {
+                    let labels: Vec<String> = ring.iter()
+                        .map(|id| format!("`{}`", strip_root_prefix(id, strip)))
+                        .collect();
+                    format!(
+                        "## Cycle containing `{}`\n\n{} node(s) in ring\n\n{}{freshness}",
+                        strip_root_prefix(&resolved, strip),
+                        labels.len(),
+                        labels.join(" → ") + " → ...",
+                    )
+                }
+                None => format!(
+                    "`{}` is not part of any circular dependency.{freshness}",
+                    strip_root_prefix(&resolved, strip),
+                ),
+            };
+        }
+
+        // No node specified: return all rings.
+        let rings = gs.index.detect_cycles(edge_filter_slice);
+        if rings.is_empty() {
+            let scope = match edge_filter_slice {
+                Some(kinds) if !kinds.is_empty() => {
+                    let labels: Vec<String> = kinds.iter().map(|k| format!("{k}")).collect();
+                    format!("filtered edges: {}", labels.join(", "))
+                }
+                _ => "default coupling graph (Calls + DependsOn)".to_string(),
+            };
+            return format!("## Circular dependency analysis\n\nNo cycles detected in the {scope}.{freshness}");
+        }
+        let mut out = format!("## Circular dependency analysis\n\n{} ring(s) detected\n\n", rings.len());
+        for (i, ring) in rings.iter().enumerate() {
+            let labels: Vec<String> = ring.iter()
+                .map(|id| format!("`{}`", strip_root_prefix(id, strip)))
+                .collect();
+            out.push_str(&format!("### Ring {}: {} nodes\n{}\n\n", i + 1, ring.len(), labels.join(" → ") + " → ..."));
+        }
+        out.push_str(&freshness);
+        return out;
+    }
+
+    // ── path mode ────────────────────────────────────────────────────────────
+    // Computes the shortest directed call path from `node` (start) to `query`
+    // (destination). Both are resolved via the usual name-matching machinery.
+    // Returns the ordered hop list: start → hop1 → hop2 → ... → destination.
+    if mode == "path" {
+        if node.is_none() || query.is_none() {
+            return "path mode requires both node= (start) and query= (destination).".to_string();
+        }
+        let gs = ctx.graph_state;
+        let from_raw = node.unwrap();
+        let to_raw   = query.unwrap();
+        let from_id  = gs.resolve_node_id(from_raw);
+        let to_id    = gs.resolve_node_id(to_raw);
+        let edge_filter = params.edge_types.as_ref().map(|types| {
+            types.iter().filter_map(|t| parse_edge_kind(t)).collect::<Vec<_>>()
+        });
+        let edge_filter_slice = edge_filter.as_deref();
+        let freshness = format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
+        let strip = ctx.root_filter.as_deref();
+
+        if gs.index.get_node(&from_id).is_none() {
+            return format!(
+                "Start node `{}` not found in graph. Use search to find valid node IDs.{freshness}",
+                strip_root_prefix(&from_id, strip),
+            );
+        }
+        if gs.index.get_node(&to_id).is_none() {
+            return format!(
+                "Destination node `{}` not found in graph. Use search to find valid node IDs.{freshness}",
+                strip_root_prefix(&to_id, strip),
+            );
+        }
+
+        return match gs.index.shortest_path(&from_id, &to_id, edge_filter_slice) {
+            None => format!(
+                "No directed call path from `{}` to `{}`.{freshness}",
+                strip_root_prefix(&from_id, strip),
+                strip_root_prefix(&to_id, strip),
+            ),
+            Some(hops) if hops.is_empty() => format!(
+                "`{}` and `{}` are the same node — no path needed.{freshness}",
+                strip_root_prefix(&from_id, strip),
+                strip_root_prefix(&to_id, strip),
+            ),
+            Some(hops) => {
+                let hop_count = hops.len(); // number of edges = number of directed calls
+                let all_nodes: Vec<String> = std::iter::once(from_id.clone())
+                    .chain(hops.iter().cloned())
+                    .collect();
+                let labels: Vec<String> = all_nodes.iter()
+                    .map(|id| format!("`{}`", strip_root_prefix(id, strip)))
+                    .collect();
+                format!(
+                    "## Call path: {} → {}\n\n{} hop(s)\n\n{}{freshness}",
+                    strip_root_prefix(&from_id, strip),
+                    strip_root_prefix(&to_id, strip),
+                    hop_count,
+                    labels.join(" → "),
+                )
+            }
+        };
+    }
+
     if node.is_none() && query.is_none() {
         return "Either query or node is required. Provide a search query or a stable node ID.".to_string();
     }

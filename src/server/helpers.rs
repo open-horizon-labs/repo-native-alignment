@@ -308,6 +308,13 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
         if let Some(ts) = n.metadata.get("diagnostic_timestamp") {
             entry.push_str(&format!("\n  Captured: {}", ts));
         }
+        // ApiEndpoint-specific metadata (only present on NodeKind::ApiEndpoint nodes)
+        if let Some(method) = n.metadata.get("http_method") {
+            entry.push_str(&format!("\n  HTTP Method: {}", method));
+        }
+        if let Some(path) = n.metadata.get("http_path") {
+            entry.push_str(&format!("\n  HTTP Path: {}", path));
+        }
         if !outgoing.is_empty() {
             entry.push_str(&format!("\n  Out: {} edge(s)", outgoing.len()));
         }
