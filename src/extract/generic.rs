@@ -4531,4 +4531,154 @@ fn check_something() {}
         assert_eq!(test_fn.metadata.get("is_test").map(|s| s.as_str()), Some("true"));
         assert!(test_fn.metadata.contains_key("decorators"), "decorators should also be preserved");
     }
+
+    // -----------------------------------------------------------------------
+    // Adversarial tests (dissent-seeded)
+    // -----------------------------------------------------------------------
+
+    /// Adversarial: function named after a stdlib/builtin call (e.g. `len`) should only
+    /// emit Calls if the caller is in the SAME file and the callee IS that same-file fn.
+    #[test]
+    fn test_same_file_calls_only_same_file_functions() {
+        use crate::extract::rust::RUST_CONFIG;
+        // `len()` is NOT a same-file function here, so no Calls edge.
+        let code = r#"
+fn my_fn() -> usize {
+    let v: Vec<i32> = vec![];
+    v.len()  // method call, not a bare call to a same-file fn named "len"
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let calls: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect();
+        // v.len() is a method call — callee node is a field_expression, not bare identifier.
+        assert!(
+            calls.is_empty(),
+            "method call v.len() should NOT emit same-file Calls edge, got: {:?}",
+            calls
+        );
+    }
+
+    /// Adversarial: decorator with path segments (chained) should not emit Implements.
+    /// `@pytest.mark.parametrize` should not → Implements(Pytest).
+    #[test]
+    fn test_chained_decorator_no_implements_edge() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = r#"
+import pytest
+
+@pytest.mark.parametrize("x,y", [(1,2)])
+def test_add(x, y):
+    pass
+"#;
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(Path::new("test.py"), code)
+            .unwrap();
+        // @pytest.mark.parametrize is chained — should NOT emit Implements
+        let impl_edges: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Implements && e.from.name == "test_add"
+                && e.from.kind == NodeKind::Function)
+            .collect();
+        assert!(
+            impl_edges.is_empty(),
+            "@pytest.mark.parametrize should not emit Implements edge, got: {:?}",
+            impl_edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// Adversarial: is_test should NOT be set on struct/enum nodes, only functions.
+    #[test]
+    fn test_is_test_not_set_on_struct() {
+        use crate::extract::rust::RUST_CONFIG;
+        // A struct named TestHelper should not get is_test=true
+        let code = "struct TestHelper {}\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let struc = result.nodes.iter().find(|n| n.id.name == "TestHelper").unwrap();
+        assert!(
+            struc.metadata.get("is_test").is_none(),
+            "struct TestHelper should NOT have is_test metadata"
+        );
+    }
+
+    /// Adversarial: wildcard re-export should NOT produce a ReExports edge (can't resolve target).
+    #[test]
+    fn test_pub_use_wildcard_no_edge() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "pub use crate::foo::*;\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("lib.rs"), code)
+            .unwrap();
+        let re_exports: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::ReExports)
+            .collect();
+        assert!(
+            re_exports.is_empty(),
+            "pub use foo::* should NOT emit ReExports edge (wildcard), got: {:?}", re_exports
+        );
+        // But visibility=pub should still be set
+        let pub_imports: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::Import
+                && n.metadata.get("visibility").map(|s| s.as_str()) == Some("pub"))
+            .collect();
+        assert!(
+            !pub_imports.is_empty(),
+            "pub use foo::* should still set visibility=pub on Import node"
+        );
+    }
+
+    /// Adversarial: `split_decorators` handles route path with curly braces correctly.
+    /// `@app.route("/users/{id}")` must not be split mid-decorator.
+    #[test]
+    fn test_split_decorators_with_curly_braces_in_path() {
+        let decorators = r#"@app.route("/users/{id}"), @login_required"#;
+        let parts = split_decorators(decorators);
+        assert_eq!(
+            parts.len(), 2,
+            "should split into 2 decorators at top-level comma, got: {:?}", parts
+        );
+        assert_eq!(parts[0], r#"@app.route("/users/{id}")"#);
+        assert_eq!(parts[1], "@login_required");
+    }
+
+    /// Adversarial: `#[derive(A, B)]` split should NOT be broken at the comma inside parens.
+    #[test]
+    fn test_split_decorators_derive_macro() {
+        let decorators = "#[derive(Debug, Clone)]";
+        let parts = split_decorators(decorators);
+        assert_eq!(parts.len(), 1, "derive with multiple traits should stay as 1 decorator");
+        assert_eq!(parts[0], "#[derive(Debug, Clone)]");
+    }
+
+    /// Adversarial: `is_async` should NOT be set on a function whose BODY contains
+    /// the word "async" but the function itself is not declared async.
+    #[test]
+    fn test_is_async_not_set_for_body_containing_async() {
+        use crate::extract::rust::RUST_CONFIG;
+        // This function calls an async method but is not itself async.
+        // The check only looks at the first line (signature), not the body.
+        let code = r#"
+fn spawn_task() {
+    let future = async { 42 };
+    tokio::spawn(future);
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let fn_node = result.nodes.iter().find(|n| n.id.name == "spawn_task").unwrap();
+        // spawn_task is not async itself — is_async should NOT be set
+        // NOTE: This test documents the current behavior of the text fallback.
+        // The text fallback checks `first_line.starts_with("async ")` which for
+        // `fn spawn_task()` is false. Body content is not checked.
+        assert!(
+            fn_node.metadata.get("is_async").is_none(),
+            "sync fn with async body should NOT have is_async, got: {:?}",
+            fn_node.metadata.get("is_async")
+        );
+    }
 }
