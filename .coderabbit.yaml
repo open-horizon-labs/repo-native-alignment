@@ -17,6 +17,12 @@ reviews:
         - cargo run instead of using the installed binary for testing
         - Full table drop+rebuild when incremental update with hash-skip would work
 
+        EXTRACTION_VERSION: Flag these as blocking issues:
+        - Any PR that adds a new post-extraction pass (e.g. nextjs_routing_pass, directory_module_pass, naming_convention_pass, manifest_pass) without bumping EXTRACTION_VERSION in src/graph/store.rs
+        - Any PR that adds new metadata fields extracted from source files (doc_comment, is_async, churn_count, etc.) without bumping EXTRACTION_VERSION
+        - Any PR that adds new EdgeKind or NodeKind variants produced at extraction time without bumping EXTRACTION_VERSION
+        EXTRACTION_VERSION must be bumped any time new data is produced during extraction that would be missing from files scanned before the upgrade. Check src/graph/store.rs for the current value and the comment listing what each version added.
+
         LANGUAGE GENERALITY: Flag these as blocking issues:
         - Any extraction feature, enrichment pass, or graph edge type that only works for one or two specific languages when the concept applies broadly across languages (e.g. module hierarchy applies to all languages, not just Rust; test coverage naming conventions work in Python/Go/Java/etc. too)
         - Hardcoding language names (e.g. "rust", "python") in feature logic that should be driven by LangConfig or file extensions
