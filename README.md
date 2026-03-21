@@ -22,6 +22,13 @@ Local context discovery and alignment tool for coding agents. Makes the fractal,
 - "What connects extract to server?" → `search(node="X", mode="neighbors", target_subsystem="server")` → cross-subsystem edges
 - "Show me the full structure of a module" → `search(node="server:module", mode="neighbors", depth=2, compact=true)` → module → members → their members in one call
 
+### Trace client code to server handlers
+
+- "Which function handles POST /payments?" → `search("POST /payments", mode="neighbors")` → `ApiEndpoint → handle_payment()` via Implements edge
+- "What API endpoints does this file call?" → `search(file="client.py", kind="const")` → URL string literals linked to their ApiEndpoint nodes
+- "Full call chain from /payments to database?" → `search("POST /payments", mode="impact")` → ApiEndpoint → handler → domain functions → storage
+- Supports Python Flask/FastAPI, TypeScript NestJS, Java Spring, Go gin/echo, Ruby Sinatra/Rails — no LSP required
+
 ### See the blast radius of a change
 
 - "What depends on the database connection pool?" → `search(query="database connection pool", mode="impact")` → transitive dependents grouped by subsystem with entry points; auto-summarized when large
