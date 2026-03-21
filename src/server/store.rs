@@ -12,7 +12,7 @@ use arrow_array::builder::BooleanBuilder;
 
 use crate::graph::{Confidence, Edge, ExtractionSource, Node, NodeId, NodeKind, EdgeKind};
 use crate::graph::index::GraphIndex;
-use crate::graph::store::{symbols_schema, edges_schema, SCHEMA_VERSION};
+use crate::graph::store::{symbols_schema, edges_schema, SCHEMA_VERSION, EXTRACTION_VERSION};
 
 use super::state::GraphState;
 
@@ -129,6 +129,93 @@ fn has_lance_data(db_path: &Path) -> bool {
                 })
         })
         .unwrap_or(false)
+}
+
+/// Check the stored extraction version and clear scan-state files if it mismatches.
+///
+/// Returns `true` if scan-state was cleared (re-extraction needed),
+/// `false` if the stored version already matches `EXTRACTION_VERSION` (no-op).
+///
+/// Unlike `check_and_migrate_schema` (which drops LanceDB tables), this only
+/// deletes scanner state files — forcing the scanner to treat all files as new
+/// on the next build without discarding the LanceDB graph/embedding data.
+///
+/// The version file lives alongside `schema_version` in `db_path`.
+/// Scan-state files are cleared for:
+/// - The primary root: `{repo_root}/.oh/.cache/scan-state.json`
+/// - Secondary roots: `~/.local/share/rna/cache/{slug}/scan-state.json`
+pub(crate) fn check_and_migrate_extraction_version(
+    db_path: &Path,
+    repo_root: &Path,
+    slugs: &[String],
+) -> anyhow::Result<bool> {
+    std::fs::create_dir_all(db_path)?;
+
+    let version_file = db_path.join("extraction_version");
+
+    let stored_version: Option<u32> = std::fs::read_to_string(&version_file)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+
+    // If version matches, nothing to do.
+    if stored_version == Some(EXTRACTION_VERSION) {
+        return Ok(false);
+    }
+
+    if stored_version.is_some() {
+        tracing::info!(
+            "Extraction version mismatch (stored={:?}, current={}) — clearing scan-state to force full re-extraction",
+            stored_version,
+            EXTRACTION_VERSION
+        );
+    } else {
+        tracing::debug!(
+            "No stored extraction version; initializing extraction_version to {}",
+            EXTRACTION_VERSION
+        );
+    }
+
+    // Delete scan-state files for all known roots so the scanner treats all
+    // files as new and re-extracts them with the updated extraction logic.
+    if stored_version.is_some() {
+        // Primary root scan-state: {repo_root}/.oh/.cache/scan-state.json
+        let primary_state = repo_root.join(".oh").join(".cache").join("scan-state.json");
+        if primary_state.exists() {
+            match std::fs::remove_file(&primary_state) {
+                Ok(()) => tracing::info!(
+                    "Cleared primary scan-state (extraction version upgrade)"
+                ),
+                Err(e) => tracing::warn!(
+                    "Failed to clear primary scan-state: {}",
+                    e
+                ),
+            }
+        }
+
+        // Secondary roots: ~/.local/share/rna/cache/{slug}/scan-state.json
+        for slug in slugs {
+            let state_path = crate::roots::cache_state_path(slug);
+            if state_path.exists() {
+                match std::fs::remove_file(&state_path) {
+                    Ok(()) => tracing::info!(
+                        "Cleared scan-state for root '{}' (extraction version upgrade)",
+                        slug
+                    ),
+                    Err(e) => tracing::warn!(
+                        "Failed to clear scan-state for root '{}': {}",
+                        slug,
+                        e
+                    ),
+                }
+            }
+        }
+    }
+
+    // Write the current extraction version.
+    std::fs::write(&version_file, EXTRACTION_VERSION.to_string())
+        .context("check_and_migrate_extraction_version: failed to write extraction_version file")?;
+
+    Ok(stored_version.is_some())
 }
 
 /// Parse a NodeKind from its string representation.
@@ -1286,6 +1373,57 @@ mod tests {
         let (r1, r2) = tokio::join!(task1, task2);
         r1.expect("task1 panicked").expect("task1 returned error");
         r2.expect("task2 panicked").expect("task2 returned error");
+    }
+
+    /// `check_and_migrate_extraction_version` clears scan-state when the stored
+    /// version is stale, and writes the current EXTRACTION_VERSION.
+    #[test]
+    fn test_extraction_version_migration_clears_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("lance");
+        let repo_root = dir.path();
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        // Seed a stale version (0) and create a fake primary scan-state file.
+        std::fs::write(db_path.join("extraction_version"), "0").unwrap();
+        let primary_state = repo_root.join(".oh").join(".cache").join("scan-state.json");
+        std::fs::create_dir_all(primary_state.parent().unwrap()).unwrap();
+        std::fs::write(&primary_state, r#"{"dir_mtimes":{},"file_mtimes":{},"file_content_hashes":{}}"#).unwrap();
+
+        // Migration should return true and clear the state file.
+        let migrated = check_and_migrate_extraction_version(&db_path, repo_root, &[])
+            .expect("migration failed");
+        assert!(migrated, "expected migration=true for stale version");
+        assert!(!primary_state.exists(), "scan-state should be cleared after migration");
+
+        // The version file should now contain EXTRACTION_VERSION.
+        let stored: u32 = std::fs::read_to_string(db_path.join("extraction_version"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(stored, EXTRACTION_VERSION);
+
+        // Second call should be a no-op.
+        let migrated2 = check_and_migrate_extraction_version(&db_path, repo_root, &[])
+            .expect("second migration failed");
+        assert!(!migrated2, "expected migration=false when already current");
+    }
+
+    /// `check_and_migrate_extraction_version` is a no-op on fresh directories
+    /// (no prior version file) and does NOT clear any state files.
+    #[test]
+    fn test_extraction_version_fresh_directory_no_clear() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("lance");
+        let repo_root = dir.path();
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        // No version file, no scan-state file.
+        let migrated = check_and_migrate_extraction_version(&db_path, repo_root, &[])
+            .expect("migration failed on fresh dir");
+        // Fresh directory: stored_version is None, so Ok(false) — no migration.
+        assert!(!migrated, "expected migration=false for fresh directory");
     }
 
     /// `is_conflict_error` correctly identifies conflict-like messages and ignores others.
