@@ -33,6 +33,10 @@ fn edge_weight(kind: &EdgeKind) -> f64 {
         EdgeKind::ConnectsTo => 0.3,
         EdgeKind::Defines => 0.1,
         EdgeKind::HasField => 0.1,
+        // Test coverage edges carry moderate signal — tests are architecturally related
+        EdgeKind::TestedBy => 0.3,
+        // Module hierarchy edges carry low signal (structural, not behavioral)
+        EdgeKind::BelongsTo => 0.2,
         // PR/outcome edges carry no architectural coupling signal
         EdgeKind::Evolves
         | EdgeKind::TopologyBoundary

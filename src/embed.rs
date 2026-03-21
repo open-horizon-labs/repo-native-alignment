@@ -178,19 +178,19 @@ fn build_code_embedding_text(
     let after_name = CODE_EMBED_CHAR_BUDGET.saturating_sub(name_chars + 1);
 
     // Estimate metadata cost in chars (not bytes) and cap to leave room for body
-    // Skip doc_comment here — it's handled separately below as a body prefix.
+    // Skip doc_comment and inferred_types here — both are handled separately below as body prefixes.
     let meta_estimate: usize = metadata
         .iter()
-        .filter(|(k, _)| k.as_str() != "doc_comment")
+        .filter(|(k, _)| k.as_str() != "doc_comment" && k.as_str() != "inferred_types")
         .map(|(k, v)| k.chars().count() + v.chars().count() + 3) // " key: value"
         .sum();
     let meta_budget = after_name.saturating_sub(min_body_budget).min(meta_estimate);
 
-    // Truncate metadata entries to fit within meta_budget (exclude doc_comment)
+    // Truncate metadata entries to fit within meta_budget (exclude doc_comment and inferred_types)
     let mut meta_parts: Vec<String> = Vec::new();
     let mut meta_used = 0usize;
     for (key, value) in metadata {
-        if key == "doc_comment" {
+        if key == "doc_comment" || key == "inferred_types" {
             continue; // handled as body prefix below
         }
         let entry = format!(" {}: {}", key, value);
@@ -204,14 +204,27 @@ fn build_code_embedding_text(
 
     // Body gets everything remaining after name and actual metadata used.
     // Prepend doc_comment (truncated) before the code body: intent before implementation.
+    // Also append inferred_types after the body to enrich semantic vocabulary.
     let body_budget = after_name.saturating_sub(meta_used);
 
     if body_budget > 0 {
-        // Build combined doc + body text, giving doc_comment up to half the body budget.
+        // Build combined doc + body + inferred_types text.
+        // Budget allocation: doc_comment up to 1/3, body up to 1/2, inferred_types up to 1/6.
         let doc_comment = metadata.get("doc_comment").map(|s| s.as_str()).unwrap_or("");
+        let inferred_types = metadata.get("inferred_types").map(|s| s.as_str()).unwrap_or("");
+
+        let types_budget = if !inferred_types.is_empty() {
+            (body_budget / 6).min(inferred_types.chars().count())
+        } else {
+            0
+        };
+        let remaining_for_doc_and_body = body_budget.saturating_sub(types_budget);
+
         if !doc_comment.is_empty() {
-            let doc_budget = body_budget / 2;
-            let remaining_body_budget = body_budget.saturating_sub(doc_budget.min(doc_comment.chars().count()) + 1);
+            let doc_budget = remaining_for_doc_and_body / 2;
+            let remaining_body_budget = remaining_for_doc_and_body.saturating_sub(
+                doc_budget.min(doc_comment.chars().count()) + 1
+            );
             let doc_truncated = truncate_chars(doc_comment, doc_budget);
             t.push(' ');
             t.push_str(doc_truncated);
@@ -221,7 +234,13 @@ fn build_code_embedding_text(
             }
         } else if !body.is_empty() {
             t.push(' ');
-            t.push_str(truncate_chars(body, body_budget));
+            t.push_str(truncate_chars(body, remaining_for_doc_and_body));
+        }
+
+        // Append inferred types after body — compiler vocabulary for semantic search
+        if !inferred_types.is_empty() && types_budget > 0 {
+            t.push(' ');
+            t.push_str(truncate_chars(inferred_types, types_budget));
         }
     }
 
