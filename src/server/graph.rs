@@ -551,6 +551,24 @@ impl RnaHandler {
             }
         }
 
+        // 4b. API link pass: connect URL-path string-literal Const nodes to
+        //     ApiEndpoint nodes via DependsOn edges.
+        //     Runs here (after all roots are merged) rather than inside
+        //     extract_scan_result() so that cross-file links are created
+        //     correctly during incremental scans — the caller may be in a
+        //     changed file while the ApiEndpoint is in an unchanged file or
+        //     vice versa.
+        {
+            let api_link_edges = crate::extract::api_link::api_link_pass(&all_nodes);
+            if !api_link_edges.is_empty() {
+                tracing::info!(
+                    "API link pass: {} DependsOn edge(s) from string literals to endpoints",
+                    api_link_edges.len()
+                );
+                all_edges.extend(api_link_edges);
+            }
+        }
+
         // 5. Build petgraph index
         let mut index = GraphIndex::new();
         index.rebuild_from_edges(&all_edges);
@@ -837,6 +855,22 @@ impl RnaHandler {
         let upsert_edges: Vec<Edge> = extraction.edges.clone();
         graph.nodes.extend(extraction.nodes);
         graph.edges.extend(extraction.edges);
+
+        // Re-run API link pass with the full (existing + new) node set so that
+        // cross-file links are created when only one side of a match was updated.
+        // Duplicate edges from the previous pass are deduplicated by the LanceDB
+        // merge_insert upsert path and are harmless in the in-memory graph
+        // (stable_id-keyed dedup happens at persist time).
+        {
+            let api_link_edges = crate::extract::api_link::api_link_pass(&graph.nodes);
+            if !api_link_edges.is_empty() {
+                tracing::info!(
+                    "API link pass (incremental): {} DependsOn edge(s) from string literals to endpoints",
+                    api_link_edges.len()
+                );
+                graph.edges.extend(api_link_edges);
+            }
+        }
 
         // Rebuild petgraph index
         graph.index = GraphIndex::new();

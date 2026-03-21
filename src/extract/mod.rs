@@ -7,6 +7,7 @@
 //! The `ExtractorRegistry` dispatches by file extension, then calls `can_handle()`
 //! for fine-grained checks. Multiple extractors can handle the same file.
 
+pub mod api_link;
 pub mod bash;
 pub mod configs;
 pub mod cpp;
@@ -286,7 +287,7 @@ impl ExtractorRegistry {
             "ExtractorRegistry: completed extraction in {:?} ({} node(s), {} edge(s))",
             extraction_start.elapsed(),
             result.nodes.len(),
-            result.edges.len()
+            result.edges.len(),
         );
 
         result

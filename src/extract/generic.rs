@@ -224,6 +224,7 @@ impl GenericExtractor {
                 source,
                 self.config.language_name,
                 &mut nodes,
+                &mut edges,
             );
         }
 
@@ -1350,6 +1351,12 @@ fn infer_method_from_name(name: &str, default: &str) -> String {
 ///
 /// Called from [`GenericExtractor::run`] after normal manual traversal, so it
 /// is purely additive — existing extraction is unaffected.
+
+/// How many lines after the last decorator row to search for the handler
+/// function definition. One extra line accommodates languages (e.g., Go)
+/// where the function signature starts directly below the decorator.
+const HANDLER_SEARCH_WINDOW: usize = 3;
+
 fn run_route_queries(
     configs: &[RouteQueryConfig],
     compiled: &[Option<QueryExtractor>],
@@ -1358,7 +1365,18 @@ fn run_route_queries(
     source: &[u8],
     language_name: &str,
     nodes: &mut Vec<Node>,
+    edges: &mut Vec<crate::graph::Edge>,
 ) {
+    // Pre-index Function nodes in this file by line_start for O(1) handler lookup.
+    // Built once before the outer loop so it doesn't scale with O(routes × nodes).
+    // Only includes nodes already in `nodes` (tree-sitter extracted Functions) —
+    // ApiEndpoint nodes emitted during this pass are not yet present and need not be.
+    let fn_by_line: std::collections::HashMap<usize, NodeId> = nodes
+        .iter()
+        .filter(|n| n.id.kind == NodeKind::Function && n.id.file == path)
+        .map(|n| (n.line_start, n.id.clone()))
+        .collect();
+
     for (cfg, maybe_extractor) in configs.iter().zip(compiled.iter()) {
         let extractor = match maybe_extractor {
             Some(e) => e,
@@ -1390,13 +1408,39 @@ fn run_route_queries(
             metadata.insert("route_query_label".to_string(), cfg.label.to_string());
             metadata.insert("synthetic".to_string(), "false".to_string());
 
+            // The decorator ends at `capture.end_row` (0-indexed). The handler
+            // function definition begins on the very next line or within a small
+            // window below (e.g., one blank line between decorator and `def`).
+            // `line_start` on Node is 1-indexed, so the expected range is
+            // [end_row+2 .. end_row+2+HANDLER_SEARCH_WINDOW].
+            let decorator_end_line = capture.end_row + 1; // convert to 1-indexed
+            let search_start = decorator_end_line + 1;
+            let search_end = decorator_end_line + 1 + HANDLER_SEARCH_WINDOW;
+
+            let endpoint_node_id = NodeId {
+                root: String::new(),
+                file: path.to_path_buf(),
+                name: name.clone(),
+                kind: NodeKind::ApiEndpoint,
+            };
+
+            // Find the handler function in the pre-built index: scan the narrow
+            // window [search_start, search_end] instead of the entire node list.
+            let handler = (search_start..=search_end)
+                .find_map(|line| fn_by_line.get(&line));
+
+            if let Some(handler_id) = handler {
+                edges.push(crate::graph::Edge {
+                    from: endpoint_node_id.clone(),
+                    to: handler_id.clone(),
+                    kind: crate::graph::EdgeKind::Implements,
+                    source: ExtractionSource::TreeSitter,
+                    confidence: crate::graph::Confidence::Detected,
+                });
+            }
+
             let node = Node {
-                id: NodeId {
-                    root: String::new(),
-                    file: path.to_path_buf(),
-                    name: name.clone(),
-                    kind: NodeKind::ApiEndpoint,
-                },
+                id: endpoint_node_id,
                 language: language_name.to_string(),
                 line_start: capture.start_row + 1,
                 line_end: capture.end_row + 1,
@@ -3384,5 +3428,91 @@ public class ItemController {
             n.metadata.get("http_method").map(|m| m == "GET").unwrap_or(false)
         });
         assert!(get_node.is_some(), "should infer GET for @GetMapping");
+    }
+
+    // -----------------------------------------------------------------------
+    // Implements edge tests (ApiEndpoint → handler Function)
+    // -----------------------------------------------------------------------
+
+    /// Python Flask: `@app.route("/users")` above `def get_users()` should
+    /// produce an `Implements` edge from the ApiEndpoint to get_users.
+    #[test]
+    fn test_python_route_emits_implements_edge_to_handler() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        use crate::graph::EdgeKind;
+        let ext = GenericExtractor::new(&PYTHON_CONFIG);
+        let code = r#"
+@app.route("/users")
+def get_users():
+    pass
+"#;
+        let result = ext.run(Path::new("routes.py"), code).unwrap();
+
+        let implements: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Implements)
+            .collect();
+        assert_eq!(
+            implements.len(), 1,
+            "should emit 1 Implements edge, got: {:?}",
+            implements
+        );
+        let edge = &implements[0];
+        assert_eq!(edge.from.kind, NodeKind::ApiEndpoint, "Implements from should be ApiEndpoint");
+        assert_eq!(edge.to.kind, NodeKind::Function, "Implements to should be Function");
+        assert_eq!(edge.to.name, "get_users", "handler should be get_users");
+    }
+
+    /// TypeScript NestJS: `@Post("/items")` above `create()` should produce an
+    /// `Implements` edge from the ApiEndpoint to the handler method.
+    #[test]
+    fn test_typescript_nestjs_route_emits_implements_edge() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        use crate::graph::EdgeKind;
+        let ext = GenericExtractor::new(&TYPESCRIPT_CONFIG);
+        let code = r#"
+class ItemController {
+  @Post("/items")
+  create() {}
+}
+"#;
+        let result = ext.run(Path::new("item.controller.ts"), code).unwrap();
+
+        let implements: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Implements)
+            .collect();
+        assert_eq!(
+            implements.len(), 1,
+            "should emit 1 Implements edge for NestJS @Post, got edges: {:?}", implements
+        );
+        assert_eq!(implements[0].to.name, "create");
+    }
+
+    /// Multiple route handlers in the same file each get their own Implements edge.
+    #[test]
+    fn test_multiple_python_routes_each_get_implements_edge() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        use crate::graph::EdgeKind;
+        let ext = GenericExtractor::new(&PYTHON_CONFIG);
+        let code = r#"
+@app.route("/users")
+def get_users():
+    pass
+
+@app.post("/users")
+def create_user():
+    pass
+"#;
+        let result = ext.run(Path::new("routes.py"), code).unwrap();
+
+        let implements: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Implements)
+            .collect();
+        assert_eq!(
+            implements.len(), 2,
+            "should emit 2 Implements edges for 2 routes, got: {:?}", implements
+        );
+        let handler_names: Vec<_> = implements.iter().map(|e| e.to.name.as_str()).collect();
+        assert!(handler_names.contains(&"get_users"), "should link to get_users");
+        assert!(handler_names.contains(&"create_user"), "should link to create_user");
     }
 }
