@@ -327,7 +327,7 @@ The `GraphIndex` supports: neighbors, BFS/DFS traversal, impact analysis (reacha
 
 ## 3. The Pipeline: Extraction to MCP Rendering
 
-```
+```text
 Source files (any language)
         |
         v
