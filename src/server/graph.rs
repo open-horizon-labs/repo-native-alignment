@@ -650,7 +650,11 @@ impl RnaHandler {
         //     matching only — no tree-sitter needed.  Runs after tree-sitter
         //     extraction so that Implements edges can link to Function nodes.
         {
-            let nextjs_roots: Vec<(String, std::path::PathBuf)> = resolved_roots
+            // Include lsp_only roots (e.g. client/) — Next.js routing is path-based,
+            // not tree-sitter-based, so it must walk all roots including subdirectory
+            // roots that are skipped for extraction.
+            let nextjs_roots: Vec<(String, std::path::PathBuf)> = workspace
+                .resolved_roots()
                 .iter()
                 .map(|r| (r.slug.clone(), r.path.clone()))
                 .collect();
@@ -1039,7 +1043,16 @@ impl RnaHandler {
         // new/changed route files produce ApiEndpoint nodes and Implements
         // edges. Include in upsert delta so nodes/edges are persisted.
         {
-            let nextjs_roots = vec![(primary_slug.clone(), self.repo_root.clone())];
+            // Include all roots (including lsp_only subdirs like client/) — Next.js
+            // routing is path-based and must walk all roots.
+            let nextjs_roots: Vec<(String, std::path::PathBuf)> = WorkspaceConfig::load()
+                .with_primary_root(self.repo_root.clone())
+                .with_worktrees(&self.repo_root)
+                .with_declared_roots(&self.repo_root)
+                .resolved_roots()
+                .iter()
+                .map(|r| (r.slug.clone(), r.path.clone()))
+                .collect();
             let nextjs_result = crate::extract::nextjs_routing::nextjs_routing_pass(
                 &nextjs_roots,
                 &graph.nodes,

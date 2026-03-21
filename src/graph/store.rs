@@ -27,7 +27,8 @@ pub const SCHEMA_VERSION: u32 = 15;
 /// invalidates the scanner's mtime/hash state — forcing full re-extraction without
 /// dropping LanceDB tables. Bumped to 1 for doc_comment metadata extraction (#401).
 /// Bumped to 3 for new C, PHP, HTML, Scala, Dart, Elixir extractors (#435).
-pub const EXTRACTION_VERSION: u32 = 3;
+/// Bumped to 4 for Next.js routing pass (#440) and monorepo subdirectory roots (#442).
+pub const EXTRACTION_VERSION: u32 = 4;
 
 /// Arrow schema for the `symbols` table.
 ///
