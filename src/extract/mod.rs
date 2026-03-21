@@ -11,6 +11,7 @@ pub mod api_link;
 pub mod bash;
 pub mod configs;
 pub mod cpp;
+pub mod dockerfile;
 pub mod generic;
 pub mod query;
 pub mod csharp;
@@ -178,6 +179,7 @@ impl ExtractorRegistry {
         registry.register(Box::new(lua::LuaExtractor::new()));
         registry.register(Box::new(swift::SwiftExtractor::new()));
         // Infrastructure / config
+        registry.register(Box::new(dockerfile::DockerfileExtractor::new()));
         registry.register(Box::new(hcl::HclExtractor::new()));
         registry.register(Box::new(json_extractor::JsonExtractor::new()));
         registry.register(Box::new(toml_extractor::TomlExtractor::new()));
@@ -534,7 +536,7 @@ mod tests {
     #[test]
     fn test_registry_with_builtins_has_extractors() {
         let registry = ExtractorRegistry::with_builtins();
-        assert_eq!(registry.len(), 22); // rust, python, typescript, javascript, go, java, bash, ruby, cpp, csharp, kotlin, zig, lua, swift, hcl, json, toml, yaml, markdown, proto, sql, openapi
+        assert_eq!(registry.len(), 23); // rust, python, typescript, javascript, go, java, bash, ruby, cpp, csharp, kotlin, zig, lua, swift, dockerfile, hcl, json, toml, yaml, markdown, proto, sql, openapi
     }
 
     #[test]

@@ -38,6 +38,7 @@ tree-sitter-hcl = "1.1"
 tree-sitter-json = "0.24"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-yaml = "0.7"
+tree-sitter-dockerfile = { package = "tree-sitter-dockerfile-updated", version = "0.2" }
 
 # In-memory graph index (traversal, path queries, impact analysis)
 petgraph = "0.8"
