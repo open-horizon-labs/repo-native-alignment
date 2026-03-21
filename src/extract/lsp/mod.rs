@@ -134,6 +134,14 @@ const MAX_TYPE_HIERARCHY_STRIKES: u32 = 3;
 /// without a venv, or a server that can't resolve any references).
 const ZERO_EDGE_ABORT_THRESHOLD: u32 = 1_000;
 
+/// Minimum warmup time before the node-count abort can fire.
+/// typescript-language-server and similar servers need time to fully index
+/// the project before producing call hierarchy results. Without this guard,
+/// the 1,000-node abort fires in ~0.3s on large TypeScript projects before
+/// the server has finished indexing — producing 0 call edges despite being
+/// correctly configured.
+const ZERO_EDGE_MIN_WARMUP: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Time-based abort: if no edges after this duration, abort enrichment.
 /// On slow LSP servers (e.g., pyright without warm cache), reaching the
 /// node-count threshold can take 100+ minutes. This caps the wait at 2 minutes.
@@ -2099,10 +2107,12 @@ impl Enricher for LspEnricher {
                 last_logged_count = done;
             }
 
-            // Early abort: if we've processed >= 1,000 nodes OR spent >= 2 minutes
-            // with 0 edges, the language server is likely misconfigured (e.g., missing venv).
+            // Early abort: if we've processed >= 1,000 nodes AND warmed up for >= 30s,
+            // OR spent >= 2 minutes with 0 edges, the language server is likely
+            // misconfigured. The warmup guard prevents false aborts on servers like
+            // typescript-language-server that need time to index before producing edges.
             if result.added_edges.is_empty()
-                && (attempted >= ZERO_EDGE_ABORT_THRESHOLD
+                && ((attempted >= ZERO_EDGE_ABORT_THRESHOLD && pass1_start.elapsed() >= ZERO_EDGE_MIN_WARMUP)
                     || pass1_start.elapsed() > ZERO_EDGE_TIMEOUT)
             {
                 tracing::warn!(
@@ -2197,9 +2207,9 @@ impl Enricher for LspEnricher {
                     pass2_last_count = pass2_done;
                 }
 
-                // Early abort: 0 new edges after 1,000 nodes OR 2 minutes
+                // Early abort: 0 new edges after 1,000 nodes + 30s warmup, OR 2 minutes
                 if result.added_edges.len() == edges_before_pass2
-                    && (pass2_done >= ZERO_EDGE_ABORT_THRESHOLD as u64
+                    && ((pass2_done >= ZERO_EDGE_ABORT_THRESHOLD as u64 && pass2_start.elapsed() >= ZERO_EDGE_MIN_WARMUP)
                         || pass2_start.elapsed() > ZERO_EDGE_TIMEOUT)
                 {
                     tracing::warn!(
