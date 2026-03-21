@@ -149,6 +149,16 @@ pub trait Enricher: Send + Sync {
 
     /// Human-readable name for this enricher (for diagnostics).
     fn name(&self) -> &str;
+
+    /// Set the LSP server startup working directory.
+    ///
+    /// When called before the first `enrich()` call, the language server is started
+    /// with `current_dir = lsp_root` and `rootUri = file:///<lsp_root>`. Used for
+    /// monorepo subdirectory roots (e.g. `client = "client"`) so language servers
+    /// can find their config files (tsconfig.json, pyproject.toml) in the subdirectory.
+    ///
+    /// Default implementation is a no-op. `LspEnricher` overrides this.
+    fn set_startup_root(&self, _lsp_root: std::path::PathBuf) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -384,10 +394,16 @@ fn pick_lsp_root_for_nodes<'a>(
     }
 
     if best_count > 0 {
-        tracing::debug!(
-            "pick_lsp_root: selected '{}' ({} matching nodes)",
+        tracing::info!(
+            "pick_lsp_root: selected '{}' ({} matching nodes out of {})",
             best_root.display(),
             best_count,
+            nodes.len(),
+        );
+    } else {
+        tracing::info!(
+            "pick_lsp_root: no lsp_root matched, using primary root '{}'",
+            primary_root.display(),
         );
     }
     best_root
@@ -530,17 +546,20 @@ impl EnricherRegistry {
                 continue; // silently skip — too many servers to log each one
             }
 
-            // Pick the best LSP working directory for this enricher.
-            // If there are lsp_roots (declared subdirectory roots), find the most-specific
-            // one that covers the majority of the nodes this enricher will process.
-            // "Most specific" = longest path prefix match.
-            let effective_root: &Path = if lsp_roots.is_empty() {
-                repo_root
-            } else {
-                pick_lsp_root_for_nodes(nodes, repo_root, lsp_roots)
-            };
+            // Configure the LSP server startup working directory if lsp_roots are available.
+            // This is a one-time operation (OnceLock, first call wins) that sets the
+            // working directory for the language server startup (current_dir + rootUri).
+            // It must be called BEFORE the first enrich() so ensure_initialized picks it up.
+            //
+            // Only set if we found a more-specific root than the primary root.
+            if !lsp_roots.is_empty() {
+                let best = pick_lsp_root_for_nodes(nodes, repo_root, lsp_roots);
+                if best != repo_root {
+                    enricher.set_startup_root(best.to_path_buf());
+                }
+            }
 
-            match enricher.enrich(nodes, index, effective_root).await {
+            match enricher.enrich(nodes, index, repo_root).await {
                 Ok(enrichment) => {
                     // If enrich() returned Ok, the server was available and ran.
                     result.any_enricher_ran = true;
