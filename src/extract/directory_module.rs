@@ -84,8 +84,11 @@ pub struct DirectoryModuleResult {
 /// edges linking symbols to them.  The caller must extend `all_nodes` with
 /// `result.nodes` **and** `all_edges` with `result.edges`.
 pub fn directory_module_pass(all_nodes: &[Node]) -> DirectoryModuleResult {
-    // Map (root, dir_path) -> module Node so we emit each module node once.
-    let mut module_nodes: HashMap<(String, PathBuf), Node> = HashMap::new();
+    // Map (root, dir_path, module_name) -> module Node so we emit each module node once.
+    // The key MUST include module_name because root-level files (e.g. main.rs, build.rs)
+    // all have an empty dir_path but different module names.  Using only (root, dir_path)
+    // would collapse them into whichever module node was inserted first.
+    let mut module_nodes: HashMap<(String, PathBuf, String), Node> = HashMap::new();
     let mut edges: Vec<Edge> = Vec::new();
 
     for node in all_nodes {
@@ -116,7 +119,7 @@ pub fn directory_module_pass(all_nodes: &[Node]) -> DirectoryModuleResult {
             _ => continue, // cannot derive a name — skip
         };
 
-        let key = (node.id.root.clone(), module_path.clone());
+        let key = (node.id.root.clone(), module_path.clone(), module_name.clone());
 
         // Create the module node if we haven't seen this directory yet.
         let module_node_id = module_nodes
@@ -474,5 +477,48 @@ mod tests {
         let (name, path) = derive_module(std::path::Path::new("cmd/server/main.go"));
         assert_eq!(name, Some("server".to_string()));
         assert_eq!(path, PathBuf::from("cmd/server"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Regression tests (from CodeRabbit review)
+    // -------------------------------------------------------------------------
+
+    /// Regression: root-level files (main.rs, build.rs, lib.rs) all have
+    /// empty `module_path` from `derive_module()`.  The dedup key must include
+    /// `module_name` so each root-level file gets its OWN module node rather
+    /// than being collapsed into whichever was inserted first.
+    #[test]
+    fn regression_root_level_files_get_distinct_module_nodes() {
+        let nodes = vec![
+            make_node("repo", "main.rs", "run", NodeKind::Function),
+            make_node("repo", "build.rs", "main", NodeKind::Function),
+            make_node("repo", "lib.rs", "lib_fn", NodeKind::Function),
+        ];
+        let result = directory_module_pass(&nodes);
+
+        // Each root-level file must produce its OWN module node.
+        assert_eq!(
+            result.nodes.len(), 3,
+            "main.rs, build.rs, lib.rs must each get a distinct module node, not share one"
+        );
+
+        let module_names: std::collections::HashSet<&str> =
+            result.nodes.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(module_names.contains("main"), "main.rs → module 'main'");
+        assert!(module_names.contains("build"), "build.rs → module 'build'");
+        assert!(module_names.contains("lib"), "lib.rs → module 'lib'");
+
+        // Each edge must point to the correct module for its source file.
+        for edge in &result.edges {
+            let src_stem = std::path::Path::new(edge.from.file.as_os_str())
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            assert_eq!(
+                edge.to.name, src_stem,
+                "symbol from {}.rs must BelongsTo module '{}'",
+                src_stem, src_stem
+            );
+        }
     }
 }

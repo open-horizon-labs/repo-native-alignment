@@ -610,6 +610,13 @@ impl RnaHandler {
         //     Runs unconditionally for all languages — no LSP required.
         //     The LSP enricher's Pass 4 (rust-analyzer/parentModule) provides
         //     more accurate Rust module paths and runs later as an override.
+        //
+        //     Deduplication note: for clean-root cache-reuse builds, the cached
+        //     node set already contains module nodes from the previous run.  This
+        //     pass will re-emit them with identical stable_ids — LanceDB's
+        //     merge_insert upsert path handles the dedup at persist time, and
+        //     GraphIndex's ensure_node deduplicates in the petgraph index.  The
+        //     same approach is used by api_link_pass and tested_by_pass.
         {
             let dir_result = crate::extract::directory_module::directory_module_pass(&all_nodes);
             if !dir_result.edges.is_empty() {
@@ -979,6 +986,11 @@ impl RnaHandler {
                     dir_result.edges.len(),
                     dir_result.nodes.len(),
                 );
+                // Also add the new module nodes to the upsert delta so they
+                // are persisted to LanceDB.  Without this, upsert_nodes is
+                // rebuilt only from upsert_node_ids and the module rows would
+                // be missing — leaving BelongsTo edges pointing at ghost nodes.
+                upsert_node_ids.extend(dir_result.nodes.iter().map(|n| n.stable_id()));
                 upsert_edges.extend(dir_result.edges.iter().cloned());
                 graph.edges.extend(dir_result.edges);
                 graph.nodes.extend(dir_result.nodes);
