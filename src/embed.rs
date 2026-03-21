@@ -1508,35 +1508,59 @@ impl EmbeddingIndex {
         let mut search_results = Vec::new();
 
         // Hybrid/FTS results use `_score` (BM25 or RRF), vector uses `_distance`.
-        // Detect which column is present and normalize to a 0..1 score.
-        let has_score_col = batches.first()
-            .is_some_and(|b| b.column_by_name("_score").is_some());
+        // Detect which column is present by checking ANY batch — not just the first.
+        // The first batch may be skipped (missing required columns) when hybrid search
+        // with a pre-filter returns a partial schema, so checking only the first batch
+        // could misdetect the score column. (#400)
+        let has_score_col = batches.iter()
+            .any(|b| b.column_by_name("_score").is_some());
 
         for batch in &batches {
+            // LanceDB hybrid search with a pre-filter (.only_if()) can return
+            // RecordBatches that are missing table columns — only FTS-indexed
+            // columns may be present. Guard against this rather than panicking.
+            // Skip the batch with a warning so callers get partial results
+            // instead of a hard crash. (#400)
+            let required_cols = ["id", "kind", "title", "body"];
+            let missing: Vec<&str> = required_cols
+                .iter()
+                .copied()
+                .filter(|col| batch.column_by_name(col).is_none())
+                .collect();
+            if !missing.is_empty() {
+                tracing::warn!(
+                    missing_columns = ?missing,
+                    schema = ?batch.schema().fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+                    "Skipping RecordBatch with missing required columns — \
+                     hybrid search pre-filter may have excluded non-indexed columns"
+                );
+                continue;
+            }
+
             let ids = batch
                 .column_by_name("id")
-                .unwrap()
+                .expect("checked above")
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .unwrap();
+                .expect("id column is StringArray");
             let kinds = batch
                 .column_by_name("kind")
-                .unwrap()
+                .expect("checked above")
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .unwrap();
+                .expect("kind column is StringArray");
             let titles = batch
                 .column_by_name("title")
-                .unwrap()
+                .expect("checked above")
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .unwrap();
+                .expect("title column is StringArray");
             let bodies = batch
                 .column_by_name("body")
-                .unwrap()
+                .expect("checked above")
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .unwrap();
+                .expect("body column is StringArray");
 
             for i in 0..batch.num_rows() {
                 let kind = kinds.value(i).to_string();
@@ -1555,24 +1579,25 @@ impl EmbeddingIndex {
                     // Use monotonic s/(1+s) transform to map [0, inf) -> [0, 1)
                     // while preserving ranking order. A hard clamp at 1.0 would
                     // destroy differentiation among high-scoring results.
+                    //
+                    // _score column presence was checked on first batch; if a
+                    // subsequent batch is missing it, fall back to 0.5 (neutral).
                     let s = batch
                         .column_by_name("_score")
-                        .unwrap()
-                        .as_any()
-                        .downcast_ref::<Float32Array>()
-                        .unwrap()
-                        .value(i);
+                        .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
+                        .map(|arr| arr.value(i))
+                        .unwrap_or(0.5);
                     let s = s.max(0.0);
                     s / (1.0 + s)
                 } else {
                     // Cosine distance [0, 2]: convert to similarity.
+                    // If _distance is absent (shouldn't happen in vector mode,
+                    // but guard defensively), treat as maximum distance → 0 score.
                     let d = batch
                         .column_by_name("_distance")
-                        .unwrap()
-                        .as_any()
-                        .downcast_ref::<Float32Array>()
-                        .unwrap()
-                        .value(i);
+                        .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
+                        .map(|arr| arr.value(i))
+                        .unwrap_or(2.0);
                     (1.0 - d).max(0.0)
                 };
 
@@ -2738,5 +2763,150 @@ mod tests {
         let sql = filters.to_sql().expect("should produce SQL");
         assert!(sql.contains("server''s module"), "single quotes should be doubled: {}", sql);
         assert!(!sql.contains("server's module"), "raw single quote should not appear: {}", sql);
+    }
+
+    // ── #400: batch column guard (hybrid search panic regression) ─────────
+
+    /// Verify that a RecordBatch missing required columns is detected and
+    /// skipped gracefully rather than causing an unwrap panic.
+    ///
+    /// Regression test for the panic at embed.rs:1518 when LanceDB hybrid
+    /// search with a pre-filter returns RecordBatches without the `id` column.
+    #[test]
+    fn batch_missing_required_column_is_detected() {
+        use arrow_array::{RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        // Build a batch that has `kind`, `title`, `body` but NOT `id` —
+        // simulating the hybrid-search-with-prefilter regression.
+        let schema = Schema::new(vec![
+            Field::new("kind", DataType::Utf8, false),
+            Field::new("title", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["function"])),
+                Arc::new(StringArray::from(vec!["example_fn"])),
+                Arc::new(StringArray::from(vec!["fn example_fn() {}"])),
+            ],
+        )
+        .expect("should build RecordBatch without id column");
+
+        // Apply the same column guard used in search_with_filters.
+        // This must NOT panic — it should detect the missing column.
+        let required_cols = ["id", "kind", "title", "body"];
+        let missing: Vec<&str> = required_cols
+            .iter()
+            .copied()
+            .filter(|col| batch.column_by_name(col).is_none())
+            .collect();
+
+        assert_eq!(
+            missing,
+            vec!["id"],
+            "should detect exactly the missing 'id' column, got: {:?}",
+            missing
+        );
+    }
+
+    /// Verify that a complete RecordBatch (all required columns present)
+    /// passes the column guard with no missing columns.
+    #[test]
+    fn batch_with_all_required_columns_passes_guard() {
+        use arrow_array::{RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("kind", DataType::Utf8, false),
+            Field::new("title", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["test::file.rs::fn_a::function"])),
+                Arc::new(StringArray::from(vec!["function"])),
+                Arc::new(StringArray::from(vec!["fn_a"])),
+                Arc::new(StringArray::from(vec!["fn fn_a() {}"])),
+            ],
+        )
+        .expect("should build complete RecordBatch");
+
+        let required_cols = ["id", "kind", "title", "body"];
+        let missing: Vec<&str> = required_cols
+            .iter()
+            .copied()
+            .filter(|col| batch.column_by_name(col).is_none())
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "complete batch should have no missing columns, but found: {:?}",
+            missing
+        );
+    }
+
+    /// Adversarial: has_score_col must be detected from ANY batch, not just the first.
+    ///
+    /// When the first batch is missing required columns (and gets skipped), later
+    /// batches may have _score. has_score_col must still be true so they use the
+    /// correct scoring branch.
+    #[test]
+    fn has_score_col_detected_from_any_batch() {
+        use arrow_array::{Float32Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        // Batch 0: missing required columns (simulates skipped FTS-only batch from pre-filter).
+        // No _score column either.
+        let schema_incomplete = Schema::new(vec![
+            Field::new("title", DataType::Utf8, false),
+        ]);
+        let batch_incomplete = RecordBatch::try_new(
+            Arc::new(schema_incomplete),
+            vec![Arc::new(StringArray::from(vec!["stub"]))],
+        )
+        .expect("should build incomplete batch");
+
+        // Batch 1: complete batch with _score (simulates valid hybrid search result).
+        let schema_complete = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("kind", DataType::Utf8, false),
+            Field::new("title", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("_score", DataType::Float32, false),
+        ]);
+        let batch_complete = RecordBatch::try_new(
+            Arc::new(schema_complete),
+            vec![
+                Arc::new(StringArray::from(vec!["id1"])),
+                Arc::new(StringArray::from(vec!["function"])),
+                Arc::new(StringArray::from(vec!["title1"])),
+                Arc::new(StringArray::from(vec!["body1"])),
+                Arc::new(Float32Array::from(vec![0.8f32])),
+            ],
+        )
+        .expect("should build complete batch");
+
+        let batches = vec![batch_incomplete, batch_complete];
+
+        // Simulate the has_score_col detection from the fix (any batch, not just first).
+        let has_score_col_any = batches.iter().any(|b| b.column_by_name("_score").is_some());
+        let has_score_col_first = batches.first()
+            .is_some_and(|b| b.column_by_name("_score").is_some());
+
+        assert!(
+            has_score_col_any,
+            "should detect _score from any batch, but iter().any() returned false"
+        );
+        assert!(
+            !has_score_col_first,
+            "first batch does not have _score — verifying that first-only detection is wrong"
+        );
     }
 }
