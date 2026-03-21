@@ -359,33 +359,57 @@ impl LspEnricher {
         // Without this, pyright produces 0 edges on projects that use poetry/venv.
         //
         // Checks common venv directory names in priority order: .venv, venv, env.
-        let effective_settings = self.init_settings.as_ref().map(|s| {
-            if self.language == "python" {
-                // Check common virtual environment directory names.
-                let venv_candidates = [".venv", "venv", "env"];
-                if let Some(venv_name) = venv_candidates.iter().find(|&&name| startup_root.join(name).is_dir()) {
-                    // Merge venvPath + venv into the python.analysis section.
-                    // startup_root is the venv parent (e.g., ai_service/).
-                    let venv_path_str = startup_root.to_string_lossy().to_string();
-                    let mut merged = s.clone();
-                    if let Some(python_obj) = merged.get_mut("python") {
-                        if let Some(analysis_obj) = python_obj.get_mut("analysis") {
-                            if let Some(obj) = analysis_obj.as_object_mut() {
-                                obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
-                                obj.insert("venv".into(), serde_json::Value::String(venv_name.to_string()));
+        // Build effective initialization settings.
+        // For pyright, detect a virtual environment at startup_root and inject
+        // venvPath + venv so pyright can resolve installed packages.
+        // We materialize the full python.analysis structure even if init_settings
+        // doesn't have it, so venv config is always delivered when a venv exists.
+        let effective_settings = if self.language == "python" {
+            let venv_candidates = [".venv", "venv", "env"];
+            if let Some(venv_name) = venv_candidates.iter().find(|&&name| startup_root.join(name).is_dir()) {
+                let venv_path_str = startup_root.to_string_lossy().to_string();
+                // Start from existing settings or an empty object, then
+                // unconditionally materialize python.analysis.{venvPath,venv}.
+                let mut merged = self.init_settings
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let python_obj = merged
+                    .as_object_mut()
+                    .and_then(|root| {
+                        if !root.contains_key("python") {
+                            root.insert("python".into(), serde_json::json!({}));
+                        }
+                        root.get_mut("python")
+                    });
+                if let Some(python_val) = python_obj {
+                    let analysis_obj = python_val
+                        .as_object_mut()
+                        .and_then(|p| {
+                            if !p.contains_key("analysis") {
+                                p.insert("analysis".into(), serde_json::json!({}));
                             }
+                            p.get_mut("analysis")
+                        });
+                    if let Some(analysis_val) = analysis_obj {
+                        if let Some(obj) = analysis_val.as_object_mut() {
+                            obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
+                            obj.insert("venv".into(), serde_json::Value::String(venv_name.to_string()));
                         }
                     }
-                    tracing::info!(
-                        "pyright: found {} at '{}', adding venvPath/venv to initializationOptions",
-                        venv_name,
-                        startup_root.display()
-                    );
-                    return merged;
                 }
+                tracing::info!(
+                    "pyright: found {} at '{}', adding venvPath/venv to initializationOptions",
+                    venv_name,
+                    startup_root.display()
+                );
+                Some(merged)
+            } else {
+                self.init_settings.clone()
             }
-            s.clone()
-        });
+        } else {
+            self.init_settings.clone()
+        };
         if let Some(ref settings) = effective_settings {
             init_params.initialization_options = Some(settings.clone());
         }
@@ -1725,6 +1749,17 @@ impl Enricher for LspEnricher {
         let matching_nodes_owned: Arc<Vec<Node>> = Arc::new(
             matching_nodes.iter().map(|n| (*n).clone()).collect()
         );
+
+        // Build a per-file index once and share it across all tasks via Arc.
+        // Without this, every function task rebuilt the same HashMap, O(functions × nodes).
+        let refs_by_file_shared: Arc<HashMap<std::path::PathBuf, Vec<Node>>> = {
+            let mut map: HashMap<std::path::PathBuf, Vec<Node>> = HashMap::new();
+            for n in matching_nodes_owned.iter() {
+                map.entry(n.id.file.clone()).or_default().push(n.clone());
+            }
+            Arc::new(map)
+        };
+
         let language = self.language.clone();
 
         let pass1_start = std::time::Instant::now();
@@ -1789,6 +1824,7 @@ impl Enricher for LspEnricher {
             let transport = Arc::clone(&transport);
             let root = root.clone();
             let matching_owned = Arc::clone(&matching_nodes_owned);
+            let refs_by_file = Arc::clone(&refs_by_file_shared);
             let language = language.clone();
             let sem = Arc::clone(&concurrency_limit);
             let completed = Arc::clone(&completed);
@@ -1820,13 +1856,10 @@ impl Enricher for LspEnricher {
                             // Server supports references but not callHierarchy (e.g., pyright).
                             // Use textDocument/references to find callers of this function.
                             // This produces Calls edges from caller → this function.
+                            // Note: references include non-call sites (imports, type annotations,
+                            // passing as callback), so confidence is Detected (not Confirmed).
                             match Self::find_references_p(&transport, &file_uri, line, col).await {
                                 Ok(locations) => {
-                                    let matching_refs: Vec<&Node> = matching_owned.iter().collect();
-                                    let mut refs_by_file: HashMap<&Path, Vec<&Node>> = HashMap::new();
-                                    for n in &matching_refs {
-                                        refs_by_file.entry(n.id.file.as_path()).or_default().push(*n);
-                                    }
                                     for loc in &locations {
                                         let ref_path = uri_to_relative_path(&loc.uri, &root);
                                         let ref_line = loc.range.start.line as usize + 1;
@@ -1845,7 +1878,10 @@ impl Enricher for LspEnricher {
 
                                         let referrer_id = refs_by_file
                                             .get(ref_path.as_path())
-                                            .and_then(|candidates| find_enclosing_symbol(candidates, &ref_path, ref_line));
+                                            .and_then(|candidates| {
+                                                let refs: Vec<&Node> = candidates.iter().collect();
+                                                find_enclosing_symbol(&refs, &ref_path, ref_line)
+                                            });
 
                                         if let Some(referrer) = referrer_id {
                                             if referrer == node.id {
@@ -1856,7 +1892,10 @@ impl Enricher for LspEnricher {
                                                 to: node.id.clone(),
                                                 kind: EdgeKind::Calls,
                                                 source: ExtractionSource::Lsp,
-                                                confidence: Confidence::Confirmed,
+                                                // Detected (not Confirmed): references include
+                                                // non-call sites (imports, type annotations,
+                                                // passing as value).
+                                                confidence: Confidence::Detected,
                                             });
                                         }
                                     }
