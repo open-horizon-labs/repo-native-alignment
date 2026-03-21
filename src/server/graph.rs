@@ -589,6 +589,22 @@ impl RnaHandler {
             }
         }
 
+        // 4d. TestedBy naming-convention pass: emit TestedBy edges from test
+        //     functions to the production functions they exercise, using only
+        //     function names (no LSP required).  Runs here so that edges are
+        //     present after every tree-sitter-only scan, not just when LSP
+        //     finishes initialising.
+        {
+            let tested_by_edges = crate::extract::naming_convention::tested_by_pass(&all_nodes);
+            if !tested_by_edges.is_empty() {
+                tracing::info!(
+                    "TestedBy naming-convention pass: {} edge(s)",
+                    tested_by_edges.len()
+                );
+                all_edges.extend(tested_by_edges);
+            }
+        }
+
         // 5. Build petgraph index
         let mut index = GraphIndex::new();
         index.rebuild_from_edges(&all_edges);
@@ -870,9 +886,12 @@ impl RnaHandler {
         // Track which node/edge IDs are in the delta for LanceDB upsert.
         // We snapshot IDs now but rebuild the actual upsert data AFTER PageRank
         // so persisted nodes include updated importance scores.
+        //
+        // NOTE: upsert_edges is declared mut so post-extraction passes
+        // (api_link, tested_by) can append their edges to the persist delta.
         let mut upsert_node_ids: std::collections::HashSet<String> =
             extraction.nodes.iter().map(|n| n.stable_id()).collect();
-        let upsert_edges: Vec<Edge> = extraction.edges.clone();
+        let mut upsert_edges: Vec<Edge> = extraction.edges.clone();
         graph.nodes.extend(extraction.nodes);
         graph.edges.extend(extraction.edges);
 
@@ -888,6 +907,8 @@ impl RnaHandler {
                     "API link pass (incremental): {} DependsOn edge(s) from string literals to endpoints",
                     api_link_edges.len()
                 );
+                // Include in upsert delta so these edges are persisted to LanceDB.
+                upsert_edges.extend(api_link_edges.iter().cloned());
                 graph.edges.extend(api_link_edges);
             }
         }
@@ -907,6 +928,24 @@ impl RnaHandler {
                 );
                 graph.nodes.extend(manifest_result.nodes);
                 graph.edges.extend(manifest_result.edges);
+            }
+        }
+
+        // Re-run TestedBy naming-convention pass over the full node set so
+        // that test/production pairs where only one side changed are still
+        // linked.  Include in upsert delta so edges are persisted to LanceDB —
+        // previously this block ran AFTER upsert_edges was captured, meaning
+        // TestedBy edges were never written to the incremental persist delta.
+        {
+            let tested_by_edges = crate::extract::naming_convention::tested_by_pass(&graph.nodes);
+            if !tested_by_edges.is_empty() {
+                tracing::info!(
+                    "TestedBy naming-convention pass (incremental): {} edge(s)",
+                    tested_by_edges.len()
+                );
+                // Include in upsert delta so these edges are persisted to LanceDB.
+                upsert_edges.extend(tested_by_edges.iter().cloned());
+                graph.edges.extend(tested_by_edges);
             }
         }
 

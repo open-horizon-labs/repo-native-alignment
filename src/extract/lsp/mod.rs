@@ -1032,93 +1032,6 @@ impl LspEnricher {
     }
 
     // ---------------------------------------------------------------------------
-    // #395: TestedBy edges via naming conventions
-    // ---------------------------------------------------------------------------
-
-    /// Scan test functions and emit `TestedBy` edges to production functions whose
-    /// name appears as a substring in the test function name.
-    ///
-    /// Example: `test_process_payment` → `TestedBy` edge to `process_payment`.
-    ///
-    /// This is language-agnostic and covers Python, Go, TypeScript, Java, Ruby, etc.
-    /// Convention patterns recognised:
-    ///   Rust:       `test_<fn>`, `<fn>_test`, `<fn>_should_*`
-    ///   Go:         `Test<Fn>`, `Benchmark<Fn>`
-    ///   Python:     `test_<fn>`, `<fn>_test`
-    ///   TypeScript: `it("...fn...")`, `describe("...fn...")`  — name-based only
-    ///   General:    any test function whose name contains the production name
-    fn emit_tested_by_edges(
-        matching_nodes: &[&Node],
-        result: &mut EnrichmentResult,
-    ) {
-        // Split into test and production functions
-        let test_fns: Vec<&Node> = matching_nodes
-            .iter()
-            .filter(|n| n.id.kind == NodeKind::Function)
-            .filter(|n| crate::ranking::is_test_function(n))
-            .copied()
-            .collect();
-
-        let prod_fns: Vec<&Node> = matching_nodes
-            .iter()
-            .filter(|n| n.id.kind == NodeKind::Function)
-            .filter(|n| !crate::ranking::is_test_function(n))
-            .copied()
-            .collect();
-
-        if test_fns.is_empty() || prod_fns.is_empty() {
-            return;
-        }
-
-        let mut edges_added = 0usize;
-
-        for test_fn in &test_fns {
-            let test_name_lower = test_fn.id.name.to_lowercase();
-
-            for prod_fn in &prod_fns {
-                // Skip very short production function names to avoid false positives
-                // (e.g. "new", "get", "run" would match too many tests)
-                if prod_fn.id.name.len() < 4 {
-                    continue;
-                }
-
-                let prod_name_lower = prod_fn.id.name.to_lowercase();
-
-                // Check whether the test name contains the production name as a
-                // word-boundary match. We accept underscore or camelCase boundaries.
-                if test_name_lower.contains(prod_name_lower.as_str()) {
-                    // Guard: avoid emitting TestedBy to itself (shouldn't happen
-                    // since we split on is_test_function, but be defensive)
-                    if test_fn.id == prod_fn.id {
-                        continue;
-                    }
-
-                    tracing::debug!(
-                        "TestedBy (naming): {} covers {}",
-                        test_fn.id.name, prod_fn.id.name
-                    );
-
-                    result.added_edges.push(Edge {
-                        from: test_fn.id.clone(),
-                        to: prod_fn.id.clone(),
-                        kind: EdgeKind::TestedBy,
-                        source: ExtractionSource::Lsp,
-                        confidence: Confidence::Detected,
-                    });
-                    edges_added += 1;
-                }
-            }
-        }
-
-        if edges_added > 0 {
-            tracing::info!(
-                "TestedBy pass: {} edges from {} test functions covering {} production functions",
-                edges_added, test_fns.len(), prod_fns.len()
-            );
-        }
-    }
-
-    // ---------------------------------------------------------------------------
     // #405: Crate-level dependency graph via rust-analyzer/viewCrateGraph
     // ---------------------------------------------------------------------------
 
@@ -2131,31 +2044,10 @@ impl Enricher for LspEnricher {
             pass1_start.elapsed(), result.added_edges.len(), attempted, errors,
         );
 
-        // ------------------------------------------------------------------
-        // Pass 1b: TestedBy edges via naming conventions (#395).
-        //
-        // Language-agnostic: scan all test functions in matching_nodes and
-        // emit TestedBy edges to production functions whose name appears as
-        // a substring in the test function name.
-        //
-        // Example: `test_process_payment` → TestedBy → `process_payment`
-        //
-        // This runs unconditionally after Pass 1 (it's pure graph analysis,
-        // no LSP requests needed). It complements the call-hierarchy approach
-        // already used by `mode="tests_for"`.
-        // ------------------------------------------------------------------
-        {
-            let pass1b_start = std::time::Instant::now();
-            let edges_before = result.added_edges.len();
-            Self::emit_tested_by_edges(&matching_nodes, &mut result);
-            let tested_by_count = result.added_edges.len() - edges_before;
-            if tested_by_count > 0 {
-                tracing::info!(
-                    "LSP Pass 1b complete in {:?}: {} TestedBy edges",
-                    pass1b_start.elapsed(), tested_by_count
-                );
-            }
-        }
+        // Pass 1b (TestedBy naming conventions) was removed in fix/#395.
+        // TestedBy edges are now emitted by the tree-sitter post-extraction
+        // pass `naming_convention::tested_by_pass`, which runs unconditionally
+        // after every scan — no LSP startup required.
 
         // ------------------------------------------------------------------
         // Pass 2: type hierarchy (sequential — strike counting needs order)
@@ -4250,119 +4142,6 @@ mod tests {
         // has_inlay_hints also defaults false (not yet initialized)
         assert!(!state.has_inlay_hints,
             "has_inlay_hints must default false (not yet initialized from LSP capabilities)");
-    }
-
-    // -----------------------------------------------------------------------
-    // #395 TestedBy: naming convention tests
-    // -----------------------------------------------------------------------
-
-    fn make_fn_node(file: &str, name: &str, is_test: bool) -> Node {
-        let mut metadata = BTreeMap::new();
-        if is_test {
-            // ranking::is_test_function checks `token.trim() == "test"` (without brackets)
-            metadata.insert("decorators".to_string(), "test".to_string());
-        }
-        Node {
-            id: NodeId {
-                root: String::new(),
-                file: PathBuf::from(file),
-                name: name.to_string(),
-                kind: NodeKind::Function,
-            },
-            language: "rust".to_string(),
-            line_start: 1,
-            line_end: 10,
-            signature: format!("fn {}()", name),
-            body: String::new(),
-            metadata,
-            source: ExtractionSource::TreeSitter,
-        }
-    }
-
-    /// Basic naming convention match: test_<fn> → <fn>
-    #[test]
-    fn test_tested_by_naming_basic() {
-        let test_fn = make_fn_node("src/lib.rs", "test_process_payment", true);
-        let prod_fn = make_fn_node("src/lib.rs", "process_payment", false);
-        let matching: Vec<&Node> = vec![&test_fn, &prod_fn];
-
-        let mut result = EnrichmentResult::default();
-        LspEnricher::emit_tested_by_edges(&matching, &mut result);
-
-        let tested_by: Vec<_> = result.added_edges.iter()
-            .filter(|e| e.kind == EdgeKind::TestedBy)
-            .collect();
-        assert_eq!(tested_by.len(), 1, "expected 1 TestedBy edge");
-        assert_eq!(tested_by[0].from.name, "test_process_payment");
-        assert_eq!(tested_by[0].to.name, "process_payment");
-        assert_eq!(tested_by[0].confidence, Confidence::Detected);
-    }
-
-    /// Short production function names (< 4 chars) are skipped to avoid false positives
-    #[test]
-    fn test_tested_by_skips_short_names() {
-        let test_fn = make_fn_node("src/lib.rs", "test_run", true);
-        let prod_fn = make_fn_node("src/lib.rs", "run", false);
-        let matching: Vec<&Node> = vec![&test_fn, &prod_fn];
-
-        let mut result = EnrichmentResult::default();
-        LspEnricher::emit_tested_by_edges(&matching, &mut result);
-
-        let tested_by: Vec<_> = result.added_edges.iter()
-            .filter(|e| e.kind == EdgeKind::TestedBy)
-            .collect();
-        assert!(tested_by.is_empty(), "should not emit TestedBy for short production names like 'run'");
-    }
-
-    /// No test functions → no TestedBy edges
-    #[test]
-    fn test_tested_by_no_test_functions() {
-        let fn1 = make_fn_node("src/lib.rs", "process_payment", false);
-        let fn2 = make_fn_node("src/lib.rs", "calculate_tax", false);
-        let matching: Vec<&Node> = vec![&fn1, &fn2];
-
-        let mut result = EnrichmentResult::default();
-        LspEnricher::emit_tested_by_edges(&matching, &mut result);
-
-        let tested_by: Vec<_> = result.added_edges.iter()
-            .filter(|e| e.kind == EdgeKind::TestedBy)
-            .collect();
-        assert!(tested_by.is_empty());
-    }
-
-    /// CamelCase convention: TestHandleRequest → HandleRequest (Go style)
-    /// Both test and production are camelCase — substring match works after lowercasing
-    #[test]
-    fn test_tested_by_camel_case() {
-        // Go convention: TestHandleRequest → HandleRequest
-        // After lowercasing: "testhandlerequest".contains("handlerequest") == true
-        let test_node = Node {
-            id: NodeId {
-                root: String::new(),
-                file: PathBuf::from("src/handler_test.rs"),  // _test. suffix → is_test_file
-                name: "TestHandleRequest".to_string(),
-                kind: NodeKind::Function,
-            },
-            language: "go".to_string(),
-            line_start: 1,
-            line_end: 10,
-            signature: "func TestHandleRequest(t *testing.T)".to_string(),
-            body: String::new(),
-            metadata: BTreeMap::new(),
-            source: ExtractionSource::TreeSitter,
-        };
-        // Production function with same camelCase name (no underscores)
-        let prod_fn = make_fn_node("src/handler.rs", "HandleRequest", false);
-        let matching: Vec<&Node> = vec![&test_node, &prod_fn];
-
-        let mut result = EnrichmentResult::default();
-        LspEnricher::emit_tested_by_edges(&matching, &mut result);
-
-        let tested_by: Vec<_> = result.added_edges.iter()
-            .filter(|e| e.kind == EdgeKind::TestedBy)
-            .collect();
-        assert_eq!(tested_by.len(), 1,
-            "TestHandleRequest should match HandleRequest via case-insensitive substring");
     }
 
     // -----------------------------------------------------------------------

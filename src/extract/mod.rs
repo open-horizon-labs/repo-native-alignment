@@ -9,6 +9,7 @@
 
 pub mod api_link;
 pub mod manifest;
+pub mod naming_convention;
 pub mod bash;
 pub mod c;
 pub mod configs;
