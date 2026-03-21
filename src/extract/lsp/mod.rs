@@ -1562,10 +1562,15 @@ impl Enricher for LspEnricher {
     async fn enrich(&self, nodes: &[Node], _index: &GraphIndex, repo_root: &Path) -> Result<EnrichmentResult> {
         let mut result = EnrichmentResult::default();
 
-        // Filter to nodes matching this enricher's language
+        // Filter to nodes matching this enricher's language.
+        // Skip virtual crate nodes emitted by Pass 0: they have language="rust" but
+        // are structural topology nodes, not source symbols. Including them would send
+        // spurious LSP requests for Cargo.toml and create bogus edges on subsequent
+        // enrichment runs. Similarly skip diagnostic nodes (already filtered in Pass 1).
         let matching_nodes: Vec<&Node> = nodes
             .iter()
             .filter(|n| n.language == self.language)
+            .filter(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "crate"))
             .collect();
 
         let fn_count = matching_nodes.iter().filter(|n| n.id.kind == NodeKind::Function).count();
