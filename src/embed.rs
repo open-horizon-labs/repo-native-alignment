@@ -1508,9 +1508,12 @@ impl EmbeddingIndex {
         let mut search_results = Vec::new();
 
         // Hybrid/FTS results use `_score` (BM25 or RRF), vector uses `_distance`.
-        // Detect which column is present and normalize to a 0..1 score.
-        let has_score_col = batches.first()
-            .is_some_and(|b| b.column_by_name("_score").is_some());
+        // Detect which column is present by checking ANY batch — not just the first.
+        // The first batch may be skipped (missing required columns) when hybrid search
+        // with a pre-filter returns a partial schema, so checking only the first batch
+        // could misdetect the score column. (#400)
+        let has_score_col = batches.iter()
+            .any(|b| b.column_by_name("_score").is_some());
 
         for batch in &batches {
             // LanceDB hybrid search with a pre-filter (.only_if()) can return
