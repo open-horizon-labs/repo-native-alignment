@@ -37,6 +37,8 @@ fn edge_weight(kind: &EdgeKind) -> f64 {
         EdgeKind::TestedBy => 0.3,
         // Module hierarchy edges carry low signal (structural, not behavioral)
         EdgeKind::BelongsTo => 0.2,
+        // Re-export edges carry moderate signal (visibility propagation)
+        EdgeKind::ReExports => 0.3,
         // PR/outcome edges carry no architectural coupling signal
         EdgeKind::Evolves
         | EdgeKind::TopologyBoundary

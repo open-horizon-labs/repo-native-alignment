@@ -53,14 +53,20 @@ pub fn is_trait_impl_method(n: &Node) -> bool {
 
 /// Returns true if a node is a test function (by decorator or file path).
 ///
-/// Checks for `#[test]` in the decorators metadata, or falls back to
-/// [`is_test_file`] for path-based detection.
+/// Checks `metadata["is_test"]` first (set during extraction by #390),
+/// then falls back to the decorator string check (for nodes extracted before
+/// #390 was deployed), and finally to [`is_test_file`] for path-based detection.
 pub fn is_test_function(n: &Node) -> bool {
     if n.id.kind != NodeKind::Function {
         return false;
     }
-    // Check for #[test] decorator -- use word boundary matching to avoid
-    // false positives on decorators like "attestation"
+    // Fast path: is_test metadata set during extraction (#390).
+    if n.metadata.get("is_test").is_some_and(|v| v == "true") {
+        return true;
+    }
+    // Backward-compat fallback: check decorator string directly.
+    // Covers nodes extracted before #390 was deployed. Uses word-boundary
+    // matching to avoid false positives on decorators like "attestation".
     if n.metadata.get("decorators").is_some_and(|d| {
         d.split(|c: char| c == ',' || c.is_whitespace())
             .any(|token| token.trim() == "test" || token.trim() == "tokio::test")

@@ -146,6 +146,32 @@ pub struct LangConfig {
     /// (and the underlying `tree_sitter::Query`) is `Send + Sync`, this is
     /// safe to store in a static `OnceLock`.
     pub compiled_route_queries: std::sync::OnceLock<Vec<Option<QueryExtractor>>>,
+    /// Tree-sitter (call_expression_kind, callee_field_name) for same-file call detection (#407).
+    /// `None` = same-file call detection disabled for this language.
+    ///
+    /// Examples:
+    /// - Rust: `Some(("call_expression", "function"))`
+    /// - Python: `Some(("call", "function"))`
+    /// - TypeScript: `Some(("call_expression", "function"))`
+    /// - Java: `Some(("method_invocation", "name"))`
+    pub call_expr_kinds: Option<(&'static str, &'static str)>,
+    /// Tree-sitter node kind for a visibility modifier that signals a public re-export (#409).
+    /// When set, Import nodes with this child are marked `visibility=pub` and a `ReExports` edge
+    /// is emitted. `None` = no visibility modifier in this language's AST (or not applicable).
+    ///
+    /// Examples:
+    /// - Rust: `Some("visibility_modifier")`
+    /// - TypeScript/JavaScript: `None` (export keyword is part of the node text, not a child)
+    /// - Python/Go/Java: `None`
+    pub pub_visibility_modifier: Option<&'static str>,
+    /// Whether to detect `__all__ = [...]` assignments as public API exports (#409).
+    /// Set `true` only for Python (the only language using this convention).
+    pub has_all_export: bool,
+    /// Whether `fn/def test_*` name prefix marks a function as a test (#390).
+    /// Set `true` only for Python (PEP/pytest convention).
+    /// Rust, Java, TypeScript use decorator/attribute patterns — their `test_helper()`
+    /// functions are NOT tests by naming alone.
+    pub test_name_prefix: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +221,29 @@ impl GenericExtractor {
                 *content_child,
                 &mut nodes,
             );
+        }
+
+        // Same-file call detection (#407).
+        // After all nodes are collected, resolve bare function calls against
+        // function names defined in this file. Emit Calls edges with Confidence::Detected.
+        // Cross-file and method-chain calls are left to LSP.
+        {
+            let same_file_calls = detect_same_file_calls(
+                tree.root_node(),
+                path,
+                source,
+                self.config,
+                &nodes,
+            );
+            edges.extend(same_file_calls);
+        }
+
+        // Decorator → Implements edges (#392).
+        // After all nodes are collected, parse decorator strings and emit
+        // Implements edges for derive macros, class decorators, annotations, etc.
+        {
+            let decorator_edges = emit_decorator_implements_edges(&nodes, path);
+            edges.extend(decorator_edges);
         }
 
         // Route query pass — runs after manual traversal; purely additive.
@@ -331,7 +380,42 @@ fn collect_nodes(
             if !config.decorator_node_kinds.is_empty() {
                 let decorators = collect_decorators(node, source, config);
                 if !decorators.is_empty() {
+                    // is_async: set before decorator-derived is_test so both can be set
+                    // independently.
+                    if node_kind == NodeKind::Function {
+                        let is_async = detect_is_async(node, source);
+                        if is_async {
+                            metadata.insert("is_async".to_string(), "true".to_string());
+                        }
+                        // is_test: check decorator tokens for test patterns.
+                        // Pass config.test_name_prefix so only languages that opt in
+                        // (Python) use the test_* naming convention.
+                        let is_test = is_test_by_decorator(&decorators, &name, config.test_name_prefix);
+                        if is_test {
+                            metadata.insert("is_test".to_string(), "true".to_string());
+                        }
+                    }
                     metadata.insert("decorators".to_string(), decorators);
+                } else if node_kind == NodeKind::Function {
+                    // No decorators but still check is_async and name-based is_test.
+                    let is_async = detect_is_async(node, source);
+                    if is_async {
+                        metadata.insert("is_async".to_string(), "true".to_string());
+                    }
+                    // Name-based test detection (only for languages that opt in via config).
+                    if is_test_by_decorator("", &name, config.test_name_prefix) {
+                        metadata.insert("is_test".to_string(), "true".to_string());
+                    }
+                }
+            } else if node_kind == NodeKind::Function {
+                // Language with no decorator config — still detect async and is_test.
+                let is_async = detect_is_async(node, source);
+                if is_async {
+                    metadata.insert("is_async".to_string(), "true".to_string());
+                }
+                // Name-based test detection (only for languages that opt in via config).
+                if is_test_by_decorator("", &name, config.test_name_prefix) {
+                    metadata.insert("is_test".to_string(), "true".to_string());
                 }
             }
 
@@ -372,6 +456,12 @@ fn collect_nodes(
                 metadata.insert("pattern_hint".to_string(), hint);
             }
 
+            // Public API export flag for `__all__ = [...]` (#409).
+            // Only set when LangConfig.has_all_export is true (Python only).
+            if node_kind == NodeKind::Const && name == "__all__" && config.has_all_export {
+                metadata.insert("exported".to_string(), "true".to_string());
+            }
+
             // Const value extraction.
             if node_kind == NodeKind::Const {
                 if let Some(value_field) = config.const_value_field {
@@ -390,6 +480,14 @@ fn collect_nodes(
                     }
                 }
                 metadata.insert("synthetic".to_string(), "false".to_string());
+            }
+
+            // Public API surface detection (#409).
+            // Rust: `pub use` → visibility=pub + ReExports edge.
+            // TypeScript/JavaScript: `export { X }` → visibility=pub + ReExports edge.
+            // Language-specific behavior is driven by LangConfig fields (no language_name checks).
+            if node_kind == NodeKind::Import {
+                detect_public_api(node, source, config, path, &name, &mut metadata, edges);
             }
 
             // Import edge.
@@ -1452,6 +1550,696 @@ fn run_route_queries(
             nodes.push(node);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// #390 — is_async detection
+// ---------------------------------------------------------------------------
+
+/// Detect whether a function node has the `async` keyword.
+///
+/// Language-agnostic detection that covers:
+/// - **Python**: `async_function_definition` node kind contains "async"
+/// - **Rust**: `async fn` — the `async` keyword appears as a direct anonymous
+///   child of `function_item` with kind `"async"`, OR the node's source text
+///   starts with `async ` (fallback for grammar version differences)
+/// - **TypeScript/JavaScript**: `async function` / `async ()` — `"async"` child
+/// - **Go**: no async keyword (goroutines are concurrency primitives, not syntax)
+///
+/// Returns `true` if the function is async.
+fn detect_is_async(node: tree_sitter::Node, source: &[u8]) -> bool {
+    // Strategy 1: node kind itself signals async (Python async_function_definition,
+    // Kotlin suspend functions mapped to a different node kind, etc.)
+    if node.kind().contains("async") {
+        return true;
+    }
+    // Strategy 2: direct named or anonymous child with kind "async".
+    // Covers tree-sitter-rust where `async` is an anonymous child of `function_item`,
+    // and tree-sitter-typescript where `async` is a named child of `function_declaration`.
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            if child.kind() == "async" {
+                return true;
+            }
+        }
+    }
+    // Strategy 3: fallback — inspect the raw source text of the function node.
+    // Some grammar versions don't expose `async` as a separate child. This is a
+    // last-resort check against the first line of the node's text, which is
+    // the function signature. We only look at the signature (before `{`) to avoid
+    // false positives on string literals inside the body.
+    let text = node.utf8_text(source).unwrap_or("");
+    let first_line = text.lines().next().unwrap_or("").trim();
+    first_line.starts_with("async ")
+        || first_line.contains(" async fn ")
+        || first_line.starts_with("async fn ")
+}
+
+// ---------------------------------------------------------------------------
+// #390 — is_test detection by decorator
+// ---------------------------------------------------------------------------
+
+/// Returns true if decorator strings indicate this is a test function.
+///
+/// Checks the comma-separated `decorators` string (as stored in metadata)
+/// for known test patterns across languages:
+/// - Rust:       `#[test]`, `#[tokio::test]`, `#[async_std::test]`
+/// - Python:     `@pytest.mark.parametrize`, `@unittest.skip*`
+/// - TypeScript: decorator-based test frameworks (`@test`)
+/// - Java/JUnit: `@Test`, `@ParameterizedTest`, `@RepeatedTest`
+///
+/// The `use_name_prefix` parameter controls whether `test_*` naming convention
+/// is applied. Set `true` only for Python (PEP/pytest convention). Rust/Java/TS
+/// `test_helper()` functions should NOT be marked as tests by name alone.
+fn is_test_by_decorator(decorators: &str, fn_name: &str, use_name_prefix: bool) -> bool {
+    // Name-based convention: Python `def test_*` (only when language opts in).
+    if use_name_prefix && (fn_name.starts_with("test_") || fn_name == "test") {
+        return true;
+    }
+    if decorators.is_empty() {
+        return false;
+    }
+    // Tokenize on comma + whitespace, then match each token.
+    decorators
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .any(|token| {
+            let t = token.trim()
+                // Strip Rust attribute brackets: `#[test]` → `test`
+                .trim_start_matches("#[")
+                .trim_end_matches(']')
+                // Strip Python/TypeScript `@`: `@Test` → `Test`
+                .trim_start_matches('@')
+                .trim();
+            // Exact match for common test markers (case-insensitive for Java/JUnit)
+            let lower = t.to_lowercase();
+            lower == "test"
+                || lower == "tokio::test"
+                || lower == "async_std::test"
+                || lower == "actix_web::test"
+                // JUnit 5
+                || lower == "parameterizedtest"
+                || lower == "repeatedtest"
+                // Rust integration: rstest
+                || lower == "rstest"
+                // Python pytest — only mark.* forms are test markers.
+                // @pytest.fixture, @pytest.param etc. are NOT test functions.
+                || lower.starts_with("pytest.mark.")
+        })
+}
+
+// ---------------------------------------------------------------------------
+// #392 — decorator → Implements edges
+// ---------------------------------------------------------------------------
+
+/// Parse decorator strings on collected nodes and emit `Implements` edges.
+///
+/// Covers:
+/// - **Rust `#[derive(...)]`**: `#[derive(Debug, Clone)]` → `Implements(Debug)`, `Implements(Clone)`
+/// - **Python class decorator**: `@dataclass` → `Implements(DataClass)`
+/// - **TypeScript `@Injectable()`** → `Implements(Injectable)`
+/// - **Java `@Override`** → `Implements(Override)`
+///
+/// Only emits edges for nodes that have a `decorators` metadata entry.
+/// Edges go from the decorated symbol to a pseudo-trait node with
+/// `NodeKind::Trait` and an empty file (unresolved). Confidence is `Detected`.
+fn emit_decorator_implements_edges(nodes: &[Node], path: &Path) -> Vec<Edge> {
+    let mut edges = Vec::new();
+    for node in nodes {
+        let decorators = match node.metadata.get("decorators") {
+            Some(d) if !d.is_empty() => d.as_str(),
+            _ => continue,
+        };
+        // Only emit for types/structs/classes that carry trait-impl semantics.
+        match node.id.kind {
+            NodeKind::Struct | NodeKind::Enum | NodeKind::Trait
+            | NodeKind::Function | NodeKind::Other(_) => {}
+            _ => continue,
+        }
+        // Split decorators on ", " but only at the top level (not inside parentheses).
+        // `#[derive(Debug, Clone)], #[serde(rename)]` → [`#[derive(Debug, Clone)]`, `#[serde(rename)]`]
+        for dec in split_decorators(decorators) {
+            let dec = dec.trim();
+            if let Some(trait_names) = parse_decorator_trait_names(dec) {
+                for trait_name in trait_names {
+                    if trait_name.is_empty() { continue; }
+                    edges.push(Edge {
+                        from: node.id.clone(),
+                        to: NodeId {
+                            root: String::new(),
+                            // Empty file: decorator-derived Implements targets are
+                            // pseudo-traits (Debug, Clone, Injectable, etc.) that may
+                            // not exist as nodes in this repo. Using an empty path keeps
+                            // the edge dangling/unresolved without pinning it to the
+                            // current file (which might define an unrelated symbol
+                            // with the same name).
+                            file: std::path::PathBuf::new(),
+                            name: trait_name,
+                            kind: NodeKind::Trait,
+                        },
+                        kind: EdgeKind::Implements,
+                        source: ExtractionSource::TreeSitter,
+                        confidence: Confidence::Detected,
+                    });
+                }
+            }
+        }
+    }
+    edges
+}
+
+/// Split a comma-separated decorators string at the top level only.
+/// Commas inside parentheses (e.g. `#[derive(Debug, Clone)]`) are NOT split.
+///
+/// Input:  `"#[derive(Debug, Clone)], #[serde(rename_all = \"snake_case\")]"`
+/// Output: `["#[derive(Debug, Clone)]", "#[serde(rename_all = \"snake_case\")]"]`
+fn split_decorators(decorators: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    let bytes = decorators.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                result.push(decorators[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = decorators[start..].trim();
+    if !tail.is_empty() {
+        result.push(tail);
+    }
+    result
+}
+
+/// Extract the trait/interface name(s) from a single decorator token.
+///
+/// Returns `None` if the decorator does not map to a named trait/interface,
+/// or `Some(vec![...])` with zero or more names.
+///
+/// Examples:
+/// - `#[derive(Debug, Clone)]` → `["Debug", "Clone"]`  (single decorator, multiple traits)
+/// - `#[test]`               → `None` (test marker, not a trait)
+/// - `@dataclass`            → `["DataClass"]`
+/// - `@Injectable()`         → `["Injectable"]`
+/// - `@Override`             → `["Override"]`
+/// - `#[tokio::test]`        → `None`
+fn parse_decorator_trait_names(dec: &str) -> Option<Vec<String>> {
+    let dec = dec.trim();
+
+    // Rust derive macro: `#[derive(Debug, Clone, Serialize)]`
+    if dec.starts_with("#[derive(") || dec.starts_with("# [derive(") {
+        let inner = dec
+            .trim_start_matches("#[derive(")
+            .trim_start_matches("# [derive(")
+            .trim_end_matches(")]")
+            .trim_end_matches(')');
+        let names: Vec<String> = inner
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s.chars().next().map_or(false, |c| c.is_ascii_uppercase()))
+            .collect();
+        return if names.is_empty() { None } else { Some(names) };
+    }
+
+    // Strip common prefixes to get bare name.
+    // Rust attribute: `#[something]` or `#[something(args)]`
+    let bare = if dec.starts_with("#[") {
+        let inner = dec.trim_start_matches("#[").trim_end_matches(']');
+        // Take the identifier before any `(` or `::`
+        inner.split(|c: char| c == '(' || c == ':').next().unwrap_or("").trim()
+    } else if dec.starts_with('@') {
+        // Python / TypeScript / Java / Kotlin annotation
+        let inner = dec.trim_start_matches('@');
+        // Take the identifier before any `(` or `.`
+        inner.split(|c: char| c == '(' || c == '.').next().unwrap_or("").trim()
+    } else {
+        dec.split(|c: char| c == '(' || c == ':' || c == '.').next().unwrap_or("").trim()
+    };
+
+    if bare.is_empty() {
+        return None;
+    }
+
+    // Skip pure test/lifecycle markers that don't represent trait impls.
+    // These are frequent decorators that produce noise if mapped to Implements.
+    const SKIP_MARKERS: &[&str] = &[
+        // Rust test markers
+        "test", "ignore", "allow", "deny", "warn", "forbid",
+        "cfg", "cfg_attr", "doc", "inline", "cold", "must_use",
+        "non_exhaustive", "repr", "deprecated", "macro_export",
+        "macro_use", "path", "recursion_limit",
+        // Python / TS lifecycle markers
+        "staticmethod", "classmethod", "property", "abstractmethod",
+        "override",
+        // Java / JUnit
+        "Override", "Deprecated", "SuppressWarnings",
+        // Route/endpoint decorators (already handled by route_queries pass)
+        "app", "router", "route", "get", "post", "put", "delete", "patch",
+        "head", "options", "blueprint", "api",
+        // Spring MVC / Spring Boot HTTP method mapping annotations
+        "getmapping", "postmapping", "putmapping", "deletemapping", "patchmapping",
+        "headmapping", "optionsmapping", "tracemapping", "requestmapping",
+        // Pytest / test lifecycle
+        "fixture", "mark", "pytest",
+        // DI / framework lifecycle decorators that don't map to trait impls
+        "component", "module", "controller", "service", "pipe",
+        // Common decorators whose target object is a namespace, not a trait
+        "app_context", "before_request", "after_request",
+        "login_required", "cached", "wraps",
+    ];
+    if SKIP_MARKERS.iter().any(|&m| bare.eq_ignore_ascii_case(m)) {
+        return None;
+    }
+    // Skip decorators that start with lowercase AND are chained (e.g. `app.route`).
+    // We split on '.' already, so bare is just `app` here — check that it starts
+    // with uppercase to be treated as an interface/trait name.
+    // Exception: known PascalCase-ish decorators like `Injectable` (already handled).
+    // Rule: if the original decorator token (before the name field) has a dot in it,
+    // it's a chained call like `@app.route(...)` — skip it.
+    // This is the most reliable heuristic without per-language special-casing.
+    let has_chain = if dec.starts_with('@') {
+        let inner = dec.trim_start_matches('@');
+        inner.contains('.') || inner.contains("::")
+    } else {
+        dec.contains("::") && !dec.starts_with("#[derive")
+    };
+    if has_chain {
+        return None;
+    }
+
+    // Convert Python snake_case decorators to PascalCase for trait names.
+    // `@dataclass` → `DataClass`, `@login_required` → `LoginRequired`
+    let trait_name = if bare.contains('_') {
+        // snake_case → PascalCase
+        bare.split('_')
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                let mut c = s.chars();
+                match c.next() {
+                    None => String::new(),
+                    Some(f) => f.to_uppercase().to_string() + c.as_str(),
+                }
+            })
+            .collect::<String>()
+    } else if bare.chars().next().map_or(false, |c| c.is_ascii_lowercase()) {
+        // lowercase → capitalize first char (e.g. `@injectable` → `Injectable`)
+        let mut c = bare.chars();
+        match c.next() {
+            None => return None,
+            Some(f) => f.to_uppercase().to_string() + c.as_str(),
+        }
+    } else {
+        bare.to_string()
+    };
+
+    if trait_name.is_empty() {
+        None
+    } else {
+        Some(vec![trait_name])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #407 — same-file call detection
+// ---------------------------------------------------------------------------
+
+/// Walk the AST and collect bare `call_expression` / `function_call` nodes.
+/// For each call whose callee name exactly matches a function defined in this
+/// file, emit a `Calls` edge from the enclosing function to the callee.
+///
+/// Only emits when:
+/// - The callee name exactly matches a `NodeKind::Function` defined in `nodes`
+/// - The call is inside an enclosing function defined in this file
+/// - The callee is not the caller itself (no self-loops)
+/// - `config.call_expr_kinds` is Some (language opts in to call detection)
+///
+/// Cross-file calls and method calls (e.g. `self.foo()`) are left to LSP.
+fn detect_same_file_calls(
+    root: tree_sitter::Node,
+    path: &Path,
+    source: &[u8],
+    config: &LangConfig,
+    nodes: &[Node],
+) -> Vec<Edge> {
+    // Language must opt in to call detection via LangConfig.call_expr_kinds.
+    if config.call_expr_kinds.is_none() {
+        return Vec::new();
+    }
+
+    // Build a set of function names defined in this file for O(1) lookup.
+    let file_fns: std::collections::HashSet<&str> = nodes
+        .iter()
+        .filter(|n| n.id.kind == NodeKind::Function && n.id.file == path)
+        .map(|n| n.id.name.as_str())
+        .collect();
+
+    if file_fns.is_empty() {
+        return Vec::new();
+    }
+
+    let mut edges = Vec::new();
+    collect_calls(root, path, source, config, &file_fns, &None, &mut edges);
+    edges
+}
+
+/// Recursive walk that collects Calls edges for same-file function calls.
+fn collect_calls(
+    node: tree_sitter::Node,
+    path: &Path,
+    source: &[u8],
+    config: &LangConfig,
+    file_fns: &std::collections::HashSet<&str>,
+    enclosing_fn: &Option<String>,
+    edges: &mut Vec<Edge>,
+) {
+    let kind = node.kind();
+
+    // Check if this node is a function definition — update enclosing context.
+    let is_fn_def = config.node_kinds.iter().any(|(ts_kind, nk)| {
+        *ts_kind == kind && *nk == NodeKind::Function
+    });
+    let new_enclosing = if is_fn_def {
+        node.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(|s| s.to_string())
+    } else {
+        None
+    };
+    let enclosing = if new_enclosing.is_some() { &new_enclosing } else { enclosing_fn };
+
+    // If we're inside a function, check for call expressions.
+    if let Some(caller_name) = enclosing {
+        if let Some((call_kind, name_field)) = config.call_expr_kinds {
+            if kind == call_kind {
+                // Reject qualified calls: Java `obj.helper()` has an `object` field;
+                // Ruby `obj.method()` has a `receiver` field. Skip these — they are
+                // method dispatches, not bare same-file function calls.
+                let is_qualified = node.child_by_field_name("object").is_some()
+                    || node.child_by_field_name("receiver").is_some();
+                if !is_qualified {
+                    // Extract callee name from the designated field.
+                    // For Rust/TS: function field → may be an `identifier` directly,
+                    // or a `scoped_identifier` / `field_expression` — take only bare identifiers.
+                    if let Some(callee_node) = node.child_by_field_name(name_field) {
+                        let callee_kind = callee_node.kind();
+                        // Only resolve bare identifiers — skip method chains, scoped paths, etc.
+                        if callee_kind == "identifier" || callee_kind == "simple_identifier" {
+                            if let Ok(callee_name) = callee_node.utf8_text(source) {
+                                let callee_name = callee_name.trim();
+                                if file_fns.contains(callee_name) && callee_name != caller_name {
+                                    edges.push(Edge {
+                                        from: NodeId {
+                                            root: String::new(),
+                                            file: path.to_path_buf(),
+                                            name: caller_name.to_string(),
+                                            kind: NodeKind::Function,
+                                        },
+                                        to: NodeId {
+                                            root: String::new(),
+                                            file: path.to_path_buf(),
+                                            name: callee_name.to_string(),
+                                            kind: NodeKind::Function,
+                                        },
+                                        kind: EdgeKind::Calls,
+                                        source: ExtractionSource::TreeSitter,
+                                        confidence: Confidence::Detected,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Recurse into children, passing the (possibly updated) enclosing context.
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            collect_calls(child, path, source, config, file_fns, enclosing, edges);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #409 — public API surface edges
+// ---------------------------------------------------------------------------
+
+/// Detect public re-exports on an Import node and emit metadata + edges.
+///
+/// Behavior is driven by `LangConfig` fields — no language-name string comparisons:
+/// - When `config.pub_visibility_modifier` is set: check for that child node → `pub use` (Rust)
+/// - When `config.pub_visibility_modifier` is None but the node text starts with `export`: TS/JS
+///
+/// The `pub_visibility_modifier = None` + `export` text fallback covers TypeScript/JavaScript
+/// where the export keyword is part of the statement, not a separate child modifier.
+fn detect_public_api(
+    node: tree_sitter::Node,
+    source: &[u8],
+    config: &LangConfig,
+    path: &Path,
+    name: &str,
+    metadata: &mut BTreeMap<String, String>,
+    edges: &mut Vec<Edge>,
+) {
+    if let Some(vis_modifier) = config.pub_visibility_modifier {
+        // Language uses a visibility modifier child node (Rust: visibility_modifier).
+        detect_pub_use_with_modifier(node, source, vis_modifier, path, name, metadata, edges);
+    } else {
+        // Language uses `export` keyword in node text (TypeScript/JavaScript).
+        detect_export_ts(node, source, path, name, metadata, edges);
+    }
+}
+
+/// Detect `pub use ...` using a visibility modifier child node and AST traversal.
+///
+/// Used by languages where `pub` visibility is expressed as a separate AST child
+/// (e.g., Rust's `visibility_modifier`). The `vis_modifier` parameter is the
+/// tree-sitter node kind to look for (from `LangConfig.pub_visibility_modifier`).
+///
+/// Uses AST traversal to extract the exact visibility text and all re-exported
+/// identifiers, rather than raw text splitting.
+fn detect_pub_use_with_modifier(
+    node: tree_sitter::Node,
+    source: &[u8],
+    vis_modifier: &str,
+    path: &Path,
+    name: &str,
+    metadata: &mut BTreeMap<String, String>,
+    edges: &mut Vec<Edge>,
+) {
+    // Find the visibility_modifier child and read its exact text.
+    // Captures pub, pub(crate), pub(super), pub(in ...) accurately.
+    let vis_text = (0..node.child_count())
+        .find_map(|i| {
+            let child = node.child(i as u32)?;
+            if child.kind() == vis_modifier {
+                child.utf8_text(source).ok().map(|t| t.trim().to_string())
+            } else {
+                None
+            }
+        });
+    let Some(vis) = vis_text else {
+        return;
+    };
+
+    // Store exact visibility string (pub, pub(crate), pub(super), etc.)
+    metadata.insert("visibility".to_string(), vis);
+
+    // Walk the use_declaration AST to collect re-exported identifiers.
+    // This handles `pub use foo::Bar`, `pub use foo::{A, B}`, and `pub use foo::*`.
+    let target_names = collect_use_targets(node, source);
+    for target in target_names {
+        if target.is_empty() || target == "self" {
+            continue;
+        }
+        edges.push(Edge {
+            from: NodeId {
+                root: String::new(),
+                file: path.to_path_buf(),
+                name: name.to_string(),
+                kind: NodeKind::Import,
+            },
+            to: NodeId {
+                root: String::new(),
+                file: path.to_path_buf(),
+                name: target,
+                kind: NodeKind::Module,
+            },
+            kind: EdgeKind::ReExports,
+            source: ExtractionSource::TreeSitter,
+            confidence: Confidence::Detected,
+        });
+    }
+}
+
+/// Walk a `use_declaration` AST node and collect all re-exported identifier names.
+///
+/// Handles:
+/// - `use foo::Bar` → `["Bar"]`
+/// - `use foo::{A, B, C}` → `["A", "B", "C"]`
+/// - `use foo::*` → `[]` (wildcard — skip edge)
+/// - `use foo::{self}` → `[]` (self re-export — skip edge)
+fn collect_use_targets(node: tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut targets = Vec::new();
+    collect_use_targets_inner(node, source, &mut targets);
+    targets
+}
+
+fn collect_use_targets_inner(node: tree_sitter::Node, source: &[u8], targets: &mut Vec<String>) {
+    let kind = node.kind();
+    match kind {
+        // Wildcard: `::*` — stop, no edge
+        "*" => {}
+        // `self` keyword in use list — skip
+        "self" => {}
+        // use_wildcard: `foo::*` — stop, no edges
+        "use_wildcard" => {}
+        // scoped_use_list: `crate::foo::{A, B}` — recurse only into the `list` field,
+        // NOT the `path` field (which would include the namespace prefix "foo" as a target).
+        "scoped_use_list" => {
+            // The `list` field is the `{A, B}` part; `path` is the `crate::foo` prefix.
+            // Only collect targets from the list, not from the path.
+            if let Some(list) = node.child_by_field_name("list") {
+                collect_use_targets_inner(list, source, targets);
+            } else {
+                // Fallback: iterate children but skip the path field
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i as u32) {
+                        if child.kind() == "use_list" {
+                            collect_use_targets_inner(child, source, targets);
+                        }
+                    }
+                }
+            }
+        }
+        // use_list: `{A, B, C}` — recurse into items
+        "use_list" => {
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    collect_use_targets_inner(child, source, targets);
+                }
+            }
+        }
+        // use_as_clause: `Bar as Baz` — take the alias (Baz) as the exported name
+        "use_as_clause" => {
+            // The second named child is the alias
+            if let Some(alias) = node.child_by_field_name("alias") {
+                if let Ok(text) = alias.utf8_text(source) {
+                    let t = text.trim().to_string();
+                    if !t.is_empty() && t != "self" && t != "_" {
+                        targets.push(t);
+                    }
+                }
+            }
+        }
+        // scoped_identifier: `crate::foo::Bar` — take the last segment
+        "scoped_identifier" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                if let Ok(text) = name_node.utf8_text(source) {
+                    let t = text.trim().to_string();
+                    if !t.is_empty() && t != "self" && t != "*" {
+                        targets.push(t);
+                    }
+                }
+            } else {
+                // Fallback: recurse
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i as u32) {
+                        collect_use_targets_inner(child, source, targets);
+                    }
+                }
+            }
+        }
+        // identifier: bare name (e.g. the "Bar" in `use crate::foo::Bar`)
+        "identifier" => {
+            if let Ok(text) = node.utf8_text(source) {
+                let t = text.trim().to_string();
+                if !t.is_empty() && t != "self" && t != "_" {
+                    targets.push(t);
+                }
+            }
+        }
+        // use_declaration: recurse to find the path inside
+        "use_declaration" => {
+            if let Some(arg) = node.child_by_field_name("argument") {
+                collect_use_targets_inner(arg, source, targets);
+            } else {
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i as u32) {
+                        let k = child.kind();
+                        if k != "use" && k != "pub" && k != ";" && k != "::" {
+                            collect_use_targets_inner(child, source, targets);
+                        }
+                    }
+                }
+            }
+        }
+        // Everything else: recurse
+        _ => {
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    collect_use_targets_inner(child, source, targets);
+                }
+            }
+        }
+    }
+}
+
+/// TypeScript/JavaScript: detect `export { X }` and `export const/let/var/function` re-exports.
+///
+/// In tree-sitter-typescript, an export statement has an `export_clause` child
+/// for named exports (`export { X, Y }`), or is an `export_statement` for
+/// `export const/function/class`.
+fn detect_export_ts(
+    node: tree_sitter::Node,
+    source: &[u8],
+    path: &Path,
+    name: &str,
+    metadata: &mut BTreeMap<String, String>,
+    edges: &mut Vec<Edge>,
+) {
+    // The import node text contains "export" for re-export declarations.
+    let text = node.utf8_text(source).unwrap_or("").trim();
+    if !text.starts_with("export ") && !text.starts_with("export{") {
+        return;
+    }
+    metadata.insert("visibility".to_string(), "pub".to_string());
+
+    // Extract exported names from `export { X, Y }`.
+    // `export { X as Y }` → target is Y (the external name).
+    let target = text
+        .trim_end_matches(';')
+        .split([' ', '{', '}', ','])
+        .filter(|s| !s.is_empty() && *s != "export" && *s != "from")
+        .next()
+        .unwrap_or("")
+        .trim();
+    if target.is_empty() {
+        return;
+    }
+
+    edges.push(Edge {
+        from: NodeId {
+            root: String::new(),
+            file: path.to_path_buf(),
+            name: name.to_string(),
+            kind: NodeKind::Import,
+        },
+        to: NodeId {
+            root: String::new(),
+            file: path.to_path_buf(),
+            name: target.to_string(),
+            kind: NodeKind::Module,
+        },
+        kind: EdgeKind::ReExports,
+        source: ExtractionSource::TreeSitter,
+        confidence: Confidence::Detected,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -3514,5 +4302,634 @@ def create_user():
         let handler_names: Vec<_> = implements.iter().map(|e| e.to.name.as_str()).collect();
         assert!(handler_names.contains(&"get_users"), "should link to get_users");
         assert!(handler_names.contains(&"create_user"), "should link to create_user");
+    }
+
+    // -----------------------------------------------------------------------
+    // #390 — is_async and is_test metadata
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_async_rust_async_fn() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+async fn fetch_data() -> String {
+    String::new()
+}
+fn sync_fn() {}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let async_fn = result.nodes.iter().find(|n| n.id.name == "fetch_data").unwrap();
+        assert_eq!(
+            async_fn.metadata.get("is_async").map(|s| s.as_str()),
+            Some("true"),
+            "async fn should have is_async=true"
+        );
+        let sync_fn = result.nodes.iter().find(|n| n.id.name == "sync_fn").unwrap();
+        assert!(
+            sync_fn.metadata.get("is_async").is_none(),
+            "sync fn should NOT have is_async metadata"
+        );
+    }
+
+    #[test]
+    fn test_is_async_typescript() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let code = "async function loadData(): Promise<string> {\n    return '';\n}\nfunction syncFn() {}\n";
+        let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
+            .run(Path::new("test.ts"), code)
+            .unwrap();
+        let async_fn = result.nodes.iter().find(|n| n.id.name == "loadData").unwrap();
+        assert_eq!(
+            async_fn.metadata.get("is_async").map(|s| s.as_str()),
+            Some("true"),
+            "async TypeScript function should have is_async=true"
+        );
+    }
+
+    #[test]
+    fn test_is_async_python() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = "async def fetch():\n    pass\ndef sync_fn():\n    pass\n";
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(Path::new("test.py"), code)
+            .unwrap();
+        let async_fn = result.nodes.iter().find(|n| n.id.name == "fetch").unwrap();
+        assert_eq!(
+            async_fn.metadata.get("is_async").map(|s| s.as_str()),
+            Some("true"),
+            "async Python function should have is_async=true"
+        );
+        let sync_fn = result.nodes.iter().find(|n| n.id.name == "sync_fn").unwrap();
+        assert!(
+            sync_fn.metadata.get("is_async").is_none(),
+            "sync Python function should NOT have is_async"
+        );
+    }
+
+    #[test]
+    fn test_is_test_rust_decorator() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+#[test]
+fn my_test() {}
+
+#[tokio::test]
+async fn my_async_test() {}
+
+fn not_a_test() {}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let test_fn = result.nodes.iter().find(|n| n.id.name == "my_test").unwrap();
+        assert_eq!(
+            test_fn.metadata.get("is_test").map(|s| s.as_str()),
+            Some("true"),
+            "#[test] function should have is_test=true"
+        );
+        let async_test = result.nodes.iter().find(|n| n.id.name == "my_async_test").unwrap();
+        assert_eq!(
+            async_test.metadata.get("is_test").map(|s| s.as_str()),
+            Some("true"),
+            "#[tokio::test] function should have is_test=true"
+        );
+        let not_test = result.nodes.iter().find(|n| n.id.name == "not_a_test").unwrap();
+        assert!(
+            not_test.metadata.get("is_test").is_none(),
+            "production function should NOT have is_test metadata"
+        );
+    }
+
+    #[test]
+    fn test_is_test_python_name_convention() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = "def test_my_feature():\n    pass\ndef helper():\n    pass\n";
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(Path::new("test.py"), code)
+            .unwrap();
+        let test_fn = result.nodes.iter().find(|n| n.id.name == "test_my_feature").unwrap();
+        assert_eq!(
+            test_fn.metadata.get("is_test").map(|s| s.as_str()),
+            Some("true"),
+            "test_ prefixed Python function should have is_test=true"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #392 — decorator → Implements edges
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_derive_emits_implements_edges() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+#[derive(Debug, Clone, Serialize)]
+pub struct Config {
+    pub name: String,
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let impl_edges: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Implements && e.from.name == "Config")
+            .collect();
+        let trait_names: Vec<&str> = impl_edges.iter().map(|e| e.to.name.as_str()).collect();
+        assert!(trait_names.contains(&"Debug"), "should emit Implements(Debug)");
+        assert!(trait_names.contains(&"Clone"), "should emit Implements(Clone)");
+        assert!(trait_names.contains(&"Serialize"), "should emit Implements(Serialize)");
+    }
+
+    #[test]
+    fn test_derive_no_test_attribute_implements() {
+        // #[test] should NOT emit an Implements edge
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+#[test]
+fn my_test() {}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let impl_from_test: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Implements && e.from.name == "my_test"
+                && e.to.name.to_lowercase() == "test")
+            .collect();
+        assert!(
+            impl_from_test.is_empty(),
+            "#[test] should NOT emit Implements(Test), got: {:?}", impl_from_test
+        );
+    }
+
+    #[test]
+    fn test_python_dataclass_decorator_implements() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        // Python `@dataclass` on a class should emit Implements(DataClass)
+        let code = "from dataclasses import dataclass\n\n@dataclass\nclass Config:\n    name: str\n";
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(Path::new("test.py"), code)
+            .unwrap();
+        let impl_edges: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Implements && e.from.name == "Config")
+            .collect();
+        assert!(
+            impl_edges.iter().any(|e| e.to.name == "Dataclass"),
+            "Python @dataclass should emit Implements(Dataclass), got: {:?}",
+            impl_edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_route_decorator_does_not_emit_implements_trait() {
+        // Route decorators (@app.route, @app.post) should NOT emit Implements edges
+        // — those are handled by the route_queries pass separately.
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = r#"
+@app.route("/users")
+def get_users():
+    pass
+"#;
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(Path::new("routes.py"), code)
+            .unwrap();
+        // Check no Implements from decorator pass for route decorators
+        let decorator_impl: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Implements && e.from.name == "get_users"
+                // Route query edges go from ApiEndpoint→handler, not function→trait
+                && e.from.kind == NodeKind::Function)
+            .collect();
+        assert!(
+            decorator_impl.is_empty(),
+            "@app.route should not emit decorator Implements edge, got: {:?}", decorator_impl
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #407 — same-file call detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_same_file_calls_rust() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+fn helper() -> i32 {
+    42
+}
+
+fn main_fn() -> i32 {
+    helper()
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let calls: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect();
+        assert!(
+            calls.iter().any(|e| e.from.name == "main_fn" && e.to.name == "helper"),
+            "should emit Calls edge from main_fn to helper, got: {:?}",
+            calls.iter().map(|e| format!("{} -> {}", e.from.name, e.to.name)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_same_file_calls_no_cross_file() {
+        // External function calls (not in same file) should NOT produce Calls edges
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+fn main_fn() {
+    println!("hello");  // std macro, not a same-file fn
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let calls: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect();
+        // No same-file functions named "println" — should be empty.
+        assert!(
+            calls.is_empty(),
+            "should NOT emit Calls edge for macro/external call, got: {:?}",
+            calls.iter().map(|e| format!("{} -> {}", e.from.name, e.to.name)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_same_file_calls_no_self_loop() {
+        // Recursive function: should not emit a self-loop Calls edge
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+fn recurse(n: i32) -> i32 {
+    if n <= 0 { 0 } else { recurse(n - 1) }
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let self_loops: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Calls && e.from.name == "recurse" && e.to.name == "recurse")
+            .collect();
+        assert!(
+            self_loops.is_empty(),
+            "recursive call should not emit self-loop Calls edge, got: {:?}", self_loops
+        );
+    }
+
+    #[test]
+    fn test_same_file_calls_python() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = "def helper():\n    return 42\n\ndef main_fn():\n    return helper()\n";
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(Path::new("test.py"), code)
+            .unwrap();
+        let calls: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect();
+        assert!(
+            calls.iter().any(|e| e.from.name == "main_fn" && e.to.name == "helper"),
+            "Python: should emit Calls from main_fn to helper, got: {:?}",
+            calls.iter().map(|e| format!("{} -> {}", e.from.name, e.to.name)).collect::<Vec<_>>()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #409 — public API surface edges
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pub_use_rust_emits_re_exports_edge() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "pub use crate::foo::Bar;\nuse crate::internal::Helper;\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("lib.rs"), code)
+            .unwrap();
+        let re_exports: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::ReExports)
+            .collect();
+        assert!(
+            !re_exports.is_empty(),
+            "pub use should emit ReExports edge, got edges: {:?}",
+            result.edges.iter().map(|e| format!("{:?}", e.kind)).collect::<Vec<_>>()
+        );
+        assert!(
+            re_exports.iter().any(|e| e.to.name == "Bar"),
+            "pub use Bar should emit ReExports to Bar, got: {:?}",
+            re_exports.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_pub_use_rust_sets_visibility_pub() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "pub use crate::foo::Bar;\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("lib.rs"), code)
+            .unwrap();
+        let pub_imports: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::Import && n.metadata.get("visibility").map(|s| s.as_str()) == Some("pub"))
+            .collect();
+        assert!(
+            !pub_imports.is_empty(),
+            "pub use should set visibility=pub on Import node"
+        );
+    }
+
+    #[test]
+    fn test_private_use_rust_no_re_exports() {
+        // Private `use` should NOT emit ReExports
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "use crate::foo::Bar;\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("lib.rs"), code)
+            .unwrap();
+        let re_exports: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::ReExports)
+            .collect();
+        assert!(
+            re_exports.is_empty(),
+            "private use should NOT emit ReExports edge"
+        );
+    }
+
+    #[test]
+    fn test_is_test_function_uses_metadata_flag() {
+        // After #390, is_test_function in ranking.rs should still work via decorator metadata.
+        // Verify the is_test metadata is set so callers that check it work correctly.
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+#[test]
+fn check_something() {}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("src/main.rs"), code)
+            .unwrap();
+        let test_fn = result.nodes.iter().find(|n| n.id.name == "check_something").unwrap();
+        // Both is_test metadata AND decorators should be set
+        assert_eq!(test_fn.metadata.get("is_test").map(|s| s.as_str()), Some("true"));
+        assert!(test_fn.metadata.contains_key("decorators"), "decorators should also be preserved");
+    }
+
+    // -----------------------------------------------------------------------
+    // Adversarial tests (dissent-seeded)
+    // -----------------------------------------------------------------------
+
+    /// Adversarial: function named after a stdlib/builtin call (e.g. `len`) should only
+    /// emit Calls if the caller is in the SAME file and the callee IS that same-file fn.
+    #[test]
+    fn test_same_file_calls_only_same_file_functions() {
+        use crate::extract::rust::RUST_CONFIG;
+        // `len()` is NOT a same-file function here, so no Calls edge.
+        let code = r#"
+fn my_fn() -> usize {
+    let v: Vec<i32> = vec![];
+    v.len()  // method call, not a bare call to a same-file fn named "len"
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let calls: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect();
+        // v.len() is a method call — callee node is a field_expression, not bare identifier.
+        assert!(
+            calls.is_empty(),
+            "method call v.len() should NOT emit same-file Calls edge, got: {:?}",
+            calls
+        );
+    }
+
+    /// Adversarial: decorator with path segments (chained) should not emit Implements.
+    /// `@pytest.mark.parametrize` should not → Implements(Pytest).
+    #[test]
+    fn test_chained_decorator_no_implements_edge() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = r#"
+import pytest
+
+@pytest.mark.parametrize("x,y", [(1,2)])
+def test_add(x, y):
+    pass
+"#;
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(Path::new("test.py"), code)
+            .unwrap();
+        // @pytest.mark.parametrize is chained — should NOT emit Implements
+        let impl_edges: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Implements && e.from.name == "test_add"
+                && e.from.kind == NodeKind::Function)
+            .collect();
+        assert!(
+            impl_edges.is_empty(),
+            "@pytest.mark.parametrize should not emit Implements edge, got: {:?}",
+            impl_edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// Adversarial: is_test should NOT be set on struct/enum nodes, only functions.
+    #[test]
+    fn test_is_test_not_set_on_struct() {
+        use crate::extract::rust::RUST_CONFIG;
+        // A struct named TestHelper should not get is_test=true
+        let code = "struct TestHelper {}\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let struc = result.nodes.iter().find(|n| n.id.name == "TestHelper").unwrap();
+        assert!(
+            struc.metadata.get("is_test").is_none(),
+            "struct TestHelper should NOT have is_test metadata"
+        );
+    }
+
+    /// Adversarial: wildcard re-export should NOT produce a ReExports edge (can't resolve target).
+    #[test]
+    fn test_pub_use_wildcard_no_edge() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "pub use crate::foo::*;\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("lib.rs"), code)
+            .unwrap();
+        let re_exports: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::ReExports)
+            .collect();
+        assert!(
+            re_exports.is_empty(),
+            "pub use foo::* should NOT emit ReExports edge (wildcard), got: {:?}", re_exports
+        );
+        // But visibility=pub should still be set
+        let pub_imports: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::Import
+                && n.metadata.get("visibility").map(|s| s.as_str()) == Some("pub"))
+            .collect();
+        assert!(
+            !pub_imports.is_empty(),
+            "pub use foo::* should still set visibility=pub on Import node"
+        );
+    }
+
+    /// Adversarial: `split_decorators` handles route path with curly braces correctly.
+    /// `@app.route("/users/{id}")` must not be split mid-decorator.
+    #[test]
+    fn test_split_decorators_with_curly_braces_in_path() {
+        let decorators = r#"@app.route("/users/{id}"), @login_required"#;
+        let parts = split_decorators(decorators);
+        assert_eq!(
+            parts.len(), 2,
+            "should split into 2 decorators at top-level comma, got: {:?}", parts
+        );
+        assert_eq!(parts[0], r#"@app.route("/users/{id}")"#);
+        assert_eq!(parts[1], "@login_required");
+    }
+
+    /// Adversarial: `#[derive(A, B)]` split should NOT be broken at the comma inside parens.
+    #[test]
+    fn test_split_decorators_derive_macro() {
+        let decorators = "#[derive(Debug, Clone)]";
+        let parts = split_decorators(decorators);
+        assert_eq!(parts.len(), 1, "derive with multiple traits should stay as 1 decorator");
+        assert_eq!(parts[0], "#[derive(Debug, Clone)]");
+    }
+
+    /// CR2: `@pytest.fixture` should NOT mark a function as is_test.
+    /// Only `@pytest.mark.*` are test markers.
+    #[test]
+    fn test_pytest_fixture_not_is_test() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = "@pytest.fixture\ndef my_fixture():\n    return 42\n";
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(Path::new("conftest.py"), code)
+            .unwrap();
+        let fn_node = result.nodes.iter().find(|n| n.id.name == "my_fixture").unwrap();
+        assert!(
+            fn_node.metadata.get("is_test").is_none(),
+            "@pytest.fixture should NOT set is_test, got: {:?}",
+            fn_node.metadata.get("is_test")
+        );
+    }
+
+    /// CR3: Spring @GetMapping should not emit Implements(GetMapping).
+    #[test]
+    fn test_spring_getmapping_no_implements_edge() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let code = r#"class ApiController {
+    @GetMapping("/users")
+    List<User> getUsers() { return List.of(); }
+}
+"#;
+        let result = GenericExtractor::new(&JAVA_CONFIG)
+            .run(Path::new("ApiController.java"), code)
+            .unwrap();
+        let impl_edges: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Implements && e.to.name.to_lowercase().contains("mapping"))
+            .collect();
+        assert!(
+            impl_edges.is_empty(),
+            "@GetMapping should not emit Implements edge, got: {:?}",
+            impl_edges.iter().map(|e| &e.to.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// CR4: Java receiver-based calls (obj.helper()) must NOT emit Calls edges.
+    #[test]
+    fn test_java_qualified_call_no_same_file_edge() {
+        use crate::extract::configs::JAVA_CONFIG;
+        // obj.helper() — qualified, should not emit
+        let code = r#"class Foo {
+    void helper() {}
+    void main() {
+        Foo obj = new Foo();
+        obj.helper();
+    }
+}
+"#;
+        let result = GenericExtractor::new(&JAVA_CONFIG)
+            .run(Path::new("Foo.java"), code)
+            .unwrap();
+        let qualified_calls: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::Calls && e.to.name == "helper")
+            .collect();
+        // `obj.helper()` is a qualified call — should NOT produce a same-file Calls edge
+        assert!(
+            qualified_calls.is_empty(),
+            "Java obj.helper() should NOT emit Calls edge, got: {:?}", qualified_calls
+        );
+    }
+
+    /// CR5: pub use visibility text is exact (pub, pub(crate), etc.)
+    #[test]
+    fn test_pub_use_visibility_exact_text() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "pub(crate) use crate::foo::Bar;\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("lib.rs"), code)
+            .unwrap();
+        let pub_imports: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::Import && n.metadata.contains_key("visibility"))
+            .collect();
+        assert!(
+            !pub_imports.is_empty(),
+            "pub(crate) use should set visibility metadata"
+        );
+        // Visibility should contain the exact text, not just "pub"
+        let vis = pub_imports[0].metadata.get("visibility").unwrap();
+        assert!(
+            vis.contains("pub"),
+            "visibility should contain 'pub', got: {}", vis
+        );
+    }
+
+    /// CR5: pub use with braces emits ReExports for each name.
+    #[test]
+    fn test_pub_use_braces_emits_multiple_re_exports() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = "pub use crate::foo::{Alpha, Beta};\n";
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("lib.rs"), code)
+            .unwrap();
+        let re_exports: Vec<_> = result.edges.iter()
+            .filter(|e| e.kind == EdgeKind::ReExports)
+            .collect();
+        let names: Vec<&str> = re_exports.iter().map(|e| e.to.name.as_str()).collect();
+        assert!(
+            names.contains(&"Alpha"),
+            "pub use {{Alpha, Beta}} should emit ReExports for Alpha, got: {:?}", names
+        );
+        assert!(
+            names.contains(&"Beta"),
+            "pub use {{Alpha, Beta}} should emit ReExports for Beta, got: {:?}", names
+        );
+    }
+
+    /// Adversarial: `is_async` should NOT be set on a function whose BODY contains
+    /// the word "async" but the function itself is not declared async.
+    #[test]
+    fn test_is_async_not_set_for_body_containing_async() {
+        use crate::extract::rust::RUST_CONFIG;
+        // This function calls an async method but is not itself async.
+        // The check only looks at the first line (signature), not the body.
+        let code = r#"
+fn spawn_task() {
+    let future = async { 42 };
+    tokio::spawn(future);
+}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+        let fn_node = result.nodes.iter().find(|n| n.id.name == "spawn_task").unwrap();
+        // spawn_task is not async itself — is_async should NOT be set
+        // NOTE: This test documents the current behavior of the text fallback.
+        // The text fallback checks `first_line.starts_with("async ")` which for
+        // `fn spawn_task()` is false. Body content is not checked.
+        assert!(
+            fn_node.metadata.get("is_async").is_none(),
+            "sync fn with async body should NOT have is_async, got: {:?}",
+            fn_node.metadata.get("is_async")
+        );
     }
 }

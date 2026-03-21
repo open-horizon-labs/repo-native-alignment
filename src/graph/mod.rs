@@ -171,6 +171,9 @@ pub enum EdgeKind {
     /// A symbol belongs to a module/package node.
     /// Direction: symbol → module
     BelongsTo,
+    /// A public re-export edge (e.g. `pub use`, `export { X }`, `__all__`).
+    /// Emitted when a module publicly re-exports a symbol defined elsewhere.
+    ReExports,
 }
 
 impl fmt::Display for EdgeKind {
@@ -191,6 +194,7 @@ impl fmt::Display for EdgeKind {
             EdgeKind::Serves => write!(f, "serves"),
             EdgeKind::TestedBy => write!(f, "tested_by"),
             EdgeKind::BelongsTo => write!(f, "belongs_to"),
+            EdgeKind::ReExports => write!(f, "re_exports"),
         }
     }
 }

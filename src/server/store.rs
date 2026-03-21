@@ -260,6 +260,7 @@ pub fn parse_edge_kind(s: &str) -> Option<EdgeKind> {
         "serves" => EdgeKind::Serves,
         "tested_by" => EdgeKind::TestedBy,
         "belongs_to" => EdgeKind::BelongsTo,
+        "re_exports" => EdgeKind::ReExports,
         _ => return None,
     })
 }
@@ -492,6 +493,30 @@ pub(crate) async fn persist_graph_to_lance(
                 None => is_static_builder.append_null(),
             }
         }
+        let mut is_async_builder = BooleanBuilder::new();
+        for n in nodes.iter() {
+            match n.metadata.get("is_async") {
+                Some(v) => is_async_builder.append_value(v == "true"),
+                None => is_async_builder.append_null(),
+            }
+        }
+        let mut is_test_builder = BooleanBuilder::new();
+        for n in nodes.iter() {
+            match n.metadata.get("is_test") {
+                Some(v) => is_test_builder.append_value(v == "true"),
+                None => is_test_builder.append_null(),
+            }
+        }
+        let visibilities: Vec<Option<String>> = nodes.iter()
+            .map(|n| n.metadata.get("visibility").cloned())
+            .collect();
+        let mut exported_builder = BooleanBuilder::new();
+        for n in nodes.iter() {
+            match n.metadata.get("exported") {
+                Some(v) => exported_builder.append_value(v == "true"),
+                None => exported_builder.append_null(),
+            }
+        }
         // Diagnostic metadata columns
         let diag_severities: Vec<Option<String>> = nodes.iter()
             .map(|n| n.metadata.get("diagnostic_severity").cloned())
@@ -542,6 +567,10 @@ pub(crate) async fn persist_graph_to_lance(
                 Arc::new(StringArray::from(type_params_col)),
                 Arc::new(StringArray::from(pattern_hints)),
                 Arc::new(is_static_builder.finish()),
+                Arc::new(is_async_builder.finish()),
+                Arc::new(is_test_builder.finish()),
+                Arc::new(StringArray::from(visibilities)),
+                Arc::new(exported_builder.finish()),
                 Arc::new(StringArray::from(diag_severities)),
                 Arc::new(StringArray::from(diag_sources)),
                 Arc::new(StringArray::from(diag_messages)),
@@ -778,6 +807,30 @@ pub(crate) async fn persist_graph_incremental(
                     None => is_static_builder.append_null(),
                 }
             }
+            let mut is_async_builder = BooleanBuilder::new();
+            for n in upsert_nodes.iter() {
+                match n.metadata.get("is_async") {
+                    Some(v) => is_async_builder.append_value(v == "true"),
+                    None => is_async_builder.append_null(),
+                }
+            }
+            let mut is_test_builder = BooleanBuilder::new();
+            for n in upsert_nodes.iter() {
+                match n.metadata.get("is_test") {
+                    Some(v) => is_test_builder.append_value(v == "true"),
+                    None => is_test_builder.append_null(),
+                }
+            }
+            let visibilities: Vec<Option<String>> = upsert_nodes.iter()
+                .map(|n| n.metadata.get("visibility").cloned())
+                .collect();
+            let mut exported_builder = BooleanBuilder::new();
+            for n in upsert_nodes.iter() {
+                match n.metadata.get("exported") {
+                    Some(v) => exported_builder.append_value(v == "true"),
+                    None => exported_builder.append_null(),
+                }
+            }
             // Diagnostic metadata columns
             let diag_severities: Vec<Option<String>> = upsert_nodes.iter()
                 .map(|n| n.metadata.get("diagnostic_severity").cloned())
@@ -828,6 +881,10 @@ pub(crate) async fn persist_graph_incremental(
                     Arc::new(StringArray::from(type_params_col)),
                     Arc::new(StringArray::from(pattern_hints)),
                     Arc::new(is_static_builder.finish()),
+                    Arc::new(is_async_builder.finish()),
+                    Arc::new(is_test_builder.finish()),
+                    Arc::new(StringArray::from(visibilities)),
+                    Arc::new(exported_builder.finish()),
                     Arc::new(StringArray::from(diag_severities)),
                     Arc::new(StringArray::from(diag_sources)),
                     Arc::new(StringArray::from(diag_messages)),
@@ -1048,6 +1105,14 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             let is_static_col = batch.column_by_name("is_static")
                 .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
+            let is_async_col = batch.column_by_name("is_async")
+                .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
+            let is_test_col = batch.column_by_name("is_test")
+                .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
+            let visibility_col = batch.column_by_name("visibility")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let exported_col = batch.column_by_name("exported")
+                .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
             // Diagnostic metadata columns (nullable — only present on diagnostic nodes)
             let diag_severity_col = batch.column_by_name("diagnostic_severity")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
@@ -1141,6 +1206,29 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 if let Some(col) = is_static_col {
                     if !col.is_null(i) {
                         metadata.insert("is_static".to_string(), if col.value(i) { "true" } else { "false" }.to_string());
+                    }
+                }
+                if let Some(col) = is_async_col {
+                    if !col.is_null(i) && col.value(i) {
+                        metadata.insert("is_async".to_string(), "true".to_string());
+                    }
+                }
+                if let Some(col) = is_test_col {
+                    if !col.is_null(i) && col.value(i) {
+                        metadata.insert("is_test".to_string(), "true".to_string());
+                    }
+                }
+                if let Some(col) = visibility_col {
+                    if !col.is_null(i) {
+                        let val = col.value(i);
+                        if !val.is_empty() {
+                            metadata.insert("visibility".to_string(), val.to_string());
+                        }
+                    }
+                }
+                if let Some(col) = exported_col {
+                    if !col.is_null(i) && col.value(i) {
+                        metadata.insert("exported".to_string(), "true".to_string());
                     }
                 }
                 if let Some(col) = diag_severity_col {
