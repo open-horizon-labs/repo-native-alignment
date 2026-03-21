@@ -540,6 +540,10 @@ pub(crate) async fn persist_graph_to_lance(
         let http_paths: Vec<Option<String>> = nodes.iter()
             .map(|n| n.metadata.get("http_path").cloned())
             .collect();
+        // doc_comment column — persisted for LSP reindex round-trip (#416)
+        let doc_comments: Vec<Option<String>> = nodes.iter()
+            .map(|n| n.metadata.get("doc_comment").cloned())
+            .collect();
         let updated_ats: Vec<i64> = vec![now; nodes.len()];
 
         let batch = RecordBatch::try_new(
@@ -578,6 +582,7 @@ pub(crate) async fn persist_graph_to_lance(
                 Arc::new(StringArray::from(diag_timestamps)),
                 Arc::new(StringArray::from(http_methods)),
                 Arc::new(StringArray::from(http_paths)),
+                Arc::new(StringArray::from(doc_comments)),
                 Arc::new(Int64Array::from(updated_ats)),
             ],
         )?;
@@ -854,6 +859,10 @@ pub(crate) async fn persist_graph_incremental(
             let http_paths: Vec<Option<String>> = upsert_nodes.iter()
                 .map(|n| n.metadata.get("http_path").cloned())
                 .collect();
+            // doc_comment column — persisted for LSP reindex round-trip (#416)
+            let doc_comments: Vec<Option<String>> = upsert_nodes.iter()
+                .map(|n| n.metadata.get("doc_comment").cloned())
+                .collect();
             let updated_ats: Vec<i64> = vec![now; upsert_nodes.len()];
 
             let batch = RecordBatch::try_new(
@@ -892,6 +901,7 @@ pub(crate) async fn persist_graph_incremental(
                     Arc::new(StringArray::from(diag_timestamps)),
                     Arc::new(StringArray::from(http_methods)),
                     Arc::new(StringArray::from(http_paths)),
+                    Arc::new(StringArray::from(doc_comments)),
                     Arc::new(Int64Array::from(updated_ats)),
                 ],
             )?;
@@ -1129,6 +1139,9 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             let http_path_col = batch.column_by_name("http_path")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            // doc_comment column — survives LSP reindex round-trip (#416)
+            let doc_comment_col = batch.column_by_name("doc_comment")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
             for i in 0..batch.num_rows() {
                 let file_path = PathBuf::from(file_paths.value(i));
@@ -1284,6 +1297,14 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("http_path".to_string(), val.to_string());
+                        }
+                    }
+                }
+                if let Some(col) = doc_comment_col {
+                    if !col.is_null(i) {
+                        let val = col.value(i);
+                        if !val.is_empty() {
+                            metadata.insert("doc_comment".to_string(), val.to_string());
                         }
                     }
                 }
