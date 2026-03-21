@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search`.
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// Extraction version for source-level extraction logic.
 ///
@@ -47,6 +47,7 @@ pub const EXTRACTION_VERSION: u32 = 2;
 /// - `diagnostic_timestamp` — unix timestamp (seconds) when diagnostic was captured
 /// - `http_method`  — HTTP verb for ApiEndpoint nodes ("GET", "POST", etc.)
 /// - `http_path`    — HTTP path for ApiEndpoint nodes ("/users", "/items/{id}", etc.)
+/// - `doc_comment`  — documentation comment extracted by tree-sitter (#416)
 ///
 /// bump SCHEMA_VERSION in store.rs when changing this
 pub fn symbols_schema() -> Schema {
@@ -87,6 +88,8 @@ pub fn symbols_schema() -> Schema {
         // ApiEndpoint columns — populated for NodeKind::ApiEndpoint nodes
         Field::new("http_method", DataType::Utf8, true),    // "GET" | "POST" | "PUT" | etc.
         Field::new("http_path", DataType::Utf8, true),      // "/users" | "/items/{id}" | etc.
+        // Doc comment column — survives LSP reindex round-trip (#416)
+        Field::new("doc_comment", DataType::Utf8, true),    // metadata["doc_comment"] — documentation comment
         // Vector column is added dynamically when embeddings are computed,
         // since the dimension depends on the model. See `symbols_schema_with_vector`.
         Field::new("updated_at", DataType::Int64, false),
@@ -134,6 +137,8 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         // ApiEndpoint columns — populated for NodeKind::ApiEndpoint nodes
         Field::new("http_method", DataType::Utf8, true),
         Field::new("http_path", DataType::Utf8, true),
+        // Doc comment column — survives LSP reindex round-trip (#416)
+        Field::new("doc_comment", DataType::Utf8, true),
         Field::new(
             "vector",
             DataType::FixedSizeList(
@@ -214,8 +219,8 @@ mod tests {
 
     #[test]
     fn test_schema_version_constant() {
-        // SCHEMA_VERSION must be at least 13 (bumped for ApiEndpoint http_method/http_path columns)
-        assert!(SCHEMA_VERSION >= 13, "SCHEMA_VERSION should be >= 13");
+        // SCHEMA_VERSION must be at least 15 (bumped for doc_comment column #416)
+        assert!(SCHEMA_VERSION >= 15, "SCHEMA_VERSION should be >= 15");
     }
 
     #[test]
@@ -256,6 +261,8 @@ mod tests {
         // ApiEndpoint columns (added for NodeKind::ApiEndpoint nodes)
         assert!(schema.field_with_name("http_method").is_ok());
         assert!(schema.field_with_name("http_path").is_ok());
+        // doc_comment column — survives LSP reindex round-trip (#416)
+        assert!(schema.field_with_name("doc_comment").is_ok());
         assert!(schema.field_with_name("updated_at").is_ok());
         // no vector column in base schema
         assert!(schema.field_with_name("vector").is_err());
