@@ -4529,4 +4529,80 @@ mod tests {
         assert_eq!(dep_edges[0].to.name, "crate_b");
         assert_eq!(dep_edges[0].from.root, "my_root");
     }
+
+    // -----------------------------------------------------------------------
+    // Adversarial tests for #405: DOT parser edge cases and emit robustness
+    // -----------------------------------------------------------------------
+
+    /// Malformed DOT: edge references unknown node IDs — should produce no pairs
+    #[test]
+    fn test_parse_crate_graph_dot_dangling_edge() {
+        let dot = r#"digraph rust_analyzer_crate_graph {
+    _0 [shape=box label="known_crate"]
+    _0 -> _99
+}"#;
+        let pairs = LspEnricher::parse_crate_graph_dot(dot);
+        // _99 has no label; should filter out since id_to_name lookup returns None
+        assert!(pairs.is_empty(), "dangling edge to unknown node should produce no pairs");
+    }
+
+    /// Label with special characters (hyphens, underscores — common in Rust crate names)
+    #[test]
+    fn test_parse_crate_graph_dot_hyphenated_crate_names() {
+        let dot = r#"digraph rust_analyzer_crate_graph {
+    _0 [shape=box label="my-crate"]
+    _1 [shape=box label="another_crate-2"]
+    _0 -> _1
+}"#;
+        let pairs = LspEnricher::parse_crate_graph_dot(dot);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "my-crate");
+        assert_eq!(pairs[0].1, "another_crate-2");
+    }
+
+    /// Diamond dependency: A→B, A→C, B→C should produce 3 edges (not deduplicated)
+    #[test]
+    fn test_parse_crate_graph_dot_diamond_dependency() {
+        let dot = r#"digraph rust_analyzer_crate_graph {
+    _0 [shape=box label="app"]
+    _1 [shape=box label="core"]
+    _2 [shape=box label="utils"]
+    _0 -> _1
+    _0 -> _2
+    _1 -> _2
+}"#;
+        let pairs = LspEnricher::parse_crate_graph_dot(dot);
+        assert_eq!(pairs.len(), 3, "diamond graph should have 3 edges");
+        let has_app_core = pairs.iter().any(|(f, t)| f == "app" && t == "core");
+        let has_app_utils = pairs.iter().any(|(f, t)| f == "app" && t == "utils");
+        let has_core_utils = pairs.iter().any(|(f, t)| f == "core" && t == "utils");
+        assert!(has_app_core, "should have app→core edge");
+        assert!(has_app_utils, "should have app→utils edge");
+        assert!(has_core_utils, "should have core→utils edge");
+    }
+
+    /// Empty DOT string should not panic
+    #[test]
+    fn test_parse_crate_graph_dot_completely_empty_string() {
+        let pairs = LspEnricher::parse_crate_graph_dot("");
+        assert!(pairs.is_empty());
+    }
+
+    /// Crate nodes use `file: Cargo.toml` — verify the file path anchoring
+    #[test]
+    fn test_emit_crate_graph_edges_file_anchor() {
+        let pairs = vec![("crate_a".to_string(), "crate_b".to_string())];
+        let mut result = EnrichmentResult::default();
+        LspEnricher::emit_crate_graph_edges(&pairs, "root", &mut result);
+
+        for node in &result.new_nodes {
+            if matches!(&node.id.kind, NodeKind::Other(s) if s == "crate") {
+                assert_eq!(
+                    node.id.file,
+                    PathBuf::from("Cargo.toml"),
+                    "crate nodes must use Cargo.toml as file anchor"
+                );
+            }
+        }
+    }
 }
