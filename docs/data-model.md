@@ -4,6 +4,8 @@ This document describes the actual data model in RNA as of schema version 14. It
 
 Authoritative sources: `src/graph/mod.rs`, `src/graph/store.rs`, `src/server/store.rs`, `src/embed.rs`, `src/server/state.rs`, `src/graph/index.rs`.
 
+**Keeping this doc in sync:** When you bump `SCHEMA_VERSION` in `src/graph/store.rs`, update the tables in section 1 of this file to match. The schema version number appears in the first paragraph of section 1.
+
 ---
 
 ## 1. LanceDB Column Store
@@ -59,6 +61,8 @@ Stores code symbols (functions, structs, traits, enums, etc.) and other node typ
 **Note on language:** The `language` field is not stored in this table. It is inferred at load time from the file extension via `infer_language_from_path`.
 
 **Note on source:** The extraction source (`tree_sitter`, `lsp`, etc.) is not stored in this table. Loaded nodes default to `ExtractionSource::TreeSitter`.
+
+**Note on subsystem:** The `subsystem` metadata value (e.g., `"scanner"`, `"server"`) is not a column in this table. It lives in `Node.metadata["subsystem"]` and is re-computed after each graph rebuild. Subsystem-based filtering is only available through the `artifacts` table (via the `search()` MCP tool's `subsystem` parameter). Do not expect a `subsystem` column when querying `symbols` directly.
 
 ### `edges` table
 
