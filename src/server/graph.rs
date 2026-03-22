@@ -385,7 +385,7 @@ impl RnaHandler {
         let mut all_nodes: Vec<Node> = Vec::new();
         let mut all_edges: Vec<Edge> = Vec::new();
         // Populated by PostExtractionConsumer via EventBus (step 4b-4j).
-        let mut all_detected_frameworks: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let all_detected_frameworks: std::collections::HashSet<String>;
 
         // Try loading cached graph for clean-root reuse.
         let cached_graph = match load_graph_from_lance(&self.repo_root).await {
@@ -584,12 +584,10 @@ impl RnaHandler {
 
         // 4b-4j. Post-extraction passes via EventBus (ADR Phase 2b, issue #502).
         //
-        // Emitting RootExtracted routes to:
-        //   - PostExtractionConsumer → runs all passes (api_link, manifest, tested_by,
-        //     import_calls, directory_module, framework_detection, nextjs_routing,
-        //     pubsub, websocket, extractor_config) → emits PassesComplete + FrameworkDetected
+        // `run_post_passes_via_bus` routes all_nodes/all_edges through:
+        //   - PostExtractionConsumer → runs all passes → emits PassesComplete
         //   - LanguageAccumulatorConsumer → emits LanguageDetected per language
-        //   - LspConsumer stubs → Phase 2 no-ops, Phase 3+ will be async consumers
+        //   - LspConsumer stubs → Phase 2 no-ops, Phase 3+ async consumers
         //
         // ADR Constraint 4: no direct pass function calls in src/server/.
         {
@@ -599,50 +597,17 @@ impl RnaHandler {
                 .map(|r| (r.slug.clone(), r.path.clone()))
                 .collect();
             let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
-
-            // Wrap into Arc<[T]> for zero-copy fan-out to multiple bus consumers.
-            // nodes_arc/edges_arc are retained as fallback in case no PassesComplete arrives.
-            let nodes_arc: Arc<[Node]> = Arc::from(all_nodes.into_boxed_slice());
-            let edges_arc: Arc<[Edge]> = Arc::from(all_edges.into_boxed_slice());
-
-            let bus = crate::extract::consumers::build_builtin_bus(
-                root_pairs,
-                primary_slug.clone(),
-            );
-            let events = bus.emit(crate::extract::event_bus::ExtractionEvent::RootExtracted {
-                slug: primary_slug,
-                path: self.repo_root.clone(),
-                nodes: Arc::clone(&nodes_arc),
-                edges: Arc::clone(&edges_arc),
-            });
-
-            // Collect PassesComplete — produced by PostExtractionConsumer.
-            // PassesComplete carries the fully enriched node/edge set and detected frameworks.
-            let passes_complete = events.into_iter().find(|e| {
-                matches!(e, crate::extract::event_bus::ExtractionEvent::PassesComplete { .. })
-            });
-            match passes_complete {
-                Some(crate::extract::event_bus::ExtractionEvent::PassesComplete {
-                    nodes,
-                    edges,
-                    detected_frameworks,
-                    ..
-                }) => {
-                    all_nodes = nodes.to_vec();
-                    all_edges = edges.to_vec();
-                    all_detected_frameworks = detected_frameworks;
-                }
-                _ => {
-                    tracing::warn!(
-                        "EventBus: no PassesComplete event from post-extraction phase — \
-                         passes may have failed; continuing with unenriched graph"
-                    );
-                    // Fall back to the pre-pass node/edge set so subsequent steps
-                    // (PageRank, subsystem, LanceDB persist) still have data to work with.
-                    all_nodes = nodes_arc.to_vec();
-                    all_edges = edges_arc.to_vec();
-                }
-            }
+            let (enriched_nodes, enriched_edges, detected_frameworks) =
+                crate::extract::consumers::run_post_passes_via_bus(
+                    all_nodes,
+                    all_edges,
+                    root_pairs,
+                    primary_slug,
+                    self.repo_root.clone(),
+                );
+            all_nodes = enriched_nodes;
+            all_edges = enriched_edges;
+            all_detected_frameworks = detected_frameworks;
         }
 
         // Dedup immediately after post-extraction passes so the graph index,
@@ -1090,9 +1055,6 @@ impl RnaHandler {
         files_to_remove.extend(stale_virtual_files);
 
         // Re-run all post-extraction passes via EventBus (ADR Phase 2b, issue #502).
-        // Routes through PostExtractionConsumer — same as the full-build and background
-        // scanner paths, satisfying ADR Constraint 4 (no pass calls in src/server/).
-        //
         // Include all roots for passes that need filesystem access (manifest, nextjs_routing).
         let root_pairs_incremental: Vec<(String, std::path::PathBuf)> = WorkspaceConfig::load()
             .with_primary_root(self.repo_root.clone())
@@ -1103,48 +1065,17 @@ impl RnaHandler {
             .map(|r| (r.slug.clone(), r.path.clone()))
             .collect();
         {
-            // Use std::mem::take to move nodes/edges into Arc<[T]> without cloning.
-            // The bus fans them out to PostExtractionConsumer which returns PassesComplete
-            // with the enriched graph. We reassign graph.nodes/graph.edges from the result.
-            let nodes_arc: Arc<[Node]> = Arc::from(
-                std::mem::take(&mut graph.nodes).into_boxed_slice()
-            );
-            let edges_arc: Arc<[Edge]> = Arc::from(
-                std::mem::take(&mut graph.edges).into_boxed_slice()
-            );
-            let bus = crate::extract::consumers::build_builtin_bus(
-                root_pairs_incremental,
-                primary_slug.clone(),
-            );
-            let events = bus.emit(crate::extract::event_bus::ExtractionEvent::RootExtracted {
-                slug: primary_slug.clone(),
-                path: self.repo_root.clone(),
-                nodes: Arc::clone(&nodes_arc),
-                edges: Arc::clone(&edges_arc),
-            });
-            let passes_complete = events.into_iter().find(|e| {
-                matches!(e, crate::extract::event_bus::ExtractionEvent::PassesComplete { .. })
-            });
-            match passes_complete {
-                Some(crate::extract::event_bus::ExtractionEvent::PassesComplete {
-                    nodes,
-                    edges,
-                    detected_frameworks,
-                    ..
-                }) => {
-                    graph.nodes = nodes.to_vec();
-                    graph.edges = edges.to_vec();
-                    graph.detected_frameworks = detected_frameworks;
-                }
-                _ => {
-                    tracing::warn!(
-                        "update_graph_with_scan EventBus: no PassesComplete — \
-                         falling back to pre-pass graph"
-                    );
-                    graph.nodes = nodes_arc.to_vec();
-                    graph.edges = edges_arc.to_vec();
-                }
-            }
+            let (enriched_nodes, enriched_edges, detected_frameworks) =
+                crate::extract::consumers::run_post_passes_via_bus(
+                    std::mem::take(&mut graph.nodes),
+                    std::mem::take(&mut graph.edges),
+                    root_pairs_incremental,
+                    primary_slug.clone(),
+                    self.repo_root.clone(),
+                );
+            graph.nodes = enriched_nodes;
+            graph.edges = enriched_edges;
+            graph.detected_frameworks = detected_frameworks;
         }
 
         // Auto-collect delta: everything added by post-extraction passes since

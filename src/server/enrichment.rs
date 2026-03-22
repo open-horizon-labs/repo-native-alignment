@@ -258,15 +258,9 @@ impl RnaHandler {
                         ));
                     }
 
-                    // Run post-extraction passes over the full merged node/edge set via
-                    // EventBus (ADR Phase 2b, issue #502). Emitting RootExtracted routes to
-                    // PostExtractionConsumer which runs all passes and emits PassesComplete.
-                    //
-                    // ADR Constraint 4: no direct pass function calls in src/server/.
-                    //
-                    // Previously these were missing from the background scanner path (#471);
-                    // now both the foreground (build_full_graph_inner) and background paths
-                    // use the same bus-driven consumer chain.
+                    // Run post-extraction passes via EventBus (ADR Phase 2b, issue #502).
+                    // Both foreground and background paths now use the same bus-driven
+                    // consumer chain. Satisfies ADR Constraint 4 (no pass calls in src/server/).
                     {
                         // Snapshot existing stable_ids before the passes run.
                         let before_node_ids: std::collections::HashSet<String> =
@@ -286,47 +280,17 @@ impl RnaHandler {
                         let primary_slug =
                             RootConfig::code_project(repo_root.clone()).slug();
 
-                        // Wrap nodes/edges into Arc<[T]> for zero-copy bus fan-out.
-                        // Retain arc references as fallback if PassesComplete is absent.
-                        let nodes_arc: std::sync::Arc<[crate::graph::Node]> =
-                            std::sync::Arc::from(std::mem::take(&mut graph_state.nodes).into_boxed_slice());
-                        let edges_arc: std::sync::Arc<[crate::graph::Edge]> =
-                            std::sync::Arc::from(std::mem::take(&mut graph_state.edges).into_boxed_slice());
-
-                        let bus = crate::extract::consumers::build_builtin_bus(
-                            root_pairs,
-                            primary_slug.clone(),
-                        );
-                        let events = bus.emit(crate::extract::event_bus::ExtractionEvent::RootExtracted {
-                            slug: primary_slug.clone(),
-                            path: repo_root.clone(),
-                            nodes: std::sync::Arc::clone(&nodes_arc),
-                            edges: std::sync::Arc::clone(&edges_arc),
-                        });
-
-                        let passes_complete = events.into_iter().find(|e| {
-                            matches!(e, crate::extract::event_bus::ExtractionEvent::PassesComplete { .. })
-                        });
-                        match passes_complete {
-                            Some(crate::extract::event_bus::ExtractionEvent::PassesComplete {
-                                nodes,
-                                edges,
-                                detected_frameworks,
-                                ..
-                            }) => {
-                                graph_state.nodes = nodes.to_vec();
-                                graph_state.edges = edges.to_vec();
-                                graph_state.detected_frameworks = detected_frameworks;
-                            }
-                            _ => {
-                                tracing::warn!(
-                                    "Background scanner EventBus: no PassesComplete — \
-                                     falling back to pre-pass graph"
-                                );
-                                graph_state.nodes = nodes_arc.to_vec();
-                                graph_state.edges = edges_arc.to_vec();
-                            }
-                        }
+                        let (enriched_nodes, enriched_edges, detected_frameworks) =
+                            crate::extract::consumers::run_post_passes_via_bus(
+                                std::mem::take(&mut graph_state.nodes),
+                                std::mem::take(&mut graph_state.edges),
+                                root_pairs,
+                                primary_slug.clone(),
+                                repo_root.clone(),
+                            );
+                        graph_state.nodes = enriched_nodes;
+                        graph_state.edges = enriched_edges;
+                        graph_state.detected_frameworks = detected_frameworks;
 
                         // Deduplicate nodes and edges after post-extraction passes.
                         // Passes re-emit edges that may already be present from cached
