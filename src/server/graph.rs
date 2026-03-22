@@ -1104,13 +1104,33 @@ impl RnaHandler {
         // We snapshot IDs now but rebuild the actual upsert data AFTER PageRank
         // so persisted nodes include updated importance scores.
         //
-        // NOTE: upsert_edges is declared mut so post-extraction passes
-        // (api_link, tested_by) can append their edges to the persist delta.
+        // Post-extraction passes (api_link, manifest, tested_by, etc.) append new
+        // nodes/edges to the graph vecs. Rather than requiring each pass to manually
+        // call upsert_node_ids.extend()/upsert_edges.extend() — a pattern that has
+        // caused multiple regressions when forgotten — we snapshot the existing stable
+        // IDs before passes run and auto-collect the delta after all passes complete.
+        //
+        // Two snapshot points are needed because the dedup step between Group 1 passes
+        // (api_link … nextjs_routing) and Group 2 passes (subsystem, fw, pubsub, ws)
+        // compacts the vecs, making index-based slicing incorrect across that boundary.
+        // Instead we snapshot existing stable IDs as a HashSet; the auto-collect step
+        // at the end of each group extends the delta with anything not in the snapshot.
+        //
+        // Exception: subsystem metadata is updated IN-PLACE on existing nodes (their
+        // stable IDs don't change), so those mutations are still tracked explicitly via
+        // upsert_node_ids.insert(sid) inside the subsystem loop below.
         let mut upsert_node_ids: std::collections::HashSet<String> =
             extraction.nodes.iter().map(|n| n.stable_id()).collect();
         let mut upsert_edges: Vec<Edge> = extraction.edges.clone();
         graph.nodes.extend(extraction.nodes);
         graph.edges.extend(extraction.edges);
+
+        // Snapshot existing IDs before Group 1 post-extraction passes so we can
+        // auto-collect everything they add into the upsert delta.
+        let node_ids_before_passes: std::collections::HashSet<String> =
+            graph.nodes.iter().map(|n| n.stable_id()).collect();
+        let edge_ids_before_passes: std::collections::HashSet<String> =
+            graph.edges.iter().map(|e| e.stable_id()).collect();
 
         // Re-run API link pass with the full (existing + new) node set so that
         // cross-file links are created when only one side of a match was updated.
@@ -1123,8 +1143,6 @@ impl RnaHandler {
                     "API link pass (incremental): {} DependsOn edge(s) from string literals to endpoints",
                     api_link_edges.len()
                 );
-                // Include in upsert delta so these edges are persisted to LanceDB.
-                upsert_edges.extend(api_link_edges.iter().cloned());
                 graph.edges.extend(api_link_edges);
             }
         }
@@ -1148,10 +1166,7 @@ impl RnaHandler {
         }
 
         // Re-run TestedBy naming-convention pass over the full node set so
-        // that test/production pairs where only one side changed are still
-        // linked.  Include in upsert delta so edges are persisted to LanceDB —
-        // previously this block ran AFTER upsert_edges was captured, meaning
-        // TestedBy edges were never written to the incremental persist delta.
+        // that test/production pairs where only one side changed are still linked.
         {
             let tested_by_edges = crate::extract::naming_convention::tested_by_pass(&graph.nodes);
             if !tested_by_edges.is_empty() {
@@ -1159,15 +1174,12 @@ impl RnaHandler {
                     "TestedBy naming-convention pass (incremental): {} edge(s)",
                     tested_by_edges.len()
                 );
-                // Include in upsert delta so these edges are persisted to LanceDB.
-                upsert_edges.extend(tested_by_edges.iter().cloned());
                 graph.edges.extend(tested_by_edges);
             }
         }
 
         // Re-run import-calls pass over the full node set so that cross-file
-        // Calls edges are always present after an incremental scan.  Include in
-        // upsert delta so edges are persisted to LanceDB.
+        // Calls edges are always present after an incremental scan.
         {
             let import_call_edges =
                 crate::extract::import_calls::import_calls_pass(&graph.nodes);
@@ -1176,14 +1188,12 @@ impl RnaHandler {
                     "Import-calls pass (incremental): {} cross-file Calls edge(s)",
                     import_call_edges.len()
                 );
-                upsert_edges.extend(import_call_edges.iter().cloned());
                 graph.edges.extend(import_call_edges);
             }
         }
 
         // Re-run directory-module pass over the full node set so that
         // BelongsTo edges are always present without requiring LSP quiescence.
-        // Include in upsert delta so edges are persisted to LanceDB.
         {
             let dir_result =
                 crate::extract::directory_module::directory_module_pass(&graph.nodes);
@@ -1193,12 +1203,6 @@ impl RnaHandler {
                     dir_result.edges.len(),
                     dir_result.nodes.len(),
                 );
-                // Also add the new module nodes to the upsert delta so they
-                // are persisted to LanceDB.  Without this, upsert_nodes is
-                // rebuilt only from upsert_node_ids and the module rows would
-                // be missing — leaving BelongsTo edges pointing at ghost nodes.
-                upsert_node_ids.extend(dir_result.nodes.iter().map(|n| n.stable_id()));
-                upsert_edges.extend(dir_result.edges.iter().cloned());
                 graph.edges.extend(dir_result.edges);
                 graph.nodes.extend(dir_result.nodes);
             }
@@ -1228,8 +1232,6 @@ impl RnaHandler {
                     nextjs_result.nodes.len(),
                     nextjs_result.edges.len()
                 );
-                upsert_node_ids.extend(nextjs_result.nodes.iter().map(|n| n.stable_id()));
-                upsert_edges.extend(nextjs_result.edges.iter().cloned());
                 graph.nodes.extend(nextjs_result.nodes);
                 graph.edges.extend(nextjs_result.edges);
             }
@@ -1264,12 +1266,26 @@ impl RnaHandler {
         {
             let fw_result = framework_detection_pass(&graph.nodes, &primary_slug);
             if !fw_result.nodes.is_empty() {
-                for node in &fw_result.nodes {
-                    upsert_node_ids.insert(node.stable_id());
-                }
                 graph.nodes.extend(fw_result.nodes);
             }
             graph.detected_frameworks = fw_result.detected_frameworks;
+        }
+
+        // Auto-collect Group 1 delta: everything added by post-extraction passes
+        // (api_link, manifest, tested_by, import_calls, directory_module, nextjs_routing,
+        // framework_detection) since the snapshot above. No pass needs to manually
+        // call upsert_node_ids.extend() or upsert_edges.extend() for its own output.
+        for n in &graph.nodes {
+            let sid = n.stable_id();
+            if !node_ids_before_passes.contains(&sid) {
+                upsert_node_ids.insert(sid);
+            }
+        }
+        for e in &graph.edges {
+            let sid = e.stable_id();
+            if !edge_ids_before_passes.contains(&sid) {
+                upsert_edges.push(e.clone());
+            }
         }
 
         // Deduplicate graph.nodes and graph.edges in-place before rebuilding the
@@ -1388,6 +1404,14 @@ impl RnaHandler {
                 }
             }
 
+            // Snapshot before Group 2 passes (subsystem_node, fw aggregation, pubsub, ws).
+            // The dedup step above compacts the vecs, so we need a fresh snapshot here
+            // rather than relying on the Group 1 snapshot indices.
+            let node_ids_before_group2: std::collections::HashSet<String> =
+                graph.nodes.iter().map(|n| n.stable_id()).collect();
+            let edge_ids_before_group2: std::collections::HashSet<String> =
+                graph.edges.iter().map(|e| e.stable_id()).collect();
+
             // Emit first-class subsystem nodes + BelongsTo edges.
             // Stale nodes were already removed in the pre-clean step above.
             let sub_result = subsystem_node_pass(&subsystems, &graph.nodes, &primary_slug);
@@ -1396,13 +1420,6 @@ impl RnaHandler {
                     "Incremental: promoted {} subsystem(s) to first-class nodes",
                     sub_result.nodes.len()
                 );
-                for node in &sub_result.nodes {
-                    upsert_node_ids.insert(node.stable_id());
-                }
-                // BelongsTo edges must be persisted too — include in upsert_edges
-                // so LanceDB gets the full delta (nodes without edges are queryable
-                // as nodes but not traversable as graph endpoints).
-                upsert_edges.extend(sub_result.edges.iter().cloned());
                 graph.nodes.extend(sub_result.nodes);
                 graph.edges.extend(sub_result.edges);
             }
@@ -1411,7 +1428,6 @@ impl RnaHandler {
             let sub_fw_edges =
                 crate::extract::framework_detection::subsystem_framework_aggregation_pass(&graph.nodes);
             if !sub_fw_edges.is_empty() {
-                upsert_edges.extend(sub_fw_edges.iter().cloned());
                 graph.edges.extend(sub_fw_edges);
             }
 
@@ -1423,10 +1439,6 @@ impl RnaHandler {
                     &primary_slug,
                 );
                 if !pubsub_result.edges.is_empty() {
-                    for node in &pubsub_result.nodes {
-                        upsert_node_ids.insert(node.stable_id());
-                    }
-                    upsert_edges.extend(pubsub_result.edges.iter().cloned());
                     graph.nodes.extend(pubsub_result.nodes);
                     graph.edges.extend(pubsub_result.edges);
                 }
@@ -1440,12 +1452,23 @@ impl RnaHandler {
                     &primary_slug,
                 );
                 if !ws_result.edges.is_empty() {
-                    for node in &ws_result.nodes {
-                        upsert_node_ids.insert(node.stable_id());
-                    }
-                    upsert_edges.extend(ws_result.edges.iter().cloned());
                     graph.nodes.extend(ws_result.nodes);
                     graph.edges.extend(ws_result.edges);
+                }
+            }
+
+            // Auto-collect Group 2 delta: everything added by subsystem_node, fw
+            // aggregation, pubsub, and websocket passes since the snapshot above.
+            for n in &graph.nodes {
+                let sid = n.stable_id();
+                if !node_ids_before_group2.contains(&sid) {
+                    upsert_node_ids.insert(sid);
+                }
+            }
+            for e in &graph.edges {
+                let sid = e.stable_id();
+                if !edge_ids_before_group2.contains(&sid) {
+                    upsert_edges.push(e.clone());
                 }
             }
         }
