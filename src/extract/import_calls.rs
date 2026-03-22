@@ -148,13 +148,21 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             }
 
             // Look up candidate Function nodes with this name in OTHER
-            // (root, file) pairs.
+            // (root, file) pairs, within the same language family.
+            // TypeScript `import` can only resolve TypeScript/JavaScript modules;
+            // Python `from … import` can only resolve Python modules; etc.
+            // Filtering by language prevents cross-language false positives in
+            // polyglot repositories.
             let Some(candidates) = fn_by_name.get(imported_name.as_str()) else {
                 continue;
             };
+            let caller_lang = node.language.as_str();
             let cross_file_candidates: Vec<&&Node> = candidates
                 .iter()
-                .filter(|c| c.id.root != node.id.root || c.id.file != node.id.file)
+                .filter(|c| {
+                    (c.id.root != node.id.root || c.id.file != node.id.file)
+                        && languages_compatible(caller_lang, c.language.as_str())
+                })
                 .collect();
 
             if cross_file_candidates.is_empty() {
@@ -203,6 +211,36 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
 }
 
 // ---------------------------------------------------------------------------
+// Language family compatibility
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when code written in `caller_lang` can `import` a function
+/// defined in `callee_lang` using that language's native module system.
+///
+/// Each language family is a closed set:
+/// - TypeScript / JavaScript / TSX / JSX — all share the same ES module system
+/// - Python — only imports Python modules (`.py` / compiled extensions)
+/// - Rust — only imports Rust crate items via `use`
+///
+/// Returns `false` for unknown language pairs to avoid cross-language noise.
+fn languages_compatible(caller_lang: &str, callee_lang: &str) -> bool {
+    // Normalize to lowercase for comparison.
+    let c1 = caller_lang.to_lowercase();
+    let c2 = callee_lang.to_lowercase();
+    if c1 == c2 {
+        return true;
+    }
+    // TypeScript / JavaScript share the same import system.
+    let ts_family = ["typescript", "javascript", "tsx", "jsx"];
+    let c1_is_ts = ts_family.iter().any(|l| c1.contains(l));
+    let c2_is_ts = ts_family.iter().any(|l| c2.contains(l));
+    if c1_is_ts && c2_is_ts {
+        return true;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Parse imported symbol names from an import statement
 // ---------------------------------------------------------------------------
 
@@ -211,7 +249,10 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
 /// Covers:
 /// - ES6 named:    `import { Foo, Bar as B } from '…'`  → `["Foo", "Bar"]`
 /// - ES6 default:  `import Foo from '…'`                → `["Foo"]`
+/// - ES6 named:    `import { Foo, Bar as B } from '…'`  → `["Foo", "Bar"]`
+/// - ES6 default:  `import Foo from '…'`                → `["Foo"]`
 /// - ES6 namespace:`import * as ns from '…'`            → `[]` (not supported — see below)
+/// - ES6 type-only:`import type { Foo } from '…'`       → `[]` (erased at runtime)
 /// - Python from:  `from mod import Foo, Bar`           → `["Foo", "Bar"]`
 /// - Python bare:  `import foo`                         → `["foo"]`
 /// - Rust use:     `use crate::foo::{A, B}`             → `["A", "B"]`
@@ -221,6 +262,9 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
 /// `ns.foo()` — a method call — and `body_contains_call` correctly rejects
 /// method calls.  Resolving `ns.foo` to the module-level `foo` would require
 /// member-access tracking beyond the scope of this pass.
+///
+/// **Type-only imports return an empty list.** `import type { Foo }` is erased
+/// by TypeScript at runtime; no callable value binding exists.
 pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
     let text = import_text.trim();
 
@@ -228,6 +272,11 @@ pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
     // TypeScript/JavaScript ES6
     // ------------------------------------------------------------------
     if text.starts_with("import ") && text.contains(" from ") {
+        // `import type { Foo }` is erased by TypeScript at runtime — no value
+        // binding is created, so `Foo()` is not callable.  Skip type-only imports.
+        if text.starts_with("import type ") {
+            return Vec::new();
+        }
         return parse_es6_import_names(text);
     }
 
@@ -315,7 +364,10 @@ pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
 /// - Named:      `import { A, B as C } from '…'`   → `["A", "B"]`
 /// - Default:    `import Foo from '…'`              → `["Foo"]`
 /// - Mixed:      `import Def, { A } from '…'`       → `["Def", "A"]`
-/// - Type-only:  `import type { A } from '…'`       → `["A"]`
+///
+/// **Note:** `import type { A }` is caught before this function is called and
+/// returns empty from `parse_imported_names`.  This function should not be
+/// called with type-only imports.
 ///
 /// **Namespace imports are intentionally NOT supported** (`import * as ns`).
 /// The pass detects bare function calls (`name(`) in function bodies, so
@@ -431,6 +483,20 @@ pub(crate) fn body_contains_call(body: &str, name: &str) -> bool {
             }
         }
 
+        // Reject declaration contexts: `function name(`, `def name(`, `fn name(`,
+        // `const name(`, `class name(` — these define the symbol, not call it.
+        // Check if the text immediately before `name` ends with a declaration keyword.
+        let before = search[..idx].trim_end();
+        let is_declaration = ["function", "def", "fn", "const", "let", "var",
+                               "class", "async function", "async def",
+                               "async fn", "pub fn", "pub async fn"]
+            .iter()
+            .any(|kw| before.ends_with(kw));
+        if is_declaration {
+            search = &search[idx + 1..];
+            continue;
+        }
+
         return true;
     }
 
@@ -528,9 +594,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_es6_type_only_import() {
+    fn test_parse_es6_type_only_import_returns_empty() {
+        // `import type { Foo }` is erased at runtime — no callable value created.
         let names = parse_imported_names("import type { MyType } from './types'");
-        assert_eq!(names, vec!["MyType"]);
+        assert!(names.is_empty(), "type-only import should return empty, got {:?}", names);
     }
 
     #[test]
@@ -594,6 +661,18 @@ mod tests {
     fn test_body_matches_multiline() {
         let body = "{\n  const data = fetchData(id);\n  return data;\n}";
         assert!(body_contains_call(body, "fetchData"));
+    }
+
+    #[test]
+    fn test_body_does_not_match_declaration_context() {
+        // `function helper(` defines the symbol, not calls it — must NOT match
+        assert!(!body_contains_call("function helper(x) { return x; }", "helper"));
+        // `def helper(` — Python declaration
+        assert!(!body_contains_call("def helper(x):\n    return x", "helper"));
+        // `fn helper(` — Rust declaration
+        assert!(!body_contains_call("fn helper(x: i32) -> i32 { x }", "helper"));
+        // Actual call SHOULD match
+        assert!(body_contains_call("let result = helper(42);", "helper"));
     }
 
     // -----------------------------------------------------------------------
@@ -818,6 +897,69 @@ mod tests {
     }
 
     #[test]
+    fn test_no_cross_language_edge() {
+        // TypeScript cannot import Python functions. If a TS file has an import
+        // for `fetch_data` and a Python file defines `fetch_data`, no edge should
+        // be emitted between them.
+        let caller = Node {
+            id: NodeId {
+                root: "r".into(),
+                file: PathBuf::from("a.ts"),
+                name: "main".into(),
+                kind: NodeKind::Function,
+            },
+            language: "typescript".into(),
+            line_start: 1, line_end: 3,
+            signature: "function main()".into(),
+            body: "function main() { return fetch_data(id); }".into(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let python_callee = Node {
+            id: NodeId {
+                root: "r".into(),
+                file: PathBuf::from("service.py"),
+                name: "fetch_data".into(),
+                kind: NodeKind::Function,
+            },
+            language: "python".into(),
+            line_start: 1, line_end: 3,
+            signature: "def fetch_data(id):".into(),
+            body: "def fetch_data(id):\n    return db.get(id)".into(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let import = make_import("a.ts", "import { fetch_data } from './service'");
+
+        let nodes = vec![caller, python_callee, import];
+        let edges = import_calls_pass(&nodes);
+
+        // TypeScript and Python are incompatible language families — no edge.
+        assert!(
+            edges.is_empty(),
+            "cross-language edges (TS → Python) must not be emitted, got {:?}",
+            edges
+        );
+    }
+
+    #[test]
+    fn test_import_type_does_not_emit_edge() {
+        // `import type { Foo }` is erased at runtime — Foo() is not callable.
+        let caller = make_fn("a.ts", "main", "function main() { return Processor(42); }");
+        let callee = make_fn("b.ts", "Processor", "function Processor(x) { return x; }");
+        let type_import = make_import("a.ts", "import type { Processor } from './b'");
+
+        let nodes = vec![caller, callee, type_import];
+        let edges = import_calls_pass(&nodes);
+
+        assert!(
+            edges.is_empty(),
+            "import type should not emit Calls edges, got {:?}",
+            edges
+        );
+    }
+
+    #[test]
     fn test_idempotent_on_repeated_call() {
         let caller = make_fn("a.ts", "main", "function main() { return helper(42); }");
         let callee = make_fn("b.ts", "helper", "function helper(x) { return x; }");
@@ -839,7 +981,7 @@ mod tests {
     fn test_multi_root_imports_keyed_by_root_and_file() {
         // Two roots both contain `src/lib.ts`. Without the (root, file) key,
         // imports from root-b would contaminate root-a's import set.
-        // With the fix, each root's imports are isolated.
+        // With the (root, file) key, each root's imports are isolated.
         let caller_a = Node {
             id: NodeId {
                 root: "root-a".into(),
@@ -848,8 +990,7 @@ mod tests {
                 kind: NodeKind::Function,
             },
             language: "typescript".into(),
-            line_start: 1,
-            line_end: 5,
+            line_start: 1, line_end: 5,
             signature: "function mainA()".into(),
             body: "function mainA() { return helperA(1); }".into(),
             metadata: BTreeMap::new(),
@@ -863,8 +1004,7 @@ mod tests {
                 kind: NodeKind::Function,
             },
             language: "typescript".into(),
-            line_start: 1,
-            line_end: 3,
+            line_start: 1, line_end: 3,
             signature: "function helperA(x)".into(),
             body: "function helperA(x) { return x; }".into(),
             metadata: BTreeMap::new(),
@@ -878,21 +1018,76 @@ mod tests {
                 kind: NodeKind::Import,
             },
             language: "typescript".into(),
-            line_start: 1,
-            line_end: 1,
+            line_start: 1, line_end: 1,
             signature: "import { helperA } from './helpers'".into(),
             body: String::new(),
             metadata: BTreeMap::new(),
             source: ExtractionSource::TreeSitter,
         };
+        // root-b also has src/lib.ts, with a different function (mainB → helperB).
+        // Without the fix, root-b's imports of helperB could be applied to root-a's
+        // `mainA`, causing spurious edges.
+        let caller_b = Node {
+            id: NodeId {
+                root: "root-b".into(),
+                file: PathBuf::from("src/lib.ts"),
+                name: "mainB".into(),
+                kind: NodeKind::Function,
+            },
+            language: "typescript".into(),
+            line_start: 1, line_end: 5,
+            signature: "function mainB()".into(),
+            body: "function mainB() { return helperB(1); }".into(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let callee_b = Node {
+            id: NodeId {
+                root: "root-b".into(),
+                file: PathBuf::from("src/helpers.ts"),
+                name: "helperB".into(),
+                kind: NodeKind::Function,
+            },
+            language: "typescript".into(),
+            line_start: 1, line_end: 3,
+            signature: "function helperB(x)".into(),
+            body: "function helperB(x) { return x; }".into(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let import_b = Node {
+            id: NodeId {
+                root: "root-b".into(),
+                file: PathBuf::from("src/lib.ts"),
+                name: "import { helperB } from './helpers'".into(),
+                kind: NodeKind::Import,
+            },
+            language: "typescript".into(),
+            line_start: 1, line_end: 1,
+            signature: "import { helperB } from './helpers'".into(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
 
-        let nodes = vec![caller_a, callee_a, import_a];
+        let nodes = vec![caller_a, callee_a.clone(), import_a,
+                         caller_b, callee_b.clone(), import_b];
         let edges = import_calls_pass(&nodes);
 
-        // Only 1 edge: mainA → helperA within root-a
-        assert_eq!(edges.len(), 1, "expected 1 cross-file edge in multi-root test");
-        assert_eq!(edges[0].from.name, "mainA");
-        assert_eq!(edges[0].to.name, "helperA");
-        assert_eq!(edges[0].from.root, "root-a");
+        // Expected: 2 edges — mainA→helperA (root-a) and mainB→helperB (root-b).
+        // Without (root, file) keying: root-b's `helperB` import could leak into
+        // root-a, and vice versa, causing different counts.
+        assert_eq!(edges.len(), 2, "expected 2 isolated cross-file edges, got {:?}",
+                   edges.iter().map(|e| format!("{}->{}", e.from.name, e.to.name)).collect::<Vec<_>>());
+
+        let edge_a = edges.iter().find(|e| e.from.root == "root-a");
+        assert!(edge_a.is_some(), "missing root-a edge");
+        assert_eq!(edge_a.unwrap().from.name, "mainA");
+        assert_eq!(edge_a.unwrap().to.name, "helperA");
+
+        let edge_b = edges.iter().find(|e| e.from.root == "root-b");
+        assert!(edge_b.is_some(), "missing root-b edge");
+        assert_eq!(edge_b.unwrap().from.name, "mainB");
+        assert_eq!(edge_b.unwrap().to.name, "helperB");
     }
 }
