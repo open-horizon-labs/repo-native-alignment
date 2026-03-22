@@ -86,15 +86,53 @@ One function. No knowledge of languages, extractors, LSP, or passes.
 
 ## Consumer Trait
 
+**Pure event subscription — no polling, no context checking.**
+
+A consumer declares which events wake it up. When that event fires, it runs. No `applies_when`, no `ScanContext` — the event itself carries everything the consumer needs.
+
 ```rust
 trait ExtractionConsumer: Send + Sync {
     fn name(&self) -> &str;
     fn subscribes_to(&self) -> &[ExtractionEventKind];
     fn on_event(&self, event: &ExtractionEvent, bus: &EventBus) -> anyhow::Result<()>;
 }
+
+// NextJsRoutingPass wakes up ONLY when FrameworkDetected("nextjs-app-router") fires.
+// It never checks context. It never polls. It just reacts.
+impl ExtractionConsumer for NextJsRoutingPass {
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::FrameworkDetected]
+    }
+    fn on_event(&self, event: &ExtractionEvent, bus: &EventBus) -> anyhow::Result<()> {
+        let ExtractionEvent::FrameworkDetected { framework, nodes } = event else { return Ok(()); };
+        if framework != "nextjs-app-router" { return Ok(()); }
+        let edges = nextjs_routing_pass(nodes);
+        bus.emit(ExtractionEvent::PassComplete { name: "nextjs_routing", edges });
+        Ok(())
+    }
+}
+
+// Custom config-driven pass from .oh/extractors/*.toml — same pattern.
+// Subscribes to FrameworkDetected for its declared framework.
 ```
 
-Adding a new enricher = implement `ExtractionConsumer`. No changes to bootstrap, no changes to other consumers.
+**The framework detection pass is what emits `FrameworkDetected` events:**
+```rust
+impl ExtractionConsumer for FrameworkDetectionPass {
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::RootExtracted]
+    }
+    fn on_event(&self, event: &ExtractionEvent, bus: &EventBus) -> anyhow::Result<()> {
+        // detect frameworks from import nodes
+        for framework in detected {
+            bus.emit(ExtractionEvent::FrameworkDetected { framework, nodes: matching_nodes });
+        }
+        Ok(())
+    }
+}
+```
+
+Adding a new enricher = implement `ExtractionConsumer`, declare which event wakes it up. No changes to any other component.
 
 ## Multi-Tenant Store (#454)
 
