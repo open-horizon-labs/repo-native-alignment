@@ -114,8 +114,18 @@ pub fn tested_by_pass(all_nodes: &[Node]) -> Vec<Edge> {
     let mut edges: Vec<Edge> = Vec::new();
 
     for test_fn in &test_fns {
+        // Track which patterns have already produced an edge for this test fn.
+        // find_iter can match the same pattern multiple times (e.g. "test_parse_parse"
+        // would match pattern "parse" at two positions), but we only want one
+        // TestedBy edge per (test_fn, prod_fn) pair — consistent with the previous
+        // str::contains behavior.
+        let mut seen_patterns = std::collections::HashSet::new();
         for mat in ac.find_iter(&test_fn.id.name) {
-            let prod_fn = prod_indexed[mat.pattern().as_usize()];
+            let pattern_idx = mat.pattern().as_usize();
+            if !seen_patterns.insert(pattern_idx) {
+                continue; // already emitted an edge for this (test_fn, prod_fn) pair
+            }
+            let prod_fn = prod_indexed[pattern_idx];
 
             // Defensive: never emit a self-edge.  The partition above
             // (is_test_function / !is_test_function) makes this unreachable
@@ -491,6 +501,24 @@ mod tests {
             edges.is_empty(),
             "Struct nodes must never produce TestedBy edges even with test-like names"
         );
+    }
+
+    /// Adversarial: test name that contains the same production name twice
+    /// (e.g. "test_parse_parse") must emit exactly ONE TestedBy edge, not two.
+    /// The Aho-Corasick automaton can match the same pattern at multiple positions;
+    /// the dedup guard ensures consistency with the original str::contains behavior.
+    #[test]
+    fn adversarial_duplicate_pattern_in_test_name() {
+        let nodes = vec![
+            make_fn("parse", false),
+            make_fn("test_parse_parse", true), // "parse" appears at positions 5 and 11
+        ];
+        let edges = tested_by_pass(&nodes);
+        assert_eq!(
+            edges.len(), 1,
+            "test name containing the same production name twice must yield exactly 1 edge"
+        );
+        assert_eq!(edges[0].to.name, "parse");
     }
 
     /// Timing smoke test: 500 test functions × 500 production functions should
