@@ -9,6 +9,8 @@
 
 Every enrichment stage is an independent `ExtractionConsumer` that subscribes to events it cares about. No consumer knows about any other consumer. The event bus is the only coupling.
 
+**Static registration, dynamic routing.** All consumers register at startup — the registry is fixed before any events fire. When an event fires (e.g. `FrameworkDetected("nextjs-app-router")`), the bus routes it to already-registered subscribers. There is no dynamic consumer creation or conditional wiring at runtime. The bus is a coordinator: it holds the registry and delivers events to matching subscribers. Nothing more.
+
 ## Event Flow
 
 ```
