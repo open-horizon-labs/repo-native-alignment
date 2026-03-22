@@ -28,8 +28,9 @@
 //!
 //! # Generated file detection
 //!
-//! Only function nodes in files whose name contains `sdk.gen`, `.generated.`, `_generated.ts`,
-//! `_generated.js`, `generated_client`, or `openapi_client` are considered. This avoids false positives from non-generated
+//! Only function nodes in files whose name contains `sdk.gen`, `.generated.`, `_generated.`
+//! (any extension — covers `.ts`, `.js`, `.py`, `.go`, `.kt`, etc.), `generated_client`,
+//! or `openapi_client` are considered. This avoids false positives from non-generated
 //! functions that happen to share a name with an operation.
 //!
 //! # Edge direction
@@ -69,11 +70,11 @@ pub fn normalize_operation_id(id: &str) -> String {
 /// Return `true` if the file path looks like a generated SDK file.
 ///
 /// Matches common code-gen output filename patterns:
-/// - `sdk.gen.ts` / `sdk.gen.js`
-/// - `api.generated.ts` / `client.generated.ts`
-/// - `_generated.ts` suffix
-/// - `generated_client.ts`
-/// - `openapi_client`
+/// - `sdk.gen.ts` / `sdk.gen.js` / `sdk.gen.py` (any `sdk.gen.*`)
+/// - `api.generated.ts` / `client.generated.ts` (contains `.generated.`)
+/// - `api_generated.py` / `client_generated.ts` / `_generated.go` (contains `_generated.`)
+/// - `generated_client.ts` / `generated_client.py`
+/// - `openapi_client.ts` / `openapi_client.py`
 fn is_generated_sdk_file(path: &std::path::Path) -> bool {
     let file_name = path
         .file_name()
@@ -83,8 +84,7 @@ fn is_generated_sdk_file(path: &std::path::Path) -> bool {
 
     file_name.contains("sdk.gen")
         || file_name.contains(".generated.")
-        || file_name.ends_with("_generated.ts")
-        || file_name.ends_with("_generated.js")
+        || file_name.contains("_generated.")
         || file_name.contains("generated_client")
         || file_name.contains("openapi_client")
 }
@@ -236,6 +236,16 @@ mod tests {
     #[test]
     fn test_underscore_generated_ts_detected() {
         assert!(is_generated_sdk_file(&PathBuf::from("src/_generated.ts")));
+    }
+
+    #[test]
+    fn test_underscore_generated_py_detected() {
+        assert!(is_generated_sdk_file(&PathBuf::from("src/api_generated.py")));
+    }
+
+    #[test]
+    fn test_underscore_generated_go_detected() {
+        assert!(is_generated_sdk_file(&PathBuf::from("src/client_generated.go")));
     }
 
     #[test]
