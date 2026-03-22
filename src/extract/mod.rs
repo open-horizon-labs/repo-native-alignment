@@ -9,6 +9,7 @@
 
 pub mod api_link;
 pub mod directory_module;
+pub mod extractor_config;
 pub mod framework_detection;
 pub mod import_calls;
 pub mod manifest;

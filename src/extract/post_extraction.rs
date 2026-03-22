@@ -236,6 +236,8 @@ impl PostExtractionRegistry {
     ///    `FrameworkDetectionPass` causes it to skip silently even when its framework
     ///    is present.
     /// 3. **Framework-gated passes last** (nextjs, pubsub, websocket)
+    /// 4. **Config-driven passes** (extractor_config) — unconditional; no-op when
+    ///    `.oh/extractors/` doesn't exist
     pub fn with_builtins() -> Self {
         let mut reg = Self::new();
         // Group 1: unconditional passes (no framework dependency)
@@ -250,6 +252,10 @@ impl PostExtractionRegistry {
         reg.register(Box::new(NextjsRoutingPass));
         reg.register(Box::new(PubSubPass));
         reg.register(Box::new(WebSocketPass));
+        // Group 4: config-driven passes — reads .oh/extractors/*.toml at scan time.
+        // Unconditional: applies_when always true; cost is zero when the directory
+        // doesn't exist (load_extractor_configs returns early).
+        reg.register(Box::new(ExtractorConfigPass));
         reg
     }
 }
@@ -443,6 +449,45 @@ impl PostExtractionPass for WebSocketPass {
         let result = crate::extract::websocket::websocket_pass(
             nodes,
             &ctx.detected_frameworks,
+            &ctx.primary_slug,
+        );
+        if !result.nodes.is_empty() || !result.edges.is_empty() {
+            nodes.extend(result.nodes);
+            edges.extend(result.edges);
+        }
+        PassResult::empty()
+    }
+}
+
+// --- ExtractorConfigPass ---
+
+/// Generic config-driven boundary detection pass.
+///
+/// Reads `*.toml` from `<repo_root>/.oh/extractors/` and emits `Produces`/`Consumes`
+/// edges for any declared pattern that matches. Zero broker-specific knowledge in RNA
+/// source — the config files teach RNA.
+struct ExtractorConfigPass;
+
+impl PostExtractionPass for ExtractorConfigPass {
+    fn name(&self) -> &str { "extractor_config" }
+
+    // Always attempts to run — whether `.oh/extractors/` exists is determined
+    // at run time (cheap directory check in load_extractor_configs).
+    fn applies_when(&self, _detected_frameworks: &HashSet<String>) -> bool { true }
+
+    fn run(&self, nodes: &mut Vec<Node>, edges: &mut Vec<Edge>, ctx: &PassContext) -> PassResult {
+        // Derive the repo root path from root_pairs using the primary_slug.
+        // This avoids adding a new field to PassContext.
+        let repo_root = ctx.root_pairs
+            .iter()
+            .find(|(slug, _)| slug == &ctx.primary_slug)
+            .or_else(|| ctx.root_pairs.first())
+            .map(|(_, path)| path.as_path())
+            .unwrap_or_else(|| std::path::Path::new("."));
+
+        let result = crate::extract::extractor_config::extractor_config_pass(
+            nodes,
+            repo_root,
             &ctx.primary_slug,
         );
         if !result.nodes.is_empty() || !result.edges.is_empty() {
