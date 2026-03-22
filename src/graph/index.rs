@@ -1006,10 +1006,17 @@ fn louvain_phase1(
 /// ## Complexity
 ///
 /// The `cross_weights` HashMap is built once from all edges (O(E)) and
-/// then maintained incrementally: after each merge of communities A→B,
-/// only the entries referencing A are updated — O(degree of A in the
-/// inter-community graph), typically O(K) per round rather than O(N+E).
-/// Total Phase 2 cost: O(E + rounds × K) instead of the previous
+/// then maintained incrementally. A companion `cross_neighbors` map
+/// (community → set of neighboring communities) enables O(degree) lookup
+/// of incident keys during each merge, eliminating the O(|cross_weights|)
+/// scan that the naïve approach required.
+///
+/// After each merge of community A into B:
+/// - Transfer weights from all A entries to the corresponding B entries.
+/// - Remove A from all neighbor sets and add B where appropriate.
+/// - Per-merge cost: O(degree of A in the inter-community graph).
+///
+/// Total Phase 2 cost: O(E + rounds × avg_degree) instead of the previous
 /// O(rounds × (N + E + K²)).
 fn louvain_phase2(
     adj: &[Vec<(usize, f64)>],
@@ -1059,15 +1066,22 @@ fn louvain_phase2(
     // Each entry (ca, cb) where ca < cb holds the total weight of edges
     // crossing between communities ca and cb.
     //
-    // Per-round cost after this initial scan: O(degree of merged communities)
+    // `cross_neighbors` is a symmetric adjacency set: cross_neighbors[c] gives
+    // all communities c shares a cross-edge with. This allows O(degree) lookup
+    // of incident keys instead of O(|cross_weights|) scanning.
+    //
+    // Per-round cost: O(degree of merged community in inter-community graph)
     // instead of the previous O(N + E + K²) rebuild.
     let mut cross_weights: HashMap<(usize, usize), f64> = HashMap::new();
+    let mut cross_neighbors: HashMap<usize, HashSet<usize>> = HashMap::new();
     for node in 0..n {
         let ca = community[node];
         for &(nbr, w) in &adj[node] {
             let cb = community[nbr];
             if ca < cb {
                 *cross_weights.entry((ca, cb)).or_default() += w;
+                cross_neighbors.entry(ca).or_default().insert(cb);
+                cross_neighbors.entry(cb).or_default().insert(ca);
             }
         }
     }
@@ -1125,32 +1139,39 @@ fn louvain_phase2(
             *comm_sizes.get_mut(&to).unwrap() = to_size + from_size;
             comm_sizes.remove(&from);
 
-            // Update cross_weights incrementally.
+            // Update cross_weights incrementally using cross_neighbors.
             //
-            // For every community X != from and X != to:
+            // Iterate only over `from`'s neighbors (O(degree of from in
+            // inter-community graph)) — not the full cross_weights map.
+            //
+            // For every community X neighboring `from`:
             //   new_weight(to, X) = old_weight(to, X) + old_weight(from, X)
             //
-            // We must handle the canonical (lo, hi) key ordering.
-            // Collect keys that reference `from` so we can iterate without
-            // borrowing `cross_weights` mutably at the same time.
-            let keys_with_from: Vec<(usize, usize)> = cross_weights
-                .keys()
-                .filter(|&&(a, b)| a == from || b == from)
-                .copied()
-                .collect();
-
-            for key in keys_with_from {
+            // Also remove `from` from each neighbor's neighbor-set and add `to`.
+            let from_neighbors = cross_neighbors.remove(&from).unwrap_or_default();
+            for other in from_neighbors {
+                // Remove `from` from `other`'s neighbor set.
+                if let Some(nbrs) = cross_neighbors.get_mut(&other) {
+                    nbrs.remove(&from);
+                }
+                // Get the weight of the (from, other) cross-edge and remove it.
+                let key = if from < other { (from, other) } else { (other, from) };
                 let w = cross_weights.remove(&key).unwrap_or(0.0);
-                // The other community involved in this edge.
-                let other = if key.0 == from { key.1 } else { key.0 };
                 if other == to {
-                    // This was the edge between `from` and `to` — drop it,
-                    // it's now an intra-community edge.
+                    // The (from, to) edge is now intra-community — drop it.
+                    // Also remove `to` from `from`'s side (already gone since
+                    // we removed from from cross_neighbors above).
+                    if let Some(nbrs) = cross_neighbors.get_mut(&to) {
+                        nbrs.remove(&from);
+                    }
                     continue;
                 }
-                // Merge the weight into the (to, other) entry.
+                // Accumulate weight into (to, other).
                 let new_key = if to < other { (to, other) } else { (other, to) };
                 *cross_weights.entry(new_key).or_default() += w;
+                // Update neighbor sets so `other` now knows about `to`.
+                cross_neighbors.entry(to).or_default().insert(other);
+                cross_neighbors.entry(other).or_default().insert(to);
             }
         }
     }
