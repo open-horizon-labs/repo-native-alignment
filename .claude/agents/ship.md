@@ -49,8 +49,10 @@ Before starting:
    COUNT=$(repo-native-alignment search "" --repo . --limit 1 2>/dev/null | grep -o "[0-9]* symbols" | head -1)
    echo "RNA ready: $COUNT indexed"
 
-   # If count is 0 or command failed, scan now
-   repo-native-alignment scan --repo . --full 2>&1 | tail -2
+   # Only run full scan if index is empty or unavailable
+   if [ -z "$COUNT" ] || [ "$COUNT" = "0" ]; then
+     repo-native-alignment scan --repo . --full 2>&1 | tail -2
+   fi
    ```
    You CANNOT do code review, dissent analysis, or adversarial testing without an indexed worktree. Any Grep/Read for code navigation after this point is a friction event and must be logged to `.oh/friction-logs/<pr-number>-ship.md`.
 
