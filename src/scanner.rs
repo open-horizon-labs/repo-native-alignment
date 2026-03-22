@@ -19,6 +19,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::walk::is_worktree_with_own_cache;
 
+/// Returns `true` (and emits an INFO log) when `path` should be skipped
+/// because it is a git worktree that maintains its own RNA index.
+///
+/// Centralising the log-and-return here avoids duplicating the
+/// `tracing::info!` message in every walk code path.
+fn skip_if_independent_worktree(path: &Path) -> bool {
+    if is_worktree_with_own_cache(path) {
+        tracing::info!(
+            "skipping worktree {}: has own RNA cache",
+            path.display()
+        );
+        return true;
+    }
+    false
+}
+
 // ── Default excludes ────────────────────────────────────────────────
 
 pub const DEFAULT_EXCLUDES: &[&str] = &[
@@ -845,11 +861,7 @@ impl Scanner {
 
             if ft.is_dir() {
                 // Skip subdirectories that are independently-indexed git worktrees.
-                if is_worktree_with_own_cache(&path) {
-                    tracing::info!(
-                        "skipping worktree {}: has own RNA cache",
-                        path.display()
-                    );
+                if skip_if_independent_worktree(&path) {
                     continue;
                 }
                 self.walk_dir_mtime(&path, changed, new, new_dir_mtimes, new_file_mtimes)?;
@@ -942,11 +954,7 @@ impl Scanner {
 
             if ft.is_dir() {
                 // Skip subdirectories that are independently-indexed git worktrees.
-                if is_worktree_with_own_cache(&path) {
-                    tracing::info!(
-                        "skipping worktree {}: has own RNA cache",
-                        path.display()
-                    );
+                if skip_if_independent_worktree(&path) {
                     continue;
                 }
 
@@ -2360,6 +2368,7 @@ exclude = ["dist/"]
         fs::write(wt_no_cache.join(".git"), "gitdir: ../../.git/worktrees/no-cache-branch\n").unwrap();
         create_file(root, "worktrees/no-cache-branch/src/lib.rs", "pub fn helper() {}");
 
+        // ── First scan (new-file path) ──────────────────────────────
         let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
         let result = scanner.scan().unwrap();
 
@@ -2376,6 +2385,23 @@ exclude = ["dist/"]
         assert!(
             all_files.iter().any(|p| p.to_string_lossy().contains("no-cache-branch")),
             "worktree without cache must be indexed; got: {:?}", all_files
+        );
+
+        // ── Second scan (carry_forward_subtree / unchanged-dir path) ─
+        // Commit state so the second scan sees unchanged mtimes and exercises
+        // carry_forward_subtree rather than walk_dir_mtime.
+        scanner.commit_state().unwrap();
+
+        let mut scanner2 = Scanner::new(root.to_path_buf()).unwrap();
+        let result2 = scanner2.scan().unwrap();
+
+        // No files should change between scans (no filesystem mutations).
+        // The worktree with its own cache must still be absent.
+        let all_files2: Vec<_> = result2.new_files.iter().chain(result2.changed_files.iter()).collect();
+
+        assert!(
+            !all_files2.iter().any(|p| p.to_string_lossy().contains("feature-branch")),
+            "carry_forward path: worktree with own cache must still be skipped; got: {:?}", all_files2
         );
     }
 }

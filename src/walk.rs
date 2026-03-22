@@ -34,9 +34,9 @@ pub fn is_worktree_with_own_cache(dir: &Path) -> bool {
         _ => return false,
     }
 
-    // Condition 2: the worktree must have its own RNA LanceDB cache.
+    // Condition 2: the worktree must have its own RNA LanceDB cache directory.
     let cache_path = dir.join(".oh").join(".cache").join("lance");
-    cache_path.exists()
+    cache_path.is_dir()
 }
 
 fn git2_walk(repo_root: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
