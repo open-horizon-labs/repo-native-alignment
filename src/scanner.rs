@@ -2330,4 +2330,52 @@ exclude = ["dist/"]
         assert!(scan.exclude.contains(&"benchmark/".to_string()),
             "bad [lsp] section must not cause ScanConfig to fall back to defaults");
     }
+
+    // ── Worktree skip tests ─────────────────────────────────────────
+
+    /// Files inside a worktree subdirectory that has its own RNA cache must NOT
+    /// appear in the scan result. Files in a sibling dir without a cache must
+    /// still be found.
+    #[test]
+    fn test_scan_skips_worktree_with_own_cache() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Set up main repo's .oh/.cache directory (required for Scanner::new)
+        fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+
+        // File in the main repo — should be found
+        create_file(root, "src/main.rs", "fn main() {}");
+
+        // Subdirectory that IS a worktree with its own cache — should be skipped
+        let wt = root.join("worktrees/feature-branch");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join(".git"), "gitdir: ../../.git/worktrees/feature-branch\n").unwrap();
+        fs::create_dir_all(wt.join(".oh/.cache/lance")).unwrap();
+        create_file(root, "worktrees/feature-branch/src/feature.rs", "pub fn feature() {}");
+
+        // Subdirectory that is a worktree WITHOUT a cache — should be indexed by main scan
+        let wt_no_cache = root.join("worktrees/no-cache-branch");
+        fs::create_dir_all(&wt_no_cache).unwrap();
+        fs::write(wt_no_cache.join(".git"), "gitdir: ../../.git/worktrees/no-cache-branch\n").unwrap();
+        create_file(root, "worktrees/no-cache-branch/src/lib.rs", "pub fn helper() {}");
+
+        let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
+        let result = scanner.scan().unwrap();
+
+        let all_files: Vec<_> = result.new_files.iter().chain(result.changed_files.iter()).collect();
+
+        assert!(
+            all_files.iter().any(|p| p.ends_with("main.rs")),
+            "main repo file must be found; got: {:?}", all_files
+        );
+        assert!(
+            !all_files.iter().any(|p| p.to_string_lossy().contains("feature-branch")),
+            "worktree with own cache must be skipped; got: {:?}", all_files
+        );
+        assert!(
+            all_files.iter().any(|p| p.to_string_lossy().contains("no-cache-branch")),
+            "worktree without cache must be indexed; got: {:?}", all_files
+        );
+    }
 }
