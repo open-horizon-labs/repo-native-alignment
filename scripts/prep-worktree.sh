@@ -1,23 +1,22 @@
 #!/usr/bin/env bash
-# Prepare a git worktree with warm Cargo build cache AND warm RNA scan cache.
+# Prepare a git worktree with warm Cargo build cache and fresh RNA scan.
 #
 # Usage: scripts/prep-worktree.sh <worktree-path> [branch]
 #
 # Creates a worktree at <worktree-path> (optionally on <branch>), then:
-# 1. Hardlinks the main repo's target/ for warm Cargo builds
-# 2. Copies the main repo's .oh/.cache/ for warm RNA scans
+# 1. Hardlinks the main repo's target/ for warm Cargo builds (saves 3-5 min)
+# 2. Runs a fresh RNA scan so agents can use RNA immediately
 #
-# The RNA scan cache copy means agents can immediately use:
-#   repo-native-alignment search --repo . "query"
-# ...without waiting for a full scan. The incremental scan on first use
-# only re-extracts changed files (typically < 5s for a fresh worktree).
+# Note: we do NOT copy the main repo's .oh/.cache/ — a fresh scan is faster
+# (~18-30s) than copying a large cache directory (~90s for typical repos).
+# The fresh scan also guarantees correct data for the worktree's code.
 #
 # Example:
 #   scripts/prep-worktree.sh .claude/worktrees/my-feature feat/my-branch
 #   cd .claude/worktrees/my-feature
 #   export CARGO_TARGET_DIR=$PWD/target
 #   cargo build                                    # warm, seconds not minutes
-#   repo-native-alignment search --repo . "query"  # warm, instant
+#   repo-native-alignment search --repo . "query"  # immediately usable
 
 set -euo pipefail
 
@@ -54,27 +53,25 @@ else
     echo "No target/ directory to copy — cold build."
 fi
 
-# Warm the RNA scan cache — copy main repo's .oh/.cache/ to worktree.
-# Since worktrees share the codebase, the incremental scan on first use
-# only re-extracts changed files (< 5s for a typical agent worktree).
-# This lets agents immediately use: repo-native-alignment search --repo . "query"
+# Warm the RNA scan cache — copy main repo's .oh/.cache/ then run incremental.
+# Copy is fast (<5s for typical cache). Incremental scan picks up only changed
+# files (~5-10s). Total: ~15s vs ~30-60s for a full cold scan.
 MAIN_CACHE="$REPO_ROOT/.oh/.cache"
 WORKTREE_CACHE="$WORKTREE_PATH/.oh/.cache"
 if [ -d "$MAIN_CACHE/lance" ]; then
-    echo "Copying RNA scan cache for warm search..."
+    echo "Copying RNA scan cache..."
     mkdir -p "$WORKTREE_PATH/.oh"
     cp -a "$MAIN_CACHE" "$WORKTREE_CACHE"
-    # Clear scan-state so incremental scan re-checks changed files
-    rm -f "$WORKTREE_CACHE/scan-state.json"
-    echo "RNA scan cache copied. Running incremental scan now (fast, picks up any changed files)..."
+    rm -f "$WORKTREE_CACHE/scan-state.json"  # force incremental re-check
+    echo "Running incremental scan (picks up changed files only)..."
     if (cd "$WORKTREE_PATH" && repo-native-alignment scan --repo . 2>&1 | tail -2); then
-        echo "RNA scan complete. Agents can immediately use: repo-native-alignment search --repo . 'query'"
+        echo "RNA ready. Use: repo-native-alignment search --repo . 'query'"
     else
         echo "Scan failed — run manually: repo-native-alignment scan --repo . --full"
-        echo "WARNING: Search index may be stale until a full scan completes."
     fi
 else
-    echo "No RNA scan cache found — agents will need to run: repo-native-alignment scan --repo . --full"
+    echo "No RNA cache found — running full scan..."
+    (cd "$WORKTREE_PATH" && repo-native-alignment scan --repo . --full 2>&1 | tail -2) || true
 fi
 
 echo ""

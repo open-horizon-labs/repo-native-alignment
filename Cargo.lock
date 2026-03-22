@@ -6296,6 +6296,7 @@ dependencies = [
  "petgraph",
  "pulldown-cmark",
  "rayon",
+ "regex",
  "rust-mcp-sdk",
  "serde",
  "serde_json",
