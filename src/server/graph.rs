@@ -662,14 +662,28 @@ impl RnaHandler {
             }
         }
 
-        // 4f. Next.js file-path routing pass: emit ApiEndpoint nodes for
-        //     Next.js App Router and Pages Router API routes.  Path-pattern
-        //     matching only — no tree-sitter needed.  Runs after tree-sitter
-        //     extraction so that Implements edges can link to Function nodes.
+        // 4f. Framework detection pass: scan Import nodes, detect frameworks,
+        // emit NodeKind::Other("framework") nodes. Runs BEFORE conditional passes
+        // (Next.js routing, pub/sub, SSE) so they can gate on detected frameworks.
         {
-            // Include lsp_only roots (e.g. client/) — Next.js routing is path-based,
-            // not tree-sitter-based, so it must walk all roots including subdirectory
-            // roots that are skipped for extraction.
+            let primary_slug = crate::roots::RootConfig::code_project(self.repo_root.clone()).slug();
+            let fw_result = framework_detection_pass(&all_nodes, &primary_slug);
+            if !fw_result.nodes.is_empty() {
+                all_nodes.extend(fw_result.nodes);
+            }
+            all_detected_frameworks = fw_result.detected_frameworks;
+        }
+
+        // 4g. Next.js file-path routing pass: emit ApiEndpoint nodes for
+        //     Next.js App Router and Pages Router API routes.
+        //     Gated: runs when Next.js framework detected via imports OR when
+        //     TypeScript/JavaScript files are present (the routing pass uses file
+        //     system patterns, so any TS/JS project might be Next.js).
+        let has_ts_js_files = all_nodes.iter().any(|n| {
+            matches!(n.language.as_str(), "typescript" | "javascript")
+        });
+        if all_detected_frameworks.contains("nextjs-app-router") || has_ts_js_files {
+            // Include lsp_only roots (e.g. client/) — Next.js routing is path-based.
             let nextjs_roots: Vec<(String, std::path::PathBuf)> = workspace
                 .resolved_roots()
                 .iter()
@@ -690,20 +704,30 @@ impl RnaHandler {
             }
         }
 
-        // 4f. Framework detection pass: scan Import nodes, detect frameworks,
-        // emit NodeKind::Other("framework") nodes. Must run before conditional
-        // extractors (pub/sub, SSE, gRPC) so they can gate on detected frameworks.
-        {
-            let primary_slug = crate::roots::RootConfig::code_project(self.repo_root.clone()).slug();
-            let fw_result = framework_detection_pass(&all_nodes, &primary_slug);
-            if !fw_result.nodes.is_empty() {
-                all_nodes.extend(fw_result.nodes);
-                // detected_frameworks stored in GraphState after full build
-                // (passed to GraphState constructor below via a local)
+        // 4h. Pub/sub pass: emit Produces/Consumes edges for Kafka/Celery/Pika.
+        //     Gated: only runs when kafka-python, kafkajs, celery, or pika detected.
+        if crate::extract::pubsub::should_run(&all_detected_frameworks) {
+            let pubsub_primary_slug =
+                crate::roots::RootConfig::code_project(self.repo_root.clone()).slug();
+            let pubsub_result =
+                crate::extract::pubsub::pubsub_pass(&all_nodes, &all_detected_frameworks, &pubsub_primary_slug);
+            if !pubsub_result.edges.is_empty() {
+                all_nodes.extend(pubsub_result.nodes);
+                all_edges.extend(pubsub_result.edges);
             }
-            // Store detected frameworks for GraphState (used by incremental path too).
-            // We collect here and pass into the Ok(GraphState { ... }) below.
-            all_detected_frameworks = fw_result.detected_frameworks;
+        }
+
+        // 4i. WebSocket/SSE pass: emit Produces/Consumes edges for Socket.IO.
+        //     Gated: only runs when socketio framework detected.
+        if crate::extract::websocket::should_run(&all_detected_frameworks) {
+            let ws_primary_slug =
+                crate::roots::RootConfig::code_project(self.repo_root.clone()).slug();
+            let ws_result =
+                crate::extract::websocket::websocket_pass(&all_nodes, &all_detected_frameworks, &ws_primary_slug);
+            if !ws_result.edges.is_empty() {
+                all_nodes.extend(ws_result.nodes);
+                all_edges.extend(ws_result.edges);
+            }
         }
 
         // 5. Build petgraph index
@@ -1101,12 +1125,12 @@ impl RnaHandler {
             }
         }
 
-        // Re-run Next.js routing pass with the full node set so that
-        // new/changed route files produce ApiEndpoint nodes and Implements
-        // edges. Include in upsert delta so nodes/edges are persisted.
-        {
-            // Include all roots (including lsp_only subdirs like client/) — Next.js
-            // routing is path-based and must walk all roots.
+        // Re-run Next.js routing pass — gated: Next.js detected OR TypeScript/JS present.
+        let has_ts_js_incremental = graph.nodes.iter().any(|n| {
+            matches!(n.language.as_str(), "typescript" | "javascript")
+        });
+        if graph.has_framework("nextjs-app-router") || has_ts_js_incremental {
+            // Include all roots (including lsp_only subdirs like client/).
             let nextjs_roots: Vec<(String, std::path::PathBuf)> = WorkspaceConfig::load()
                 .with_primary_root(self.repo_root.clone())
                 .with_worktrees(&self.repo_root)
@@ -1125,7 +1149,6 @@ impl RnaHandler {
                     nextjs_result.nodes.len(),
                     nextjs_result.edges.len()
                 );
-                // Include in upsert delta so nodes/edges are persisted to LanceDB.
                 upsert_node_ids.extend(nextjs_result.nodes.iter().map(|n| n.stable_id()));
                 upsert_edges.extend(nextjs_result.edges.iter().cloned());
                 graph.nodes.extend(nextjs_result.nodes);
@@ -1133,8 +1156,8 @@ impl RnaHandler {
             }
         }
 
-        // Pre-clean: remove stale virtual nodes (subsystem + framework) and their
-        // BelongsTo/UsesFramework edges BEFORE dedup/index/PageRank. This ensures
+        // Pre-clean: remove stale virtual nodes (subsystem, framework, channel, event) and
+        // their associated edges BEFORE dedup/index/PageRank. This ensures
         // detect_communities() only sees real code symbols.
         // Collect virtual file paths for LanceDB deletion — these will be added to
         // files_to_remove so the old rows are removed from LanceDB on persist.
@@ -1142,14 +1165,16 @@ impl RnaHandler {
             .nodes
             .iter()
             .filter(|n| {
-                matches!(&n.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework"))
+                matches!(&n.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event"))
             })
             .map(|n| n.id.file.clone())
             .collect();
-        graph.nodes.retain(|n| !matches!(&n.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework")));
+        graph.nodes.retain(|n| !matches!(&n.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")));
         graph.edges.retain(|e| {
             !matches!(&e.to.kind, NodeKind::Other(s) if s == "subsystem")
                 && e.kind != crate::graph::EdgeKind::UsesFramework
+                && e.kind != crate::graph::EdgeKind::Produces
+                && e.kind != crate::graph::EdgeKind::Consumes
         });
         // Schedule stale virtual file paths for LanceDB deletion so they won't
         // reappear on reload. The fresh nodes (re-emitted later) will be upserted.
@@ -1305,6 +1330,40 @@ impl RnaHandler {
             if !sub_fw_edges.is_empty() {
                 upsert_edges.extend(sub_fw_edges.iter().cloned());
                 graph.edges.extend(sub_fw_edges);
+            }
+
+            // Pub/sub pass (incremental) — gated on detected frameworks.
+            if crate::extract::pubsub::should_run(&graph.detected_frameworks) {
+                let pubsub_result = crate::extract::pubsub::pubsub_pass(
+                    &graph.nodes,
+                    &graph.detected_frameworks,
+                    &primary_slug,
+                );
+                if !pubsub_result.edges.is_empty() {
+                    for node in &pubsub_result.nodes {
+                        upsert_node_ids.insert(node.stable_id());
+                    }
+                    upsert_edges.extend(pubsub_result.edges.iter().cloned());
+                    graph.nodes.extend(pubsub_result.nodes);
+                    graph.edges.extend(pubsub_result.edges);
+                }
+            }
+
+            // WebSocket/SSE pass (incremental) — gated on socketio framework.
+            if crate::extract::websocket::should_run(&graph.detected_frameworks) {
+                let ws_result = crate::extract::websocket::websocket_pass(
+                    &graph.nodes,
+                    &graph.detected_frameworks,
+                    &primary_slug,
+                );
+                if !ws_result.edges.is_empty() {
+                    for node in &ws_result.nodes {
+                        upsert_node_ids.insert(node.stable_id());
+                    }
+                    upsert_edges.extend(ws_result.edges.iter().cloned());
+                    graph.nodes.extend(ws_result.nodes);
+                    graph.edges.extend(ws_result.edges);
+                }
             }
         }
 
