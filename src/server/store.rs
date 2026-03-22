@@ -623,6 +623,16 @@ fn build_symbols_batch(nodes: &[Node], scan_version: u64) -> anyhow::Result<Reco
     let doc_comments: Vec<Option<String>> = nodes.iter()
         .map(|n| n.metadata.get("doc_comment").cloned())
         .collect();
+    // gRPC / proto columns — populated for proto RPC Function nodes (#466)
+    let parent_services: Vec<Option<String>> = nodes.iter()
+        .map(|n| n.metadata.get("parent_service").cloned())
+        .collect();
+    let rpc_request_types: Vec<Option<String>> = nodes.iter()
+        .map(|n| n.metadata.get("request_type").cloned())
+        .collect();
+    let rpc_response_types: Vec<Option<String>> = nodes.iter()
+        .map(|n| n.metadata.get("response_type").cloned())
+        .collect();
     let updated_ats: Vec<i64> = vec![now; nodes.len()];
     let scan_versions: Vec<u64> = vec![scan_version; nodes.len()];
 
@@ -663,6 +673,9 @@ fn build_symbols_batch(nodes: &[Node], scan_version: u64) -> anyhow::Result<Reco
             Arc::new(StringArray::from(http_methods)),
             Arc::new(StringArray::from(http_paths)),
             Arc::new(StringArray::from(doc_comments)),
+            Arc::new(StringArray::from(parent_services)),
+            Arc::new(StringArray::from(rpc_request_types)),
+            Arc::new(StringArray::from(rpc_response_types)),
             Arc::new(Int64Array::from(updated_ats)),
             Arc::new(UInt64Array::from(scan_versions)),
         ],
@@ -1234,6 +1247,13 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
             // doc_comment column — survives LSP reindex round-trip (#416)
             let doc_comment_col = batch.column_by_name("doc_comment")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            // gRPC / proto columns — survives round-trip for GrpcClientCallsPass on incremental scans (#466)
+            let parent_service_col = batch.column_by_name("parent_service")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let rpc_request_type_col = batch.column_by_name("rpc_request_type")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let rpc_response_type_col = batch.column_by_name("rpc_response_type")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
             for i in 0..batch.num_rows() {
                 let file_path = PathBuf::from(file_paths.value(i));
@@ -1397,6 +1417,31 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("doc_comment".to_string(), val.to_string());
+                        }
+                    }
+                }
+                // gRPC / proto columns — restore metadata for GrpcClientCallsPass (#466)
+                if let Some(col) = parent_service_col {
+                    if !col.is_null(i) {
+                        let val = col.value(i);
+                        if !val.is_empty() {
+                            metadata.insert("parent_service".to_string(), val.to_string());
+                        }
+                    }
+                }
+                if let Some(col) = rpc_request_type_col {
+                    if !col.is_null(i) {
+                        let val = col.value(i);
+                        if !val.is_empty() {
+                            metadata.insert("request_type".to_string(), val.to_string());
+                        }
+                    }
+                }
+                if let Some(col) = rpc_response_type_col {
+                    if !col.is_null(i) {
+                        let val = col.value(i);
+                        if !val.is_empty() {
+                            metadata.insert("response_type".to_string(), val.to_string());
                         }
                     }
                 }

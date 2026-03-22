@@ -253,6 +253,7 @@ impl PostExtractionRegistry {
         reg.register(Box::new(NextjsRoutingPass));
         reg.register(Box::new(PubSubPass));
         reg.register(Box::new(WebSocketPass));
+        reg.register(Box::new(GrpcClientCallsPass));
         // Group 4: config-driven passes — reads .oh/extractors/*.toml at scan time.
         // Unconditional: applies_when always true; cost is zero when the directory
         // doesn't exist (load_extractor_configs returns early).
@@ -479,6 +480,31 @@ impl PostExtractionPass for WebSocketPass {
         if !result.nodes.is_empty() || !result.edges.is_empty() {
             nodes.extend(result.nodes);
             edges.extend(result.edges);
+        }
+        PassResult::empty()
+    }
+}
+
+// --- GrpcClientCallsPass ---
+
+/// Post-extraction pass that emits `Calls` edges from gRPC client stub call
+/// sites to proto RPC method `Function` nodes.
+///
+/// Gates on `grpc-python`, `grpc-go`, or `grpc-js` framework detection —
+/// zero cost for repos with no gRPC usage.
+struct GrpcClientCallsPass;
+
+impl PostExtractionPass for GrpcClientCallsPass {
+    fn name(&self) -> &str { "grpc_client_calls" }
+
+    fn applies_when(&self, detected_frameworks: &HashSet<String>) -> bool {
+        crate::extract::grpc::should_run(detected_frameworks)
+    }
+
+    fn run(&self, nodes: &mut Vec<Node>, edges: &mut Vec<Edge>, _ctx: &PassContext) -> PassResult {
+        let new_edges = crate::extract::grpc::grpc_client_calls_pass(nodes);
+        if !new_edges.is_empty() {
+            edges.extend(new_edges);
         }
         PassResult::empty()
     }
