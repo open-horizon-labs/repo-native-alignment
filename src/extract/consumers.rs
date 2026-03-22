@@ -771,18 +771,27 @@ impl ExtractionConsumer for SubsystemConsumer {
 // EventBus::with_builtins
 // ---------------------------------------------------------------------------
 
-/// Build an `EventBus` pre-loaded with all built-in synchronous consumers.
+/// Build an `EventBus` pre-loaded with all built-in consumers.
 ///
-/// The bus covers the synchronous portion of the pipeline:
-/// - Tree-sitter extraction (per root)
-/// - Language accumulation (per root)
-/// - Post-extraction passes (per root)
-/// - Framework-gated pass stubs (nextjs, pubsub, websocket)
-/// - New consumer stubs (openapi, grpc, custom extractors)
+/// All consumers — including async ones (LSP, embedding, LanceDB) — are registered
+/// here as **Phase 2 stubs**. The stubs subscribe to the correct events and emit
+/// the correct follow-on events, but do not perform the actual async work yet.
+/// In Phase 2, async work continues via the existing `spawn_background_enrichment`
+/// path; Phase 3+ promotes these stubs to full async consumers.
 ///
-/// Async consumers (LSP enrichment, embedding, LanceDB persist) are NOT
-/// registered here — they run via the existing spawn_background_enrichment
-/// path in Phase 2. Phase 3+ will move them onto the bus.
+/// Registered consumers:
+/// - `ManifestConsumer`, `TreeSitterConsumer` — `RootDiscovered`
+/// - `LanguageAccumulatorConsumer`, `PostExtractionConsumer`,
+///   `OpenApiConsumer`, `GrpcConsumer`, `EmbeddingIndexerConsumer` — `RootExtracted`
+/// - `LspConsumer(lang)` × N — `LanguageDetected` (one per language from `EnricherRegistry`)
+/// - `FrameworkDetectionConsumer`, `NextjsRoutingConsumer`,
+///   `PubSubConsumer`, `WebSocketConsumer` — `FrameworkDetected`
+/// - `SubsystemConsumer`, `LanceDBConsumer` — `PassesComplete`
+///
+/// Note: `CustomExtractorConsumer` is not pre-registered here because the set of
+/// custom extractors is config-driven (`.oh/extractors/*.toml`) and unknown at
+/// startup. Callers loading custom extractor configs must register additional
+/// `CustomExtractorConsumer` instances after calling `build_builtin_bus()`.
 ///
 /// `root_pairs` must be the full `(slug, path)` list for the workspace.
 /// `primary_slug` is the slug of the primary code root.
