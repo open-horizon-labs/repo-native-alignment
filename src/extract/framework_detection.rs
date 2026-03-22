@@ -65,6 +65,7 @@ pub struct FrameworkRule {
 /// Top-level shape of a framework rules TOML file.
 #[derive(Debug, Deserialize)]
 struct FrameworkRulesFile {
+    #[serde(default)]
     rules: Vec<FrameworkRule>,
 }
 
