@@ -1182,6 +1182,89 @@ mod tests {
         );
     }
 
+    /// Adversarial test for #453 fix: removing an lsp_only root from config must still
+    /// cause its LanceDB nodes to be pruned on the next scan.
+    ///
+    /// Verifies that `all_declared_slugs` (used for stale pruning) is rebuilt from
+    /// `resolved_roots` each scan, so a removed lsp_only root's slug falls out of
+    /// `all_declared_slugs` and its nodes are correctly treated as stale.
+    #[tokio::test]
+    async fn test_removed_lsp_only_root_nodes_get_pruned() {
+        use tempfile::TempDir;
+
+        let primary = TempDir::new().unwrap();
+        let client_dir = primary.path().join("client");
+
+        // Primary root: one Rust file
+        std::fs::create_dir_all(primary.path().join("src")).unwrap();
+        std::fs::write(
+            primary.path().join("src/lib.rs"),
+            "pub fn primary_fn() {}\n",
+        )
+        .unwrap();
+
+        // lsp_only subdirectory root: a Next.js Pages Router API route
+        std::fs::create_dir_all(client_dir.join("pages/api")).unwrap();
+        std::fs::write(
+            client_dir.join("pages/api/health.ts"),
+            "export default function handler(req: any, res: any) { res.json({ ok: true }); }\n",
+        )
+        .unwrap();
+
+        // Declare client as lsp_only root
+        let config_dir = primary.path().join(".oh");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[workspace.roots]\nclient = \"{}\"\n",
+                client_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let handler = RnaHandler {
+            repo_root: primary.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        // First build: ApiEndpoint nodes appear
+        let gs1 = handler.build_full_graph().await.unwrap();
+        assert!(
+            gs1.nodes
+                .iter()
+                .any(|n| n.id.kind == crate::graph::NodeKind::ApiEndpoint && n.id.root == "client"),
+            "First build must include ApiEndpoint from lsp_only client root"
+        );
+
+        // Remove the lsp_only root from config
+        std::fs::write(&config_path, "").unwrap();
+
+        // Force a second build (simulate rescan after config change)
+        {
+            let mut g = handler.graph.write().await;
+            *g = None;
+        }
+        let gs2 = handler.build_full_graph().await.unwrap();
+
+        // The client root is no longer declared — its nodes should be pruned
+        let client_nodes: Vec<_> = gs2
+            .nodes
+            .iter()
+            .filter(|n| n.id.root == "client")
+            .collect();
+        assert!(
+            client_nodes.is_empty(),
+            "After removing lsp_only root from config, its nodes must be pruned. \
+            Remaining client nodes: {:?}",
+            client_nodes
+                .iter()
+                .map(|n| &n.id.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_enricher_registry_includes_markdown() {
         // Verify that EnricherRegistry::with_builtins() registers enrichers for
