@@ -2,6 +2,24 @@
 //!
 //! Each handler parses MCP tool params, builds a service context, delegates to
 //! the shared service layer, and wraps the result as MCP `TextContent`.
+//!
+//! ## `repo` parameter
+//!
+//! `search`, `repo_map`, and `outcome_progress` accept an optional `repo` path.
+//! When provided, the handler loads a fresh [`GraphState`] from that path's
+//! `.oh/.cache/lance/` LanceDB instead of the server's in-memory graph. This
+//! lets agents in git worktrees query their own repo:
+//!
+//! ```text
+//! search(query="build_code_embedding_text", repo="/path/to/worktree")
+//! ```
+//!
+//! The worktree must have been scanned first:
+//! `repo-native-alignment scan --repo /path/to/worktree`
+//!
+//! Embedding (semantic) search is not available for external repos.
+
+use std::path::PathBuf;
 
 use petgraph::Direction;
 use rust_mcp_sdk::schema::{CallToolError, CallToolResult};
@@ -15,12 +33,66 @@ use crate::service::{
 };
 
 use super::helpers::text_result;
+use super::state::GraphState;
+use super::store::load_graph_from_lance;
 use super::tools::{OutcomeProgress, RepoMap, Search};
 use super::RnaHandler;
 
 impl RnaHandler {
+    /// Resolve an optional `repo` path string to a canonical [`PathBuf`].
+    ///
+    /// Accepts absolute paths. Relative paths are resolved against the server's
+    /// configured repo root (not the process CWD, which is undefined in MCP).
+    fn resolve_repo_path(&self, repo: &str) -> PathBuf {
+        let p = PathBuf::from(repo);
+        if p.is_absolute() {
+            p
+        } else {
+            self.repo_root.join(p)
+        }
+    }
+
+    /// Load a [`GraphState`] from an external repo path's LanceDB.
+    ///
+    /// Returns `Err` with a human-readable message if loading fails (e.g. the
+    /// repo has not been scanned yet).
+    async fn load_external_graph(&self, repo: &str) -> Result<GraphState, String> {
+        let repo_path = self.resolve_repo_path(repo);
+        load_graph_from_lance(&repo_path)
+            .await
+            .map_err(|e| format!(
+                "Failed to load graph from repo \"{}\": {}. \
+                 Ensure the repo has been scanned: \
+                 repo-native-alignment scan --repo \"{}\"",
+                repo_path.display(), e, repo_path.display()
+            ))
+    }
+
     pub(crate) async fn handle_search(&self, args: Search) -> Result<CallToolResult, CallToolError> {
         let params = SearchParams::from_mcp_search(&args);
+
+        // When `repo` is provided, load an external graph from that path.
+        // Semantic search is skipped (no embed_index for external repos).
+        if let Some(ref repo) = args.repo {
+            let external_graph = match self.load_external_graph(repo).await {
+                Ok(g) => g,
+                Err(e) => return Ok(text_result(e)),
+            };
+            let repo_path = self.resolve_repo_path(repo);
+            // No root filter: show all nodes from the external repo's graph.
+            let ctx = SearchContext {
+                graph_state: &external_graph,
+                embed_index: None,
+                repo_root: &repo_path,
+                lsp_status: None,
+                embed_status: None,
+                root_filter: None,
+                non_code_slugs: std::collections::HashSet::new(),
+            };
+            let markdown = crate::service::search(&params, &ctx).await;
+            return Ok(text_result(markdown));
+        }
+
         let root_filter = self.effective_root_filter(args.root.as_deref());
         let non_code_slugs = if root_filter.is_some() { self.non_code_root_slugs() } else { std::collections::HashSet::new() };
         let graph_guard = match self.get_graph().await { Ok(g) => g, Err(e) => return Ok(text_result(format!("Graph error: {}", e))), };
@@ -33,6 +105,24 @@ impl RnaHandler {
     }
 
     pub(crate) async fn handle_outcome_progress(&self, args: OutcomeProgress) -> Result<CallToolResult, CallToolError> {
+        // When `repo` is provided, load an external graph from that path.
+        if let Some(ref repo) = args.repo {
+            let external_graph = match self.load_external_graph(repo).await {
+                Ok(g) => g,
+                Err(e) => return Ok(text_result(e)),
+            };
+            let repo_path = self.resolve_repo_path(repo);
+            let params = OutcomeProgressParams {
+                outcome_id: args.outcome_id,
+                include_impact: args.include_impact.unwrap_or(false),
+                root_filter: None,
+                non_code_slugs: std::collections::HashSet::new(),
+            };
+            let ctx = OutcomeProgressContext { graph_state: &external_graph, repo_root: &repo_path };
+            let markdown = crate::service::outcome_progress(&params, &ctx);
+            return Ok(text_result(markdown));
+        }
+
         let root_filter = self.effective_root_filter(args.root.as_deref());
         let non_code_slugs = if root_filter.is_some() { self.non_code_root_slugs() } else { std::collections::HashSet::new() };
         let graph_guard = match self.get_graph().await { Ok(g) => g, Err(e) => return Ok(text_result(format!("Graph error: {}", e))), };
@@ -69,6 +159,28 @@ impl RnaHandler {
     }
 
     pub(crate) async fn handle_repo_map(&self, args: RepoMap) -> Result<CallToolResult, CallToolError> {
+        // When `repo` is provided, load an external graph from that path.
+        if let Some(ref repo) = args.repo {
+            let external_graph = match self.load_external_graph(repo).await {
+                Ok(g) => g,
+                Err(e) => return Ok(text_result(e)),
+            };
+            let repo_path = self.resolve_repo_path(repo);
+            let params = RepoMapParams {
+                top_n: args.top_n.unwrap_or(15) as usize,
+                root_filter: None,
+                non_code_slugs: std::collections::HashSet::new(),
+            };
+            let ctx = RepoMapContext {
+                graph_state: &external_graph,
+                repo_root: &repo_path,
+                lsp_status: None,
+                embed_status: None,
+            };
+            let markdown = crate::service::repo_map(&params, &ctx);
+            return Ok(text_result(markdown));
+        }
+
         let root_filter = self.effective_root_filter(args.root.as_deref());
         let non_code_slugs = if root_filter.is_some() { self.non_code_root_slugs() } else { std::collections::HashSet::new() };
         let graph_guard = match self.get_graph().await { Ok(g) => g, Err(e) => return Ok(text_result(format!("Graph error: {}", e))), };
@@ -497,5 +609,38 @@ mod tests {
         let groups = run_traversal_grouped(&index, "a", "neighbors", None, None, Some(&filter)).unwrap();
         assert_eq!(groups.len(), 2);
         assert!(!groups.contains_key(&EdgeKind::DependsOn));
+    }
+
+    // ── resolve_repo_path tests ──────────────────────────────────────────
+
+    fn make_handler(repo_root: &std::path::Path) -> RnaHandler {
+        RnaHandler {
+            repo_root: repo_root.to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_resolve_repo_path_absolute_passthrough() {
+        let root = PathBuf::from("/srv/main-repo");
+        let handler = make_handler(&root);
+        let resolved = handler.resolve_repo_path("/path/to/worktree");
+        assert_eq!(resolved, PathBuf::from("/path/to/worktree"));
+    }
+
+    #[test]
+    fn test_resolve_repo_path_relative_joins_repo_root() {
+        let root = PathBuf::from("/srv/main-repo");
+        let handler = make_handler(&root);
+        let resolved = handler.resolve_repo_path(".claude/worktrees/my-feature");
+        assert_eq!(resolved, PathBuf::from("/srv/main-repo/.claude/worktrees/my-feature"));
+    }
+
+    #[test]
+    fn test_resolve_repo_path_dot_joins_repo_root() {
+        let root = PathBuf::from("/srv/main-repo");
+        let handler = make_handler(&root);
+        let resolved = handler.resolve_repo_path(".");
+        assert_eq!(resolved, PathBuf::from("/srv/main-repo/."));
     }
 }

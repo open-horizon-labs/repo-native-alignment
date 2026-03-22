@@ -14,6 +14,12 @@ The full quality gate for this project. 13 steps. Run sequentially — each step
 >
 > **Two RNA access paths — use the right one:**
 > - **MCP tools** (`search`, `repo_map`, `outcome_progress`, `search_symbols`, `graph_query`) — use for project-level context: guardrails, outcomes, metis, impact analysis. These query the main RNA repo index.
+>   - **Worktree-aware queries:** use the `repo` parameter to scope to your worktree's graph:
+>     ```
+>     mcp__rna-mcp__search(query="handle_search", repo="/path/to/worktree")
+>     mcp__rna-mcp__repo_map(repo="/path/to/worktree")
+>     ```
+>     Requires the worktree to be scanned: `repo-native-alignment scan --repo /path/to/worktree`
 > - **CLI in your worktree** (`repo-native-alignment search --repo . "query"`, `repo-native-alignment graph --node "..." --repo . --mode neighbors`) — use for code navigation WITHIN your working directory. Always pass `--repo .` so it reads your local worktree's index.
 >
 > **Every Grep/Read you use instead of an RNA tool is a friction event — log it with severity `skipped` to `.oh/friction-logs/`.** When an RNA tool fails, log that too. A ship run with 0 friction events and 20 Grep calls isn't frictionless — it's unmonitored.
