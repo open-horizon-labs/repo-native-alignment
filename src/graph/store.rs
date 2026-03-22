@@ -39,7 +39,10 @@ pub const SCHEMA_VERSION: u32 = 17; // append-only rebuild: scan_version column 
 /// manifest, tested_by, directory_module, import_calls, framework_detection,
 /// nextjs_routing, pubsub, and websocket now run in both foreground and
 /// background paths — older caches lack these edges and must be re-extracted.
-pub const EXTRACTION_VERSION: u32 = 9;
+/// Bumped to 10 for generic extractor-config pass (#467): reads *.toml from
+/// .oh/extractors/ and emits NodeKind::Other("channel") nodes + Produces/Consumes
+/// edges. Older caches lack config-driven channel nodes and must be re-extracted.
+pub const EXTRACTION_VERSION: u32 = 10;
 
 /// Arrow schema for the `symbols` table.
 ///

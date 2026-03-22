@@ -236,6 +236,8 @@ impl PostExtractionRegistry {
     ///    `FrameworkDetectionPass` causes it to skip silently even when its framework
     ///    is present.
     /// 3. **Framework-gated passes last** (nextjs, pubsub, websocket)
+    /// 4. **Config-driven passes** (extractor_config) — unconditional; no-op when
+    ///    `.oh/extractors/` doesn't exist
     pub fn with_builtins() -> Self {
         let mut reg = Self::new();
         // Group 1: unconditional passes (no framework dependency)
@@ -250,6 +252,10 @@ impl PostExtractionRegistry {
         reg.register(Box::new(NextjsRoutingPass));
         reg.register(Box::new(PubSubPass));
         reg.register(Box::new(WebSocketPass));
+        // Group 4: config-driven passes — reads .oh/extractors/*.toml at scan time.
+        // Unconditional: applies_when always true; cost is zero when the directory
+        // doesn't exist (load_extractor_configs returns early).
+        reg.register(Box::new(ExtractorConfigPass));
         reg
     }
 }
@@ -448,6 +454,60 @@ impl PostExtractionPass for WebSocketPass {
         if !result.nodes.is_empty() || !result.edges.is_empty() {
             nodes.extend(result.nodes);
             edges.extend(result.edges);
+        }
+        PassResult::empty()
+    }
+}
+
+// --- ExtractorConfigPass ---
+
+/// Generic config-driven boundary detection pass.
+///
+/// Reads `*.toml` from `<repo_root>/.oh/extractors/` and emits `Produces`/`Consumes`
+/// edges for any declared pattern that matches. Zero broker-specific knowledge in RNA
+/// source — the config files teach RNA.
+struct ExtractorConfigPass;
+
+impl PostExtractionPass for ExtractorConfigPass {
+    fn name(&self) -> &str { "extractor_config" }
+
+    // Always attempts to run — whether `.oh/extractors/` exists is determined
+    // at run time (cheap directory check in load_extractor_configs).
+    fn applies_when(&self, _detected_frameworks: &HashSet<String>) -> bool { true }
+
+    fn run(&self, nodes: &mut Vec<Node>, edges: &mut Vec<Edge>, ctx: &PassContext) -> PassResult {
+        // Run per workspace root so that:
+        // - Each root's own `.oh/extractors/` configs are loaded independently
+        // - Synthetic channel nodes are anchored under the correct root slug
+        // - Import nodes from root A don't incorrectly activate root B's patterns
+        //
+        // For each root we filter `nodes` to only those belonging to that root
+        // before calling the pass, and use that root's slug for channel node IDs.
+        for (slug, path) in &ctx.root_pairs {
+            // Load configs for this specific root.
+            let configs =
+                crate::extract::extractor_config::load_extractor_configs(path.as_path());
+            if configs.is_empty() {
+                continue;
+            }
+
+            // Filter nodes to this root only (imports + functions both required).
+            // This prevents cross-root false positives: imports from root A should
+            // not trigger patterns defined for root B's namespace.
+            let root_nodes: Vec<_> = nodes.iter().filter(|n| &n.id.root == slug).cloned().collect();
+            if root_nodes.is_empty() {
+                continue;
+            }
+
+            let result = crate::extract::extractor_config::extractor_config_pass_with_configs(
+                &root_nodes,
+                slug.as_str(),
+                &configs,
+            );
+            if !result.nodes.is_empty() || !result.edges.is_empty() {
+                nodes.extend(result.nodes);
+                edges.extend(result.edges);
+            }
         }
         PassResult::empty()
     }

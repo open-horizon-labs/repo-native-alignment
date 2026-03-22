@@ -300,10 +300,42 @@ repo-native-alignment scan --repo . --full
 ├── guardrails/      <- constraints that shape behavior
 ├── metis/           <- learnings that compound across sessions
 ├── config.toml      <- scanner excludes, LSP severity threshold, pattern detection, declared workspace roots
+├── extractors/      <- custom boundary detection configs (optional, see below)
 └── .cache/          <- scan state, embedding index (gitignored)
 ```
 
 Business artifacts (`outcomes/`, `signals/`, `guardrails/`, `metis/`) are committed to git — they're part of the project. `.cache/` is gitignored and rebuilt automatically on first query.
+
+### Custom boundary detection: `.oh/extractors/`
+
+Declare custom pub/sub or event-bus boundary patterns in `.oh/extractors/*.toml`. RNA reads these at scan time and emits `Produces`/`Consumes` edges without any changes to RNA source.
+
+```toml
+# .oh/extractors/internal-event-bus.toml
+[meta]
+name = "internal-event-bus"
+applies_when = { language = "python", imports_contain = "src.events.bus" }
+
+[[boundaries]]
+function_pattern = "bus.publish"
+arg_position = 0
+edge_kind = "Produces"
+
+[[boundaries]]
+function_pattern = "bus.subscribe"
+arg_position = 0
+edge_kind = "Consumes"
+```
+
+**How it works:**
+1. `applies_when.language` — only fires on nodes in that language
+2. `applies_when.imports_contain` — only fires when at least one Import node contains this string (gates on the library being actually imported)
+3. `function_pattern` — substring to look for in function bodies
+4. `arg_position` (or `topic_arg`) — zero-indexed position of the argument that holds the topic/channel name (must be a string literal)
+5. `edge_kind` — `"Produces"` or `"Consumes"`
+6. `decorator` — (optional, default `false`) set to `true` when `function_pattern` is a decorator name (e.g., `@bus.subscribe`) — the body-text heuristic matches decorator patterns the same way as call patterns
+
+RNA includes built-in extractors for kafka-python, kafkajs, celery, pika, and redis-py. Use `.oh/extractors/` to add support for any other broker — Google Pub/Sub, AWS SNS, Azure Service Bus, internal event buses, custom RPC frameworks, etc.
 
 RNA also indexes agent rule/memory files when they exist alongside a project:
 
