@@ -63,19 +63,30 @@ enum Extraction {
 static PUBSUB_RULES: &[PubSubRule] = &[
     // -------------------------------------------------------------------------
     // kafka-python (confluent_kafka / kafka-python)
+    // Use producer-specific patterns to avoid matching unrelated .send() calls.
     // -------------------------------------------------------------------------
+    // confluent_kafka: producer.produce("topic", ...)
     PubSubRule {
         framework: "kafka-python",
-        body_pattern: ".produce(",
-        extraction: Extraction::QuotedAfter(".produce("),
+        body_pattern: "producer.produce(",
+        extraction: Extraction::QuotedAfter("producer.produce("),
         direction: Direction::Produces,
     },
+    // kafka-python: producer.send("topic", ...)
     PubSubRule {
         framework: "kafka-python",
-        body_pattern: ".send(",
-        extraction: Extraction::QuotedAfter(".send("),
+        body_pattern: "producer.send(",
+        extraction: Extraction::QuotedAfter("producer.send("),
         direction: Direction::Produces,
     },
+    // kafka-python consumer: consumer.subscribe(["topic"])
+    PubSubRule {
+        framework: "kafka-python",
+        body_pattern: "consumer.subscribe([",
+        extraction: Extraction::QuotedAfter("consumer.subscribe(["),
+        direction: Direction::Consumes,
+    },
+    // confluent_kafka: consumer.subscribe(["topic"])
     PubSubRule {
         framework: "kafka-python",
         body_pattern: ".subscribe([",
@@ -100,24 +111,27 @@ static PUBSUB_RULES: &[PubSubRule] = &[
     // -------------------------------------------------------------------------
     // Celery
     // -------------------------------------------------------------------------
+    // @app.task marks a Celery task handler (consumer side — it receives/handles tasks)
     PubSubRule {
         framework: "celery",
         body_pattern: "@app.task",
+        extraction: Extraction::FixedName("celery:task"),
+        direction: Direction::Consumes,
+    },
+    // .delay() and .apply_async() enqueue a task (producer side)
+    PubSubRule {
+        framework: "celery",
+        body_pattern: ".delay(",
         extraction: Extraction::FixedName("celery:task"),
         direction: Direction::Produces,
     },
     PubSubRule {
         framework: "celery",
-        body_pattern: ".delay(",
-        extraction: Extraction::FixedName("celery:task"),
-        direction: Direction::Consumes,
-    },
-    PubSubRule {
-        framework: "celery",
         body_pattern: ".apply_async(",
         extraction: Extraction::FixedName("celery:task"),
-        direction: Direction::Consumes,
+        direction: Direction::Produces,
     },
+    // app.send_task() sends a named task by string (producer side)
     PubSubRule {
         framework: "celery",
         body_pattern: "app.send_task(",
@@ -145,6 +159,30 @@ static PUBSUB_RULES: &[PubSubRule] = &[
         extraction: Extraction::QuotedAfter("queue="),
         direction: Direction::Produces,
     },
+    // -------------------------------------------------------------------------
+    // Redis pub/sub (Python redis-py / JS ioredis / node-redis)
+    // -------------------------------------------------------------------------
+    // Python: r.publish("channel", msg) → produces
+    PubSubRule {
+        framework: "redis",
+        body_pattern: ".publish(",
+        extraction: Extraction::QuotedAfter(".publish("),
+        direction: Direction::Produces,
+    },
+    // Python: p.subscribe("channel") → consumes
+    PubSubRule {
+        framework: "redis",
+        body_pattern: ".subscribe(",
+        extraction: Extraction::QuotedAfter(".subscribe("),
+        direction: Direction::Consumes,
+    },
+    // Python: p.psubscribe("channel*") → consumes
+    PubSubRule {
+        framework: "redis",
+        body_pattern: ".psubscribe(",
+        extraction: Extraction::QuotedAfter(".psubscribe("),
+        direction: Direction::Consumes,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -159,6 +197,7 @@ pub fn should_run(detected_frameworks: &HashSet<String>) -> bool {
         || detected_frameworks.contains("kafkajs")
         || detected_frameworks.contains("celery")
         || detected_frameworks.contains("pika")
+        || detected_frameworks.contains("redis")
 }
 
 /// Result of the pub/sub pass.
@@ -415,6 +454,11 @@ mod tests {
     }
 
     #[test]
+    fn test_should_run_with_redis() {
+        assert!(should_run(&fw(&["redis"])));
+    }
+
+    #[test]
     fn test_kafka_python_producer_send() {
         let node = make_fn(
             "repo",
@@ -457,7 +501,8 @@ mod tests {
         );
         let result = pubsub_pass(&[node], &fw(&["celery"]), "repo");
         assert!(!result.edges.is_empty(), "Should detect .delay(");
-        assert_eq!(result.edges[0].kind, EdgeKind::Consumes);
+        // .delay() enqueues a task — producer side
+        assert_eq!(result.edges[0].kind, EdgeKind::Produces);
     }
 
     #[test]
