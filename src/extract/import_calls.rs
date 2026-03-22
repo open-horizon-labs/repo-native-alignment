@@ -132,6 +132,14 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             continue;
         }
 
+        // Perf optimization: extract call sites from the body ONCE, then check
+        // each against the imports set. This is O(body_size + imports) instead
+        // of O(imports × body_size) when iterating imports first.
+        let called_names = extract_call_sites(&node.body);
+        if called_names.is_empty() {
+            continue;
+        }
+
         // For each imported name that appears as a call in this function body
         for imported_name in imported_names {
             // Skip very short names to avoid false positives.
@@ -142,8 +150,8 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             if node.id.name == imported_name.as_str() {
                 continue;
             }
-            // Check if the function body contains a call to this name.
-            if !body_contains_call(&node.body, imported_name) {
+            // Check if the extracted call sites include this imported name.
+            if !called_names.contains(imported_name.as_str()) {
                 continue;
             }
 
@@ -434,6 +442,43 @@ fn parse_es6_import_names(text: &str) -> Vec<String> {
 /// i.e., the name appears followed by `(` with no intervening `.` or `::`.
 ///
 /// This is intentionally conservative: only `name(` counts, not `obj.name(`.
+/// Extract all function call site names from a body in one pass.
+/// Returns a HashSet of identifier names that appear immediately before `(`.
+/// O(body_size) — called once per function body instead of once per import name.
+pub(crate) fn extract_call_sites(body: &str) -> HashSet<&str> {
+    let mut result = HashSet::new();
+    let bytes = body.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        // Find '('
+        if bytes[i] == b'(' && i > 0 {
+            // Walk backwards to find the identifier
+            let mut end = i;
+            let mut j = i.saturating_sub(1);
+            // Skip whitespace
+            while j > 0 && bytes[j] == b' ' { j -= 1; }
+            end = j + 1;
+            // Walk back through identifier chars
+            while j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || bytes[j - 1] == b'_' || bytes[j - 1] == b'$') {
+                j -= 1;
+            }
+            if j < end {
+                let ident = &body[j..end];
+                if ident.len() >= 4 {
+                    // Reject if preceded by '.' or ':' (method/scoped call)
+                    let prev = if j > 0 { bytes[j - 1] } else { 0 };
+                    if prev != b'.' && prev != b':' {
+                        result.insert(ident);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    result
+}
+
 pub(crate) fn body_contains_call(body: &str, name: &str) -> bool {
     // Fast reject: name must appear somewhere in the body.
     if !body.contains(name) {

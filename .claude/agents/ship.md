@@ -298,6 +298,9 @@ UPDATED_BODY="$(printf '%s' "$CURRENT_BODY" | sed 's/- \[ \]/- [x]/g')"
 gh issue edit <ISSUE> --body "$UPDATED_BODY"
 # Then merge
 gh pr merge <PR-number> --squash --delete-branch
+# Clean up the worktree after merge — do not leave stale worktrees behind
+git worktree remove <worktree-path> --force 2>/dev/null || true
+git worktree prune
 ```
 
 ## Step Questions (don't collapse steps — they answer different things)
