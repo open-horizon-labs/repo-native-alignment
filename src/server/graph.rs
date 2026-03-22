@@ -9,7 +9,6 @@ pub(crate) const SUBSYSTEM_KEY: &str = "subsystem";
 
 use crate::embed::EmbeddingIndex;
 use crate::extract::ExtractorRegistry;
-use crate::extract::framework_detection::framework_detection_pass;
 use crate::extract::subsystem_pass::subsystem_node_pass;
 use crate::graph::{Edge, Node, NodeKind};
 use crate::graph::index::GraphIndex;
@@ -1010,114 +1009,10 @@ impl RnaHandler {
         let edge_ids_before_passes: std::collections::HashSet<String> =
             graph.edges.iter().map(|e| e.stable_id()).collect();
 
-        // Re-run API link pass with the full (existing + new) node set so that
-        // cross-file links are created when only one side of a match was updated.
-        // Duplicate edges from the previous pass are deduplicated below before
-        // rebuild_from_edges so they don't cause PageRank skew.
-        {
-            let api_link_edges = crate::extract::api_link::api_link_pass(&graph.nodes);
-            if !api_link_edges.is_empty() {
-                tracing::info!(
-                    "API link pass (incremental): {} DependsOn edge(s) from string literals to endpoints",
-                    api_link_edges.len()
-                );
-                graph.edges.extend(api_link_edges);
-            }
-        }
-
-        // Re-run manifest pass with the primary root so that changes to
-        // package.json, pyproject.toml, requirements.txt, or go.mod are
-        // reflected in the incremental graph. Duplicate package nodes from
-        // repeated runs are deduplicated below before the petgraph rebuild.
-        {
-            let root_pairs = vec![(primary_slug.clone(), self.repo_root.clone())];
-            let manifest_result = crate::extract::manifest::manifest_pass(&root_pairs);
-            if !manifest_result.nodes.is_empty() || !manifest_result.edges.is_empty() {
-                tracing::info!(
-                    "Manifest pass (incremental): {} package node(s), {} DependsOn edge(s)",
-                    manifest_result.nodes.len(),
-                    manifest_result.edges.len()
-                );
-                graph.nodes.extend(manifest_result.nodes);
-                graph.edges.extend(manifest_result.edges);
-            }
-        }
-
-        // Re-run TestedBy naming-convention pass over the full node set so
-        // that test/production pairs where only one side changed are still linked.
-        {
-            let tested_by_edges = crate::extract::naming_convention::tested_by_pass(&graph.nodes);
-            if !tested_by_edges.is_empty() {
-                tracing::info!(
-                    "TestedBy naming-convention pass (incremental): {} edge(s)",
-                    tested_by_edges.len()
-                );
-                graph.edges.extend(tested_by_edges);
-            }
-        }
-
-        // Re-run import-calls pass over the full node set so that cross-file
-        // Calls edges are always present after an incremental scan.
-        {
-            let import_call_edges =
-                crate::extract::import_calls::import_calls_pass(&graph.nodes);
-            if !import_call_edges.is_empty() {
-                tracing::info!(
-                    "Import-calls pass (incremental): {} cross-file Calls edge(s)",
-                    import_call_edges.len()
-                );
-                graph.edges.extend(import_call_edges);
-            }
-        }
-
-        // Re-run directory-module pass over the full node set so that
-        // BelongsTo edges are always present without requiring LSP quiescence.
-        {
-            let dir_result =
-                crate::extract::directory_module::directory_module_pass(&graph.nodes);
-            if !dir_result.edges.is_empty() {
-                tracing::info!(
-                    "Directory module pass (incremental): {} BelongsTo edge(s), {} module node(s)",
-                    dir_result.edges.len(),
-                    dir_result.nodes.len(),
-                );
-                graph.edges.extend(dir_result.edges);
-                graph.nodes.extend(dir_result.nodes);
-            }
-        }
-
-        // Re-run Next.js routing pass — gated: Next.js detected OR TypeScript/JS present.
-        let has_ts_js_incremental = graph.nodes.iter().any(|n| {
-            matches!(n.language.as_str(), "typescript" | "javascript")
-        });
-        if graph.has_framework("nextjs-app-router") || has_ts_js_incremental {
-            // Include all roots (including lsp_only subdirs like client/).
-            let nextjs_roots: Vec<(String, std::path::PathBuf)> = WorkspaceConfig::load()
-                .with_primary_root(self.repo_root.clone())
-                .with_worktrees(&self.repo_root)
-                .with_declared_roots(&self.repo_root)
-                .resolved_roots()
-                .iter()
-                .map(|r| (r.slug.clone(), r.path.clone()))
-                .collect();
-            let nextjs_result = crate::extract::nextjs_routing::nextjs_routing_pass(
-                &nextjs_roots,
-                &graph.nodes,
-            );
-            if !nextjs_result.nodes.is_empty() || !nextjs_result.edges.is_empty() {
-                tracing::info!(
-                    "Next.js routing pass (incremental): {} ApiEndpoint node(s), {} Implements edge(s)",
-                    nextjs_result.nodes.len(),
-                    nextjs_result.edges.len()
-                );
-                graph.nodes.extend(nextjs_result.nodes);
-                graph.edges.extend(nextjs_result.edges);
-            }
-        }
-
         // Pre-clean: remove stale virtual nodes (subsystem, framework, channel, event) and
-        // their associated edges BEFORE dedup/index/PageRank. This ensures
-        // detect_communities() only sees real code symbols.
+        // their associated edges BEFORE post-extraction passes run. This ensures
+        // detect_communities() only sees real code symbols, and framework_detection_pass
+        // re-emits fresh framework nodes with correct state.
         // Collect virtual file paths for LanceDB deletion — these will be added to
         // files_to_remove so the old rows are removed from LanceDB on persist.
         let stale_virtual_files: Vec<std::path::PathBuf> = graph
@@ -1139,20 +1034,30 @@ impl RnaHandler {
         // reappear on reload. The fresh nodes (re-emitted later) will be upserted.
         files_to_remove.extend(stale_virtual_files);
 
-        // Framework detection pass (incremental): re-scan all Import nodes and
-        // refresh framework nodes + detected_frameworks set.
-        {
-            let fw_result = framework_detection_pass(&graph.nodes, &primary_slug);
-            if !fw_result.nodes.is_empty() {
-                graph.nodes.extend(fw_result.nodes);
-            }
-            graph.detected_frameworks = fw_result.detected_frameworks;
-        }
+        // Re-run all post-extraction passes (api_link, manifest, tested_by, import_calls,
+        // directory_module, framework_detection, nextjs_routing, pubsub, websocket) using
+        // the registry. This replaces the previous manual Group 1 + framework detection
+        // sequence and ensures identical enrichment to the full-build path.
+        //
+        // Include all roots for passes that need filesystem access (manifest, nextjs_routing).
+        let root_pairs_incremental: Vec<(String, std::path::PathBuf)> = WorkspaceConfig::load()
+            .with_primary_root(self.repo_root.clone())
+            .with_worktrees(&self.repo_root)
+            .with_declared_roots(&self.repo_root)
+            .resolved_roots()
+            .iter()
+            .map(|r| (r.slug.clone(), r.path.clone()))
+            .collect();
+        let detected_from_passes = run_post_extraction_passes(
+            &mut graph.nodes,
+            &mut graph.edges,
+            &root_pairs_incremental,
+            &primary_slug,
+        );
+        graph.detected_frameworks = detected_from_passes;
 
-        // Auto-collect Group 1 delta: everything added by post-extraction passes
-        // (api_link, manifest, tested_by, import_calls, directory_module, nextjs_routing,
-        // framework_detection) since the snapshot above. No pass needs to manually
-        // call upsert_node_ids.extend() or upsert_edges.extend() for its own output.
+        // Auto-collect delta: everything added by post-extraction passes since
+        // the snapshot above. No pass needs to manually report its own output.
         for n in &graph.nodes {
             let sid = n.stable_id();
             if !node_ids_before_passes.contains(&sid) {
@@ -1282,9 +1187,9 @@ impl RnaHandler {
                 }
             }
 
-            // Snapshot before Group 2 passes (subsystem_node, fw aggregation, pubsub, ws).
+            // Snapshot before post-community passes (subsystem_node, fw aggregation).
             // The dedup step above compacts the vecs, so we need a fresh snapshot here
-            // rather than relying on the Group 1 snapshot indices.
+            // rather than relying on the pre-passes snapshot indices.
             let node_ids_before_group2: std::collections::HashSet<String> =
                 graph.nodes.iter().map(|n| n.stable_id()).collect();
             let edge_ids_before_group2: std::collections::HashSet<String> =
@@ -1292,6 +1197,9 @@ impl RnaHandler {
 
             // Emit first-class subsystem nodes + BelongsTo edges.
             // Stale nodes were already removed in the pre-clean step above.
+            // Note: subsystem_node_pass runs here (after community detection + PageRank)
+            // rather than inside the PostExtractionRegistry, because it depends on
+            // subsystem community results that are only available at this point.
             let sub_result = subsystem_node_pass(&subsystems, &graph.nodes, &primary_slug);
             if !sub_result.nodes.is_empty() {
                 tracing::info!(
@@ -1309,34 +1217,8 @@ impl RnaHandler {
                 graph.edges.extend(sub_fw_edges);
             }
 
-            // Pub/sub pass (incremental) — gated on detected frameworks.
-            if crate::extract::pubsub::should_run(&graph.detected_frameworks) {
-                let pubsub_result = crate::extract::pubsub::pubsub_pass(
-                    &graph.nodes,
-                    &graph.detected_frameworks,
-                    &primary_slug,
-                );
-                if !pubsub_result.edges.is_empty() {
-                    graph.nodes.extend(pubsub_result.nodes);
-                    graph.edges.extend(pubsub_result.edges);
-                }
-            }
-
-            // WebSocket/SSE pass (incremental) — gated on socketio framework.
-            if crate::extract::websocket::should_run(&graph.detected_frameworks) {
-                let ws_result = crate::extract::websocket::websocket_pass(
-                    &graph.nodes,
-                    &graph.detected_frameworks,
-                    &primary_slug,
-                );
-                if !ws_result.edges.is_empty() {
-                    graph.nodes.extend(ws_result.nodes);
-                    graph.edges.extend(ws_result.edges);
-                }
-            }
-
-            // Auto-collect Group 2 delta: everything added by subsystem_node, fw
-            // aggregation, pubsub, and websocket passes since the snapshot above.
+            // Auto-collect post-community delta: everything added by subsystem_node and
+            // fw aggregation since the snapshot above.
             for n in &graph.nodes {
                 let sid = n.stable_id();
                 if !node_ids_before_group2.contains(&sid) {
@@ -1488,6 +1370,9 @@ impl RnaHandler {
 /// - 4h: Pub/sub Produces/Consumes edges (gated on kafka/celery/pika)
 /// - 4i: WebSocket/SSE edges (gated on socketio)
 ///
+/// Delegates to [`PostExtractionRegistry::with_builtins`] so all passes run
+/// through the plugin architecture (framework-gated, auto-delta tracked).
+///
 /// # Arguments
 /// * `all_nodes` - mutable reference to the merged node set
 /// * `all_edges` - mutable reference to the merged edge set
@@ -1504,127 +1389,26 @@ pub(crate) fn run_post_extraction_passes(
     root_pairs: &[(String, PathBuf)],
     primary_slug: &str,
 ) -> std::collections::HashSet<String> {
-    // 4b. API link pass
-    {
-        let api_link_edges = crate::extract::api_link::api_link_pass(all_nodes);
-        if !api_link_edges.is_empty() {
-            tracing::info!(
-                "API link pass: {} DependsOn edge(s) from string literals to endpoints",
-                api_link_edges.len()
-            );
-            all_edges.extend(api_link_edges);
-        }
-    }
+    use crate::extract::post_extraction::{PassContext, PostExtractionRegistry};
 
-    // 4c. Manifest pass
-    {
-        let manifest_result = crate::extract::manifest::manifest_pass(root_pairs);
-        if !manifest_result.nodes.is_empty() || !manifest_result.edges.is_empty() {
-            tracing::info!(
-                "Manifest pass: {} package node(s), {} DependsOn edge(s)",
-                manifest_result.nodes.len(),
-                manifest_result.edges.len()
-            );
-            all_nodes.extend(manifest_result.nodes);
-            all_edges.extend(manifest_result.edges);
-        }
-    }
+    let registry = PostExtractionRegistry::with_builtins();
+    let ctx = PassContext {
+        root_pairs: root_pairs.to_vec(),
+        primary_slug: primary_slug.to_string(),
+        detected_frameworks: std::collections::HashSet::new(),
+    };
+    let result = registry.run_all(all_nodes, all_edges, ctx);
 
-    // 4d. TestedBy naming-convention pass
-    {
-        let tested_by_edges = crate::extract::naming_convention::tested_by_pass(all_nodes);
-        if !tested_by_edges.is_empty() {
-            tracing::info!(
-                "TestedBy naming-convention pass: {} edge(s)",
-                tested_by_edges.len()
-            );
-            all_edges.extend(tested_by_edges);
-        }
-    }
-
-    // 4e-pre. Import-calls pass
-    {
-        let import_call_edges = crate::extract::import_calls::import_calls_pass(all_nodes);
-        if !import_call_edges.is_empty() {
-            tracing::info!(
-                "Import-calls pass: {} cross-file Calls edge(s) via import resolution",
-                import_call_edges.len()
-            );
-            all_edges.extend(import_call_edges);
-        }
-    }
-
-    // 4e. Directory-module pass
-    {
-        let dir_result = crate::extract::directory_module::directory_module_pass(all_nodes);
-        if !dir_result.edges.is_empty() {
-            tracing::info!(
-                "Directory module pass: {} BelongsTo edge(s), {} module node(s)",
-                dir_result.edges.len(),
-                dir_result.nodes.len(),
-            );
-            all_nodes.extend(dir_result.nodes);
-            all_edges.extend(dir_result.edges);
-        }
-    }
-
-    // 4f. Framework detection pass
-    let detected_frameworks;
-    {
-        let fw_result = framework_detection_pass(all_nodes, primary_slug);
-        if !fw_result.nodes.is_empty() {
-            all_nodes.extend(fw_result.nodes);
-        }
-        detected_frameworks = fw_result.detected_frameworks;
-    }
-
-    // 4g. Next.js routing pass (gated on framework detection or TS/JS files)
-    let has_ts_js_files = all_nodes.iter().any(|n| {
-        matches!(n.language.as_str(), "typescript" | "javascript")
-    });
-    if detected_frameworks.contains("nextjs-app-router") || has_ts_js_files {
-        let nextjs_result = crate::extract::nextjs_routing::nextjs_routing_pass(
-            root_pairs,
-            all_nodes,
+    if result.added_node_count > 0 || result.added_edge_count > 0 {
+        tracing::info!(
+            "Post-extraction passes complete: +{} node(s), +{} edge(s), {} framework(s) detected",
+            result.added_node_count,
+            result.added_edge_count,
+            result.detected_frameworks.len(),
         );
-        if !nextjs_result.nodes.is_empty() || !nextjs_result.edges.is_empty() {
-            tracing::info!(
-                "Next.js routing pass: {} ApiEndpoint node(s), {} Implements edge(s)",
-                nextjs_result.nodes.len(),
-                nextjs_result.edges.len()
-            );
-            all_nodes.extend(nextjs_result.nodes);
-            all_edges.extend(nextjs_result.edges);
-        }
     }
 
-    // 4h. Pub/sub pass (gated on kafka/celery/pika detection)
-    if crate::extract::pubsub::should_run(&detected_frameworks) {
-        let pubsub_result = crate::extract::pubsub::pubsub_pass(
-            all_nodes,
-            &detected_frameworks,
-            primary_slug,
-        );
-        if !pubsub_result.edges.is_empty() {
-            all_nodes.extend(pubsub_result.nodes);
-            all_edges.extend(pubsub_result.edges);
-        }
-    }
-
-    // 4i. WebSocket/SSE pass (gated on socketio detection)
-    if crate::extract::websocket::should_run(&detected_frameworks) {
-        let ws_result = crate::extract::websocket::websocket_pass(
-            all_nodes,
-            &detected_frameworks,
-            primary_slug,
-        );
-        if !ws_result.edges.is_empty() {
-            all_nodes.extend(ws_result.nodes);
-            all_edges.extend(ws_result.edges);
-        }
-    }
-
-    detected_frameworks
+    result.detected_frameworks
 }
 
 #[cfg(test)]
