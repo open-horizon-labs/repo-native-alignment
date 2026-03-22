@@ -14,6 +14,7 @@ pub mod event_bus;
 pub mod openapi_sdk_link;
 pub mod extractor_config;
 pub mod framework_detection;
+pub mod grpc;
 pub mod import_calls;
 pub mod manifest;
 pub mod naming_convention;
