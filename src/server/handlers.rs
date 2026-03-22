@@ -653,6 +653,52 @@ mod tests {
         assert!(result.is_err(), "relative path '.' should be rejected");
     }
 
+    // ── Integration: load_external_graph with real LanceDB ──────────────
+
+    /// Verify that load_external_graph succeeds when a real LanceDB is present.
+    ///
+    /// Uses the main repo's own LanceDB at `.oh/.cache/lance`. This is always
+    /// present in developer environments. If absent (fresh CI checkout without
+    /// a prior scan), the test is skipped gracefully.
+    #[tokio::test]
+    async fn test_load_external_graph_succeeds_with_real_lance() {
+        let repo_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let lance_path = repo_path.join(".oh/.cache/lance/symbols.lance");
+        if !lance_path.exists() {
+            // LanceDB not present — skip rather than fail.
+            eprintln!("Skipping: symbols.lance not present at {}", lance_path.display());
+            return;
+        }
+        let handler = make_handler(&std::path::PathBuf::from("/tmp"));
+        let result = handler.load_external_graph(repo_path.to_str().unwrap()).await;
+        // Using match to avoid unwrap_err() which requires GraphState: Debug
+        match result {
+            Ok((graph, returned_path)) => {
+                assert_eq!(returned_path, repo_path, "Returned path should match input");
+                assert!(!graph.nodes.is_empty(), "Repo graph should have nodes");
+            }
+            Err(e) => panic!("Should load repo graph: {}", e),
+        }
+    }
+
+    /// Verify that load_external_graph returns a clear error for a path without LanceDB.
+    #[tokio::test]
+    async fn test_load_external_graph_fails_for_missing_lance() {
+        let handler = make_handler(&std::path::PathBuf::from("/tmp"));
+        let result = handler.load_external_graph("/tmp/no-such-repo-rna-test").await;
+        assert!(result.is_err(), "Should fail for path without LanceDB");
+        // Extract error without calling unwrap_err() (which needs Debug on Ok type)
+        let err = match result {
+            Ok(_) => panic!("Expected error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("Failed to load graph") || err.contains("absolute path"),
+            "Error should be descriptive: {}",
+            err
+        );
+    }
+
     // ── Adversarial: repo parameter edge cases ──────────────────────────
 
     /// Empty string is not an absolute path — must be rejected.
