@@ -35,7 +35,11 @@ pub const SCHEMA_VERSION: u32 = 16; // slug portability: root_id now uses direct
 /// Bumped to 7 for pub/sub + websocket extractors (#464/#467): Produces/Consumes edges,
 /// channel/event nodes. Gates nextjs_routing_pass on framework detection.
 /// Bumped to 8 for cross-file import-calls pass (#462).
-pub const EXTRACTION_VERSION: u32 = 8;
+/// Bumped to 9 for background scanner post-extraction passes (#471): api_link,
+/// manifest, tested_by, directory_module, import_calls, framework_detection,
+/// nextjs_routing, pubsub, and websocket now run in both foreground and
+/// background paths — older caches lack these edges and must be re-extracted.
+pub const EXTRACTION_VERSION: u32 = 9;
 
 /// Arrow schema for the `symbols` table.
 ///
