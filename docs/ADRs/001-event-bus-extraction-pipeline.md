@@ -183,8 +183,12 @@ After each implementation phase, an audit agent must verify the architectural co
 ### Constraint 2: Static registration only
 **Audit:** No `register()` or `subscribe()` calls inside `on_event()` or any event handler. Registration happens only at startup in `main.rs` or the pipeline bootstrap. `grep -n "bus.register\|registry.add" src/` must show only startup-time call sites.
 
-### Constraint 3: Zero broker-specific knowledge in RNA core
-**Audit:** `grep -r "kafka\|pubsub\|rabbitmq\|redis.*publish\|google.cloud" src/` must return 0 results. All broker-specific patterns live in `.oh/extractors/*.toml` config files.
+### Constraint 3: No broker-specific extraction/enrichment logic in RNA core
+**OK:** Default framework detection rules (import pattern → framework name) may be hardcoded as defaults — e.g. `FrameworkRule { import_pattern: "kafka", ... }` in `framework_detection.rs`. These are lookup tables, not logic.
+
+**NOT OK:** Broker-specific extraction or enrichment logic — e.g. `if framework == "kafka" { run_kafka_pass() }`. All such logic lives in pass implementations triggered by `FrameworkDetected` events, never hardcoded in the bus or registry.
+
+**Audit:** No `if framework == "X"` conditionals in `src/server/` or `src/bus/`. Pass selection is purely event-driven.
 
 ### Constraint 4: All paths go through the same consumer registry
 **Audit:** The background scanner and foreground pipeline both call the same `run_consumers()` function. No pass is invoked directly outside the registry. `grep -r "api_link_pass\|tested_by_pass\|import_calls_pass" src/server/` must return 0 results after #479 lands.
