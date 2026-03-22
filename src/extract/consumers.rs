@@ -263,7 +263,11 @@ impl ExtractionConsumer for PostExtractionConsumer {
         let mut follow_ons: Vec<ExtractionEvent> = Vec::new();
 
         // Emit FrameworkDetected for each detected framework.
-        for framework in &result.detected_frameworks {
+        // Sort framework names for deterministic fan-out ordering — HashSet iteration
+        // is nondeterministic, which causes unstable event ordering across runs.
+        let mut frameworks: Vec<String> = result.detected_frameworks.iter().cloned().collect();
+        frameworks.sort_unstable();
+        for framework in &frameworks {
             // Gather nodes associated with this framework.
             let fw_nodes: Vec<Node> = all_nodes
                 .iter()
@@ -1027,17 +1031,23 @@ mod tests {
     #[test]
     fn test_builtin_bus_has_consumers_for_all_event_kinds() {
         let bus = build_builtin_bus(vec![], "test".into());
-        // Must have at least one consumer for each key event kind.
-        // Synchronous: ManifestConsumer, TreeSitterConsumer, LanguageAccumulatorConsumer,
-        // PostExtractionConsumer, OpenApiConsumer, GrpcConsumer, EmbeddingIndexerConsumer = 7
-        // LSP stubs: 31 (one per language)
-        // FrameworkDetected: FrameworkDetectionConsumer, NextjsRoutingConsumer, PubSubConsumer,
-        //   WebSocketConsumer = 4
-        // PassesComplete: SubsystemConsumer, LanceDBConsumer = 2
-        // RootDiscovered: ManifestConsumer, TreeSitterConsumer = already counted
-        // Total: 2 + 7 + 31 + 4 + 2 = 46 (some double-counted since ManifestConsumer is in RootDiscovered)
-        // Use a conservative lower bound
-        assert!(bus.len() >= 40, "Expected at least 40 consumers, got {}", bus.len());
+        // Derive the exact expected count to catch regressions when languages are added/removed.
+        let lsp_count = crate::extract::EnricherRegistry::with_builtins()
+            .supported_languages()
+            .len();
+        let expected_total =
+            2 +        // RootDiscovered: ManifestConsumer, TreeSitterConsumer
+            5 +        // RootExtracted: LanguageAccumulatorConsumer, PostExtractionConsumer,
+                       //   OpenApiConsumer, GrpcConsumer, EmbeddingIndexerConsumer
+            lsp_count + // LanguageDetected: LspConsumer × N
+            4 +        // FrameworkDetected: FrameworkDetectionConsumer, NextjsRoutingConsumer,
+                       //   PubSubConsumer, WebSocketConsumer
+            2;         // PassesComplete: SubsystemConsumer, LanceDBConsumer
+        assert_eq!(
+            bus.len(), expected_total,
+            "Unexpected built-in consumer count: got {}, expected {} (lsp_count={})",
+            bus.len(), expected_total, lsp_count
+        );
     }
 
     /// Verify PostExtractionConsumer emits PassesComplete on empty input.
