@@ -194,68 +194,67 @@ pub fn websocket_pass(
                 continue;
             }
 
-            let event_name = match &rule.extraction {
-                WsExtraction::QuotedAfter(prefix) => extract_quoted_after(&node.body, prefix),
+            // Collect ALL quoted event names for this rule — a handler body may
+            // contain multiple socket.on("a", ...) / socket.emit("b", ...) calls.
+            let event_names: Vec<String> = match &rule.extraction {
+                WsExtraction::QuotedAfter(prefix) => extract_all_quoted_after(&node.body, prefix),
             };
-
-            let event_name = match event_name {
-                Some(n) if !n.is_empty() => n,
-                _ => continue,
-            };
-
-            // Skip lifecycle events — they're not application-level topology.
-            if is_lifecycle_event(&event_name) {
-                continue;
-            }
-
-            let event_key = format!("{}:{}", root_id, event_name);
-            let event_id = event_nodes
-                .entry(event_key)
-                .or_insert_with(|| {
-                    let mut metadata = BTreeMap::new();
-                    metadata.insert("channel_type".to_string(), "socketio".to_string());
-                    Node {
-                        id: NodeId {
-                            root: root_id.to_string(),
-                            file: PathBuf::from(format!("events/{}", event_name)),
-                            name: event_name.clone(),
-                            kind: NodeKind::Other("event".to_string()),
-                        },
-                        language: String::new(),
-                        line_start: 0,
-                        line_end: 0,
-                        signature: format!("event {}", event_name),
-                        body: String::new(),
-                        metadata,
-                        source: ExtractionSource::TreeSitter,
-                    }
-                })
-                .id
-                .clone();
 
             let edge_kind = match rule.direction {
                 Direction::Produces => EdgeKind::Produces,
                 Direction::Consumes => EdgeKind::Consumes,
             };
 
-            // Deduplicate: skip if we already emitted an edge for this
-            // (from_node, event_name, direction) combination.
-            let dedup_key = (
-                node.stable_id(),
-                event_name.clone(),
-                edge_kind.to_string(),
-            );
-            if !seen_edges.insert(dedup_key) {
-                continue;
-            }
+            for event_name in event_names {
+                // Skip lifecycle events — they're not application-level topology.
+                if is_lifecycle_event(&event_name) {
+                    continue;
+                }
 
-            result_edges.push(Edge {
-                from: node.id.clone(),
-                to: event_id,
-                kind: edge_kind,
-                source: ExtractionSource::TreeSitter,
-                confidence: Confidence::Detected,
-            });
+                let event_key = format!("{}:{}", root_id, event_name);
+                let event_id = event_nodes
+                    .entry(event_key)
+                    .or_insert_with(|| {
+                        let mut metadata = BTreeMap::new();
+                        metadata.insert("channel_type".to_string(), "socketio".to_string());
+                        Node {
+                            id: NodeId {
+                                root: root_id.to_string(),
+                                file: PathBuf::from(format!("events/{}", event_name)),
+                                name: event_name.clone(),
+                                kind: NodeKind::Other("event".to_string()),
+                            },
+                            language: String::new(),
+                            line_start: 0,
+                            line_end: 0,
+                            signature: format!("event {}", event_name),
+                            body: String::new(),
+                            metadata,
+                            source: ExtractionSource::TreeSitter,
+                        }
+                    })
+                    .id
+                    .clone();
+
+                // Deduplicate: skip if we already emitted an edge for this
+                // (from_node, event_name, direction) combination.
+                let dedup_key = (
+                    node.stable_id(),
+                    event_name.clone(),
+                    edge_kind.to_string(),
+                );
+                if !seen_edges.insert(dedup_key) {
+                    continue;
+                }
+
+                result_edges.push(Edge {
+                    from: node.id.clone(),
+                    to: event_id,
+                    kind: edge_kind.clone(),
+                    source: ExtractionSource::TreeSitter,
+                    confidence: Confidence::Detected,
+                });
+            }
         }
     }
 
@@ -280,29 +279,56 @@ pub fn websocket_pass(
 // ---------------------------------------------------------------------------
 
 fn extract_quoted_after(body: &str, prefix: &str) -> Option<String> {
+    extract_all_quoted_after(body, prefix).into_iter().next()
+}
+
+/// Extract ALL quoted string arguments that immediately follow each occurrence of
+/// `prefix` in `body`. A handler with multiple `socket.on("a", ...) socket.on("b", ...)`
+/// calls will return `["a", "b"]` instead of just `["a"]`.
+fn extract_all_quoted_after(body: &str, prefix: &str) -> Vec<String> {
     let prefix_lower = prefix.to_lowercase();
     let body_lower = body.to_lowercase();
+    let prefix_len = prefix.len();
 
-    let start_pos = body_lower.find(prefix_lower.as_str())?;
-    let after = &body[start_pos + prefix.len()..];
-    let after = after.trim_start_matches([' ', '\t', '\n', '\r']);
+    let mut results = Vec::new();
+    let mut search_start = 0usize;
 
-    let quote_char = match after.chars().next()? {
-        '"' => '"',
-        '\'' => '\'',
-        '`' => '`',
-        _ => return None,
-    };
+    while let Some(rel_pos) = body_lower[search_start..].find(prefix_lower.as_str()) {
+        let abs_pos = search_start + rel_pos;
+        let after_start = abs_pos + prefix_len;
+        search_start = after_start;
 
-    let content = &after[1..];
-    let end = content.find(quote_char)?;
-    let name = content[..end].trim().to_string();
+        // Guard: prefix_len must advance at least one byte to prevent infinite loop.
+        if prefix_len == 0 {
+            break;
+        }
 
-    if name.is_empty() || name.contains('\n') {
-        return None;
+        let after = match body.get(after_start..) {
+            Some(s) => s,
+            None => break,
+        };
+        let after = after.trim_start_matches([' ', '\t', '\n', '\r']);
+
+        let quote_char = match after.chars().next() {
+            Some('"') => '"',
+            Some('\'') => '\'',
+            Some('`') => '`',
+            _ => continue,
+        };
+
+        let content = &after[1..];
+        let end = match content.find(quote_char) {
+            Some(e) => e,
+            None => continue,
+        };
+        let name = content[..end].trim().to_string();
+        if name.is_empty() || name.contains('\n') {
+            continue;
+        }
+        results.push(name);
     }
 
-    Some(name)
+    results
 }
 
 // ---------------------------------------------------------------------------
