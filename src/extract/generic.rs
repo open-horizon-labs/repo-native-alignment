@@ -1506,6 +1506,24 @@ fn run_route_queries(
             metadata.insert("route_query_label".to_string(), cfg.label.to_string());
             metadata.insert("synthetic".to_string(), "false".to_string());
 
+            // Store the router variable name (the object before `.method`) so
+            // that the FastAPI router prefix pass can prepend `APIRouter(prefix=...)`
+            // to the path.  For `@workspace_router.get("/path")`, `@name` captures
+            // `workspace_router.get` → strip the last `.xxx` suffix to get
+            // `workspace_router`.  For bare identifiers like `@app.route` the same
+            // logic strips `.route`, leaving `app`.  For identifiers with no dot
+            // (unusual but valid) the full name is stored.
+            if let Some(name_capture) = capture.get("name") {
+                let router_var = if let Some(dot_pos) = name_capture.rfind('.') {
+                    &name_capture[..dot_pos]
+                } else {
+                    name_capture
+                };
+                if !router_var.is_empty() {
+                    metadata.insert("router_var".to_string(), router_var.to_string());
+                }
+            }
+
             // The decorator ends at `capture.end_row` (0-indexed). The handler
             // function definition begins on the very next line or within a small
             // window below (e.g., one blank line between decorator and `def`).
