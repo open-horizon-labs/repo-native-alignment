@@ -107,6 +107,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 gray_matter = "0.3.2"
 
+# Multi-pattern substring search (tested_by_pass naming-convention pass)
+aho-corasick = "1"
+
 [features]
 default = ["metal"]
 metal = ["candle-core/metal", "candle-core/accelerate", "metal-candle/custom-metal"]

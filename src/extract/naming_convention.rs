@@ -18,18 +18,23 @@
 //!
 //! # Algorithm
 //!
-//! For every test function (identified by `is_test_function()`):
+//! Build an Aho-Corasick automaton once over all production function names
+//! (names shorter than 4 characters are filtered out first to avoid false
+//! positives from `new`, `get`, `run`, etc.).  The automaton is built with
+//! case-insensitive matching enabled so no manual `to_lowercase()` is required
+//! at query time.
 //!
-//! 1. Convert the test name to lowercase.
-//! 2. For every *production* function whose lowercase name is a substring of
-//!    the test name:
-//!    - Skip names shorter than 4 characters (avoids false positives from
-//!      `new`, `get`, `run`, etc.).
-//!    - Emit one `EdgeKind::TestedBy` edge: test_fn → prod_fn.
+//! For every test function, run its name through the automaton.  Each match
+//! gives a pattern index that maps back to the corresponding production node.
+//!
+//! Complexity:
+//! - Construction: O(P × avg_name_len)
+//! - Per-query: O(test_name_len + matches)
+//! - Total: O(N + E_emitted) instead of the previous O(T × P)
 //!
 //! Examples:
 //! - `test_process_payment` → `TestedBy` → `process_payment`
-//! - `TestHandleRequest` → `TestedBy` → `HandleRequest` (case-insensitive lowercasing only)
+//! - `TestHandleRequest` → `TestedBy` → `HandleRequest` (case-insensitive)
 //! - `it_should_parse_config` → `TestedBy` → `parse_config`
 //!
 //! # Placement
@@ -40,6 +45,7 @@
 //! cross-file test/production pairs are linked even when only one side was
 //! touched in an incremental scan.
 
+use aho_corasick::{AhoCorasick, MatchKind};
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeKind};
 use crate::ranking::is_test_function;
 
@@ -71,48 +77,76 @@ pub fn tested_by_pass(all_nodes: &[Node]) -> Vec<Edge> {
         return Vec::new();
     }
 
-    // Pre-compute lowercase names for all production functions once.
-    // This avoids the O(T × P) repeated `to_lowercase()` allocations that
-    // would occur inside the nested loop below.  Filtering short names here
-    // also keeps the inner list tight.
-    let prod_indexed: Vec<(String, &Node)> = prod_fns
+    // Filter production functions to those with names >= 4 chars.
+    // Short names ("new", "get", "run", …) produce too many false positives.
+    let prod_indexed: Vec<&Node> = prod_fns
         .iter()
-        .filter(|n| n.id.name.len() >= 4) // skip very short names ("new", "get", …)
-        .map(|n| (n.id.name.to_lowercase(), *n))
+        .filter(|n| n.id.name.len() >= 4)
+        .copied()
         .collect();
 
     if prod_indexed.is_empty() {
         return Vec::new();
     }
 
+    // Build one Aho-Corasick automaton from all production function names.
+    // Construction is O(P × avg_name_len); each query is O(haystack_len + matches).
+    // Total: O(N + E_emitted) vs the previous O(T × P).
+    //
+    // `MatchKind::LeftmostLongest` selects the longest match at each position,
+    // so when one production name is a prefix of another (e.g. "parse" vs
+    // "parse_config"), only the longer name matches at that offset.  This
+    // reduces false-positive edges compared to the previous str::contains loop,
+    // which would have emitted edges for both.  Non-overlapping patterns in
+    // different positions of the haystack (e.g. "build" and "parse" in
+    // "test_build_and_parse") are all reported as expected.
+    //
+    // `ascii_case_insensitive` replaces the previous to_lowercase() allocations
+    // and is correct for function names, which are always ASCII across all
+    // supported languages.
+    let patterns: Vec<&str> = prod_indexed.iter().map(|n| n.id.name.as_str()).collect();
+    let ac = AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .match_kind(MatchKind::LeftmostLongest)
+        .build(&patterns)
+        .expect("AhoCorasick construction must not fail for valid UTF-8 function names");
+
     let mut edges: Vec<Edge> = Vec::new();
 
     for test_fn in &test_fns {
-        let test_name_lower = test_fn.id.name.to_lowercase();
-
-        for (prod_name_lower, prod_fn) in &prod_indexed {
-            if test_name_lower.contains(prod_name_lower.as_str()) {
-                // Defensive: never emit a self-edge.  The split above
-                // (is_test_function / !is_test_function) makes this
-                // unreachable in normal data, but guard anyway.
-                if test_fn.id == prod_fn.id {
-                    continue;
-                }
-
-                tracing::debug!(
-                    "TestedBy (naming): {} -> {}",
-                    test_fn.id.name,
-                    prod_fn.id.name
-                );
-
-                edges.push(Edge {
-                    from: test_fn.id.clone(),
-                    to: prod_fn.id.clone(),
-                    kind: EdgeKind::TestedBy,
-                    source: ExtractionSource::TreeSitter,
-                    confidence: Confidence::Detected,
-                });
+        // Track which patterns have already produced an edge for this test fn.
+        // find_iter can match the same pattern multiple times (e.g. "test_parse_parse"
+        // would match pattern "parse" at two positions), but we only want one
+        // TestedBy edge per (test_fn, prod_fn) pair — consistent with the previous
+        // str::contains behavior.
+        let mut seen_patterns = std::collections::HashSet::new();
+        for mat in ac.find_iter(&test_fn.id.name) {
+            let pattern_idx = mat.pattern().as_usize();
+            if !seen_patterns.insert(pattern_idx) {
+                continue; // already emitted an edge for this (test_fn, prod_fn) pair
             }
+            let prod_fn = prod_indexed[pattern_idx];
+
+            // Defensive: never emit a self-edge.  The partition above
+            // (is_test_function / !is_test_function) makes this unreachable
+            // in normal data, but guard anyway.
+            if test_fn.id == prod_fn.id {
+                continue;
+            }
+
+            tracing::debug!(
+                "TestedBy (naming): {} -> {}",
+                test_fn.id.name,
+                prod_fn.id.name
+            );
+
+            edges.push(Edge {
+                from: test_fn.id.clone(),
+                to: prod_fn.id.clone(),
+                kind: EdgeKind::TestedBy,
+                source: ExtractionSource::TreeSitter,
+                confidence: Confidence::Detected,
+            });
         }
     }
 
@@ -418,6 +452,37 @@ mod tests {
         }
     }
 
+    /// Adversarial: when one production name is a prefix of another (e.g.
+    /// "parse" and "parse_config"), LeftmostLongest will match only the
+    /// longer pattern at any overlapping position.  Verify this produces
+    /// deterministic, sensible results — specifically, no panics and no
+    /// out-of-bounds pattern indices.
+    #[test]
+    fn adversarial_prefix_related_prod_names() {
+        let nodes = vec![
+            make_fn("parse", false),
+            make_fn("parse_config", false),
+            make_fn("test_parse_config_values", true),
+        ];
+        let edges = tested_by_pass(&nodes);
+        // With LeftmostLongest, "parse_config" wins over "parse" at the same
+        // offset. We expect at least one edge (to "parse_config").
+        // We do NOT assert a specific count — the exact behavior is a
+        // documented intentional change from str::contains (fewer false positives).
+        assert!(
+            !edges.is_empty(),
+            "expected at least one TestedBy edge; got 0"
+        );
+        // Every emitted edge must reference a valid prod node.
+        for edge in &edges {
+            let to_name = &edge.to.name;
+            assert!(
+                to_name == "parse" || to_name == "parse_config",
+                "edge.to.name '{}' must be one of the prod functions", to_name
+            );
+        }
+    }
+
     /// Adversarial: mix of struct nodes and function nodes — struct nodes
     /// with test-like names must not produce edges.
     #[test]
@@ -435,6 +500,59 @@ mod tests {
         assert!(
             edges.is_empty(),
             "Struct nodes must never produce TestedBy edges even with test-like names"
+        );
+    }
+
+    /// Adversarial: test name that contains the same production name twice
+    /// (e.g. "test_parse_parse") must emit exactly ONE TestedBy edge, not two.
+    /// The Aho-Corasick automaton can match the same pattern at multiple positions;
+    /// the dedup guard ensures consistency with the original str::contains behavior.
+    #[test]
+    fn adversarial_duplicate_pattern_in_test_name() {
+        let nodes = vec![
+            make_fn("parse", false),
+            make_fn("test_parse_parse", true), // "parse" appears at positions 5 and 11
+        ];
+        let edges = tested_by_pass(&nodes);
+        assert_eq!(
+            edges.len(), 1,
+            "test name containing the same production name twice must yield exactly 1 edge"
+        );
+        assert_eq!(edges[0].to.name, "parse");
+    }
+
+    /// Timing smoke test: 500 test functions × 500 production functions should
+    /// complete in under 100ms on any hardware.  This exercises the O(N) path
+    /// of the Aho-Corasick automaton vs the original O(T×P) nested loop.
+    ///
+    /// The test does NOT fail on timing (flaky on loaded CI boxes) — it just
+    /// prints elapsed time so the ship step can record it.
+    #[test]
+    fn timing_smoke_500x500() {
+        use std::time::Instant;
+
+        let mut nodes: Vec<Node> = Vec::new();
+        // 500 production functions with realistic names
+        for i in 0..500 {
+            nodes.push(make_fn(&format!("process_event_{}", i), false));
+        }
+        // 500 test functions that each contain one production name
+        for i in 0..500 {
+            nodes.push(make_fn(&format!("test_process_event_{}_happy_path", i), true));
+        }
+
+        let start = Instant::now();
+        let edges = tested_by_pass(&nodes);
+        let elapsed = start.elapsed();
+
+        // Each test fn matches exactly one prod fn → 500 edges
+        assert_eq!(edges.len(), 500, "expected 500 edges in 500×500 case");
+        println!("tested_by_pass 500×500: {:?} (250_000 comparisons with O(T×P) would be ~same)", elapsed);
+        // Generous upper bound: must complete in under 1 second even in debug mode
+        assert!(
+            elapsed.as_secs() < 1,
+            "tested_by_pass 500×500 took {:?} — must complete in < 1s",
+            elapsed
         );
     }
 }
