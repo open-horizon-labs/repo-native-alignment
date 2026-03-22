@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search`.
-pub const SCHEMA_VERSION: u32 = 16; // slug portability: root_id now uses directory name, not full path
+pub const SCHEMA_VERSION: u32 = 17; // append-only rebuild: scan_version column for versioned writes
 
 /// Extraction version for source-level extraction logic.
 ///
@@ -106,6 +106,9 @@ pub fn symbols_schema() -> Schema {
         // Vector column is added dynamically when embeddings are computed,
         // since the dimension depends on the model. See `symbols_schema_with_vector`.
         Field::new("updated_at", DataType::Int64, false),
+        // Append-only versioning: each full rebuild writes with an incrementing scan_version.
+        // Queries filter to the latest committed version. Stale rows compacted separately.
+        Field::new("scan_version", DataType::UInt64, false),
     ])
 }
 
@@ -161,6 +164,8 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
             true, // nullable: not all symbols need embeddings immediately
         ),
         Field::new("updated_at", DataType::Int64, false),
+        // Append-only versioning: each full rebuild writes with an incrementing scan_version.
+        Field::new("scan_version", DataType::UInt64, false),
     ])
 }
 
@@ -182,6 +187,9 @@ pub fn edges_schema() -> Schema {
         Field::new("edge_confidence", DataType::Utf8, false),
         Field::new("root_id", DataType::Utf8, false),
         Field::new("updated_at", DataType::Int64, false),
+        // Append-only versioning: each full rebuild writes with an incrementing scan_version.
+        // Queries filter to the latest committed version. Stale rows compacted separately.
+        Field::new("scan_version", DataType::UInt64, false),
     ])
 }
 
@@ -232,8 +240,8 @@ mod tests {
 
     #[test]
     fn test_schema_version_constant() {
-        // SCHEMA_VERSION must be at least 15 (bumped for doc_comment column #416)
-        assert!(SCHEMA_VERSION >= 15, "SCHEMA_VERSION should be >= 15");
+        // SCHEMA_VERSION must be at least 17 (bumped for scan_version column #477)
+        assert!(SCHEMA_VERSION >= 17, "SCHEMA_VERSION should be >= 17");
     }
 
     #[test]
@@ -277,6 +285,7 @@ mod tests {
         // doc_comment column — survives LSP reindex round-trip (#416)
         assert!(schema.field_with_name("doc_comment").is_ok());
         assert!(schema.field_with_name("updated_at").is_ok());
+        assert!(schema.field_with_name("scan_version").is_ok());
         // no vector column in base schema
         assert!(schema.field_with_name("vector").is_err());
     }
@@ -319,6 +328,7 @@ mod tests {
         assert!(schema.field_with_name("edge_confidence").is_ok());
         assert!(schema.field_with_name("root_id").is_ok());
         assert!(schema.field_with_name("updated_at").is_ok());
+        assert!(schema.field_with_name("scan_version").is_ok());
     }
 
     #[test]

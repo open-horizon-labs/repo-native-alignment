@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use arrow_array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array};
+use arrow_array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array};
 use arrow_array::builder::BooleanBuilder;
 
 use crate::graph::{Confidence, Edge, ExtractionSource, Node, NodeId, NodeKind, EdgeKind};
@@ -21,6 +21,38 @@ use super::state::GraphState;
 /// LanceDB path for graph persistence.
 pub(crate) fn graph_lance_path(repo_root: &Path) -> PathBuf {
     repo_root.join(".oh").join(".cache").join("lance")
+}
+
+/// Path to the committed scan_version pointer file.
+///
+/// This file contains the `u64` scan version that is currently live for reads.
+/// Written atomically after a successful full-rebuild append. Until this file is
+/// updated, the previous version remains the source of truth for queries.
+fn scan_version_path(db_path: &Path) -> PathBuf {
+    db_path.join("scan_version")
+}
+
+/// Read the committed scan version from the pointer file.
+///
+/// Returns `0` if the file is absent or unparseable (first-run default that matches
+/// rows written by the very first persist, which also writes version `1`).
+fn read_committed_scan_version(db_path: &Path) -> u64 {
+    std::fs::read_to_string(scan_version_path(db_path))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Atomically write the committed scan_version pointer.
+fn write_committed_scan_version(db_path: &Path, version: u64) -> anyhow::Result<()> {
+    let path = scan_version_path(db_path);
+    // Write to a temp file then rename for atomicity.
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, version.to_string())
+        .context("write_committed_scan_version: failed to write tmp file")?;
+    std::fs::rename(&tmp, &path)
+        .context("write_committed_scan_version: failed to rename tmp to scan_version")?;
+    Ok(())
 }
 
 /// Check the stored schema version and migrate (drop + recreate) if it mismatches.
@@ -69,15 +101,19 @@ pub(crate) async fn check_and_migrate_schema(db_path: &Path) -> anyhow::Result<b
         );
     }
 
-    // Delete all LanceDB data by removing directory contents (except the version file
-    // we're about to write). This is more reliable than drop_table which can fail
+    // Delete all LanceDB data by removing directory contents (except the version files
+    // we manage separately). This is more reliable than drop_table which can fail
     // on corrupted/incompatible tables.
     if let Ok(entries) = std::fs::read_dir(db_path) {
         for entry in entries {
             let entry = entry.context("check_and_migrate_schema: failed to read db_path entry")?;
             let path = entry.path();
-            // Don't delete the version file yet — we'll overwrite it below.
-            if path.file_name().map(|n| n == "schema_version").unwrap_or(false) {
+            // Preserve version-tracking files: schema_version is rewritten below;
+            // extraction_version must survive so the next extraction-version bump
+            // still triggers its scan-state reset correctly.
+            // scan_version is deleted (reset to 0 on next read) since all rows are gone.
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if name == "schema_version" || name == "extraction_version" {
                 continue;
             }
             if path.is_dir() {
@@ -469,7 +505,223 @@ fn is_schema_mismatch_error(e: &anyhow::Error) -> bool {
         || msg.contains("invalid recordbatch")
 }
 
-/// Persist graph nodes and edges to LanceDB tables.
+/// Build a symbols `RecordBatch` for `nodes` tagged with `scan_version`.
+fn build_symbols_batch(nodes: &[Node], scan_version: u64) -> anyhow::Result<RecordBatch> {
+    use std::sync::Arc;
+    let schema = Arc::new(symbols_schema());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
+    let root_ids: Vec<String> = nodes.iter().map(|n| n.id.root.clone()).collect();
+    let file_paths: Vec<String> = nodes.iter().map(|n| n.id.file.display().to_string()).collect();
+    let names: Vec<String> = nodes.iter().map(|n| n.id.name.clone()).collect();
+    let kinds: Vec<String> = nodes.iter().map(|n| n.id.kind.to_string()).collect();
+    let line_starts: Vec<u32> = nodes.iter().map(|n| n.line_start as u32).collect();
+    let line_ends: Vec<u32> = nodes.iter().map(|n| n.line_end as u32).collect();
+    let signatures: Vec<String> = nodes.iter().map(|n| n.signature.clone()).collect();
+    let bodies: Vec<String> = nodes.iter().map(|n| n.body.clone()).collect();
+    let meta_virtuals: Vec<Option<bool>> = nodes.iter()
+        .map(|n| if n.metadata.get("virtual").map(|v| v.as_str()) == Some("true") { Some(true) } else { None })
+        .collect();
+    let meta_packages: Vec<Option<String>> = nodes.iter()
+        .map(|n| n.metadata.get("package").cloned())
+        .collect();
+    let meta_name_cols: Vec<Option<i32>> = nodes.iter()
+        .map(|n| n.metadata.get("name_col").and_then(|s| s.parse::<i32>().ok()))
+        .collect();
+    let values: Vec<Option<String>> = nodes.iter().map(|n| n.metadata.get("value").cloned()).collect();
+    let mut synthetic_builder = BooleanBuilder::new();
+    for n in nodes.iter() {
+        match n.metadata.get("synthetic") {
+            Some(v) => synthetic_builder.append_value(v == "true"),
+            None => synthetic_builder.append_null(),
+        }
+    }
+    let cyclomatics: Vec<Option<i32>> = nodes.iter()
+        .map(|n| n.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok()))
+        .collect();
+    let importances: Vec<Option<f64>> = nodes.iter()
+        .map(|n| n.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()))
+        .collect();
+    let storages: Vec<Option<String>> = nodes.iter()
+        .map(|n| n.metadata.get("storage").cloned())
+        .collect();
+    let mut mutable_builder = BooleanBuilder::new();
+    for n in nodes.iter() {
+        match n.metadata.get("mutable") {
+            Some(v) => mutable_builder.append_value(v == "true"),
+            None => mutable_builder.append_null(),
+        }
+    }
+    let decorators_col: Vec<Option<String>> = nodes.iter()
+        .map(|n| n.metadata.get("decorators").cloned())
+        .collect();
+    let type_params_col: Vec<Option<String>> = nodes.iter()
+        .map(|n| n.metadata.get("type_params").cloned())
+        .collect();
+    let pattern_hints: Vec<Option<String>> = nodes.iter()
+        .map(|n| n.metadata.get("pattern_hint").cloned())
+        .collect();
+    let mut is_static_builder = BooleanBuilder::new();
+    for n in nodes.iter() {
+        match n.metadata.get("is_static") {
+            Some(v) => is_static_builder.append_value(v == "true"),
+            None => is_static_builder.append_null(),
+        }
+    }
+    let mut is_async_builder = BooleanBuilder::new();
+    for n in nodes.iter() {
+        match n.metadata.get("is_async") {
+            Some(v) => is_async_builder.append_value(v == "true"),
+            None => is_async_builder.append_null(),
+        }
+    }
+    let mut is_test_builder = BooleanBuilder::new();
+    for n in nodes.iter() {
+        match n.metadata.get("is_test") {
+            Some(v) => is_test_builder.append_value(v == "true"),
+            None => is_test_builder.append_null(),
+        }
+    }
+    let visibilities: Vec<Option<String>> = nodes.iter()
+        .map(|n| n.metadata.get("visibility").cloned())
+        .collect();
+    let mut exported_builder = BooleanBuilder::new();
+    for n in nodes.iter() {
+        match n.metadata.get("exported") {
+            Some(v) => exported_builder.append_value(v == "true"),
+            None => exported_builder.append_null(),
+        }
+    }
+    // Diagnostic metadata columns
+    let diag_severities: Vec<Option<String>> = nodes.iter()
+        .map(|n| n.metadata.get("diagnostic_severity").cloned())
+        .collect();
+    let diag_sources: Vec<Option<String>> = nodes.iter()
+        .map(|n| n.metadata.get("diagnostic_source").cloned())
+        .collect();
+    let diag_messages: Vec<Option<String>> = nodes.iter()
+        .map(|n| n.metadata.get("diagnostic_message").cloned())
+        .collect();
+    let diag_ranges: Vec<Option<String>> = nodes.iter()
+        .map(|n| n.metadata.get("diagnostic_range").cloned())
+        .collect();
+    let diag_timestamps: Vec<Option<String>> = nodes.iter()
+        .map(|n| n.metadata.get("diagnostic_timestamp").cloned())
+        .collect();
+    // ApiEndpoint metadata columns
+    let http_methods: Vec<Option<String>> = nodes.iter()
+        .map(|n| n.metadata.get("http_method").cloned())
+        .collect();
+    let http_paths: Vec<Option<String>> = nodes.iter()
+        .map(|n| n.metadata.get("http_path").cloned())
+        .collect();
+    // doc_comment column — persisted for LSP reindex round-trip (#416)
+    let doc_comments: Vec<Option<String>> = nodes.iter()
+        .map(|n| n.metadata.get("doc_comment").cloned())
+        .collect();
+    let updated_ats: Vec<i64> = vec![now; nodes.len()];
+    let scan_versions: Vec<u64> = vec![scan_version; nodes.len()];
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(StringArray::from(root_ids)),
+            Arc::new(StringArray::from(file_paths)),
+            Arc::new(StringArray::from(names)),
+            Arc::new(StringArray::from(kinds)),
+            Arc::new(UInt32Array::from(line_starts)),
+            Arc::new(UInt32Array::from(line_ends)),
+            Arc::new(StringArray::from(signatures)),
+            Arc::new(StringArray::from(bodies)),
+            Arc::new(BooleanArray::from(meta_virtuals)),
+            Arc::new(StringArray::from(meta_packages)),
+            Arc::new(Int32Array::from(meta_name_cols)),
+            Arc::new(StringArray::from(values)),
+            Arc::new(synthetic_builder.finish()),
+            Arc::new(Int32Array::from(cyclomatics)),
+            Arc::new(Float64Array::from(importances)),
+            Arc::new(StringArray::from(storages)),
+            Arc::new(mutable_builder.finish()),
+            Arc::new(StringArray::from(decorators_col)),
+            Arc::new(StringArray::from(type_params_col)),
+            Arc::new(StringArray::from(pattern_hints)),
+            Arc::new(is_static_builder.finish()),
+            Arc::new(is_async_builder.finish()),
+            Arc::new(is_test_builder.finish()),
+            Arc::new(StringArray::from(visibilities)),
+            Arc::new(exported_builder.finish()),
+            Arc::new(StringArray::from(diag_severities)),
+            Arc::new(StringArray::from(diag_sources)),
+            Arc::new(StringArray::from(diag_messages)),
+            Arc::new(StringArray::from(diag_ranges)),
+            Arc::new(StringArray::from(diag_timestamps)),
+            Arc::new(StringArray::from(http_methods)),
+            Arc::new(StringArray::from(http_paths)),
+            Arc::new(StringArray::from(doc_comments)),
+            Arc::new(Int64Array::from(updated_ats)),
+            Arc::new(UInt64Array::from(scan_versions)),
+        ],
+    ).map_err(anyhow::Error::from)
+}
+
+/// Build an edges `RecordBatch` for `edges` tagged with `scan_version`.
+fn build_edges_batch(edges: &[Edge], scan_version: u64) -> anyhow::Result<RecordBatch> {
+    use std::sync::Arc;
+    let schema = Arc::new(edges_schema());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let ids: Vec<String> = edges.iter().map(|e| e.stable_id()).collect();
+    let source_ids: Vec<String> = edges.iter().map(|e| e.from.to_stable_id()).collect();
+    let source_types: Vec<String> = edges.iter().map(|e| e.from.kind.to_string()).collect();
+    let target_ids: Vec<String> = edges.iter().map(|e| e.to.to_stable_id()).collect();
+    let target_types: Vec<String> = edges.iter().map(|e| e.to.kind.to_string()).collect();
+    let edge_types: Vec<String> = edges.iter().map(|e| e.kind.to_string()).collect();
+    let edge_sources: Vec<String> = edges.iter().map(|e| e.source.to_string()).collect();
+    let edge_confidences: Vec<String> = edges.iter().map(|e| e.confidence.to_string()).collect();
+    let root_ids: Vec<String> = edges.iter().map(|e| e.from.root.clone()).collect();
+    let updated_ats: Vec<i64> = vec![now; edges.len()];
+    let scan_versions: Vec<u64> = vec![scan_version; edges.len()];
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(StringArray::from(source_ids)),
+            Arc::new(StringArray::from(source_types)),
+            Arc::new(StringArray::from(target_ids)),
+            Arc::new(StringArray::from(target_types)),
+            Arc::new(StringArray::from(edge_types)),
+            Arc::new(StringArray::from(edge_sources)),
+            Arc::new(StringArray::from(edge_confidences)),
+            Arc::new(StringArray::from(root_ids)),
+            Arc::new(Int64Array::from(updated_ats)),
+            Arc::new(UInt64Array::from(scan_versions)),
+        ],
+    ).map_err(anyhow::Error::from)
+}
+
+/// Persist graph nodes and edges to LanceDB using append-only versioned writes.
+///
+/// Each call appends a new `scan_version` (monotonically incrementing) to the tables
+/// and atomically updates the version pointer file ONLY after both tables are fully
+/// written. Old rows remain queryable until the pointer flips; reads always filter to
+/// the latest committed version.
+///
+/// This replaces the previous DROP+CREATE strategy, eliminating:
+/// - Zero-result query windows during rebuild
+/// - Data loss if persist fails mid-way (old version stays live)
+/// - Slow index recreation on every scan (FTS index created once, not per rebuild)
+///
+/// After a successful commit, background compaction removes rows from versions older
+/// than `committed - 1` via `compact_stale_versions`.
 pub(crate) async fn persist_graph_to_lance(
     repo_root: &Path,
     nodes: &[Node],
@@ -488,271 +740,191 @@ pub(crate) async fn persist_graph_to_lance(
         .await
         .context("Failed to connect to LanceDB for graph persistence")?;
 
-    // ── Write symbols (nodes) table ──
+    // Determine the next scan_version to write.
+    // current committed version → write to current + 1.
+    let committed_version = read_committed_scan_version(&db_path);
+    let new_version = committed_version + 1;
+
+    tracing::debug!(
+        "persist_graph_to_lance: committed_version={} → writing new_version={}",
+        committed_version, new_version
+    );
+
+    // ── Append symbols (nodes) with new_version ──
     {
         let schema = Arc::new(symbols_schema());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let batch = build_symbols_batch(nodes, new_version)?;
 
-        let ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
-        let root_ids: Vec<String> = nodes.iter().map(|n| n.id.root.clone()).collect();
-        let file_paths: Vec<String> = nodes.iter().map(|n| n.id.file.display().to_string()).collect();
-        let names: Vec<String> = nodes.iter().map(|n| n.id.name.clone()).collect();
-        let kinds: Vec<String> = nodes.iter().map(|n| n.id.kind.to_string()).collect();
-        let line_starts: Vec<u32> = nodes.iter().map(|n| n.line_start as u32).collect();
-        let line_ends: Vec<u32> = nodes.iter().map(|n| n.line_end as u32).collect();
-        let signatures: Vec<String> = nodes.iter().map(|n| n.signature.clone()).collect();
-        let bodies: Vec<String> = nodes.iter().map(|n| n.body.clone()).collect();
-        let meta_virtuals: Vec<Option<bool>> = nodes.iter()
-            .map(|n| if n.metadata.get("virtual").map(|v| v.as_str()) == Some("true") { Some(true) } else { None })
-            .collect();
-        let meta_packages: Vec<Option<String>> = nodes.iter()
-            .map(|n| n.metadata.get("package").cloned())
-            .collect();
-        let meta_name_cols: Vec<Option<i32>> = nodes.iter()
-            .map(|n| n.metadata.get("name_col").and_then(|s| s.parse::<i32>().ok()))
-            .collect();
-        let values: Vec<Option<String>> = nodes.iter().map(|n| n.metadata.get("value").cloned()).collect();
-        let mut synthetic_builder = BooleanBuilder::new();
-        for n in nodes.iter() {
-            match n.metadata.get("synthetic") {
-                Some(v) => synthetic_builder.append_value(v == "true"),
-                None => synthetic_builder.append_null(),
+        match db.open_table("symbols").execute().await {
+            Ok(tbl) => {
+                // Table exists — append the new-version rows.
+                let mut attempts: u64 = 0;
+                loop {
+                    let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+                    match tbl.add(batches).execute().await {
+                        Ok(_) => break,
+                        Err(e) => {
+                            let err = anyhow::anyhow!("{}", e);
+                            if is_conflict_error(&err) && attempts < 3 {
+                                attempts += 1;
+                                tracing::warn!(
+                                    "LanceDB conflict on symbols append (attempt {}), retrying in {}ms",
+                                    attempts, 100 * attempts
+                                );
+                                tokio::time::sleep(Duration::from_millis(100 * attempts)).await;
+                            } else if is_schema_mismatch_error(&err) {
+                                tracing::warn!(
+                                    "LanceDB schema mismatch on symbols append — dropping and recreating: {}",
+                                    err
+                                );
+                                drop_all_lance_tables(&db_path);
+                                // Signal caller to do a fresh full persist after schema reset.
+                                return Err(anyhow::anyhow!(
+                                    "Schema mismatch during full persist — tables dropped, retry needed"
+                                ));
+                            } else {
+                                return Err(err).context("Failed to append to symbols table");
+                            }
+                        }
+                    }
+                }
             }
-        }
-        let cyclomatics: Vec<Option<i32>> = nodes.iter()
-            .map(|n| n.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok()))
-            .collect();
-        let importances: Vec<Option<f64>> = nodes.iter()
-            .map(|n| n.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()))
-            .collect();
-        let storages: Vec<Option<String>> = nodes.iter()
-            .map(|n| n.metadata.get("storage").cloned())
-            .collect();
-        let mut mutable_builder = BooleanBuilder::new();
-        for n in nodes.iter() {
-            match n.metadata.get("mutable") {
-                Some(v) => mutable_builder.append_value(v == "true"),
-                None => mutable_builder.append_null(),
-            }
-        }
-        let decorators_col: Vec<Option<String>> = nodes.iter()
-            .map(|n| n.metadata.get("decorators").cloned())
-            .collect();
-        let type_params_col: Vec<Option<String>> = nodes.iter()
-            .map(|n| n.metadata.get("type_params").cloned())
-            .collect();
-        let pattern_hints: Vec<Option<String>> = nodes.iter()
-            .map(|n| n.metadata.get("pattern_hint").cloned())
-            .collect();
-        let mut is_static_builder = BooleanBuilder::new();
-        for n in nodes.iter() {
-            match n.metadata.get("is_static") {
-                Some(v) => is_static_builder.append_value(v == "true"),
-                None => is_static_builder.append_null(),
-            }
-        }
-        let mut is_async_builder = BooleanBuilder::new();
-        for n in nodes.iter() {
-            match n.metadata.get("is_async") {
-                Some(v) => is_async_builder.append_value(v == "true"),
-                None => is_async_builder.append_null(),
-            }
-        }
-        let mut is_test_builder = BooleanBuilder::new();
-        for n in nodes.iter() {
-            match n.metadata.get("is_test") {
-                Some(v) => is_test_builder.append_value(v == "true"),
-                None => is_test_builder.append_null(),
-            }
-        }
-        let visibilities: Vec<Option<String>> = nodes.iter()
-            .map(|n| n.metadata.get("visibility").cloned())
-            .collect();
-        let mut exported_builder = BooleanBuilder::new();
-        for n in nodes.iter() {
-            match n.metadata.get("exported") {
-                Some(v) => exported_builder.append_value(v == "true"),
-                None => exported_builder.append_null(),
-            }
-        }
-        // Diagnostic metadata columns
-        let diag_severities: Vec<Option<String>> = nodes.iter()
-            .map(|n| n.metadata.get("diagnostic_severity").cloned())
-            .collect();
-        let diag_sources: Vec<Option<String>> = nodes.iter()
-            .map(|n| n.metadata.get("diagnostic_source").cloned())
-            .collect();
-        let diag_messages: Vec<Option<String>> = nodes.iter()
-            .map(|n| n.metadata.get("diagnostic_message").cloned())
-            .collect();
-        let diag_ranges: Vec<Option<String>> = nodes.iter()
-            .map(|n| n.metadata.get("diagnostic_range").cloned())
-            .collect();
-        let diag_timestamps: Vec<Option<String>> = nodes.iter()
-            .map(|n| n.metadata.get("diagnostic_timestamp").cloned())
-            .collect();
-        // ApiEndpoint metadata columns
-        let http_methods: Vec<Option<String>> = nodes.iter()
-            .map(|n| n.metadata.get("http_method").cloned())
-            .collect();
-        let http_paths: Vec<Option<String>> = nodes.iter()
-            .map(|n| n.metadata.get("http_path").cloned())
-            .collect();
-        // doc_comment column — persisted for LSP reindex round-trip (#416)
-        let doc_comments: Vec<Option<String>> = nodes.iter()
-            .map(|n| n.metadata.get("doc_comment").cloned())
-            .collect();
-        let updated_ats: Vec<i64> = vec![now; nodes.len()];
+            Err(_) => {
+                // Table doesn't exist yet — create it with the first batch.
+                let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+                db.create_table("symbols", Box::new(batches))
+                    .execute()
+                    .await
+                    .context("Failed to create symbols table")?;
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(ids)),
-                Arc::new(StringArray::from(root_ids)),
-                Arc::new(StringArray::from(file_paths)),
-                Arc::new(StringArray::from(names)),
-                Arc::new(StringArray::from(kinds)),
-                Arc::new(UInt32Array::from(line_starts)),
-                Arc::new(UInt32Array::from(line_ends)),
-                Arc::new(StringArray::from(signatures)),
-                Arc::new(StringArray::from(bodies)),
-                Arc::new(BooleanArray::from(meta_virtuals)),
-                Arc::new(StringArray::from(meta_packages)),
-                Arc::new(Int32Array::from(meta_name_cols)),
-                Arc::new(StringArray::from(values)),
-                Arc::new(synthetic_builder.finish()),
-                Arc::new(Int32Array::from(cyclomatics)),
-                Arc::new(Float64Array::from(importances)),
-                Arc::new(StringArray::from(storages)),
-                Arc::new(mutable_builder.finish()),
-                Arc::new(StringArray::from(decorators_col)),
-                Arc::new(StringArray::from(type_params_col)),
-                Arc::new(StringArray::from(pattern_hints)),
-                Arc::new(is_static_builder.finish()),
-                Arc::new(is_async_builder.finish()),
-                Arc::new(is_test_builder.finish()),
-                Arc::new(StringArray::from(visibilities)),
-                Arc::new(exported_builder.finish()),
-                Arc::new(StringArray::from(diag_severities)),
-                Arc::new(StringArray::from(diag_sources)),
-                Arc::new(StringArray::from(diag_messages)),
-                Arc::new(StringArray::from(diag_ranges)),
-                Arc::new(StringArray::from(diag_timestamps)),
-                Arc::new(StringArray::from(http_methods)),
-                Arc::new(StringArray::from(http_paths)),
-                Arc::new(StringArray::from(doc_comments)),
-                Arc::new(Int64Array::from(updated_ats)),
-            ],
-        )?;
-
-        // Retry on conflict: another process may be mid-write.
-        // Each attempt re-drops and re-creates so we always write a complete table.
-        let mut attempts: u64 = 0;
-        loop {
-            let _ = db.drop_table("symbols", &[]).await;
-            let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
-            match db.create_table("symbols", Box::new(batches)).execute().await {
-                Ok(_) => break,
-                Err(e) => {
-                    let err = anyhow::anyhow!("{}", e);
-                    if is_conflict_error(&err) && attempts < 3 {
-                        attempts += 1;
-                        tracing::warn!(
-                            "LanceDB conflict on symbols table (attempt {}), retrying in {}ms",
-                            attempts,
-                            100 * attempts
-                        );
-                        tokio::time::sleep(Duration::from_millis(100 * attempts)).await;
-                    } else {
-                        return Err(err).context("Failed to create symbols table after retries");
+                // Create FTS index once on new table — not on every rebuild.
+                if let Ok(tbl) = db.open_table("symbols").execute().await {
+                    match tbl
+                        .create_index(&["name"], lancedb::index::Index::FTS(Default::default()))
+                        .execute()
+                        .await
+                    {
+                        Ok(_) => tracing::info!("Created FTS index on symbols.name"),
+                        Err(e) => tracing::warn!("Failed to create FTS index: {}", e),
                     }
                 }
             }
         }
     }
 
-    // ── Write edges table ──
+    // ── Append edges with new_version ──
     {
         let schema = Arc::new(edges_schema());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let batch = build_edges_batch(edges, new_version)?;
 
-        let ids: Vec<String> = edges.iter().map(|e| e.stable_id()).collect();
-        let source_ids: Vec<String> = edges.iter().map(|e| e.from.to_stable_id()).collect();
-        let source_types: Vec<String> = edges.iter().map(|e| e.from.kind.to_string()).collect();
-        let target_ids: Vec<String> = edges.iter().map(|e| e.to.to_stable_id()).collect();
-        let target_types: Vec<String> = edges.iter().map(|e| e.to.kind.to_string()).collect();
-        let edge_types: Vec<String> = edges.iter().map(|e| e.kind.to_string()).collect();
-        let edge_sources: Vec<String> = edges.iter().map(|e| e.source.to_string()).collect();
-        let edge_confidences: Vec<String> = edges.iter().map(|e| e.confidence.to_string()).collect();
-        let root_ids: Vec<String> = edges.iter().map(|e| e.from.root.clone()).collect();
-        let updated_ats: Vec<i64> = vec![now; edges.len()];
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(ids)),
-                Arc::new(StringArray::from(source_ids)),
-                Arc::new(StringArray::from(source_types)),
-                Arc::new(StringArray::from(target_ids)),
-                Arc::new(StringArray::from(target_types)),
-                Arc::new(StringArray::from(edge_types)),
-                Arc::new(StringArray::from(edge_sources)),
-                Arc::new(StringArray::from(edge_confidences)),
-                Arc::new(StringArray::from(root_ids)),
-                Arc::new(Int64Array::from(updated_ats)),
-            ],
-        )?;
-
-        // Retry on conflict: another process may be mid-write.
-        let mut attempts: u64 = 0;
-        loop {
-            let _ = db.drop_table("edges", &[]).await;
-            let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
-            match db.create_table("edges", Box::new(batches)).execute().await {
-                Ok(_) => break,
-                Err(e) => {
-                    let err = anyhow::anyhow!("{}", e);
-                    if is_conflict_error(&err) && attempts < 3 {
-                        attempts += 1;
-                        tracing::warn!(
-                            "LanceDB conflict on edges table (attempt {}), retrying in {}ms",
-                            attempts,
-                            100 * attempts
-                        );
-                        tokio::time::sleep(Duration::from_millis(100 * attempts)).await;
-                    } else {
-                        return Err(err).context("Failed to create edges table after retries");
+        match db.open_table("edges").execute().await {
+            Ok(tbl) => {
+                let mut attempts: u64 = 0;
+                loop {
+                    let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+                    match tbl.add(batches).execute().await {
+                        Ok(_) => break,
+                        Err(e) => {
+                            let err = anyhow::anyhow!("{}", e);
+                            if is_conflict_error(&err) && attempts < 3 {
+                                attempts += 1;
+                                tracing::warn!(
+                                    "LanceDB conflict on edges append (attempt {}), retrying in {}ms",
+                                    attempts, 100 * attempts
+                                );
+                                tokio::time::sleep(Duration::from_millis(100 * attempts)).await;
+                            } else if is_schema_mismatch_error(&err) {
+                                tracing::warn!(
+                                    "LanceDB schema mismatch on edges append — dropping and recreating: {}",
+                                    err
+                                );
+                                drop_all_lance_tables(&db_path);
+                                return Err(anyhow::anyhow!(
+                                    "Schema mismatch during full persist — tables dropped, retry needed"
+                                ));
+                            } else {
+                                return Err(err).context("Failed to append to edges table");
+                            }
+                        }
                     }
+                }
+            }
+            Err(_) => {
+                let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+                db.create_table("edges", Box::new(batches))
+                    .execute()
+                    .await
+                    .context("Failed to create edges table")?;
+            }
+        }
+    }
+
+    // ── Atomically flip the version pointer ──
+    // Both tables are fully written. Only now do we make new_version live for reads.
+    write_committed_scan_version(&db_path, new_version)
+        .context("Failed to update committed scan_version pointer")?;
+
+    tracing::info!(
+        "Persisted graph to LanceDB: {} nodes, {} edges (scan_version={})",
+        nodes.len(), edges.len(), new_version
+    );
+
+    // ── Background compaction: remove stale version rows ──
+    // Run after commit — non-fatal if it fails (just leaves extra rows).
+    if let Err(e) = compact_stale_versions(&db_path, new_version).await {
+        tracing::warn!("compact_stale_versions failed (non-fatal): {}", e);
+    }
+
+    Ok(())
+}
+
+/// Delete rows from `symbols` and `edges` where `scan_version < committed_version - 1`.
+///
+/// Keeps one previous version as a safety buffer in case a concurrent reader is
+/// mid-query on the old version. The N-2 and older versions are unreachable.
+///
+/// This is called automatically after each successful `persist_graph_to_lance`.
+/// Non-fatal: a failure here leaves stale rows that will be cleaned up next scan.
+pub(crate) async fn compact_stale_versions(db_path: &Path, committed_version: u64) -> anyhow::Result<()> {
+    // Keep committed_version and committed_version - 1 (one buffer).
+    // Delete everything older.
+    if committed_version < 2 {
+        // Nothing to compact on first or second write.
+        return Ok(());
+    }
+    let cutoff = committed_version - 1; // delete scan_version < cutoff
+    let predicate = format!("scan_version < {}", cutoff);
+
+    let db = lancedb::connect(db_path.to_str().unwrap_or_default())
+        .execute()
+        .await
+        .context("compact_stale_versions: failed to connect to LanceDB")?;
+
+    let mut deleted_symbols = 0u64;
+    let mut deleted_edges = 0u64;
+
+    for (table_name, deleted_count) in [("symbols", &mut deleted_symbols), ("edges", &mut deleted_edges)] {
+        if let Ok(tbl) = db.open_table(table_name).execute().await {
+            // Count rows before deletion for logging.
+            match tbl.delete(&predicate).await {
+                Ok(_) => {
+                    *deleted_count = 1; // deletion succeeded (LanceDB doesn't return count)
+                    tracing::debug!("compact_stale_versions: deleted stale rows from {} (scan_version < {})", table_name, cutoff);
+                }
+                Err(e) => {
+                    tracing::warn!("compact_stale_versions: delete from {} failed: {}", table_name, e);
                 }
             }
         }
     }
 
-    // Create FTS index on symbols table for keyword search over all nodes
-    // (fields, imports, keys, consts that don't get vector embeddings)
-    if let Ok(symbols_table) = db.open_table("symbols").execute().await {
-        // LanceDB doesn't support composite FTS indices yet — index name only
-        match symbols_table
-            .create_index(&["name"], lancedb::index::Index::FTS(Default::default()))
-            .execute()
-            .await
-        {
-            Ok(_) => tracing::info!("Created FTS index on symbols.name"),
-            Err(e) => tracing::warn!("Failed to create FTS index: {}", e),
-        }
+    if deleted_symbols > 0 || deleted_edges > 0 {
+        tracing::info!(
+            "compact_stale_versions: removed stale rows (scan_version < {}) from symbols and edges",
+            cutoff
+        );
     }
 
-    tracing::info!(
-        "Persisted graph to LanceDB: {} nodes, {} edges",
-        nodes.len(),
-        edges.len()
-    );
     Ok(())
 }
 
@@ -790,15 +962,17 @@ pub(crate) async fn persist_graph_incremental(
         .await
         .context("Failed to connect to LanceDB for incremental graph persistence")?;
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    // Incremental writes use the current committed version so updated nodes
+    // remain visible in queries. A full rebuild bumps the version; incremental
+    // does not change the version pointer.
+    let committed_version = read_committed_scan_version(&db_path);
+    // Use max(committed_version, 1) so that even before the first full rebuild
+    // incremental writes produce version=1 rows (not version=0 which is the
+    // "no filter" sentinel used by load_graph_from_lance for legacy data).
+    let write_version = committed_version.max(1);
 
     // ── Symbols (nodes) table: delete then upsert ──
     {
-        let schema = Arc::new(symbols_schema());
-
         // 1. Delete symbols for removed/changed files first so upsert is clean.
         if !deleted_files.is_empty() {
             if let Ok(tbl) = db.open_table("symbols").execute().await {
@@ -815,157 +989,8 @@ pub(crate) async fn persist_graph_incremental(
 
         // 2. Upsert changed/added nodes (insert new, update existing by stable id).
         if !upsert_nodes.is_empty() {
-            let ids: Vec<String> = upsert_nodes.iter().map(|n| n.stable_id()).collect();
-            let root_ids: Vec<String> = upsert_nodes.iter().map(|n| n.id.root.clone()).collect();
-            let file_paths: Vec<String> = upsert_nodes.iter().map(|n| n.id.file.display().to_string()).collect();
-            let names: Vec<String> = upsert_nodes.iter().map(|n| n.id.name.clone()).collect();
-            let kinds: Vec<String> = upsert_nodes.iter().map(|n| n.id.kind.to_string()).collect();
-            let line_starts: Vec<u32> = upsert_nodes.iter().map(|n| n.line_start as u32).collect();
-            let line_ends: Vec<u32> = upsert_nodes.iter().map(|n| n.line_end as u32).collect();
-            let signatures: Vec<String> = upsert_nodes.iter().map(|n| n.signature.clone()).collect();
-            let bodies: Vec<String> = upsert_nodes.iter().map(|n| n.body.clone()).collect();
-            let meta_virtuals: Vec<Option<bool>> = upsert_nodes.iter()
-                .map(|n| if n.metadata.get("virtual").map(|v| v.as_str()) == Some("true") { Some(true) } else { None })
-                .collect();
-            let meta_packages: Vec<Option<String>> = upsert_nodes.iter()
-                .map(|n| n.metadata.get("package").cloned())
-                .collect();
-            let meta_name_cols: Vec<Option<i32>> = upsert_nodes.iter()
-                .map(|n| n.metadata.get("name_col").and_then(|s| s.parse::<i32>().ok()))
-                .collect();
-            let values: Vec<Option<String>> = upsert_nodes.iter().map(|n| n.metadata.get("value").cloned()).collect();
-            let mut synthetic_builder = BooleanBuilder::new();
-            for n in upsert_nodes.iter() {
-                match n.metadata.get("synthetic") {
-                    Some(v) => synthetic_builder.append_value(v == "true"),
-                    None => synthetic_builder.append_null(),
-                }
-            }
-            let cyclomatics: Vec<Option<i32>> = upsert_nodes.iter()
-                .map(|n| n.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok()))
-                .collect();
-            let importances: Vec<Option<f64>> = upsert_nodes.iter()
-                .map(|n| n.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()))
-                .collect();
-            let storages: Vec<Option<String>> = upsert_nodes.iter()
-                .map(|n| n.metadata.get("storage").cloned())
-                .collect();
-            let mut mutable_builder = BooleanBuilder::new();
-            for n in upsert_nodes.iter() {
-                match n.metadata.get("mutable") {
-                    Some(v) => mutable_builder.append_value(v == "true"),
-                    None => mutable_builder.append_null(),
-                }
-            }
-            let decorators_col: Vec<Option<String>> = upsert_nodes.iter()
-                .map(|n| n.metadata.get("decorators").cloned())
-                .collect();
-            let type_params_col: Vec<Option<String>> = upsert_nodes.iter()
-                .map(|n| n.metadata.get("type_params").cloned())
-                .collect();
-            let pattern_hints: Vec<Option<String>> = upsert_nodes.iter()
-                .map(|n| n.metadata.get("pattern_hint").cloned())
-                .collect();
-            let mut is_static_builder = BooleanBuilder::new();
-            for n in upsert_nodes.iter() {
-                match n.metadata.get("is_static") {
-                    Some(v) => is_static_builder.append_value(v == "true"),
-                    None => is_static_builder.append_null(),
-                }
-            }
-            let mut is_async_builder = BooleanBuilder::new();
-            for n in upsert_nodes.iter() {
-                match n.metadata.get("is_async") {
-                    Some(v) => is_async_builder.append_value(v == "true"),
-                    None => is_async_builder.append_null(),
-                }
-            }
-            let mut is_test_builder = BooleanBuilder::new();
-            for n in upsert_nodes.iter() {
-                match n.metadata.get("is_test") {
-                    Some(v) => is_test_builder.append_value(v == "true"),
-                    None => is_test_builder.append_null(),
-                }
-            }
-            let visibilities: Vec<Option<String>> = upsert_nodes.iter()
-                .map(|n| n.metadata.get("visibility").cloned())
-                .collect();
-            let mut exported_builder = BooleanBuilder::new();
-            for n in upsert_nodes.iter() {
-                match n.metadata.get("exported") {
-                    Some(v) => exported_builder.append_value(v == "true"),
-                    None => exported_builder.append_null(),
-                }
-            }
-            // Diagnostic metadata columns
-            let diag_severities: Vec<Option<String>> = upsert_nodes.iter()
-                .map(|n| n.metadata.get("diagnostic_severity").cloned())
-                .collect();
-            let diag_sources: Vec<Option<String>> = upsert_nodes.iter()
-                .map(|n| n.metadata.get("diagnostic_source").cloned())
-                .collect();
-            let diag_messages: Vec<Option<String>> = upsert_nodes.iter()
-                .map(|n| n.metadata.get("diagnostic_message").cloned())
-                .collect();
-            let diag_ranges: Vec<Option<String>> = upsert_nodes.iter()
-                .map(|n| n.metadata.get("diagnostic_range").cloned())
-                .collect();
-            let diag_timestamps: Vec<Option<String>> = upsert_nodes.iter()
-                .map(|n| n.metadata.get("diagnostic_timestamp").cloned())
-                .collect();
-            // ApiEndpoint metadata columns
-            let http_methods: Vec<Option<String>> = upsert_nodes.iter()
-                .map(|n| n.metadata.get("http_method").cloned())
-                .collect();
-            let http_paths: Vec<Option<String>> = upsert_nodes.iter()
-                .map(|n| n.metadata.get("http_path").cloned())
-                .collect();
-            // doc_comment column — persisted for LSP reindex round-trip (#416)
-            let doc_comments: Vec<Option<String>> = upsert_nodes.iter()
-                .map(|n| n.metadata.get("doc_comment").cloned())
-                .collect();
-            let updated_ats: Vec<i64> = vec![now; upsert_nodes.len()];
-
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(StringArray::from(ids)),
-                    Arc::new(StringArray::from(root_ids)),
-                    Arc::new(StringArray::from(file_paths)),
-                    Arc::new(StringArray::from(names)),
-                    Arc::new(StringArray::from(kinds)),
-                    Arc::new(UInt32Array::from(line_starts)),
-                    Arc::new(UInt32Array::from(line_ends)),
-                    Arc::new(StringArray::from(signatures)),
-                    Arc::new(StringArray::from(bodies)),
-                    Arc::new(BooleanArray::from(meta_virtuals)),
-                    Arc::new(StringArray::from(meta_packages)),
-                    Arc::new(Int32Array::from(meta_name_cols)),
-                    Arc::new(StringArray::from(values)),
-                    Arc::new(synthetic_builder.finish()),
-                    Arc::new(Int32Array::from(cyclomatics)),
-                    Arc::new(Float64Array::from(importances)),
-                    Arc::new(StringArray::from(storages)),
-                    Arc::new(mutable_builder.finish()),
-                    Arc::new(StringArray::from(decorators_col)),
-                    Arc::new(StringArray::from(type_params_col)),
-                    Arc::new(StringArray::from(pattern_hints)),
-                    Arc::new(is_static_builder.finish()),
-                    Arc::new(is_async_builder.finish()),
-                    Arc::new(is_test_builder.finish()),
-                    Arc::new(StringArray::from(visibilities)),
-                    Arc::new(exported_builder.finish()),
-                    Arc::new(StringArray::from(diag_severities)),
-                    Arc::new(StringArray::from(diag_sources)),
-                    Arc::new(StringArray::from(diag_messages)),
-                    Arc::new(StringArray::from(diag_ranges)),
-                    Arc::new(StringArray::from(diag_timestamps)),
-                    Arc::new(StringArray::from(http_methods)),
-                    Arc::new(StringArray::from(http_paths)),
-                    Arc::new(StringArray::from(doc_comments)),
-                    Arc::new(Int64Array::from(updated_ats)),
-                ],
-            )?;
+            let batch = build_symbols_batch(upsert_nodes, write_version)?;
+            let schema = batch.schema();
 
             match db.open_table("symbols").execute().await {
                 Ok(tbl) => {
@@ -1007,7 +1032,7 @@ pub(crate) async fn persist_graph_incremental(
                 }
                 Err(_) => {
                     // Table doesn't exist yet — create it (first incremental run after a fresh repo)
-                    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+                    let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], schema);
                     db.create_table("symbols", Box::new(batches))
                         .execute()
                         .await
@@ -1019,8 +1044,6 @@ pub(crate) async fn persist_graph_incremental(
 
     // ── Edges table: delete then upsert ──
     {
-        let schema = Arc::new(edges_schema());
-
         // 1. Delete edges that referenced removed/changed files (by stable edge ID).
         if !deleted_edge_ids.is_empty() {
             if let Ok(tbl) = db.open_table("edges").execute().await {
@@ -1037,32 +1060,8 @@ pub(crate) async fn persist_graph_incremental(
 
         // 2. Upsert changed/added edges.
         if !upsert_edges.is_empty() {
-            let ids: Vec<String> = upsert_edges.iter().map(|e| e.stable_id()).collect();
-            let source_ids: Vec<String> = upsert_edges.iter().map(|e| e.from.to_stable_id()).collect();
-            let source_types: Vec<String> = upsert_edges.iter().map(|e| e.from.kind.to_string()).collect();
-            let target_ids: Vec<String> = upsert_edges.iter().map(|e| e.to.to_stable_id()).collect();
-            let target_types: Vec<String> = upsert_edges.iter().map(|e| e.to.kind.to_string()).collect();
-            let edge_types: Vec<String> = upsert_edges.iter().map(|e| e.kind.to_string()).collect();
-            let edge_sources: Vec<String> = upsert_edges.iter().map(|e| e.source.to_string()).collect();
-            let edge_confidences: Vec<String> = upsert_edges.iter().map(|e| e.confidence.to_string()).collect();
-            let root_ids: Vec<String> = upsert_edges.iter().map(|e| e.from.root.clone()).collect();
-            let updated_ats: Vec<i64> = vec![now; upsert_edges.len()];
-
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(StringArray::from(ids)),
-                    Arc::new(StringArray::from(source_ids)),
-                    Arc::new(StringArray::from(source_types)),
-                    Arc::new(StringArray::from(target_ids)),
-                    Arc::new(StringArray::from(target_types)),
-                    Arc::new(StringArray::from(edge_types)),
-                    Arc::new(StringArray::from(edge_sources)),
-                    Arc::new(StringArray::from(edge_confidences)),
-                    Arc::new(StringArray::from(root_ids)),
-                    Arc::new(Int64Array::from(updated_ats)),
-                ],
-            )?;
+            let batch = build_edges_batch(upsert_edges, write_version)?;
+            let schema = batch.schema();
 
             match db.open_table("edges").execute().await {
                 Ok(tbl) => {
@@ -1103,7 +1102,7 @@ pub(crate) async fn persist_graph_incremental(
                 }
                 Err(_) => {
                     // Table doesn't exist yet — create it
-                    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+                    let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], schema);
                     db.create_table("edges", Box::new(batches))
                         .execute()
                         .await
@@ -1124,14 +1123,28 @@ pub(crate) async fn persist_graph_incremental(
 }
 
 /// Load graph nodes and edges from LanceDB tables.
+///
+/// Reads only rows matching the currently committed `scan_version`.
+/// This ensures full-rebuild appends don't expose partially-written data:
+/// the new version only becomes visible after `persist_graph_to_lance` flips
+/// the version pointer.
 pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphState> {
     use futures::TryStreamExt;
-    use lancedb::query::ExecutableQuery;
+    use lancedb::query::{ExecutableQuery, QueryBase};
 
     let db_path = graph_lance_path(repo_root);
     if !db_path.exists() {
         anyhow::bail!("No persisted graph at {}", db_path.display());
     }
+
+    // Read the committed version. If it's 0 (no version file), fall back to loading
+    // all rows — this handles legacy data written before the scan_version column existed.
+    let committed_version = read_committed_scan_version(&db_path);
+    let version_filter: Option<String> = if committed_version > 0 {
+        Some(format!("scan_version = {}", committed_version))
+    } else {
+        None // Legacy data: no filter (scan_version absent or all rows at version 0)
+    };
 
     let db = lancedb::connect(db_path.to_str().unwrap())
         .execute()
@@ -1145,7 +1158,11 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
             .execute()
             .await
             .context("No symbols table found")?;
-        let stream = table.query().execute().await.context("Failed to query symbols")?;
+        let mut q = table.query();
+        if let Some(ref filter) = version_filter {
+            q = q.only_if(filter.as_str());
+        }
+        let stream = q.execute().await.context("Failed to query symbols")?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
 
         let mut nodes = Vec::new();
@@ -1410,7 +1427,11 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
             .execute()
             .await
             .context("No edges table found")?;
-        let stream = table.query().execute().await.context("Failed to query edges")?;
+        let mut q = table.query();
+        if let Some(ref filter) = version_filter {
+            q = q.only_if(filter.as_str());
+        }
+        let stream = q.execute().await.context("Failed to query edges")?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
 
         let mut edges = Vec::new();
@@ -1785,5 +1806,129 @@ mod tests {
         let node2 = make_test_node("after_recovery");
         let result = persist_graph_incremental(repo_root, &[node2], &[], &[], &[]).await;
         assert!(result.is_ok(), "persist after drop should succeed, got: {:?}", result);
+    }
+
+    // ── scan_version helpers ──────────────────────────────────────────────────
+
+    /// `read_committed_scan_version` returns 0 when no version file exists.
+    #[test]
+    fn test_read_committed_scan_version_missing_returns_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("lance");
+        std::fs::create_dir_all(&db_path).unwrap();
+        assert_eq!(read_committed_scan_version(&db_path), 0);
+    }
+
+    /// `write_committed_scan_version` + `read_committed_scan_version` round-trip.
+    #[test]
+    fn test_scan_version_write_read_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("lance");
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        write_committed_scan_version(&db_path, 42).expect("write failed");
+        assert_eq!(read_committed_scan_version(&db_path), 42);
+
+        // Overwrite with a higher version.
+        write_committed_scan_version(&db_path, 100).expect("write failed");
+        assert_eq!(read_committed_scan_version(&db_path), 100);
+    }
+
+    /// `drop_all_lance_tables` removes the scan_version pointer (tables were dropped,
+    /// so the old version pointer would point to non-existent rows).
+    #[test]
+    fn test_drop_all_lance_tables_removes_scan_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("lance");
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        std::fs::write(db_path.join("schema_version"), "16").unwrap();
+        std::fs::write(db_path.join("extraction_version"), "5").unwrap();
+        std::fs::write(db_path.join("scan_version"), "7").unwrap();
+        std::fs::create_dir_all(db_path.join("symbols.lance")).unwrap();
+
+        drop_all_lance_tables(&db_path);
+
+        // scan_version should be removed (tables gone, pointer is stale).
+        assert!(!db_path.join("scan_version").exists(), "scan_version should be removed by drop_all_lance_tables");
+        // extraction_version must survive.
+        assert_eq!(
+            std::fs::read_to_string(db_path.join("extraction_version")).unwrap(),
+            "5"
+        );
+    }
+
+    /// `persist_graph_to_lance` increments the scan_version pointer on each call.
+    /// First call: version 0 → 1. Second call: version 1 → 2.
+    #[tokio::test]
+    async fn test_persist_graph_to_lance_increments_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+        let db_path = graph_lance_path(repo_root);
+
+        let node_a = make_test_node("fn_a");
+        persist_graph_to_lance(repo_root, &[node_a], &[])
+            .await
+            .expect("first persist failed");
+        assert_eq!(read_committed_scan_version(&db_path), 1, "first persist should write version 1");
+
+        let node_b = make_test_node("fn_b");
+        persist_graph_to_lance(repo_root, &[node_b], &[])
+            .await
+            .expect("second persist failed");
+        assert_eq!(read_committed_scan_version(&db_path), 2, "second persist should write version 2");
+    }
+
+    /// `load_graph_from_lance` reads only nodes from the committed scan_version.
+    /// After a second full rebuild, the old nodes should NOT be returned.
+    #[tokio::test]
+    async fn test_load_filters_to_committed_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+
+        // First rebuild: fn_v1.
+        let node_v1 = make_test_node("fn_v1");
+        persist_graph_to_lance(repo_root, &[node_v1], &[])
+            .await
+            .expect("first persist");
+
+        // Second rebuild: fn_v2 (different node).
+        let node_v2 = make_test_node("fn_v2");
+        persist_graph_to_lance(repo_root, &[node_v2], &[])
+            .await
+            .expect("second persist");
+
+        // Load should return only fn_v2, not fn_v1 (which has scan_version=1,
+        // while the committed version is now 2).
+        let state = load_graph_from_lance(repo_root)
+            .await
+            .expect("load failed");
+        let names: Vec<&str> = state.nodes.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"fn_v2"), "fn_v2 should be present");
+        assert!(!names.contains(&"fn_v1"), "fn_v1 (old version) should not be present");
+    }
+
+    /// `compact_stale_versions` deletes rows with scan_version < committed - 1.
+    /// After two full rebuilds, the first rebuild's rows should be compacted.
+    #[tokio::test]
+    async fn test_compact_removes_stale_version_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+        let db_path = graph_lance_path(repo_root);
+
+        // Three rebuilds: versions 1, 2, 3.
+        for name in ["fn_v1", "fn_v2", "fn_v3"] {
+            persist_graph_to_lance(repo_root, &[make_test_node(name)], &[])
+                .await
+                .expect("persist failed");
+        }
+        assert_eq!(read_committed_scan_version(&db_path), 3);
+
+        // After 3 rebuilds: compact should have removed version 1 rows (< 3-1=2),
+        // keeping versions 2 and 3. Verify by loading — should get fn_v3 only.
+        let state = load_graph_from_lance(repo_root).await.expect("load failed");
+        let names: Vec<&str> = state.nodes.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"fn_v3"), "fn_v3 should be present (current version)");
+        assert!(!names.contains(&"fn_v1"), "fn_v1 should have been compacted");
     }
 }
