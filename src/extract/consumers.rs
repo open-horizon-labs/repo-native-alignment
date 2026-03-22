@@ -575,6 +575,145 @@ impl ExtractionConsumer for CustomExtractorConsumer {
 }
 
 // ---------------------------------------------------------------------------
+// LspConsumer
+// ---------------------------------------------------------------------------
+
+/// Subscribes to `LanguageDetected` and runs LSP enrichment for the given language.
+///
+/// **Phase 2 stub.** LSP enrichers require async execution — they start language
+/// servers and communicate via JSON-RPC, which requires tokio. The event bus in
+/// Phase 2 is synchronous. LSP enrichment continues to run via the existing
+/// `spawn_background_enrichment` path.
+///
+/// In Phase 3, the bus will gain async support and this consumer will call
+/// `EnricherRegistry::enrich_all()` for the specific language.
+///
+/// Per the ADR: "Consumer of LanguageDetected(lang, nodes): LSP enrichers — ALL fire
+/// concurrently, one per language." Parallel LSP will fall out of the architecture when
+/// this stub is promoted to a full async consumer.
+///
+/// Subscribes to: `LanguageDetected`
+/// Emits: `EnrichmentComplete` (Phase 2 stub — no-op)
+pub struct LspConsumer {
+    /// Which language this consumer handles (e.g., "rust", "python", "typescript").
+    pub language: String,
+}
+
+impl ExtractionConsumer for LspConsumer {
+    fn name(&self) -> &str { "lsp" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::LanguageDetected]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::LanguageDetected { slug, language, nodes } = event else {
+            return Ok(vec![]);
+        };
+        if language != &self.language {
+            return Ok(vec![]);
+        }
+        // Phase 2 stub: log that LSP would run, emit EnrichmentComplete with no edges.
+        // In Phase 3+: start the language server and run enrich() asynchronously.
+        tracing::debug!(
+            "LspConsumer({}): root '{}' language '{}' — {} nodes (Phase 2 stub, async LSP not yet wired)",
+            self.language,
+            slug,
+            language,
+            nodes.len(),
+        );
+        Ok(vec![ExtractionEvent::EnrichmentComplete {
+            slug: slug.clone(),
+            language: language.clone(),
+            added_edges: vec![],
+            new_nodes: vec![],
+        }])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EmbeddingIndexerConsumer
+// ---------------------------------------------------------------------------
+
+/// Subscribes to `RootExtracted` and streams nodes to the embedding index.
+///
+/// **Phase 2 stub.** Embedding requires async LanceDB operations. In Phase 2,
+/// embedding continues to run via `spawn_background_enrichment` after the full
+/// graph is assembled. Phase 4 (#454) moves it here as a streaming consumer
+/// so vectors are available as soon as nodes are extracted.
+///
+/// Per the ADR: "Consumer of RootExtracted (streaming, as nodes arrive):
+/// EmbeddingIndexer — SINGLETON — embeds nodes as they're extracted incrementally
+/// via BLAKE3, doesn't wait for passes."
+///
+/// Subscribes to: `RootExtracted`
+/// Emits: nothing
+pub struct EmbeddingIndexerConsumer;
+
+impl ExtractionConsumer for EmbeddingIndexerConsumer {
+    fn name(&self) -> &str { "embedding_indexer" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::RootExtracted]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::RootExtracted { slug, nodes, .. } = event else {
+            return Ok(vec![]);
+        };
+        // Phase 2 stub: embedding runs via spawn_background_enrichment.
+        // Phase 4 (#454) promotes this to async streaming embed.
+        tracing::debug!(
+            "EmbeddingIndexerConsumer: root '{}' — {} nodes (Phase 2 stub, embed runs in background task)",
+            slug,
+            nodes.len(),
+        );
+        Ok(vec![])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LanceDBConsumer
+// ---------------------------------------------------------------------------
+
+/// Subscribes to `PassesComplete` and persists the graph to LanceDB.
+///
+/// **Phase 2 stub.** LanceDB persist requires async operations and the full
+/// graph (nodes + edges from all roots merged). In Phase 2, persistence runs
+/// via `persist_graph_to_lance` inside `build_full_graph_inner`. Phase 4 (#454)
+/// moves it here as a singleton consumer.
+///
+/// Per the ADR: "Consumer of PassesComplete: LanceDBPersist — SINGLETON —
+/// writes with tenant_id = root slug."
+///
+/// Subscribes to: `PassesComplete`
+/// Emits: nothing
+pub struct LanceDBConsumer;
+
+impl ExtractionConsumer for LanceDBConsumer {
+    fn name(&self) -> &str { "lancedb_persist" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::PassesComplete]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::PassesComplete { slug, nodes, edges, .. } = event else {
+            return Ok(vec![]);
+        };
+        // Phase 2 stub: persist runs inside build_full_graph_inner.
+        // Phase 4 (#454) promotes this to async singleton consumer.
+        tracing::debug!(
+            "LanceDBConsumer: root '{}' — {} nodes, {} edges (Phase 2 stub, persist runs in graph pipeline)",
+            slug,
+            nodes.len(),
+            edges.len(),
+        );
+        Ok(vec![])
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SubsystemConsumer
 // ---------------------------------------------------------------------------
 
@@ -652,6 +791,19 @@ pub fn build_builtin_bus(
     bus.register(Box::new(PostExtractionConsumer::new(root_pairs.clone(), primary_slug)));
     bus.register(Box::new(OpenApiConsumer));
     bus.register(Box::new(GrpcConsumer));
+    // EmbeddingIndexerConsumer: streaming embed as nodes arrive (Phase 2 stub)
+    bus.register(Box::new(EmbeddingIndexerConsumer));
+
+    // --- LanguageDetected consumers (one LSP stub per language) ---
+    // Per the ADR: "ALL fire concurrently, one per language" — in Phase 3+ these
+    // will be promoted to async consumers running in parallel.
+    for lang in &["rust", "python", "typescript", "go", "java", "c-cpp", "ruby",
+                  "csharp", "kotlin", "swift", "lua", "zig", "elixir", "scala",
+                  "dart", "php", "markdown", "yaml", "json", "toml", "terraform",
+                  "nix", "vue", "svelte", "erlang", "gleam", "nim", "clojure",
+                  "deno", "protobuf", "latex"] {
+        bus.register(Box::new(LspConsumer { language: lang.to_string() }));
+    }
 
     // --- FrameworkDetected consumers ---
     bus.register(Box::new(FrameworkDetectionConsumer));
@@ -661,6 +813,7 @@ pub fn build_builtin_bus(
 
     // --- PassesComplete consumers ---
     bus.register(Box::new(SubsystemConsumer));
+    bus.register(Box::new(LanceDBConsumer));
 
     bus
 }
@@ -850,11 +1003,16 @@ mod tests {
     fn test_builtin_bus_has_consumers_for_all_event_kinds() {
         let bus = build_builtin_bus(vec![], "test".into());
         // Must have at least one consumer for each key event kind.
-        // Current: ManifestConsumer, TreeSitterConsumer, LanguageAccumulatorConsumer,
-        // PostExtractionConsumer, OpenApiConsumer, GrpcConsumer,
-        // FrameworkDetectionConsumer, NextjsRoutingConsumer, PubSubConsumer,
-        // WebSocketConsumer, SubsystemConsumer = 11
-        assert!(bus.len() >= 11, "Expected at least 11 consumers, got {}", bus.len());
+        // Synchronous: ManifestConsumer, TreeSitterConsumer, LanguageAccumulatorConsumer,
+        // PostExtractionConsumer, OpenApiConsumer, GrpcConsumer, EmbeddingIndexerConsumer = 7
+        // LSP stubs: 31 (one per language)
+        // FrameworkDetected: FrameworkDetectionConsumer, NextjsRoutingConsumer, PubSubConsumer,
+        //   WebSocketConsumer = 4
+        // PassesComplete: SubsystemConsumer, LanceDBConsumer = 2
+        // RootDiscovered: ManifestConsumer, TreeSitterConsumer = already counted
+        // Total: 2 + 7 + 31 + 4 + 2 = 46 (some double-counted since ManifestConsumer is in RootDiscovered)
+        // Use a conservative lower bound
+        assert!(bus.len() >= 40, "Expected at least 40 consumers, got {}", bus.len());
     }
 
     /// Verify PostExtractionConsumer emits PassesComplete on empty input.
@@ -930,5 +1088,79 @@ mod tests {
         // Must include PassesComplete
         let has_passes_complete = events.iter().any(|e| matches!(e, ExtractionEvent::PassesComplete { .. }));
         assert!(has_passes_complete, "PostExtractionConsumer must produce PassesComplete");
+    }
+
+    /// Verify LspConsumer fires only for its declared language.
+    #[test]
+    fn test_lsp_consumer_fires_for_declared_language() {
+        let consumer = LspConsumer { language: "rust".into() };
+        let matching = ExtractionEvent::LanguageDetected {
+            slug: "test".into(),
+            language: "rust".into(),
+            nodes: vec![],
+        };
+        let result = consumer.on_event(&matching).unwrap();
+        assert_eq!(result.len(), 1, "LspConsumer must emit EnrichmentComplete for its language");
+        assert!(
+            matches!(result[0], ExtractionEvent::EnrichmentComplete { .. }),
+            "LspConsumer must emit EnrichmentComplete"
+        );
+    }
+
+    #[test]
+    fn test_lsp_consumer_ignores_other_language() {
+        let consumer = LspConsumer { language: "rust".into() };
+        let other_lang = ExtractionEvent::LanguageDetected {
+            slug: "test".into(),
+            language: "python".into(),
+            nodes: vec![],
+        };
+        let result = consumer.on_event(&other_lang).unwrap();
+        assert!(result.is_empty(), "LspConsumer must ignore events for other languages");
+    }
+
+    /// Verify SubsystemConsumer subscribes to PassesComplete.
+    #[test]
+    fn test_subsystem_consumer_subscription() {
+        let consumer = SubsystemConsumer;
+        assert!(consumer.subscribes_to().contains(&ExtractionEventKind::PassesComplete));
+        let event = ExtractionEvent::PassesComplete {
+            slug: "test".into(),
+            nodes: vec![],
+            edges: vec![],
+            detected_frameworks: HashSet::new(),
+        };
+        let result = consumer.on_event(&event).unwrap();
+        assert!(result.is_empty(), "SubsystemConsumer Phase 2 stub emits nothing");
+    }
+
+    /// Verify LanceDBConsumer subscribes to PassesComplete.
+    #[test]
+    fn test_lancedb_consumer_subscription() {
+        let consumer = LanceDBConsumer;
+        assert!(consumer.subscribes_to().contains(&ExtractionEventKind::PassesComplete));
+        let event = ExtractionEvent::PassesComplete {
+            slug: "test".into(),
+            nodes: vec![],
+            edges: vec![],
+            detected_frameworks: HashSet::new(),
+        };
+        let result = consumer.on_event(&event).unwrap();
+        assert!(result.is_empty(), "LanceDBConsumer Phase 2 stub emits nothing");
+    }
+
+    /// Verify EmbeddingIndexerConsumer subscribes to RootExtracted.
+    #[test]
+    fn test_embedding_indexer_consumer_subscription() {
+        let consumer = EmbeddingIndexerConsumer;
+        assert!(consumer.subscribes_to().contains(&ExtractionEventKind::RootExtracted));
+        let event = ExtractionEvent::RootExtracted {
+            slug: "test".into(),
+            path: PathBuf::from("."),
+            nodes: vec![],
+            edges: vec![],
+        };
+        let result = consumer.on_event(&event).unwrap();
+        assert!(result.is_empty(), "EmbeddingIndexerConsumer Phase 2 stub emits nothing");
     }
 }
