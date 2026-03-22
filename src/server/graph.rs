@@ -602,6 +602,29 @@ impl RnaHandler {
             );
         }
 
+        // Dedup immediately after post-extraction passes so the graph index,
+        // PageRank, and subsystem detection run on clean topology.
+        // On a mixed dirty/clean rebuild, `all_nodes`/`all_edges` may already
+        // contain cached pass output for clean roots; the passes re-emit the
+        // same entries, producing duplicates. Dedup here avoids skewed PageRank
+        // weights and inflated community sizes.
+        {
+            let mut seen_nodes = std::collections::HashSet::new();
+            all_nodes.reverse();
+            all_nodes.retain(|n| seen_nodes.insert(n.stable_id()));
+            all_nodes.reverse();
+
+            let before_edges = all_edges.len();
+            let mut seen_edges = std::collections::HashSet::new();
+            all_edges.retain(|e| seen_edges.insert(e.stable_id()));
+            if before_edges != all_edges.len() {
+                tracing::debug!(
+                    "Post-pass dedup: {} → {} edges ({} duplicates removed)",
+                    before_edges, all_edges.len(), before_edges - all_edges.len()
+                );
+            }
+        }
+
         // 5. Build petgraph index
         let mut index = GraphIndex::new();
         index.rebuild_from_edges(&all_edges);
