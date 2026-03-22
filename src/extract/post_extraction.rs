@@ -357,8 +357,16 @@ impl PostExtractionPass for FrameworkDetectionPass {
     fn applies_when(&self, _detected_frameworks: &HashSet<String>) -> bool { true }
 
     fn run(&self, nodes: &mut Vec<Node>, _edges: &mut Vec<Edge>, ctx: &PassContext) -> PassResult {
-        let result =
-            crate::extract::framework_detection::framework_detection_pass(nodes, &ctx.primary_slug);
+        // Resolve the primary root filesystem path for user-rule loading.
+        let primary_path = ctx.root_pairs
+            .iter()
+            .find(|(slug, _)| slug == &ctx.primary_slug)
+            .map(|(_, path)| path.as_path());
+        let result = crate::extract::framework_detection::framework_detection_pass(
+            nodes,
+            &ctx.primary_slug,
+            primary_path,
+        );
         let detected = result.detected_frameworks;
         if !result.nodes.is_empty() {
             nodes.extend(result.nodes);

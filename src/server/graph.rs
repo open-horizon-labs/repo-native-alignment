@@ -727,7 +727,10 @@ impl RnaHandler {
             // from subsystem nodes to framework nodes (when ≥70% of members share a framework).
             // Graceful: no-op if no subsystem nodes or no framework nodes exist.
             let subsystem_fw_edges =
-                crate::extract::framework_detection::subsystem_framework_aggregation_pass(&all_nodes);
+                crate::extract::framework_detection::subsystem_framework_aggregation_pass(
+                    &all_nodes,
+                    Some(self.repo_root.as_path()),
+                );
             if !subsystem_fw_edges.is_empty() {
                 tracing::info!(
                     "Subsystem-framework aggregation: {} UsesFramework edge(s)",
@@ -1223,7 +1226,10 @@ impl RnaHandler {
 
             // Subsystem → framework aggregation (incremental): emit UsesFramework edges.
             let sub_fw_edges =
-                crate::extract::framework_detection::subsystem_framework_aggregation_pass(&graph.nodes);
+                crate::extract::framework_detection::subsystem_framework_aggregation_pass(
+                    &graph.nodes,
+                    Some(self.repo_root.as_path()),
+                );
             if !sub_fw_edges.is_empty() {
                 graph.edges.extend(sub_fw_edges);
             }

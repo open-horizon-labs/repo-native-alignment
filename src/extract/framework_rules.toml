@@ -1,0 +1,564 @@
+# Built-in framework detection rules.
+#
+# Each [[rules]] entry defines one detection rule.
+# Fields:
+#   import_pattern  — substring matched case-insensitively against the Import node name
+#   language        — language filter ("python", "typescript", etc.; "" = any language)
+#   framework_id    — stable ID used in graph nodes and has_framework() checks
+#   display_name    — human-readable label shown in search results
+#
+# Rules are evaluated in order; more-specific patterns must appear before
+# less-specific ones (e.g., "next/" before "react").
+#
+# User-defined rules from .oh/extractors/*.toml are merged after these at runtime.
+
+# -------------------------------------------------------------------------
+# Python frameworks
+# -------------------------------------------------------------------------
+
+[[rules]]
+import_pattern = "fastapi"
+language = "python"
+framework_id = "fastapi"
+display_name = "FastAPI"
+
+[[rules]]
+import_pattern = "flask"
+language = "python"
+framework_id = "flask"
+display_name = "Flask"
+
+[[rules]]
+import_pattern = "django"
+language = "python"
+framework_id = "django"
+display_name = "Django"
+
+[[rules]]
+import_pattern = "celery"
+language = "python"
+framework_id = "celery"
+display_name = "Celery"
+
+# confluent-kafka uses `confluent_kafka`; kafka-python uses `kafka`.
+# More-specific pattern first.
+[[rules]]
+import_pattern = "confluent_kafka"
+language = "python"
+framework_id = "kafka-python"
+display_name = "Kafka (confluent-kafka)"
+
+[[rules]]
+import_pattern = "kafka"
+language = "python"
+framework_id = "kafka-python"
+display_name = "Kafka (kafka-python)"
+
+[[rules]]
+import_pattern = "pika"
+language = "python"
+framework_id = "pika"
+display_name = "Pika (RabbitMQ)"
+
+[[rules]]
+import_pattern = "redis"
+language = "python"
+framework_id = "redis"
+display_name = "Redis"
+
+[[rules]]
+import_pattern = "sqlalchemy"
+language = "python"
+framework_id = "sqlalchemy"
+display_name = "SQLAlchemy"
+
+[[rules]]
+import_pattern = "aiohttp"
+language = "python"
+framework_id = "aiohttp"
+display_name = "aiohttp"
+
+[[rules]]
+import_pattern = "tornado"
+language = "python"
+framework_id = "tornado"
+display_name = "Tornado"
+
+[[rules]]
+import_pattern = "starlette"
+language = "python"
+framework_id = "starlette"
+display_name = "Starlette"
+
+[[rules]]
+import_pattern = "socketio"
+language = "python"
+framework_id = "socketio"
+display_name = "Socket.IO (Python)"
+
+[[rules]]
+import_pattern = "socket.io"
+language = "python"
+framework_id = "socketio"
+display_name = "Socket.IO (Python)"
+
+[[rules]]
+import_pattern = "grpc"
+language = "python"
+framework_id = "grpc-python"
+display_name = "gRPC (Python)"
+
+[[rules]]
+import_pattern = "boto3"
+language = "python"
+framework_id = "boto3"
+display_name = "AWS SDK (boto3)"
+
+[[rules]]
+import_pattern = "pymongo"
+language = "python"
+framework_id = "pymongo"
+display_name = "PyMongo"
+
+[[rules]]
+import_pattern = "httpx"
+language = "python"
+framework_id = "httpx"
+display_name = "HTTPX"
+
+[[rules]]
+import_pattern = "pytest"
+language = "python"
+framework_id = "pytest"
+display_name = "pytest"
+
+[[rules]]
+import_pattern = "pydantic"
+language = "python"
+framework_id = "pydantic"
+display_name = "Pydantic"
+
+[[rules]]
+import_pattern = "langchain"
+language = "python"
+framework_id = "langchain"
+display_name = "LangChain"
+
+[[rules]]
+import_pattern = "openai"
+language = "python"
+framework_id = "openai"
+display_name = "OpenAI SDK"
+
+[[rules]]
+import_pattern = "anthropic"
+language = "python"
+framework_id = "anthropic"
+display_name = "Anthropic SDK"
+
+# -------------------------------------------------------------------------
+# TypeScript / JavaScript frameworks
+# -------------------------------------------------------------------------
+
+# Next.js — must appear before generic "react" to avoid false negatives.
+[[rules]]
+import_pattern = "next/"
+language = "typescript"
+framework_id = "nextjs-app-router"
+display_name = "Next.js"
+
+[[rules]]
+import_pattern = "next/"
+language = "javascript"
+framework_id = "nextjs-app-router"
+display_name = "Next.js"
+
+[[rules]]
+import_pattern = "\"next\""
+language = "typescript"
+framework_id = "nextjs-app-router"
+display_name = "Next.js"
+
+[[rules]]
+import_pattern = "'next'"
+language = "javascript"
+framework_id = "nextjs-app-router"
+display_name = "Next.js"
+
+# React (after Next.js)
+[[rules]]
+import_pattern = "react"
+language = "typescript"
+framework_id = "react"
+display_name = "React"
+
+[[rules]]
+import_pattern = "react"
+language = "javascript"
+framework_id = "react"
+display_name = "React"
+
+# Express
+[[rules]]
+import_pattern = "express"
+language = "typescript"
+framework_id = "express"
+display_name = "Express.js"
+
+[[rules]]
+import_pattern = "express"
+language = "javascript"
+framework_id = "express"
+display_name = "Express.js"
+
+# Kafka JS
+[[rules]]
+import_pattern = "kafkajs"
+language = "typescript"
+framework_id = "kafkajs"
+display_name = "KafkaJS"
+
+[[rules]]
+import_pattern = "kafkajs"
+language = "javascript"
+framework_id = "kafkajs"
+display_name = "KafkaJS"
+
+# Socket.IO
+[[rules]]
+import_pattern = "socket.io"
+language = "typescript"
+framework_id = "socketio"
+display_name = "Socket.IO"
+
+[[rules]]
+import_pattern = "socket.io"
+language = "javascript"
+framework_id = "socketio"
+display_name = "Socket.IO"
+
+# TanStack Query (formerly React Query)
+[[rules]]
+import_pattern = "@tanstack/"
+language = "typescript"
+framework_id = "tanstack-query"
+display_name = "TanStack Query"
+
+[[rules]]
+import_pattern = "@tanstack/"
+language = "javascript"
+framework_id = "tanstack-query"
+display_name = "TanStack Query"
+
+[[rules]]
+import_pattern = "react-query"
+language = "typescript"
+framework_id = "tanstack-query"
+display_name = "TanStack Query"
+
+[[rules]]
+import_pattern = "react-query"
+language = "javascript"
+framework_id = "tanstack-query"
+display_name = "TanStack Query"
+
+# Redis JS
+[[rules]]
+import_pattern = "ioredis"
+language = "typescript"
+framework_id = "redis"
+display_name = "Redis (ioredis)"
+
+[[rules]]
+import_pattern = "ioredis"
+language = "javascript"
+framework_id = "redis"
+display_name = "Redis (ioredis)"
+
+[[rules]]
+import_pattern = "redis"
+language = "typescript"
+framework_id = "redis"
+display_name = "Redis"
+
+[[rules]]
+import_pattern = "redis"
+language = "javascript"
+framework_id = "redis"
+display_name = "Redis"
+
+# GraphQL
+[[rules]]
+import_pattern = "graphql"
+language = "typescript"
+framework_id = "graphql"
+display_name = "GraphQL"
+
+[[rules]]
+import_pattern = "graphql"
+language = "javascript"
+framework_id = "graphql"
+display_name = "GraphQL"
+
+# Prisma
+[[rules]]
+import_pattern = "@prisma/"
+language = "typescript"
+framework_id = "prisma"
+display_name = "Prisma"
+
+[[rules]]
+import_pattern = "@prisma/"
+language = "javascript"
+framework_id = "prisma"
+display_name = "Prisma"
+
+# TypeORM
+[[rules]]
+import_pattern = "typeorm"
+language = "typescript"
+framework_id = "typeorm"
+display_name = "TypeORM"
+
+[[rules]]
+import_pattern = "typeorm"
+language = "javascript"
+framework_id = "typeorm"
+display_name = "TypeORM"
+
+# gRPC JS
+[[rules]]
+import_pattern = "@grpc/"
+language = "typescript"
+framework_id = "grpc-js"
+display_name = "gRPC (Node.js)"
+
+[[rules]]
+import_pattern = "@grpc/"
+language = "javascript"
+framework_id = "grpc-js"
+display_name = "gRPC (Node.js)"
+
+# Fastify
+[[rules]]
+import_pattern = "fastify"
+language = "typescript"
+framework_id = "fastify"
+display_name = "Fastify"
+
+[[rules]]
+import_pattern = "fastify"
+language = "javascript"
+framework_id = "fastify"
+display_name = "Fastify"
+
+# NestJS
+[[rules]]
+import_pattern = "@nestjs/"
+language = "typescript"
+framework_id = "nestjs"
+display_name = "NestJS"
+
+[[rules]]
+import_pattern = "@nestjs/"
+language = "javascript"
+framework_id = "nestjs"
+display_name = "NestJS"
+
+# Remix
+[[rules]]
+import_pattern = "@remix-run/"
+language = "typescript"
+framework_id = "remix"
+display_name = "Remix"
+
+[[rules]]
+import_pattern = "@remix-run/"
+language = "javascript"
+framework_id = "remix"
+display_name = "Remix"
+
+# Svelte
+[[rules]]
+import_pattern = "svelte"
+language = "typescript"
+framework_id = "svelte"
+display_name = "Svelte"
+
+[[rules]]
+import_pattern = "svelte"
+language = "javascript"
+framework_id = "svelte"
+display_name = "Svelte"
+
+# Vue
+[[rules]]
+import_pattern = "vue"
+language = "typescript"
+framework_id = "vue"
+display_name = "Vue.js"
+
+[[rules]]
+import_pattern = "vue"
+language = "javascript"
+framework_id = "vue"
+display_name = "Vue.js"
+
+# OpenAI JS
+[[rules]]
+import_pattern = "openai"
+language = "typescript"
+framework_id = "openai"
+display_name = "OpenAI SDK"
+
+[[rules]]
+import_pattern = "openai"
+language = "javascript"
+framework_id = "openai"
+display_name = "OpenAI SDK"
+
+[[rules]]
+import_pattern = "@anthropic-ai/"
+language = "typescript"
+framework_id = "anthropic"
+display_name = "Anthropic SDK"
+
+[[rules]]
+import_pattern = "@anthropic-ai/"
+language = "javascript"
+framework_id = "anthropic"
+display_name = "Anthropic SDK"
+
+# -------------------------------------------------------------------------
+# Go frameworks
+# -------------------------------------------------------------------------
+
+[[rules]]
+import_pattern = "gin-gonic/gin"
+language = "go"
+framework_id = "gin"
+display_name = "Gin (Go)"
+
+[[rules]]
+import_pattern = "labstack/echo"
+language = "go"
+framework_id = "echo"
+display_name = "Echo (Go)"
+
+[[rules]]
+import_pattern = "gorilla/mux"
+language = "go"
+framework_id = "gorilla-mux"
+display_name = "Gorilla Mux"
+
+[[rules]]
+import_pattern = "confluent-kafka-go"
+language = "go"
+framework_id = "kafka-go"
+display_name = "Kafka (Go)"
+
+[[rules]]
+import_pattern = "segmentio/kafka-go"
+language = "go"
+framework_id = "kafka-go"
+display_name = "Kafka (Go)"
+
+[[rules]]
+import_pattern = "gofiber/fiber"
+language = "go"
+framework_id = "fiber"
+display_name = "Fiber (Go)"
+
+[[rules]]
+import_pattern = "go-redis/redis"
+language = "go"
+framework_id = "redis"
+display_name = "Redis (Go)"
+
+[[rules]]
+import_pattern = "grpc-ecosystem"
+language = "go"
+framework_id = "grpc-go"
+display_name = "gRPC (Go)"
+
+[[rules]]
+import_pattern = "google.golang.org/grpc"
+language = "go"
+framework_id = "grpc-go"
+display_name = "gRPC (Go)"
+
+[[rules]]
+import_pattern = "gorm.io/gorm"
+language = "go"
+framework_id = "gorm"
+display_name = "GORM"
+
+# -------------------------------------------------------------------------
+# Rust frameworks
+# -------------------------------------------------------------------------
+
+[[rules]]
+import_pattern = "actix-web"
+language = "rust"
+framework_id = "actix-web"
+display_name = "Actix-Web"
+
+[[rules]]
+import_pattern = "actix_web"
+language = "rust"
+framework_id = "actix-web"
+display_name = "Actix-Web"
+
+[[rules]]
+import_pattern = "axum"
+language = "rust"
+framework_id = "axum"
+display_name = "Axum"
+
+[[rules]]
+import_pattern = "warp"
+language = "rust"
+framework_id = "warp"
+display_name = "Warp"
+
+[[rules]]
+import_pattern = "rocket"
+language = "rust"
+framework_id = "rocket"
+display_name = "Rocket"
+
+[[rules]]
+import_pattern = "tokio"
+language = "rust"
+framework_id = "tokio"
+display_name = "Tokio"
+
+[[rules]]
+import_pattern = "tonic"
+language = "rust"
+framework_id = "tonic"
+display_name = "Tonic (gRPC)"
+
+[[rules]]
+import_pattern = "rdkafka"
+language = "rust"
+framework_id = "rdkafka"
+display_name = "rdkafka"
+
+[[rules]]
+import_pattern = "lancedb"
+language = "rust"
+framework_id = "lancedb"
+display_name = "LanceDB"
+
+[[rules]]
+import_pattern = "sqlx"
+language = "rust"
+framework_id = "sqlx"
+display_name = "SQLx"
+
+[[rules]]
+import_pattern = "diesel"
+language = "rust"
+framework_id = "diesel"
+display_name = "Diesel ORM"

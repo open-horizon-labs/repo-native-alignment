@@ -1,5 +1,5 @@
 //! Post-extraction pass that scans `Import` nodes, detects frameworks from a
-//! lookup table, and emits `NodeKind::Other("framework")` nodes.
+//! data-driven rule table, and emits `NodeKind::Other("framework")` nodes.
 //!
 //! # Why
 //!
@@ -17,6 +17,13 @@
 //! in `id.name`) against a lookup table of `(pattern, framework_id)` pairs. Pattern
 //! matching is case-insensitive substring/prefix matching on the import text.
 //!
+//! # Rule sources (merged in order)
+//!
+//! 1. Built-in rules from `src/extract/framework_rules.toml` (embedded at compile
+//!    time via `include_str!`). No framework names are hardcoded in Rust.
+//! 2. User-defined rules from `.oh/extractors/*.toml` files in the workspace root.
+//!    User rules are appended after built-in rules.
+//!
 //! # Emitted nodes
 //!
 //! One `NodeKind::Other("framework")` node per detected framework, anchored to the
@@ -29,149 +36,106 @@
 //! `build_full_graph_inner` and `update_graph_with_scan`.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use serde::Deserialize;
 
 use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
 
 // ---------------------------------------------------------------------------
-// Framework lookup table
+// Rule representation (data-driven)
 // ---------------------------------------------------------------------------
 
-/// A single framework detection rule.
+/// A single framework detection rule, loaded from TOML.
+///
 /// `import_pattern` is checked against the Import node's `id.name` (case-insensitive).
-struct FrameworkRule {
+#[derive(Debug, Clone, Deserialize)]
+pub struct FrameworkRule {
     /// Substring to look for in the import text.
-    import_pattern: &'static str,
-    /// Language(s) this rule applies to (empty = all languages).
-    language: &'static str,
+    pub import_pattern: String,
+    /// Language(s) this rule applies to (empty string = all languages).
+    pub language: String,
     /// Stable framework ID (e.g., "fastapi", "nextjs-app-router").
-    framework_id: &'static str,
+    pub framework_id: String,
     /// Human-readable display name.
-    display_name: &'static str,
+    pub display_name: String,
 }
 
-/// All framework detection rules, ordered by specificity (more specific first).
-static FRAMEWORK_RULES: &[FrameworkRule] = &[
-    // -------------------------------------------------------------------------
-    // Python frameworks
-    // -------------------------------------------------------------------------
-    FrameworkRule { import_pattern: "fastapi", language: "python", framework_id: "fastapi", display_name: "FastAPI" },
-    FrameworkRule { import_pattern: "flask", language: "python", framework_id: "flask", display_name: "Flask" },
-    FrameworkRule { import_pattern: "django", language: "python", framework_id: "django", display_name: "Django" },
-    FrameworkRule { import_pattern: "celery", language: "python", framework_id: "celery", display_name: "Celery" },
-    // Kafka Python: confluent-kafka uses `confluent_kafka`, kafka-python uses `kafka`
-    FrameworkRule { import_pattern: "confluent_kafka", language: "python", framework_id: "kafka-python", display_name: "Kafka (confluent-kafka)" },
-    FrameworkRule { import_pattern: "kafka", language: "python", framework_id: "kafka-python", display_name: "Kafka (kafka-python)" },
-    FrameworkRule { import_pattern: "pika", language: "python", framework_id: "pika", display_name: "Pika (RabbitMQ)" },
-    FrameworkRule { import_pattern: "redis", language: "python", framework_id: "redis", display_name: "Redis" },
-    FrameworkRule { import_pattern: "sqlalchemy", language: "python", framework_id: "sqlalchemy", display_name: "SQLAlchemy" },
-    FrameworkRule { import_pattern: "aiohttp", language: "python", framework_id: "aiohttp", display_name: "aiohttp" },
-    FrameworkRule { import_pattern: "tornado", language: "python", framework_id: "tornado", display_name: "Tornado" },
-    FrameworkRule { import_pattern: "starlette", language: "python", framework_id: "starlette", display_name: "Starlette" },
-    FrameworkRule { import_pattern: "socketio", language: "python", framework_id: "socketio", display_name: "Socket.IO (Python)" },
-    FrameworkRule { import_pattern: "socket.io", language: "python", framework_id: "socketio", display_name: "Socket.IO (Python)" },
-    FrameworkRule { import_pattern: "grpc", language: "python", framework_id: "grpc-python", display_name: "gRPC (Python)" },
-    FrameworkRule { import_pattern: "boto3", language: "python", framework_id: "boto3", display_name: "AWS SDK (boto3)" },
-    FrameworkRule { import_pattern: "pymongo", language: "python", framework_id: "pymongo", display_name: "PyMongo" },
-    FrameworkRule { import_pattern: "httpx", language: "python", framework_id: "httpx", display_name: "HTTPX" },
-    FrameworkRule { import_pattern: "pytest", language: "python", framework_id: "pytest", display_name: "pytest" },
-    FrameworkRule { import_pattern: "pydantic", language: "python", framework_id: "pydantic", display_name: "Pydantic" },
-    FrameworkRule { import_pattern: "langchain", language: "python", framework_id: "langchain", display_name: "LangChain" },
-    FrameworkRule { import_pattern: "openai", language: "python", framework_id: "openai", display_name: "OpenAI SDK" },
-    FrameworkRule { import_pattern: "anthropic", language: "python", framework_id: "anthropic", display_name: "Anthropic SDK" },
+/// Top-level shape of a framework rules TOML file.
+#[derive(Debug, Deserialize)]
+struct FrameworkRulesFile {
+    #[serde(default)]
+    rules: Vec<FrameworkRule>,
+}
 
-    // -------------------------------------------------------------------------
-    // TypeScript / JavaScript frameworks
-    // -------------------------------------------------------------------------
-    // Next.js — must check 'next/server', 'next/router', etc. before generic 'react'
-    FrameworkRule { import_pattern: "next/", language: "typescript", framework_id: "nextjs-app-router", display_name: "Next.js" },
-    FrameworkRule { import_pattern: "next/", language: "javascript", framework_id: "nextjs-app-router", display_name: "Next.js" },
-    FrameworkRule { import_pattern: "\"next\"", language: "typescript", framework_id: "nextjs-app-router", display_name: "Next.js" },
-    FrameworkRule { import_pattern: "'next'", language: "javascript", framework_id: "nextjs-app-router", display_name: "Next.js" },
-    // React (after Next.js to avoid clobbering)
-    FrameworkRule { import_pattern: "react", language: "typescript", framework_id: "react", display_name: "React" },
-    FrameworkRule { import_pattern: "react", language: "javascript", framework_id: "react", display_name: "React" },
-    // Express
-    FrameworkRule { import_pattern: "express", language: "typescript", framework_id: "express", display_name: "Express.js" },
-    FrameworkRule { import_pattern: "express", language: "javascript", framework_id: "express", display_name: "Express.js" },
-    // Kafka JS
-    FrameworkRule { import_pattern: "kafkajs", language: "typescript", framework_id: "kafkajs", display_name: "KafkaJS" },
-    FrameworkRule { import_pattern: "kafkajs", language: "javascript", framework_id: "kafkajs", display_name: "KafkaJS" },
-    // Socket.IO
-    FrameworkRule { import_pattern: "socket.io", language: "typescript", framework_id: "socketio", display_name: "Socket.IO" },
-    FrameworkRule { import_pattern: "socket.io", language: "javascript", framework_id: "socketio", display_name: "Socket.IO" },
-    // TanStack Query (formerly React Query)
-    FrameworkRule { import_pattern: "@tanstack/", language: "typescript", framework_id: "tanstack-query", display_name: "TanStack Query" },
-    FrameworkRule { import_pattern: "@tanstack/", language: "javascript", framework_id: "tanstack-query", display_name: "TanStack Query" },
-    FrameworkRule { import_pattern: "react-query", language: "typescript", framework_id: "tanstack-query", display_name: "TanStack Query" },
-    FrameworkRule { import_pattern: "react-query", language: "javascript", framework_id: "tanstack-query", display_name: "TanStack Query" },
-    // Redis JS
-    FrameworkRule { import_pattern: "ioredis", language: "typescript", framework_id: "redis", display_name: "Redis (ioredis)" },
-    FrameworkRule { import_pattern: "ioredis", language: "javascript", framework_id: "redis", display_name: "Redis (ioredis)" },
-    FrameworkRule { import_pattern: "redis", language: "typescript", framework_id: "redis", display_name: "Redis" },
-    FrameworkRule { import_pattern: "redis", language: "javascript", framework_id: "redis", display_name: "Redis" },
-    // GraphQL
-    FrameworkRule { import_pattern: "graphql", language: "typescript", framework_id: "graphql", display_name: "GraphQL" },
-    FrameworkRule { import_pattern: "graphql", language: "javascript", framework_id: "graphql", display_name: "GraphQL" },
-    // Prisma
-    FrameworkRule { import_pattern: "@prisma/", language: "typescript", framework_id: "prisma", display_name: "Prisma" },
-    FrameworkRule { import_pattern: "@prisma/", language: "javascript", framework_id: "prisma", display_name: "Prisma" },
-    // Typeorm
-    FrameworkRule { import_pattern: "typeorm", language: "typescript", framework_id: "typeorm", display_name: "TypeORM" },
-    FrameworkRule { import_pattern: "typeorm", language: "javascript", framework_id: "typeorm", display_name: "TypeORM" },
-    // gRPC JS
-    FrameworkRule { import_pattern: "@grpc/", language: "typescript", framework_id: "grpc-js", display_name: "gRPC (Node.js)" },
-    FrameworkRule { import_pattern: "@grpc/", language: "javascript", framework_id: "grpc-js", display_name: "gRPC (Node.js)" },
-    // Fastify
-    FrameworkRule { import_pattern: "fastify", language: "typescript", framework_id: "fastify", display_name: "Fastify" },
-    FrameworkRule { import_pattern: "fastify", language: "javascript", framework_id: "fastify", display_name: "Fastify" },
-    // NestJS
-    FrameworkRule { import_pattern: "@nestjs/", language: "typescript", framework_id: "nestjs", display_name: "NestJS" },
-    FrameworkRule { import_pattern: "@nestjs/", language: "javascript", framework_id: "nestjs", display_name: "NestJS" },
-    // Remix
-    FrameworkRule { import_pattern: "@remix-run/", language: "typescript", framework_id: "remix", display_name: "Remix" },
-    FrameworkRule { import_pattern: "@remix-run/", language: "javascript", framework_id: "remix", display_name: "Remix" },
-    // Svelte
-    FrameworkRule { import_pattern: "svelte", language: "typescript", framework_id: "svelte", display_name: "Svelte" },
-    FrameworkRule { import_pattern: "svelte", language: "javascript", framework_id: "svelte", display_name: "Svelte" },
-    // Vue
-    FrameworkRule { import_pattern: "vue", language: "typescript", framework_id: "vue", display_name: "Vue.js" },
-    FrameworkRule { import_pattern: "vue", language: "javascript", framework_id: "vue", display_name: "Vue.js" },
-    // OpenAI JS
-    FrameworkRule { import_pattern: "openai", language: "typescript", framework_id: "openai", display_name: "OpenAI SDK" },
-    FrameworkRule { import_pattern: "openai", language: "javascript", framework_id: "openai", display_name: "OpenAI SDK" },
-    FrameworkRule { import_pattern: "@anthropic-ai/", language: "typescript", framework_id: "anthropic", display_name: "Anthropic SDK" },
-    FrameworkRule { import_pattern: "@anthropic-ai/", language: "javascript", framework_id: "anthropic", display_name: "Anthropic SDK" },
+// ---------------------------------------------------------------------------
+// Built-in rules — embedded at compile time, zero hardcoded names in Rust
+// ---------------------------------------------------------------------------
 
-    // -------------------------------------------------------------------------
-    // Go frameworks
-    // -------------------------------------------------------------------------
-    FrameworkRule { import_pattern: "gin-gonic/gin", language: "go", framework_id: "gin", display_name: "Gin (Go)" },
-    FrameworkRule { import_pattern: "labstack/echo", language: "go", framework_id: "echo", display_name: "Echo (Go)" },
-    FrameworkRule { import_pattern: "gorilla/mux", language: "go", framework_id: "gorilla-mux", display_name: "Gorilla Mux" },
-    FrameworkRule { import_pattern: "confluent-kafka-go", language: "go", framework_id: "kafka-go", display_name: "Kafka (Go)" },
-    FrameworkRule { import_pattern: "segmentio/kafka-go", language: "go", framework_id: "kafka-go", display_name: "Kafka (Go)" },
-    FrameworkRule { import_pattern: "gofiber/fiber", language: "go", framework_id: "fiber", display_name: "Fiber (Go)" },
-    FrameworkRule { import_pattern: "go-redis/redis", language: "go", framework_id: "redis", display_name: "Redis (Go)" },
-    FrameworkRule { import_pattern: "grpc-ecosystem", language: "go", framework_id: "grpc-go", display_name: "gRPC (Go)" },
-    FrameworkRule { import_pattern: "google.golang.org/grpc", language: "go", framework_id: "grpc-go", display_name: "gRPC (Go)" },
-    FrameworkRule { import_pattern: "gorm.io/gorm", language: "go", framework_id: "gorm", display_name: "GORM" },
+static BUILTIN_RULES_SOURCE: &str = include_str!("framework_rules.toml");
 
-    // -------------------------------------------------------------------------
-    // Rust frameworks
-    // -------------------------------------------------------------------------
-    FrameworkRule { import_pattern: "actix-web", language: "rust", framework_id: "actix-web", display_name: "Actix-Web" },
-    FrameworkRule { import_pattern: "actix_web", language: "rust", framework_id: "actix-web", display_name: "Actix-Web" },
-    FrameworkRule { import_pattern: "axum", language: "rust", framework_id: "axum", display_name: "Axum" },
-    FrameworkRule { import_pattern: "warp", language: "rust", framework_id: "warp", display_name: "Warp" },
-    FrameworkRule { import_pattern: "rocket", language: "rust", framework_id: "rocket", display_name: "Rocket" },
-    FrameworkRule { import_pattern: "tokio", language: "rust", framework_id: "tokio", display_name: "Tokio" },
-    FrameworkRule { import_pattern: "tonic", language: "rust", framework_id: "tonic", display_name: "Tonic (gRPC)" },
-    FrameworkRule { import_pattern: "rdkafka", language: "rust", framework_id: "rdkafka", display_name: "rdkafka" },
-    FrameworkRule { import_pattern: "lancedb", language: "rust", framework_id: "lancedb", display_name: "LanceDB" },
-    FrameworkRule { import_pattern: "sqlx", language: "rust", framework_id: "sqlx", display_name: "SQLx" },
-    FrameworkRule { import_pattern: "diesel", language: "rust", framework_id: "diesel", display_name: "Diesel ORM" },
-];
+static BUILTIN_RULES: OnceLock<Vec<FrameworkRule>> = OnceLock::new();
+
+/// Returns the built-in rules parsed from the embedded TOML.
+/// Parsed once per process via `OnceLock`.
+fn builtin_rules() -> &'static [FrameworkRule] {
+    BUILTIN_RULES.get_or_init(|| {
+        match toml::from_str::<FrameworkRulesFile>(BUILTIN_RULES_SOURCE) {
+            Ok(file) => file.rules,
+            Err(e) => {
+                // The embedded TOML is compile-time data — a parse failure is a
+                // programming error, not a runtime condition.
+                panic!("Failed to parse embedded framework_rules.toml: {e}");
+            }
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// User-defined rules loader
+// ---------------------------------------------------------------------------
+
+/// Load user-defined framework rules from `.oh/extractors/*.toml` under `root_path`.
+///
+/// Files that fail to parse are logged and skipped; they never panic.
+/// Returns an empty vec if the directory does not exist.
+fn load_user_rules(root_path: &Path) -> Vec<FrameworkRule> {
+    let extractor_dir = root_path.join(".oh").join("extractors");
+    let Ok(entries) = std::fs::read_dir(&extractor_dir) else {
+        return Vec::new();
+    };
+
+    let mut rules = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match toml::from_str::<FrameworkRulesFile>(&text) {
+                Ok(file) => {
+                    tracing::debug!(
+                        "Loaded {} user framework rule(s) from {}",
+                        file.rules.len(),
+                        path.display()
+                    );
+                    rules.extend(file.rules);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Skipping {}: failed to parse as framework rules: {e}",
+                        path.display()
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!("Skipping {}: read error: {e}", path.display());
+            }
+        }
+    }
+    rules
+}
 
 // ---------------------------------------------------------------------------
 // Public return type
@@ -191,10 +155,15 @@ pub struct FrameworkDetectionResult {
 
 /// Post-extraction pass: scan Import nodes, detect frameworks, emit framework nodes.
 ///
+/// Merges built-in rules (from `framework_rules.toml`) with any user-defined rules
+/// found under `<root_path>/.oh/extractors/`. Pass `root_path = None` to use
+/// built-in rules only (e.g., in tests).
+///
 /// # Arguments
 ///
 /// * `all_nodes` — the complete merged node list (all roots).
 /// * `root_id` — the workspace root ID to anchor framework nodes.
+/// * `root_path` — filesystem path to the workspace root (for loading user rules).
 ///
 /// # Returns
 ///
@@ -202,7 +171,28 @@ pub struct FrameworkDetectionResult {
 /// the set of detected framework IDs. The caller must extend `all_nodes` with
 /// `result.nodes`. The `detected_frameworks` set is stored in `GraphState` for
 /// conditional extractor gating.
-pub fn framework_detection_pass(all_nodes: &[Node], root_id: &str) -> FrameworkDetectionResult {
+pub fn framework_detection_pass(
+    all_nodes: &[Node],
+    root_id: &str,
+    root_path: Option<&Path>,
+) -> FrameworkDetectionResult {
+    // Merge built-in + user rules into a local Vec.
+    // builtin_rules() returns a &'static slice; if there are no user rules we
+    // iterate it directly via combined (which is just a re-export as a Vec).
+    let combined: std::borrow::Cow<'static, [FrameworkRule]> = if let Some(path) = root_path {
+        let user_rules = load_user_rules(path);
+        if user_rules.is_empty() {
+            std::borrow::Cow::Borrowed(builtin_rules())
+        } else {
+            let mut merged = builtin_rules().to_vec();
+            merged.extend(user_rules);
+            std::borrow::Cow::Owned(merged)
+        }
+    } else {
+        std::borrow::Cow::Borrowed(builtin_rules())
+    };
+    let rules: &[FrameworkRule] = &combined;
+
     let mut detected: HashSet<String> = HashSet::new();
 
     for node in all_nodes {
@@ -217,14 +207,14 @@ pub fn framework_detection_pass(all_nodes: &[Node], root_id: &str) -> FrameworkD
         let import_text = node.id.name.to_lowercase();
         let language = node.language.as_str();
 
-        for rule in FRAMEWORK_RULES {
+        for rule in rules {
             // Language filter: empty = any language, otherwise must match.
             if !rule.language.is_empty() && rule.language != language {
                 continue;
             }
             let pattern = rule.import_pattern.to_lowercase();
             if import_text.contains(pattern.as_str()) {
-                detected.insert(rule.framework_id.to_string());
+                detected.insert(rule.framework_id.clone());
             }
         }
     }
@@ -239,11 +229,11 @@ pub fn framework_detection_pass(all_nodes: &[Node], root_id: &str) -> FrameworkD
     // Emit one framework node per detected framework.
     let mut nodes: Vec<Node> = Vec::with_capacity(detected.len());
     for framework_id in &detected {
-        // Look up display name.
-        let display_name = FRAMEWORK_RULES
+        // Look up display name from the first matching rule.
+        let display_name = rules
             .iter()
             .find(|r| r.framework_id == framework_id.as_str())
-            .map(|r| r.display_name)
+            .map(|r| r.display_name.as_str())
             .unwrap_or(framework_id.as_str());
 
         let mut metadata = BTreeMap::new();
@@ -300,28 +290,37 @@ const SUBSYSTEM_FRAMEWORK_THRESHOLD: f64 = 0.70;
 ///
 /// * `all_nodes` — the complete merged node list (all roots, including subsystem nodes
 ///   and framework nodes emitted by earlier passes).
+/// * `root_path` — optional filesystem path to workspace root for loading user rules.
 ///
 /// # Returns
 ///
 /// A `Vec<Edge>` of `UsesFramework` edges. The caller must extend `all_edges`.
-pub fn subsystem_framework_aggregation_pass(all_nodes: &[Node]) -> Vec<crate::graph::Edge> {
+pub fn subsystem_framework_aggregation_pass(
+    all_nodes: &[Node],
+    root_path: Option<&Path>,
+) -> Vec<crate::graph::Edge> {
     use std::collections::HashMap;
     use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource};
+
+    // Load rules (same merge logic as detection pass).
+    let combined: std::borrow::Cow<'static, [FrameworkRule]> = if let Some(path) = root_path {
+        let user_rules = load_user_rules(path);
+        if user_rules.is_empty() {
+            std::borrow::Cow::Borrowed(builtin_rules())
+        } else {
+            let mut merged = builtin_rules().to_vec();
+            merged.extend(user_rules);
+            std::borrow::Cow::Owned(merged)
+        }
+    } else {
+        std::borrow::Cow::Borrowed(builtin_rules())
+    };
+    let rules: &[FrameworkRule] = &combined;
 
     // Build (member_stable_id → subsystem_name) from node metadata.
     let mut member_to_subsystem: HashMap<String, String> = HashMap::new();
     let mut subsystem_node_ids: HashMap<String, crate::graph::NodeId> = HashMap::new();
     let mut framework_node_ids: HashMap<String, crate::graph::NodeId> = HashMap::new();
-
-    // Also: (member_stable_id → set of framework_ids) from Import nodes.
-    // We need to count how many members of each subsystem use each framework.
-    // Strategy: for each Import node, detect its frameworks (re-use detection logic),
-    // then map to the import's parent_scope or file to associate with a member.
-
-    // Simpler approach that works with available data:
-    // 1. Collect (file → [framework_id]) from Import node analysis.
-    // 2. Collect (member stable_id → file) from all non-subsystem nodes.
-    // 3. For each subsystem, count members' files → frameworks.
 
     // Step 1: file → set of frameworks detected in that file.
     let mut file_frameworks: HashMap<String, HashSet<String>> = HashMap::new();
@@ -334,7 +333,7 @@ pub fn subsystem_framework_aggregation_pass(all_nodes: &[Node]) -> Vec<crate::gr
         }
         let import_text = node.id.name.to_lowercase();
         let language = node.language.as_str();
-        for rule in FRAMEWORK_RULES {
+        for rule in rules {
             if !rule.language.is_empty() && rule.language != language {
                 continue;
             }
@@ -343,7 +342,7 @@ pub fn subsystem_framework_aggregation_pass(all_nodes: &[Node]) -> Vec<crate::gr
                 file_frameworks
                     .entry(node.id.file.display().to_string())
                     .or_default()
-                    .insert(rule.framework_id.to_string());
+                    .insert(rule.framework_id.clone());
             }
         }
     }
@@ -489,7 +488,7 @@ mod tests {
     #[test]
     fn test_detects_fastapi() {
         let nodes = vec![make_import("repo", "python", "from fastapi import FastAPI")];
-        let result = framework_detection_pass(&nodes, "repo");
+        let result = framework_detection_pass(&nodes, "repo", None);
         assert!(result.detected_frameworks.contains("fastapi"));
         assert!(result.nodes.iter().any(|n| n.id.name == "fastapi"));
     }
@@ -497,49 +496,49 @@ mod tests {
     #[test]
     fn test_detects_react() {
         let nodes = vec![make_import("repo", "typescript", "import React from 'react'")];
-        let result = framework_detection_pass(&nodes, "repo");
+        let result = framework_detection_pass(&nodes, "repo", None);
         assert!(result.detected_frameworks.contains("react"));
     }
 
     #[test]
     fn test_detects_nextjs_from_next_slash() {
         let nodes = vec![make_import("repo", "typescript", "import { NextRequest } from 'next/server'")];
-        let result = framework_detection_pass(&nodes, "repo");
+        let result = framework_detection_pass(&nodes, "repo", None);
         assert!(result.detected_frameworks.contains("nextjs-app-router"));
     }
 
     #[test]
     fn test_detects_kafkajs() {
         let nodes = vec![make_import("repo", "typescript", "import { Kafka } from 'kafkajs'")];
-        let result = framework_detection_pass(&nodes, "repo");
+        let result = framework_detection_pass(&nodes, "repo", None);
         assert!(result.detected_frameworks.contains("kafkajs"));
     }
 
     #[test]
     fn test_detects_kafka_python() {
         let nodes = vec![make_import("repo", "python", "from kafka import KafkaProducer")];
-        let result = framework_detection_pass(&nodes, "repo");
+        let result = framework_detection_pass(&nodes, "repo", None);
         assert!(result.detected_frameworks.contains("kafka-python"));
     }
 
     #[test]
     fn test_detects_celery() {
         let nodes = vec![make_import("repo", "python", "from celery import Celery")];
-        let result = framework_detection_pass(&nodes, "repo");
+        let result = framework_detection_pass(&nodes, "repo", None);
         assert!(result.detected_frameworks.contains("celery"));
     }
 
     #[test]
     fn test_detects_socketio() {
         let nodes = vec![make_import("repo", "typescript", "import { Server } from 'socket.io'")];
-        let result = framework_detection_pass(&nodes, "repo");
+        let result = framework_detection_pass(&nodes, "repo", None);
         assert!(result.detected_frameworks.contains("socketio"));
     }
 
     #[test]
     fn test_detects_gin_go() {
         let nodes = vec![make_import("repo", "go", "import \"github.com/gin-gonic/gin\"")];
-        let result = framework_detection_pass(&nodes, "repo");
+        let result = framework_detection_pass(&nodes, "repo", None);
         assert!(result.detected_frameworks.contains("gin"));
     }
 
@@ -547,7 +546,7 @@ mod tests {
     fn test_no_false_positives_from_function_nodes() {
         // Only Import nodes should trigger detection
         let nodes = vec![make_fn("repo", "python", "fastapi_handler")];
-        let result = framework_detection_pass(&nodes, "repo");
+        let result = framework_detection_pass(&nodes, "repo", None);
         // Function named fastapi_handler should NOT trigger framework detection
         assert!(!result.detected_frameworks.contains("fastapi"),
             "Function nodes must not trigger framework detection");
@@ -555,7 +554,7 @@ mod tests {
 
     #[test]
     fn test_empty_input_returns_empty() {
-        let result = framework_detection_pass(&[], "repo");
+        let result = framework_detection_pass(&[], "repo", None);
         assert!(result.nodes.is_empty());
         assert!(result.detected_frameworks.is_empty());
     }
@@ -563,7 +562,7 @@ mod tests {
     #[test]
     fn test_no_imports_returns_empty() {
         let nodes = vec![make_fn("repo", "python", "my_function")];
-        let result = framework_detection_pass(&nodes, "repo");
+        let result = framework_detection_pass(&nodes, "repo", None);
         assert!(result.nodes.is_empty());
         assert!(result.detected_frameworks.is_empty());
     }
@@ -572,7 +571,7 @@ mod tests {
     fn test_external_root_nodes_skipped() {
         // External nodes from LSP should not trigger detection
         let node = make_import("external", "python", "from fastapi import FastAPI");
-        let result = framework_detection_pass(&[node], "repo");
+        let result = framework_detection_pass(&[node], "repo", None);
         assert!(!result.detected_frameworks.contains("fastapi"),
             "External root nodes must be skipped");
     }
@@ -580,7 +579,7 @@ mod tests {
     #[test]
     fn test_framework_node_metadata() {
         let nodes = vec![make_import("repo", "python", "import fastapi")];
-        let result = framework_detection_pass(&nodes, "repo");
+        let result = framework_detection_pass(&nodes, "repo", None);
         let node = result.nodes.iter().find(|n| n.id.name == "fastapi").unwrap();
         assert!(node.metadata.contains_key("display_name"));
         assert_eq!(node.metadata.get("display_name").map(|s| s.as_str()), Some("FastAPI"));
@@ -589,7 +588,7 @@ mod tests {
     #[test]
     fn test_framework_node_kind() {
         let nodes = vec![make_import("repo", "python", "import flask")];
-        let result = framework_detection_pass(&nodes, "repo");
+        let result = framework_detection_pass(&nodes, "repo", None);
         let node = result.nodes.iter().find(|n| n.id.name == "flask").unwrap();
         assert!(matches!(&node.id.kind, NodeKind::Other(s) if s == "framework"));
         assert_eq!(node.id.file, PathBuf::from("frameworks/flask"));
@@ -616,7 +615,7 @@ mod tests {
                 source: ExtractionSource::TreeSitter,
             });
         }
-        let result = framework_detection_pass(&nodes, "repo");
+        let result = framework_detection_pass(&nodes, "repo", None);
         let fastapi_nodes: Vec<_> = result.nodes.iter().filter(|n| n.id.name == "fastapi").collect();
         assert_eq!(fastapi_nodes.len(), 1, "Multiple imports of same framework must produce one node");
     }
@@ -629,7 +628,7 @@ mod tests {
             // Generic "kafka" in Go — should not match kafka-python rule (Python-only)
             make_import("repo", "go", "kafka"),
         ];
-        let result = framework_detection_pass(&nodes, "repo");
+        let result = framework_detection_pass(&nodes, "repo", None);
         // kafka-python rule has language="python", so Go imports should not match it.
         assert!(!result.detected_frameworks.contains("kafka-python"),
             "kafka-python rule must not fire on Go imports");
@@ -642,7 +641,7 @@ mod tests {
             make_import("repo", "python", "from celery import Celery"),
             make_import("repo", "python", "import redis"),
         ];
-        let result = framework_detection_pass(&nodes, "repo");
+        let result = framework_detection_pass(&nodes, "repo", None);
         assert!(result.detected_frameworks.contains("fastapi"));
         assert!(result.detected_frameworks.contains("celery"));
         assert!(result.detected_frameworks.contains("redis"));
@@ -654,7 +653,7 @@ mod tests {
         let nodes = vec![
             make_import("repo", "typescript", "import { useQuery } from '@tanstack/react-query'"),
         ];
-        let result = framework_detection_pass(&nodes, "repo");
+        let result = framework_detection_pass(&nodes, "repo", None);
         assert!(result.detected_frameworks.contains("tanstack-query"),
             "TanStack Query must be detected from @tanstack/ imports");
     }
@@ -666,11 +665,41 @@ mod tests {
             make_import("repo", "python", "import fastapi"),
             make_import("repo", "python", "from celery import Celery"),
         ];
-        let result = framework_detection_pass(&nodes, "repo");
+        let result = framework_detection_pass(&nodes, "repo", None);
         // Check nodes are sorted by name
         let names: Vec<&str> = result.nodes.iter().map(|n| n.id.name.as_str()).collect();
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted, "Framework nodes must be sorted by name for deterministic output");
+    }
+
+    #[test]
+    fn test_user_rules_extend_builtin() {
+        use std::io::Write;
+        // Write a temp dir with a .oh/extractors/custom.toml
+        let dir = tempfile::tempdir().expect("tempdir");
+        let extractors_dir = dir.path().join(".oh").join("extractors");
+        std::fs::create_dir_all(&extractors_dir).unwrap();
+        let rule_toml = extractors_dir.join("custom.toml");
+        let mut f = std::fs::File::create(&rule_toml).unwrap();
+        writeln!(f, r#"
+[[rules]]
+import_pattern = "my_custom_lib"
+language = "python"
+framework_id = "my-custom"
+display_name = "My Custom Lib"
+"#).unwrap();
+
+        let nodes = vec![make_import("repo", "python", "import my_custom_lib")];
+        let result = framework_detection_pass(&nodes, "repo", Some(dir.path()));
+        assert!(result.detected_frameworks.contains("my-custom"),
+            "User-defined rules must be detected");
+    }
+
+    #[test]
+    fn test_builtin_rules_parse() {
+        // Ensures the embedded TOML parses without panic.
+        let rules = builtin_rules();
+        assert!(!rules.is_empty(), "Embedded framework_rules.toml must not be empty");
     }
 }
