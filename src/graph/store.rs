@@ -254,6 +254,18 @@ mod tests {
     }
 
     #[test]
+    fn test_extraction_version_includes_extractor_config_pass() {
+        // EXTRACTION_VERSION was bumped to 10 for the generic extractor-config pass (#467).
+        // Caches built before version 10 lack config-driven channel nodes and must be
+        // re-extracted. Asserting >= 10 ensures this bump is never accidentally reverted.
+        assert!(
+            EXTRACTION_VERSION >= 10,
+            "EXTRACTION_VERSION must be >= 10 after extractor-config pass bump; got {}",
+            EXTRACTION_VERSION
+        );
+    }
+
+    #[test]
     fn test_symbols_schema_fields() {
         let schema = symbols_schema();
         assert!(schema.field_with_name("id").is_ok());

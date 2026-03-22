@@ -705,4 +705,234 @@ mod tests {
         // No frameworks detected from a plain Function node with no imports
         assert!(result.detected_frameworks.is_empty());
     }
+
+    // -------------------------------------------------------------------------
+    // ExtractorConfigPass tests
+    // -------------------------------------------------------------------------
+
+    /// ExtractorConfigPass::name() must return the canonical "extractor_config" string.
+    ///
+    /// The registry key is used for logging and future pass-selection APIs — the
+    /// exact string matters.
+    #[test]
+    fn test_extractor_config_pass_name() {
+        let pass = ExtractorConfigPass;
+        assert_eq!(pass.name(), "extractor_config");
+    }
+
+    /// ExtractorConfigPass::applies_when() must return true regardless of
+    /// which frameworks are detected.
+    ///
+    /// The pass is unconditional — the `.oh/extractors/` directory check is a
+    /// run-time filesystem check inside `run()`, not a compile-time gate.
+    #[test]
+    fn test_extractor_config_pass_always_applies() {
+        let pass = ExtractorConfigPass;
+        // Empty framework set → still applies.
+        assert!(pass.applies_when(&HashSet::new()), "must apply with no frameworks");
+        // Random framework set → still applies.
+        let mut fw = HashSet::new();
+        fw.insert("kafka".to_string());
+        fw.insert("celery".to_string());
+        assert!(pass.applies_when(&fw), "must apply regardless of detected frameworks");
+    }
+
+    /// ExtractorConfigPass::run() with no root_pairs in context is a no-op.
+    ///
+    /// When the pipeline has no workspace roots (e.g. empty scan), the pass must
+    /// not modify nodes or edges and must return an empty PassResult.
+    #[test]
+    fn test_extractor_config_pass_noop_when_no_root_pairs() {
+        let pass = ExtractorConfigPass;
+        let ctx = empty_ctx(); // root_pairs is empty
+        let mut nodes: Vec<Node> = vec![
+            make_node("repo", "src/pub.py", "publish_fn", NodeKind::Function, "python"),
+        ];
+        let mut edges: Vec<crate::graph::Edge> = vec![];
+        let node_count_before = nodes.len();
+        let result = pass.run(&mut nodes, &mut edges, &ctx);
+        assert_eq!(
+            nodes.len(),
+            node_count_before,
+            "no root_pairs → no new nodes added"
+        );
+        assert!(edges.is_empty(), "no root_pairs → no new edges added");
+        assert!(
+            result.detected_frameworks.is_none(),
+            "ExtractorConfigPass must not update framework state"
+        );
+    }
+
+    /// ExtractorConfigPass::run() with a root that has no `.oh/extractors/` dir is a no-op.
+    ///
+    /// When the root directory does not contain `.oh/extractors/`, the pass must
+    /// exit early without touching nodes or edges.
+    #[test]
+    fn test_extractor_config_pass_noop_when_no_extractors_dir() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root_path = tmp.path().to_path_buf();
+        // No `.oh/extractors/` created — directory does not exist.
+
+        let pass = ExtractorConfigPass;
+        let ctx = PassContext {
+            root_pairs: vec![("repo".to_string(), root_path)],
+            primary_slug: "repo".to_string(),
+            detected_frameworks: HashSet::new(),
+        };
+        let mut nodes: Vec<Node> = vec![
+            make_node("repo", "src/pub.py", "publish_fn", NodeKind::Function, "python"),
+        ];
+        let mut edges: Vec<crate::graph::Edge> = vec![];
+        let node_count_before = nodes.len();
+        pass.run(&mut nodes, &mut edges, &ctx);
+        assert_eq!(nodes.len(), node_count_before, "missing dir → no new nodes");
+        assert!(edges.is_empty(), "missing dir → no new edges");
+    }
+
+    /// ExtractorConfigPass::run() enforces per-root isolation: nodes from root-A
+    /// are not processed against root-B's configs.
+    ///
+    /// When the ctx has two root_pairs but only root-A has a `.oh/extractors/`
+    /// config, only nodes belonging to root-A should produce edges. The nodes
+    /// belonging to root-B must remain untouched.
+    #[test]
+    fn test_extractor_config_pass_per_root_isolation() {
+        use tempfile::TempDir;
+
+        // Create a temp dir that plays the role of root-A.
+        let tmp_a = TempDir::new().unwrap();
+        let root_a_path = tmp_a.path().to_path_buf();
+
+        // Write a minimal extractor config in root-A's `.oh/extractors/`.
+        let extractors_dir = root_a_path.join(".oh").join("extractors");
+        std::fs::create_dir_all(&extractors_dir).unwrap();
+        std::fs::write(
+            extractors_dir.join("bus.toml"),
+            r#"
+[meta]
+name = "internal-bus"
+applies_when = { language = "python", imports_contain = "src.bus" }
+
+[[boundaries]]
+function_pattern = "bus.emit"
+topic_arg = 0
+edge_kind = "Produces"
+"#,
+        )
+        .unwrap();
+
+        // Create a temp dir for root-B (no extractors config).
+        let tmp_b = TempDir::new().unwrap();
+        let root_b_path = tmp_b.path().to_path_buf();
+
+        let pass = ExtractorConfigPass;
+        let ctx = PassContext {
+            root_pairs: vec![
+                ("root-a".to_string(), root_a_path),
+                ("root-b".to_string(), root_b_path),
+            ],
+            primary_slug: "root-a".to_string(),
+            detected_frameworks: HashSet::new(),
+        };
+
+        // Helper to build an Import node for a given root.
+        let make_import_node = |root: &str, name: &str| Node {
+            id: NodeId {
+                root: root.to_string(),
+                file: PathBuf::from("src/main.py"),
+                name: name.to_string(),
+                kind: NodeKind::Import,
+            },
+            language: "python".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: name.to_string(),
+            body: name.to_string(),
+            metadata: BTreeMap::new(),
+            source: crate::graph::ExtractionSource::TreeSitter,
+        };
+
+        // Helper to build a Function node for a given root with a body.
+        let make_fn_node = |root: &str, name: &str, body: &str| Node {
+            id: NodeId {
+                root: root.to_string(),
+                file: PathBuf::from("src/pub.py"),
+                name: name.to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "python".to_string(),
+            line_start: 1,
+            line_end: 10,
+            signature: format!("def {}():", name),
+            body: body.to_string(),
+            metadata: BTreeMap::new(),
+            source: crate::graph::ExtractionSource::TreeSitter,
+        };
+
+        // Both roots have matching imports and functions, but only root-A has a
+        // config. So only root-A nodes should produce edges.
+        let mut nodes = vec![
+            // root-A: has config → should produce an edge
+            make_import_node("root-a", "from src.bus import bus"),
+            make_fn_node("root-a", "emit_event_a", r#"bus.emit("orders", data)"#),
+            // root-B: no config → must not produce any edge
+            make_import_node("root-b", "from src.bus import bus"),
+            make_fn_node("root-b", "emit_event_b", r#"bus.emit("payments", data)"#),
+        ];
+        let mut edges: Vec<crate::graph::Edge> = vec![];
+
+        pass.run(&mut nodes, &mut edges, &ctx);
+
+        // Only root-A's function should have produced an edge.
+        assert_eq!(
+            edges.len(),
+            1,
+            "only root-A has a config → exactly one edge produced (got {:?})",
+            edges
+        );
+        assert_eq!(
+            edges[0].from.root,
+            "root-a",
+            "edge must originate from root-a"
+        );
+        // The channel node should be for root-A's topic.
+        let channel_nodes: Vec<_> = nodes
+            .iter()
+            .filter(|n| matches!(&n.id.kind, NodeKind::Other(s) if s == "channel"))
+            .collect();
+        assert_eq!(channel_nodes.len(), 1, "only one channel node created");
+        assert_eq!(channel_nodes[0].id.name, "orders");
+    }
+
+    /// ExtractorConfigPass is registered in `with_builtins()`.
+    ///
+    /// Verifies that the pass name appears in the list of registered pass names
+    /// after a registry is constructed with built-ins.
+    #[test]
+    fn test_extractor_config_pass_registered_in_builtins() {
+        let reg = PostExtractionRegistry::with_builtins();
+        let names: Vec<&str> = reg.passes.iter().map(|p| p.name()).collect();
+        assert!(
+            names.contains(&"extractor_config"),
+            "with_builtins() must include ExtractorConfigPass; registered passes: {:?}",
+            names
+        );
+    }
+
+    /// Regression: ExtractorConfigPass::run() returns None for detected_frameworks
+    /// (must not interfere with framework detection state).
+    #[test]
+    fn test_extractor_config_pass_does_not_set_frameworks() {
+        let pass = ExtractorConfigPass;
+        let ctx = empty_ctx();
+        let mut nodes: Vec<Node> = vec![];
+        let mut edges: Vec<crate::graph::Edge> = vec![];
+        let result = pass.run(&mut nodes, &mut edges, &ctx);
+        assert!(
+            result.detected_frameworks.is_none(),
+            "ExtractorConfigPass must return None for detected_frameworks, not {:?}",
+            result.detected_frameworks
+        );
+    }
 }
