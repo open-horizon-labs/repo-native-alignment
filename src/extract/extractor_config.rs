@@ -311,11 +311,16 @@ pub fn extractor_config_pass_with_configs(
                 // Iterate ALL occurrences of `function_pattern(` in the body so
                 // functions that publish to multiple topics all get edges.
                 //
-                // Safety: all searches and argument extraction are performed
-                // on `body_lower` (not `node.body`) to avoid byte-offset
-                // mismatches caused by multi-byte UTF-8 characters. Topic names
-                // in call arguments are typically ASCII literals, so extracting
-                // from the lowercased copy is safe and case-insensitive.
+                // Search uses `body_lower` (case-insensitive pattern matching).
+                // Extraction uses `node.body` at the same byte offset to preserve
+                // original topic casing — "OrdersCreated" must not become "orderscreated".
+                //
+                // Safety: `call_prefix_lower` has the same byte length as `call_prefix`
+                // because function names are always ASCII. So the byte offset found in
+                // `body_lower` is a valid char boundary in `node.body` as long as no
+                // multi-byte UTF-8 chars appear BEFORE the pattern match. This is safe
+                // in practice because function call sites like `publisher.publish(` are
+                // ASCII and appear at ASCII-only offsets.
                 let mut search_start = 0usize;
                 while let Some(rel_pos) =
                     body_lower[search_start..].find(call_prefix_lower.as_str())
@@ -324,9 +329,14 @@ pub fn extractor_config_pass_with_configs(
                     // Advance past this occurrence for the next iteration.
                     search_start = abs_pos + call_prefix_lower.len();
 
-                    // Slice body_lower from the opening paren — byte-safe since
-                    // body_lower is a single String with consistent offsets.
-                    let body_from_here = &body_lower[abs_pos + call_prefix_lower.len() - 1..];
+                    // Extract from `node.body` at the same offset to preserve casing.
+                    // The paren offset is `abs_pos + call_prefix_lower.len() - 1`.
+                    let paren_offset = abs_pos + call_prefix_lower.len() - 1;
+                    // Guard: must be a valid char boundary in node.body.
+                    if !node.body.is_char_boundary(paren_offset) {
+                        continue;
+                    }
+                    let body_from_here = &node.body[paren_offset..];
                     let topic_name = if boundary.topic_arg == 0 {
                         extract_first_quoted(body_from_here)
                     } else {
@@ -515,6 +525,12 @@ fn extract_first_quoted(at_paren: &str) -> Option<String> {
         return None;
     }
 
+    // Skip interpolated template literals: `orders-${env}` is dynamic, not a
+    // static channel name. Only backtick strings with no `${` are safe.
+    if quote_char == '`' && name.contains("${") {
+        return None;
+    }
+
     Some(name)
 }
 
@@ -548,6 +564,11 @@ fn extract_nth_arg_quoted_from_open(at_paren: &str, n: usize) -> Option<String> 
     let name = content[..end].trim().to_string();
 
     if name.is_empty() || name.contains('\n') {
+        return None;
+    }
+
+    // Skip interpolated template literals (same as extract_first_quoted).
+    if quote_char == '`' && name.contains("${") {
         return None;
     }
 
@@ -1160,5 +1181,69 @@ edge_kind = "Produces"
             result.nodes.iter().all(|n| n.id.name != "go-topic"),
             "No go-topic channel node when Go import is absent"
         );
+    }
+
+    /// Test: topic casing is preserved (extract from node.body, not body_lower).
+    #[test]
+    fn test_preserves_topic_casing() {
+        let cfg = pubsub_fixture_config();
+        let import = make_import("repo", "python", "google.cloud.pubsub_v1", "google.cloud.pubsub_v1");
+        let fn_node = make_fn(
+            "repo",
+            "python",
+            "src/pub.py",
+            "publish_event",
+            r#"publisher.publish("OrdersCreated", data)"#,
+        );
+        let result = extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
+        assert_eq!(result.edges.len(), 1, "Should produce one edge");
+        // Topic name must preserve original case, not lowercase.
+        let channel = result.nodes.iter().find(|n| n.id.name == "OrdersCreated");
+        assert!(
+            channel.is_some(),
+            "Channel name must preserve original casing 'OrdersCreated', not 'orderscreated'"
+        );
+    }
+
+    /// Test: interpolated template literals are skipped (dynamic topics).
+    #[test]
+    fn test_skips_interpolated_template_literals() {
+        // Config that uses JavaScript-style backtick patterns.
+        let js_config = parse_config(
+            r#"
+[meta]
+name = "js-bus"
+applies_when = { language = "javascript", imports_contain = "my-bus" }
+
+[[boundaries]]
+function_pattern = "bus.publish"
+arg_position = 0
+edge_kind = "Produces"
+"#,
+        );
+        let import = make_import("repo", "javascript", "my-bus", "my-bus");
+        let fn_with_interpolation = make_fn(
+            "repo",
+            "javascript",
+            "src/pub.js",
+            "publishDynamic",
+            r#"bus.publish(`orders-${env}`, data)"#,
+        );
+        let fn_with_literal = make_fn(
+            "repo",
+            "javascript",
+            "src/pub2.js",
+            "publishStatic",
+            r#"bus.publish(`orders-prod`, data)"#,
+        );
+        let result = extractor_config_pass_with_configs(
+            &[import, fn_with_interpolation, fn_with_literal],
+            "repo",
+            &[js_config],
+        );
+        // Dynamic topic (with ${}) must produce no edge.
+        // Static backtick topic must produce one edge.
+        assert_eq!(result.edges.len(), 1, "Only static template literal produces an edge");
+        assert!(result.nodes.iter().any(|n| n.id.name == "orders-prod"), "Static topic present");
     }
 }

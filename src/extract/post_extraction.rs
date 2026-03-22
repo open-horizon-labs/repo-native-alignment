@@ -476,23 +476,38 @@ impl PostExtractionPass for ExtractorConfigPass {
     fn applies_when(&self, _detected_frameworks: &HashSet<String>) -> bool { true }
 
     fn run(&self, nodes: &mut Vec<Node>, edges: &mut Vec<Edge>, ctx: &PassContext) -> PassResult {
-        // Derive the repo root path from root_pairs using the primary_slug.
-        // This avoids adding a new field to PassContext.
-        let repo_root = ctx.root_pairs
-            .iter()
-            .find(|(slug, _)| slug == &ctx.primary_slug)
-            .or_else(|| ctx.root_pairs.first())
-            .map(|(_, path)| path.as_path())
-            .unwrap_or_else(|| std::path::Path::new("."));
+        // Run per workspace root so that:
+        // - Each root's own `.oh/extractors/` configs are loaded independently
+        // - Synthetic channel nodes are anchored under the correct root slug
+        // - Import nodes from root A don't incorrectly activate root B's patterns
+        //
+        // For each root we filter `nodes` to only those belonging to that root
+        // before calling the pass, and use that root's slug for channel node IDs.
+        for (slug, path) in &ctx.root_pairs {
+            // Load configs for this specific root.
+            let configs =
+                crate::extract::extractor_config::load_extractor_configs(path.as_path());
+            if configs.is_empty() {
+                continue;
+            }
 
-        let result = crate::extract::extractor_config::extractor_config_pass(
-            nodes,
-            repo_root,
-            &ctx.primary_slug,
-        );
-        if !result.nodes.is_empty() || !result.edges.is_empty() {
-            nodes.extend(result.nodes);
-            edges.extend(result.edges);
+            // Filter nodes to this root only (imports + functions both required).
+            // This prevents cross-root false positives: imports from root A should
+            // not trigger patterns defined for root B's namespace.
+            let root_nodes: Vec<_> = nodes.iter().filter(|n| &n.id.root == slug).cloned().collect();
+            if root_nodes.is_empty() {
+                continue;
+            }
+
+            let result = crate::extract::extractor_config::extractor_config_pass_with_configs(
+                &root_nodes,
+                slug.as_str(),
+                &configs,
+            );
+            if !result.nodes.is_empty() || !result.edges.is_empty() {
+                nodes.extend(result.nodes);
+                edges.extend(result.edges);
+            }
         }
         PassResult::empty()
     }
