@@ -62,18 +62,30 @@ pub struct PassContext {
 ///
 /// Passes extend `nodes` and `edges` in-place (the registry auto-tracks the
 /// delta via length snapshotting). The only value a pass needs to return is the
-/// set of detected frameworks — the registry propagates this into `PassContext`
-/// so subsequent framework-gated passes see the updated set.
+/// framework detection result.
+///
+/// # Framework state semantics
+///
+/// `detected_frameworks` uses `Option<HashSet<String>>` to distinguish:
+/// - `None` — this pass does not update framework state (the common case for
+///   non-framework-detection passes)
+/// - `Some(set)` — authoritative framework state after this pass; the registry
+///   **replaces** `PassContext::detected_frameworks` with this set rather than
+///   merging into it. This allows framework detection to clear stale frameworks
+///   from previous scans.
+///
+/// Only `FrameworkDetectionPass` returns `Some(...)`. All other passes return
+/// `None` (via `PassResult::empty()`).
 #[derive(Debug, Default)]
 pub struct PassResult {
-    /// Frameworks detected by this pass (non-empty only for `framework_detection_pass`).
-    /// The registry merges these into `PassContext::detected_frameworks` before running
-    /// the next pass.
-    pub detected_frameworks: HashSet<String>,
+    /// Framework detection result.
+    /// `None` = pass did not touch framework state.
+    /// `Some(set)` = authoritative framework state after this pass.
+    pub detected_frameworks: Option<HashSet<String>>,
 }
 
 impl PassResult {
-    /// Convenience: pass produced no framework detections.
+    /// Convenience: pass produced no framework state update.
     pub fn empty() -> Self {
         Self::default()
     }
@@ -179,14 +191,14 @@ impl PostExtractionRegistry {
             let added_nodes = nodes.len().saturating_sub(nodes_before);
             let added_edges = edges.len().saturating_sub(edges_before);
 
-            if added_nodes > 0 || added_edges > 0 || !pass_result.detected_frameworks.is_empty() {
+            if added_nodes > 0 || added_edges > 0 || pass_result.detected_frameworks.is_some() {
                 tracing::info!(
                     "PostExtractionPass '{}': +{} node(s), +{} edge(s){}",
                     pass.name(),
                     added_nodes,
                     added_edges,
-                    if !pass_result.detected_frameworks.is_empty() {
-                        format!(", detected: {:?}", pass_result.detected_frameworks)
+                    if let Some(ref fw) = pass_result.detected_frameworks {
+                        format!(", detected: {:?}", fw)
                     } else {
                         String::new()
                     }
@@ -200,11 +212,11 @@ impl PostExtractionRegistry {
 
             // Propagate detected frameworks so subsequent passes (pubsub, ws, nextjs)
             // see the updated set via `applies_when`.
-            if !pass_result.detected_frameworks.is_empty() {
-                ctx.detected_frameworks
-                    .extend(pass_result.detected_frameworks.iter().cloned());
-                result.detected_frameworks
-                    .extend(pass_result.detected_frameworks);
+            // `Some(set)` replaces the context state entirely (authoritative update);
+            // `None` leaves it unchanged (this pass doesn't touch framework state).
+            if let Some(detected_frameworks) = pass_result.detected_frameworks {
+                ctx.detected_frameworks = detected_frameworks.clone();
+                result.detected_frameworks = detected_frameworks;
             }
         }
 
@@ -347,12 +359,15 @@ impl PostExtractionPass for FrameworkDetectionPass {
     fn run(&self, nodes: &mut Vec<Node>, _edges: &mut Vec<Edge>, ctx: &PassContext) -> PassResult {
         let result =
             crate::extract::framework_detection::framework_detection_pass(nodes, &ctx.primary_slug);
-        let detected = result.detected_frameworks.clone();
+        let detected = result.detected_frameworks;
         if !result.nodes.is_empty() {
             nodes.extend(result.nodes);
         }
+        // Return Some(...) — the authoritative framework state after this pass.
+        // The registry will REPLACE ctx.detected_frameworks with this set,
+        // rather than merging, enabling stale frameworks to be cleared.
         PassResult {
-            detected_frameworks: detected,
+            detected_frameworks: Some(detected),
         }
     }
 }
@@ -515,7 +530,7 @@ mod tests {
             fn run(&self, _n: &mut Vec<Node>, _e: &mut Vec<crate::graph::Edge>, _c: &PassContext) -> PassResult {
                 let mut fw = HashSet::new();
                 fw.insert("some-framework".to_string());
-                PassResult { detected_frameworks: fw }
+                PassResult { detected_frameworks: Some(fw) }
             }
         }
 
@@ -597,7 +612,7 @@ mod tests {
             fn run(&self, _n: &mut Vec<Node>, _e: &mut Vec<crate::graph::Edge>, _c: &PassContext) -> PassResult {
                 let mut fw = HashSet::new();
                 fw.insert("my-framework".to_string());
-                PassResult { detected_frameworks: fw }
+                PassResult { detected_frameworks: Some(fw) }
             }
         }
 
