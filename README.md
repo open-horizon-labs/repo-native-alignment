@@ -203,7 +203,7 @@ The system compounds from here. Agents use `search` to discover relevant context
 
 **Worktree-aware queries:** Agents working in a git worktree can query their own code by passing the absolute path: `search(query="...", repo="/absolute/path/to/worktree")`. The worktree must be scanned first: `repo-native-alignment scan --repo /path/to/worktree`. Keyword and graph traversal search are available; semantic search requires a separate scan-time embedding index in the worktree.
 
-**Auto-discovered roots:** RNA automatically adds git worktrees and Claude Code memory as additional roots. Use `list_roots` to see what's active.
+**Auto-discovered roots:** RNA automatically adds git worktrees and Claude Code memory as additional roots. Worktrees that maintain their own RNA cache (`.oh/.cache/lance/` directory present) are skipped — their code stays in their own index. Use `list_roots` to see what's active.
 
 **Declared roots:** Declare intentionally related repos by slug in `.oh/config.toml`:
 
