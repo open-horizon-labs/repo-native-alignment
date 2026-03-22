@@ -405,7 +405,7 @@ impl PostExtractionPass for PubSubPass {
             &ctx.detected_frameworks,
             &ctx.primary_slug,
         );
-        if !result.edges.is_empty() {
+        if !result.nodes.is_empty() || !result.edges.is_empty() {
             nodes.extend(result.nodes);
             edges.extend(result.edges);
         }
@@ -430,7 +430,7 @@ impl PostExtractionPass for WebSocketPass {
             &ctx.detected_frameworks,
             &ctx.primary_slug,
         );
-        if !result.edges.is_empty() {
+        if !result.nodes.is_empty() || !result.edges.is_empty() {
             nodes.extend(result.nodes);
             edges.extend(result.edges);
         }
