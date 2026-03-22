@@ -93,11 +93,17 @@ pub fn tested_by_pass(all_nodes: &[Node]) -> Vec<Edge> {
     // Construction is O(P × avg_name_len); each query is O(haystack_len + matches).
     // Total: O(N + E_emitted) vs the previous O(T × P).
     //
-    // `MatchKind::LeftmostLongest` is intentional: when one production name is
-    // a prefix of another (e.g. "parse" vs "parse_config"), we want the longest
-    // match so the more-specific function wins.  All matches are still reported
-    // for a given haystack position via `find_iter`, so multiple production
-    // functions can match a single test name.
+    // `MatchKind::LeftmostLongest` selects the longest match at each position,
+    // so when one production name is a prefix of another (e.g. "parse" vs
+    // "parse_config"), only the longer name matches at that offset.  This
+    // reduces false-positive edges compared to the previous str::contains loop,
+    // which would have emitted edges for both.  Non-overlapping patterns in
+    // different positions of the haystack (e.g. "build" and "parse" in
+    // "test_build_and_parse") are all reported as expected.
+    //
+    // `ascii_case_insensitive` replaces the previous to_lowercase() allocations
+    // and is correct for function names, which are always ASCII across all
+    // supported languages.
     let patterns: Vec<&str> = prod_indexed.iter().map(|n| n.id.name.as_str()).collect();
     let ac = AhoCorasickBuilder::new()
         .ascii_case_insensitive(true)
