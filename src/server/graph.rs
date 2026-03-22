@@ -860,6 +860,29 @@ impl RnaHandler {
             }
         }
 
+        // 6z. Deduplicate all_edges before persistence.
+        //
+        // Post-extraction passes (api_link, tested_by, import_calls, directory_module)
+        // run over the full merged all_nodes after each root's edges are loaded from
+        // cache.  On a mixed dirty/clean rebuild, those passes re-emit edges that
+        // are already present in all_edges from the cached roots.  Deduplicate here
+        // so the LanceDB full-persist (DROP+CREATE) doesn't write duplicate rows.
+        //
+        // The incremental path (update_graph_with_scan) has its own dedup block;
+        // keep them in sync.
+        {
+            let before = all_edges.len();
+            let mut seen_edges = std::collections::HashSet::new();
+            all_edges.retain(|e| seen_edges.insert(e.stable_id()));
+            let after = all_edges.len();
+            if before != after {
+                tracing::debug!(
+                    "Full-build edge dedup: {} → {} edges ({} duplicates removed)",
+                    before, after, before - after
+                );
+            }
+        }
+
         // 7. Persist graph to LanceDB
         //
         // When `spawn_background=true` (MCP server path), persist NOW so the
