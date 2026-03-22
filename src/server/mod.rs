@@ -1092,6 +1092,96 @@ mod tests {
         // Cleanup runs automatically when _cleanup is dropped (end of test scope).
     }
 
+    /// Regression test for #453: ApiEndpoint nodes produced by `nextjs_routing_pass`
+    /// for an lsp_only subdirectory root must survive subsequent scans.
+    ///
+    /// The bug: `live_slugs` excluded lsp_only roots. Stale pruning filtered stored
+    /// root IDs against `live_slugs`, so the lsp_only slug (e.g. "client") was always
+    /// treated as a removed worktree and deleted on every scan.
+    ///
+    /// The fix: stale pruning uses `all_declared_slugs` (includes lsp_only) to avoid
+    /// deleting nodes produced by post-extraction passes like `nextjs_routing_pass`.
+    #[tokio::test]
+    async fn test_lsp_only_root_api_endpoint_nodes_survive_rescan() {
+        use tempfile::TempDir;
+
+        let primary = TempDir::new().unwrap();
+        let client_dir = primary.path().join("client");
+
+        // Primary root: one Rust file (required so the scanner has something to extract)
+        std::fs::create_dir_all(primary.path().join("src")).unwrap();
+        std::fs::write(
+            primary.path().join("src/lib.rs"),
+            "pub fn primary_fn() {}\n",
+        )
+        .unwrap();
+
+        // lsp_only subdirectory root: a Next.js Pages Router API route
+        // pages/api/health.ts → ApiEndpoint node "ANY /api/health"
+        std::fs::create_dir_all(client_dir.join("pages/api")).unwrap();
+        std::fs::write(
+            client_dir.join("pages/api/health.ts"),
+            "export default function handler(req: any, res: any) { res.json({ ok: true }); }\n",
+        )
+        .unwrap();
+
+        // Declare the client subdirectory as an lsp_only root in config.toml
+        let config_dir = primary.path().join(".oh");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            format!(
+                "[workspace.roots]\nclient = \"{}\"\n",
+                client_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let handler = RnaHandler {
+            repo_root: primary.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        // First build: nextjs_routing_pass should produce ApiEndpoint with root="client"
+        let gs1 = handler.build_full_graph().await.unwrap();
+        let has_endpoint_first = gs1
+            .nodes
+            .iter()
+            .any(|n| n.id.kind == crate::graph::NodeKind::ApiEndpoint && n.id.root == "client");
+        assert!(
+            has_endpoint_first,
+            "First build must include ApiEndpoint from lsp_only client root. \
+            Nodes: {:?}",
+            gs1.nodes
+                .iter()
+                .filter(|n| n.id.kind == crate::graph::NodeKind::ApiEndpoint)
+                .map(|n| (&n.id.root, &n.id.name))
+                .collect::<Vec<_>>()
+        );
+
+        // Force a second build (simulate rescan)
+        {
+            let mut g = handler.graph.write().await;
+            *g = None;
+        }
+        let gs2 = handler.build_full_graph().await.unwrap();
+        let has_endpoint_second = gs2
+            .nodes
+            .iter()
+            .any(|n| n.id.kind == crate::graph::NodeKind::ApiEndpoint && n.id.root == "client");
+        assert!(
+            has_endpoint_second,
+            "Second build (rescan) must still include ApiEndpoint from lsp_only client root. \
+            Stale pruning must NOT delete nodes for declared lsp_only roots. \
+            Nodes: {:?}",
+            gs2.nodes
+                .iter()
+                .filter(|n| n.id.kind == crate::graph::NodeKind::ApiEndpoint)
+                .map(|n| (&n.id.root, &n.id.name))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_enricher_registry_includes_markdown() {
         // Verify that EnricherRegistry::with_builtins() registers enrichers for
