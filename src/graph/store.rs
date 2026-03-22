@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search`.
-pub const SCHEMA_VERSION: u32 = 17; // append-only rebuild: scan_version column for versioned writes
+pub const SCHEMA_VERSION: u32 = 18; // gRPC proto columns: parent_service, rpc_request_type, rpc_response_type
 
 /// Extraction version for source-level extraction logic.
 ///
@@ -109,6 +109,11 @@ pub fn symbols_schema() -> Schema {
         Field::new("http_path", DataType::Utf8, true),      // "/users" | "/items/{id}" | etc.
         // Doc comment column — survives LSP reindex round-trip (#416)
         Field::new("doc_comment", DataType::Utf8, true),    // metadata["doc_comment"] — documentation comment
+        // gRPC / proto columns — populated for proto RPC Function nodes (#466)
+        // These must survive LanceDB round-trip so GrpcClientCallsPass works on incremental scans.
+        Field::new("parent_service", DataType::Utf8, true), // metadata["parent_service"] — owning service name
+        Field::new("rpc_request_type", DataType::Utf8, true), // metadata["request_type"] — proto request message
+        Field::new("rpc_response_type", DataType::Utf8, true), // metadata["response_type"] — proto response message
         // Vector column is added dynamically when embeddings are computed,
         // since the dimension depends on the model. See `symbols_schema_with_vector`.
         Field::new("updated_at", DataType::Int64, false),
@@ -161,6 +166,10 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("http_path", DataType::Utf8, true),
         // Doc comment column — survives LSP reindex round-trip (#416)
         Field::new("doc_comment", DataType::Utf8, true),
+        // gRPC / proto columns — populated for proto RPC Function nodes (#466)
+        Field::new("parent_service", DataType::Utf8, true),
+        Field::new("rpc_request_type", DataType::Utf8, true),
+        Field::new("rpc_response_type", DataType::Utf8, true),
         Field::new(
             "vector",
             DataType::FixedSizeList(
