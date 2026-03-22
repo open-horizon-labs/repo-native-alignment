@@ -30,6 +30,7 @@
 //! | Python     | `_pb2_grpc`             | `stub.MethodName(`    |
 //! | Go         | `google.golang.org/grpc`| `client.MethodName(`  |
 //! | TypeScript | `@grpc/`                | `client.MethodName(`  |
+//! | Java       | `io.grpc`               | `stub.MethodName(`    |
 //!
 //! # gRPC stub calls are method calls
 //!
@@ -41,7 +42,7 @@
 //! # Placement
 //!
 //! Registered in `PostExtractionRegistry` with `applies_when` gating on
-//! `grpc-python`, `grpc-go`, or `grpc-js` frameworks (set by
+//! `grpc-python`, `grpc-go`, `grpc-js`, or `grpc-java` frameworks (set by
 //! `FrameworkDetectionPass`). Runs after framework detection, before
 //! LanceDB persist.
 
@@ -61,11 +62,14 @@ use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, N
 /// - Python: `_pb2_grpc` — generated protobuf-grpc stub module suffix
 /// - Go: `google.golang.org/grpc` — canonical gRPC Go import path
 /// - TypeScript/JavaScript: `@grpc/` — @grpc npm scope
+/// - Java: `io.grpc` — canonical gRPC Java import prefix (covers `io.grpc.stub.*`,
+///   `io.grpc.ManagedChannel`, generated `*Grpc` stub classes, etc.)
 fn is_grpc_stub_import(import_text: &str) -> bool {
     let lower = import_text.to_lowercase();
     lower.contains("_pb2_grpc")
         || lower.contains("google.golang.org/grpc")
         || lower.contains("@grpc/")
+        || lower.contains("io.grpc")
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +267,7 @@ pub fn should_run(detected_frameworks: &std::collections::HashSet<String>) -> bo
     detected_frameworks.contains("grpc-python")
         || detected_frameworks.contains("grpc-go")
         || detected_frameworks.contains("grpc-js")
+        || detected_frameworks.contains("grpc-java")
         || detected_frameworks.contains("tonic") // Rust gRPC
 }
 
@@ -564,6 +569,29 @@ mod tests {
     }
 
     #[test]
+    fn test_java_client_call_emits_edge() {
+        let rpc = make_proto_rpc("api/user.proto", "GetUser", "UserService");
+        let caller = make_caller(
+            "src/UserClient.java",
+            "fetchUser",
+            "public User fetchUser(String id) {\n    GetUserRequest request = GetUserRequest.newBuilder().setId(id).build();\n    return stub.GetUser(request);\n}",
+            "java",
+        );
+        let import = make_import(
+            "src/UserClient.java",
+            "import io.grpc.stub.AbstractStub;",
+            "java",
+        );
+
+        let nodes = vec![rpc.clone(), caller.clone(), import];
+        let edges = grpc_client_calls_pass(&nodes);
+
+        assert_eq!(edges.len(), 1, "expected 1 Calls edge for Java, got {:?}", edges);
+        assert_eq!(edges[0].from.name, "fetchUser");
+        assert_eq!(edges[0].to.name, "GetUser");
+    }
+
+    #[test]
     fn test_should_run_gates_correctly() {
         let mut fw = HashSet::new();
         assert!(!should_run(&fw), "should not run with no frameworks");
@@ -576,13 +604,23 @@ mod tests {
         fw3.insert("grpc-js".to_string());
         assert!(should_run(&fw3));
         let mut fw4 = HashSet::new();
-        fw4.insert("fastapi".to_string());
-        assert!(!should_run(&fw4), "non-grpc framework should not trigger pass");
+        fw4.insert("grpc-java".to_string());
+        assert!(should_run(&fw4), "should run with grpc-java");
+        let mut fw5 = HashSet::new();
+        fw5.insert("fastapi".to_string());
+        assert!(!should_run(&fw5), "non-grpc framework should not trigger pass");
     }
 
     #[test]
     fn test_empty_input_returns_empty() {
         let edges = grpc_client_calls_pass(&[]);
         assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn test_is_grpc_stub_import_java() {
+        assert!(is_grpc_stub_import("import io.grpc.stub.AbstractStub;"));
+        assert!(is_grpc_stub_import("import io.grpc.ManagedChannel;"));
+        assert!(is_grpc_stub_import("import io.grpc.Channel;"));
     }
 }

@@ -144,6 +144,16 @@ static FRAMEWORK_RULES: &[FrameworkRule] = &[
     FrameworkRule { import_pattern: "@anthropic-ai/", language: "javascript", framework_id: "anthropic", display_name: "Anthropic SDK" },
 
     // -------------------------------------------------------------------------
+    // Java frameworks
+    // -------------------------------------------------------------------------
+    FrameworkRule { import_pattern: "io.grpc", language: "java", framework_id: "grpc-java", display_name: "gRPC (Java)" },
+    FrameworkRule { import_pattern: "io.micronaut", language: "java", framework_id: "micronaut", display_name: "Micronaut" },
+    FrameworkRule { import_pattern: "org.springframework", language: "java", framework_id: "spring", display_name: "Spring Framework" },
+    FrameworkRule { import_pattern: "javax.ws.rs", language: "java", framework_id: "jax-rs", display_name: "JAX-RS" },
+    FrameworkRule { import_pattern: "jakarta.ws.rs", language: "java", framework_id: "jax-rs", display_name: "JAX-RS (Jakarta)" },
+    FrameworkRule { import_pattern: "org.apache.kafka", language: "java", framework_id: "kafka-java", display_name: "Kafka (Java)" },
+
+    // -------------------------------------------------------------------------
     // Go frameworks
     // -------------------------------------------------------------------------
     FrameworkRule { import_pattern: "gin-gonic/gin", language: "go", framework_id: "gin", display_name: "Gin (Go)" },
