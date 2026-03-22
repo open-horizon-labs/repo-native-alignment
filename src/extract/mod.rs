@@ -681,6 +681,125 @@ impl Default for EnricherRegistry {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use crate::scanner::ScanResult;
+    use std::time::Duration;
+
+    // ---------------------------------------------------------------------------
+    // Adversarial tests for parallel extraction correctness
+    // ---------------------------------------------------------------------------
+
+    /// Adversarial: parallel extraction must produce nodes from all files.
+    /// Seeded from dissent: "node/edge count must be identical to sequential."
+    #[test]
+    fn test_parallel_extraction_same_node_count_as_sequential() {
+        let registry = ExtractorRegistry::with_builtins();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        let mut new_files = Vec::new();
+        for i in 0..10 {
+            let name = format!("src/lib_{i}.rs");
+            std::fs::write(
+                tmp.path().join(&name),
+                format!("pub fn func_{i}() -> u32 {{ {i} }}\n"),
+            ).unwrap();
+            new_files.push(PathBuf::from(&name));
+        }
+        for i in 0..10 {
+            let name = format!("src/lib_{i}.py");
+            std::fs::write(
+                tmp.path().join(&name),
+                format!("def func_{i}():\n    return {i}\n"),
+            ).unwrap();
+            new_files.push(PathBuf::from(&name));
+        }
+
+        let scan = ScanResult {
+            changed_files: vec![],
+            new_files,
+            deleted_files: vec![],
+            scan_duration: Duration::ZERO,
+        };
+
+        let result = registry.extract_scan_result(tmp.path(), &scan);
+        assert!(
+            result.nodes.len() >= 20,
+            "Should have at least one node per file, got {}",
+            result.nodes.len()
+        );
+    }
+
+    /// Adversarial: binary files (invalid UTF-8) must be skipped, not panic.
+    /// Seeded from dissent: "invalid UTF-8 → debug-level skip, not crash."
+    #[test]
+    fn test_parallel_extraction_skips_binary_files() {
+        let registry = ExtractorRegistry::with_builtins();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        // Binary file — invalid UTF-8 bytes
+        std::fs::write(tmp.path().join("src/binary.rs"), b"\xff\xfe\x00\x01").unwrap();
+
+        let scan = ScanResult {
+            changed_files: vec![],
+            new_files: vec![
+                PathBuf::from("src/lib.rs"),
+                PathBuf::from("src/binary.rs"),
+            ],
+            deleted_files: vec![],
+            scan_duration: Duration::ZERO,
+        };
+
+        let result = registry.extract_scan_result(tmp.path(), &scan);
+        assert!(!result.nodes.is_empty(), "Should extract from valid Rust file");
+    }
+
+    /// Adversarial: empty scan must return empty result.
+    /// Edge case: rayon reduce with 0 items returns the identity (ExtractionResult::default).
+    #[test]
+    fn test_parallel_extraction_empty_scan() {
+        let registry = ExtractorRegistry::with_builtins();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let scan = ScanResult {
+            changed_files: vec![],
+            new_files: vec![],
+            deleted_files: vec![],
+            scan_duration: Duration::ZERO,
+        };
+
+        let result = registry.extract_scan_result(tmp.path(), &scan);
+        assert!(result.nodes.is_empty());
+        assert!(result.edges.is_empty());
+    }
+
+    /// Adversarial: single-file parallel extraction must match direct extraction.
+    /// Edge case: rayon with one item takes the identity path.
+    #[test]
+    fn test_parallel_extraction_single_file_matches_direct() {
+        let registry = ExtractorRegistry::with_builtins();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let code = "pub fn only_fn() {}\npub struct Only {}\n";
+        std::fs::write(tmp.path().join("only.rs"), code).unwrap();
+
+        let scan = ScanResult {
+            changed_files: vec![],
+            new_files: vec![PathBuf::from("only.rs")],
+            deleted_files: vec![],
+            scan_duration: Duration::ZERO,
+        };
+
+        let parallel_result = registry.extract_scan_result(tmp.path(), &scan);
+        let direct_result = registry.extract_file(Path::new("only.rs"), code);
+
+        assert_eq!(
+            parallel_result.nodes.len(),
+            direct_result.nodes.len(),
+            "Single-file parallel extraction must match direct extraction"
+        );
+    }
 
     #[test]
     fn test_registry_dispatches_by_extension() {
