@@ -45,7 +45,7 @@
 //! cross-file test/production pairs are linked even when only one side was
 //! touched in an incremental scan.
 
-use aho_corasick::{AhoCorasickBuilder, MatchKind};
+use aho_corasick::{AhoCorasick, MatchKind};
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeKind};
 use crate::ranking::is_test_function;
 
@@ -105,7 +105,7 @@ pub fn tested_by_pass(all_nodes: &[Node]) -> Vec<Edge> {
     // and is correct for function names, which are always ASCII across all
     // supported languages.
     let patterns: Vec<&str> = prod_indexed.iter().map(|n| n.id.name.as_str()).collect();
-    let ac = AhoCorasickBuilder::new()
+    let ac = AhoCorasick::builder()
         .ascii_case_insensitive(true)
         .match_kind(MatchKind::LeftmostLongest)
         .build(&patterns)
