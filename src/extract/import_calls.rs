@@ -43,8 +43,8 @@
 //!
 //! For TypeScript, the pass also attempts to filter to relative imports (those
 //! starting with `.`) to avoid emitting edges to npm package functions that may
-//! share a name with local code.  Non-relative import edges are still emitted
-//! but at [`Confidence::Inferred`] rather than [`Confidence::Detected`].
+//! share a name with local code.  Both relative and non-relative import matches
+//! use [`Confidence::Detected`] since the function body text confirms the call.
 //!
 //! # Placement
 //!
@@ -53,7 +53,7 @@
 //! [`tested_by_pass`](super::naming_convention::tested_by_pass) in
 //! `build_full_graph_inner` and `update_graph_with_scan`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeKind};
@@ -87,44 +87,25 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
     }
 
     // ------------------------------------------------------------------
-    // 2. Group Import nodes by file.
+    // 2. For each file, build the set of imported symbol names.
     // ------------------------------------------------------------------
-    // file -> Vec<(import_text, is_relative)>
-    let mut imports_by_file: HashMap<PathBuf, Vec<(String, bool)>> = HashMap::new();
+    // file -> HashSet<imported_name>
+    let mut imported_names_by_file: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     for node in all_nodes {
         if node.id.kind == NodeKind::Import {
             let text = &node.id.name; // Import node name = full import text
-            let is_relative = is_relative_import(text);
-            imports_by_file
-                .entry(node.id.file.clone())
-                .or_default()
-                .push((text.clone(), is_relative));
-        }
-    }
-
-    if imports_by_file.is_empty() {
-        return Vec::new();
-    }
-
-    // ------------------------------------------------------------------
-    // 3. For each file, build: imported_name -> is_relative
-    // ------------------------------------------------------------------
-    // file -> (name -> is_relative)
-    let mut imported_names_by_file: HashMap<PathBuf, BTreeMap<String, bool>> = HashMap::new();
-    for (file, imports) in &imports_by_file {
-        let mut name_map: BTreeMap<String, bool> = BTreeMap::new();
-        for (import_text, is_relative) in imports {
-            for name in parse_imported_names(import_text) {
-                // Keep the "most confident" status: relative beats non-relative.
-                let entry = name_map.entry(name).or_insert(*is_relative);
-                if *is_relative {
-                    *entry = true;
-                }
+            let names = parse_imported_names(text);
+            if !names.is_empty() {
+                imported_names_by_file
+                    .entry(node.id.file.clone())
+                    .or_default()
+                    .extend(names);
             }
         }
-        if !name_map.is_empty() {
-            imported_names_by_file.insert(file.clone(), name_map);
-        }
+    }
+
+    if imported_names_by_file.is_empty() {
+        return Vec::new();
     }
 
     // ------------------------------------------------------------------
@@ -139,7 +120,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         if node.id.kind != NodeKind::Function {
             continue;
         }
-        let Some(name_map) = imported_names_by_file.get(&node.id.file) else {
+        let Some(imported_names) = imported_names_by_file.get(&node.id.file) else {
             continue;
         };
         if node.body.is_empty() {
@@ -147,7 +128,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         }
 
         // For each imported name that appears as a call in this function body
-        for (imported_name, &is_relative) in name_map {
+        for imported_name in imported_names {
             // Skip very short names to avoid false positives.
             if imported_name.len() < 4 {
                 continue;
@@ -174,10 +155,9 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
                 continue;
             }
 
-            // Confidence: relative imports get Detected; npm/absolute package imports
-            // also get Detected since we found a matching local function node.
-            // Future: consider adding an Inferred variant for lower-confidence matches.
-            let _ = is_relative; // used for filtering logic below; confidence is always Detected
+            // All import-call edges use Detected confidence.  Both relative and
+            // non-relative imports are treated the same: finding a local function
+            // node with a matching name confirms the call target.
             let confidence = Confidence::Detected;
 
             for &callee in &cross_file_candidates {
@@ -390,27 +370,6 @@ fn parse_es6_import_names(text: &str) -> Vec<String> {
     }
 
     names
-}
-
-// ---------------------------------------------------------------------------
-// Helper: check if import is relative (local file) vs. package
-// ---------------------------------------------------------------------------
-
-/// Returns `true` when the import is a relative path (`./` or `../`) or a
-/// Python relative import (starts with `.`).
-fn is_relative_import(import_text: &str) -> bool {
-    let text = import_text.trim();
-    // ES6/TS: check for `from './'` or `from '../'`
-    if let Some(from_idx) = text.find(" from ") {
-        let after = text[from_idx + 6..].trim();
-        let path = after.trim_matches(|c| c == '\'' || c == '"' || c == ';');
-        return path.starts_with('.') || path.starts_with("./") || path.starts_with("../");
-    }
-    // Python relative: `from .mod import …`
-    if text.starts_with("from .") || text.starts_with("from ..") {
-        return true;
-    }
-    false
 }
 
 // ---------------------------------------------------------------------------
