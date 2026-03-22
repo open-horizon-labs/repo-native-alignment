@@ -42,7 +42,10 @@ pub const SCHEMA_VERSION: u32 = 17; // append-only rebuild: scan_version column 
 /// Bumped to 10 for generic extractor-config pass (#467): reads *.toml from
 /// .oh/extractors/ and emits NodeKind::Other("channel") nodes + Produces/Consumes
 /// edges. Older caches lack config-driven channel nodes and must be re-extracted.
-pub const EXTRACTION_VERSION: u32 = 10;
+/// Bumped to 11 for openapi_sdk_link_pass (#465): emits Implements edges from
+/// generated SDK Function nodes to ApiEndpoint nodes (matched by operation_id).
+/// Older caches lack SDK→spec links and must be re-extracted.
+pub const EXTRACTION_VERSION: u32 = 11;
 
 /// Arrow schema for the `symbols` table.
 ///

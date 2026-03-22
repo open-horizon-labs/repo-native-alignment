@@ -242,6 +242,7 @@ impl PostExtractionRegistry {
         let mut reg = Self::new();
         // Group 1: unconditional passes (no framework dependency)
         reg.register(Box::new(ApiLinkPass));
+        reg.register(Box::new(OpenApiSdkLinkPass));
         reg.register(Box::new(ManifestPass));
         reg.register(Box::new(TestedByPass));
         reg.register(Box::new(ImportCallsPass));
@@ -279,6 +280,30 @@ impl PostExtractionPass for ApiLinkPass {
 
     fn run(&self, nodes: &mut Vec<Node>, edges: &mut Vec<Edge>, _ctx: &PassContext) -> PassResult {
         let new_edges = crate::extract::api_link::api_link_pass(nodes);
+        if !new_edges.is_empty() {
+            edges.extend(new_edges);
+        }
+        PassResult::empty()
+    }
+}
+
+// --- OpenApiSdkLinkPass ---
+
+/// Links generated SDK functions to their OpenAPI spec operations via `Implements` edges.
+///
+/// Matches function nodes in generated SDK files (e.g. `sdk.gen.ts`) to `ApiEndpoint`
+/// nodes that carry an `operation_id` in their metadata, using case-insensitive
+/// camelCase/snake_case normalisation.
+///
+/// This closes the HTTP traversal gap:
+/// `TS SDK function → [Implements] → ApiEndpoint → [Implements] → FastAPI handler`
+struct OpenApiSdkLinkPass;
+
+impl PostExtractionPass for OpenApiSdkLinkPass {
+    fn name(&self) -> &str { "openapi_sdk_link" }
+
+    fn run(&self, nodes: &mut Vec<Node>, edges: &mut Vec<Edge>, _ctx: &PassContext) -> PassResult {
+        let new_edges = crate::extract::openapi_sdk_link::openapi_sdk_link_pass(nodes);
         if !new_edges.is_empty() {
             edges.extend(new_edges);
         }

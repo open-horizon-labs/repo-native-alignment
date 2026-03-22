@@ -11,6 +11,7 @@ pub mod api_link;
 pub mod consumers;
 pub mod directory_module;
 pub mod event_bus;
+pub mod openapi_sdk_link;
 pub mod extractor_config;
 pub mod framework_detection;
 pub mod import_calls;
