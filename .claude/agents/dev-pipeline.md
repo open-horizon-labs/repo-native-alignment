@@ -12,6 +12,16 @@ Full development pipeline: **problem-statement → solution-space → execute �
 
 Takes a feature or bug from framing through merge. Each phase feeds the next via a session file. The pipeline ensures nothing is skipped — no coding without a problem statement, no merging without the /ship quality gate.
 
+> **Use RNA tools — not Grep/Read — for all code navigation:**
+>
+> - **MCP tools** (`search`, `repo_map`, `outcome_progress`, `graph_query`) — project-level context: guardrails, outcomes, metis, cross-cutting impact analysis.
+> - **CLI in your worktree** — code navigation WITHIN your working directory. Use these Bash commands from inside your worktree:
+>   ```bash
+>   repo-native-alignment search --repo . "what you're looking for" --limit 5
+>   repo-native-alignment graph --node "file.rs:function:kind" --repo . --mode neighbors
+>   ```
+>   If the worktree hasn't been scanned yet, run `repo-native-alignment scan --repo . --full` once before querying.
+>
 > **Friction logging:** When an RNA tool falls short or you fall back to Grep/Read, append to the session file's `## RNA Tool Friction Log` table. See guardrail: `dogfood-rna-tools`.
 
 > **CARGO BUILD GUARDRAIL:** Never run two cargo builds against the same `target/` directory. Each pipeline gets its own worktree with its own `CARGO_TARGET_DIR` (see Phase 3 worktree setup). Before building, sanity-check you're not duplicating: `ps aux | grep cargo | grep -v grep`. A second cargo process targeting the same directory blocks silently on the file lock, hanging indefinitely. See `.oh/guardrails/no-parallel-cargo-agents.md`.

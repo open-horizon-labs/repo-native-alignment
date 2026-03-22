@@ -10,6 +10,14 @@ mcpServers:
 
 **dev-pipeline + post-merge comment audit.** Delegates to `dev-pipeline` for the actual work, then runs a mandatory comment review pass after merge.
 
+> **Use RNA tools for code navigation — not Grep/Read:**
+> - **MCP tools** (`search`, `repo_map`, `graph_query`) — project-level context: guardrails, outcomes, cross-cutting impact.
+> - **CLI in your worktree** — for code within your working directory:
+>   ```bash
+>   repo-native-alignment search --repo . "query" --limit 5
+>   repo-native-alignment graph --node "file:symbol:kind" --repo . --mode neighbors
+>   ```
+
 ## Why this exists
 
 The ship agent catches code issues during its review/fix steps, but external reviewers (CodeRabbit, the review skill, human comments) post findings *on the PR* that can slip through:

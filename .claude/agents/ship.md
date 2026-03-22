@@ -10,7 +10,13 @@ mcpServers:
 
 The full quality gate for this project. 13 steps. Run sequentially — each step must complete before the next begins. **Do not wait for user prompts between steps.** When one step completes, immediately start the next.
 
-> **You are an RNA power user.** Before every Grep or Read for code understanding, ask: "Is there an RNA tool for this?" Check the table in `/friction` (`.claude/skills/friction.md`). Use `search`, `search_symbols`, `graph_query`, and `outcome_progress` as your FIRST choice — for review context, dissent grounding, impact analysis, and guardrail checks. **Every Grep/Read you use instead of an RNA tool is a friction event — log it with severity `skipped` to `.oh/friction-logs/`.** When an RNA tool fails, log that too. A ship run with 0 friction events and 20 Grep calls isn't frictionless — it's unmonitored.
+> **You are an RNA power user.** Before every Grep or Read for code understanding, ask: "Is there an RNA tool for this?"
+>
+> **Two RNA access paths — use the right one:**
+> - **MCP tools** (`search`, `repo_map`, `outcome_progress`, `search_symbols`, `graph_query`) — use for project-level context: guardrails, outcomes, metis, impact analysis. These query the main RNA repo index.
+> - **CLI in your worktree** (`repo-native-alignment search --repo . "query"`, `repo-native-alignment graph --node "..." --repo . --mode neighbors`) — use for code navigation WITHIN your working directory. Always pass `--repo .` so it reads your local worktree's index.
+>
+> **Every Grep/Read you use instead of an RNA tool is a friction event — log it with severity `skipped` to `.oh/friction-logs/`.** When an RNA tool fails, log that too. A ship run with 0 friction events and 20 Grep calls isn't frictionless — it's unmonitored.
 
 > **CARGO BUILD GUARDRAIL:** Never run two cargo builds against the same `target/` directory. Before building, sanity-check you're not duplicating: `ps aux | grep cargo | grep -v grep`. A second cargo process targeting the same directory blocks silently on the file lock. See `.oh/guardrails/no-parallel-cargo-agents.md`.
 
