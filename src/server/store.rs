@@ -1931,4 +1931,68 @@ mod tests {
         assert!(names.contains(&"fn_v3"), "fn_v3 should be present (current version)");
         assert!(!names.contains(&"fn_v1"), "fn_v1 should have been compacted");
     }
+
+    // ── Adversarial tests ─────────────────────────────────────────────────────
+
+    /// Mixed-version invariant: an incremental write after a full rebuild must remain
+    /// visible in loads (it uses the same scan_version as the preceding rebuild).
+    #[tokio::test]
+    async fn test_incremental_after_full_rebuild_stays_visible() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+        let db_path = graph_lance_path(repo_root);
+
+        // Full rebuild with fn_base.
+        persist_graph_to_lance(repo_root, &[make_test_node("fn_base")], &[])
+            .await
+            .expect("full rebuild");
+        assert_eq!(read_committed_scan_version(&db_path), 1);
+
+        // Incremental write: adds fn_incremental with scan_version = 1 (committed).
+        persist_graph_incremental(repo_root, &[make_test_node("fn_incremental")], &[], &[], &[])
+            .await
+            .expect("incremental write");
+        // Version pointer must NOT change after incremental write.
+        assert_eq!(read_committed_scan_version(&db_path), 1, "incremental must not change version pointer");
+
+        // Load: must return both fn_base and fn_incremental (both at version 1).
+        let state = load_graph_from_lance(repo_root).await.expect("load after incremental");
+        let names: Vec<&str> = state.nodes.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"fn_base"), "fn_base should be present");
+        assert!(names.contains(&"fn_incremental"), "fn_incremental should be present");
+
+        // Second full rebuild — version 2. fn_incremental should vanish (was at version 1).
+        persist_graph_to_lance(repo_root, &[make_test_node("fn_v2")], &[])
+            .await
+            .expect("second full rebuild");
+        assert_eq!(read_committed_scan_version(&db_path), 2);
+
+        let state2 = load_graph_from_lance(repo_root).await.expect("load after second rebuild");
+        let names2: Vec<&str> = state2.nodes.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names2.contains(&"fn_v2"), "fn_v2 should be present");
+        assert!(!names2.contains(&"fn_incremental"), "fn_incremental (version 1) should not appear after version 2 rebuild");
+    }
+
+    /// If the version pointer file is absent, `load_graph_from_lance` falls back to
+    /// loading ALL rows (legacy compatibility). Ensure no filter is applied.
+    #[tokio::test]
+    async fn test_load_without_version_file_loads_all_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+        let db_path = graph_lance_path(repo_root);
+
+        // Write rows with scan_version = 1.
+        persist_graph_to_lance(repo_root, &[make_test_node("fn_any")], &[])
+            .await
+            .expect("full rebuild");
+
+        // Remove the version pointer file (simulates legacy LanceDB data).
+        let _ = std::fs::remove_file(scan_version_path(&db_path));
+        assert_eq!(read_committed_scan_version(&db_path), 0, "missing file should read as 0");
+
+        // Load with committed_version=0 → no filter → must see fn_any.
+        let state = load_graph_from_lance(repo_root).await.expect("load without version file");
+        let names: Vec<&str> = state.nodes.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"fn_any"), "fn_any should be visible with no version filter");
+    }
 }
