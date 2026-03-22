@@ -28,14 +28,16 @@
 //!
 //! # Generated file detection
 //!
-//! Only function nodes in files whose name contains `sdk.gen`, `.generated.`, `_generated`,
-//! or `generated_client` are considered. This avoids false positives from non-generated
+//! Only function nodes in files whose name contains `sdk.gen`, `.generated.`, `_generated.ts`,
+//! `_generated.js`, `generated_client`, or `openapi_client` are considered. This avoids false positives from non-generated
 //! functions that happen to share a name with an operation.
 //!
 //! # Edge direction
 //!
-//! `Implements` edge from SDK Function → ApiEndpoint. This follows the existing convention
-//! in `api_link.rs` where concrete code points at the spec/contract node.
+//! `Implements` edge from SDK Function → ApiEndpoint. The SDK function is the generated
+//! implementation of the spec operation — analogous to how LSP emits `Implements` from
+//! a concrete type to its supertype. (`api_link.rs` uses `DependsOn` for URL-literal →
+//! ApiEndpoint links, which is a weaker, reference-only relationship.)
 
 use std::collections::HashMap;
 
@@ -138,7 +140,7 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
                     from: node.id.clone(),
                     to: ep_id.clone(),
                     kind: EdgeKind::Implements,
-                    source: ExtractionSource::Schema,
+                    source: ExtractionSource::TreeSitter,
                     confidence: Confidence::Detected,
                 });
             }
