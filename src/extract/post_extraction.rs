@@ -574,4 +574,60 @@ mod tests {
             "passes are idempotent when dedup runs between calls"
         );
     }
+
+    /// Adversarial: a gated pass registered BEFORE framework detection must NOT
+    /// run (its `applies_when` sees an empty framework set). This verifies the
+    /// ordering invariant documented in `with_builtins`.
+    #[test]
+    fn test_gated_pass_before_framework_detection_is_skipped() {
+        struct EarlyGatedPass { ran: std::sync::Arc<std::sync::atomic::AtomicBool> }
+        impl PostExtractionPass for EarlyGatedPass {
+            fn name(&self) -> &str { "early_gated" }
+            fn applies_when(&self, detected_frameworks: &HashSet<String>) -> bool {
+                detected_frameworks.contains("my-framework")
+            }
+            fn run(&self, _n: &mut Vec<Node>, _e: &mut Vec<crate::graph::Edge>, _c: &PassContext) -> PassResult {
+                self.ran.store(true, std::sync::atomic::Ordering::Relaxed);
+                PassResult::empty()
+            }
+        }
+        struct FwEmit;
+        impl PostExtractionPass for FwEmit {
+            fn name(&self) -> &str { "fw_emit" }
+            fn run(&self, _n: &mut Vec<Node>, _e: &mut Vec<crate::graph::Edge>, _c: &PassContext) -> PassResult {
+                let mut fw = HashSet::new();
+                fw.insert("my-framework".to_string());
+                PassResult { detected_frameworks: fw }
+            }
+        }
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut reg = PostExtractionRegistry::new();
+        // Wrong order: gated pass registered BEFORE fw detection
+        reg.register(Box::new(EarlyGatedPass { ran: ran.clone() }));
+        reg.register(Box::new(FwEmit));
+
+        let mut nodes: Vec<Node> = vec![];
+        let mut edges: Vec<crate::graph::Edge> = vec![];
+        reg.run_all(&mut nodes, &mut edges, empty_ctx());
+
+        // The gated pass should NOT have run — it was registered before FwEmit
+        // so its applies_when saw an empty detected_frameworks set.
+        assert!(!ran.load(std::sync::atomic::Ordering::Relaxed),
+            "gated pass must not run when ordered before framework detection");
+    }
+
+    /// Adversarial: registry must not panic on passes that return empty results.
+    #[test]
+    fn test_registry_handles_all_passes_noop() {
+        let reg = PostExtractionRegistry::with_builtins();
+        // Single node that produces zero pass output (no imports, no test files, etc.)
+        let node = make_node("root", "src/main.rs", "main", NodeKind::Function, "rust");
+        let mut nodes = vec![node];
+        let mut edges: Vec<crate::graph::Edge> = vec![];
+        // Should not panic even when all passes return empty
+        let result = reg.run_all(&mut nodes, &mut edges, empty_ctx());
+        // No frameworks detected from a plain Function node with no imports
+        assert!(result.detected_frameworks.is_empty());
+    }
 }
