@@ -173,6 +173,25 @@ Each repo is a tenant. `tenant_id` = root slug. Multiple repos scanning simultan
 | Upsert delta assembled manually (#474) | Consumers emit deltas as part of their `on_event` return |
 | Multi-repo requires separate servers | Singleton consumers accept events from any agent |
 
+## Audit Passes (required after each phase)
+
+After each implementation phase, an audit agent must verify the architectural constraints are upheld. These are not optional:
+
+### Constraint 1: No consumer knows about other consumers
+**Audit:** `grep -r "PostExtractionRegistry\|EventBus\|run_consumers" src/extract/` must return 0 results. Consumers live in `src/extract/` and must not import from `src/server/graph.rs` or each other.
+
+### Constraint 2: Static registration only
+**Audit:** No `register()` or `subscribe()` calls inside `on_event()` or any event handler. Registration happens only at startup in `main.rs` or the pipeline bootstrap. `grep -n "bus.register\|registry.add" src/` must show only startup-time call sites.
+
+### Constraint 3: Zero broker-specific knowledge in RNA core
+**Audit:** `grep -r "kafka\|pubsub\|rabbitmq\|redis.*publish\|google.cloud" src/` must return 0 results. All broker-specific patterns live in `.oh/extractors/*.toml` config files.
+
+### Constraint 4: All paths go through the same consumer registry
+**Audit:** The background scanner and foreground pipeline both call the same `run_consumers()` function. No pass is invoked directly outside the registry. `grep -r "api_link_pass\|tested_by_pass\|import_calls_pass" src/server/` must return 0 results after #479 lands.
+
+### Constraint 5: Performance gate
+**Audit:** `time repo-native-alignment scan --repo . --full` must complete in < 120s on the main RNA repo with no active agent worktrees.
+
 ## References
 
 - `src/server/graph.rs` — current `build_full_graph_inner` (to be replaced by event flow)
