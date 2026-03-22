@@ -52,14 +52,31 @@ use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
 /// `import_pattern` is checked against the Import node's `id.name` (case-insensitive).
 #[derive(Debug, Clone, Deserialize)]
 pub struct FrameworkRule {
-    /// Substring to look for in the import text.
+    /// Substring to look for in the import text (original case from TOML).
     pub import_pattern: String,
+    /// Pre-lowercased form of `import_pattern`. Populated after parsing via
+    /// `normalize_rules()`; skipped by serde (never in TOML).
+    /// Eliminates per-comparison String allocations during matching.
+    #[serde(skip)]
+    pub import_pattern_lower: String,
     /// Language(s) this rule applies to (empty string = all languages).
     pub language: String,
     /// Stable framework ID (e.g., "fastapi", "nextjs-app-router").
     pub framework_id: String,
     /// Human-readable display name.
     pub display_name: String,
+}
+
+/// Populate the `import_pattern_lower` field on each rule.
+/// Called once after parsing (in `builtin_rules()`) and after user rule loading.
+fn normalize_rules(rules: Vec<FrameworkRule>) -> Vec<FrameworkRule> {
+    rules
+        .into_iter()
+        .map(|mut r| {
+            r.import_pattern_lower = r.import_pattern.to_lowercase();
+            r
+        })
+        .collect()
 }
 
 /// Top-level shape of a framework rules TOML file.
@@ -82,7 +99,7 @@ static BUILTIN_RULES: OnceLock<Vec<FrameworkRule>> = OnceLock::new();
 fn builtin_rules() -> &'static [FrameworkRule] {
     BUILTIN_RULES.get_or_init(|| {
         match toml::from_str::<FrameworkRulesFile>(BUILTIN_RULES_SOURCE) {
-            Ok(file) => file.rules,
+            Ok(file) => normalize_rules(file.rules),
             Err(e) => {
                 // The embedded TOML is compile-time data — a parse failure is a
                 // programming error, not a runtime condition.
@@ -120,7 +137,7 @@ fn load_user_rules(root_path: &Path) -> Vec<FrameworkRule> {
                         file.rules.len(),
                         path.display()
                     );
-                    rules.extend(file.rules);
+                    rules.extend(normalize_rules(file.rules));
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -135,6 +152,25 @@ fn load_user_rules(root_path: &Path) -> Vec<FrameworkRule> {
         }
     }
     rules
+}
+
+/// Returns merged rules (built-in + optional user rules from `.oh/extractors/`).
+///
+/// Returns `Cow::Borrowed` (zero allocation) when there are no user rules,
+/// and `Cow::Owned` only when user rules are present.
+fn merged_rules(root_path: Option<&Path>) -> std::borrow::Cow<'static, [FrameworkRule]> {
+    if let Some(path) = root_path {
+        let user_rules = load_user_rules(path);
+        if user_rules.is_empty() {
+            std::borrow::Cow::Borrowed(builtin_rules())
+        } else {
+            let mut merged = builtin_rules().to_vec();
+            merged.extend(user_rules);
+            std::borrow::Cow::Owned(merged)
+        }
+    } else {
+        std::borrow::Cow::Borrowed(builtin_rules())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -176,21 +212,7 @@ pub fn framework_detection_pass(
     root_id: &str,
     root_path: Option<&Path>,
 ) -> FrameworkDetectionResult {
-    // Merge built-in + user rules into a local Vec.
-    // builtin_rules() returns a &'static slice; if there are no user rules we
-    // iterate it directly via combined (which is just a re-export as a Vec).
-    let combined: std::borrow::Cow<'static, [FrameworkRule]> = if let Some(path) = root_path {
-        let user_rules = load_user_rules(path);
-        if user_rules.is_empty() {
-            std::borrow::Cow::Borrowed(builtin_rules())
-        } else {
-            let mut merged = builtin_rules().to_vec();
-            merged.extend(user_rules);
-            std::borrow::Cow::Owned(merged)
-        }
-    } else {
-        std::borrow::Cow::Borrowed(builtin_rules())
-    };
+    let combined = merged_rules(root_path);
     let rules: &[FrameworkRule] = &combined;
 
     let mut detected: HashSet<String> = HashSet::new();
@@ -212,8 +234,8 @@ pub fn framework_detection_pass(
             if !rule.language.is_empty() && rule.language != language {
                 continue;
             }
-            let pattern = rule.import_pattern.to_lowercase();
-            if import_text.contains(pattern.as_str()) {
+            // Use pre-lowercased pattern to avoid per-comparison allocations.
+            if import_text.contains(rule.import_pattern_lower.as_str()) {
                 detected.insert(rule.framework_id.clone());
             }
         }
@@ -302,19 +324,7 @@ pub fn subsystem_framework_aggregation_pass(
     use std::collections::HashMap;
     use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource};
 
-    // Load rules (same merge logic as detection pass).
-    let combined: std::borrow::Cow<'static, [FrameworkRule]> = if let Some(path) = root_path {
-        let user_rules = load_user_rules(path);
-        if user_rules.is_empty() {
-            std::borrow::Cow::Borrowed(builtin_rules())
-        } else {
-            let mut merged = builtin_rules().to_vec();
-            merged.extend(user_rules);
-            std::borrow::Cow::Owned(merged)
-        }
-    } else {
-        std::borrow::Cow::Borrowed(builtin_rules())
-    };
+    let combined = merged_rules(root_path);
     let rules: &[FrameworkRule] = &combined;
 
     // Build (member_stable_id → subsystem_name) from node metadata.
@@ -337,8 +347,8 @@ pub fn subsystem_framework_aggregation_pass(
             if !rule.language.is_empty() && rule.language != language {
                 continue;
             }
-            let pattern = rule.import_pattern.to_lowercase();
-            if import_text.contains(pattern.as_str()) {
+            // Use pre-lowercased pattern to avoid per-comparison allocations.
+            if import_text.contains(rule.import_pattern_lower.as_str()) {
                 file_frameworks
                     .entry(node.id.file.display().to_string())
                     .or_default()
