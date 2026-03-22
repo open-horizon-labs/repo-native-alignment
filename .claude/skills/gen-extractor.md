@@ -12,7 +12,7 @@ Generate `.oh/extractors/*.toml` config files that teach RNA to detect `Produces
 
 ## Usage
 
-```
+```text
 /gen-extractor "detect Google Pub/Sub in Python — publisher.publish(topic_path) and subscriber.subscribe(subscription_path, callback)"
 /gen-extractor "detect Redis pub/sub in Python — r.publish(channel, message) and r.subscribe(channel)"
 /gen-extractor "detect RabbitMQ in Python — channel.basic_publish(exchange='', routing_key=topic, body=msg)"
@@ -159,7 +159,7 @@ Messaging libraries to flag: Pub/Sub systems (Google Pub/Sub, AWS SNS/SQS, Azure
 
 For each uncovered messaging framework found:
 
-```
+```text
 Framework detected: redis (python)
 No extractor coverage found.
 Common Redis pub/sub patterns:
@@ -179,7 +179,7 @@ If the user confirms, generate and validate the config (Steps 4-6 from the descr
 ### Example 1: Google Pub/Sub (Python)
 
 Input:
-```
+```text
 /gen-extractor "detect Google Pub/Sub in Python — publisher.publish(topic_path, data) and subscriber.subscribe(subscription_path, callback)"
 ```
 
@@ -203,7 +203,7 @@ edge_kind = "Consumes"
 ### Example 2: Redis pub/sub (Python)
 
 Input:
-```
+```text
 /gen-extractor "detect Redis pub/sub in Python — r.publish(channel, message) produces, pubsub.subscribe(channel) consumes"
 ```
 
@@ -227,7 +227,7 @@ edge_kind = "Consumes"
 ### Example 3: Internal event bus (Python)
 
 Input:
-```
+```text
 /gen-extractor "detect our internal event bus — bus.publish('EventName', payload) produces, @bus.subscribe('EventName') consumes — imports src.events.bus"
 ```
 
