@@ -637,6 +637,23 @@ impl RnaHandler {
             }
         }
 
+        // 4e-pre. Import-calls pass: emit Calls edges for cross-file function
+        //         calls resolved through import declarations.  Runs after all
+        //         nodes are merged so that both caller and callee are visible.
+        //         Covers TypeScript/JavaScript ES6 imports, Python from-imports,
+        //         and Rust use declarations.  Same-file calls are already handled
+        //         by the tree-sitter call detection inside extract_scan_result.
+        {
+            let import_call_edges = crate::extract::import_calls::import_calls_pass(&all_nodes);
+            if !import_call_edges.is_empty() {
+                tracing::info!(
+                    "Import-calls pass: {} cross-file Calls edge(s) via import resolution",
+                    import_call_edges.len()
+                );
+                all_edges.extend(import_call_edges);
+            }
+        }
+
         // 4e. Directory-module pass: emit BelongsTo edges from every symbol to
         //     a virtual NodeKind::Module node derived from its directory path.
         //     Runs unconditionally for all languages — no LSP required.
@@ -1099,6 +1116,22 @@ impl RnaHandler {
                 // Include in upsert delta so these edges are persisted to LanceDB.
                 upsert_edges.extend(tested_by_edges.iter().cloned());
                 graph.edges.extend(tested_by_edges);
+            }
+        }
+
+        // Re-run import-calls pass over the full node set so that cross-file
+        // Calls edges are always present after an incremental scan.  Include in
+        // upsert delta so edges are persisted to LanceDB.
+        {
+            let import_call_edges =
+                crate::extract::import_calls::import_calls_pass(&graph.nodes);
+            if !import_call_edges.is_empty() {
+                tracing::info!(
+                    "Import-calls pass (incremental): {} cross-file Calls edge(s)",
+                    import_call_edges.len()
+                );
+                upsert_edges.extend(import_call_edges.iter().cloned());
+                graph.edges.extend(import_call_edges);
             }
         }
 
