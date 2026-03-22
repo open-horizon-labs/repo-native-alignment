@@ -174,7 +174,7 @@ Run the actual feature with real data. Not unit tests — real queries, real fil
 **Performance gate (required for any PR that adds or modifies a post-extraction pass):**
 Run a full scan of the RNA repo before and after and compare times:
 ```bash
-time repo-native-alignment scan --repo /Users/muness/src/open-horizon-labs/repo-native-alignment --full
+time repo-native-alignment scan --repo . --full
 ```
 If scan time increases by more than 10%, the pass must be optimized before merging. Do NOT declare "done" without this check. Common failure patterns:
 - O(nodes × patterns) loops — must pre-index and use O(1) HashSet lookups
