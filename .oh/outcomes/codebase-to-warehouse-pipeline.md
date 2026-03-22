@@ -12,11 +12,29 @@ changes) and write them to a data warehouse alongside business metrics (DAU, rev
 latency, error rates). Make "did this PR cause a crash in business metrics?" trivially
 answerable.
 
-## The pain today
+## The gap
 
-Engineers ship a PR. Three days later, a business metric crashes. Nobody knows which
-PR caused it. The post-mortem is manual archaeology: grep logs, correlate timestamps,
-re-read every commit. This is slow, error-prone, and often abandoned.
+Business metrics (DAU, revenue, error rates) are well-served by existing analytics
+tools. The missing piece is **code artifact extraction**: structured, queryable signals
+about what changed in the codebase — which subsystem, what kind of change, which
+functions, which API surface.
+
+Today this extraction is not feasible. There is no tool that produces:
+```
+{
+  pr_id: 483,
+  merged_at: "2026-03-22T04:01",
+  subsystems_touched: ["payments", "auth"],
+  change_type: "fix",
+  functions_changed: ["process_payment", "validate_session"],
+  api_endpoints_changed: ["POST /payments"],
+  complexity_delta: -12
+}
+```
+
+...as a structured row that a data warehouse can JOIN against business metrics.
+Engineers launch features and wait weeks to find out if they worked — not because
+the analytics pipeline is slow, but because the **code side of the join doesn't exist**.
 
 ## The insight
 
