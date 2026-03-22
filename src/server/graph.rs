@@ -796,16 +796,23 @@ impl RnaHandler {
         // Persisting here would write only tree-sitter edges, and a subsequent
         // `repo-map` loading from LanceDB cache would miss LSP edges (#311).
         if spawn_background {
+            // Clear the LSP sentinel before making the new extraction-only graph durable.
+            // The previous sentinel describes the OLD graph (with old LSP edges). After this
+            // persist, LanceDB contains a fresh tree-sitter-only snapshot; if the process
+            // exits before background LSP enrichment writes a new sentinel, the next startup
+            // must not trust the old sentinel and skip re-enrichment for the new graph (#477).
+            super::sentinel::clear_lsp_sentinel(&self.repo_root);
+
             let _lance_guard = self.lance_write_lock.lock().await;
             if let Err(e) = persist_graph_to_lance(&self.repo_root, &all_nodes, &all_edges).await {
                 tracing::error!("Failed to persist graph to LanceDB: {}", e);
                 return Err(e.context("LanceDB full persist failed during graph build"));
             }
-            drop(_lance_guard);
 
-            // Write extraction sentinel now that extraction + persist succeeded.
-            // The LSP sentinel is written later by the background LSP enrichment task.
+            // Write extraction sentinel inside the lock so another writer cannot race
+            // between the persist and the sentinel write (#477 CodeRabbit critical).
             super::sentinel::write_extract_sentinel(&self.repo_root, all_nodes.len(), all_edges.len());
+            drop(_lance_guard);
 
             // Post-persist sanity check: if any new roots were detected, verify they
             // actually made it into LanceDB. A mismatch here indicates a partial write

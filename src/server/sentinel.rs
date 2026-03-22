@@ -101,32 +101,54 @@ pub fn read_lsp_sentinel(repo_root: &Path) -> Option<SentinelData> {
 /// Delete both sentinels. Called when a full rebuild is triggered (schema migration,
 /// extraction version bump, or explicit `--full` with cache invalidation).
 pub fn clear_sentinels(repo_root: &Path) {
-    for (path, name) in [
-        (extract_sentinel_path(repo_root), "extract"),
-        (lsp_sentinel_path(repo_root), "lsp"),
-    ] {
-        if path.exists() {
-            if let Err(e) = std::fs::remove_file(&path) {
-                tracing::warn!("Failed to clear {} sentinel: {}", name, e);
-            } else {
-                tracing::debug!("Cleared {} sentinel", name);
-            }
+    clear_sentinel(&extract_sentinel_path(repo_root), "extract");
+    clear_sentinel(&lsp_sentinel_path(repo_root), "lsp");
+}
+
+/// Delete only the LSP sentinel. Called before an extraction-only persist so the
+/// old LSP sentinel (describing the previous graph) cannot be trusted by the next
+/// startup when LanceDB now holds a fresh tree-sitter-only snapshot.
+pub fn clear_lsp_sentinel(repo_root: &Path) {
+    clear_sentinel(&lsp_sentinel_path(repo_root), "lsp");
+}
+
+fn clear_sentinel(path: &Path, name: &str) {
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(path) {
+            tracing::warn!("Failed to clear {} sentinel: {}", name, e);
+        } else {
+            tracing::debug!("Cleared {} sentinel", name);
         }
     }
 }
 
 fn write_sentinel(path: &Path, data: &SentinelData, name: &str) {
     // Ensure parent directory exists.
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            tracing::warn!("Failed to create sentinel directory for {}: {}", name, e);
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => {
+            tracing::warn!("Sentinel path {} has no parent directory", path.display());
             return;
         }
+    };
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        tracing::warn!("Failed to create sentinel directory for {}: {}", name, e);
+        return;
     }
+
+    // Use a temp file + atomic rename so readers never observe a partial write.
+    // If the process crashes between write and rename, the previous sentinel survives.
+    let tmp_path = path.with_extension("tmp");
     match serde_json::to_string_pretty(data) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(path, json) {
-                tracing::warn!("Failed to write {} sentinel: {}", name, e);
+            if let Err(e) = std::fs::write(&tmp_path, &json) {
+                tracing::warn!("Failed to write {} sentinel temp file: {}", name, e);
+                return;
+            }
+            if let Err(e) = std::fs::rename(&tmp_path, path) {
+                tracing::warn!("Failed to rename {} sentinel into place: {}", name, e);
+                // Best effort: remove the temp file so it doesn't clutter the cache.
+                let _ = std::fs::remove_file(&tmp_path);
             } else {
                 tracing::debug!(
                     "Wrote {} sentinel: {} nodes, {} edges",
