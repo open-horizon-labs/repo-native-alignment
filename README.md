@@ -29,6 +29,13 @@ Local context discovery and alignment tool for coding agents. Makes the fractal,
 - "Full call chain from /payments to database?" → `search("POST /payments", mode="impact")` → ApiEndpoint → handler → domain functions → storage
 - Supports Python Flask/FastAPI, TypeScript NestJS, Java Spring, Go gin/echo, Ruby Sinatra/Rails — no LSP required
 
+### Trace gRPC client stubs to proto definitions
+
+- "What clients call the UserService.GetUser RPC?" → `search("GetUser", mode="neighbors", direction="incoming")` → Python/Go/TypeScript/Java stub callers → proto method node
+- "What proto methods does this Python service call?" → `search(file="client.py", edge_types=["calls"])` → stub call sites linked to `.proto` definitions
+- "Full gRPC call chain?" → `search("GetUser", mode="impact")` → client stub → proto method → server implementation
+- Supports Python (`_pb2_grpc`), Go (`google.golang.org/grpc`), TypeScript (`@grpc/`), Java (`io.grpc`) — no LSP required
+
 ### See the blast radius of a change
 
 - "What depends on the database connection pool?" → `search(query="database connection pool", mode="impact")` → transitive dependents grouped by subsystem with entry points; auto-summarized when large
