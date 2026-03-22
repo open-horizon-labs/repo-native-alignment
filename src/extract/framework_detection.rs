@@ -86,7 +86,12 @@ static FRAMEWORK_RULES: &[FrameworkRule] = &[
     // Next.js — must check 'next/server', 'next/router', etc. before generic 'react'
     FrameworkRule { import_pattern: "next/", language: "typescript", framework_id: "nextjs-app-router", display_name: "Next.js" },
     FrameworkRule { import_pattern: "next/", language: "javascript", framework_id: "nextjs-app-router", display_name: "Next.js" },
+    // Bare `import "next"` / `import 'next'` — support both quote styles in both
+    // languages because TypeScript and JavaScript projects freely mix single/double
+    // quotes depending on their formatter config.
     FrameworkRule { import_pattern: "\"next\"", language: "typescript", framework_id: "nextjs-app-router", display_name: "Next.js" },
+    FrameworkRule { import_pattern: "'next'", language: "typescript", framework_id: "nextjs-app-router", display_name: "Next.js" },
+    FrameworkRule { import_pattern: "\"next\"", language: "javascript", framework_id: "nextjs-app-router", display_name: "Next.js" },
     FrameworkRule { import_pattern: "'next'", language: "javascript", framework_id: "nextjs-app-router", display_name: "Next.js" },
     // React (after Next.js to avoid clobbering)
     FrameworkRule { import_pattern: "react", language: "typescript", framework_id: "react", display_name: "React" },
@@ -333,8 +338,10 @@ pub fn subsystem_framework_aggregation_pass(all_nodes: &[Node]) -> Vec<crate::gr
     // 2. Collect (member stable_id → file) from all non-subsystem nodes.
     // 3. For each subsystem, count members' files → frameworks.
 
-    // Step 1: file → set of frameworks detected in that file.
-    let mut file_frameworks: HashMap<String, HashSet<String>> = HashMap::new();
+    // Step 1: (root, file) → set of frameworks detected in that file.
+    // The key includes root so that two workspace roots with the same relative
+    // file path (e.g. both have `src/main.ts`) don't merge their import data.
+    let mut file_frameworks: HashMap<(String, String), HashSet<String>> = HashMap::new();
     for node in all_nodes {
         if node.id.kind != NodeKind::Import {
             continue;
@@ -351,7 +358,7 @@ pub fn subsystem_framework_aggregation_pass(all_nodes: &[Node]) -> Vec<crate::gr
             let pattern = rule.import_pattern.to_lowercase();
             if import_text.contains(pattern.as_str()) {
                 file_frameworks
-                    .entry(node.id.file.display().to_string())
+                    .entry((node.id.root.clone(), node.id.file.display().to_string()))
                     .or_default()
                     .insert(rule.framework_id.to_string());
             }
@@ -395,7 +402,7 @@ pub fn subsystem_framework_aggregation_pass(all_nodes: &[Node]) -> Vec<crate::gr
         let sid = node.stable_id();
         if let Some(sub_name) = member_to_subsystem.get(&sid) {
             *subsystem_member_counts.entry(sub_name.clone()).or_default() += 1;
-            let file_key = node.id.file.display().to_string();
+            let file_key = (node.id.root.clone(), node.id.file.display().to_string());
             if let Some(frameworks) = file_frameworks.get(&file_key) {
                 let sub_entry = subsystem_framework_counts
                     .entry(sub_name.clone())

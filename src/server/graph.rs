@@ -1056,6 +1056,9 @@ impl RnaHandler {
 
         // Re-run all post-extraction passes via EventBus (ADR Phase 2b, issue #502).
         // Include all roots for passes that need filesystem access (manifest, nextjs_routing).
+        // lsp_only roots are intentionally included: nextjs_routing_pass emits ApiEndpoint
+        // nodes for lsp_only subdirectory roots so agents can see what routes exist even
+        // when tree-sitter extraction was skipped for those roots.
         let root_pairs_incremental: Vec<(String, std::path::PathBuf)> = WorkspaceConfig::load()
             .with_primary_root(self.repo_root.clone())
             .with_worktrees(&self.repo_root)
