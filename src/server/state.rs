@@ -1,5 +1,7 @@
 //! Graph state and LSP enrichment status types.
 
+use std::collections::HashSet;
+
 use crate::graph::{Node, Edge};
 use crate::graph::index::GraphIndex;
 
@@ -16,6 +18,26 @@ pub struct GraphState {
     /// Timestamp of the last completed scan (full or incremental).
     /// `None` until the first scan finishes.
     pub last_scan_completed_at: Option<std::time::Instant>,
+    /// Set of framework IDs detected in this workspace (populated by framework_detection_pass).
+    /// Used to gate conditional extractors (pub/sub, SSE/WebSocket, gRPC, etc.) so they
+    /// only run when their target framework is present. Empty until the first scan completes.
+    pub detected_frameworks: HashSet<String>,
+}
+
+impl GraphState {
+    /// Check whether a given framework was detected in this workspace.
+    ///
+    /// Framework IDs use kebab-case: "fastapi", "kafkajs", "nextjs-app-router", etc.
+    ///
+    /// # Example
+    /// ```ignore
+    /// if graph.has_framework("kafkajs") || graph.has_framework("kafka-python") {
+    ///     // run pub/sub extractor
+    /// }
+    /// ```
+    pub fn has_framework(&self, framework_id: &str) -> bool {
+        self.detected_frameworks.contains(framework_id)
+    }
 }
 
 impl GraphState {
@@ -860,7 +882,7 @@ mod tests {
         for n in &nodes {
             index.ensure_node(&n.stable_id(), &n.id.kind.to_string());
         }
-        GraphState { nodes, edges: vec![], index, last_scan_completed_at: None }
+        GraphState { nodes, edges: vec![], index, last_scan_completed_at: None, detected_frameworks: std::collections::HashSet::new() }
     }
 
     #[test]

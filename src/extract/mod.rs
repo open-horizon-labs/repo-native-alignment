@@ -9,6 +9,7 @@
 
 pub mod api_link;
 pub mod directory_module;
+pub mod framework_detection;
 pub mod manifest;
 pub mod naming_convention;
 pub mod nextjs_routing;

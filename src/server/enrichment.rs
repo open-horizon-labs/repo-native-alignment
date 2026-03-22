@@ -1365,6 +1365,7 @@ impl RnaHandler {
                     idx
                 },
                 last_scan_completed_at: graph_state.last_scan_completed_at,
+                detected_frameworks: graph_state.detected_frameworks.clone(),
             });
         }
 

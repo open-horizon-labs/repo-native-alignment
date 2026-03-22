@@ -1585,6 +1585,7 @@ async fn run_impact_output_size_check(index: &GraphIndex, nodes: &[Node]) -> Che
         edges: Vec::new(),
         index: index.clone(),
         last_scan_completed_at: None,
+        detected_frameworks: std::collections::HashSet::new(),
     };
 
     let ctx = crate::service::SearchContext {
@@ -1691,6 +1692,7 @@ fn run_short_id_resolution_check(_index: &GraphIndex, _nodes: &[Node]) -> Check 
         edges: Vec::new(),
         index,
         last_scan_completed_at: None,
+        detected_frameworks: std::collections::HashSet::new(),
     };
 
     // Strip the root prefix to get the short ID

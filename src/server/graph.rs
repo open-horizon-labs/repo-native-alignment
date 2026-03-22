@@ -9,6 +9,7 @@ pub(crate) const SUBSYSTEM_KEY: &str = "subsystem";
 
 use crate::embed::EmbeddingIndex;
 use crate::extract::ExtractorRegistry;
+use crate::extract::framework_detection::framework_detection_pass;
 use crate::extract::subsystem_pass::subsystem_node_pass;
 use crate::graph::{Edge, Node, NodeKind};
 use crate::graph::index::GraphIndex;
@@ -384,6 +385,8 @@ impl RnaHandler {
         let registry = ExtractorRegistry::with_builtins();
         let mut all_nodes: Vec<Node> = Vec::new();
         let mut all_edges: Vec<Edge> = Vec::new();
+        // Populated by framework detection pass (step 4f).
+        let all_detected_frameworks: std::collections::HashSet<String>;
 
         // Try loading cached graph for clean-root reuse.
         let cached_graph = match load_graph_from_lance(&self.repo_root).await {
@@ -687,6 +690,22 @@ impl RnaHandler {
             }
         }
 
+        // 4f. Framework detection pass: scan Import nodes, detect frameworks,
+        // emit NodeKind::Other("framework") nodes. Must run before conditional
+        // extractors (pub/sub, SSE, gRPC) so they can gate on detected frameworks.
+        {
+            let primary_slug = crate::roots::RootConfig::code_project(self.repo_root.clone()).slug();
+            let fw_result = framework_detection_pass(&all_nodes, &primary_slug);
+            if !fw_result.nodes.is_empty() {
+                all_nodes.extend(fw_result.nodes);
+                // detected_frameworks stored in GraphState after full build
+                // (passed to GraphState constructor below via a local)
+            }
+            // Store detected frameworks for GraphState (used by incremental path too).
+            // We collect here and pass into the Ok(GraphState { ... }) below.
+            all_detected_frameworks = fw_result.detected_frameworks;
+        }
+
         // 5. Build petgraph index
         let mut index = GraphIndex::new();
         index.rebuild_from_edges(&all_edges);
@@ -785,6 +804,19 @@ impl RnaHandler {
                 all_nodes.extend(sub_result.nodes);
                 all_edges.extend(sub_result.edges);
             }
+
+            // 6d. Subsystem → framework aggregation: emit UsesFramework edges
+            // from subsystem nodes to framework nodes (when ≥70% of members share a framework).
+            // Graceful: no-op if no subsystem nodes or no framework nodes exist.
+            let subsystem_fw_edges =
+                crate::extract::framework_detection::subsystem_framework_aggregation_pass(&all_nodes);
+            if !subsystem_fw_edges.is_empty() {
+                tracing::info!(
+                    "Subsystem-framework aggregation: {} UsesFramework edge(s)",
+                    subsystem_fw_edges.len()
+                );
+                all_edges.extend(subsystem_fw_edges);
+            }
         }
 
         // 7. Persist graph to LanceDB
@@ -877,6 +909,7 @@ impl RnaHandler {
             edges: all_edges,
             index,
             last_scan_completed_at: Some(symbols_ready_at),
+            detected_frameworks: all_detected_frameworks,
         })
     }
 
@@ -928,7 +961,7 @@ impl RnaHandler {
         let registry = ExtractorRegistry::with_builtins();
 
         // Remove nodes/edges for deleted + changed files
-        let files_to_remove: Vec<PathBuf> = scan
+        let mut files_to_remove: Vec<PathBuf> = scan
             .deleted_files
             .iter()
             .chain(scan.changed_files.iter())
@@ -1100,13 +1133,40 @@ impl RnaHandler {
             }
         }
 
-        // Pre-clean: remove stale subsystem first-class nodes and their BelongsTo edges
-        // from the previous scan BEFORE dedup/index/PageRank. This ensures that
-        // detect_communities() (which uses the petgraph index) only sees real code symbols,
-        // not previously-emitted virtual subsystem nodes — preventing inflated PageRank and
-        // spurious community membership for virtual nodes.
-        graph.nodes.retain(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "subsystem"));
-        graph.edges.retain(|e| !matches!(&e.to.kind, NodeKind::Other(s) if s == "subsystem"));
+        // Pre-clean: remove stale virtual nodes (subsystem + framework) and their
+        // BelongsTo/UsesFramework edges BEFORE dedup/index/PageRank. This ensures
+        // detect_communities() only sees real code symbols.
+        // Collect virtual file paths for LanceDB deletion — these will be added to
+        // files_to_remove so the old rows are removed from LanceDB on persist.
+        let stale_virtual_files: Vec<std::path::PathBuf> = graph
+            .nodes
+            .iter()
+            .filter(|n| {
+                matches!(&n.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework"))
+            })
+            .map(|n| n.id.file.clone())
+            .collect();
+        graph.nodes.retain(|n| !matches!(&n.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework")));
+        graph.edges.retain(|e| {
+            !matches!(&e.to.kind, NodeKind::Other(s) if s == "subsystem")
+                && e.kind != crate::graph::EdgeKind::UsesFramework
+        });
+        // Schedule stale virtual file paths for LanceDB deletion so they won't
+        // reappear on reload. The fresh nodes (re-emitted later) will be upserted.
+        files_to_remove.extend(stale_virtual_files);
+
+        // Framework detection pass (incremental): re-scan all Import nodes and
+        // refresh framework nodes + detected_frameworks set.
+        {
+            let fw_result = framework_detection_pass(&graph.nodes, &primary_slug);
+            if !fw_result.nodes.is_empty() {
+                for node in &fw_result.nodes {
+                    upsert_node_ids.insert(node.stable_id());
+                }
+                graph.nodes.extend(fw_result.nodes);
+            }
+            graph.detected_frameworks = fw_result.detected_frameworks;
+        }
 
         // Deduplicate graph.nodes and graph.edges in-place before rebuilding the
         // petgraph index.  Post-extraction passes (api_link, manifest, tested_by,
@@ -1237,6 +1297,14 @@ impl RnaHandler {
                 }
                 graph.nodes.extend(sub_result.nodes);
                 graph.edges.extend(sub_result.edges);
+            }
+
+            // Subsystem → framework aggregation (incremental): emit UsesFramework edges.
+            let sub_fw_edges =
+                crate::extract::framework_detection::subsystem_framework_aggregation_pass(&graph.nodes);
+            if !sub_fw_edges.is_empty() {
+                upsert_edges.extend(sub_fw_edges.iter().cloned());
+                graph.edges.extend(sub_fw_edges);
             }
         }
 
