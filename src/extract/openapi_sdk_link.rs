@@ -75,6 +75,7 @@ pub fn normalize_operation_id(id: &str) -> String {
 /// - `api_generated.py` / `client_generated.ts` / `_generated.go` (contains `_generated.`)
 /// - `generated_client.ts` / `generated_client.py`
 /// - `openapi_client.ts` / `openapi_client.py`
+/// - `api_client.py` / `api_client.go` (starts with `api_client.`)
 fn is_generated_sdk_file(path: &std::path::Path) -> bool {
     let file_name = path
         .file_name()
@@ -87,6 +88,7 @@ fn is_generated_sdk_file(path: &std::path::Path) -> bool {
         || file_name.contains("_generated.")
         || file_name.contains("generated_client")
         || file_name.contains("openapi_client")
+        || file_name.starts_with("api_client.")
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +261,16 @@ mod tests {
     }
 
     #[test]
+    fn test_api_client_py_detected() {
+        assert!(is_generated_sdk_file(&PathBuf::from("src/api_client.py")));
+    }
+
+    #[test]
+    fn test_api_client_go_detected() {
+        assert!(is_generated_sdk_file(&PathBuf::from("pkg/api_client.go")));
+    }
+
+    #[test]
     fn test_regular_service_not_detected() {
         assert!(!is_generated_sdk_file(&PathBuf::from("src/services/user_service.ts")));
     }
@@ -266,6 +278,12 @@ mod tests {
     #[test]
     fn test_plain_ts_not_detected() {
         assert!(!is_generated_sdk_file(&PathBuf::from("src/api/users.ts")));
+    }
+
+    #[test]
+    fn test_plain_client_py_not_detected() {
+        // "client.py" alone is too generic — don't match it without a "generated" qualifier
+        assert!(!is_generated_sdk_file(&PathBuf::from("src/client.py")));
     }
 
     // --- openapi_sdk_link_pass ---
