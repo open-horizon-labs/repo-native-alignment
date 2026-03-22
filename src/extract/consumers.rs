@@ -168,9 +168,16 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
             return Ok(vec![]);
         };
 
-        // Group nodes by language.
-        let mut by_lang: std::collections::HashMap<String, Vec<Node>> =
-            std::collections::HashMap::new();
+        // Group nodes by language using BTreeMap for deterministic emission order.
+        // BTreeMap ensures LanguageDetected events always fire in alphabetical language
+        // order (go, python, rust, typescript, ...) across runs — stable for testing
+        // and for Phase 3+ when consumers may depend on relative event ordering.
+        //
+        // NOTE (Phase 2): nodes are cloned because ExtractionEvent carries owned
+        // Vec<Node>. Phase 3+ will switch to Arc<[Node]> shared ownership to avoid
+        // repeated graph-sized copies when the bus is wired into the hot path.
+        let mut by_lang: std::collections::BTreeMap<String, Vec<Node>> =
+            std::collections::BTreeMap::new();
         for node in nodes {
             if node.language.is_empty() {
                 continue;
@@ -237,6 +244,10 @@ impl ExtractionConsumer for PostExtractionConsumer {
             detected_frameworks: HashSet::new(),
         };
 
+        // NOTE (Phase 2): full clone of nodes + edges because PostExtractionRegistry::run_all
+        // takes mutable references and appends new items. Phase 3+ will switch to
+        // Arc<[Node]>-based events so the bus doesn't require O(N) copies on each
+        // RootExtracted event.
         let mut all_nodes = nodes.clone();
         let mut all_edges = edges.clone();
         let result = registry.run_all(&mut all_nodes, &mut all_edges, ctx);
@@ -477,14 +488,14 @@ impl ExtractionConsumer for OpenApiConsumer {
         let ExtractionEvent::RootExtracted { slug, nodes, .. } = event else {
             return Ok(vec![]);
         };
-        // Only run if there are OpenAPI spec nodes present.
-        let has_openapi = nodes.iter().any(|n| {
-            n.language == "openapi" || n.language == "yaml" || n.language == "json"
-        });
+        // Only run if there are OpenAPI-specific nodes present. Use the dedicated
+        // "openapi" language tag set by the OpenApiExtractor — not generic yaml/json
+        // which fires for any config file (package.json, .github/workflows, etc.).
+        let has_openapi = nodes.iter().any(|n| n.language == "openapi");
         if !has_openapi {
             return Ok(vec![]);
         }
-        tracing::debug!("OpenApiConsumer: root '{}' has OpenAPI-like files (stub)", slug);
+        tracing::debug!("OpenApiConsumer: root '{}' has OpenAPI nodes (stub)", slug);
         Ok(vec![ExtractionEvent::PassComplete {
             pass_name: "openapi_bidirectional",
             added_nodes: 0,
@@ -798,12 +809,16 @@ pub fn build_builtin_bus(
     // --- LanguageDetected consumers (one LSP stub per language) ---
     // Per the ADR: "ALL fire concurrently, one per language" — in Phase 3+ these
     // will be promoted to async consumers running in parallel.
-    for lang in &["rust", "python", "typescript", "go", "java", "c-cpp", "ruby",
-                  "csharp", "kotlin", "swift", "lua", "zig", "elixir", "scala",
-                  "dart", "php", "markdown", "yaml", "json", "toml", "terraform",
-                  "nix", "vue", "svelte", "erlang", "gleam", "nim", "clojure",
-                  "deno", "protobuf", "latex"] {
-        bus.register(Box::new(LspConsumer { language: lang.to_string() }));
+    //
+    // Derive from EnricherRegistry so this list never drifts when languages
+    // are added or removed from the enrichment stack.
+    let mut supported_languages: Vec<String> = crate::extract::EnricherRegistry::with_builtins()
+        .supported_languages()
+        .into_iter()
+        .collect();
+    supported_languages.sort(); // deterministic registration order
+    for lang in supported_languages {
+        bus.register(Box::new(LspConsumer { language: lang }));
     }
 
     // --- FrameworkDetected consumers ---
