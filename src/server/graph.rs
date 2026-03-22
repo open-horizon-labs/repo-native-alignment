@@ -175,13 +175,26 @@ impl RnaHandler {
         // Prune stale roots: compare discovered roots against what LanceDB has stored.
         // Worktrees removed while the server was offline leave orphaned rows that cause
         // duplicate results (see #198).
-        // Exclude lsp_only roots: they have no extracted nodes and never get persisted to
-        // LanceDB. Including them in live_slugs would cause has_new_root to fire on every
-        // startup (the root is "live" but has no stored nodes), triggering unnecessary cold
-        // rebuilds.
+        //
+        // Two separate sets serve different purposes:
+        //
+        // `live_slugs` — non-lsp_only roots only. Used for `has_new_root` detection:
+        //   lsp_only roots are excluded because they have no tree-sitter-extracted nodes
+        //   and are not persisted to LanceDB directly, so including them would cause
+        //   has_new_root to fire on every startup (root is "live" but has no stored nodes),
+        //   triggering unnecessary cold rebuilds.
+        //
+        // `all_declared_slugs` — ALL declared roots including lsp_only. Used for stale
+        //   pruning: lsp_only roots CAN produce nodes (e.g. nextjs_routing_pass emits
+        //   ApiEndpoint nodes with root_id = lsp_only slug). Those nodes must not be
+        //   treated as stale and deleted on every subsequent scan (see #453).
         let live_slugs: std::collections::HashSet<String> = resolved_roots
             .iter()
             .filter(|r| !r.config.lsp_only)
+            .map(|r| r.slug.clone())
+            .collect();
+        let all_declared_slugs: std::collections::HashSet<String> = resolved_roots
+            .iter()
             .map(|r| r.slug.clone())
             .collect();
         // Synthetic root IDs (e.g., "external" for LSP virtual nodes) are never
@@ -200,7 +213,7 @@ impl RnaHandler {
                 let stored_set: std::collections::HashSet<String> = stored.iter().cloned().collect();
                 let stale: Vec<String> = stored
                     .into_iter()
-                    .filter(|s| !live_slugs.contains(s))
+                    .filter(|s| !all_declared_slugs.contains(s))
                     .filter(|s| !RESERVED_ROOT_IDS.contains(&s.as_str()))
                     .collect();
                 if !stale.is_empty() {
