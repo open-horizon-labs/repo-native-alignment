@@ -36,8 +36,10 @@ if [ -d "$REPO_ROOT/target" ]; then
     echo "Warming build cache via hardlinks..."
     cp -al "$REPO_ROOT/target" "$WORKTREE_PATH/target" 2>/dev/null \
         || cp -a "$REPO_ROOT/target" "$WORKTREE_PATH/target"
-    # Break the hardlink on cargo's lock file so parallel builds don't fight.
-    rm -f "$WORKTREE_PATH/target/.cargo-lock"
+    # Break hardlinks on ALL cargo lock files so parallel builds don't fight.
+    # Cargo places .cargo-lock at multiple levels: target/, target/debug/,
+    # target/release/, target/<arch>/release/, etc. All must be removed.
+    find "$WORKTREE_PATH/target" -name ".cargo-lock" -delete 2>/dev/null || true
     rm -f "$WORKTREE_PATH/target/.package-cache"
     echo "Done. Set CARGO_TARGET_DIR=$WORKTREE_PATH/target before building."
 else
