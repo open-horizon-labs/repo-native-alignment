@@ -161,7 +161,17 @@ pub fn grpc_client_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
                 continue;
             }
 
-            let Some(candidates) = rpc_by_name.get(rpc_name) else {
+            // Look up by exact name first (Python/Go/TypeScript use PascalCase: `stub.GetUser`).
+            // Java gRPC generated stubs use lowerCamelCase: `stub.getUser` — normalize to PascalCase
+            // before lookup so Java calls match proto RPC names (`GetUser`).
+            let pascal = to_pascal_case(rpc_name);
+            let lookup_key: &str = if rpc_by_name.contains_key(rpc_name) {
+                rpc_name
+            } else {
+                pascal.as_str()
+            };
+
+            let Some(candidates) = rpc_by_name.get(lookup_key) else {
                 continue;
             };
 
@@ -200,6 +210,36 @@ pub fn grpc_client_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
     }
 
     edges
+}
+
+// ---------------------------------------------------------------------------
+// Helper: lowerCamelCase → PascalCase normalization for Java
+// ---------------------------------------------------------------------------
+
+/// Convert a lowerCamelCase identifier to PascalCase by uppercasing the first
+/// ASCII letter.
+///
+/// Java gRPC generated stubs use lowerCamelCase method names (`stub.getUser`),
+/// while proto RPC names are PascalCase (`GetUser`). This function normalizes
+/// the extracted method name so it can be looked up in the `rpc_by_name` index.
+///
+/// # Examples
+///
+/// ```text
+/// "getUser"    → "GetUser"
+/// "search"     → "Search"
+/// "GetUser"    → "GetUser"  (already PascalCase — no-op)
+/// "getFeature" → "GetFeature"
+/// ```
+pub(crate) fn to_pascal_case(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => {
+            let upper: String = first.to_uppercase().collect();
+            upper + chars.as_str()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -262,13 +302,19 @@ pub(crate) fn extract_method_call_sites(body: &str) -> HashSet<&str> {
 
 /// Returns `true` when any of the gRPC framework IDs are present.
 ///
+/// Supported frameworks: `grpc-python`, `grpc-go`, `grpc-js`, `grpc-java`.
+///
+/// Note: `tonic` (Rust gRPC) is intentionally excluded — `is_grpc_stub_import()`
+/// has no Rust import pattern, so a tonic-only repo would run the pass, find
+/// zero gRPC import files, and exit early with wasted scan cost. Rust support
+/// can be added when a `tonic` import pattern is implemented.
+///
 /// Used by `GrpcClientCallsPass::applies_when` in `post_extraction.rs`.
 pub fn should_run(detected_frameworks: &std::collections::HashSet<String>) -> bool {
     detected_frameworks.contains("grpc-python")
         || detected_frameworks.contains("grpc-go")
         || detected_frameworks.contains("grpc-js")
         || detected_frameworks.contains("grpc-java")
-        || detected_frameworks.contains("tonic") // Rust gRPC
 }
 
 // ---------------------------------------------------------------------------
@@ -570,11 +616,15 @@ mod tests {
 
     #[test]
     fn test_java_client_call_emits_edge() {
+        // Java gRPC generated stubs use lowerCamelCase method names.
+        // Proto defines `rpc GetUser (...)` → stub method is `stub.getUser(request)`.
+        // The pass must normalize `getUser` → `GetUser` before looking up in rpc_by_name.
         let rpc = make_proto_rpc("api/user.proto", "GetUser", "UserService");
         let caller = make_caller(
             "src/UserClient.java",
             "fetchUser",
-            "public User fetchUser(String id) {\n    GetUserRequest request = GetUserRequest.newBuilder().setId(id).build();\n    return stub.GetUser(request);\n}",
+            // Realistic Java gRPC generated code: lowerCamelCase method name
+            "public User fetchUser(String id) {\n    GetUserRequest request = GetUserRequest.newBuilder().setId(id).build();\n    return stub.getUser(request);\n}",
             "java",
         );
         let import = make_import(
@@ -586,7 +636,8 @@ mod tests {
         let nodes = vec![rpc.clone(), caller.clone(), import];
         let edges = grpc_client_calls_pass(&nodes);
 
-        assert_eq!(edges.len(), 1, "expected 1 Calls edge for Java, got {:?}", edges);
+        // Edge should match: getUser (lowerCamel) → normalized to GetUser (PascalCase) → found
+        assert_eq!(edges.len(), 1, "expected 1 Calls edge for Java lowerCamelCase call, got {:?}", edges);
         assert_eq!(edges[0].from.name, "fetchUser");
         assert_eq!(edges[0].to.name, "GetUser");
     }
@@ -606,9 +657,23 @@ mod tests {
         let mut fw4 = HashSet::new();
         fw4.insert("grpc-java".to_string());
         assert!(should_run(&fw4), "should run with grpc-java");
+        // tonic (Rust gRPC) intentionally excluded — no Rust import pattern exists yet
+        let mut fw_tonic = HashSet::new();
+        fw_tonic.insert("tonic".to_string());
+        assert!(!should_run(&fw_tonic), "tonic must not trigger pass (no Rust import pattern)");
         let mut fw5 = HashSet::new();
         fw5.insert("fastapi".to_string());
         assert!(!should_run(&fw5), "non-grpc framework should not trigger pass");
+    }
+
+    #[test]
+    fn test_to_pascal_case() {
+        assert_eq!(to_pascal_case("getUser"), "GetUser");
+        assert_eq!(to_pascal_case("search"), "Search");
+        assert_eq!(to_pascal_case("GetUser"), "GetUser"); // already PascalCase — no-op
+        assert_eq!(to_pascal_case("getFeature"), "GetFeature");
+        assert_eq!(to_pascal_case(""), "");
+        assert_eq!(to_pascal_case("x"), "X");
     }
 
     #[test]

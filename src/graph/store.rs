@@ -45,7 +45,10 @@ pub const SCHEMA_VERSION: u32 = 18; // gRPC proto columns: parent_service, rpc_r
 /// Bumped to 11 for openapi_sdk_link_pass (#465): emits Implements edges from
 /// generated SDK Function nodes to ApiEndpoint nodes (matched by operation_id).
 /// Older caches lack SDK→spec links and must be re-extracted.
-pub const EXTRACTION_VERSION: u32 = 11;
+/// Bumped to 12 for gRPC client calls pass (#466): detects `_pb2_grpc` / grpc-go /
+/// @grpc/ / io.grpc imports and emits Calls edges to proto RPC method nodes.
+/// Older caches lack these cross-boundary gRPC Calls edges and must be re-extracted.
+pub const EXTRACTION_VERSION: u32 = 12;
 
 /// Arrow schema for the `symbols` table.
 ///
