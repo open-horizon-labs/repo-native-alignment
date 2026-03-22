@@ -249,12 +249,10 @@ fn languages_compatible(caller_lang: &str, callee_lang: &str) -> bool {
 /// Covers:
 /// - ES6 named:    `import { Foo, Bar as B } from '…'`  → `["Foo", "Bar"]`
 /// - ES6 default:  `import Foo from '…'`                → `["Foo"]`
-/// - ES6 named:    `import { Foo, Bar as B } from '…'`  → `["Foo", "Bar"]`
-/// - ES6 default:  `import Foo from '…'`                → `["Foo"]`
 /// - ES6 namespace:`import * as ns from '…'`            → `[]` (not supported — see below)
 /// - ES6 type-only:`import type { Foo } from '…'`       → `[]` (erased at runtime)
 /// - Python from:  `from mod import Foo, Bar`           → `["Foo", "Bar"]`
-/// - Python bare:  `import foo`                         → `["foo"]`
+/// - Python bare:  `import foo`                         → `[]` (binds module, not callable)
 /// - Rust use:     `use crate::foo::{A, B}`             → `["A", "B"]`
 /// - Rust use:     `use crate::foo::Bar`                → `["Bar"]`
 ///
@@ -265,6 +263,11 @@ fn languages_compatible(caller_lang: &str, callee_lang: &str) -> bool {
 ///
 /// **Type-only imports return an empty list.** `import type { Foo }` is erased
 /// by TypeScript at runtime; no callable value binding exists.
+///
+/// **Python bare imports return an empty list.** `import os` binds a module
+/// object, not a callable function.  `os.path.exists()` is a method call which
+/// `body_contains_call` rejects.  Use `from os import exists` to import a
+/// callable function.
 pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
     let text = import_text.trim();
 
@@ -300,27 +303,14 @@ pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
     // ------------------------------------------------------------------
     // Python: `import foo` / `import foo, bar`
     // ------------------------------------------------------------------
+    // `import foo` binds a *module object*, not a directly callable function.
+    // Calling `foo()` afterwards would be `TypeError: 'module' object is not
+    // callable`. Module member calls like `foo.bar()` are method-call syntax,
+    // which `body_contains_call` already rejects.  We return empty here to
+    // match the same pattern used for TypeScript namespace imports and type-only
+    // imports — both of which also produce non-callable bindings.
     if text.starts_with("import ") && !text.contains(" from ") {
-        let after = text
-            .strip_prefix("import ")
-            .unwrap_or("")
-            .trim()
-            .trim_end_matches(';');
-        return after
-            .split(',')
-            .map(|s| {
-                // Handle `import foo as f` — take the alias
-                let mut parts = s.trim().split(" as ");
-                let canonical = parts.next().unwrap_or("").trim();
-                // For `import foo.bar`, the callable is `foo` (the module)
-                canonical
-                    .split('.')
-                    .next()
-                    .unwrap_or("")
-                    .to_string()
-            })
-            .filter(|s| !s.is_empty())
-            .collect();
+        return Vec::new();
     }
 
     // ------------------------------------------------------------------
@@ -456,10 +446,19 @@ pub(crate) fn body_contains_call(body: &str, name: &str) -> bool {
     while let Some(idx) = search.find(name) {
         let after_idx = idx + name.len();
 
+        // Compute the number of bytes to advance past the first character at `idx`.
+        // `find()` returns byte offsets; `&search[idx + 1..]` panics if the character
+        // at `idx` is a multi-byte Unicode sequence.  Use the actual char width instead.
+        let advance = idx + search[idx..]
+            .chars()
+            .next()
+            .map(|ch| ch.len_utf8())
+            .unwrap_or(1);
+
         // Check that what follows is `(`.
         let next_char = search[after_idx..].chars().next();
         if next_char != Some('(') {
-            search = &search[idx + 1..];
+            search = &search[advance..];
             continue;
         }
 
@@ -477,7 +476,7 @@ pub(crate) fn body_contains_call(body: &str, name: &str) -> bool {
                     || prev_char == '$'
                     || prev_char.is_ascii_alphanumeric()
                 {
-                    search = &search[idx + 1..];
+                    search = &search[advance..];
                     continue;
                 }
             }
@@ -493,7 +492,7 @@ pub(crate) fn body_contains_call(body: &str, name: &str) -> bool {
             .iter()
             .any(|kw| before.ends_with(kw));
         if is_declaration {
-            search = &search[idx + 1..];
+            search = &search[advance..];
             continue;
         }
 
@@ -607,9 +606,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_python_bare_import() {
+    fn test_parse_python_bare_import_returns_empty() {
+        // `import os` binds the module object, not a callable function.
+        // `os()` would raise TypeError; module members need `os.method()` which
+        // body_contains_call correctly rejects.
         let names = parse_imported_names("import os");
-        assert_eq!(names, vec!["os"]);
+        assert!(names.is_empty(), "bare Python import should return empty, got {:?}", names);
     }
 
     #[test]
@@ -661,6 +663,19 @@ mod tests {
     fn test_body_matches_multiline() {
         let body = "{\n  const data = fetchData(id);\n  return data;\n}";
         assert!(body_contains_call(body, "fetchData"));
+    }
+
+    #[test]
+    fn test_body_contains_call_unicode_safe() {
+        // Verifies no panic on multi-byte Unicode before a bare function call.
+        // Previously `&search[idx + 1..]` would panic if `idx` landed mid-char.
+        // The fix advances by `ch.len_utf8()` bytes instead.
+        let body = "{ let résultat = fetch(42); }"; // é is a 2-byte char
+        assert!(body_contains_call(body, "fetch"));
+        // Ensure the search doesn't panic when the imported name appears after a
+        // non-ASCII identifier prefix (method call on unicode-named obj).
+        let body2 = "{ résultat.fetch(42); }";
+        assert!(!body_contains_call(body2, "fetch")); // method call, not bare
     }
 
     #[test]
@@ -889,6 +904,7 @@ mod tests {
         let edges = import_calls_pass(&nodes);
 
         // Edge is emitted when a local function with matching name exists.
+        assert_eq!(edges.len(), 1, "expected 1 Calls edge for the non-relative import");
         // All edges use Detected confidence.
         for e in &edges {
             assert_eq!(e.confidence, Confidence::Detected,
