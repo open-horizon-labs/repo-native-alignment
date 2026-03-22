@@ -280,17 +280,36 @@ impl RnaHandler {
                         let primary_slug =
                             RootConfig::code_project(repo_root.clone()).slug();
 
-                        let (enriched_nodes, enriched_edges, detected_frameworks) =
-                            crate::extract::consumers::run_post_passes_via_bus(
-                                std::mem::take(&mut graph_state.nodes),
-                                std::mem::take(&mut graph_state.edges),
-                                root_pairs,
-                                primary_slug.clone(),
-                                repo_root.clone(),
-                            );
-                        graph_state.nodes = enriched_nodes;
-                        graph_state.edges = enriched_edges;
-                        graph_state.detected_frameworks = detected_frameworks;
+                        // Pipeline invariant: PostExtractionConsumer always emits PassesComplete.
+                        // If it doesn't (a logic bug), log the error and clear lance_deltas so
+                        // the empty graph is not persisted. The graph remains empty until the
+                        // next full rebuild (next startup or manual `scan --full`).
+                        match crate::extract::consumers::run_post_passes_via_bus(
+                            std::mem::take(&mut graph_state.nodes),
+                            std::mem::take(&mut graph_state.edges),
+                            root_pairs,
+                            primary_slug.clone(),
+                            repo_root.clone(),
+                        ) {
+                            Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
+                                graph_state.nodes = enriched_nodes;
+                                graph_state.edges = enriched_edges;
+                                graph_state.detected_frameworks = detected_frameworks;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Background scanner: post-extraction passes failed \
+                                     (pipeline invariant violated) — aborting tick, \
+                                     no data will be persisted: {:#}",
+                                    e
+                                );
+                                // Clear deltas so nothing bad gets written to LanceDB.
+                                lance_deltas.clear();
+                                // graph_state.nodes/edges are now empty (taken above).
+                                // An empty graph is safe for the subsequent rebuild-index
+                                // and pagerank steps (both are no-ops on an empty set).
+                            }
+                        }
 
                         // Deduplicate nodes and edges after post-extraction passes.
                         // Passes re-emit edges that may already be present from cached

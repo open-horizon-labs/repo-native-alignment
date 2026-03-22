@@ -877,19 +877,25 @@ pub fn build_builtin_bus(
 /// * `repo_root` - path to the primary repository root (for the bus event)
 ///
 /// # Returns
-/// `(nodes, edges, detected_frameworks)` — the enriched graph and framework set.
+/// `Ok((nodes, edges, detected_frameworks))` — the enriched graph and framework set.
+///
+/// # Errors
+/// Returns `Err` if the bus does not produce a `PassesComplete` event.
+/// This is a pipeline invariant violation (`PostExtractionConsumer` always emits
+/// `PassesComplete`), so `Err` here indicates a logic bug, not a transient error.
+/// Callers should propagate this as a hard failure so the pipeline can retry on
+/// the next scan rather than silently persisting an unenriched graph.
 pub fn run_post_passes_via_bus(
     nodes: Vec<crate::graph::Node>,
     edges: Vec<crate::graph::Edge>,
     root_pairs: Vec<(String, PathBuf)>,
     primary_slug: String,
     repo_root: PathBuf,
-) -> (Vec<crate::graph::Node>, Vec<crate::graph::Edge>, std::collections::HashSet<String>) {
+) -> anyhow::Result<(Vec<crate::graph::Node>, Vec<crate::graph::Edge>, std::collections::HashSet<String>)> {
     use crate::extract::event_bus::ExtractionEvent;
     use std::sync::Arc;
 
     // Wrap into Arc<[T]> for zero-copy bus fan-out.
-    // Retain references as fallback if PassesComplete is absent.
     let nodes_arc: Arc<[crate::graph::Node]> = Arc::from(nodes.into_boxed_slice());
     let edges_arc: Arc<[crate::graph::Edge]> = Arc::from(edges.into_boxed_slice());
 
@@ -902,6 +908,8 @@ pub fn run_post_passes_via_bus(
     });
 
     // Collect PassesComplete — produced by PostExtractionConsumer.
+    // PassesComplete is a pipeline invariant: PostExtractionConsumer always emits it.
+    // If it's absent, the bus was misconfigured or a consumer panicked — treat as error.
     let passes_complete = events.into_iter().find(|e| {
         matches!(e, ExtractionEvent::PassesComplete { .. })
     });
@@ -913,14 +921,17 @@ pub fn run_post_passes_via_bus(
             detected_frameworks,
             ..
         }) => {
-            (nodes.to_vec(), edges.to_vec(), detected_frameworks)
+            Ok((nodes.to_vec(), edges.to_vec(), detected_frameworks))
         }
         _ => {
-            tracing::warn!(
-                "run_post_passes_via_bus: no PassesComplete from bus — \
-                 returning unenriched graph"
-            );
-            (nodes_arc.to_vec(), edges_arc.to_vec(), std::collections::HashSet::new())
+            // This is a hard invariant violation — do NOT fall back to the unenriched
+            // graph. The caller must not persist/commit scan state with missing passes.
+            anyhow::bail!(
+                "EventBus post-extraction: PassesComplete event absent — \
+                 this is a pipeline invariant violation (PostExtractionConsumer \
+                 must always emit PassesComplete). Failing hard to prevent \
+                 persisting an unenriched graph."
+            )
         }
     }
 }
@@ -1279,7 +1290,7 @@ mod tests {
 
     // ── run_post_passes_via_bus tests ─────────────────────────────────────
 
-    /// Verify run_post_passes_via_bus returns PassesComplete data on empty input.
+    /// Verify run_post_passes_via_bus returns Ok(PassesComplete data) on empty input.
     ///
     /// This is the ADR Phase 2b integration test: ensures that emitting
     /// RootExtracted to the bus always produces a PassesComplete event, even
@@ -1292,7 +1303,7 @@ mod tests {
             vec![],
             "test".to_string(),
             PathBuf::from("."),
-        );
+        ).expect("run_post_passes_via_bus must not fail on empty input");
         assert!(nodes.is_empty(), "empty input → empty nodes");
         assert!(edges.is_empty(), "empty input → empty edges");
         assert!(frameworks.is_empty(), "empty input → no frameworks");
@@ -1332,7 +1343,7 @@ mod tests {
             vec![],
             "test".to_string(),
             PathBuf::from("."),
-        );
+        ).expect("run_post_passes_via_bus must not fail with valid input");
 
         // Output must contain the input node (passes should not drop it)
         assert!(

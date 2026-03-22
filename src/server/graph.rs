@@ -604,7 +604,7 @@ impl RnaHandler {
                     root_pairs,
                     primary_slug,
                     self.repo_root.clone(),
-                );
+                )?;
             all_nodes = enriched_nodes;
             all_edges = enriched_edges;
             all_detected_frameworks = detected_frameworks;
@@ -1072,7 +1072,12 @@ impl RnaHandler {
                     root_pairs_incremental,
                     primary_slug.clone(),
                     self.repo_root.clone(),
-                );
+                ).map_err(|e| {
+                    // Pipeline invariant violated — abort the incremental update so the
+                    // partial graph is not persisted. Scanner state is not committed on
+                    // Err return, so the next scan will retry the full pass sequence.
+                    e.context("incremental update aborted: post-extraction passes did not complete")
+                })?;
             graph.nodes = enriched_nodes;
             graph.edges = enriched_edges;
             graph.detected_frameworks = detected_frameworks;
