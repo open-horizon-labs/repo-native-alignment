@@ -640,11 +640,23 @@ impl RnaHandler {
                     );
                     drop(guard); // release graph lock before acquiring lance write lock
                     // Serialize with other LanceDB writers via the shared mutex (#344 round 3).
+                    // The sentinel is written inside the same critical section as the persist so
+                    // another writer cannot race in between (#477 CodeRabbit critical).
                     let persist_result = {
                         let _lance_guard = bg_lance_write_lock.lock().await;
-                        persist_graph_incremental(
+                        let result = persist_graph_incremental(
                             &lsp_repo_root, &upsert_nodes, &persist_edges, &[], &[],
-                        ).await
+                        ).await;
+                        if matches!(result, Ok(false)) {
+                            // Incremental persist succeeded -- write sentinel while lock is held.
+                            let (total_nodes, total_edges) = {
+                                let g = bg_graph.read().await;
+                                g.as_ref().map(|gs| (gs.nodes.len(), gs.edges.len()))
+                                    .unwrap_or((0, 0))
+                            };
+                            super::sentinel::write_lsp_sentinel(&lsp_repo_root, total_nodes, total_edges);
+                        }
+                        result
                     };
                     match persist_result {
                         Ok(true) => {
@@ -656,18 +668,20 @@ impl RnaHandler {
                             let snapshot = {
                                 let g = bg_graph.read().await;
                                 if let Some(ref gs) = *g {
-                                    Some((gs.nodes.clone(), gs.edges.clone()))
+                                    Some((gs.nodes.clone(), gs.edges.clone(), true))
                                 } else if !migration_fallback_nodes.is_empty() {
                                     // CLI path: use the pre-enrichment node set.
                                     // Edges are empty because LSP enrichment hadn't
                                     // completed; the tree-sitter edges are already in
                                     // migration_fallback_nodes via the initial persist.
+                                    // Do NOT write the LSP sentinel in this path -- the
+                                    // persisted graph has no LSP edges (#477 CodeRabbit major).
                                     tracing::warn!(
                                         "[background] LSP enrichment: bg_graph is None after migration; \
-                                         falling back to {} pre-enrichment nodes for full persist",
+                                         falling back to {} pre-enrichment nodes for full persist (no LSP edges)",
                                         migration_fallback_nodes.len()
                                     );
-                                    Some((migration_fallback_nodes, Vec::new()))
+                                    Some((migration_fallback_nodes, Vec::new(), false))
                                 } else {
                                     tracing::error!(
                                         "[background] LSP enrichment: schema migrated but no nodes \
@@ -676,12 +690,16 @@ impl RnaHandler {
                                     None
                                 }
                             };
-                            if let Some((nodes, edges)) = snapshot {
+                            if let Some((nodes, edges, has_lsp_edges)) = snapshot {
                                 let _lance_guard = bg_lance_write_lock.lock().await;
                                 if let Err(e) = persist_graph_to_lance(&lsp_repo_root, &nodes, &edges).await {
                                     tracing::error!("[background] LSP enrichment: full persist after migration failed: {:#}", e);
                                     bg_lsp_status.set_complete_persist_failed(edge_count);
                                 } else {
+                                    if has_lsp_edges {
+                                        // Only write the sentinel when real LSP edges were persisted.
+                                        super::sentinel::write_lsp_sentinel(&lsp_repo_root, nodes.len(), edges.len());
+                                    }
                                     bg_lsp_status.set_complete(edge_count);
                                 }
                             } else {
@@ -821,11 +839,23 @@ impl RnaHandler {
                 );
                 drop(guard); // release graph lock before acquiring lance write lock
                 // Serialize with other LanceDB writers via the shared mutex (#344 round 3).
+                // The sentinel is written inside the same critical section as the persist so
+                // another writer cannot race in between (#477 CodeRabbit critical).
                 let persist_result = {
                     let _lance_guard = bg_lance_write_lock.lock().await;
-                    persist_graph_incremental(
+                    let result = persist_graph_incremental(
                         &bg_repo_root, &upsert_nodes, &persist_edges, &[], &[],
-                    ).await
+                    ).await;
+                    if matches!(result, Ok(false)) {
+                        // Incremental persist succeeded -- write sentinel while lock is held.
+                        let (total_nodes, total_edges) = {
+                            let g = bg_graph.read().await;
+                            g.as_ref().map(|gs| (gs.nodes.len(), gs.edges.len()))
+                                .unwrap_or((0, 0))
+                        };
+                        super::sentinel::write_lsp_sentinel(&bg_repo_root, total_nodes, total_edges);
+                    }
+                    result
                 };
                 match persist_result {
                     Ok(true) => {
@@ -836,14 +866,16 @@ impl RnaHandler {
                         let snapshot = {
                             let g = bg_graph.read().await;
                             if let Some(ref gs) = *g {
-                                Some((gs.nodes.clone(), gs.edges.clone()))
+                                Some((gs.nodes.clone(), gs.edges.clone(), true))
                             } else if !migration_fallback_nodes.is_empty() {
+                                // Do NOT write the LSP sentinel in this path -- the
+                                // persisted graph has no LSP edges (#477 CodeRabbit major).
                                 tracing::warn!(
                                     "[background] LSP enrichment (cache-hit): bg_graph is None after migration; \
-                                     falling back to {} pre-enrichment nodes for full persist",
+                                     falling back to {} pre-enrichment nodes for full persist (no LSP edges)",
                                     migration_fallback_nodes.len()
                                 );
-                                Some((migration_fallback_nodes, Vec::new()))
+                                Some((migration_fallback_nodes, Vec::new(), false))
                             } else {
                                 tracing::error!(
                                     "[background] LSP enrichment (cache-hit): schema migrated but no nodes \
@@ -852,12 +884,16 @@ impl RnaHandler {
                                 None
                             }
                         };
-                        if let Some((nodes, edges)) = snapshot {
+                        if let Some((nodes, edges, has_lsp_edges)) = snapshot {
                             let _lance_guard = bg_lance_write_lock.lock().await;
                             if let Err(e) = persist_graph_to_lance(&bg_repo_root, &nodes, &edges).await {
                                 tracing::error!("[background] LSP enrichment (cache-hit): full persist after migration failed: {:#}", e);
                                 bg_lsp_status.set_complete_persist_failed(edge_count);
                             } else {
+                                if has_lsp_edges {
+                                    // Only write the sentinel when real LSP edges were persisted.
+                                    super::sentinel::write_lsp_sentinel(&bg_repo_root, nodes.len(), edges.len());
+                                }
                                 bg_lsp_status.set_complete(edge_count);
                             }
                         } else {
@@ -1011,11 +1047,23 @@ impl RnaHandler {
 
                 // Persist to LanceDB (slow -- outside the lock).
                 // Acquire the write mutex to serialize with other LanceDB writers (#344 round 3).
+                // The sentinel is written inside the same critical section as the persist so
+                // another writer cannot race in between (#477 CodeRabbit critical).
                 let persist_result = {
                     let _lance_guard = bg_lance_write_lock.lock().await;
-                    persist_graph_incremental(
+                    let result = persist_graph_incremental(
                         &bg_repo_root, &all_upsert_nodes, &persist_edges, &[], &[],
-                    ).await
+                    ).await;
+                    if matches!(result, Ok(false)) {
+                        // Incremental persist succeeded -- write sentinel while lock is held.
+                        let (total_nodes, total_edges) = {
+                            let g = bg_graph.read().await;
+                            g.as_ref().map(|gs| (gs.nodes.len(), gs.edges.len()))
+                                .unwrap_or((0, 0))
+                        };
+                        super::sentinel::write_lsp_sentinel(&bg_repo_root, total_nodes, total_edges);
+                    }
+                    result
                 };
                 match persist_result {
                     Ok(true) => {
@@ -1030,6 +1078,7 @@ impl RnaHandler {
                                 tracing::error!("[incremental-bg] Full persist after migration failed: {:#}", e);
                                 bg_lsp_status.set_complete_persist_failed(edge_count);
                             } else {
+                                super::sentinel::write_lsp_sentinel(&bg_repo_root, nodes.len(), edges.len());
                                 bg_lsp_status.set_complete(edge_count);
                             }
                         } else {
@@ -1110,6 +1159,8 @@ impl RnaHandler {
         if super::store::check_and_migrate_schema(&db_path).await? {
             tracing::info!("Schema migrated during incremental pre-flight -- falling back to full rebuild");
             on_progress("Schema migration detected -- rebuilding from scratch.");
+            // Clear sentinels -- they reference the old schema version and are now stale.
+            super::sentinel::clear_sentinels(&self.repo_root);
             return self.run_pipeline_foreground_full(on_progress, pipeline_start).await;
         }
 
@@ -1136,6 +1187,8 @@ impl RnaHandler {
                     "Extraction version migrated during incremental pre-flight -- falling back to full rebuild"
                 );
                 on_progress("Extraction version upgrade detected -- rebuilding from scratch.");
+                // Clear sentinels -- they reference the old extraction version and are now stale.
+                super::sentinel::clear_sentinels(&self.repo_root);
                 return self.run_pipeline_foreground_full(on_progress, pipeline_start).await;
             }
         }
@@ -1173,14 +1226,14 @@ impl RnaHandler {
                 }
             }
 
-            // Check if cached graph needs LSP enrichment.
-            let has_call_edges = {
-                let guard = self.graph.read().await;
-                let gs = guard.as_ref().unwrap();
-                gs.edges.iter().any(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
-            };
+            // Check if LSP enrichment has been durably persisted via the completion
+            // sentinel. This replaces the `has_call_edges` heuristic, which fails
+            // when LSP ran but the subsequent LanceDB persist crashed: edges end up
+            // in memory but the sentinel is never written, so the next restart
+            // correctly re-runs LSP enrichment (#477).
+            let lsp_sentinel = super::sentinel::read_lsp_sentinel(&self.repo_root);
 
-            let lsp_edge_count = if has_call_edges {
+            let lsp_edge_count = if lsp_sentinel.is_some() {
                 let call_count = {
                     let guard = self.graph.read().await;
                     guard.as_ref().unwrap().edges.iter()
@@ -1188,12 +1241,12 @@ impl RnaHandler {
                         .count()
                 };
                 self.lsp_status.set_complete(call_count);
-                on_progress(&format!("LSP: {} cached call edges", call_count));
+                on_progress(&format!("LSP: {} cached call edges (sentinel present)", call_count));
                 call_count
             } else {
-                // Need LSP enrichment even though no files changed.
+                // LSP sentinel absent -- enrichment has not been durably persisted.
                 // Run it synchronously on all nodes.
-                on_progress("LSP: no cached call edges -- running full enrichment...");
+                on_progress("LSP: no sentinel -- running full enrichment...");
                 self.run_foreground_lsp_and_persist(&on_progress).await?
             };
 
@@ -1382,6 +1435,10 @@ impl RnaHandler {
                     tracing::error!("Foreground incremental persist failed: {}", e);
                     return Err(e.context("Full persist failed during incremental foreground pipeline"));
                 }
+                // Persist succeeded -- write both sentinels. Incremental path rewrites
+                // the full graph, so extraction is also complete after this persist.
+                super::sentinel::write_extract_sentinel(&self.repo_root, nodes.len(), edges.len());
+                super::sentinel::write_lsp_sentinel(&self.repo_root, nodes.len(), edges.len());
             }
         }
 
@@ -1586,6 +1643,10 @@ impl RnaHandler {
                     tracing::error!("Foreground full persist failed: {}", e);
                     return Err(e.context("Full persist failed during foreground pipeline"));
                 }
+                // Full persist succeeded (tree-sitter + LSP in one write) -- write
+                // both sentinels since the single persist covers both phases (#477).
+                super::sentinel::write_extract_sentinel(&self.repo_root, nodes.len(), edges.len());
+                super::sentinel::write_lsp_sentinel(&self.repo_root, nodes.len(), edges.len());
             }
         }
 
@@ -1705,6 +1766,9 @@ impl RnaHandler {
                 tracing::error!("Foreground LSP persist failed: {}", e);
                 return Err(e.context("LSP persist failed during foreground pipeline"));
             }
+            // Persist succeeded -- write LSP sentinel so future startups know
+            // LSP enrichment is durable and can skip re-enrichment (#477).
+            super::sentinel::write_lsp_sentinel(&self.repo_root, nodes.len(), edges.len());
         }
 
         Ok(lsp_edge_count)
