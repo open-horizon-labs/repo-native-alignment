@@ -508,7 +508,10 @@ impl LspEnricher {
                 let remaining = deadline.duration_since(tokio::time::Instant::now());
                 remaining.min(tokio::time::Duration::from_secs(60))
             } else {
-                tokio::time::Duration::from_secs(5)
+                // Servers that don't send serverStatus (e.g. typescript-language-server)
+                // may still be indexing the project. Wait up to 30s of silence before
+                // assuming ready — tsserver needs time to load a large project.
+                tokio::time::Duration::from_secs(30)
             };
 
             match tokio::time::timeout(
@@ -587,7 +590,7 @@ impl LspEnricher {
                         );
                     } else {
                         // No serverStatus received — server may not support it
-                        tracing::info!("{} no serverStatus after 5s, assuming ready", self.server_command);
+                        tracing::info!("{} no serverStatus after 30s, assuming ready", self.server_command);
                     }
                     break;
                 }
