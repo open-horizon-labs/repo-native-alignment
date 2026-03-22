@@ -582,8 +582,9 @@ impl RnaHandler {
             }
         }
 
-        // 4b-4i. Post-extraction passes: API link, manifest, tested-by, import-calls,
-        //        directory-module, framework detection, Next.js routing, pub/sub, WebSocket.
+        // 4b-4j. Post-extraction passes: API link, manifest, tested-by, import-calls,
+        //        directory-module, framework detection, Next.js routing, pub/sub, WebSocket,
+        //        and generic extractor-config (.oh/extractors/*.toml).
         //        Extracted into `run_post_extraction_passes` so the background scanner
         //        calls the same function (fix for #471).
         {
@@ -1380,6 +1381,7 @@ impl RnaHandler {
 /// - 4g: Next.js routing ApiEndpoint nodes (gated on TS/JS or detected Next.js)
 /// - 4h: Pub/sub Produces/Consumes edges (gated on kafka/celery/pika)
 /// - 4i: WebSocket/SSE edges (gated on socketio)
+/// - 4j: Generic extractor config pass (.oh/extractors/*.toml, always-on, no-op when dir absent)
 ///
 /// Delegates to [`PostExtractionRegistry::with_builtins`] so all passes run
 /// through the plugin architecture (framework-gated, auto-delta tracked).

@@ -1,0 +1,13 @@
+[meta]
+name = "google-pubsub"
+applies_when = { language = "python", imports_contain = "google.cloud.pubsub" }
+
+[[boundaries]]
+function_pattern = "publisher.publish"
+topic_arg = 0
+edge_kind = "Produces"
+
+[[boundaries]]
+function_pattern = "subscriber.subscribe"
+topic_arg = 0
+edge_kind = "Consumes"
