@@ -116,7 +116,7 @@ jobs:
 
   smoke:
     needs: changes
-    if: needs.changes.outputs.rust == 'true' && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false))
+    if: needs.changes.outputs.rust == 'true' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: namespace-profile-cached
     timeout-minutes: 20
     env:
