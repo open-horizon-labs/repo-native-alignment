@@ -18,18 +18,23 @@
 //!
 //! # Algorithm
 //!
-//! For every test function (identified by `is_test_function()`):
+//! Build an Aho-Corasick automaton once over all production function names
+//! (names shorter than 4 characters are filtered out first to avoid false
+//! positives from `new`, `get`, `run`, etc.).  The automaton is built with
+//! case-insensitive matching enabled so no manual `to_lowercase()` is required
+//! at query time.
 //!
-//! 1. Convert the test name to lowercase.
-//! 2. For every *production* function whose lowercase name is a substring of
-//!    the test name:
-//!    - Skip names shorter than 4 characters (avoids false positives from
-//!      `new`, `get`, `run`, etc.).
-//!    - Emit one `EdgeKind::TestedBy` edge: test_fn → prod_fn.
+//! For every test function, run its name through the automaton.  Each match
+//! gives a pattern index that maps back to the corresponding production node.
+//!
+//! Complexity:
+//! - Construction: O(P × avg_name_len)
+//! - Per-query: O(test_name_len + matches)
+//! - Total: O(N + E_emitted) instead of the previous O(T × P)
 //!
 //! Examples:
 //! - `test_process_payment` → `TestedBy` → `process_payment`
-//! - `TestHandleRequest` → `TestedBy` → `HandleRequest` (case-insensitive lowercasing only)
+//! - `TestHandleRequest` → `TestedBy` → `HandleRequest` (case-insensitive)
 //! - `it_should_parse_config` → `TestedBy` → `parse_config`
 //!
 //! # Placement
@@ -40,6 +45,7 @@
 //! cross-file test/production pairs are linked even when only one side was
 //! touched in an incremental scan.
 
+use aho_corasick::{AhoCorasickBuilder, MatchKind};
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeKind};
 use crate::ranking::is_test_function;
 
@@ -71,48 +77,60 @@ pub fn tested_by_pass(all_nodes: &[Node]) -> Vec<Edge> {
         return Vec::new();
     }
 
-    // Pre-compute lowercase names for all production functions once.
-    // This avoids the O(T × P) repeated `to_lowercase()` allocations that
-    // would occur inside the nested loop below.  Filtering short names here
-    // also keeps the inner list tight.
-    let prod_indexed: Vec<(String, &Node)> = prod_fns
+    // Filter production functions to those with names >= 4 chars.
+    // Short names ("new", "get", "run", …) produce too many false positives.
+    let prod_indexed: Vec<&Node> = prod_fns
         .iter()
-        .filter(|n| n.id.name.len() >= 4) // skip very short names ("new", "get", …)
-        .map(|n| (n.id.name.to_lowercase(), *n))
+        .filter(|n| n.id.name.len() >= 4)
+        .copied()
         .collect();
 
     if prod_indexed.is_empty() {
         return Vec::new();
     }
 
+    // Build one Aho-Corasick automaton from all production function names.
+    // Construction is O(P × avg_name_len); each query is O(haystack_len + matches).
+    // Total: O(N + E_emitted) vs the previous O(T × P).
+    //
+    // `MatchKind::LeftmostLongest` is intentional: when one production name is
+    // a prefix of another (e.g. "parse" vs "parse_config"), we want the longest
+    // match so the more-specific function wins.  All matches are still reported
+    // for a given haystack position via `find_iter`, so multiple production
+    // functions can match a single test name.
+    let patterns: Vec<&str> = prod_indexed.iter().map(|n| n.id.name.as_str()).collect();
+    let ac = AhoCorasickBuilder::new()
+        .ascii_case_insensitive(true)
+        .match_kind(MatchKind::LeftmostLongest)
+        .build(&patterns)
+        .expect("AhoCorasick construction must not fail for valid UTF-8 function names");
+
     let mut edges: Vec<Edge> = Vec::new();
 
     for test_fn in &test_fns {
-        let test_name_lower = test_fn.id.name.to_lowercase();
+        for mat in ac.find_iter(&test_fn.id.name) {
+            let prod_fn = prod_indexed[mat.pattern().as_usize()];
 
-        for (prod_name_lower, prod_fn) in &prod_indexed {
-            if test_name_lower.contains(prod_name_lower.as_str()) {
-                // Defensive: never emit a self-edge.  The split above
-                // (is_test_function / !is_test_function) makes this
-                // unreachable in normal data, but guard anyway.
-                if test_fn.id == prod_fn.id {
-                    continue;
-                }
-
-                tracing::debug!(
-                    "TestedBy (naming): {} -> {}",
-                    test_fn.id.name,
-                    prod_fn.id.name
-                );
-
-                edges.push(Edge {
-                    from: test_fn.id.clone(),
-                    to: prod_fn.id.clone(),
-                    kind: EdgeKind::TestedBy,
-                    source: ExtractionSource::TreeSitter,
-                    confidence: Confidence::Detected,
-                });
+            // Defensive: never emit a self-edge.  The partition above
+            // (is_test_function / !is_test_function) makes this unreachable
+            // in normal data, but guard anyway.
+            if test_fn.id == prod_fn.id {
+                continue;
             }
+
+            tracing::debug!(
+                "TestedBy (naming): {} -> {}",
+                test_fn.id.name,
+                prod_fn.id.name
+            );
+
+            edges.push(Edge {
+                from: test_fn.id.clone(),
+                to: prod_fn.id.clone(),
+                kind: EdgeKind::TestedBy,
+                source: ExtractionSource::TreeSitter,
+                confidence: Confidence::Detected,
+            });
         }
     }
 
