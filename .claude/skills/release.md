@@ -52,6 +52,43 @@ For each merged PR since last tag:
 - If not, add a test to the suite file
 - Re-run
 
+### Step 4b: Sweep all PRs and issues for unaddressed feedback
+
+**This step is BLOCKING. Unaddressed Critical/Major findings = NO-GO.**
+
+For every PR merged since last tag, check CodeRabbit inline comments AND issue comments:
+
+```bash
+# Get all merged PRs since last tag
+git log <last-tag>..HEAD --merges --oneline | grep -o '#[0-9]*' | sort -u | while read pr; do
+  echo "=== PR $pr ==="
+  # CodeRabbit inline comments
+  gh api repos/{owner}/{repo}/pulls/${pr#\#}/comments --paginate 2>/dev/null | \
+    python3 -c "
+import json,sys
+cs = [c for c in json.load(sys.stdin) if 'coderabbit' in c.get('user',{}).get('login','').lower()]
+for c in cs:
+    sev = '🔴CRITICAL' if '🔴' in c.get('body','') else ('🟠MAJOR' if '🟠' in c.get('body','') else '🟡MINOR')
+    print(f'  [{sev}] {c.get(\"path\",\"\")}:{c.get(\"line\",\"\")}')
+    print(f'    {c.get(\"body\",\"\")[:150]}')
+" 2>/dev/null
+  # Issue comments
+  gh api repos/{owner}/{repo}/issues/${pr#\#}/comments --paginate 2>/dev/null | \
+    python3 -c "
+import json,sys
+cs = [c for c in json.load(sys.stdin) if 'coderabbit' not in c.get('user',{}).get('login','').lower() and 'github-actions' not in c.get('user',{}).get('login','').lower()]
+for c in cs[:3]:
+    print(f'  [HUMAN] {c.get(\"user\",{}).get(\"login\",\"\")}')
+    print(f'    {c.get(\"body\",\"\")[:150]}')
+" 2>/dev/null
+done
+```
+
+For each finding:
+- CRITICAL/MAJOR: **fix before release or it's NO-GO**
+- MINOR: fix if trivial, otherwise explicitly reply with N/A reasoning
+- Human comments: acknowledge or address
+
 ### Step 5: GO / NO-GO determination
 
 **Before writing any release notes, state clearly:**
