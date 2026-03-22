@@ -13,8 +13,8 @@
 //!   whose framework is not present are skipped at zero cost.
 //! - **Auto-delta collection** — the registry snapshots node/edge counts before
 //!   and after each pass, making the cumulative delta available as
-//!   [`RegistryResult::added_nodes`] / [`RegistryResult::added_edges`]. No pass
-//!   needs to manually report what it added (fixes #474).
+//!   [`RegistryResult::added_node_count`] / [`RegistryResult::added_edge_count`].
+//!   No pass needs to manually report what it added (fixes #474).
 //! - **Single call site** — `PostExtractionRegistry::run_all` is called from
 //!   `run_post_extraction_passes` which is invoked from both
 //!   `build_full_graph_inner` AND the background scanner (fixes #471).
@@ -58,23 +58,22 @@ pub struct PassContext {
 // Pass result
 // ---------------------------------------------------------------------------
 
-/// Nodes and edges produced by a single pass.
+/// The metadata returned by a single pass.
 ///
-/// Framework-aware passes (framework_detection) also populate
-/// `detected_frameworks` so the registry can update `ctx` before running
-/// framework-gated passes.
+/// Passes extend `nodes` and `edges` in-place (the registry auto-tracks the
+/// delta via length snapshotting). The only value a pass needs to return is the
+/// set of detected frameworks — the registry propagates this into `PassContext`
+/// so subsequent framework-gated passes see the updated set.
 #[derive(Debug, Default)]
 pub struct PassResult {
-    /// New nodes produced by this pass.
-    pub nodes: Vec<Node>,
-    /// New edges produced by this pass.
-    pub edges: Vec<Edge>,
-    /// Frameworks detected by this pass (non-empty only for framework_detection_pass).
+    /// Frameworks detected by this pass (non-empty only for `framework_detection_pass`).
+    /// The registry merges these into `PassContext::detected_frameworks` before running
+    /// the next pass.
     pub detected_frameworks: HashSet<String>,
 }
 
 impl PassResult {
-    /// Convenience: pass produced no output.
+    /// Convenience: pass produced no framework detections.
     pub fn empty() -> Self {
         Self::default()
     }
@@ -343,8 +342,6 @@ impl PostExtractionPass for FrameworkDetectionPass {
             nodes.extend(result.nodes);
         }
         PassResult {
-            nodes: Vec::new(),
-            edges: Vec::new(),
             detected_frameworks: detected,
         }
     }
@@ -508,7 +505,7 @@ mod tests {
             fn run(&self, _n: &mut Vec<Node>, _e: &mut Vec<crate::graph::Edge>, _c: &PassContext) -> PassResult {
                 let mut fw = HashSet::new();
                 fw.insert("some-framework".to_string());
-                PassResult { nodes: vec![], edges: vec![], detected_frameworks: fw }
+                PassResult { detected_frameworks: fw }
             }
         }
 
