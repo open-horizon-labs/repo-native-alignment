@@ -36,7 +36,7 @@ jobs:
   lint:
     needs: changes
     runs-on: namespace-profile-cached
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - name: Skip (no Rust changes)
         if: needs.changes.outputs.rust != 'true'
@@ -67,6 +67,34 @@ jobs:
             echo "WARN: cloning nodes/edges vec — can you move instead?"
             echo "$HITS"
           fi
+      - name: Install protoc
+        if: needs.changes.outputs.rust == 'true'
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Rust toolchain
+        if: needs.changes.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Setup sccache
+        if: needs.changes.outputs.rust == 'true'
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure Namespace sccache cache
+        if: needs.changes.outputs.rust == 'true'
+        run: nsc cache sccache setup --cache_name default >> "$GITHUB_ENV"
+      - name: Cache Rust downloads
+        if: needs.changes.outputs.rust == 'true'
+        uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+      - name: Clippy
+        if: needs.changes.outputs.rust == 'true'
+        env:
+          RUSTC_WRAPPER: "sccache"
+        run: cargo clippy --no-default-features -- -D warnings
 
   test:
     needs: changes

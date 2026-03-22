@@ -49,7 +49,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeKind};
 
 // ---------------------------------------------------------------------------
 // Import patterns that signal gRPC stub usage
@@ -269,13 +269,12 @@ pub(crate) fn extract_method_call_sites(body: &str) -> HashSet<&str> {
         // Find '('
         if bytes[i] == b'(' && i > 0 {
             // Walk backwards to find the identifier.
-            let mut end = i;
             let mut j = i.saturating_sub(1);
             // Skip whitespace before '('.
             while j > 0 && bytes[j] == b' ' {
                 j -= 1;
             }
-            end = j + 1;
+            let end = j + 1;
             // Walk back through identifier chars.
             while j > 0
                 && (bytes[j - 1].is_ascii_alphanumeric()

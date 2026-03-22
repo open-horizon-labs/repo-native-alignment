@@ -697,7 +697,7 @@ dependencies = [
 name = "pkg"
 dependencies = ["fastapi>=0.100", "uvicorn"]
 "#;
-        let (nodes, edges) = parse_pyproject_toml(content, &manifest("pyproject.toml"), "root");
+        let (_nodes, edges) = parse_pyproject_toml(content, &manifest("pyproject.toml"), "root");
         assert_eq!(edges.len(), 2);
     }
 
@@ -807,7 +807,7 @@ require (
     github.com/indirect v2.0.0 // indirect
 )
 "#;
-        let (nodes, edges) = parse_go_mod(content, &manifest("go.mod"), "root");
+        let (_nodes, edges) = parse_go_mod(content, &manifest("go.mod"), "root");
         assert_eq!(edges.len(), 2, "indirect deps should be included");
     }
 

@@ -454,11 +454,10 @@ pub(crate) fn extract_call_sites(body: &str) -> HashSet<&str> {
         // Find '('
         if bytes[i] == b'(' && i > 0 {
             // Walk backwards to find the identifier
-            let mut end = i;
             let mut j = i.saturating_sub(1);
             // Skip whitespace
             while j > 0 && bytes[j] == b' ' { j -= 1; }
-            end = j + 1;
+            let end = j + 1;
             // Walk back through identifier chars
             while j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || bytes[j - 1] == b'_' || bytes[j - 1] == b'$') {
                 j -= 1;
@@ -483,6 +482,7 @@ pub(crate) fn extract_call_sites(body: &str) -> HashSet<&str> {
     result
 }
 
+#[allow(dead_code)]
 pub(crate) fn body_contains_call(body: &str, name: &str) -> bool {
     // Fast reject: name must appear somewhere in the body.
     if !body.contains(name) {

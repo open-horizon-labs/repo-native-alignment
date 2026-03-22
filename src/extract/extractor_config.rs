@@ -451,6 +451,7 @@ pub fn extractor_config_pass_with_configs(
 ///
 /// Handles single quotes, double quotes, and backtick strings.
 /// Skips leading whitespace and brackets before the opening quote.
+#[allow(dead_code)]
 fn extract_quoted_after(body: &str, prefix: &str) -> Option<String> {
     let prefix_lower = prefix.to_lowercase();
     let body_lower = body.to_lowercase();
@@ -487,6 +488,7 @@ fn extract_quoted_after(body: &str, prefix: &str) -> Option<String> {
 /// advance past `n` comma-delimited argument positions and then extract the
 /// next quoted string. This is a best-effort heuristic — complex expressions
 /// (nested calls, multi-line args) are not fully handled.
+#[allow(dead_code)]
 fn extract_nth_arg_quoted(body: &str, prefix: &str, n: usize) -> Option<String> {
     if n == 0 {
         return extract_quoted_after(body, prefix);

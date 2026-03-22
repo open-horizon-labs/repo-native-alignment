@@ -117,38 +117,6 @@ static GO_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
     default_method: "GET",
 };
 
-/// Rust Actix-web / Rocket / Poem route attribute query.
-///
-/// Matches attribute macros where the HTTP method is deterministic:
-/// - `#[get("/users")]`    (Actix-web, Rocket)   → GET
-/// - `#[post("/items")]`   (Actix-web, Rocket)   → POST
-/// - `#[put("/items/{id}")]`  (Actix-web, Rocket) → PUT
-/// - `#[delete("/items/{id}")]` (Actix-web, Rocket) → DELETE
-/// - `#[patch("/items/{id}")]`  (Actix-web, Rocket) → PATCH
-/// - `#[head("/path")]`    (Actix-web)            → HEAD
-/// - `#[options("/path")]` (Actix-web)            → OPTIONS
-///
-/// NOT included (deferred to #390 or later):
-/// - `route(...)` — Actix-web multi-method: `#[route("/path", method="GET", method="POST")]`
-///   requires parsing the nested `method=` argument, not just the path
-/// - `connect`/`trace` — uncommon; include if demand emerges
-///
-/// Tree-sitter represents `#[get("/path")]` as:
-///   `(attribute_item (attribute (identifier) @name arguments: (token_tree (string_literal) @path)))`
-///
-/// Note: Axum uses `Router::route("/path", ...)` (function call style), not attribute macros.
-static RUST_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
-    label: "rust-route-attributes",
-    query: r#"
-(attribute_item
-  (attribute
-    (identifier) @name
-    arguments: (token_tree
-      (string_literal) @path))
-  (#match? @name "^(get|post|put|delete|patch|head|options)$"))
-"#,
-    default_method: "GET",
-};
 
 /// JavaScript / Node.js Express route registration query.
 ///

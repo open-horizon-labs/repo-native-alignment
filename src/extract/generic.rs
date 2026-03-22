@@ -1662,7 +1662,7 @@ fn is_test_by_decorator(decorators: &str, fn_name: &str, use_name_prefix: bool) 
 /// Only emits edges for nodes that have a `decorators` metadata entry.
 /// Edges go from the decorated symbol to a pseudo-trait node with
 /// `NodeKind::Trait` and an empty file (unresolved). Confidence is `Detected`.
-fn emit_decorator_implements_edges(nodes: &[Node], path: &Path) -> Vec<Edge> {
+fn emit_decorator_implements_edges(nodes: &[Node], _path: &Path) -> Vec<Edge> {
     let mut edges = Vec::new();
     for node in nodes {
         let decorators = match node.metadata.get("decorators") {

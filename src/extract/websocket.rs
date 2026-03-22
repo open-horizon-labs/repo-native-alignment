@@ -278,6 +278,7 @@ pub fn websocket_pass(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 fn extract_quoted_after(body: &str, prefix: &str) -> Option<String> {
     extract_all_quoted_after(body, prefix).into_iter().next()
 }
