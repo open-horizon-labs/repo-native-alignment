@@ -19,6 +19,9 @@ pub struct OutcomeProgress {
     /// Workspace root slug; "all" for cross-root
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
+    /// Repo path to query (e.g. worktree path); defaults to server repo
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
 }
 
 // ── Unified search tool ─────────────────────────────────────────────
@@ -104,6 +107,9 @@ pub struct Search {
     /// Cross-subsystem query: show only neighbors in this target subsystem. Use with mode="neighbors" to find edges between subsystems.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_subsystem: Option<String>,
+    /// Repo path to query (e.g. worktree path); defaults to server repo
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
 }
 
 fn default_true() -> Option<bool> {
@@ -129,6 +135,9 @@ pub struct RepoMap {
     /// Workspace root slug; "all" for cross-root
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
+    /// Repo path to query (e.g. worktree path); defaults to server repo
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
 }
 
 #[cfg(test)]
@@ -552,6 +561,7 @@ mod tests {
             "Number of top symbols (default: 15)",
             // Shared
             r#"Workspace root slug; "all" for cross-root"#,
+            "Repo path to query (e.g. worktree path); defaults to server repo",
         ];
 
         let max_len = 80;
@@ -562,5 +572,49 @@ mod tests {
                 desc.len()
             );
         }
+    }
+
+    // ── repo parameter tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_search_repo_default_is_none() {
+        let s = parse_search(json!({"query": "test"})).unwrap();
+        assert!(s.repo.is_none());
+    }
+
+    #[test]
+    fn test_search_repo_absolute_path() {
+        let s = parse_search(json!({"query": "test", "repo": "/path/to/worktree"})).unwrap();
+        assert_eq!(s.repo, Some("/path/to/worktree".to_string()));
+    }
+
+    #[test]
+    fn test_search_repo_relative_path() {
+        let s = parse_search(json!({"query": "test", "repo": ".claude/worktrees/my-feature"})).unwrap();
+        assert_eq!(s.repo, Some(".claude/worktrees/my-feature".to_string()));
+    }
+
+    #[test]
+    fn test_repo_map_repo_default_is_none() {
+        let rm: super::RepoMap = serde_json::from_value(json!({})).unwrap();
+        assert!(rm.repo.is_none());
+    }
+
+    #[test]
+    fn test_repo_map_repo_with_path() {
+        let rm: super::RepoMap = serde_json::from_value(json!({"repo": "/path/to/worktree"})).unwrap();
+        assert_eq!(rm.repo, Some("/path/to/worktree".to_string()));
+    }
+
+    #[test]
+    fn test_outcome_progress_repo_default_is_none() {
+        let op: super::OutcomeProgress = serde_json::from_value(json!({"outcome_id": "agent-alignment"})).unwrap();
+        assert!(op.repo.is_none());
+    }
+
+    #[test]
+    fn test_outcome_progress_repo_with_path() {
+        let op: super::OutcomeProgress = serde_json::from_value(json!({"outcome_id": "agent-alignment", "repo": "/path/to/worktree"})).unwrap();
+        assert_eq!(op.repo, Some("/path/to/worktree".to_string()));
     }
 }
