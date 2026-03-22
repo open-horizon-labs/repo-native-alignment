@@ -11,3 +11,4 @@ pub mod directory_module;
 pub mod extractor_config;
 pub mod framework_detect;
 pub mod import_calls;
+pub mod tested_by;
