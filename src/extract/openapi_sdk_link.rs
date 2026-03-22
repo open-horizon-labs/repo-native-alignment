@@ -137,10 +137,15 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
 
         let key = normalize_operation_id(&node.id.name);
         if let Some(ep_ids) = endpoint_by_op_id.get(&key) {
-            for ep_id in ep_ids {
+            // Skip ambiguous matches: if multiple ApiEndpoint nodes share the same
+            // normalized operation_id (e.g. two services in a monorepo both define
+            // `listUsers`), linking to all of them would create false cross-service
+            // edges. Only emit an edge when the match is unambiguous (exactly one
+            // ApiEndpoint has this operation_id).
+            if ep_ids.len() == 1 {
                 edges.push(Edge {
                     from: node.id.clone(),
-                    to: ep_id.clone(),
+                    to: ep_ids[0].clone(),
                     kind: EdgeKind::Implements,
                     source: ExtractionSource::TreeSitter,
                     confidence: Confidence::Detected,
@@ -432,5 +437,36 @@ mod tests {
         let edges = openapi_sdk_link_pass(&nodes);
 
         assert!(edges.is_empty(), "partial name match must not produce edge");
+    }
+
+    /// Adversarial: ambiguous operation_id (multiple ApiEndpoints share the same
+    /// normalized op_id, e.g. two services in a monorepo both define `listUsers`).
+    /// Must NOT emit edges to avoid false cross-service links.
+    #[test]
+    fn test_ambiguous_op_id_skipped() {
+        let nodes = vec![
+            make_sdk_fn("listUsers", "src/api/sdk.gen.ts"),
+            // Two services both have listUsers
+            make_api_endpoint("GET /users", "listUsers", "service-a/openapi/api.yaml"),
+            make_api_endpoint("GET /users", "listUsers", "service-b/openapi/api.yaml"),
+        ];
+        let edges = openapi_sdk_link_pass(&nodes);
+
+        assert!(
+            edges.is_empty(),
+            "ambiguous op_id (2 endpoints) must produce no edge, got: {:?}", edges
+        );
+    }
+
+    /// Verify single-match still works after ambiguity guard.
+    #[test]
+    fn test_unique_op_id_still_links() {
+        let nodes = vec![
+            make_sdk_fn("listUsers", "src/api/sdk.gen.ts"),
+            make_api_endpoint("GET /users", "listUsers", "openapi/api.yaml"),
+        ];
+        let edges = openapi_sdk_link_pass(&nodes);
+
+        assert_eq!(edges.len(), 1, "unique op_id must still produce edge");
     }
 }
