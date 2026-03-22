@@ -862,8 +862,9 @@ impl RnaHandler {
             // 6e. Extend petgraph index to include newly emitted virtual nodes
             // (subsystem, framework, channel, event) and their edges. Step 5 built
             // the index BEFORE these nodes existed, so agents traversing the graph
-            // would miss them. Use targeted incremental updates (not full rebuild)
-            // to keep this O(new nodes + new edges) instead of O(all nodes).
+            // would miss them. Iterates all_nodes/all_edges to find virtual nodes,
+            // then adds only those to the index. This is O(total nodes + total edges)
+            // for the scan but O(virtual nodes) for the index operations.
             for node in &all_nodes {
                 if matches!(&node.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
                     index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
@@ -1423,6 +1424,27 @@ impl RnaHandler {
                     graph.nodes.extend(ws_result.nodes);
                     graph.edges.extend(ws_result.edges);
                 }
+            }
+        }
+
+        // Update petgraph index for virtual nodes added after the initial rebuild
+        // (subsystem, framework, channel, event nodes from steps 6b-6c and pub/sub/ws passes).
+        // The index was rebuilt at line ~1275 (before these passes ran), so virtual nodes
+        // are missing. Add only virtual nodes here — O(virtual nodes + their edges).
+        for node in &graph.nodes {
+            if matches!(&node.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+                graph.index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+            }
+        }
+        for edge in &graph.edges {
+            if matches!(&edge.to.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+                graph.index.add_edge(
+                    &edge.from.to_stable_id(),
+                    &edge.from.kind.to_string(),
+                    &edge.to.to_stable_id(),
+                    &edge.to.kind.to_string(),
+                    edge.kind.clone(),
+                );
             }
         }
 
