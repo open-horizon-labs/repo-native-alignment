@@ -1580,3 +1580,85 @@ pub(crate) fn run_post_extraction_passes(
 
     detected_frameworks
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn make_node(root: &str, file: &str, name: &str, kind: NodeKind, lang: &str) -> Node {
+        Node {
+            id: NodeId {
+                root: root.to_string(),
+                file: PathBuf::from(file),
+                name: name.to_string(),
+                kind,
+            },
+            language: lang.to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: name.to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        }
+    }
+
+    #[test]
+    fn test_run_post_extraction_passes_empty_input() {
+        let mut nodes: Vec<Node> = vec![];
+        let mut edges: Vec<crate::graph::Edge> = vec![];
+        let root_pairs: Vec<(String, PathBuf)> = vec![];
+        let detected = run_post_extraction_passes(&mut nodes, &mut edges, &root_pairs, "test");
+        assert!(nodes.is_empty(), "empty input should yield no nodes");
+        assert!(edges.is_empty(), "empty input should yield no edges");
+        assert!(detected.is_empty(), "empty input should detect no frameworks");
+    }
+
+    #[test]
+    fn test_run_post_extraction_passes_idempotent_edges() {
+        // Running the passes twice with dedup between should not grow the edge count.
+        // This simulates the background scanner calling the function on successive ticks.
+        let node1 = make_node("root", "src/foo.rs", "test_foo", NodeKind::Function, "rust");
+        let node2 = make_node("root", "src/foo.rs", "foo", NodeKind::Function, "rust");
+        let mut nodes = vec![node1, node2];
+        let mut edges: Vec<crate::graph::Edge> = vec![];
+        let root_pairs: Vec<(String, PathBuf)> = vec![];
+
+        let _d1 = run_post_extraction_passes(&mut nodes, &mut edges, &root_pairs, "root");
+        let edge_count_after_first = edges.len();
+
+        // Dedup before second run (mirrors background scanner dedup block).
+        let mut seen = std::collections::HashSet::new();
+        edges.retain(|e| seen.insert(e.stable_id()));
+
+        let _d2 = run_post_extraction_passes(&mut nodes, &mut edges, &root_pairs, "root");
+        // Dedup again as scanner would.
+        let mut seen2 = std::collections::HashSet::new();
+        edges.retain(|e| seen2.insert(e.stable_id()));
+        let edge_count_after_second = edges.len();
+
+        assert_eq!(
+            edge_count_after_first, edge_count_after_second,
+            "post-extraction passes are idempotent when dedup runs between calls (first={edge_count_after_first}, second={edge_count_after_second})"
+        );
+    }
+
+    #[test]
+    fn test_run_post_extraction_passes_no_frameworks_without_imports() {
+        // Framework detection pass requires Import nodes. Without them, the
+        // detected set should be empty.
+        let mut nodes = vec![
+            make_node("root", "src/lib.rs", "my_fn", NodeKind::Function, "rust"),
+        ];
+        let mut edges: Vec<crate::graph::Edge> = vec![];
+        let root_pairs: Vec<(String, PathBuf)> = vec![];
+        let detected = run_post_extraction_passes(&mut nodes, &mut edges, &root_pairs, "root");
+        assert!(
+            detected.is_empty(),
+            "no Import nodes means no detected frameworks, got: {:?}", detected
+        );
+    }
+}
