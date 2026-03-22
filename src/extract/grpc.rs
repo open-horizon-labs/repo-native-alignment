@@ -623,4 +623,100 @@ mod tests {
         assert!(is_grpc_stub_import("import io.grpc.ManagedChannel;"));
         assert!(is_grpc_stub_import("import io.grpc.Channel;"));
     }
+
+    // -----------------------------------------------------------------------
+    // Adversarial tests (seeded from dissent findings)
+    // -----------------------------------------------------------------------
+
+    /// Dissent finding: multi-proto repos with same RPC name in multiple files.
+    /// The pass should emit edges to ALL matching candidates (both are plausible).
+    #[test]
+    fn test_multiple_proto_files_same_rpc_name_emits_all() {
+        let rpc_user = make_proto_rpc("api/user.proto", "GetUser", "UserService");
+        let rpc_admin = make_proto_rpc("api/admin.proto", "GetUser", "AdminService");
+        let caller = make_caller(
+            "client.py",
+            "fetch_user",
+            "resp = stub.GetUser(req)",
+            "python",
+        );
+        let import = make_import("client.py", "import user_pb2_grpc", "python");
+
+        let nodes = vec![rpc_user.clone(), rpc_admin.clone(), caller, import];
+        let edges = grpc_client_calls_pass(&nodes);
+
+        // Both candidates are plausible — both edges should be emitted.
+        assert_eq!(edges.len(), 2,
+            "should emit to all matching RPC candidates, got {:?}", edges);
+        assert!(edges.iter().any(|e| e.to.file == rpc_user.id.file),
+            "missing edge to user.proto");
+        assert!(edges.iter().any(|e| e.to.file == rpc_admin.id.file),
+            "missing edge to admin.proto");
+    }
+
+    /// Dissent finding: verify that a function with no body produces no edges
+    /// even if the file has a gRPC import. Empty body check must hold.
+    #[test]
+    fn test_empty_body_produces_no_edge() {
+        let rpc = make_proto_rpc("api/user.proto", "GetUser", "UserService");
+        let caller = Node {
+            id: crate::graph::NodeId {
+                root: "r".into(),
+                file: std::path::PathBuf::from("client.py"),
+                name: "empty_fn".into(),
+                kind: NodeKind::Function,
+            },
+            language: "python".into(),
+            line_start: 1,
+            line_end: 2,
+            signature: "def empty_fn():".into(),
+            body: String::new(), // empty body
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let import = make_import("client.py", "import user_pb2_grpc", "python");
+
+        let nodes = vec![rpc, caller, import];
+        let edges = grpc_client_calls_pass(&nodes);
+
+        assert!(edges.is_empty(), "empty body should produce no edges, got {:?}", edges);
+    }
+
+    /// Dissent finding: `parent_service` metadata is the key contract.
+    /// Function nodes WITHOUT `parent_service` (regular functions) must not
+    /// be treated as RPC targets even if their name matches a stub call.
+    #[test]
+    fn test_non_rpc_function_node_not_targeted() {
+        // A regular Python function named "GetUser" (no parent_service metadata).
+        let regular_fn = make_caller("service.py", "GetUser", "def GetUser(req): ...", "python");
+        let caller = make_caller(
+            "client.py",
+            "fetch_user",
+            "resp = stub.GetUser(req)",
+            "python",
+        );
+        let import = make_import("client.py", "import user_pb2_grpc", "python");
+
+        let nodes = vec![regular_fn, caller, import];
+        let edges = grpc_client_calls_pass(&nodes);
+
+        // Regular function nodes have no `parent_service` — they are not indexed
+        // as RPC targets, so no edge should be emitted.
+        assert!(edges.is_empty(),
+            "non-RPC functions must not be targeted by grpc pass, got {:?}", edges);
+    }
+
+    /// Adversarial: short method names (< 3 chars) must be skipped.
+    #[test]
+    fn test_short_rpc_name_skipped() {
+        let rpc = make_proto_rpc("api/x.proto", "Do", "XService"); // 2-char name
+        let caller = make_caller("c.py", "fn_do", "resp = stub.Do(req)", "python");
+        let import = make_import("c.py", "import x_pb2_grpc", "python");
+
+        let nodes = vec![rpc, caller, import];
+        let edges = grpc_client_calls_pass(&nodes);
+
+        // "Do" is < 3 chars — should be skipped by the length guard.
+        assert!(edges.is_empty(), "short RPC names must be filtered, got {:?}", edges);
+    }
 }
