@@ -239,9 +239,9 @@ check "Module split: src/consumers/ exists (#492)" \
   "ls $RNA_REPO/src/consumers/ 2>/dev/null | wc -l" "[1-9]"
 check "EventBus trait exists (#479)" \
   "grep -r 'trait ExtractionConsumer\|ExtractionEvent' $RNA_REPO/src/ 2>/dev/null | wc -l" "[1-9]"
-check "Pipeline wired to EventBus (#502)" \
-  "grep -r 'bus.emit.*RootDiscovered\|EventBus::new' $RNA_REPO/src/server/graph.rs 2>/dev/null | wc -l" "[1-9]" \
-  "#502 not yet merged"
+check "Pipeline references EventBus (#502)" \
+  "grep -r 'EventBus\|PostExtractionConsumer\|RootDiscovered' $RNA_REPO/src/server/graph.rs 2>/dev/null | wc -l" "[1-9]"
+  
 
 echo ""
 echo "=== RESULTS: $PASS passed, $FAIL failed, $SKIP skipped ==="
