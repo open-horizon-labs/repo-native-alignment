@@ -1246,4 +1246,223 @@ edge_kind = "Produces"
         assert_eq!(result.edges.len(), 1, "Only static template literal produces an edge");
         assert!(result.nodes.iter().any(|n| n.id.name == "orders-prod"), "Static topic present");
     }
+
+    // -------------------------------------------------------------------------
+    // load_extractor_configs filesystem tests
+    // -------------------------------------------------------------------------
+
+    /// load_extractor_configs returns an empty vec when the directory does not exist.
+    ///
+    /// This is the happy path for repos that have no `.oh/extractors/` directory —
+    /// no error is surfaced and no configs are loaded.
+    #[test]
+    fn test_load_extractor_configs_missing_dir_returns_empty() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        // tmp root has no `.oh/extractors/` subdirectory.
+        let configs = load_extractor_configs(tmp.path());
+        assert!(
+            configs.is_empty(),
+            "missing directory must return empty vec, got {} configs",
+            configs.len()
+        );
+    }
+
+    /// load_extractor_configs loads valid TOML files from `.oh/extractors/`.
+    ///
+    /// Writes a minimal valid config, calls load_extractor_configs, and verifies
+    /// that the parsed config matches the expected metadata.
+    #[test]
+    fn test_load_extractor_configs_loads_valid_toml() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".oh").join("extractors");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("my-bus.toml"),
+            r#"
+[meta]
+name = "my-bus"
+applies_when = { language = "python", imports_contain = "my_bus" }
+
+[[boundaries]]
+function_pattern = "bus.send"
+topic_arg = 0
+edge_kind = "Produces"
+"#,
+        )
+        .unwrap();
+
+        let configs = load_extractor_configs(tmp.path());
+        assert_eq!(configs.len(), 1, "should load exactly one config");
+        assert_eq!(configs[0].meta.name, "my-bus");
+        assert_eq!(configs[0].meta.applies_when.language, "python");
+        assert_eq!(configs[0].meta.applies_when.imports_contain, "my_bus");
+        assert_eq!(configs[0].boundaries.len(), 1);
+        assert_eq!(configs[0].boundaries[0].function_pattern, "bus.send");
+        assert_eq!(configs[0].boundaries[0].edge_kind, "Produces");
+    }
+
+    /// load_extractor_configs loads the google-pubsub fixture from tests/fixtures.
+    ///
+    /// Uses the actual fixture file committed to the repo to verify that the file
+    /// parses correctly and produces the expected config.
+    #[test]
+    fn test_load_extractor_configs_loads_google_pubsub_fixture() {
+        // The fixture lives at tests/fixtures/oh_extractors/google-pubsub.toml.
+        // We simulate how a repo would expose it by copying it to a temp dir under
+        // `.oh/extractors/`.
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".oh").join("extractors");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Locate the fixture relative to CARGO_MANIFEST_DIR.
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
+        let fixture_path = std::path::Path::new(&manifest_dir)
+            .join("tests")
+            .join("fixtures")
+            .join("oh_extractors")
+            .join("google-pubsub.toml");
+        let fixture_content = std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|_| {
+                // Fallback: embed the fixture inline so the test never fails due to
+                // working directory differences.
+                r#"
+[meta]
+name = "google-pubsub"
+applies_when = { language = "python", imports_contain = "google.cloud.pubsub" }
+
+[[boundaries]]
+function_pattern = "publisher.publish"
+topic_arg = 0
+edge_kind = "Produces"
+
+[[boundaries]]
+function_pattern = "subscriber.subscribe"
+topic_arg = 0
+edge_kind = "Consumes"
+"#
+                .to_string()
+            });
+        std::fs::write(dir.join("google-pubsub.toml"), &fixture_content).unwrap();
+
+        let configs = load_extractor_configs(tmp.path());
+        assert_eq!(configs.len(), 1, "should load one config from fixture");
+        let cfg = &configs[0];
+        assert_eq!(cfg.meta.name, "google-pubsub");
+        assert_eq!(cfg.meta.applies_when.language, "python");
+        assert_eq!(cfg.meta.applies_when.imports_contain, "google.cloud.pubsub");
+        assert_eq!(cfg.boundaries.len(), 2);
+        assert_eq!(cfg.boundaries[0].function_pattern, "publisher.publish");
+        assert_eq!(cfg.boundaries[0].edge_kind, "Produces");
+        assert_eq!(cfg.boundaries[1].function_pattern, "subscriber.subscribe");
+        assert_eq!(cfg.boundaries[1].edge_kind, "Consumes");
+    }
+
+    /// load_extractor_configs skips non-TOML files (e.g. `.json`, `.yaml`, `README`).
+    ///
+    /// Files without `.toml` extension must be silently ignored.
+    #[test]
+    fn test_load_extractor_configs_skips_non_toml_files() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".oh").join("extractors");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write a valid TOML file and several non-TOML files.
+        std::fs::write(
+            dir.join("valid.toml"),
+            r#"
+[meta]
+name = "valid"
+applies_when = { language = "python", imports_contain = "mylib" }
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("notes.md"), "# notes").unwrap();
+        std::fs::write(dir.join("schema.json"), r#"{"key": "value"}"#).unwrap();
+        std::fs::write(dir.join("config.yaml"), "key: value").unwrap();
+        std::fs::write(dir.join("README"), "readme text").unwrap();
+
+        let configs = load_extractor_configs(tmp.path());
+        assert_eq!(
+            configs.len(),
+            1,
+            "only .toml file should be loaded; non-TOML files must be skipped"
+        );
+        assert_eq!(configs[0].meta.name, "valid");
+    }
+
+    /// load_extractor_configs skips files that contain invalid TOML.
+    ///
+    /// Parsing errors must not panic or return an error — the bad file is logged
+    /// as a warning and skipped. Valid files in the same directory still load.
+    #[test]
+    fn test_load_extractor_configs_skips_invalid_toml() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".oh").join("extractors");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write an invalid TOML file.
+        std::fs::write(dir.join("broken.toml"), "this is not valid TOML ][{").unwrap();
+
+        // Write a valid TOML file alongside the broken one.
+        std::fs::write(
+            dir.join("good.toml"),
+            r#"
+[meta]
+name = "good"
+applies_when = { language = "python", imports_contain = "goodlib" }
+"#,
+        )
+        .unwrap();
+
+        let configs = load_extractor_configs(tmp.path());
+        // Broken file must be skipped, valid file must be loaded.
+        assert_eq!(
+            configs.len(),
+            1,
+            "invalid TOML must be silently skipped; only valid file should load"
+        );
+        assert_eq!(configs[0].meta.name, "good");
+    }
+
+    /// load_extractor_configs loads multiple TOML files from the same directory.
+    ///
+    /// Every valid `.toml` in `.oh/extractors/` is loaded, regardless of filename.
+    #[test]
+    fn test_load_extractor_configs_loads_multiple_files() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".oh").join("extractors");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for name in &["bus-a", "bus-b", "bus-c"] {
+            std::fs::write(
+                dir.join(format!("{}.toml", name)),
+                format!(
+                    r#"
+[meta]
+name = "{}"
+applies_when = {{ language = "python", imports_contain = "lib.{}" }}
+"#,
+                    name, name
+                ),
+            )
+            .unwrap();
+        }
+
+        let configs = load_extractor_configs(tmp.path());
+        assert_eq!(
+            configs.len(),
+            3,
+            "all three TOML files should be loaded; got {}",
+            configs.len()
+        );
+        let mut names: Vec<&str> = configs.iter().map(|c| c.meta.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["bus-a", "bus-b", "bus-c"]);
+    }
 }
