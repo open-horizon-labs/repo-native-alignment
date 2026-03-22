@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::scanner::DEFAULT_EXCLUDES;
+use crate::walk::is_worktree_with_own_cache;
 
 // ── Root types ──────────────────────────────────────────────────────
 
@@ -231,6 +232,16 @@ impl WorkspaceConfig {
 
             // Skip if already present (e.g. from user's roots.toml).
             if self.roots.iter().any(|r| r.resolved_path() == worktree_path) {
+                continue;
+            }
+
+            // Skip worktrees that maintain their own RNA index — they manage
+            // their own scan lifecycle and should not be indexed by the main repo.
+            if is_worktree_with_own_cache(&worktree_path) {
+                tracing::info!(
+                    "skipping worktree {}: has own RNA cache",
+                    worktree_path.display()
+                );
                 continue;
             }
 
@@ -1442,6 +1453,66 @@ excludes = ["*.iso", "*.dmg"]
         let slugs: Vec<&str> = lsp_roots.iter().map(|(s, _)| s.as_str()).collect();
         assert!(slugs.contains(&"client"), "client should be in lsp_only_roots");
         assert!(slugs.contains(&"ai-service"), "ai_service (sanitized) should be in lsp_only_roots");
+    }
+
+    // ── with_worktrees RNA-cache skip tests ────────────────────────────────
+
+    /// A linked worktree that has its own `.oh/.cache/lance/` must NOT be
+    /// added as a root by `with_worktrees()`.
+    #[test]
+    fn test_with_worktrees_skips_worktree_with_own_cache() {
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path();
+
+        // Create a worktree checkout with .git file + own RNA cache
+        let wt_path = tmp.path().join("wt-with-cache");
+        std::fs::create_dir_all(&wt_path).unwrap();
+        std::fs::write(wt_path.join(".git"), "gitdir: ../.git/worktrees/wt-with-cache\n").unwrap();
+        std::fs::create_dir_all(wt_path.join(".oh").join(".cache").join("lance")).unwrap();
+
+        // Register it in .git/worktrees/<name>/gitdir
+        let wt_admin = repo_root.join(".git").join("worktrees").join("wt-with-cache");
+        std::fs::create_dir_all(&wt_admin).unwrap();
+        std::fs::write(
+            wt_admin.join("gitdir"),
+            format!("{}/.git", wt_path.display()),
+        ).unwrap();
+
+        let config = WorkspaceConfig::default().with_worktrees(repo_root);
+        assert!(
+            config.roots.is_empty(),
+            "Worktree with own RNA cache must be skipped by with_worktrees(); got: {:?}",
+            config.roots
+        );
+    }
+
+    /// A linked worktree WITHOUT its own cache must still be added as a root.
+    #[test]
+    fn test_with_worktrees_includes_worktree_without_cache() {
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path();
+
+        // Create a worktree checkout with .git file but NO cache
+        let wt_path = tmp.path().join("wt-no-cache");
+        std::fs::create_dir_all(&wt_path).unwrap();
+        std::fs::write(wt_path.join(".git"), "gitdir: ../.git/worktrees/wt-no-cache\n").unwrap();
+        // Note: no .oh/.cache/lance/ created
+
+        // Register it in .git/worktrees/<name>/gitdir
+        let wt_admin = repo_root.join(".git").join("worktrees").join("wt-no-cache");
+        std::fs::create_dir_all(&wt_admin).unwrap();
+        std::fs::write(
+            wt_admin.join("gitdir"),
+            format!("{}/.git", wt_path.display()),
+        ).unwrap();
+
+        let config = WorkspaceConfig::default().with_worktrees(repo_root);
+        assert_eq!(
+            config.roots.len(), 1,
+            "Worktree WITHOUT its own cache must be added as a root; got: {:?}",
+            config.roots
+        );
+        assert_eq!(config.roots[0].resolved_path(), wt_path);
     }
 }
 
