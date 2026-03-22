@@ -652,4 +652,38 @@ mod tests {
         let result = handler.resolve_repo_path(".");
         assert!(result.is_err(), "relative path '.' should be rejected");
     }
+
+    // ── Adversarial: repo parameter edge cases ──────────────────────────
+
+    /// Empty string is not an absolute path — must be rejected.
+    #[test]
+    fn test_resolve_repo_path_empty_string_is_rejected() {
+        let root = PathBuf::from("/srv/main-repo");
+        let handler = make_handler(&root);
+        let result = handler.resolve_repo_path("");
+        assert!(result.is_err(), "empty string should be rejected as relative path");
+        let err = result.unwrap_err();
+        assert!(err.contains("absolute path"), "error should mention absolute path: {}", err);
+    }
+
+    /// A path with just a slash followed by nothing is still absolute.
+    #[test]
+    fn test_resolve_repo_path_root_slash_is_absolute() {
+        let root = PathBuf::from("/srv/main-repo");
+        let handler = make_handler(&root);
+        let result = handler.resolve_repo_path("/");
+        assert!(result.is_ok(), "/ is an absolute path");
+        assert_eq!(result.unwrap(), PathBuf::from("/"));
+    }
+
+    /// Error message for relative path must mention how to fix it.
+    #[test]
+    fn test_resolve_repo_path_error_message_is_actionable() {
+        let root = PathBuf::from("/srv/main-repo");
+        let handler = make_handler(&root);
+        let err = handler.resolve_repo_path("worktrees/my-feature").unwrap_err();
+        // Must explain the problem and how to fix it
+        assert!(err.contains("absolute path"), "should say to use absolute path: {}", err);
+        assert!(err.contains("worktrees/my-feature"), "should echo back the bad value: {}", err);
+    }
 }
