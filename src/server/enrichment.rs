@@ -265,7 +265,17 @@ impl RnaHandler {
                     // graph missing api_link, manifest, tested_by, directory_module,
                     // import_calls, framework_detection, nextjs_routing, pubsub, and
                     // websocket edges/nodes. Fix for #471.
+                    //
+                    // We snapshot stable_ids BEFORE the passes to compute the net-new
+                    // nodes/edges added by them. These additions are persisted to LanceDB
+                    // via a separate lance_delta entry so they survive restarts/reloads.
                     {
+                        // Snapshot existing stable_ids before the passes run.
+                        let before_node_ids: std::collections::HashSet<String> =
+                            graph_state.nodes.iter().map(|n| n.stable_id()).collect();
+                        let before_edge_ids: std::collections::HashSet<String> =
+                            graph_state.edges.iter().map(|e| e.stable_id()).collect();
+
                         let root_pairs: Vec<(String, std::path::PathBuf)> =
                             WorkspaceConfig::load()
                                 .with_primary_root(repo_root.clone())
@@ -284,19 +294,52 @@ impl RnaHandler {
                             &primary_slug,
                         );
                         graph_state.detected_frameworks = detected;
-                    }
 
-                    // Deduplicate nodes and edges after post-extraction passes.
-                    // Passes re-emit edges that may already be present from cached
-                    // roots; dedup here mirrors the full-build dedup block (6z).
-                    {
-                        let mut seen_nodes = std::collections::HashSet::new();
-                        graph_state.nodes.reverse();
-                        graph_state.nodes.retain(|n| seen_nodes.insert(n.stable_id()));
-                        graph_state.nodes.reverse();
+                        // Deduplicate nodes and edges after post-extraction passes.
+                        // Passes re-emit edges that may already be present from cached
+                        // roots; dedup here mirrors the full-build dedup block (6z).
+                        {
+                            let mut seen_nodes = std::collections::HashSet::new();
+                            graph_state.nodes.reverse();
+                            graph_state.nodes.retain(|n| seen_nodes.insert(n.stable_id()));
+                            graph_state.nodes.reverse();
 
-                        let mut seen_edges = std::collections::HashSet::new();
-                        graph_state.edges.retain(|e| seen_edges.insert(e.stable_id()));
+                            let mut seen_edges = std::collections::HashSet::new();
+                            graph_state.edges.retain(|e| seen_edges.insert(e.stable_id()));
+                        }
+
+                        // Collect net-new nodes/edges introduced by the passes.
+                        // These must be persisted to LanceDB so they survive restarts.
+                        let new_nodes: Vec<Node> = graph_state
+                            .nodes
+                            .iter()
+                            .filter(|n| !before_node_ids.contains(&n.stable_id()))
+                            .cloned()
+                            .collect();
+                        let new_edges: Vec<Edge> = graph_state
+                            .edges
+                            .iter()
+                            .filter(|e| !before_edge_ids.contains(&e.stable_id()))
+                            .cloned()
+                            .collect();
+
+                        if !new_nodes.is_empty() || !new_edges.is_empty() {
+                            tracing::info!(
+                                "Post-extraction passes added {} node(s), {} edge(s) to persist delta",
+                                new_nodes.len(),
+                                new_edges.len()
+                            );
+                            // Use repo_root as the path for cross-cutting additions
+                            // (api_link, manifest, etc. are global, not per-root).
+                            lance_deltas.push((
+                                primary_slug,
+                                repo_root.clone(),
+                                new_nodes,
+                                new_edges,
+                                Vec::new(), // no deletions — passes only add
+                                Vec::new(), // no files removed
+                            ));
+                        }
                     }
 
                     // Rebuild petgraph index.
