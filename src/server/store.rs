@@ -1658,6 +1658,7 @@ mod tests {
 
     /// `check_and_migrate_extraction_version` is a no-op on fresh directories
     /// (no prior version file) and does NOT clear any state files.
+    /// It DOES write the current EXTRACTION_VERSION so the next call is a no-op.
     #[test]
     fn test_extraction_version_fresh_directory_no_clear() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1670,6 +1671,68 @@ mod tests {
             .expect("migration failed on fresh dir");
         // Fresh directory: stored_version is None, so Ok(false) — no migration.
         assert!(!migrated, "expected migration=false for fresh directory");
+
+        // The version file must be written to db_path (the lance/ subdir), not the
+        // parent .cache/ directory. This invariant ensures a subsequent EXTRACTION_VERSION
+        // bump is detected on the next run.
+        let version_file = db_path.join("extraction_version");
+        assert!(
+            version_file.exists(),
+            "extraction_version must be written to lance/ subdir on first run, not found at {}",
+            version_file.display()
+        );
+        let stored: u32 = std::fs::read_to_string(&version_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            stored,
+            EXTRACTION_VERSION,
+            "extraction_version file should contain current EXTRACTION_VERSION"
+        );
+
+        // The parent .cache/ dir must NOT have a stray extraction_version file.
+        let parent_version_file = dir.path().join("extraction_version");
+        assert!(
+            !parent_version_file.exists(),
+            "extraction_version must NOT be written to the parent .cache/ dir (found at {})",
+            parent_version_file.display()
+        );
+    }
+
+    /// `extraction_version` path invariant: the file lives inside `lance/`, not the
+    /// parent `.cache/` directory.  If it were written to `.oh/.cache/extraction_version`
+    /// instead of `.oh/.cache/lance/extraction_version`, the check would never find a
+    /// stored version and would silently treat every run as "fresh", meaning bumping
+    /// EXTRACTION_VERSION would never trigger re-extraction.
+    #[test]
+    fn test_extraction_version_file_path_is_inside_lance_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // db_path is the lance/ subdirectory, as graph_lance_path() returns.
+        let db_path = dir.path().join("lance");
+        let repo_root = dir.path();
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        check_and_migrate_extraction_version(&db_path, repo_root, &[])
+            .expect("initial write failed");
+
+        // Correct location: inside lance/
+        let correct_path = db_path.join("extraction_version");
+        assert!(
+            correct_path.exists(),
+            "extraction_version must be at lance/extraction_version, not found at {}",
+            correct_path.display()
+        );
+
+        // Wrong location: parent dir (.oh/.cache/ without lance/)
+        let wrong_path = dir.path().join("extraction_version");
+        assert!(
+            !wrong_path.exists(),
+            "extraction_version must NOT be at .cache/extraction_version (found at {}); \
+             write path must match read path in check_and_migrate_extraction_version",
+            wrong_path.display()
+        );
     }
 
     /// `is_conflict_error` correctly identifies conflict-like messages and ignores others.
