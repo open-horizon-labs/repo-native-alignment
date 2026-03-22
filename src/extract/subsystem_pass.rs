@@ -49,6 +49,11 @@ pub struct SubsystemNodeResult {
     pub edges: Vec<Edge>,
 }
 
+// Metadata key constants for subsystem nodes.
+const META_SYMBOL_COUNT: &str = "symbol_count";
+const META_COHESION: &str = "cohesion";
+const META_INTERFACES: &str = "interfaces";
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -97,11 +102,8 @@ pub fn subsystem_node_pass(
         };
 
         let mut metadata = BTreeMap::new();
-        metadata.insert("symbol_count".to_string(), subsystem.symbol_count.to_string());
-        metadata.insert(
-            "cohesion".to_string(),
-            format!("{:.4}", subsystem.cohesion),
-        );
+        metadata.insert(META_SYMBOL_COUNT.to_owned(), subsystem.symbol_count.to_string());
+        metadata.insert(META_COHESION.to_owned(), format!("{:.4}", subsystem.cohesion));
         // Store interface names for display (comma-separated, top 3).
         let iface_names: Vec<String> = subsystem
             .interfaces
@@ -118,7 +120,7 @@ pub fn subsystem_node_pass(
             })
             .collect();
         if !iface_names.is_empty() {
-            metadata.insert("interfaces".to_string(), iface_names.join(", "));
+            metadata.insert(META_INTERFACES.to_owned(), iface_names.join(", "));
         }
 
         let subsystem_node = Node {
@@ -270,11 +272,11 @@ mod tests {
         let result = subsystem_node_pass(&[subsystem], &all_nodes, "repo");
 
         let sub_node = &result.nodes[0];
-        assert!(sub_node.metadata.contains_key("symbol_count"));
-        assert!(sub_node.metadata.contains_key("cohesion"));
-        assert!(sub_node.metadata.contains_key("interfaces"));
+        assert!(sub_node.metadata.contains_key(META_SYMBOL_COUNT));
+        assert!(sub_node.metadata.contains_key(META_COHESION));
+        assert!(sub_node.metadata.contains_key(META_INTERFACES));
         assert_eq!(
-            sub_node.metadata.get("symbol_count").map(|s| s.as_str()),
+            sub_node.metadata.get(META_SYMBOL_COUNT).map(|s| s.as_str()),
             Some("2")
         );
     }

@@ -1087,6 +1087,14 @@ impl RnaHandler {
             }
         }
 
+        // Pre-clean: remove stale subsystem first-class nodes and their BelongsTo edges
+        // from the previous scan BEFORE dedup/index/PageRank. This ensures that
+        // detect_communities() (which uses the petgraph index) only sees real code symbols,
+        // not previously-emitted virtual subsystem nodes — preventing inflated PageRank and
+        // spurious community membership for virtual nodes.
+        graph.nodes.retain(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "subsystem"));
+        graph.edges.retain(|e| !matches!(&e.to.kind, NodeKind::Other(s) if s == "subsystem"));
+
         // Deduplicate graph.nodes and graph.edges in-place before rebuilding the
         // petgraph index.  Post-extraction passes (api_link, manifest, tested_by,
         // directory_module, nextjs_routing) re-run over the full node/edge set on
@@ -1203,11 +1211,8 @@ impl RnaHandler {
                 }
             }
 
-            // Emit / refresh first-class subsystem nodes + BelongsTo edges.
-            // Drop stale subsystem nodes from graph first, then add fresh ones.
-            graph.nodes.retain(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "subsystem"));
-            graph.edges.retain(|e| !matches!(&e.to.kind, NodeKind::Other(s) if s == "subsystem"));
-
+            // Emit first-class subsystem nodes + BelongsTo edges.
+            // Stale nodes were already removed in the pre-clean step above.
             let sub_result = subsystem_node_pass(&subsystems, &graph.nodes, &primary_slug);
             if !sub_result.nodes.is_empty() {
                 tracing::info!(
