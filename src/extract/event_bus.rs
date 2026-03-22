@@ -40,7 +40,7 @@
 //! - No broker-specific knowledge (`kafka`, `pubsub`, `rabbitmq`) in RNA core.
 //! - All pipeline paths go through `EventBus::run()`.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
 use crate::graph::{Edge, Node};
@@ -201,11 +201,12 @@ impl EventBus {
     /// Returns all events emitted (including the seed), in emission order.
     /// This is primarily useful for testing.
     pub fn emit(&self, seed: ExtractionEvent) -> Vec<ExtractionEvent> {
-        let mut queue: Vec<ExtractionEvent> = vec![seed];
+        // Use VecDeque for O(1) front removal rather than O(n) Vec::remove(0).
+        let mut queue: VecDeque<ExtractionEvent> = VecDeque::new();
+        queue.push_back(seed);
         let mut emitted: Vec<ExtractionEvent> = Vec::new();
 
-        while let Some(event) = queue.first().cloned() {
-            queue.remove(0);
+        while let Some(event) = queue.pop_front() {
             let kind = event.kind();
 
             // Collect follow-on events from all subscribers, in registration order.
@@ -241,8 +242,14 @@ impl EventBus {
             emitted.push(event);
             // Prepend follow-ons so depth-first ordering is preserved:
             // follow-ons from this event are processed before the next sibling.
-            follow_ons.extend(queue.drain(..));
-            queue = follow_ons;
+            // drain remaining queue items to rebuild with follow-ons first.
+            let remaining: Vec<_> = queue.drain(..).collect();
+            for fo in follow_ons {
+                queue.push_back(fo);
+            }
+            for r in remaining {
+                queue.push_back(r);
+            }
         }
 
         emitted

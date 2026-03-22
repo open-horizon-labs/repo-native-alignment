@@ -575,6 +575,48 @@ impl ExtractionConsumer for CustomExtractorConsumer {
 }
 
 // ---------------------------------------------------------------------------
+// SubsystemConsumer
+// ---------------------------------------------------------------------------
+
+/// Subscribes to `PassesComplete` and handles subsystem node promotion.
+///
+/// **Phase 2 stub.** In Phase 3+, this consumer will run `subsystem_node_pass`
+/// after the graph index is built. In Phase 2, subsystem detection requires
+/// `GraphIndex::detect_communities()` which is not available in the event payload —
+/// it runs synchronously inside `build_full_graph_inner` after the graph is assembled.
+///
+/// This stub establishes the subscription slot per the ADR consumer migration list.
+/// The issue spec maps: `subsystem_node_pass → PassesComplete`.
+///
+/// Subscribes to: `PassesComplete`
+/// Emits: nothing (Phase 2 stub)
+pub struct SubsystemConsumer;
+
+impl ExtractionConsumer for SubsystemConsumer {
+    fn name(&self) -> &str { "subsystem" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::PassesComplete]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::PassesComplete { slug, nodes, .. } = event else {
+            return Ok(vec![]);
+        };
+        // Phase 2: subsystem detection requires GraphIndex::detect_communities()
+        // which is not available in the event payload. It runs inside
+        // build_full_graph_inner after the graph is assembled. This consumer
+        // establishes the subscription slot; Phase 3+ moves the logic here.
+        tracing::debug!(
+            "SubsystemConsumer: root '{}' — {} nodes (Phase 2 stub, subsystem detection runs in graph pipeline)",
+            slug,
+            nodes.len(),
+        );
+        Ok(vec![])
+    }
+}
+
+// ---------------------------------------------------------------------------
 // EventBus::with_builtins
 // ---------------------------------------------------------------------------
 
@@ -616,6 +658,9 @@ pub fn build_builtin_bus(
     bus.register(Box::new(NextjsRoutingConsumer::new(root_pairs)));
     bus.register(Box::new(PubSubConsumer));
     bus.register(Box::new(WebSocketConsumer));
+
+    // --- PassesComplete consumers ---
+    bus.register(Box::new(SubsystemConsumer));
 
     bus
 }
@@ -804,8 +849,12 @@ mod tests {
     #[test]
     fn test_builtin_bus_has_consumers_for_all_event_kinds() {
         let bus = build_builtin_bus(vec![], "test".into());
-        // Must have at least one consumer for each key event kind
-        assert!(bus.len() >= 8, "Expected at least 8 consumers, got {}", bus.len());
+        // Must have at least one consumer for each key event kind.
+        // Current: ManifestConsumer, TreeSitterConsumer, LanguageAccumulatorConsumer,
+        // PostExtractionConsumer, OpenApiConsumer, GrpcConsumer,
+        // FrameworkDetectionConsumer, NextjsRoutingConsumer, PubSubConsumer,
+        // WebSocketConsumer, SubsystemConsumer = 11
+        assert!(bus.len() >= 11, "Expected at least 11 consumers, got {}", bus.len());
     }
 
     /// Verify PostExtractionConsumer emits PassesComplete on empty input.
