@@ -32,7 +32,9 @@ pub const SCHEMA_VERSION: u32 = 16; // slug portability: root_id now uses direct
 /// nodes and BelongsTo edges after community detection.
 /// Bumped to 6 for framework detection pass (#469): emits NodeKind::Other("framework")
 /// nodes and adds UsesFramework/Produces/Consumes EdgeKinds.
-pub const EXTRACTION_VERSION: u32 = 6;
+/// Bumped to 7 for pub/sub + websocket extractors (#464/#467): Produces/Consumes edges,
+/// channel/event nodes. Gates nextjs_routing_pass on framework detection.
+pub const EXTRACTION_VERSION: u32 = 7;
 
 /// Arrow schema for the `symbols` table.
 ///
