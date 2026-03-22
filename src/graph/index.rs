@@ -3325,4 +3325,61 @@ mod tests {
             subsystems.len()
         );
     }
+
+    /// Performance gate for the Phase 2 O(K²) regression fix.
+    ///
+    /// Builds a sparse graph with 200 nodes in 100 communities (2 nodes each)
+    /// with weak inter-community edges so Phase 2 runs many rounds. With the
+    /// old O(rounds × (N + K²)) implementation this would be ~40× slower.
+    ///
+    /// Run with `cargo test --lib louvain_phase2_perf -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn louvain_phase2_perf() {
+        use std::time::Instant;
+
+        // 100 pairs of nodes, each pair is a 2-node community with intra-edge.
+        // Inter-community edge between adjacent pairs to trigger many Phase 2 rounds.
+        let mut index = GraphIndex::new();
+        let n = 100;
+        for i in 0..n {
+            let a = format!("node_{}_a", i);
+            let b = format!("node_{}_b", i);
+            index.add_edge(&a, "fn", &b, "fn", EdgeKind::Calls);
+            index.add_edge(&b, "fn", &a, "fn", EdgeKind::Calls);
+        }
+        // Sparse inter-community links: pair i connects to pair i+1
+        for i in 0..(n - 1) {
+            let from = format!("node_{}_a", i);
+            let to = format!("node_{}_a", i + 1);
+            index.add_edge(&from, "fn", &to, "fn", EdgeKind::Calls);
+        }
+
+        let pagerank = index.compute_pagerank(0.85, 20);
+        let mut file_map: HashMap<String, String> = HashMap::new();
+        for i in 0..n {
+            let module = format!("src/mod{}/mod.rs", i / 10);
+            file_map.insert(format!("node_{}_a", i), module.clone());
+            file_map.insert(format!("node_{}_b", i), module.clone());
+        }
+
+        let start = Instant::now();
+        let subsystems = index.detect_communities(&pagerank, &file_map);
+        let elapsed = start.elapsed();
+
+        println!(
+            "louvain_phase2_perf: {} nodes, {} subsystems detected in {:?}",
+            2 * n,
+            subsystems.len(),
+            elapsed
+        );
+
+        // Should complete in well under 1 second even on debug builds.
+        // The old O(K²) implementation would take ~10-100× longer on this graph.
+        assert!(
+            elapsed.as_secs() < 2,
+            "Phase 2 took too long ({:?}) — regression in O(K²) incremental update?",
+            elapsed
+        );
+    }
 }
