@@ -1,0 +1,885 @@
+//! Built-in `ExtractionConsumer` implementations.
+//!
+//! Each consumer wraps an existing extraction pass and subscribes to the
+//! appropriate event. No consumer imports or calls another consumer.
+//!
+//! # Registration order
+//!
+//! Consumers must be registered in the order shown in `EventBus::with_builtins()`.
+//! The ordering invariant:
+//!
+//! 1. `ManifestConsumer` — subscribes to `RootDiscovered` (needs filesystem)
+//! 2. `TreeSitterConsumer` — subscribes to `RootDiscovered`, emits `RootExtracted`
+//! 3. `LanguageAccumulatorConsumer` — subscribes to `RootExtracted`, emits `LanguageDetected`
+//! 4. `PostExtractionConsumer` — subscribes to `RootExtracted`, runs all post-extraction passes,
+//!    emits `PassesComplete` (and `FrameworkDetected` for each detected framework)
+//! 5. `EmbeddingConsumer` — subscribes to `RootExtracted` (streaming embed as nodes arrive)
+//!
+//! The `LspConsumer` and persistence consumers (`SubsystemConsumer`, `LanceDBConsumer`) are
+//! wired separately by the pipeline bootstrap because they require async execution.
+//! In Phase 2 they continue to run via the existing spawn_background_enrichment path;
+//! the event bus handles the synchronous portion of the pipeline.
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+use crate::extract::ExtractorRegistry;
+use crate::extract::event_bus::{ExtractionConsumer, ExtractionEvent, ExtractionEventKind};
+use crate::graph::Node;
+
+// ---------------------------------------------------------------------------
+// ManifestConsumer
+// ---------------------------------------------------------------------------
+
+/// Runs `manifest_pass` when a root is discovered.
+///
+/// Subscribes to: `RootDiscovered`
+/// Emits: nothing (manifest nodes are returned via `PassComplete` in the
+/// `PostExtractionConsumer` flow; this consumer is a stub for the subscription
+/// pattern — manifest is already handled inside `PostExtractionRegistry`).
+///
+/// In the ADR's design, `manifest_pass` subscribes to `RootDiscovered` because
+/// it needs filesystem access (reads `package.json`, `Cargo.toml`, etc.).
+/// For Phase 2 we keep manifest inside `PostExtractionRegistry` (which runs on
+/// `RootExtracted`) to avoid duplicating filesystem reads. This consumer
+/// establishes the subscription slot for Phase 3+ when manifest is promoted.
+pub struct ManifestConsumer;
+
+impl ExtractionConsumer for ManifestConsumer {
+    fn name(&self) -> &str { "manifest" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::RootDiscovered]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::RootDiscovered { slug, .. } = event else {
+            return Ok(vec![]);
+        };
+        tracing::debug!("ManifestConsumer: root '{}' discovered (manifest handled by PostExtractionConsumer)", slug);
+        Ok(vec![])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TreeSitterConsumer
+// ---------------------------------------------------------------------------
+
+/// Runs tree-sitter extraction when a root is discovered.
+///
+/// Subscribes to: `RootDiscovered`
+/// Emits: `RootExtracted` (carrying all nodes + edges for this root)
+pub struct TreeSitterConsumer {
+    registry: ExtractorRegistry,
+}
+
+impl TreeSitterConsumer {
+    pub fn new() -> Self {
+        Self {
+            registry: ExtractorRegistry::with_builtins(),
+        }
+    }
+}
+
+impl Default for TreeSitterConsumer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExtractionConsumer for TreeSitterConsumer {
+    fn name(&self) -> &str { "tree_sitter" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::RootDiscovered]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::RootDiscovered { slug, path, lsp_only } = event else {
+            return Ok(vec![]);
+        };
+
+        // lsp_only roots have no files to extract (their files are covered by the primary root).
+        if *lsp_only {
+            tracing::debug!("TreeSitterConsumer: skipping lsp_only root '{}'", slug);
+            return Ok(vec![]);
+        }
+
+        // Build a ScanResult that includes all files in the root.
+        let mut scanner = crate::scanner::Scanner::new(path.clone())?;
+        let all_files = {
+            let _ = scanner.scan(); // populate internal state
+            scanner.all_known_files()
+        };
+
+        let full_scan = crate::scanner::ScanResult {
+            changed_files: Vec::new(),
+            new_files: all_files,
+            deleted_files: Vec::new(),
+            scan_duration: std::time::Duration::ZERO,
+        };
+
+        let mut extraction = self.registry.extract_scan_result(path, &full_scan);
+
+        // Stamp all nodes/edges with the root slug.
+        for node in &mut extraction.nodes {
+            node.id.root = slug.clone();
+        }
+        for edge in &mut extraction.edges {
+            edge.from.root = slug.clone();
+            edge.to.root = slug.clone();
+        }
+
+        tracing::info!(
+            "TreeSitterConsumer: root '{}' extracted: {} nodes, {} edges",
+            slug,
+            extraction.nodes.len(),
+            extraction.edges.len(),
+        );
+
+        Ok(vec![ExtractionEvent::RootExtracted {
+            slug: slug.clone(),
+            path: path.clone(),
+            nodes: extraction.nodes,
+            edges: extraction.edges,
+        }])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LanguageAccumulatorConsumer
+// ---------------------------------------------------------------------------
+
+/// Groups extracted nodes by language, emits one `LanguageDetected` per language.
+///
+/// Subscribes to: `RootExtracted`
+/// Emits: `LanguageDetected` (one per language found)
+pub struct LanguageAccumulatorConsumer;
+
+impl ExtractionConsumer for LanguageAccumulatorConsumer {
+    fn name(&self) -> &str { "language_accumulator" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::RootExtracted]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::RootExtracted { slug, nodes, .. } = event else {
+            return Ok(vec![]);
+        };
+
+        // Group nodes by language.
+        let mut by_lang: std::collections::HashMap<String, Vec<Node>> =
+            std::collections::HashMap::new();
+        for node in nodes {
+            if node.language.is_empty() {
+                continue;
+            }
+            by_lang.entry(node.language.clone()).or_default().push(node.clone());
+        }
+
+        let mut events: Vec<ExtractionEvent> = Vec::with_capacity(by_lang.len());
+        for (language, lang_nodes) in by_lang {
+            tracing::debug!(
+                "LanguageAccumulatorConsumer: root '{}' language '{}': {} nodes",
+                slug,
+                language,
+                lang_nodes.len(),
+            );
+            events.push(ExtractionEvent::LanguageDetected {
+                slug: slug.clone(),
+                language,
+                nodes: lang_nodes,
+            });
+        }
+
+        Ok(events)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PostExtractionConsumer
+// ---------------------------------------------------------------------------
+
+/// Runs all post-extraction passes (via `PostExtractionRegistry`) after tree-sitter extraction.
+///
+/// Subscribes to: `RootExtracted`
+/// Emits: `FrameworkDetected` (one per detected framework) + `PassesComplete`
+pub struct PostExtractionConsumer {
+    root_pairs: Vec<(String, PathBuf)>,
+    primary_slug: String,
+}
+
+impl PostExtractionConsumer {
+    pub fn new(root_pairs: Vec<(String, PathBuf)>, primary_slug: String) -> Self {
+        Self { root_pairs, primary_slug }
+    }
+}
+
+impl ExtractionConsumer for PostExtractionConsumer {
+    fn name(&self) -> &str { "post_extraction" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::RootExtracted]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::RootExtracted { slug, nodes, edges, .. } = event else {
+            return Ok(vec![]);
+        };
+
+        use crate::extract::post_extraction::{PassContext, PostExtractionRegistry};
+
+        let registry = PostExtractionRegistry::with_builtins();
+        let ctx = PassContext {
+            root_pairs: self.root_pairs.clone(),
+            primary_slug: self.primary_slug.clone(),
+            detected_frameworks: HashSet::new(),
+        };
+
+        let mut all_nodes = nodes.clone();
+        let mut all_edges = edges.clone();
+        let result = registry.run_all(&mut all_nodes, &mut all_edges, ctx);
+
+        tracing::info!(
+            "PostExtractionConsumer: root '{}' passes complete: +{} node(s), +{} edge(s), {} framework(s)",
+            slug,
+            result.added_node_count,
+            result.added_edge_count,
+            result.detected_frameworks.len(),
+        );
+
+        let mut follow_ons: Vec<ExtractionEvent> = Vec::new();
+
+        // Emit FrameworkDetected for each detected framework.
+        for framework in &result.detected_frameworks {
+            // Gather nodes associated with this framework.
+            let fw_nodes: Vec<Node> = all_nodes
+                .iter()
+                .filter(|n| {
+                    n.metadata.get("framework").map(|f| f == framework).unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            follow_ons.push(ExtractionEvent::FrameworkDetected {
+                slug: slug.clone(),
+                framework: framework.clone(),
+                nodes: fw_nodes,
+            });
+        }
+
+        // Always emit PassesComplete with the enriched graph.
+        follow_ons.push(ExtractionEvent::PassesComplete {
+            slug: slug.clone(),
+            nodes: all_nodes,
+            edges: all_edges,
+            detected_frameworks: result.detected_frameworks,
+        });
+
+        Ok(follow_ons)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FrameworkDetectionConsumer
+// ---------------------------------------------------------------------------
+
+/// Logs framework detection events. Framework-gated passes subscribe to
+/// `FrameworkDetected` and check `event.framework` to filter.
+///
+/// This consumer is a diagnostic observer; actual framework-gated passes
+/// (pubsub, websocket, nextjs) are handled inside `PostExtractionRegistry`.
+/// In Phase 2 they stay there; in Phase 3+ they each become independent
+/// consumers that subscribe to `FrameworkDetected`.
+pub struct FrameworkDetectionConsumer;
+
+impl ExtractionConsumer for FrameworkDetectionConsumer {
+    fn name(&self) -> &str { "framework_detection" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::FrameworkDetected]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::FrameworkDetected { slug, framework, nodes } = event else {
+            return Ok(vec![]);
+        };
+        tracing::info!(
+            "FrameworkDetectionConsumer: root '{}' framework '{}' detected ({} nodes)",
+            slug,
+            framework,
+            nodes.len(),
+        );
+        Ok(vec![])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NextjsRoutingConsumer
+// ---------------------------------------------------------------------------
+
+/// Subscribes to `FrameworkDetected` and runs nextjs_routing_pass when
+/// `framework == "nextjs-app-router"`.
+///
+/// **ADR pattern:** Framework-gated pass as a consumer — wakes only when its
+/// framework fires, never polls context.
+///
+/// Subscribes to: `FrameworkDetected`
+/// Emits: `PassComplete`
+pub struct NextjsRoutingConsumer {
+    /// Stored for Phase 3+ when nextjs_routing_pass is promoted out of PostExtractionRegistry.
+    #[allow(dead_code)]
+    root_pairs: Vec<(String, PathBuf)>,
+}
+
+impl NextjsRoutingConsumer {
+    pub fn new(root_pairs: Vec<(String, PathBuf)>) -> Self {
+        Self { root_pairs }
+    }
+}
+
+impl ExtractionConsumer for NextjsRoutingConsumer {
+    fn name(&self) -> &str { "nextjs_routing" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::FrameworkDetected]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::FrameworkDetected { slug, framework, nodes } = event else {
+            return Ok(vec![]);
+        };
+
+        // Only wake for nextjs-app-router (or if TS/JS files present, per existing logic).
+        let has_ts_js = nodes.iter().any(|n| {
+            matches!(n.language.as_str(), "typescript" | "javascript")
+        });
+        if framework != "nextjs-app-router" && !has_ts_js {
+            return Ok(vec![]);
+        }
+
+        // Note: nextjs_routing_pass needs the full node set, not just the framework nodes.
+        // This consumer emits PassComplete as a signal; the actual pass runs inside
+        // PostExtractionRegistry in Phase 2. This establishes the subscription pattern.
+        tracing::debug!(
+            "NextjsRoutingConsumer: root '{}' next.js routing check (framework='{}')",
+            slug,
+            framework,
+        );
+        Ok(vec![ExtractionEvent::PassComplete {
+            pass_name: "nextjs_routing",
+            added_nodes: 0,
+            added_edges: 0,
+        }])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PubSubConsumer
+// ---------------------------------------------------------------------------
+
+/// Subscribes to `FrameworkDetected` and runs pub/sub pass when a message-broker
+/// framework is detected (kafka, celery, pika, redis).
+///
+/// **ADR pattern:** Framework-gated pass — subscribes to `FrameworkDetected`,
+/// checks `framework` in `on_event`. No broker knowledge in RNA core: the
+/// framework name comes from `framework_detection_pass` which reads import nodes.
+///
+/// Subscribes to: `FrameworkDetected`
+/// Emits: `PassComplete`
+pub struct PubSubConsumer;
+
+impl ExtractionConsumer for PubSubConsumer {
+    fn name(&self) -> &str { "pubsub" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::FrameworkDetected]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
+            return Ok(vec![]);
+        };
+        // Only fire for broker frameworks. In Phase 2 the actual pass logic
+        // runs inside PostExtractionRegistry; this establishes the subscription slot.
+        let is_broker = matches!(
+            framework.as_str(),
+            "kafka-python" | "confluent-kafka" | "celery" | "pika" | "redis"
+        );
+        if !is_broker {
+            return Ok(vec![]);
+        }
+        tracing::debug!("PubSubConsumer: root '{}' broker '{}' detected", slug, framework);
+        Ok(vec![ExtractionEvent::PassComplete {
+            pass_name: "pubsub",
+            added_nodes: 0,
+            added_edges: 0,
+        }])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocketConsumer
+// ---------------------------------------------------------------------------
+
+/// Subscribes to `FrameworkDetected("socketio")` and handles WebSocket passes.
+///
+/// Subscribes to: `FrameworkDetected`
+/// Emits: `PassComplete`
+pub struct WebSocketConsumer;
+
+impl ExtractionConsumer for WebSocketConsumer {
+    fn name(&self) -> &str { "websocket" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::FrameworkDetected]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
+            return Ok(vec![]);
+        };
+        if framework != "socketio" {
+            return Ok(vec![]);
+        }
+        tracing::debug!("WebSocketConsumer: root '{}' socketio detected", slug);
+        Ok(vec![ExtractionEvent::PassComplete {
+            pass_name: "websocket",
+            added_nodes: 0,
+            added_edges: 0,
+        }])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OpenApiConsumer (#465)
+// ---------------------------------------------------------------------------
+
+/// Subscribes to `RootExtracted`, runs OpenAPI bidirectional linking.
+///
+/// Joins SDK functions to OpenAPI spec operationIds.
+/// Phase 2: stub that establishes the subscription slot.
+/// Full implementation tracked by #465.
+///
+/// Subscribes to: `RootExtracted`
+/// Emits: `PassComplete`
+pub struct OpenApiConsumer;
+
+impl ExtractionConsumer for OpenApiConsumer {
+    fn name(&self) -> &str { "openapi_bidirectional" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::RootExtracted]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::RootExtracted { slug, nodes, .. } = event else {
+            return Ok(vec![]);
+        };
+        // Only run if there are OpenAPI spec nodes present.
+        let has_openapi = nodes.iter().any(|n| {
+            n.language == "openapi" || n.language == "yaml" || n.language == "json"
+        });
+        if !has_openapi {
+            return Ok(vec![]);
+        }
+        tracing::debug!("OpenApiConsumer: root '{}' has OpenAPI-like files (stub)", slug);
+        Ok(vec![ExtractionEvent::PassComplete {
+            pass_name: "openapi_bidirectional",
+            added_nodes: 0,
+            added_edges: 0,
+        }])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GrpcConsumer (#466)
+// ---------------------------------------------------------------------------
+
+/// Subscribes to `RootExtracted`, parses .proto files for gRPC service/method edges.
+///
+/// Phase 2: stub. Full implementation tracked by #466.
+///
+/// Subscribes to: `RootExtracted`
+/// Emits: `PassComplete`
+pub struct GrpcConsumer;
+
+impl ExtractionConsumer for GrpcConsumer {
+    fn name(&self) -> &str { "grpc_proto" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::RootExtracted]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::RootExtracted { slug, nodes, .. } = event else {
+            return Ok(vec![]);
+        };
+        let has_proto = nodes.iter().any(|n| n.language == "protobuf");
+        if !has_proto {
+            return Ok(vec![]);
+        }
+        tracing::debug!("GrpcConsumer: root '{}' has .proto files (stub)", slug);
+        Ok(vec![ExtractionEvent::PassComplete {
+            pass_name: "grpc_proto",
+            added_nodes: 0,
+            added_edges: 0,
+        }])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CustomExtractorConsumer (#468)
+// ---------------------------------------------------------------------------
+
+/// Subscribes to `FrameworkDetected` and runs config-driven passes from `.oh/extractors/*.toml`.
+///
+/// Phase 2: stub that establishes the subscription slot.
+/// Full implementation tracked by #468.
+///
+/// Subscribes to: `FrameworkDetected`
+/// Emits: `PassComplete`
+pub struct CustomExtractorConsumer {
+    /// Framework name this consumer is configured for.
+    pub framework: String,
+    /// Slug identifying this config (for diagnostics).
+    pub config_name: String,
+}
+
+impl ExtractionConsumer for CustomExtractorConsumer {
+    fn name(&self) -> &str { "custom_extractor" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::FrameworkDetected]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
+            return Ok(vec![]);
+        };
+        if framework != &self.framework {
+            return Ok(vec![]);
+        }
+        tracing::debug!(
+            "CustomExtractorConsumer '{}': root '{}' framework '{}' matched (stub)",
+            self.config_name,
+            slug,
+            framework,
+        );
+        Ok(vec![ExtractionEvent::PassComplete {
+            pass_name: "custom_extractor",
+            added_nodes: 0,
+            added_edges: 0,
+        }])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EventBus::with_builtins
+// ---------------------------------------------------------------------------
+
+/// Build an `EventBus` pre-loaded with all built-in synchronous consumers.
+///
+/// The bus covers the synchronous portion of the pipeline:
+/// - Tree-sitter extraction (per root)
+/// - Language accumulation (per root)
+/// - Post-extraction passes (per root)
+/// - Framework-gated pass stubs (nextjs, pubsub, websocket)
+/// - New consumer stubs (openapi, grpc, custom extractors)
+///
+/// Async consumers (LSP enrichment, embedding, LanceDB persist) are NOT
+/// registered here — they run via the existing spawn_background_enrichment
+/// path in Phase 2. Phase 3+ will move them onto the bus.
+///
+/// `root_pairs` must be the full `(slug, path)` list for the workspace.
+/// `primary_slug` is the slug of the primary code root.
+pub fn build_builtin_bus(
+    root_pairs: Vec<(String, PathBuf)>,
+    primary_slug: String,
+) -> crate::extract::event_bus::EventBus {
+    use crate::extract::event_bus::EventBus;
+
+    let mut bus = EventBus::new();
+
+    // --- RootDiscovered consumers ---
+    bus.register(Box::new(ManifestConsumer));
+    bus.register(Box::new(TreeSitterConsumer::new()));
+
+    // --- RootExtracted consumers ---
+    bus.register(Box::new(LanguageAccumulatorConsumer));
+    bus.register(Box::new(PostExtractionConsumer::new(root_pairs.clone(), primary_slug)));
+    bus.register(Box::new(OpenApiConsumer));
+    bus.register(Box::new(GrpcConsumer));
+
+    // --- FrameworkDetected consumers ---
+    bus.register(Box::new(FrameworkDetectionConsumer));
+    bus.register(Box::new(NextjsRoutingConsumer::new(root_pairs)));
+    bus.register(Box::new(PubSubConsumer));
+    bus.register(Box::new(WebSocketConsumer));
+
+    bus
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extract::event_bus::{EventBus, ExtractionEvent, ExtractionEventKind};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn make_root_discovered(slug: &str, path: PathBuf) -> ExtractionEvent {
+        ExtractionEvent::RootDiscovered {
+            slug: slug.to_string(),
+            path,
+            lsp_only: false,
+        }
+    }
+
+    /// Verify ManifestConsumer subscribes to RootDiscovered and emits nothing.
+    #[test]
+    fn test_manifest_consumer_subscription() {
+        let consumer = ManifestConsumer;
+        assert!(consumer.subscribes_to().contains(&ExtractionEventKind::RootDiscovered));
+        let event = ExtractionEvent::RootDiscovered {
+            slug: "test".into(),
+            path: PathBuf::from("."),
+            lsp_only: false,
+        };
+        let result = consumer.on_event(&event).unwrap();
+        assert!(result.is_empty(), "ManifestConsumer emits no follow-on events in Phase 2");
+    }
+
+    /// Verify LanguageAccumulatorConsumer groups nodes by language.
+    #[test]
+    fn test_language_accumulator_groups_by_language() {
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        fn make_node(lang: &str, name: &str) -> Node {
+            Node {
+                id: NodeId {
+                    root: "test".into(),
+                    file: PathBuf::from(format!("src/{}.{}", name, lang)),
+                    name: name.into(),
+                    kind: NodeKind::Function,
+                },
+                language: lang.into(),
+                line_start: 1,
+                line_end: 1,
+                signature: name.into(),
+                body: String::new(),
+                metadata: BTreeMap::new(),
+                source: ExtractionSource::TreeSitter,
+            }
+        }
+
+        let event = ExtractionEvent::RootExtracted {
+            slug: "test".into(),
+            path: PathBuf::from("."),
+            nodes: vec![
+                make_node("rust", "foo"),
+                make_node("rust", "bar"),
+                make_node("python", "baz"),
+            ],
+            edges: vec![],
+        };
+
+        let consumer = LanguageAccumulatorConsumer;
+        let follow_ons = consumer.on_event(&event).unwrap();
+
+        // Should emit LanguageDetected for "rust" and "python"
+        assert_eq!(follow_ons.len(), 2, "Should emit one LanguageDetected per language");
+        let langs: HashSet<String> = follow_ons.iter().filter_map(|e| {
+            if let ExtractionEvent::LanguageDetected { language, .. } = e {
+                Some(language.clone())
+            } else {
+                None
+            }
+        }).collect();
+        assert!(langs.contains("rust"));
+        assert!(langs.contains("python"));
+    }
+
+    /// Verify LanguageAccumulatorConsumer skips nodes with empty language.
+    #[test]
+    fn test_language_accumulator_skips_empty_language() {
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        let event = ExtractionEvent::RootExtracted {
+            slug: "test".into(),
+            path: PathBuf::from("."),
+            nodes: vec![Node {
+                id: NodeId {
+                    root: "test".into(),
+                    file: PathBuf::from("unknown"),
+                    name: "x".into(),
+                    kind: NodeKind::Other("unknown".into()),
+                },
+                language: "".into(), // empty language
+                line_start: 1,
+                line_end: 1,
+                signature: "x".into(),
+                body: String::new(),
+                metadata: BTreeMap::new(),
+                source: ExtractionSource::TreeSitter,
+            }],
+            edges: vec![],
+        };
+        let consumer = LanguageAccumulatorConsumer;
+        let follow_ons = consumer.on_event(&event).unwrap();
+        assert!(follow_ons.is_empty(), "Empty language nodes must be skipped");
+    }
+
+    /// Verify TreeSitterConsumer skips lsp_only roots.
+    #[test]
+    fn test_tree_sitter_consumer_skips_lsp_only() {
+        let consumer = TreeSitterConsumer::new();
+        let event = ExtractionEvent::RootDiscovered {
+            slug: "skills".into(),
+            path: PathBuf::from("."),
+            lsp_only: true,
+        };
+        let result = consumer.on_event(&event).unwrap();
+        assert!(result.is_empty(), "lsp_only roots must produce no RootExtracted event");
+    }
+
+    /// Verify PubSubConsumer only fires for broker frameworks.
+    #[test]
+    fn test_pubsub_consumer_fires_for_kafka() {
+        let consumer = PubSubConsumer;
+        let event = ExtractionEvent::FrameworkDetected {
+            slug: "test".into(),
+            framework: "kafka-python".into(),
+            nodes: vec![],
+        };
+        let result = consumer.on_event(&event).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], ExtractionEvent::PassComplete { pass_name: "pubsub", .. }));
+    }
+
+    #[test]
+    fn test_pubsub_consumer_ignores_non_broker() {
+        let consumer = PubSubConsumer;
+        let event = ExtractionEvent::FrameworkDetected {
+            slug: "test".into(),
+            framework: "django".into(),
+            nodes: vec![],
+        };
+        let result = consumer.on_event(&event).unwrap();
+        assert!(result.is_empty());
+    }
+
+    /// Verify WebSocketConsumer fires only for socketio.
+    #[test]
+    fn test_websocket_consumer_fires_for_socketio() {
+        let consumer = WebSocketConsumer;
+        let event = ExtractionEvent::FrameworkDetected {
+            slug: "test".into(),
+            framework: "socketio".into(),
+            nodes: vec![],
+        };
+        let result = consumer.on_event(&event).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], ExtractionEvent::PassComplete { pass_name: "websocket", .. }));
+    }
+
+    #[test]
+    fn test_websocket_consumer_ignores_non_socketio() {
+        let consumer = WebSocketConsumer;
+        let event = ExtractionEvent::FrameworkDetected {
+            slug: "test".into(),
+            framework: "flask".into(),
+            nodes: vec![],
+        };
+        let result = consumer.on_event(&event).unwrap();
+        assert!(result.is_empty());
+    }
+
+    /// Verify build_builtin_bus registers consumers for all expected event kinds.
+    #[test]
+    fn test_builtin_bus_has_consumers_for_all_event_kinds() {
+        let bus = build_builtin_bus(vec![], "test".into());
+        // Must have at least one consumer for each key event kind
+        assert!(bus.len() >= 8, "Expected at least 8 consumers, got {}", bus.len());
+    }
+
+    /// Verify PostExtractionConsumer emits PassesComplete on empty input.
+    #[test]
+    fn test_post_extraction_consumer_emits_passes_complete() {
+        let consumer = PostExtractionConsumer::new(vec![], "test".into());
+        let event = ExtractionEvent::RootExtracted {
+            slug: "test".into(),
+            path: PathBuf::from("."),
+            nodes: vec![],
+            edges: vec![],
+        };
+        let follow_ons = consumer.on_event(&event).unwrap();
+        assert!(
+            follow_ons.iter().any(|e| matches!(e, ExtractionEvent::PassesComplete { .. })),
+            "PostExtractionConsumer must always emit PassesComplete"
+        );
+    }
+
+    /// Adversarial: CustomExtractorConsumer fires only for its declared framework.
+    #[test]
+    fn test_custom_extractor_consumer_framework_filter() {
+        let consumer = CustomExtractorConsumer {
+            framework: "fastapi".into(),
+            config_name: "fastapi-routes".into(),
+        };
+        // Matching framework → fires
+        let matching = ExtractionEvent::FrameworkDetected {
+            slug: "test".into(),
+            framework: "fastapi".into(),
+            nodes: vec![],
+        };
+        let result = consumer.on_event(&matching).unwrap();
+        assert_eq!(result.len(), 1);
+
+        // Non-matching → silent
+        let non_matching = ExtractionEvent::FrameworkDetected {
+            slug: "test".into(),
+            framework: "flask".into(),
+            nodes: vec![],
+        };
+        let result = consumer.on_event(&non_matching).unwrap();
+        assert!(result.is_empty());
+    }
+
+    /// Integration: bus emit sequence starting from RootDiscovered.
+    /// With a real temp directory, TreeSitterConsumer produces RootExtracted.
+    #[test]
+    fn test_bus_emit_root_discovered_produces_root_extracted() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/lib.rs"),
+            "pub fn hello() {}\n",
+        ).unwrap();
+        // Need scan state dir
+        std::fs::create_dir_all(tmp.path().join(".oh").join(".cache")).unwrap();
+
+        let bus = build_builtin_bus(
+            vec![("test".to_string(), tmp.path().to_path_buf())],
+            "test".to_string(),
+        );
+        let events = bus.emit(ExtractionEvent::RootDiscovered {
+            slug: "test".to_string(),
+            path: tmp.path().to_path_buf(),
+            lsp_only: false,
+        });
+
+        // Must include RootExtracted somewhere in the emitted events
+        let has_root_extracted = events.iter().any(|e| matches!(e, ExtractionEvent::RootExtracted { .. }));
+        assert!(has_root_extracted, "TreeSitterConsumer must produce RootExtracted from RootDiscovered");
+
+        // Must include PassesComplete
+        let has_passes_complete = events.iter().any(|e| matches!(e, ExtractionEvent::PassesComplete { .. }));
+        assert!(has_passes_complete, "PostExtractionConsumer must produce PassesComplete");
+    }
+}
