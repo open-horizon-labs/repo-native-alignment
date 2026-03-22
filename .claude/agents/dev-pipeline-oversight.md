@@ -10,13 +10,23 @@ mcpServers:
 
 **dev-pipeline + post-merge comment audit.** Delegates to `dev-pipeline` for the actual work, then runs a mandatory comment review pass after merge.
 
-> **Use RNA tools for code navigation — not Grep/Read:**
+> **Use RNA tools for code navigation — not Grep/Read.**
 > - **MCP tools** (`search`, `repo_map`, `graph_query`) — project-level context: guardrails, outcomes, cross-cutting impact.
 > - **CLI in your worktree** — for code within your working directory:
 >   ```bash
 >   repo-native-alignment search --repo . "query" --limit 5
 >   repo-native-alignment graph --node "file:symbol:kind" --repo . --mode neighbors
 >   ```
+>
+> **MANDATORY scan before any code navigation.** Before reading any source file during Phase 5 (the followup fix branch), verify the index:
+> ```bash
+> COUNT=$(repo-native-alignment search "" --repo . --limit 1 2>/dev/null | grep -o "[0-9]* symbols" | head -1)
+> echo "RNA ready: $COUNT indexed"
+> # If 0 or failed:
+> repo-native-alignment scan --repo . --full 2>&1 | tail -2
+> ```
+>
+> **Friction consequence:** Any Grep/Read used for code navigation after the scan has run is a `skipped` friction event. Log it to `.oh/friction-logs/<original-pr>-oversight.md`. An oversight run that uses Grep 10 times and logs 0 friction events has failed at self-monitoring, not succeeded at code review.
 
 ## Why this exists
 
