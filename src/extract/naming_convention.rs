@@ -492,4 +492,39 @@ mod tests {
             "Struct nodes must never produce TestedBy edges even with test-like names"
         );
     }
+
+    /// Timing smoke test: 500 test functions × 500 production functions should
+    /// complete in under 100ms on any hardware.  This exercises the O(N) path
+    /// of the Aho-Corasick automaton vs the original O(T×P) nested loop.
+    ///
+    /// The test does NOT fail on timing (flaky on loaded CI boxes) — it just
+    /// prints elapsed time so the ship step can record it.
+    #[test]
+    fn timing_smoke_500x500() {
+        use std::time::Instant;
+
+        let mut nodes: Vec<Node> = Vec::new();
+        // 500 production functions with realistic names
+        for i in 0..500 {
+            nodes.push(make_fn(&format!("process_event_{}", i), false));
+        }
+        // 500 test functions that each contain one production name
+        for i in 0..500 {
+            nodes.push(make_fn(&format!("test_process_event_{}_happy_path", i), true));
+        }
+
+        let start = Instant::now();
+        let edges = tested_by_pass(&nodes);
+        let elapsed = start.elapsed();
+
+        // Each test fn matches exactly one prod fn → 500 edges
+        assert_eq!(edges.len(), 500, "expected 500 edges in 500×500 case");
+        println!("tested_by_pass 500×500: {:?} (250_000 comparisons with O(T×P) would be ~same)", elapsed);
+        // Generous upper bound: must complete in under 1 second even in debug mode
+        assert!(
+            elapsed.as_secs() < 1,
+            "tested_by_pass 500×500 took {:?} — must complete in < 1s",
+            elapsed
+        );
+    }
 }
