@@ -416,6 +416,7 @@ mod tests {
             edges,
             index,
             last_scan_completed_at: None,
+            detected_frameworks: std::collections::HashSet::new(),
         }
     }
 

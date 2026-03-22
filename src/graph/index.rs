@@ -45,6 +45,10 @@ fn edge_weight(kind: &EdgeKind) -> f64 {
         | EdgeKind::Modified
         | EdgeKind::Affected
         | EdgeKind::Serves => 0.05,
+        // Framework/subsystem topology edges carry low structural signal
+        EdgeKind::UsesFramework => 0.1,
+        // Pub/sub edges carry moderate signal (async coupling)
+        EdgeKind::Produces | EdgeKind::Consumes => 0.4,
     }
 }
 

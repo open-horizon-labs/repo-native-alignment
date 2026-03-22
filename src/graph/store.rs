@@ -30,7 +30,9 @@ pub const SCHEMA_VERSION: u32 = 16; // slug portability: root_id now uses direct
 /// Bumped to 4 for Next.js routing pass (#440) and monorepo subdirectory roots (#442).
 /// Bumped to 5 for subsystem first-class nodes (#470): emits NodeKind::Other("subsystem")
 /// nodes and BelongsTo edges after community detection.
-pub const EXTRACTION_VERSION: u32 = 5;
+/// Bumped to 6 for framework detection pass (#469): emits NodeKind::Other("framework")
+/// nodes and adds UsesFramework/Produces/Consumes EdgeKinds.
+pub const EXTRACTION_VERSION: u32 = 6;
 
 /// Arrow schema for the `symbols` table.
 ///

@@ -1123,7 +1123,7 @@ mod tests {
 
     fn make_graph_state(nodes: Vec<Node>) -> GraphState {
         let index = GraphIndex::new();
-        GraphState { nodes, edges: vec![], index, last_scan_completed_at: None }
+        GraphState { nodes, edges: vec![], index, last_scan_completed_at: None, detected_frameworks: std::collections::HashSet::new() }
     }
 
     fn make_graph_state_with_edges(nodes: Vec<Node>, edges: Vec<crate::graph::Edge>) -> GraphState {
@@ -1132,7 +1132,7 @@ mod tests {
         for node in &nodes {
             index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
         }
-        GraphState { nodes, edges, index, last_scan_completed_at: None }
+        GraphState { nodes, edges, index, last_scan_completed_at: None, detected_frameworks: std::collections::HashSet::new() }
     }
 
     fn make_edge(from: &Node, to: &Node, kind: crate::graph::EdgeKind) -> crate::graph::Edge {

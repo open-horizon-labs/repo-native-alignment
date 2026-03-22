@@ -174,6 +174,15 @@ pub enum EdgeKind {
     /// A public re-export edge (e.g. `pub use`, `export { X }`, `__all__`).
     /// Emitted when a module publicly re-exports a symbol defined elsewhere.
     ReExports,
+    /// A subsystem or symbol uses a detected framework.
+    /// Direction: subsystem/symbol → framework node
+    UsesFramework,
+    /// A symbol/handler produces events to a channel/topic.
+    /// Direction: producer → channel
+    Produces,
+    /// A symbol/handler consumes events from a channel/topic.
+    /// Direction: consumer → channel
+    Consumes,
 }
 
 impl fmt::Display for EdgeKind {
@@ -195,6 +204,9 @@ impl fmt::Display for EdgeKind {
             EdgeKind::TestedBy => write!(f, "tested_by"),
             EdgeKind::BelongsTo => write!(f, "belongs_to"),
             EdgeKind::ReExports => write!(f, "re_exports"),
+            EdgeKind::UsesFramework => write!(f, "uses_framework"),
+            EdgeKind::Produces => write!(f, "produces"),
+            EdgeKind::Consumes => write!(f, "consumes"),
         }
     }
 }

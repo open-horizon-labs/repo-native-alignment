@@ -261,6 +261,9 @@ pub fn parse_edge_kind(s: &str) -> Option<EdgeKind> {
         "tested_by" => EdgeKind::TestedBy,
         "belongs_to" => EdgeKind::BelongsTo,
         "re_exports" => EdgeKind::ReExports,
+        "uses_framework" => EdgeKind::UsesFramework,
+        "produces" => EdgeKind::Produces,
+        "consumes" => EdgeKind::Consumes,
         _ => return None,
     })
 }
@@ -1459,7 +1462,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
         index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
     }
 
-    Ok(GraphState { nodes, edges, index, last_scan_completed_at: Some(std::time::Instant::now()) })
+    Ok(GraphState { nodes, edges, index, last_scan_completed_at: Some(std::time::Instant::now()), detected_frameworks: std::collections::HashSet::new() })
 }
 
 /// Parse a NodeId from its stable_id string (format: "root:file:name:kind").
