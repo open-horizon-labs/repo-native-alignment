@@ -66,7 +66,9 @@ if [ -d "$MAIN_CACHE/lance" ]; then
     cp -a "$MAIN_CACHE" "$WORKTREE_CACHE"
     # Clear scan-state so incremental scan re-checks changed files
     rm -f "$WORKTREE_CACHE/scan-state.json"
-    echo "RNA scan cache ready. Run: repo-native-alignment scan --repo . (incremental, fast)"
+    echo "RNA scan cache copied. Running incremental scan now (fast, picks up any changed files)..."
+    (cd "$WORKTREE_PATH" && repo-native-alignment scan --repo . 2>&1 | tail -2) || echo "Scan failed — run manually: repo-native-alignment scan --repo . --full"
+    echo "RNA scan complete. Agents can immediately use: repo-native-alignment search --repo . 'query'"
 else
     echo "No RNA scan cache found — agents will need to run: repo-native-alignment scan --repo . --full"
 fi
