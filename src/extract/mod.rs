@@ -309,9 +309,10 @@ impl ExtractorRegistry {
 
         // Process files in parallel. Each file is independent (no shared mutable
         // state between extractors), so rayon par_iter is safe here.
-        let per_file_results: Vec<Option<ExtractionResult>> = files_to_process
+        // `filter_map` skips unreadable/binary files; `reduce` merges in parallel.
+        let result = files_to_process
             .into_par_iter()
-            .map(|rel_path| {
+            .filter_map(|rel_path| {
                 let file_start = std::time::Instant::now();
                 let abs_path = repo_root.join(rel_path);
                 tracing::debug!("ExtractorRegistry: reading {}", abs_path.display());
@@ -339,13 +340,7 @@ impl ExtractorRegistry {
                 );
                 Some(file_result)
             })
-            .collect();
-
-        // Fold per-file results into a single ExtractionResult.
-        let result = per_file_results
-            .into_iter()
-            .flatten()
-            .fold(ExtractionResult::default(), |mut acc, r| {
+            .reduce(ExtractionResult::default, |mut acc, r| {
                 acc.merge(r);
                 acc
             });
