@@ -1,4 +1,7 @@
+pub mod bootstrap;
+pub mod bus;
 pub mod code;
+pub mod consumers;
 pub mod embed;
 pub mod extract;
 pub mod git;
