@@ -6294,6 +6294,7 @@ dependencies = [
  "metal-candle",
  "petgraph",
  "pulldown-cmark",
+ "rayon",
  "rust-mcp-sdk",
  "serde",
  "serde_json",
