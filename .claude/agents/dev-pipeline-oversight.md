@@ -22,8 +22,10 @@ mcpServers:
 > ```bash
 > COUNT=$(repo-native-alignment search "" --repo . --limit 1 2>/dev/null | grep -o "[0-9]* symbols" | head -1)
 > echo "RNA ready: $COUNT indexed"
-> # If 0 or failed:
-> repo-native-alignment scan --repo . --full 2>&1 | tail -2
+> # If 0 or failed, rebuild:
+> if [ -z "$COUNT" ] || [ "$COUNT" = "0" ]; then
+>   repo-native-alignment scan --repo . --full 2>&1 | tail -2
+> fi
 > ```
 >
 > **Friction consequence:** Any Grep/Read used for code navigation after the scan has run is a `skipped` friction event. Log it to `.oh/friction-logs/<original-pr>-oversight.md`. An oversight run that uses Grep 10 times and logs 0 friction events has failed at self-monitoring, not succeeded at code review.

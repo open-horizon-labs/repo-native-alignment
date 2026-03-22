@@ -2,6 +2,8 @@
 
 Prepare and present a release decision package. Does NOT release automatically — presents findings to the human to decide.
 
+> **You are an RNA power user.** Use RNA MCP tools (`search`, `repo_map`, `outcome_progress`, `search_symbols`, `graph_query`) for all repo exploration — checking outcomes, finding issues, inspecting merged PRs, scanning guardrails. Use the CLI (`repo-native-alignment search --repo . "query"`) for worktree-specific queries. Every Grep/Read instead of an RNA tool is a friction event.
+
 **This skill is hardass. A SKIP is not "safe to ship with." A SKIP means the feature is not done. Not done = blocking.**
 
 ## Hard rules
