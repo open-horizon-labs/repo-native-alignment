@@ -36,10 +36,13 @@
 //!
 //! - TypeScript/JavaScript ES6 named imports: `import { foo, bar } from '…'`
 //! - TypeScript/JavaScript default imports: `import foo from '…'`
-//! - TypeScript/JavaScript namespace imports: `import * as ns from '…'`
 //! - Python named imports: `from module import foo, bar`
 //! - Python bare imports: `import foo`
 //! - Rust `use` declarations: `use crate::foo::{A, B}`
+//!
+//! **Not supported:** TypeScript namespace imports (`import * as ns`). The
+//! alias is used as `ns.foo()` — a method call — which the body scanner
+//! correctly rejects. Resolving `ns.foo` requires member-access tracking.
 //!
 //! For TypeScript, the pass also attempts to filter to relative imports (those
 //! starting with `.`) to avoid emitting edges to npm package functions that may
@@ -87,17 +90,18 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
     }
 
     // ------------------------------------------------------------------
-    // 2. For each file, build the set of imported symbol names.
+    // 2. For each (root, file) pair, build the set of imported symbol names.
     // ------------------------------------------------------------------
-    // file -> HashSet<imported_name>
-    let mut imported_names_by_file: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    // Key: (root, file) — file alone is not unique in multi-root workspaces
+    // where two roots may both contain `src/lib.ts`.
+    let mut imported_names_by_file: HashMap<(String, PathBuf), HashSet<String>> = HashMap::new();
     for node in all_nodes {
         if node.id.kind == NodeKind::Import {
             let text = &node.id.name; // Import node name = full import text
             let names = parse_imported_names(text);
             if !names.is_empty() {
                 imported_names_by_file
-                    .entry(node.id.file.clone())
+                    .entry((node.id.root.clone(), node.id.file.clone()))
                     .or_default()
                     .extend(names);
             }
@@ -120,7 +124,8 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         if node.id.kind != NodeKind::Function {
             continue;
         }
-        let Some(imported_names) = imported_names_by_file.get(&node.id.file) else {
+        let file_key = (node.id.root.clone(), node.id.file.clone());
+        let Some(imported_names) = imported_names_by_file.get(&file_key) else {
             continue;
         };
         if node.body.is_empty() {
@@ -142,13 +147,14 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
                 continue;
             }
 
-            // Look up candidate Function nodes with this name in OTHER files.
+            // Look up candidate Function nodes with this name in OTHER
+            // (root, file) pairs.
             let Some(candidates) = fn_by_name.get(imported_name.as_str()) else {
                 continue;
             };
             let cross_file_candidates: Vec<&&Node> = candidates
                 .iter()
-                .filter(|c| c.id.file != node.id.file)
+                .filter(|c| c.id.root != node.id.root || c.id.file != node.id.file)
                 .collect();
 
             if cross_file_candidates.is_empty() {
@@ -205,11 +211,16 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
 /// Covers:
 /// - ES6 named:    `import { Foo, Bar as B } from '…'`  → `["Foo", "Bar"]`
 /// - ES6 default:  `import Foo from '…'`                → `["Foo"]`
-/// - ES6 namespace:`import * as ns from '…'`            → `["ns"]`
+/// - ES6 namespace:`import * as ns from '…'`            → `[]` (not supported — see below)
 /// - Python from:  `from mod import Foo, Bar`           → `["Foo", "Bar"]`
 /// - Python bare:  `import foo`                         → `["foo"]`
 /// - Rust use:     `use crate::foo::{A, B}`             → `["A", "B"]`
 /// - Rust use:     `use crate::foo::Bar`                → `["Bar"]`
+///
+/// **Namespace imports return an empty list.** The alias (`ns`) is used as
+/// `ns.foo()` — a method call — and `body_contains_call` correctly rejects
+/// method calls.  Resolving `ns.foo` to the module-level `foo` would require
+/// member-access tracking beyond the scope of this pass.
 pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
     let text = import_text.trim();
 
@@ -303,9 +314,14 @@ pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
 /// Handles:
 /// - Named:      `import { A, B as C } from '…'`   → `["A", "B"]`
 /// - Default:    `import Foo from '…'`              → `["Foo"]`
-/// - Namespace:  `import * as ns from '…'`          → `["ns"]`
 /// - Mixed:      `import Def, { A } from '…'`       → `["Def", "A"]`
 /// - Type-only:  `import type { A } from '…'`       → `["A"]`
+///
+/// **Namespace imports are intentionally NOT supported** (`import * as ns`).
+/// The pass detects bare function calls (`name(`) in function bodies, so
+/// namespace-qualified calls (`ns.foo()`) would require member-access tracking
+/// which is out of scope for this v1 pass.  Namespace imports return an empty
+/// list; they are not yet supported.
 fn parse_es6_import_names(text: &str) -> Vec<String> {
     // Strip `import ` prefix and optional `type ` keyword.
     let body = text
@@ -325,18 +341,14 @@ fn parse_es6_import_names(text: &str) -> Vec<String> {
     };
     let specifier = specifier.trim().trim_end_matches(',').trim();
 
-    let mut names = Vec::new();
-
-    // Namespace import: `* as ns`
-    if specifier.starts_with("* as ") {
-        if let Some(ns) = specifier.strip_prefix("* as ") {
-            let ns = ns.trim();
-            if !ns.is_empty() {
-                names.push(ns.to_string());
-            }
-        }
-        return names;
+    // Namespace imports (`* as ns`) are not resolved by this pass — the
+    // namespace alias is used as `ns.foo()` (method call), which
+    // body_contains_call correctly rejects.  Return empty list.
+    if specifier.starts_with("* as ") || specifier == "*" {
+        return Vec::new();
     }
+
+    let mut names = Vec::new();
 
     // Split named `{ … }` block from default import prefix.
     let (default_part, named_part) = if let Some(brace_start) = specifier.find('{') {
@@ -399,12 +411,23 @@ pub(crate) fn body_contains_call(body: &str, name: &str) -> bool {
             continue;
         }
 
-        // Check that the character immediately before `name` is not `.` or `:`.
+        // Check that the character immediately before `name` is an identifier
+        // boundary — i.e., NOT a character that would make it part of a longer
+        // identifier (`rerender` must not match `render`).
+        //
+        // Reject: alphanumeric, `_`, `$` (JS identifier chars), `.` (method call),
+        //         `:` (scoped path).
         if idx > 0 {
-            let prev_char = search[..idx].chars().last();
-            if prev_char == Some('.') || prev_char == Some(':') {
-                search = &search[idx + 1..];
-                continue;
+            if let Some(prev_char) = search[..idx].chars().last() {
+                if prev_char == '.'
+                    || prev_char == ':'
+                    || prev_char == '_'
+                    || prev_char == '$'
+                    || prev_char.is_ascii_alphanumeric()
+                {
+                    search = &search[idx + 1..];
+                    continue;
+                }
             }
         }
 
@@ -496,9 +519,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_es6_namespace_import() {
+    fn test_parse_es6_namespace_import_returns_empty() {
+        // Namespace imports (`import * as ns`) are intentionally not supported.
+        // The alias is used as `ns.foo()` (method call) which body_contains_call
+        // rejects. We return empty so no spurious edges are emitted.
         let names = parse_imported_names("import * as api from './api'");
-        assert_eq!(names, vec!["api"]);
+        assert!(names.is_empty(), "namespace imports should return empty, got {:?}", names);
     }
 
     #[test]
@@ -550,6 +576,18 @@ mod tests {
     fn test_body_does_not_match_scoped_call() {
         // `::foo()` is a scoped path — should NOT match
         assert!(!body_contains_call("let x = mod::foo();", "foo"));
+    }
+
+    #[test]
+    fn test_body_does_not_match_suffix_identifier() {
+        // `rerender()` must NOT match when looking for `render`
+        assert!(!body_contains_call("rerender(component);", "render"));
+        // `_render()` (prefixed with underscore) must NOT match
+        assert!(!body_contains_call("_render(component);", "render"));
+        // `$render()` must NOT match
+        assert!(!body_contains_call("$render(component);", "render"));
+        // Bare `render()` SHOULD match
+        assert!(body_contains_call("render(component);", "render"));
     }
 
     #[test]
@@ -795,5 +833,66 @@ mod tests {
             edges_second.len(),
             "repeated calls must produce the same number of edges"
         );
+    }
+
+    #[test]
+    fn test_multi_root_imports_keyed_by_root_and_file() {
+        // Two roots both contain `src/lib.ts`. Without the (root, file) key,
+        // imports from root-b would contaminate root-a's import set.
+        // With the fix, each root's imports are isolated.
+        let caller_a = Node {
+            id: NodeId {
+                root: "root-a".into(),
+                file: PathBuf::from("src/lib.ts"),
+                name: "mainA".into(),
+                kind: NodeKind::Function,
+            },
+            language: "typescript".into(),
+            line_start: 1,
+            line_end: 5,
+            signature: "function mainA()".into(),
+            body: "function mainA() { return helperA(1); }".into(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let callee_a = Node {
+            id: NodeId {
+                root: "root-a".into(),
+                file: PathBuf::from("src/helpers.ts"),
+                name: "helperA".into(),
+                kind: NodeKind::Function,
+            },
+            language: "typescript".into(),
+            line_start: 1,
+            line_end: 3,
+            signature: "function helperA(x)".into(),
+            body: "function helperA(x) { return x; }".into(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let import_a = Node {
+            id: NodeId {
+                root: "root-a".into(),
+                file: PathBuf::from("src/lib.ts"),
+                name: "import { helperA } from './helpers'".into(),
+                kind: NodeKind::Import,
+            },
+            language: "typescript".into(),
+            line_start: 1,
+            line_end: 1,
+            signature: "import { helperA } from './helpers'".into(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let nodes = vec![caller_a, callee_a, import_a];
+        let edges = import_calls_pass(&nodes);
+
+        // Only 1 edge: mainA → helperA within root-a
+        assert_eq!(edges.len(), 1, "expected 1 cross-file edge in multi-root test");
+        assert_eq!(edges[0].from.name, "mainA");
+        assert_eq!(edges[0].to.name, "helperA");
+        assert_eq!(edges[0].from.root, "root-a");
     }
 }
