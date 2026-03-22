@@ -8,6 +8,7 @@
 //! for fine-grained checks. Multiple extractors can handle the same file.
 
 pub mod api_link;
+pub mod fastapi_router_prefix;
 pub mod consumers;
 pub mod directory_module;
 pub mod event_bus;

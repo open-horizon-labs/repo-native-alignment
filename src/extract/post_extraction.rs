@@ -258,6 +258,10 @@ impl PostExtractionRegistry {
         // Unconditional: applies_when always true; cost is zero when the directory
         // doesn't exist (load_extractor_configs returns early).
         reg.register(Box::new(ExtractorConfigPass));
+        // Group 5: FastAPI router prefix resolution — must run after route extraction
+        // (api_link has already consumed the raw paths). Unconditional: the pass
+        // self-gates on the presence of Python ApiEndpoint nodes with router_var metadata.
+        reg.register(Box::new(FastapiRouterPrefixPass));
         reg
     }
 }
@@ -560,6 +564,27 @@ impl PostExtractionPass for ExtractorConfigPass {
                 edges.extend(result.edges);
             }
         }
+        PassResult::empty()
+    }
+}
+
+// --- FastapiRouterPrefixPass ---
+
+/// Post-extraction pass that resolves FastAPI `APIRouter(prefix=...)` and
+/// prepends the prefix to the `http_path` of matching `ApiEndpoint` nodes.
+///
+/// Unconditional — `applies_when` always returns `true` because the pass
+/// self-gates on the presence of Python `ApiEndpoint` nodes with `router_var`
+/// metadata. The cost when no such nodes exist is a single `filter` pass.
+struct FastapiRouterPrefixPass;
+
+impl PostExtractionPass for FastapiRouterPrefixPass {
+    fn name(&self) -> &str { "fastapi_router_prefix" }
+
+    fn applies_when(&self, _detected_frameworks: &HashSet<String>) -> bool { true }
+
+    fn run(&self, nodes: &mut Vec<Node>, _edges: &mut Vec<Edge>, _ctx: &PassContext) -> PassResult {
+        crate::extract::fastapi_router_prefix::fastapi_router_prefix_pass(nodes);
         PassResult::empty()
     }
 }
