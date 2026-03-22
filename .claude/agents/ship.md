@@ -171,6 +171,20 @@ Run the actual feature with real data. Not unit tests — real queries, real fil
 
 **For RNA:** Use `cargo test` and write integration-style tests that parse real source files and verify the feature produces correct results.
 
+**Performance gate (required for any PR that adds or modifies a post-extraction pass):**
+Run a full scan of the RNA repo before and after and compare times:
+```bash
+time repo-native-alignment scan --repo /Users/muness/src/open-horizon-labs/repo-native-alignment --full
+```
+If scan time increases by more than 10%, the pass must be optimized before merging. Do NOT declare "done" without this check. Common failure patterns:
+- O(nodes × patterns) loops — must pre-index and use O(1) HashSet lookups
+- String search inside a loop — extract candidates in one body pass, then check set membership
+- Not gated by framework detection — passes that scan all nodes when they only apply to specific frameworks
+
+**Issue hygiene:**
+- If a feature doesn't work after merge → reopen the ORIGINAL issue, do NOT create a new one
+- If a pass causes a perf regression → fix it in a follow-up PR, do NOT file a new issue and move on
+
 **Post results as PR comment:**
 ```bash
 gh pr comment <PR> --body "$(cat <<'EOF'

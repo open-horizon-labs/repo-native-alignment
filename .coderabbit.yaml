@@ -23,6 +23,17 @@ reviews:
         - Any PR that adds new EdgeKind or NodeKind variants produced at extraction time without bumping EXTRACTION_VERSION
         EXTRACTION_VERSION must be bumped any time new data is produced during extraction that would be missing from files scanned before the upgrade. Check src/graph/store.rs for the current value and the comment listing what each version added.
 
+        POST-EXTRACTION PASS PERFORMANCE: Flag these as blocking issues:
+        - Any new post-extraction pass (api_link, import_calls, manifest, etc.) that iterates over ALL nodes for EACH import/pattern (O(nodes × patterns)) instead of doing ONE pass over nodes to extract candidates then O(1) lookup — must use pre-indexed HashMaps or extract-once patterns
+        - Any pass that calls body.contains(name) or similar string search inside a loop over imported names — must extract all call sites in ONE body pass then check against imports HashSet
+        - Any PR adding a new post-extraction pass without a scan timing benchmark showing the pass adds <5% to total scan time on a 100k+ node repo
+        - Shipping a feature as "done" without verifying it doesn't cause scan time regression
+
+        ISSUE HYGIENE: Flag these as blocking issues:
+        - Creating a new GitHub issue for a regression in an existing feature — must reopen the original issue instead
+        - Creating a new GitHub issue for a poor/slow/broken implementation of a recently-merged feature — must fix directly or reopen the original issue
+        - Any comment like "tracked as follow-up" or "filed new issue" for problems that were introduced by the current PR
+
         LANGUAGE GENERALITY: Flag these as blocking issues:
         - Any extraction feature, enrichment pass, or graph edge type that only works for one or two specific languages when the concept applies broadly across languages (e.g. module hierarchy applies to all languages, not just Rust; test coverage naming conventions work in Python/Go/Java/etc. too)
         - Hardcoding language names (e.g. "rust", "python") in feature logic that should be driven by LangConfig or file extensions
