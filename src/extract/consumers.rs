@@ -346,15 +346,16 @@ impl ExtractionConsumer for NextjsRoutingConsumer {
     }
 
     fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::FrameworkDetected { slug, framework, nodes } = event else {
+        let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
             return Ok(vec![]);
         };
 
-        // Only wake for nextjs-app-router (or if TS/JS files present, per existing logic).
-        let has_ts_js = nodes.iter().any(|n| {
-            matches!(n.language.as_str(), "typescript" | "javascript")
-        });
-        if framework != "nextjs-app-router" && !has_ts_js {
+        // Only wake for nextjs-app-router. The `has_ts_js` fallback from the original
+        // PostExtractionPass is intentionally dropped here: `nodes` in FrameworkDetected
+        // carries only the framework-matching nodes, not all repo nodes, so checking
+        // TS/JS presence would give wrong results. In Phase 3+, when the bus has access
+        // to the full node set, this can be revisited.
+        if framework != "nextjs-app-router" {
             return Ok(vec![]);
         }
 
@@ -362,7 +363,7 @@ impl ExtractionConsumer for NextjsRoutingConsumer {
         // This consumer emits PassComplete as a signal; the actual pass runs inside
         // PostExtractionRegistry in Phase 2. This establishes the subscription pattern.
         tracing::debug!(
-            "NextjsRoutingConsumer: root '{}' next.js routing check (framework='{}')",
+            "NextjsRoutingConsumer: root '{}' next.js routing triggered (framework='{}')",
             slug,
             framework,
         );
