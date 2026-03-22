@@ -10,7 +10,6 @@ use crate::graph::index::GraphIndex;
 use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
 use crate::scanner::Scanner;
 
-use super::graph::run_post_extraction_passes;
 use super::helpers;
 use super::state::GraphState;
 use super::store::{
@@ -259,16 +258,15 @@ impl RnaHandler {
                         ));
                     }
 
-                    // Run post-extraction passes over the full merged node/edge set.
-                    // These were previously only run in build_full_graph_inner (foreground
-                    // full build), causing the background scanner to produce a diverged
-                    // graph missing api_link, manifest, tested_by, directory_module,
-                    // import_calls, framework_detection, nextjs_routing, pubsub, and
-                    // websocket edges/nodes. Fix for #471.
+                    // Run post-extraction passes over the full merged node/edge set via
+                    // EventBus (ADR Phase 2b, issue #502). Emitting RootExtracted routes to
+                    // PostExtractionConsumer which runs all passes and emits PassesComplete.
                     //
-                    // We snapshot stable_ids BEFORE the passes to compute the net-new
-                    // nodes/edges added by them. These additions are persisted to LanceDB
-                    // via a separate lance_delta entry so they survive restarts/reloads.
+                    // ADR Constraint 4: no direct pass function calls in src/server/.
+                    //
+                    // Previously these were missing from the background scanner path (#471);
+                    // now both the foreground (build_full_graph_inner) and background paths
+                    // use the same bus-driven consumer chain.
                     {
                         // Snapshot existing stable_ids before the passes run.
                         let before_node_ids: std::collections::HashSet<String> =
@@ -287,13 +285,48 @@ impl RnaHandler {
                                 .collect();
                         let primary_slug =
                             RootConfig::code_project(repo_root.clone()).slug();
-                        let detected = run_post_extraction_passes(
-                            &mut graph_state.nodes,
-                            &mut graph_state.edges,
-                            &root_pairs,
-                            &primary_slug,
+
+                        // Wrap nodes/edges into Arc<[T]> for zero-copy bus fan-out.
+                        // Retain arc references as fallback if PassesComplete is absent.
+                        let nodes_arc: std::sync::Arc<[crate::graph::Node]> =
+                            std::sync::Arc::from(std::mem::take(&mut graph_state.nodes).into_boxed_slice());
+                        let edges_arc: std::sync::Arc<[crate::graph::Edge]> =
+                            std::sync::Arc::from(std::mem::take(&mut graph_state.edges).into_boxed_slice());
+
+                        let bus = crate::extract::consumers::build_builtin_bus(
+                            root_pairs,
+                            primary_slug.clone(),
                         );
-                        graph_state.detected_frameworks = detected;
+                        let events = bus.emit(crate::extract::event_bus::ExtractionEvent::RootExtracted {
+                            slug: primary_slug.clone(),
+                            path: repo_root.clone(),
+                            nodes: std::sync::Arc::clone(&nodes_arc),
+                            edges: std::sync::Arc::clone(&edges_arc),
+                        });
+
+                        let passes_complete = events.into_iter().find(|e| {
+                            matches!(e, crate::extract::event_bus::ExtractionEvent::PassesComplete { .. })
+                        });
+                        match passes_complete {
+                            Some(crate::extract::event_bus::ExtractionEvent::PassesComplete {
+                                nodes,
+                                edges,
+                                detected_frameworks,
+                                ..
+                            }) => {
+                                graph_state.nodes = nodes.to_vec();
+                                graph_state.edges = edges.to_vec();
+                                graph_state.detected_frameworks = detected_frameworks;
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    "Background scanner EventBus: no PassesComplete — \
+                                     falling back to pre-pass graph"
+                                );
+                                graph_state.nodes = nodes_arc.to_vec();
+                                graph_state.edges = edges_arc.to_vec();
+                            }
+                        }
 
                         // Deduplicate nodes and edges after post-extraction passes.
                         // Passes re-emit edges that may already be present from cached
