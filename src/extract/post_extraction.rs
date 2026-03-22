@@ -213,18 +213,28 @@ impl PostExtractionRegistry {
 
     /// Build the default registry with all built-in passes in the standard order.
     ///
-    /// Order matters:
-    /// 1. Unconditional passes first (api_link, manifest, tested_by, import_calls, dir_module)
-    /// 2. Framework detection (populates `detected_frameworks` for gated passes)
-    /// 3. Framework-gated passes (nextjs, pubsub, websocket)
+    /// **Registration order is significant.** Passes run in the order they are
+    /// registered. The invariant that must be preserved:
+    ///
+    /// 1. **Unconditional passes first** (api_link, manifest, tested_by, import_calls,
+    ///    dir_module) — these depend only on extracted nodes/edges
+    /// 2. **`FrameworkDetectionPass` before any framework-gated pass** — it sets
+    ///    `detected_frameworks` in the context; gated passes (pubsub, websocket) call
+    ///    `applies_when` which checks that set. Inserting a gated pass before
+    ///    `FrameworkDetectionPass` causes it to skip silently even when its framework
+    ///    is present.
+    /// 3. **Framework-gated passes last** (nextjs, pubsub, websocket)
     pub fn with_builtins() -> Self {
         let mut reg = Self::new();
+        // Group 1: unconditional passes (no framework dependency)
         reg.register(Box::new(ApiLinkPass));
         reg.register(Box::new(ManifestPass));
         reg.register(Box::new(TestedByPass));
         reg.register(Box::new(ImportCallsPass));
         reg.register(Box::new(DirectoryModulePass));
+        // Group 2: framework detection — MUST run before any framework-gated pass
         reg.register(Box::new(FrameworkDetectionPass));
+        // Group 3: framework-gated passes (pubsub/websocket use applies_when; nextjs gates in run())
         reg.register(Box::new(NextjsRoutingPass));
         reg.register(Box::new(PubSubPass));
         reg.register(Box::new(WebSocketPass));
