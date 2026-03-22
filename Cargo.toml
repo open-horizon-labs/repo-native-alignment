@@ -96,6 +96,9 @@ url = "2"
 # Content hashing (incremental extraction/embedding skip)
 blake3 = "1"
 
+# Parallel file extraction
+rayon = "1"
+
 # Error handling
 anyhow = "1"
 
