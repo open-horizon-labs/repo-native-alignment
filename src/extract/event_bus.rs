@@ -42,6 +42,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::graph::{Edge, Node};
 
@@ -52,6 +53,14 @@ use crate::graph::{Edge, Node};
 /// All events the extraction pipeline can emit.
 ///
 /// Each variant carries the data consumers need — no consumer polls context.
+///
+/// **Shared ownership via `Arc<[T]>`**: Node/edge payloads use `Arc<[Node]>` and
+/// `Arc<[Edge]>` instead of `Vec<T>` to avoid O(N) clones when multiple consumers
+/// receive the same event. The bus fans out events by `clone()` — with `Vec`, each
+/// consumer gets a full deep copy; with `Arc`, consumers share the same allocation.
+///
+/// Constructing a payload: `Arc::from(vec.into_boxed_slice())` or
+/// `Arc::from(slice)`. Reading: `event.nodes.iter()` works as with Vec.
 #[derive(Debug, Clone)]
 pub enum ExtractionEvent {
     /// A repository root has been discovered. First event in the pipeline.
@@ -66,8 +75,10 @@ pub enum ExtractionEvent {
     RootExtracted {
         slug: String,
         path: PathBuf,
-        nodes: Vec<Node>,
-        edges: Vec<Edge>,
+        /// Shared read-only view of all extracted nodes. Use `Arc::from(vec)` to construct.
+        nodes: Arc<[Node]>,
+        /// Shared read-only view of all extracted edges. Use `Arc::from(vec)` to construct.
+        edges: Arc<[Edge]>,
     },
 
     /// A language has been detected in the extracted nodes.
@@ -75,15 +86,16 @@ pub enum ExtractionEvent {
     LanguageDetected {
         slug: String,
         language: String,
-        nodes: Vec<Node>,
+        /// Nodes for this specific language — subset of the root's nodes.
+        nodes: Arc<[Node]>,
     },
 
     /// LSP enrichment is complete for a language.
     EnrichmentComplete {
         slug: String,
         language: String,
-        added_edges: Vec<Edge>,
-        new_nodes: Vec<Node>,
+        added_edges: Arc<[Edge]>,
+        new_nodes: Arc<[Node]>,
     },
 
     /// A framework has been detected during post-extraction passes.
@@ -91,7 +103,8 @@ pub enum ExtractionEvent {
     FrameworkDetected {
         slug: String,
         framework: String,
-        nodes: Vec<Node>,
+        /// Nodes that were tagged with this framework during detection.
+        nodes: Arc<[Node]>,
     },
 
     /// A single post-extraction pass has completed.
@@ -105,8 +118,10 @@ pub enum ExtractionEvent {
     /// Terminal consumers (LanceDBPersist, SubsystemPass) subscribe here.
     PassesComplete {
         slug: String,
-        nodes: Vec<Node>,
-        edges: Vec<Edge>,
+        /// Full enriched node set after all passes ran.
+        nodes: Arc<[Node]>,
+        /// Full enriched edge set after all passes ran.
+        edges: Arc<[Edge]>,
         detected_frameworks: HashSet<String>,
     },
 }
@@ -331,8 +346,8 @@ mod tests {
         ExtractionEvent::RootExtracted {
             slug: "test".to_string(),
             path: PathBuf::from("."),
-            nodes: vec![],
-            edges: vec![],
+            nodes: Arc::from(vec![].into_boxed_slice()),
+            edges: Arc::from(vec![].into_boxed_slice()),
         }
     }
 
@@ -411,8 +426,8 @@ mod tests {
                 make_root_extracted(),
                 ExtractionEvent::PassesComplete {
                     slug: "test".into(),
-                    nodes: vec![],
-                    edges: vec![],
+                    nodes: Arc::from(vec![].into_boxed_slice()),
+                    edges: Arc::from(vec![].into_boxed_slice()),
                     detected_frameworks: HashSet::new(),
                 },
             ],

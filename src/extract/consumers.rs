@@ -140,8 +140,8 @@ impl ExtractionConsumer for TreeSitterConsumer {
         Ok(vec![ExtractionEvent::RootExtracted {
             slug: slug.clone(),
             path: path.clone(),
-            nodes: extraction.nodes,
-            edges: extraction.edges,
+            nodes: std::sync::Arc::from(extraction.nodes.into_boxed_slice()),
+            edges: std::sync::Arc::from(extraction.edges.into_boxed_slice()),
         }])
     }
 }
@@ -173,12 +173,11 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
         // order (go, python, rust, typescript, ...) across runs — stable for testing
         // and for Phase 3+ when consumers may depend on relative event ordering.
         //
-        // NOTE (Phase 2): nodes are cloned because ExtractionEvent carries owned
-        // Vec<Node>. Phase 3+ will switch to Arc<[Node]> shared ownership to avoid
-        // repeated graph-sized copies when the bus is wired into the hot path.
+        // Nodes are cloned into per-language buckets. The event payload uses Arc<[Node]>
+        // to avoid O(N) copies when multiple consumers receive the same LanguageDetected.
         let mut by_lang: std::collections::BTreeMap<String, Vec<Node>> =
             std::collections::BTreeMap::new();
-        for node in nodes {
+        for node in nodes.iter() {
             if node.language.is_empty() {
                 continue;
             }
@@ -196,7 +195,7 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
             events.push(ExtractionEvent::LanguageDetected {
                 slug: slug.clone(),
                 language,
-                nodes: lang_nodes,
+                nodes: std::sync::Arc::from(lang_nodes.into_boxed_slice()),
             });
         }
 
@@ -244,12 +243,12 @@ impl ExtractionConsumer for PostExtractionConsumer {
             detected_frameworks: HashSet::new(),
         };
 
-        // NOTE (Phase 2): full clone of nodes + edges because PostExtractionRegistry::run_all
-        // takes mutable references and appends new items. Phase 3+ will switch to
-        // Arc<[Node]>-based events so the bus doesn't require O(N) copies on each
-        // RootExtracted event.
-        let mut all_nodes = nodes.clone();
-        let mut all_edges = edges.clone();
+        // PostExtractionRegistry::run_all takes mutable Vec references and appends
+        // items. We must materialize mutable Vecs from the Arc<[T]> payloads.
+        // The resulting all_nodes/all_edges are wrapped back into Arc<[T]> for the
+        // PassesComplete event so downstream consumers share the same allocation.
+        let mut all_nodes = nodes.to_vec();
+        let mut all_edges = edges.to_vec();
         let result = registry.run_all(&mut all_nodes, &mut all_edges, ctx);
 
         tracing::info!(
@@ -279,15 +278,18 @@ impl ExtractionConsumer for PostExtractionConsumer {
             follow_ons.push(ExtractionEvent::FrameworkDetected {
                 slug: slug.clone(),
                 framework: framework.clone(),
-                nodes: fw_nodes,
+                nodes: std::sync::Arc::from(fw_nodes.into_boxed_slice()),
             });
         }
 
         // Always emit PassesComplete with the enriched graph.
+        // Wrap into Arc<[T]> so all PassesComplete subscribers share the allocation.
+        let nodes_arc = std::sync::Arc::from(all_nodes.into_boxed_slice());
+        let edges_arc = std::sync::Arc::from(all_edges.into_boxed_slice());
         follow_ons.push(ExtractionEvent::PassesComplete {
             slug: slug.clone(),
-            nodes: all_nodes,
-            edges: all_edges,
+            nodes: nodes_arc,
+            edges: edges_arc,
             detected_frameworks: result.detected_frameworks,
         });
 
@@ -641,8 +643,8 @@ impl ExtractionConsumer for LspConsumer {
         Ok(vec![ExtractionEvent::EnrichmentComplete {
             slug: slug.clone(),
             language: language.clone(),
-            added_edges: vec![],
-            new_nodes: vec![],
+            added_edges: std::sync::Arc::from([]),
+            new_nodes: std::sync::Arc::from([]),
         }])
     }
 }
@@ -907,12 +909,12 @@ mod tests {
         let event = ExtractionEvent::RootExtracted {
             slug: "test".into(),
             path: PathBuf::from("."),
-            nodes: vec![
+            nodes: std::sync::Arc::from(vec![
                 make_node("rust", "foo"),
                 make_node("rust", "bar"),
                 make_node("python", "baz"),
-            ],
-            edges: vec![],
+            ].into_boxed_slice()),
+            edges: std::sync::Arc::from([]),
         };
 
         let consumer = LanguageAccumulatorConsumer;
@@ -940,7 +942,7 @@ mod tests {
         let event = ExtractionEvent::RootExtracted {
             slug: "test".into(),
             path: PathBuf::from("."),
-            nodes: vec![Node {
+            nodes: std::sync::Arc::from(vec![Node {
                 id: NodeId {
                     root: "test".into(),
                     file: PathBuf::from("unknown"),
@@ -954,8 +956,8 @@ mod tests {
                 body: String::new(),
                 metadata: BTreeMap::new(),
                 source: ExtractionSource::TreeSitter,
-            }],
-            edges: vec![],
+            }].into_boxed_slice()),
+            edges: std::sync::Arc::from([]),
         };
         let consumer = LanguageAccumulatorConsumer;
         let follow_ons = consumer.on_event(&event).unwrap();
@@ -982,7 +984,7 @@ mod tests {
         let event = ExtractionEvent::FrameworkDetected {
             slug: "test".into(),
             framework: "kafka-python".into(),
-            nodes: vec![],
+            nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&event).unwrap();
         assert_eq!(result.len(), 1);
@@ -995,7 +997,7 @@ mod tests {
         let event = ExtractionEvent::FrameworkDetected {
             slug: "test".into(),
             framework: "django".into(),
-            nodes: vec![],
+            nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&event).unwrap();
         assert!(result.is_empty());
@@ -1008,7 +1010,7 @@ mod tests {
         let event = ExtractionEvent::FrameworkDetected {
             slug: "test".into(),
             framework: "socketio".into(),
-            nodes: vec![],
+            nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&event).unwrap();
         assert_eq!(result.len(), 1);
@@ -1021,7 +1023,7 @@ mod tests {
         let event = ExtractionEvent::FrameworkDetected {
             slug: "test".into(),
             framework: "flask".into(),
-            nodes: vec![],
+            nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&event).unwrap();
         assert!(result.is_empty());
@@ -1057,8 +1059,8 @@ mod tests {
         let event = ExtractionEvent::RootExtracted {
             slug: "test".into(),
             path: PathBuf::from("."),
-            nodes: vec![],
-            edges: vec![],
+            nodes: std::sync::Arc::from([]),
+            edges: std::sync::Arc::from([]),
         };
         let follow_ons = consumer.on_event(&event).unwrap();
         assert!(
@@ -1078,7 +1080,7 @@ mod tests {
         let matching = ExtractionEvent::FrameworkDetected {
             slug: "test".into(),
             framework: "fastapi".into(),
-            nodes: vec![],
+            nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&matching).unwrap();
         assert_eq!(result.len(), 1);
@@ -1087,7 +1089,7 @@ mod tests {
         let non_matching = ExtractionEvent::FrameworkDetected {
             slug: "test".into(),
             framework: "flask".into(),
-            nodes: vec![],
+            nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&non_matching).unwrap();
         assert!(result.is_empty());
@@ -1132,7 +1134,7 @@ mod tests {
         let matching = ExtractionEvent::LanguageDetected {
             slug: "test".into(),
             language: "rust".into(),
-            nodes: vec![],
+            nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&matching).unwrap();
         assert_eq!(result.len(), 1, "LspConsumer must emit EnrichmentComplete for its language");
@@ -1148,7 +1150,7 @@ mod tests {
         let other_lang = ExtractionEvent::LanguageDetected {
             slug: "test".into(),
             language: "python".into(),
-            nodes: vec![],
+            nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&other_lang).unwrap();
         assert!(result.is_empty(), "LspConsumer must ignore events for other languages");
@@ -1161,8 +1163,8 @@ mod tests {
         assert!(consumer.subscribes_to().contains(&ExtractionEventKind::PassesComplete));
         let event = ExtractionEvent::PassesComplete {
             slug: "test".into(),
-            nodes: vec![],
-            edges: vec![],
+            nodes: std::sync::Arc::from([]),
+            edges: std::sync::Arc::from([]),
             detected_frameworks: HashSet::new(),
         };
         let result = consumer.on_event(&event).unwrap();
@@ -1176,8 +1178,8 @@ mod tests {
         assert!(consumer.subscribes_to().contains(&ExtractionEventKind::PassesComplete));
         let event = ExtractionEvent::PassesComplete {
             slug: "test".into(),
-            nodes: vec![],
-            edges: vec![],
+            nodes: std::sync::Arc::from([]),
+            edges: std::sync::Arc::from([]),
             detected_frameworks: HashSet::new(),
         };
         let result = consumer.on_event(&event).unwrap();
@@ -1192,8 +1194,8 @@ mod tests {
         let event = ExtractionEvent::RootExtracted {
             slug: "test".into(),
             path: PathBuf::from("."),
-            nodes: vec![],
-            edges: vec![],
+            nodes: std::sync::Arc::from([]),
+            edges: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&event).unwrap();
         assert!(result.is_empty(), "EmbeddingIndexerConsumer Phase 2 stub emits nothing");
