@@ -12,7 +12,7 @@ Full development pipeline: **problem-statement → solution-space → execute �
 
 Takes a feature or bug from framing through merge. Each phase feeds the next via a session file. The pipeline ensures nothing is skipped — no coding without a problem statement, no merging without the /ship quality gate.
 
-> **Use RNA tools — not Grep/Read — for all code navigation:**
+> **Use RNA tools — not Grep/Read — for all code navigation.**
 >
 > - **MCP tools** (`search`, `repo_map`, `outcome_progress`, `graph_query`) — project-level context: guardrails, outcomes, metis, cross-cutting impact analysis.
 > - **CLI in your worktree** — code navigation WITHIN your working directory. Use these Bash commands from inside your worktree:
@@ -20,9 +20,9 @@ Takes a feature or bug from framing through merge. Each phase feeds the next via
 >   repo-native-alignment search --repo . "what you're looking for" --limit 5
 >   repo-native-alignment graph --node "file.rs:function:kind" --repo . --mode neighbors
 >   ```
->   If the worktree hasn't been scanned yet, run `repo-native-alignment scan --repo . --full` once before querying.
+>   **The worktree MUST be scanned before querying.** See the MANDATORY scan step in Phase 3 below — do not skip it.
 >
-> **Friction logging:** When an RNA tool falls short or you fall back to Grep/Read, append to the session file's `## RNA Tool Friction Log` table. See guardrail: `dogfood-rna-tools`.
+> **Friction logging:** Every Grep/Read used for code navigation after the scan has run is a friction event. Log it to the session file's `## RNA Tool Friction Log` table with severity `skipped`. See guardrail: `dogfood-rna-tools`.
 
 > **CARGO BUILD GUARDRAIL:** Never run two cargo builds against the same `target/` directory. Each pipeline gets its own worktree with its own `CARGO_TARGET_DIR` (see Phase 3 worktree setup). Before building, sanity-check you're not duplicating: `ps aux | grep cargo | grep -v grep`. A second cargo process targeting the same directory blocks silently on the file lock, hanging indefinitely. See `.oh/guardrails/no-parallel-cargo-agents.md`.
 
@@ -174,6 +174,34 @@ This hardlinks the main repo's `target/` directory so `cargo build` only recompi
 ```bash
 git worktree remove .claude/worktrees/<issue-number> --force
 ```
+
+### MANDATORY: RNA scan before touching any code
+
+**You CANNOT start coding until the RNA index is live in the worktree.** Run this before opening any source file:
+
+```bash
+# Step 1: verify index is already populated
+COUNT=$(repo-native-alignment search "" --repo . --limit 1 2>/dev/null | grep -o "[0-9]* symbols" | head -1)
+echo "RNA ready: $COUNT indexed"
+
+# Step 2: if count is 0 or the command failed, run a full scan first
+# (only needed on a fresh worktree — takes ~10s)
+repo-native-alignment scan --repo . --full 2>&1 | tail -2
+```
+
+If after scanning the count is still 0, stop and investigate before proceeding. A zero-node index means code navigation will silently fall back to Grep/Read, producing incomplete results and friction events.
+
+**Once the index is live, use RNA for ALL code navigation in this worktree:**
+
+```bash
+# Find symbols, understand existing patterns
+repo-native-alignment search "what you need" --repo . --limit 5
+
+# Understand a specific symbol's callers or dependencies
+repo-native-alignment graph --node "file.rs:function:kind" --repo . --mode neighbors
+```
+
+**Friction consequence:** If you use `grep`, `rg`, or `Read(file)` for code navigation _after_ the scan has run, that is a friction event. Log it immediately to the session file's `## RNA Tool Friction Log` table with severity `skipped`. A pipeline with 20 Grep calls and 0 friction log entries is not frictionless — it is unmonitored. The log exists to improve RNA; suppressing it by not logging makes the tool permanently worse.
 
 ### Implementation
 

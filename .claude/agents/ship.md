@@ -17,6 +17,8 @@ The full quality gate for this project. 13 steps. Run sequentially — each step
 > - **CLI in your worktree** (`repo-native-alignment search --repo . "query"`, `repo-native-alignment graph --node "..." --repo . --mode neighbors`) — use for code navigation WITHIN your working directory. Always pass `--repo .` so it reads your local worktree's index.
 >
 > **Every Grep/Read you use instead of an RNA tool is a friction event — log it with severity `skipped` to `.oh/friction-logs/`.** When an RNA tool fails, log that too. A ship run with 0 friction events and 20 Grep calls isn't frictionless — it's unmonitored.
+>
+> **MANDATORY scan before any code navigation:** The worktree index must be live before you read any source file. See the scan gate in Pre-flight step 6 below.
 
 > **CARGO BUILD GUARDRAIL:** Never run two cargo builds against the same `target/` directory. Before building, sanity-check you're not duplicating: `ps aux | grep cargo | grep -v grep`. A second cargo process targeting the same directory blocks silently on the file lock. See `.oh/guardrails/no-parallel-cargo-agents.md`.
 
@@ -35,6 +37,16 @@ Before starting:
 3. Identify the PR, branch, and issue being closed
 4. Read the PR description and issue acceptance criteria
 5. Check for CodeRabbit review comments on the PR (`gh api repos/{owner}/{repo}/pulls/<PR-number>/comments`). Note: CodeRabbit only reviews non-draft PRs, so comments may not exist yet during pre-flight if the PR is still a draft.
+6. **MANDATORY RNA scan gate** — before reading any source file, verify the worktree index is live:
+   ```bash
+   # Check if already indexed
+   COUNT=$(repo-native-alignment search "" --repo . --limit 1 2>/dev/null | grep -o "[0-9]* symbols" | head -1)
+   echo "RNA ready: $COUNT indexed"
+
+   # If count is 0 or command failed, scan now
+   repo-native-alignment scan --repo . --full 2>&1 | tail -2
+   ```
+   You CANNOT do code review, dissent analysis, or adversarial testing without an indexed worktree. Any Grep/Read for code navigation after this point is a friction event and must be logged to `.oh/friction-logs/<pr-number>-ship.md`.
 
 ## The 12 Steps
 
