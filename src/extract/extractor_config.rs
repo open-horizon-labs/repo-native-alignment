@@ -697,7 +697,7 @@ edge_kind = "Consumes"
         let cfg = pubsub_fixture_config();
         assert_eq!(cfg.boundaries.len(), 2);
         assert_eq!(cfg.boundaries[0].function_pattern, "publisher.publish");
-        assert_eq!(cfg.boundaries[0].topic_arg, 0);
+        assert_eq!(cfg.boundaries[0].topic_arg, Some(0));
         assert_eq!(cfg.boundaries[0].edge_kind, "Produces");
         assert_eq!(cfg.boundaries[1].function_pattern, "subscriber.subscribe");
         assert_eq!(cfg.boundaries[1].edge_kind, "Consumes");
@@ -737,7 +737,7 @@ decorator = true
 "#,
         );
         assert_eq!(cfg.boundaries.len(), 2);
-        assert_eq!(cfg.boundaries[0].topic_arg, 0, "arg_position alias must map to topic_arg");
+        assert_eq!(cfg.boundaries[0].topic_arg, Some(0), "arg_position alias must map to topic_arg");
         assert!(!cfg.boundaries[0].decorator);
         assert!(cfg.boundaries[1].decorator);
     }

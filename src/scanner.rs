@@ -17,6 +17,8 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::walk::is_worktree_with_own_cache;
+
 // ── Default excludes ────────────────────────────────────────────────
 
 pub const DEFAULT_EXCLUDES: &[&str] = &[
@@ -842,6 +844,14 @@ impl Scanner {
             let ft = entry.file_type()?;
 
             if ft.is_dir() {
+                // Skip subdirectories that are independently-indexed git worktrees.
+                if is_worktree_with_own_cache(&path) {
+                    tracing::info!(
+                        "skipping worktree {}: has own RNA cache",
+                        path.display()
+                    );
+                    continue;
+                }
                 self.walk_dir_mtime(&path, changed, new, new_dir_mtimes, new_file_mtimes)?;
             } else if ft.is_file() {
                 let file_start = Instant::now();
@@ -931,6 +941,15 @@ impl Scanner {
             let ft = entry.file_type()?;
 
             if ft.is_dir() {
+                // Skip subdirectories that are independently-indexed git worktrees.
+                if is_worktree_with_own_cache(&path) {
+                    tracing::info!(
+                        "skipping worktree {}: has own RNA cache",
+                        path.display()
+                    );
+                    continue;
+                }
+
                 let rel_dir = path
                     .strip_prefix(&self.repo_root)
                     .unwrap_or(&path)
