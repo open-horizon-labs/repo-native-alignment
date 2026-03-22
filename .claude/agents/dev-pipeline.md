@@ -16,7 +16,7 @@ Takes a feature or bug from framing through merge. Each phase feeds the next via
 >
 > - **MCP tools** (`search`, `repo_map`, `outcome_progress`, `graph_query`) — project-level context: guardrails, outcomes, metis, cross-cutting impact analysis.
 >   - **When working in a worktree**, use the `repo` parameter to scope queries to your worktree's graph:
->     ```
+>     ```text
 >     mcp__rna-mcp__search(query="build_code_embedding_text", repo="/path/to/worktree")
 >     mcp__rna-mcp__repo_map(repo="/path/to/worktree")
 >     ```

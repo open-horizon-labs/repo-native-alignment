@@ -15,7 +15,7 @@ The full quality gate for this project. 13 steps. Run sequentially — each step
 > **Two RNA access paths — use the right one:**
 > - **MCP tools** (`search`, `repo_map`, `outcome_progress`, `search_symbols`, `graph_query`) — use for project-level context: guardrails, outcomes, metis, impact analysis. These query the main RNA repo index.
 >   - **Worktree-aware queries:** use the `repo` parameter to scope to your worktree's graph:
->     ```
+>     ```text
 >     mcp__rna-mcp__search(query="handle_search", repo="/path/to/worktree")
 >     mcp__rna-mcp__repo_map(repo="/path/to/worktree")
 >     ```
