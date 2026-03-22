@@ -115,8 +115,10 @@ static FRAMEWORK_RULES: &[FrameworkRule] = &[
     FrameworkRule { import_pattern: "graphql", language: "javascript", framework_id: "graphql", display_name: "GraphQL" },
     // Prisma
     FrameworkRule { import_pattern: "@prisma/", language: "typescript", framework_id: "prisma", display_name: "Prisma" },
+    FrameworkRule { import_pattern: "@prisma/", language: "javascript", framework_id: "prisma", display_name: "Prisma" },
     // Typeorm
     FrameworkRule { import_pattern: "typeorm", language: "typescript", framework_id: "typeorm", display_name: "TypeORM" },
+    FrameworkRule { import_pattern: "typeorm", language: "javascript", framework_id: "typeorm", display_name: "TypeORM" },
     // gRPC JS
     FrameworkRule { import_pattern: "@grpc/", language: "typescript", framework_id: "grpc-js", display_name: "gRPC (Node.js)" },
     FrameworkRule { import_pattern: "@grpc/", language: "javascript", framework_id: "grpc-js", display_name: "gRPC (Node.js)" },
@@ -125,16 +127,21 @@ static FRAMEWORK_RULES: &[FrameworkRule] = &[
     FrameworkRule { import_pattern: "fastify", language: "javascript", framework_id: "fastify", display_name: "Fastify" },
     // NestJS
     FrameworkRule { import_pattern: "@nestjs/", language: "typescript", framework_id: "nestjs", display_name: "NestJS" },
+    FrameworkRule { import_pattern: "@nestjs/", language: "javascript", framework_id: "nestjs", display_name: "NestJS" },
     // Remix
     FrameworkRule { import_pattern: "@remix-run/", language: "typescript", framework_id: "remix", display_name: "Remix" },
+    FrameworkRule { import_pattern: "@remix-run/", language: "javascript", framework_id: "remix", display_name: "Remix" },
     // Svelte
     FrameworkRule { import_pattern: "svelte", language: "typescript", framework_id: "svelte", display_name: "Svelte" },
+    FrameworkRule { import_pattern: "svelte", language: "javascript", framework_id: "svelte", display_name: "Svelte" },
     // Vue
     FrameworkRule { import_pattern: "vue", language: "typescript", framework_id: "vue", display_name: "Vue.js" },
     FrameworkRule { import_pattern: "vue", language: "javascript", framework_id: "vue", display_name: "Vue.js" },
     // OpenAI JS
     FrameworkRule { import_pattern: "openai", language: "typescript", framework_id: "openai", display_name: "OpenAI SDK" },
+    FrameworkRule { import_pattern: "openai", language: "javascript", framework_id: "openai", display_name: "OpenAI SDK" },
     FrameworkRule { import_pattern: "@anthropic-ai/", language: "typescript", framework_id: "anthropic", display_name: "Anthropic SDK" },
+    FrameworkRule { import_pattern: "@anthropic-ai/", language: "javascript", framework_id: "anthropic", display_name: "Anthropic SDK" },
 
     // -------------------------------------------------------------------------
     // Go frameworks

@@ -961,7 +961,7 @@ impl RnaHandler {
         let registry = ExtractorRegistry::with_builtins();
 
         // Remove nodes/edges for deleted + changed files
-        let files_to_remove: Vec<PathBuf> = scan
+        let mut files_to_remove: Vec<PathBuf> = scan
             .deleted_files
             .iter()
             .chain(scan.changed_files.iter())
@@ -1136,11 +1136,24 @@ impl RnaHandler {
         // Pre-clean: remove stale virtual nodes (subsystem + framework) and their
         // BelongsTo/UsesFramework edges BEFORE dedup/index/PageRank. This ensures
         // detect_communities() only sees real code symbols.
+        // Collect virtual file paths for LanceDB deletion — these will be added to
+        // files_to_remove so the old rows are removed from LanceDB on persist.
+        let stale_virtual_files: Vec<std::path::PathBuf> = graph
+            .nodes
+            .iter()
+            .filter(|n| {
+                matches!(&n.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework"))
+            })
+            .map(|n| n.id.file.clone())
+            .collect();
         graph.nodes.retain(|n| !matches!(&n.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework")));
         graph.edges.retain(|e| {
             !matches!(&e.to.kind, NodeKind::Other(s) if s == "subsystem")
                 && e.kind != crate::graph::EdgeKind::UsesFramework
         });
+        // Schedule stale virtual file paths for LanceDB deletion so they won't
+        // reappear on reload. The fresh nodes (re-emitted later) will be upserted.
+        files_to_remove.extend(stale_virtual_files);
 
         // Framework detection pass (incremental): re-scan all Import nodes and
         // refresh framework nodes + detected_frameworks set.
