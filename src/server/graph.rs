@@ -583,168 +583,23 @@ impl RnaHandler {
             }
         }
 
-        // 4b. API link pass: connect URL-path string-literal Const nodes to
-        //     ApiEndpoint nodes via DependsOn edges.
-        //     Runs here (after all roots are merged) rather than inside
-        //     extract_scan_result() so that cross-file links are created
-        //     correctly during incremental scans — the caller may be in a
-        //     changed file while the ApiEndpoint is in an unchanged file or
-        //     vice versa.
+        // 4b-4i. Post-extraction passes: API link, manifest, tested-by, import-calls,
+        //        directory-module, framework detection, Next.js routing, pub/sub, WebSocket.
+        //        Extracted into `run_post_extraction_passes` so the background scanner
+        //        calls the same function (fix for #471).
         {
-            let api_link_edges = crate::extract::api_link::api_link_pass(&all_nodes);
-            if !api_link_edges.is_empty() {
-                tracing::info!(
-                    "API link pass: {} DependsOn edge(s) from string literals to endpoints",
-                    api_link_edges.len()
-                );
-                all_edges.extend(api_link_edges);
-            }
-        }
-
-        // 4c. Manifest pass: emit package nodes + DependsOn edges for JS/TS,
-        //     Python, and Go projects by parsing package.json, pyproject.toml,
-        //     requirements.txt, and go.mod files.
-        {
-            let root_pairs: Vec<(String, std::path::PathBuf)> = resolved_roots
-                .iter()
-                .map(|r| (r.slug.clone(), r.path.clone()))
-                .collect();
-            let manifest_result = crate::extract::manifest::manifest_pass(&root_pairs);
-            if !manifest_result.nodes.is_empty() || !manifest_result.edges.is_empty() {
-                tracing::info!(
-                    "Manifest pass: {} package node(s), {} DependsOn edge(s)",
-                    manifest_result.nodes.len(),
-                    manifest_result.edges.len()
-                );
-                all_nodes.extend(manifest_result.nodes);
-                all_edges.extend(manifest_result.edges);
-            }
-        }
-
-        // 4d. TestedBy naming-convention pass: emit TestedBy edges from test
-        //     functions to the production functions they exercise, using only
-        //     function names (no LSP required).  Runs here so that edges are
-        //     present after every tree-sitter-only scan, not just when LSP
-        //     finishes initialising.
-        {
-            let tested_by_edges = crate::extract::naming_convention::tested_by_pass(&all_nodes);
-            if !tested_by_edges.is_empty() {
-                tracing::info!(
-                    "TestedBy naming-convention pass: {} edge(s)",
-                    tested_by_edges.len()
-                );
-                all_edges.extend(tested_by_edges);
-            }
-        }
-
-        // 4e-pre. Import-calls pass: emit Calls edges for cross-file function
-        //         calls resolved through import declarations.  Runs after all
-        //         nodes are merged so that both caller and callee are visible.
-        //         Covers TypeScript/JavaScript ES6 imports, Python from-imports,
-        //         and Rust use declarations.  Same-file calls are already handled
-        //         by the tree-sitter call detection inside extract_scan_result.
-        {
-            let import_call_edges = crate::extract::import_calls::import_calls_pass(&all_nodes);
-            if !import_call_edges.is_empty() {
-                tracing::info!(
-                    "Import-calls pass: {} cross-file Calls edge(s) via import resolution",
-                    import_call_edges.len()
-                );
-                all_edges.extend(import_call_edges);
-            }
-        }
-
-        // 4e. Directory-module pass: emit BelongsTo edges from every symbol to
-        //     a virtual NodeKind::Module node derived from its directory path.
-        //     Runs unconditionally for all languages — no LSP required.
-        //     The LSP enricher's Pass 4 (rust-analyzer/parentModule) provides
-        //     more accurate Rust module paths and runs later as an override.
-        //
-        //     Deduplication note: for clean-root cache-reuse builds, the cached
-        //     node set already contains module nodes from the previous run.  This
-        //     pass will re-emit them with identical stable_ids — LanceDB's
-        //     merge_insert upsert path handles the dedup at persist time, and
-        //     GraphIndex's ensure_node deduplicates in the petgraph index.  The
-        //     same approach is used by api_link_pass and tested_by_pass.
-        {
-            let dir_result = crate::extract::directory_module::directory_module_pass(&all_nodes);
-            if !dir_result.edges.is_empty() {
-                tracing::info!(
-                    "Directory module pass: {} BelongsTo edge(s), {} module node(s)",
-                    dir_result.edges.len(),
-                    dir_result.nodes.len(),
-                );
-                all_nodes.extend(dir_result.nodes);
-                all_edges.extend(dir_result.edges);
-            }
-        }
-
-        // 4f. Framework detection pass: scan Import nodes, detect frameworks,
-        // emit NodeKind::Other("framework") nodes. Runs BEFORE conditional passes
-        // (Next.js routing, pub/sub, SSE) so they can gate on detected frameworks.
-        {
-            let primary_slug = crate::roots::RootConfig::code_project(self.repo_root.clone()).slug();
-            let fw_result = framework_detection_pass(&all_nodes, &primary_slug);
-            if !fw_result.nodes.is_empty() {
-                all_nodes.extend(fw_result.nodes);
-            }
-            all_detected_frameworks = fw_result.detected_frameworks;
-        }
-
-        // 4g. Next.js file-path routing pass: emit ApiEndpoint nodes for
-        //     Next.js App Router and Pages Router API routes.
-        //     Gated: runs when Next.js framework detected via imports OR when
-        //     TypeScript/JavaScript files are present (the routing pass uses file
-        //     system patterns, so any TS/JS project might be Next.js).
-        let has_ts_js_files = all_nodes.iter().any(|n| {
-            matches!(n.language.as_str(), "typescript" | "javascript")
-        });
-        if all_detected_frameworks.contains("nextjs-app-router") || has_ts_js_files {
-            // Include lsp_only roots (e.g. client/) — Next.js routing is path-based.
-            let nextjs_roots: Vec<(String, std::path::PathBuf)> = workspace
+            let root_pairs: Vec<(String, std::path::PathBuf)> = workspace
                 .resolved_roots()
                 .iter()
                 .map(|r| (r.slug.clone(), r.path.clone()))
                 .collect();
-            let nextjs_result = crate::extract::nextjs_routing::nextjs_routing_pass(
-                &nextjs_roots,
-                &all_nodes,
+            let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
+            all_detected_frameworks = run_post_extraction_passes(
+                &mut all_nodes,
+                &mut all_edges,
+                &root_pairs,
+                &primary_slug,
             );
-            if !nextjs_result.nodes.is_empty() || !nextjs_result.edges.is_empty() {
-                tracing::info!(
-                    "Next.js routing pass: {} ApiEndpoint node(s), {} Implements edge(s)",
-                    nextjs_result.nodes.len(),
-                    nextjs_result.edges.len()
-                );
-                all_nodes.extend(nextjs_result.nodes);
-                all_edges.extend(nextjs_result.edges);
-            }
-        }
-
-        // 4h. Pub/sub pass: emit Produces/Consumes edges for Kafka/Celery/Pika.
-        //     Gated: only runs when kafka-python, kafkajs, celery, or pika detected.
-        if crate::extract::pubsub::should_run(&all_detected_frameworks) {
-            let pubsub_primary_slug =
-                crate::roots::RootConfig::code_project(self.repo_root.clone()).slug();
-            let pubsub_result =
-                crate::extract::pubsub::pubsub_pass(&all_nodes, &all_detected_frameworks, &pubsub_primary_slug);
-            if !pubsub_result.edges.is_empty() {
-                all_nodes.extend(pubsub_result.nodes);
-                all_edges.extend(pubsub_result.edges);
-            }
-        }
-
-        // 4i. WebSocket/SSE pass: emit Produces/Consumes edges for Socket.IO.
-        //     Gated: only runs when socketio framework detected.
-        if crate::extract::websocket::should_run(&all_detected_frameworks) {
-            let ws_primary_slug =
-                crate::roots::RootConfig::code_project(self.repo_root.clone()).slug();
-            let ws_result =
-                crate::extract::websocket::websocket_pass(&all_nodes, &all_detected_frameworks, &ws_primary_slug);
-            if !ws_result.edges.is_empty() {
-                all_nodes.extend(ws_result.nodes);
-                all_edges.extend(ws_result.edges);
-            }
         }
 
         // 5. Build petgraph index
@@ -1569,4 +1424,159 @@ impl RnaHandler {
 
         Ok(())
     }
+}
+
+/// Run all post-extraction passes over the merged node/edge sets.
+///
+/// Called from both `build_full_graph_inner` (foreground full build) and the
+/// background scanner (`spawn_background_scanner`) so both paths produce
+/// identical graph enrichment.  Passes 4b-4i from the full-build pipeline:
+///
+/// - 4b: API link pass (string-literal → ApiEndpoint edges)
+/// - 4c: Manifest pass (package.json / pyproject.toml / go.mod nodes)
+/// - 4d: TestedBy naming-convention pass
+/// - 4e-pre: Import-calls cross-file Calls edges
+/// - 4e: Directory-module BelongsTo edges
+/// - 4f: Framework detection (populates `detected_frameworks`)
+/// - 4g: Next.js routing ApiEndpoint nodes (gated on TS/JS or detected Next.js)
+/// - 4h: Pub/sub Produces/Consumes edges (gated on kafka/celery/pika)
+/// - 4i: WebSocket/SSE edges (gated on socketio)
+///
+/// # Arguments
+/// * `all_nodes` - mutable reference to the merged node set
+/// * `all_edges` - mutable reference to the merged edge set
+/// * `root_pairs` - `(slug, path)` pairs for all workspace roots (for manifest +
+///   Next.js passes that need filesystem access)
+/// * `primary_slug` - slug of the primary code root (for framework, pubsub, WS passes)
+///
+/// # Returns
+/// The set of detected framework IDs (for callers that need to record this on
+/// `GraphState::detected_frameworks`).
+pub(crate) fn run_post_extraction_passes(
+    all_nodes: &mut Vec<Node>,
+    all_edges: &mut Vec<Edge>,
+    root_pairs: &[(String, PathBuf)],
+    primary_slug: &str,
+) -> std::collections::HashSet<String> {
+    // 4b. API link pass
+    {
+        let api_link_edges = crate::extract::api_link::api_link_pass(all_nodes);
+        if !api_link_edges.is_empty() {
+            tracing::info!(
+                "API link pass: {} DependsOn edge(s) from string literals to endpoints",
+                api_link_edges.len()
+            );
+            all_edges.extend(api_link_edges);
+        }
+    }
+
+    // 4c. Manifest pass
+    {
+        let manifest_result = crate::extract::manifest::manifest_pass(root_pairs);
+        if !manifest_result.nodes.is_empty() || !manifest_result.edges.is_empty() {
+            tracing::info!(
+                "Manifest pass: {} package node(s), {} DependsOn edge(s)",
+                manifest_result.nodes.len(),
+                manifest_result.edges.len()
+            );
+            all_nodes.extend(manifest_result.nodes);
+            all_edges.extend(manifest_result.edges);
+        }
+    }
+
+    // 4d. TestedBy naming-convention pass
+    {
+        let tested_by_edges = crate::extract::naming_convention::tested_by_pass(all_nodes);
+        if !tested_by_edges.is_empty() {
+            tracing::info!(
+                "TestedBy naming-convention pass: {} edge(s)",
+                tested_by_edges.len()
+            );
+            all_edges.extend(tested_by_edges);
+        }
+    }
+
+    // 4e-pre. Import-calls pass
+    {
+        let import_call_edges = crate::extract::import_calls::import_calls_pass(all_nodes);
+        if !import_call_edges.is_empty() {
+            tracing::info!(
+                "Import-calls pass: {} cross-file Calls edge(s) via import resolution",
+                import_call_edges.len()
+            );
+            all_edges.extend(import_call_edges);
+        }
+    }
+
+    // 4e. Directory-module pass
+    {
+        let dir_result = crate::extract::directory_module::directory_module_pass(all_nodes);
+        if !dir_result.edges.is_empty() {
+            tracing::info!(
+                "Directory module pass: {} BelongsTo edge(s), {} module node(s)",
+                dir_result.edges.len(),
+                dir_result.nodes.len(),
+            );
+            all_nodes.extend(dir_result.nodes);
+            all_edges.extend(dir_result.edges);
+        }
+    }
+
+    // 4f. Framework detection pass
+    let detected_frameworks;
+    {
+        let fw_result = framework_detection_pass(all_nodes, primary_slug);
+        if !fw_result.nodes.is_empty() {
+            all_nodes.extend(fw_result.nodes);
+        }
+        detected_frameworks = fw_result.detected_frameworks;
+    }
+
+    // 4g. Next.js routing pass (gated on framework detection or TS/JS files)
+    let has_ts_js_files = all_nodes.iter().any(|n| {
+        matches!(n.language.as_str(), "typescript" | "javascript")
+    });
+    if detected_frameworks.contains("nextjs-app-router") || has_ts_js_files {
+        let nextjs_result = crate::extract::nextjs_routing::nextjs_routing_pass(
+            root_pairs,
+            all_nodes,
+        );
+        if !nextjs_result.nodes.is_empty() || !nextjs_result.edges.is_empty() {
+            tracing::info!(
+                "Next.js routing pass: {} ApiEndpoint node(s), {} Implements edge(s)",
+                nextjs_result.nodes.len(),
+                nextjs_result.edges.len()
+            );
+            all_nodes.extend(nextjs_result.nodes);
+            all_edges.extend(nextjs_result.edges);
+        }
+    }
+
+    // 4h. Pub/sub pass (gated on kafka/celery/pika detection)
+    if crate::extract::pubsub::should_run(&detected_frameworks) {
+        let pubsub_result = crate::extract::pubsub::pubsub_pass(
+            all_nodes,
+            &detected_frameworks,
+            primary_slug,
+        );
+        if !pubsub_result.edges.is_empty() {
+            all_nodes.extend(pubsub_result.nodes);
+            all_edges.extend(pubsub_result.edges);
+        }
+    }
+
+    // 4i. WebSocket/SSE pass (gated on socketio detection)
+    if crate::extract::websocket::should_run(&detected_frameworks) {
+        let ws_result = crate::extract::websocket::websocket_pass(
+            all_nodes,
+            &detected_frameworks,
+            primary_slug,
+        );
+        if !ws_result.edges.is_empty() {
+            all_nodes.extend(ws_result.nodes);
+            all_edges.extend(ws_result.edges);
+        }
+    }
+
+    detected_frameworks
 }
