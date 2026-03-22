@@ -646,6 +646,100 @@ mod tests {
         );
     }
 
+    /// Regression test: bumping SCHEMA_VERSION must force a full rebuild even on the
+    /// foreground incremental path (run_pipeline_foreground with a cached LanceDB graph).
+    ///
+    /// After a schema version bump (e.g. 16→17), the next `scan` without `--full` must
+    /// auto-detect the mismatch in `run_pipeline_foreground_incremental`, drop the stale
+    /// LanceDB tables, and fall back to `run_pipeline_foreground_full`.  Without this,
+    /// the incremental path loads the now-empty tables and returns a partial graph.
+    ///
+    /// Mirrors `test_extraction_version_bump_forces_full_rebuild_on_incremental_path`
+    /// which covers the EXTRACTION_VERSION case (#452).
+    #[tokio::test]
+    async fn test_schema_version_bump_forces_full_rebuild_on_incremental_path() {
+        use tempfile::TempDir;
+        use std::sync::Mutex;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn stable_function() {}\n",
+        )
+        .unwrap();
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            ..Default::default()
+        };
+
+        // First run: full rebuild, writes SCHEMA_VERSION to the version file.
+        let result1 = handler
+            .run_pipeline_foreground(|_| {})
+            .await
+            .expect("first run should succeed");
+        assert!(result1.node_count > 0, "should have extracted nodes on first run");
+
+        // Verify the schema_version file was written.
+        let schema_version_file = root.join(".oh").join(".cache").join("lance").join("schema_version");
+        assert!(schema_version_file.exists(), "schema_version file should exist after first run");
+
+        // Simulate a schema version bump: overwrite the stored version with a stale value.
+        // This mimics what happens when a new binary with a higher SCHEMA_VERSION is run
+        // against a repo whose LanceDB cache was built with an older schema.
+        std::fs::write(&schema_version_file, "0").unwrap();
+
+        // Second run: should detect the version mismatch in the incremental pre-flight,
+        // drop all LanceDB tables, and fall back to run_pipeline_foreground_full.
+        let handler2 = RnaHandler {
+            repo_root: root.to_path_buf(),
+            ..Default::default()
+        };
+
+        let progress2: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let p2 = progress2.clone();
+        let result2 = handler2
+            .run_pipeline_foreground(move |msg| {
+                p2.lock().unwrap().push(msg.to_string());
+            })
+            .await
+            .expect("second run should succeed after schema version migration");
+
+        assert!(result2.node_count > 0, "should have nodes after schema version bump rebuild");
+
+        let msgs = progress2.lock().unwrap();
+
+        // The second run must enter the incremental path (LanceDB cache existed from first run).
+        assert!(
+            msgs.iter().any(|m| m.contains("Loaded cached graph")),
+            "second run should start from cached graph (incremental entry). Messages: {:?}",
+            *msgs
+        );
+
+        // Must report the schema migration message.
+        assert!(
+            msgs.iter().any(|m| m.contains("Schema migration detected")),
+            "should report schema migration. Messages: {:?}",
+            *msgs
+        );
+
+        // Verify the schema_version file now holds the current SCHEMA_VERSION.
+        let stored: u32 = std::fs::read_to_string(&schema_version_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            stored,
+            crate::graph::store::SCHEMA_VERSION,
+            "schema_version file should be updated to current SCHEMA_VERSION"
+        );
+    }
+
     // ── effective_root_filter / node_passes_root_filter tests ──────────
 
     #[test]
