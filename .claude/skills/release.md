@@ -16,6 +16,11 @@ Prepare and present a release decision package. Does NOT release automatically �
 
 ## What this skill does
 
+0. **Use RNA tools for code exploration** before drawing conclusions:
+   - Inspect changed files and related symbols with RNA.
+   - Use RNA evidence when determining scope, blockers, and smoke candidates.
+   - Do not rely on assumptions when repository evidence is available.
+
 1. **Run full test suite** (`scripts/test-suite.sh`)
 2. **Add feature tests** for anything new since last tag not already in the suite
 3. **Hard pass/fail assessment** — SKIP = blocking, FAIL = blocking, PASS = good
@@ -40,10 +45,10 @@ Run `bash scripts/test-suite.sh` (or with IC: `bash scripts/test-suite.sh $RNA_R
 ### Step 3: Hard assessment of skips
 
 For EVERY skipped test:
-- Is it for a feature that was in scope for this release? → **BLOCKING**
-- Is it for a future feature explicitly deferred? → **NOT BLOCKING** (document why it's deferred)
+- Is it for a feature that was in scope for this release baseline/scope freeze? → **BLOCKING**
+- Is it for a feature explicitly marked out-of-scope before scope freeze? → **NOT BLOCKING** (document deferral reference — link to issue or decision)
 
-There is no middle ground. Either it was in scope (blocking) or it wasn't (document the deferral decision explicitly).
+There is no middle ground. Either it was in scope at freeze (blocking) or it was explicitly deferred before freeze (document it). "We can ship without it" is not a deferral decision.
 
 ### Step 4: Add missing feature tests
 
@@ -56,7 +61,7 @@ For each merged PR since last tag:
 
 **Before writing any release notes, state clearly:**
 
-```
+```text
 GO / NO-GO: [GO|NO-GO]
 
 Reason: [one sentence]

@@ -48,7 +48,11 @@ echo ""
 # data after worktree switches or clean checkouts.
 echo "--- Pre-flight: ensure cache is current ---"
 echo "  Running incremental scan on RNA repo..."
-_rna_scan_out=$(repo-native-alignment scan --repo "$RNA_REPO" 2>&1)
+if ! _rna_scan_out=$(repo-native-alignment scan --repo "$RNA_REPO" 2>&1); then
+  echo "FAIL: RNA pre-flight scan failed — tests would run on stale/partial cache"
+  echo "$_rna_scan_out" | tail -20
+  exit 1
+fi
 echo "$_rna_scan_out" | tail -3
 echo ""
 
@@ -201,7 +205,11 @@ if [ -d "$IC_REPO/.oh/.cache/lance" ]; then
   echo "" && echo "--- Innovation-Connector ---"
   # Ensure IC cache is fresh before running IC tests
   echo "  Running incremental scan on IC repo..."
-  _ic_scan_out=$(repo-native-alignment scan --repo "$IC_REPO" 2>&1)
+  if ! _ic_scan_out=$(repo-native-alignment scan --repo "$IC_REPO" 2>&1); then
+    echo "FAIL: IC pre-flight scan failed — IC tests would run on stale/partial cache"
+    echo "$_ic_scan_out" | tail -20
+    exit 1
+  fi
   echo "$_ic_scan_out" | tail -2
 
   check "IC: FastAPI endpoints" \
@@ -246,4 +254,10 @@ check "Pipeline wired to EventBus (#502)" \
 
 echo ""
 echo "=== RESULTS: $PASS passed, $FAIL failed, $SKIP skipped ==="
-[ $FAIL -eq 0 ] && echo "ALL TESTS PASSING (excluding skipped)" || echo "FAILURES NEED ATTENTION"
+if [ "$FAIL" -eq 0 ]; then
+  echo "ALL TESTS PASSING (excluding skipped)"
+  exit 0
+else
+  echo "FAILURES NEED ATTENTION"
+  exit 1
+fi

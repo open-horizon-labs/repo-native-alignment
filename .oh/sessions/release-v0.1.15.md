@@ -1,3 +1,11 @@
+---
+session: release-decision
+release: v0.1.15
+started: 2026-03-22
+binary: repo-native-alignment 0.1.15
+status: awaiting-human-decision
+---
+
 # Release v0.1.15 Decision Package
 **Started:** 2026-03-22
 **Binary:** repo-native-alignment 0.1.15
