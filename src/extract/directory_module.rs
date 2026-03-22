@@ -97,8 +97,9 @@ pub fn directory_module_pass(all_nodes: &[Node]) -> DirectoryModuleResult {
         if node.id.kind == NodeKind::Module {
             continue;
         }
-        // Diagnostic nodes are transient and not structural.
-        if matches!(&node.id.kind, NodeKind::Other(s) if s == "diagnostic") {
+        // Virtual structural nodes (subsystems, frameworks, diagnostics) have no
+        // meaningful directory hierarchy and must not get module edges.
+        if matches!(&node.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "diagnostic" | "subsystem" | "framework")) {
             continue;
         }
         // Skip virtual / external nodes that have no real file (empty path).

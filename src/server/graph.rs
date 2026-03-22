@@ -9,7 +9,8 @@ pub(crate) const SUBSYSTEM_KEY: &str = "subsystem";
 
 use crate::embed::EmbeddingIndex;
 use crate::extract::ExtractorRegistry;
-use crate::graph::{Edge, Node};
+use crate::extract::subsystem_pass::subsystem_node_pass;
+use crate::graph::{Edge, Node, NodeKind};
 use crate::graph::index::GraphIndex;
 use crate::graph::store::SCHEMA_VERSION;
 use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
@@ -756,6 +757,21 @@ impl RnaHandler {
                     subsystems.len()
                 );
             }
+
+            // 6c. Emit first-class subsystem nodes + BelongsTo edges.
+            // These go into all_nodes/all_edges so they survive the LanceDB persist.
+            // Anchored to the primary root (subsystem detection spans all roots but
+            // subsystem nodes need a root ID for stable_id uniqueness).
+            let primary_slug = crate::roots::RootConfig::code_project(self.repo_root.clone()).slug();
+            let sub_result = subsystem_node_pass(&subsystems, &all_nodes, &primary_slug);
+            if !sub_result.nodes.is_empty() {
+                tracing::info!(
+                    "Promoted {} subsystem(s) to first-class nodes",
+                    sub_result.nodes.len()
+                );
+                all_nodes.extend(sub_result.nodes);
+                all_edges.extend(sub_result.edges);
+            }
         }
 
         // 7. Persist graph to LanceDB
@@ -1185,6 +1201,24 @@ impl RnaHandler {
                     // Include in upsert set so LanceDB gets the updated metadata
                     upsert_node_ids.insert(sid);
                 }
+            }
+
+            // Emit / refresh first-class subsystem nodes + BelongsTo edges.
+            // Drop stale subsystem nodes from graph first, then add fresh ones.
+            graph.nodes.retain(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "subsystem"));
+            graph.edges.retain(|e| !matches!(&e.to.kind, NodeKind::Other(s) if s == "subsystem"));
+
+            let sub_result = subsystem_node_pass(&subsystems, &graph.nodes, &primary_slug);
+            if !sub_result.nodes.is_empty() {
+                tracing::info!(
+                    "Incremental: promoted {} subsystem(s) to first-class nodes",
+                    sub_result.nodes.len()
+                );
+                for node in &sub_result.nodes {
+                    upsert_node_ids.insert(node.stable_id());
+                }
+                graph.nodes.extend(sub_result.nodes);
+                graph.edges.extend(sub_result.edges);
             }
         }
 

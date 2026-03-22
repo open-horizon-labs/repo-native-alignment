@@ -28,7 +28,9 @@ pub const SCHEMA_VERSION: u32 = 16; // slug portability: root_id now uses direct
 /// dropping LanceDB tables. Bumped to 1 for doc_comment metadata extraction (#401).
 /// Bumped to 3 for new C, PHP, HTML, Scala, Dart, Elixir extractors (#435).
 /// Bumped to 4 for Next.js routing pass (#440) and monorepo subdirectory roots (#442).
-pub const EXTRACTION_VERSION: u32 = 4;
+/// Bumped to 5 for subsystem first-class nodes (#470): emits NodeKind::Other("subsystem")
+/// nodes and BelongsTo edges after community detection.
+pub const EXTRACTION_VERSION: u32 = 5;
 
 /// Arrow schema for the `symbols` table.
 ///
