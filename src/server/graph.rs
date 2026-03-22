@@ -339,23 +339,23 @@ impl RnaHandler {
 
                     // FIX(#215): The early return here previously skipped LSP
                     // enrichment entirely, leaving status stuck at SERVER_FOUND.
-                    // Check if the cached graph already has call edges; if not,
-                    // spawn background LSP enrichment (only in background mode --
-                    // foreground callers handle LSP themselves).
+                    // Use the LSP completion sentinel (written after successful LSP
+                    // persist) instead of the heuristic `has_call_edges` check.
+                    // The heuristic fails when LSP ran but persist failed -- the
+                    // edges are in memory but not durable, so the next restart
+                    // would incorrectly skip re-enrichment (#477).
                     if spawn_background {
-                        let has_call_edges = state.edges.iter().any(|e| {
-                            matches!(e.kind, crate::graph::EdgeKind::Calls)
-                        });
-                        if !has_call_edges {
+                        let lsp_sentinel = super::sentinel::read_lsp_sentinel(&self.repo_root);
+                        if lsp_sentinel.is_none() {
                             tracing::info!(
-                                "Cached graph has no call edges -- spawning LSP enrichment"
+                                "LSP sentinel absent -- spawning background LSP enrichment"
                             );
                             self.spawn_lsp_enrichment(&state.nodes);
                         } else {
                             tracing::info!(
-                                "Cached graph already has call edges -- skipping LSP enrichment"
+                                "LSP sentinel present -- LSP enrichment already persisted, skipping"
                             );
-                            // Mark LSP as complete since we have cached edges
+                            // Mark LSP as complete using the actual persisted call edge count.
                             let call_count = state.edges.iter()
                                 .filter(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
                                 .count();
@@ -802,6 +802,10 @@ impl RnaHandler {
                 return Err(e.context("LanceDB full persist failed during graph build"));
             }
             drop(_lance_guard);
+
+            // Write extraction sentinel now that extraction + persist succeeded.
+            // The LSP sentinel is written later by the background LSP enrichment task.
+            super::sentinel::write_extract_sentinel(&self.repo_root, all_nodes.len(), all_edges.len());
 
             // Post-persist sanity check: if any new roots were detected, verify they
             // actually made it into LanceDB. A mismatch here indicates a partial write

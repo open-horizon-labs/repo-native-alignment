@@ -682,13 +682,23 @@ impl RnaHandler {
                                     tracing::error!("[background] LSP enrichment: full persist after migration failed: {:#}", e);
                                     bg_lsp_status.set_complete_persist_failed(edge_count);
                                 } else {
+                                    super::sentinel::write_lsp_sentinel(&lsp_repo_root, nodes.len(), edges.len());
                                     bg_lsp_status.set_complete(edge_count);
                                 }
                             } else {
                                 bg_lsp_status.set_complete(edge_count);
                             }
                         }
-                        Ok(false) => bg_lsp_status.set_complete(edge_count),
+                        Ok(false) => {
+                            // Incremental persist succeeded -- write LSP sentinel.
+                            let (total_nodes, total_edges) = {
+                                let g = bg_graph.read().await;
+                                g.as_ref().map(|gs| (gs.nodes.len(), gs.edges.len()))
+                                    .unwrap_or((0, 0))
+                            };
+                            super::sentinel::write_lsp_sentinel(&lsp_repo_root, total_nodes, total_edges);
+                            bg_lsp_status.set_complete(edge_count);
+                        }
                         Err(e) => {
                             tracing::error!("[background] LSP enrichment: incremental persist failed: {:#}", e);
                             bg_lsp_status.set_complete_persist_failed(edge_count);
@@ -858,13 +868,23 @@ impl RnaHandler {
                                 tracing::error!("[background] LSP enrichment (cache-hit): full persist after migration failed: {:#}", e);
                                 bg_lsp_status.set_complete_persist_failed(edge_count);
                             } else {
+                                super::sentinel::write_lsp_sentinel(&bg_repo_root, nodes.len(), edges.len());
                                 bg_lsp_status.set_complete(edge_count);
                             }
                         } else {
                             bg_lsp_status.set_complete(edge_count);
                         }
                     }
-                    Ok(false) => bg_lsp_status.set_complete(edge_count),
+                    Ok(false) => {
+                        // Incremental persist succeeded -- write LSP sentinel.
+                        let (total_nodes, total_edges) = {
+                            let g = bg_graph.read().await;
+                            g.as_ref().map(|gs| (gs.nodes.len(), gs.edges.len()))
+                                .unwrap_or((0, 0))
+                        };
+                        super::sentinel::write_lsp_sentinel(&bg_repo_root, total_nodes, total_edges);
+                        bg_lsp_status.set_complete(edge_count);
+                    }
                     Err(e) => {
                         tracing::error!("[background] LSP enrichment (cache-hit): incremental persist failed: {:#}", e);
                         bg_lsp_status.set_complete_persist_failed(edge_count);
@@ -1030,13 +1050,23 @@ impl RnaHandler {
                                 tracing::error!("[incremental-bg] Full persist after migration failed: {:#}", e);
                                 bg_lsp_status.set_complete_persist_failed(edge_count);
                             } else {
+                                super::sentinel::write_lsp_sentinel(&bg_repo_root, nodes.len(), edges.len());
                                 bg_lsp_status.set_complete(edge_count);
                             }
                         } else {
                             bg_lsp_status.set_complete(edge_count);
                         }
                     }
-                    Ok(false) => bg_lsp_status.set_complete(edge_count),
+                    Ok(false) => {
+                        // Incremental persist succeeded -- write LSP sentinel.
+                        let (total_nodes, total_edges) = {
+                            let g = bg_graph.read().await;
+                            g.as_ref().map(|gs| (gs.nodes.len(), gs.edges.len()))
+                                .unwrap_or((0, 0))
+                        };
+                        super::sentinel::write_lsp_sentinel(&bg_repo_root, total_nodes, total_edges);
+                        bg_lsp_status.set_complete(edge_count);
+                    }
                     Err(e) => {
                         tracing::error!("[incremental-bg] LSP enrichment persist failed: {:#}", e);
                         bg_lsp_status.set_complete_persist_failed(edge_count);
@@ -1110,6 +1140,8 @@ impl RnaHandler {
         if super::store::check_and_migrate_schema(&db_path).await? {
             tracing::info!("Schema migrated during incremental pre-flight -- falling back to full rebuild");
             on_progress("Schema migration detected -- rebuilding from scratch.");
+            // Clear sentinels -- they reference the old schema version and are now stale.
+            super::sentinel::clear_sentinels(&self.repo_root);
             return self.run_pipeline_foreground_full(on_progress, pipeline_start).await;
         }
 
@@ -1136,6 +1168,8 @@ impl RnaHandler {
                     "Extraction version migrated during incremental pre-flight -- falling back to full rebuild"
                 );
                 on_progress("Extraction version upgrade detected -- rebuilding from scratch.");
+                // Clear sentinels -- they reference the old extraction version and are now stale.
+                super::sentinel::clear_sentinels(&self.repo_root);
                 return self.run_pipeline_foreground_full(on_progress, pipeline_start).await;
             }
         }
@@ -1173,14 +1207,14 @@ impl RnaHandler {
                 }
             }
 
-            // Check if cached graph needs LSP enrichment.
-            let has_call_edges = {
-                let guard = self.graph.read().await;
-                let gs = guard.as_ref().unwrap();
-                gs.edges.iter().any(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
-            };
+            // Check if LSP enrichment has been durably persisted via the completion
+            // sentinel. This replaces the `has_call_edges` heuristic, which fails
+            // when LSP ran but the subsequent LanceDB persist crashed: edges end up
+            // in memory but the sentinel is never written, so the next restart
+            // correctly re-runs LSP enrichment (#477).
+            let lsp_sentinel = super::sentinel::read_lsp_sentinel(&self.repo_root);
 
-            let lsp_edge_count = if has_call_edges {
+            let lsp_edge_count = if lsp_sentinel.is_some() {
                 let call_count = {
                     let guard = self.graph.read().await;
                     guard.as_ref().unwrap().edges.iter()
@@ -1188,12 +1222,12 @@ impl RnaHandler {
                         .count()
                 };
                 self.lsp_status.set_complete(call_count);
-                on_progress(&format!("LSP: {} cached call edges", call_count));
+                on_progress(&format!("LSP: {} cached call edges (sentinel present)", call_count));
                 call_count
             } else {
-                // Need LSP enrichment even though no files changed.
+                // LSP sentinel absent -- enrichment has not been durably persisted.
                 // Run it synchronously on all nodes.
-                on_progress("LSP: no cached call edges -- running full enrichment...");
+                on_progress("LSP: no sentinel -- running full enrichment...");
                 self.run_foreground_lsp_and_persist(&on_progress).await?
             };
 
@@ -1382,6 +1416,10 @@ impl RnaHandler {
                     tracing::error!("Foreground incremental persist failed: {}", e);
                     return Err(e.context("Full persist failed during incremental foreground pipeline"));
                 }
+                // Persist succeeded -- write both sentinels. Incremental path rewrites
+                // the full graph, so extraction is also complete after this persist.
+                super::sentinel::write_extract_sentinel(&self.repo_root, nodes.len(), edges.len());
+                super::sentinel::write_lsp_sentinel(&self.repo_root, nodes.len(), edges.len());
             }
         }
 
@@ -1586,6 +1624,10 @@ impl RnaHandler {
                     tracing::error!("Foreground full persist failed: {}", e);
                     return Err(e.context("Full persist failed during foreground pipeline"));
                 }
+                // Full persist succeeded (tree-sitter + LSP in one write) -- write
+                // both sentinels since the single persist covers both phases (#477).
+                super::sentinel::write_extract_sentinel(&self.repo_root, nodes.len(), edges.len());
+                super::sentinel::write_lsp_sentinel(&self.repo_root, nodes.len(), edges.len());
             }
         }
 
@@ -1705,6 +1747,9 @@ impl RnaHandler {
                 tracing::error!("Foreground LSP persist failed: {}", e);
                 return Err(e.context("LSP persist failed during foreground pipeline"));
             }
+            // Persist succeeded -- write LSP sentinel so future startups know
+            // LSP enrichment is durable and can skip re-enrichment (#477).
+            super::sentinel::write_lsp_sentinel(&self.repo_root, nodes.len(), edges.len());
         }
 
         Ok(lsp_edge_count)

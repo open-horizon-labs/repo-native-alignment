@@ -5,6 +5,7 @@ pub mod store;
 pub mod state;
 pub mod handlers;
 pub mod helpers;
+pub mod sentinel;
 mod graph;
 mod enrichment;
 
