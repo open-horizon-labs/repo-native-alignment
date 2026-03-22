@@ -464,7 +464,11 @@ pub(crate) fn extract_call_sites(body: &str) -> HashSet<&str> {
                 j -= 1;
             }
             if j < end {
-                let ident = &body[j..end];
+                // Use byte-based slicing to avoid UTF-8 char boundary panics.
+                // `j` and `end` are byte indices from walking over `bytes`; the
+                // walk only proceeds through ASCII identifier chars, so `j..end`
+                // is always a valid ASCII slice. Convert via the byte slice.
+                let ident = std::str::from_utf8(&bytes[j..end]).unwrap_or("");
                 if ident.len() >= 4 {
                     // Reject if preceded by '.' or ':' (method/scoped call)
                     let prev = if j > 0 { bytes[j - 1] } else { 0 };
