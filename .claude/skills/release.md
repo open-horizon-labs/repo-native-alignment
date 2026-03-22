@@ -2,6 +2,8 @@
 
 Prepare and present a release decision package. Does NOT release automatically — presents findings to the human to decide.
 
+> **You are an RNA power user.** Use RNA MCP tools (`search`, `repo_map`, `outcome_progress`, `search_symbols`, `graph_query`) for all repo exploration — checking outcomes, finding issues, inspecting merged PRs, scanning guardrails. Use the CLI (`repo-native-alignment search --repo . "query"`) for worktree-specific queries. Every Grep/Read instead of an RNA tool is a friction event.
+
 **This skill is hardass. A SKIP is not "safe to ship with." A SKIP means the feature is not done. Not done = blocking.**
 
 ## Hard rules
@@ -56,6 +58,43 @@ For each merged PR since last tag:
 - Does the full test suite exercise it?
 - If not, add a test to the suite file
 - Re-run
+
+### Step 4b: Sweep all PRs and issues for unaddressed feedback
+
+**This step is BLOCKING. Unaddressed Critical/Major findings = NO-GO.**
+
+For every PR merged since last tag, check CodeRabbit inline comments AND issue comments:
+
+```bash
+# Get all merged PRs since last tag
+git log <last-tag>..HEAD --merges --oneline | grep -o '#[0-9]*' | sort -u | while read pr; do
+  echo "=== PR $pr ==="
+  # CodeRabbit inline comments
+  gh api repos/{owner}/{repo}/pulls/${pr#\#}/comments --paginate 2>/dev/null | \
+    python3 -c "
+import json,sys
+cs = [c for c in json.load(sys.stdin) if 'coderabbit' in c.get('user',{}).get('login','').lower()]
+for c in cs:
+    sev = '🔴CRITICAL' if '🔴' in c.get('body','') else ('🟠MAJOR' if '🟠' in c.get('body','') else '🟡MINOR')
+    print(f'  [{sev}] {c.get(\"path\",\"\")}:{c.get(\"line\",\"\")}')
+    print(f'    {c.get(\"body\",\"\")[:150]}')
+" 2>/dev/null
+  # Issue comments
+  gh api repos/{owner}/{repo}/issues/${pr#\#}/comments --paginate 2>/dev/null | \
+    python3 -c "
+import json,sys
+cs = [c for c in json.load(sys.stdin) if 'coderabbit' not in c.get('user',{}).get('login','').lower() and 'github-actions' not in c.get('user',{}).get('login','').lower()]
+for c in cs[:3]:
+    print(f'  [HUMAN] {c.get(\"user\",{}).get(\"login\",\"\")}')
+    print(f'    {c.get(\"body\",\"\")[:150]}')
+" 2>/dev/null
+done
+```
+
+For each finding:
+- CRITICAL/MAJOR: **fix before release or it's NO-GO**
+- MINOR: fix if trivial, otherwise explicitly reply with N/A reasoning
+- Human comments: acknowledge or address
 
 ### Step 5: GO / NO-GO determination
 

@@ -88,8 +88,10 @@ pub struct Boundary {
     pub function_pattern: String,
     /// Zero-indexed position of the argument that holds the topic name.
     /// Accepts both `topic_arg` and `arg_position` as field names in TOML.
+    /// When absent (None), the `function_pattern` itself is used as the channel name —
+    /// useful for wrapper functions where the function name IS the semantic boundary.
     #[serde(alias = "arg_position")]
-    pub topic_arg: usize,
+    pub topic_arg: Option<usize>,
     /// `"Produces"` or `"Consumes"`.
     pub edge_kind: String,
     /// Whether this is a decorator pattern (e.g., `@bus.subscribe`).
@@ -301,46 +303,68 @@ pub fn extractor_config_pass_with_configs(
                     }
                 };
 
-                // Quick body check with pre-lowercased body and pattern.
-                let call_prefix = format!("{}(", boundary.function_pattern);
-                let call_prefix_lower = call_prefix.to_lowercase();
-                if !body_lower.contains(call_prefix_lower.as_str()) {
-                    continue;
-                }
+                // Build a regex from the function_pattern:
+                // - `*` matches any sequence of identifier chars (alphanumeric, _, $, .)
+                // - Everything else is treated as a literal
+                // This supports: `publish_*`, `*.publish`, `*publish*`, `publisher.publish`
+                let pattern_lower = boundary.function_pattern.to_lowercase();
+                let is_glob = pattern_lower.contains('*');
 
-                // Iterate ALL occurrences of `function_pattern(` in the body so
-                // functions that publish to multiple topics all get edges.
-                //
-                // Search uses `body_lower` (case-insensitive pattern matching).
-                // Extraction uses `node.body` at the same byte offset to preserve
-                // original topic casing — "OrdersCreated" must not become "orderscreated".
-                //
-                // Safety: `call_prefix_lower` has the same byte length as `call_prefix`
-                // because function names are always ASCII. So the byte offset found in
-                // `body_lower` is a valid char boundary in `node.body` as long as no
-                // multi-byte UTF-8 chars appear BEFORE the pattern match. This is safe
-                // in practice because function call sites like `publisher.publish(` are
-                // ASCII and appear at ASCII-only offsets.
-                let mut search_start = 0usize;
-                while let Some(rel_pos) =
-                    body_lower[search_start..].find(call_prefix_lower.as_str())
-                {
-                    let abs_pos = search_start + rel_pos;
-                    // Advance past this occurrence for the next iteration.
-                    search_start = abs_pos + call_prefix_lower.len();
-
-                    // Extract from `node.body` at the same offset to preserve casing.
-                    // The paren offset is `abs_pos + call_prefix_lower.len() - 1`.
-                    let paren_offset = abs_pos + call_prefix_lower.len() - 1;
-                    // Guard: must be a valid char boundary in node.body.
-                    if !node.body.is_char_boundary(paren_offset) {
+                // Quick body pre-check before expensive regex work.
+                if !is_glob {
+                    let call_prefix_lower = format!("{}(", pattern_lower);
+                    if !body_lower.contains(call_prefix_lower.as_str()) {
                         continue;
                     }
-                    let body_from_here = &node.body[paren_offset..];
-                    let topic_name = if boundary.topic_arg == 0 {
-                        extract_first_quoted(body_from_here)
-                    } else {
-                        extract_nth_arg_quoted_from_open(body_from_here, boundary.topic_arg)
+                } else {
+                    // For globs: check that at least the literal portions appear in body.
+                    let literal_parts: Vec<&str> = pattern_lower.split('*').collect();
+                    if !literal_parts.iter().all(|p| p.is_empty() || body_lower.contains(p)) {
+                        continue;
+                    }
+                }
+
+                // Convert glob pattern to a regex that matches `pattern(`.
+                // `*` → `[a-zA-Z0-9_$.]*` (identifier chars, not `(`)
+                let escaped = pattern_lower
+                    .chars()
+                    .map(|c| match c {
+                        '*' => "[a-zA-Z0-9_$.]*".to_string(),
+                        '.' | '(' | ')' | '[' | ']' | '{' | '}' | '+' | '?' | '^' | '$' | '|' | '\\' => {
+                            format!("\\{}", c)
+                        }
+                        _ => c.to_string(),
+                    })
+                    .collect::<String>();
+                let re_str = format!("(?i){}\\(", escaped);
+                let re = match regex::Regex::new(&re_str) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+
+                // Iterate ALL matches of the pattern in the body.
+                let mut search_start = 0usize;
+                while let Some(m) = re.find(&body_lower[search_start..]) {
+                    let abs_match_start = search_start + m.start();
+                    let abs_paren_offset = search_start + m.end() - 1; // points to `(`
+                    search_start = search_start + m.end();
+
+                    // Extract the actual matched function name from node.body (preserves casing).
+                    let matched_fn_name = &node.body[abs_match_start..abs_paren_offset];
+
+                    // Guard: must be valid char boundary.
+                    if !node.body.is_char_boundary(abs_paren_offset) {
+                        continue;
+                    }
+                    let body_from_here = &node.body[abs_paren_offset..];
+
+                    // Determine the channel/topic name:
+                    // - If topic_arg is Some(n): extract the nth quoted argument from the call
+                    // - If topic_arg is None: use the matched function name as the channel
+                    let topic_name = match boundary.topic_arg {
+                        Some(0) => extract_first_quoted(body_from_here),
+                        Some(n) => extract_nth_arg_quoted_from_open(body_from_here, n),
+                        None => Some(matched_fn_name.trim().to_string()),
                     };
 
                     let topic_name = match topic_name {
@@ -673,7 +697,7 @@ edge_kind = "Consumes"
         let cfg = pubsub_fixture_config();
         assert_eq!(cfg.boundaries.len(), 2);
         assert_eq!(cfg.boundaries[0].function_pattern, "publisher.publish");
-        assert_eq!(cfg.boundaries[0].topic_arg, 0);
+        assert_eq!(cfg.boundaries[0].topic_arg, Some(0));
         assert_eq!(cfg.boundaries[0].edge_kind, "Produces");
         assert_eq!(cfg.boundaries[1].function_pattern, "subscriber.subscribe");
         assert_eq!(cfg.boundaries[1].edge_kind, "Consumes");
@@ -713,7 +737,7 @@ decorator = true
 "#,
         );
         assert_eq!(cfg.boundaries.len(), 2);
-        assert_eq!(cfg.boundaries[0].topic_arg, 0, "arg_position alias must map to topic_arg");
+        assert_eq!(cfg.boundaries[0].topic_arg, Some(0), "arg_position alias must map to topic_arg");
         assert!(!cfg.boundaries[0].decorator);
         assert!(cfg.boundaries[1].decorator);
     }

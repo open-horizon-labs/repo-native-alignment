@@ -1,14 +1,13 @@
 ---
 session: release-decision
 release: v0.1.15
+title: Release v0.1.15 Decision Package
 started: 2026-03-22
 binary: repo-native-alignment 0.1.15
 status: awaiting-human-decision
 ---
 
 # Release v0.1.15 Decision Package
-**Started:** 2026-03-22
-**Binary:** repo-native-alignment 0.1.15
 
 ---
 
@@ -133,11 +132,15 @@ Rationale: These 5 cover the four major v0.1.14→v0.1.15 architectural addition
 ### Block release
 None identified.
 
-### Safe to ship with
-- #465 (OpenAPI bidirectional) — not yet merged, skip list in test suite
-- #466 (gRPC service edges) — not yet merged, skip list in test suite
-- #492 (module split) — not yet merged, skip list in test suite
-- #502 (pipeline wired to EventBus) — Phase 3 work, not blocking Phase 2 release
+### Deferred (explicitly out-of-scope for v0.1.15)
+
+These items were deferred when the decision package was assembled. They have since landed:
+- #465 (OpenAPI bidirectional) — **merged as #509** after this package was written
+- #466 (gRPC service edges) — **merged as #508** after this package was written
+- #492 (module split) — **merged as #503** after this package was written
+- #502 (pipeline wired to EventBus) — **merged as #515** after this package was written
+
+### Known issue (not blocking)
 - Lance panic during rapid successive incremental scans — transient, no data loss, self-resolving. Manifests as "JoinError::Cancelled" in stderr. All scan data is persisted before the panic.
 
 ---

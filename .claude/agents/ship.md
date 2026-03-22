@@ -14,6 +14,12 @@ The full quality gate for this project. 13 steps. Run sequentially — each step
 >
 > **Two RNA access paths — use the right one:**
 > - **MCP tools** (`search`, `repo_map`, `outcome_progress`, `search_symbols`, `graph_query`) — use for project-level context: guardrails, outcomes, metis, impact analysis. These query the main RNA repo index.
+>   - **Worktree-aware queries:** use the `repo` parameter to scope to your worktree's graph:
+>     ```text
+>     mcp__rna-mcp__search(query="handle_search", repo="/path/to/worktree")
+>     mcp__rna-mcp__repo_map(repo="/path/to/worktree")
+>     ```
+>     Requires the worktree to be scanned: `repo-native-alignment scan --repo /path/to/worktree`
 > - **CLI in your worktree** (`repo-native-alignment search --repo . "query"`, `repo-native-alignment graph --node "..." --repo . --mode neighbors`) — use for code navigation WITHIN your working directory. Always pass `--repo .` so it reads your local worktree's index.
 >
 > **Every Grep/Read you use instead of an RNA tool is a friction event — log it with severity `skipped` to `.oh/friction-logs/`.** When an RNA tool fails, log that too. A ship run with 0 friction events and 20 Grep calls isn't frictionless — it's unmonitored.
@@ -43,8 +49,10 @@ Before starting:
    COUNT=$(repo-native-alignment search "" --repo . --limit 1 2>/dev/null | grep -o "[0-9]* symbols" | head -1)
    echo "RNA ready: $COUNT indexed"
 
-   # If count is 0 or command failed, scan now
-   repo-native-alignment scan --repo . --full 2>&1 | tail -2
+   # Only run full scan if index is empty or unavailable
+   if [ -z "$COUNT" ] || [ "$COUNT" = "0" ]; then
+     repo-native-alignment scan --repo . --full 2>&1 | tail -2
+   fi
    ```
    You CANNOT do code review, dissent analysis, or adversarial testing without an indexed worktree. Any Grep/Read for code navigation after this point is a friction event and must be logged to `.oh/friction-logs/<pr-number>-ship.md`.
 

@@ -384,7 +384,7 @@ impl RnaHandler {
         let registry = ExtractorRegistry::with_builtins();
         let mut all_nodes: Vec<Node> = Vec::new();
         let mut all_edges: Vec<Edge> = Vec::new();
-        // Populated by framework detection pass (step 4f).
+        // Populated by PostExtractionConsumer via EventBus (step 4b-4j).
         let all_detected_frameworks: std::collections::HashSet<String>;
 
         // Try loading cached graph for clean-root reuse.
@@ -582,11 +582,14 @@ impl RnaHandler {
             }
         }
 
-        // 4b-4j. Post-extraction passes: API link, manifest, tested-by, import-calls,
-        //        directory-module, framework detection, Next.js routing, pub/sub, WebSocket,
-        //        and generic extractor-config (.oh/extractors/*.toml).
-        //        Extracted into `run_post_extraction_passes` so the background scanner
-        //        calls the same function (fix for #471).
+        // 4b-4j. Post-extraction passes via EventBus (ADR Phase 2b, issue #502).
+        //
+        // `run_post_passes_via_bus` routes all_nodes/all_edges through:
+        //   - PostExtractionConsumer → runs all passes → emits PassesComplete
+        //   - LanguageAccumulatorConsumer → emits LanguageDetected per language
+        //   - LspConsumer stubs → Phase 2 no-ops, Phase 3+ async consumers
+        //
+        // ADR Constraint 4: no direct pass function calls in src/server/.
         {
             let root_pairs: Vec<(String, std::path::PathBuf)> = workspace
                 .resolved_roots()
@@ -594,12 +597,17 @@ impl RnaHandler {
                 .map(|r| (r.slug.clone(), r.path.clone()))
                 .collect();
             let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
-            all_detected_frameworks = run_post_extraction_passes(
-                &mut all_nodes,
-                &mut all_edges,
-                &root_pairs,
-                &primary_slug,
-            );
+            let (enriched_nodes, enriched_edges, detected_frameworks) =
+                crate::extract::consumers::run_post_passes_via_bus(
+                    all_nodes,
+                    all_edges,
+                    root_pairs,
+                    primary_slug,
+                    self.repo_root.clone(),
+                )?;
+            all_nodes = enriched_nodes;
+            all_edges = enriched_edges;
+            all_detected_frameworks = detected_frameworks;
         }
 
         // Dedup immediately after post-extraction passes so the graph index,
@@ -1046,12 +1054,11 @@ impl RnaHandler {
         // reappear on reload. The fresh nodes (re-emitted later) will be upserted.
         files_to_remove.extend(stale_virtual_files);
 
-        // Re-run all post-extraction passes (api_link, manifest, tested_by, import_calls,
-        // directory_module, framework_detection, nextjs_routing, pubsub, websocket) using
-        // the registry. This replaces the previous manual Group 1 + framework detection
-        // sequence and ensures identical enrichment to the full-build path.
-        //
+        // Re-run all post-extraction passes via EventBus (ADR Phase 2b, issue #502).
         // Include all roots for passes that need filesystem access (manifest, nextjs_routing).
+        // lsp_only roots are intentionally included: nextjs_routing_pass emits ApiEndpoint
+        // nodes for lsp_only subdirectory roots so agents can see what routes exist even
+        // when tree-sitter extraction was skipped for those roots.
         let root_pairs_incremental: Vec<(String, std::path::PathBuf)> = WorkspaceConfig::load()
             .with_primary_root(self.repo_root.clone())
             .with_worktrees(&self.repo_root)
@@ -1060,13 +1067,24 @@ impl RnaHandler {
             .iter()
             .map(|r| (r.slug.clone(), r.path.clone()))
             .collect();
-        let detected_from_passes = run_post_extraction_passes(
-            &mut graph.nodes,
-            &mut graph.edges,
-            &root_pairs_incremental,
-            &primary_slug,
-        );
-        graph.detected_frameworks = detected_from_passes;
+        {
+            let (enriched_nodes, enriched_edges, detected_frameworks) =
+                crate::extract::consumers::run_post_passes_via_bus(
+                    std::mem::take(&mut graph.nodes),
+                    std::mem::take(&mut graph.edges),
+                    root_pairs_incremental,
+                    primary_slug.clone(),
+                    self.repo_root.clone(),
+                ).map_err(|e| {
+                    // Pipeline invariant violated — abort the incremental update so the
+                    // partial graph is not persisted. Scanner state is not committed on
+                    // Err return, so the next scan will retry the full pass sequence.
+                    e.context("incremental update aborted: post-extraction passes did not complete")
+                })?;
+            graph.nodes = enriched_nodes;
+            graph.edges = enriched_edges;
+            graph.detected_frameworks = detected_frameworks;
+        }
 
         // Auto-collect delta: everything added by post-extraction passes since
         // the snapshot above. No pass needs to manually report its own output.
@@ -1366,142 +1384,3 @@ impl RnaHandler {
     }
 }
 
-/// Run all post-extraction passes over the merged node/edge sets.
-///
-/// Called from both `build_full_graph_inner` (foreground full build) and the
-/// background scanner (`spawn_background_scanner`) so both paths produce
-/// identical graph enrichment.  Passes 4b-4i from the full-build pipeline:
-///
-/// - 4b: API link pass (string-literal → ApiEndpoint edges)
-/// - 4c: Manifest pass (package.json / pyproject.toml / go.mod nodes)
-/// - 4d: TestedBy naming-convention pass
-/// - 4e-pre: Import-calls cross-file Calls edges
-/// - 4e: Directory-module BelongsTo edges
-/// - 4f: Framework detection (populates `detected_frameworks`)
-/// - 4g: Next.js routing ApiEndpoint nodes (gated on TS/JS or detected Next.js)
-/// - 4h: Pub/sub Produces/Consumes edges (gated on kafka/celery/pika)
-/// - 4i: WebSocket/SSE edges (gated on socketio)
-/// - 4j: Generic extractor config pass (.oh/extractors/*.toml, always-on, no-op when dir absent)
-///
-/// Delegates to [`PostExtractionRegistry::with_builtins`] so all passes run
-/// through the plugin architecture (framework-gated, auto-delta tracked).
-///
-/// # Arguments
-/// * `all_nodes` - mutable reference to the merged node set
-/// * `all_edges` - mutable reference to the merged edge set
-/// * `root_pairs` - `(slug, path)` pairs for all workspace roots (for manifest +
-///   Next.js passes that need filesystem access)
-/// * `primary_slug` - slug of the primary code root (for framework, pubsub, WS passes)
-///
-/// # Returns
-/// The set of detected framework IDs (for callers that need to record this on
-/// `GraphState::detected_frameworks`).
-pub(crate) fn run_post_extraction_passes(
-    all_nodes: &mut Vec<Node>,
-    all_edges: &mut Vec<Edge>,
-    root_pairs: &[(String, PathBuf)],
-    primary_slug: &str,
-) -> std::collections::HashSet<String> {
-    use crate::extract::post_extraction::{PassContext, PostExtractionRegistry};
-
-    let registry = PostExtractionRegistry::with_builtins();
-    let ctx = PassContext {
-        root_pairs: root_pairs.to_vec(),
-        primary_slug: primary_slug.to_string(),
-        detected_frameworks: std::collections::HashSet::new(),
-    };
-    let result = registry.run_all(all_nodes, all_edges, ctx);
-
-    if result.added_node_count > 0 || result.added_edge_count > 0 {
-        tracing::info!(
-            "Post-extraction passes complete: +{} node(s), +{} edge(s), {} framework(s) detected",
-            result.added_node_count,
-            result.added_edge_count,
-            result.detected_frameworks.len(),
-        );
-    }
-
-    result.detected_frameworks
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
-    use std::collections::BTreeMap;
-    use std::path::PathBuf;
-
-    fn make_node(root: &str, file: &str, name: &str, kind: NodeKind, lang: &str) -> Node {
-        Node {
-            id: NodeId {
-                root: root.to_string(),
-                file: PathBuf::from(file),
-                name: name.to_string(),
-                kind,
-            },
-            language: lang.to_string(),
-            line_start: 1,
-            line_end: 1,
-            signature: name.to_string(),
-            body: String::new(),
-            metadata: BTreeMap::new(),
-            source: ExtractionSource::TreeSitter,
-        }
-    }
-
-    #[test]
-    fn test_run_post_extraction_passes_empty_input() {
-        let mut nodes: Vec<Node> = vec![];
-        let mut edges: Vec<crate::graph::Edge> = vec![];
-        let root_pairs: Vec<(String, PathBuf)> = vec![];
-        let detected = run_post_extraction_passes(&mut nodes, &mut edges, &root_pairs, "test");
-        assert!(nodes.is_empty(), "empty input should yield no nodes");
-        assert!(edges.is_empty(), "empty input should yield no edges");
-        assert!(detected.is_empty(), "empty input should detect no frameworks");
-    }
-
-    #[test]
-    fn test_run_post_extraction_passes_idempotent_edges() {
-        // Running the passes twice with dedup between should not grow the edge count.
-        // This simulates the background scanner calling the function on successive ticks.
-        let node1 = make_node("root", "src/foo.rs", "test_foo", NodeKind::Function, "rust");
-        let node2 = make_node("root", "src/foo.rs", "foo", NodeKind::Function, "rust");
-        let mut nodes = vec![node1, node2];
-        let mut edges: Vec<crate::graph::Edge> = vec![];
-        let root_pairs: Vec<(String, PathBuf)> = vec![];
-
-        let _d1 = run_post_extraction_passes(&mut nodes, &mut edges, &root_pairs, "root");
-        let edge_count_after_first = edges.len();
-
-        // Dedup before second run (mirrors background scanner dedup block).
-        let mut seen = std::collections::HashSet::new();
-        edges.retain(|e| seen.insert(e.stable_id()));
-
-        let _d2 = run_post_extraction_passes(&mut nodes, &mut edges, &root_pairs, "root");
-        // Dedup again as scanner would.
-        let mut seen2 = std::collections::HashSet::new();
-        edges.retain(|e| seen2.insert(e.stable_id()));
-        let edge_count_after_second = edges.len();
-
-        assert_eq!(
-            edge_count_after_first, edge_count_after_second,
-            "post-extraction passes are idempotent when dedup runs between calls (first={edge_count_after_first}, second={edge_count_after_second})"
-        );
-    }
-
-    #[test]
-    fn test_run_post_extraction_passes_no_frameworks_without_imports() {
-        // Framework detection pass requires Import nodes. Without them, the
-        // detected set should be empty.
-        let mut nodes = vec![
-            make_node("root", "src/lib.rs", "my_fn", NodeKind::Function, "rust"),
-        ];
-        let mut edges: Vec<crate::graph::Edge> = vec![];
-        let root_pairs: Vec<(String, PathBuf)> = vec![];
-        let detected = run_post_extraction_passes(&mut nodes, &mut edges, &root_pairs, "root");
-        assert!(
-            detected.is_empty(),
-            "no Import nodes means no detected frameworks, got: {:?}", detected
-        );
-    }
-}

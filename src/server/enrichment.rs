@@ -10,7 +10,6 @@ use crate::graph::index::GraphIndex;
 use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
 use crate::scanner::Scanner;
 
-use super::graph::run_post_extraction_passes;
 use super::helpers;
 use super::state::GraphState;
 use super::store::{
@@ -259,16 +258,9 @@ impl RnaHandler {
                         ));
                     }
 
-                    // Run post-extraction passes over the full merged node/edge set.
-                    // These were previously only run in build_full_graph_inner (foreground
-                    // full build), causing the background scanner to produce a diverged
-                    // graph missing api_link, manifest, tested_by, directory_module,
-                    // import_calls, framework_detection, nextjs_routing, pubsub, and
-                    // websocket edges/nodes. Fix for #471.
-                    //
-                    // We snapshot stable_ids BEFORE the passes to compute the net-new
-                    // nodes/edges added by them. These additions are persisted to LanceDB
-                    // via a separate lance_delta entry so they survive restarts/reloads.
+                    // Run post-extraction passes via EventBus (ADR Phase 2b, issue #502).
+                    // Both foreground and background paths now use the same bus-driven
+                    // consumer chain. Satisfies ADR Constraint 4 (no pass calls in src/server/).
                     {
                         // Snapshot existing stable_ids before the passes run.
                         let before_node_ids: std::collections::HashSet<String> =
@@ -287,13 +279,37 @@ impl RnaHandler {
                                 .collect();
                         let primary_slug =
                             RootConfig::code_project(repo_root.clone()).slug();
-                        let detected = run_post_extraction_passes(
-                            &mut graph_state.nodes,
-                            &mut graph_state.edges,
-                            &root_pairs,
-                            &primary_slug,
-                        );
-                        graph_state.detected_frameworks = detected;
+
+                        // Pipeline invariant: PostExtractionConsumer always emits PassesComplete.
+                        // If it doesn't (a logic bug), log the error and clear lance_deltas so
+                        // the empty graph is not persisted. The graph remains empty until the
+                        // next full rebuild (next startup or manual `scan --full`).
+                        match crate::extract::consumers::run_post_passes_via_bus(
+                            std::mem::take(&mut graph_state.nodes),
+                            std::mem::take(&mut graph_state.edges),
+                            root_pairs,
+                            primary_slug.clone(),
+                            repo_root.clone(),
+                        ) {
+                            Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
+                                graph_state.nodes = enriched_nodes;
+                                graph_state.edges = enriched_edges;
+                                graph_state.detected_frameworks = detected_frameworks;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Background scanner: post-extraction passes failed \
+                                     (pipeline invariant violated) — aborting tick, \
+                                     no data will be persisted: {:#}",
+                                    e
+                                );
+                                // Clear deltas so nothing bad gets written to LanceDB.
+                                lance_deltas.clear();
+                                // graph_state.nodes/edges are now empty (taken above).
+                                // An empty graph is safe for the subsequent rebuild-index
+                                // and pagerank steps (both are no-ops on an empty set).
+                            }
+                        }
 
                         // Deduplicate nodes and edges after post-extraction passes.
                         // Passes re-emit edges that may already be present from cached

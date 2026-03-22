@@ -850,6 +850,93 @@ pub fn build_builtin_bus(
 }
 
 // ---------------------------------------------------------------------------
+// run_post_passes_via_bus
+// ---------------------------------------------------------------------------
+
+/// Run post-extraction passes via the EventBus, returning enriched nodes/edges
+/// and detected frameworks.
+///
+/// This is the common pattern used by `build_full_graph_inner`,
+/// `update_graph_with_scan`, and the background scanner:
+///
+/// ```text
+/// nodes + edges → Arc<[T]> → RootExtracted → bus → PostExtractionConsumer
+///     → PassesComplete { nodes, edges, detected_frameworks }
+/// ```
+///
+/// The `nodes` and `edges` arguments are consumed (moved into `Arc<[T]>` for
+/// zero-copy fan-out to the bus consumers). If the bus fails to produce a
+/// `PassesComplete` event, the original data is returned unchanged via the
+/// fallback `Arc<[T]>` references.
+///
+/// # Arguments
+/// * `nodes` - extracted node set (consumed)
+/// * `edges` - extracted edge set (consumed)
+/// * `root_pairs` - `(slug, path)` pairs for all workspace roots
+/// * `primary_slug` - slug of the primary code root
+/// * `repo_root` - path to the primary repository root (for the bus event)
+///
+/// # Returns
+/// `Ok((nodes, edges, detected_frameworks))` — the enriched graph and framework set.
+///
+/// # Errors
+/// Returns `Err` if the bus does not produce a `PassesComplete` event.
+/// This is a pipeline invariant violation (`PostExtractionConsumer` always emits
+/// `PassesComplete`), so `Err` here indicates a logic bug, not a transient error.
+/// Callers should propagate this as a hard failure so the pipeline can retry on
+/// the next scan rather than silently persisting an unenriched graph.
+pub fn run_post_passes_via_bus(
+    nodes: Vec<crate::graph::Node>,
+    edges: Vec<crate::graph::Edge>,
+    root_pairs: Vec<(String, PathBuf)>,
+    primary_slug: String,
+    repo_root: PathBuf,
+) -> anyhow::Result<(Vec<crate::graph::Node>, Vec<crate::graph::Edge>, std::collections::HashSet<String>)> {
+    use crate::extract::event_bus::ExtractionEvent;
+    use std::sync::Arc;
+
+    // Wrap into Arc<[T]> for zero-copy bus fan-out.
+    let nodes_arc: Arc<[crate::graph::Node]> = Arc::from(nodes.into_boxed_slice());
+    let edges_arc: Arc<[crate::graph::Edge]> = Arc::from(edges.into_boxed_slice());
+
+    let bus = build_builtin_bus(root_pairs, primary_slug.clone());
+    let events = bus.emit(ExtractionEvent::RootExtracted {
+        slug: primary_slug,
+        path: repo_root,
+        nodes: Arc::clone(&nodes_arc),
+        edges: Arc::clone(&edges_arc),
+    });
+
+    // Collect PassesComplete — produced by PostExtractionConsumer.
+    // PassesComplete is a pipeline invariant: PostExtractionConsumer always emits it.
+    // If it's absent, the bus was misconfigured or a consumer panicked — treat as error.
+    let passes_complete = events.into_iter().find(|e| {
+        matches!(e, ExtractionEvent::PassesComplete { .. })
+    });
+
+    match passes_complete {
+        Some(ExtractionEvent::PassesComplete {
+            nodes,
+            edges,
+            detected_frameworks,
+            ..
+        }) => {
+            Ok((nodes.to_vec(), edges.to_vec(), detected_frameworks))
+        }
+        _ => {
+            // This is a hard invariant violation — do NOT fall back to the unenriched
+            // graph. The caller must not persist/commit scan state with missing passes.
+            anyhow::bail!(
+                "EventBus post-extraction: PassesComplete event absent — \
+                 this is a pipeline invariant violation (PostExtractionConsumer \
+                 must always emit PassesComplete). Failing hard to prevent \
+                 persisting an unenriched graph."
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1199,5 +1286,69 @@ mod tests {
         };
         let result = consumer.on_event(&event).unwrap();
         assert!(result.is_empty(), "EmbeddingIndexerConsumer Phase 2 stub emits nothing");
+    }
+
+    // ── run_post_passes_via_bus tests ─────────────────────────────────────
+
+    /// Verify run_post_passes_via_bus returns Ok(PassesComplete data) on empty input.
+    ///
+    /// This is the ADR Phase 2b integration test: ensures that emitting
+    /// RootExtracted to the bus always produces a PassesComplete event, even
+    /// when the input graph is empty.
+    #[test]
+    fn test_run_post_passes_via_bus_empty_input() {
+        let (nodes, edges, frameworks) = super::run_post_passes_via_bus(
+            vec![],
+            vec![],
+            vec![],
+            "test".to_string(),
+            PathBuf::from("."),
+        ).expect("run_post_passes_via_bus must not fail on empty input");
+        assert!(nodes.is_empty(), "empty input → empty nodes");
+        assert!(edges.is_empty(), "empty input → empty edges");
+        assert!(frameworks.is_empty(), "empty input → no frameworks");
+    }
+
+    /// Verify run_post_passes_via_bus routes nodes through PostExtractionConsumer.
+    ///
+    /// With a real temp directory and a Rust source file, the bus should:
+    /// 1. Accept RootExtracted with the pre-extracted nodes
+    /// 2. Route to PostExtractionConsumer which runs all passes
+    /// 3. Return PassesComplete with the enriched graph
+    #[test]
+    fn test_run_post_passes_via_bus_preserves_input_nodes() {
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        let node = Node {
+            id: NodeId {
+                root: "test".into(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "my_fn".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            line_start: 1,
+            line_end: 1,
+            signature: "fn my_fn()".into(),
+            body: "fn my_fn() {}".into(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let input_nodes = vec![node];
+        let (out_nodes, _out_edges, _frameworks) = super::run_post_passes_via_bus(
+            input_nodes,
+            vec![],
+            vec![],
+            "test".to_string(),
+            PathBuf::from("."),
+        ).expect("run_post_passes_via_bus must not fail with valid input");
+
+        // Output must contain the input node (passes should not drop it)
+        assert!(
+            out_nodes.iter().any(|n| n.id.name == "my_fn"),
+            "run_post_passes_via_bus must preserve input nodes through post-extraction passes"
+        );
     }
 }

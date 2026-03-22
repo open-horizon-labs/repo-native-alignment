@@ -2,6 +2,24 @@
 //!
 //! Each handler parses MCP tool params, builds a service context, delegates to
 //! the shared service layer, and wraps the result as MCP `TextContent`.
+//!
+//! ## `repo` parameter
+//!
+//! `search`, `repo_map`, and `outcome_progress` accept an optional `repo` path.
+//! When provided, the handler loads a fresh [`GraphState`] from that path's
+//! `.oh/.cache/lance/` LanceDB instead of the server's in-memory graph. This
+//! lets agents in git worktrees query their own repo:
+//!
+//! ```text
+//! search(query="build_code_embedding_text", repo="/path/to/worktree")
+//! ```
+//!
+//! The worktree must have been scanned first:
+//! `repo-native-alignment scan --repo /path/to/worktree`
+//!
+//! Embedding (semantic) search is not available for external repos.
+
+use std::path::PathBuf;
 
 use petgraph::Direction;
 use rust_mcp_sdk::schema::{CallToolError, CallToolResult};
@@ -15,12 +33,75 @@ use crate::service::{
 };
 
 use super::helpers::text_result;
+use super::state::GraphState;
+use super::store::load_graph_from_lance;
 use super::tools::{OutcomeProgress, RepoMap, Search};
 use super::RnaHandler;
 
 impl RnaHandler {
+    /// Resolve a `repo` path string to a canonical [`PathBuf`].
+    ///
+    /// Only absolute paths are accepted. Relative paths are rejected with an
+    /// error message because MCP has no caller CWD concept — a relative path
+    /// is always ambiguous and would silently resolve to the server's own repo
+    /// root, which defeats the purpose of the `repo` parameter.
+    ///
+    /// Use an absolute path: `repo="/absolute/path/to/worktree"`.
+    fn resolve_repo_path(&self, repo: &str) -> Result<PathBuf, String> {
+        let p = PathBuf::from(repo);
+        if p.is_absolute() {
+            Ok(p)
+        } else {
+            Err(format!(
+                "The `repo` parameter requires an absolute path, got \"{}\". \
+                 MCP has no caller CWD context, so relative paths are ambiguous. \
+                 Use an absolute path: repo=\"/absolute/path/to/worktree\"",
+                repo
+            ))
+        }
+    }
+
+    /// Load a [`GraphState`] from an external repo path's LanceDB.
+    ///
+    /// Returns `Ok((GraphState, PathBuf))` on success, or `Err` with a
+    /// human-readable message (e.g. the repo has not been scanned yet).
+    async fn load_external_graph(&self, repo: &str) -> Result<(GraphState, PathBuf), String> {
+        let repo_path = self.resolve_repo_path(repo)?;
+        let graph = load_graph_from_lance(&repo_path)
+            .await
+            .map_err(|e| format!(
+                "Failed to load graph from repo \"{}\": {}. \
+                 Ensure the repo has been scanned: \
+                 repo-native-alignment scan --repo \"{}\"",
+                repo_path.display(), e, repo_path.display()
+            ))?;
+        Ok((graph, repo_path))
+    }
+
     pub(crate) async fn handle_search(&self, args: Search) -> Result<CallToolResult, CallToolError> {
         let params = SearchParams::from_mcp_search(&args);
+
+        // When `repo` is provided, load an external graph from that path.
+        // Semantic search is skipped (no embed_index for external repos).
+        if let Some(ref repo) = args.repo {
+            let (external_graph, repo_path) = match self.load_external_graph(repo).await {
+                Ok(pair) => pair,
+                Err(e) => return Ok(text_result(e)),
+            };
+            // No root filter: show all nodes from the external repo's graph.
+            let ctx = SearchContext {
+                graph_state: &external_graph,
+                embed_index: None,
+                repo_root: &repo_path,
+                lsp_status: None,
+                embed_status: None,
+                root_filter: None,
+                non_code_slugs: std::collections::HashSet::new(),
+            };
+            let markdown = crate::service::search(&params, &ctx).await;
+            return Ok(text_result(markdown));
+        }
+
         let root_filter = self.effective_root_filter(args.root.as_deref());
         let non_code_slugs = if root_filter.is_some() { self.non_code_root_slugs() } else { std::collections::HashSet::new() };
         let graph_guard = match self.get_graph().await { Ok(g) => g, Err(e) => return Ok(text_result(format!("Graph error: {}", e))), };
@@ -33,6 +114,23 @@ impl RnaHandler {
     }
 
     pub(crate) async fn handle_outcome_progress(&self, args: OutcomeProgress) -> Result<CallToolResult, CallToolError> {
+        // When `repo` is provided, load an external graph from that path.
+        if let Some(ref repo) = args.repo {
+            let (external_graph, repo_path) = match self.load_external_graph(repo).await {
+                Ok(pair) => pair,
+                Err(e) => return Ok(text_result(e)),
+            };
+            let params = OutcomeProgressParams {
+                outcome_id: args.outcome_id,
+                include_impact: args.include_impact.unwrap_or(false),
+                root_filter: None,
+                non_code_slugs: std::collections::HashSet::new(),
+            };
+            let ctx = OutcomeProgressContext { graph_state: &external_graph, repo_root: &repo_path };
+            let markdown = crate::service::outcome_progress(&params, &ctx);
+            return Ok(text_result(markdown));
+        }
+
         let root_filter = self.effective_root_filter(args.root.as_deref());
         let non_code_slugs = if root_filter.is_some() { self.non_code_root_slugs() } else { std::collections::HashSet::new() };
         let graph_guard = match self.get_graph().await { Ok(g) => g, Err(e) => return Ok(text_result(format!("Graph error: {}", e))), };
@@ -69,6 +167,27 @@ impl RnaHandler {
     }
 
     pub(crate) async fn handle_repo_map(&self, args: RepoMap) -> Result<CallToolResult, CallToolError> {
+        // When `repo` is provided, load an external graph from that path.
+        if let Some(ref repo) = args.repo {
+            let (external_graph, repo_path) = match self.load_external_graph(repo).await {
+                Ok(pair) => pair,
+                Err(e) => return Ok(text_result(e)),
+            };
+            let params = RepoMapParams {
+                top_n: args.top_n.unwrap_or(15) as usize,
+                root_filter: None,
+                non_code_slugs: std::collections::HashSet::new(),
+            };
+            let ctx = RepoMapContext {
+                graph_state: &external_graph,
+                repo_root: &repo_path,
+                lsp_status: None,
+                embed_status: None,
+            };
+            let markdown = crate::service::repo_map(&params, &ctx);
+            return Ok(text_result(markdown));
+        }
+
         let root_filter = self.effective_root_filter(args.root.as_deref());
         let non_code_slugs = if root_filter.is_some() { self.non_code_root_slugs() } else { std::collections::HashSet::new() };
         let graph_guard = match self.get_graph().await { Ok(g) => g, Err(e) => return Ok(text_result(format!("Graph error: {}", e))), };
@@ -497,5 +616,120 @@ mod tests {
         let groups = run_traversal_grouped(&index, "a", "neighbors", None, None, Some(&filter)).unwrap();
         assert_eq!(groups.len(), 2);
         assert!(!groups.contains_key(&EdgeKind::DependsOn));
+    }
+
+    // ── resolve_repo_path tests ──────────────────────────────────────────
+
+    fn make_handler(repo_root: &std::path::Path) -> RnaHandler {
+        RnaHandler {
+            repo_root: repo_root.to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_resolve_repo_path_absolute_passthrough() {
+        let root = PathBuf::from("/srv/main-repo");
+        let handler = make_handler(&root);
+        let resolved = handler.resolve_repo_path("/path/to/worktree").unwrap();
+        assert_eq!(resolved, PathBuf::from("/path/to/worktree"));
+    }
+
+    #[test]
+    fn test_resolve_repo_path_relative_is_rejected() {
+        let root = PathBuf::from("/srv/main-repo");
+        let handler = make_handler(&root);
+        let result = handler.resolve_repo_path(".claude/worktrees/my-feature");
+        assert!(result.is_err(), "relative path should be rejected");
+        let err = result.unwrap_err();
+        assert!(err.contains("absolute path"), "error should mention absolute path: {}", err);
+    }
+
+    #[test]
+    fn test_resolve_repo_path_dot_is_rejected() {
+        let root = PathBuf::from("/srv/main-repo");
+        let handler = make_handler(&root);
+        let result = handler.resolve_repo_path(".");
+        assert!(result.is_err(), "relative path '.' should be rejected");
+    }
+
+    // ── Integration: load_external_graph with real LanceDB ──────────────
+
+    /// Verify that load_external_graph succeeds when a real LanceDB is present.
+    ///
+    /// Uses the main repo's own LanceDB at `.oh/.cache/lance`. This is always
+    /// present in developer environments. If absent (fresh CI checkout without
+    /// a prior scan), the test is skipped gracefully.
+    #[tokio::test]
+    async fn test_load_external_graph_succeeds_with_real_lance() {
+        let repo_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let lance_path = repo_path.join(".oh/.cache/lance/symbols.lance");
+        if !lance_path.exists() {
+            // LanceDB not present — skip rather than fail.
+            eprintln!("Skipping: symbols.lance not present at {}", lance_path.display());
+            return;
+        }
+        let handler = make_handler(&std::path::PathBuf::from("/tmp"));
+        let result = handler.load_external_graph(repo_path.to_str().unwrap()).await;
+        // Using match to avoid unwrap_err() which requires GraphState: Debug
+        match result {
+            Ok((graph, returned_path)) => {
+                assert_eq!(returned_path, repo_path, "Returned path should match input");
+                assert!(!graph.nodes.is_empty(), "Repo graph should have nodes");
+            }
+            Err(e) => panic!("Should load repo graph: {}", e),
+        }
+    }
+
+    /// Verify that load_external_graph returns a clear error for a path without LanceDB.
+    #[tokio::test]
+    async fn test_load_external_graph_fails_for_missing_lance() {
+        let handler = make_handler(&std::path::PathBuf::from("/tmp"));
+        let result = handler.load_external_graph("/tmp/no-such-repo-rna-test").await;
+        assert!(result.is_err(), "Should fail for path without LanceDB");
+        // Extract error without calling unwrap_err() (which needs Debug on Ok type)
+        let err = match result {
+            Ok(_) => panic!("Expected error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("Failed to load graph") || err.contains("absolute path"),
+            "Error should be descriptive: {}",
+            err
+        );
+    }
+
+    // ── Adversarial: repo parameter edge cases ──────────────────────────
+
+    /// Empty string is not an absolute path — must be rejected.
+    #[test]
+    fn test_resolve_repo_path_empty_string_is_rejected() {
+        let root = PathBuf::from("/srv/main-repo");
+        let handler = make_handler(&root);
+        let result = handler.resolve_repo_path("");
+        assert!(result.is_err(), "empty string should be rejected as relative path");
+        let err = result.unwrap_err();
+        assert!(err.contains("absolute path"), "error should mention absolute path: {}", err);
+    }
+
+    /// A path with just a slash followed by nothing is still absolute.
+    #[test]
+    fn test_resolve_repo_path_root_slash_is_absolute() {
+        let root = PathBuf::from("/srv/main-repo");
+        let handler = make_handler(&root);
+        let result = handler.resolve_repo_path("/");
+        assert!(result.is_ok(), "/ is an absolute path");
+        assert_eq!(result.unwrap(), PathBuf::from("/"));
+    }
+
+    /// Error message for relative path must mention how to fix it.
+    #[test]
+    fn test_resolve_repo_path_error_message_is_actionable() {
+        let root = PathBuf::from("/srv/main-repo");
+        let handler = make_handler(&root);
+        let err = handler.resolve_repo_path("worktrees/my-feature").unwrap_err();
+        // Must explain the problem and how to fix it
+        assert!(err.contains("absolute path"), "should say to use absolute path: {}", err);
+        assert!(err.contains("worktrees/my-feature"), "should echo back the bad value: {}", err);
     }
 }

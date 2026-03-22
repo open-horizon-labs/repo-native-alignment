@@ -15,6 +15,13 @@ Takes a feature or bug from framing through merge. Each phase feeds the next via
 > **Use RNA tools — not Grep/Read — for all code navigation.**
 >
 > - **MCP tools** (`search`, `repo_map`, `outcome_progress`, `graph_query`) — project-level context: guardrails, outcomes, metis, cross-cutting impact analysis.
+>   - **When working in a worktree**, use the `repo` parameter to scope queries to your worktree's graph:
+>     ```text
+>     mcp__rna-mcp__search(query="build_code_embedding_text", repo="/path/to/worktree")
+>     mcp__rna-mcp__repo_map(repo="/path/to/worktree")
+>     ```
+>     The worktree must be scanned first: `repo-native-alignment scan --repo /path/to/worktree`
+>   - Without `repo`, MCP tools query the server's configured repo (main repo).
 > - **CLI in your worktree** — code navigation WITHIN your working directory. Use these Bash commands from inside your worktree:
 >   ```bash
 >   repo-native-alignment search --repo . "what you're looking for" --limit 5

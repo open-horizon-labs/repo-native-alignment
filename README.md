@@ -29,6 +29,13 @@ Local context discovery and alignment tool for coding agents. Makes the fractal,
 - "Full call chain from /payments to database?" → `search("POST /payments", mode="impact")` → ApiEndpoint → handler → domain functions → storage
 - Supports Python Flask/FastAPI, TypeScript NestJS, Java Spring, Go gin/echo, Ruby Sinatra/Rails — no LSP required
 
+### Trace gRPC client stubs to proto definitions
+
+- "What clients call the UserService.GetUser RPC?" → `search("GetUser", mode="neighbors", direction="incoming")` → Python/Go/TypeScript/Java stub callers → proto method node
+- "What proto methods does this Python service call?" → `search(file="client.py", edge_types=["calls"])` → stub call sites linked to `.proto` definitions
+- "Full gRPC call chain?" → `search("GetUser", mode="impact")` → client stub → proto method → server implementation
+- Supports Python (`_pb2_grpc`), Go (`google.golang.org/grpc`), TypeScript (`@grpc/`), Java (`io.grpc`) — no LSP required
+
 ### See the blast radius of a change
 
 - "What depends on the database connection pool?" → `search(query="database connection pool", mode="impact")` → transitive dependents grouped by subsystem with entry points; auto-summarized when large
@@ -193,6 +200,8 @@ The system compounds from here. Agents use `search` to discover relevant context
 | `list_roots` | Show configured workspace roots with scan recency, symbol/edge counts, and LSP enrichment status. Includes LSP servers available to install for each root's detected languages. |
 
 **Root scoping:** All query tools default to the primary workspace root (`--repo`). Pass `root: "all"` for cross-root search, or `root: "<slug>"` for a specific root. Non-code roots (.oh/ artifacts, commits, Notes) always pass through regardless of root filter.
+
+**Worktree-aware queries:** Agents working in a git worktree can query their own code by passing the absolute path: `search(query="...", repo="/absolute/path/to/worktree")`. The worktree must be scanned first: `repo-native-alignment scan --repo /path/to/worktree`. Keyword and graph traversal search are available; semantic search requires a separate scan-time embedding index in the worktree.
 
 **Auto-discovered roots:** RNA automatically adds git worktrees and Claude Code memory as additional roots. Use `list_roots` to see what's active.
 

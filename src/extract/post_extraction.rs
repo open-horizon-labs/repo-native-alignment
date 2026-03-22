@@ -253,6 +253,7 @@ impl PostExtractionRegistry {
         reg.register(Box::new(NextjsRoutingPass));
         reg.register(Box::new(PubSubPass));
         reg.register(Box::new(WebSocketPass));
+        reg.register(Box::new(GrpcClientCallsPass));
         // Group 4: config-driven passes — reads .oh/extractors/*.toml at scan time.
         // Unconditional: applies_when always true; cost is zero when the directory
         // doesn't exist (load_extractor_configs returns early).
@@ -484,6 +485,31 @@ impl PostExtractionPass for WebSocketPass {
     }
 }
 
+// --- GrpcClientCallsPass ---
+
+/// Post-extraction pass that emits `Calls` edges from gRPC client stub call
+/// sites to proto RPC method `Function` nodes.
+///
+/// Gates on `grpc-python`, `grpc-go`, or `grpc-js` framework detection —
+/// zero cost for repos with no gRPC usage.
+struct GrpcClientCallsPass;
+
+impl PostExtractionPass for GrpcClientCallsPass {
+    fn name(&self) -> &str { "grpc_client_calls" }
+
+    fn applies_when(&self, detected_frameworks: &HashSet<String>) -> bool {
+        crate::extract::grpc::should_run(detected_frameworks)
+    }
+
+    fn run(&self, nodes: &mut Vec<Node>, edges: &mut Vec<Edge>, _ctx: &PassContext) -> PassResult {
+        let new_edges = crate::extract::grpc::grpc_client_calls_pass(nodes);
+        if !new_edges.is_empty() {
+            edges.extend(new_edges);
+        }
+        PassResult::empty()
+    }
+}
+
 // --- ExtractorConfigPass ---
 
 /// Generic config-driven boundary detection pass.
@@ -541,6 +567,62 @@ impl PostExtractionPass for ExtractorConfigPass {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+// run_post_extraction_passes — convenience wrapper used by the incremental
+// graph update path (`update_graph_with_scan`).
+// ---------------------------------------------------------------------------
+
+/// Run all post-extraction passes over a merged node/edge set.
+///
+/// This is the incremental-path helper used by `update_graph_with_scan`.
+/// The full-build path (`build_full_graph_inner`) and the background scanner
+/// use `EventBus::emit(RootExtracted)` → `PostExtractionConsumer` instead
+/// (ADR Phase 2b, issue #502). Both paths produce identical enrichment because
+/// they both call `PostExtractionRegistry::with_builtins().run_all()`.
+///
+/// # Why this function still exists
+///
+/// `update_graph_with_scan` is the synchronous incremental path (triggered by
+/// `get_graph` when changed files are detected). It mutates an existing
+/// `GraphState` in place rather than building from scratch, so the bus
+/// `RootExtracted` → `PassesComplete` pattern (which returns a NEW node/edge set)
+/// doesn't map cleanly onto it without larger refactoring (Phase 3+).
+///
+/// Callers outside `src/server/` are the rule; this function lives in
+/// `src/extract/` to satisfy ADR Constraint 4 (no direct pass calls in `src/server/`).
+///
+/// # Arguments
+/// * `all_nodes` - mutable reference to the merged node set
+/// * `all_edges` - mutable reference to the merged edge set
+/// * `root_pairs` - `(slug, path)` pairs for all workspace roots
+/// * `primary_slug` - slug of the primary code root
+///
+/// # Returns
+/// The set of detected framework IDs.
+pub fn run_post_extraction_passes(
+    all_nodes: &mut Vec<Node>,
+    all_edges: &mut Vec<Edge>,
+    root_pairs: &[(String, std::path::PathBuf)],
+    primary_slug: &str,
+) -> std::collections::HashSet<String> {
+    let registry = PostExtractionRegistry::with_builtins();
+    let ctx = PassContext {
+        root_pairs: root_pairs.to_vec(),
+        primary_slug: primary_slug.to_string(),
+        detected_frameworks: std::collections::HashSet::new(),
+    };
+    let result = registry.run_all(all_nodes, all_edges, ctx);
+
+    if result.added_node_count > 0 || result.added_edge_count > 0 {
+        tracing::info!(
+            "Post-extraction passes complete: +{} node(s), +{} edge(s), {} framework(s) detected",
+            result.added_node_count,
+            result.added_edge_count,
+            result.detected_frameworks.len(),
+        );
+    }
+
+    result.detected_frameworks
+}
 
 #[cfg(test)]
 mod tests {
@@ -928,6 +1010,97 @@ edge_kind = "Produces"
             .collect();
         assert_eq!(channel_nodes.len(), 1, "only one channel node created");
         assert_eq!(channel_nodes[0].id.name, "orders");
+    }
+
+    // ── run_post_extraction_passes helper tests ──────────────────────────────
+
+    #[test]
+    fn test_run_post_extraction_passes_empty_input() {
+        use std::path::PathBuf;
+        let mut nodes: Vec<Node> = vec![];
+        let mut edges: Vec<crate::graph::Edge> = vec![];
+        let root_pairs: Vec<(String, PathBuf)> = vec![];
+        let detected = super::run_post_extraction_passes(&mut nodes, &mut edges, &root_pairs, "test");
+        assert!(nodes.is_empty(), "empty input should yield no nodes");
+        assert!(edges.is_empty(), "empty input should yield no edges");
+        assert!(detected.is_empty(), "empty input should detect no frameworks");
+    }
+
+    #[test]
+    fn test_run_post_extraction_passes_idempotent_edges() {
+        use crate::graph::{ExtractionSource, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        fn make_node(root: &str, file: &str, name: &str) -> Node {
+            Node {
+                id: NodeId {
+                    root: root.to_string(),
+                    file: PathBuf::from(file),
+                    name: name.to_string(),
+                    kind: NodeKind::Function,
+                },
+                language: "rust".into(),
+                line_start: 1,
+                line_end: 1,
+                signature: name.to_string(),
+                body: String::new(),
+                metadata: BTreeMap::new(),
+                source: ExtractionSource::TreeSitter,
+            }
+        }
+
+        let node1 = make_node("root", "src/foo.rs", "test_foo");
+        let node2 = make_node("root", "src/foo.rs", "foo");
+        let mut nodes = vec![node1, node2];
+        let mut edges: Vec<crate::graph::Edge> = vec![];
+        let root_pairs: Vec<(String, PathBuf)> = vec![];
+
+        let _d1 = super::run_post_extraction_passes(&mut nodes, &mut edges, &root_pairs, "root");
+        let edge_count_after_first = edges.len();
+
+        let mut seen = std::collections::HashSet::new();
+        edges.retain(|e| seen.insert(e.stable_id()));
+
+        let _d2 = super::run_post_extraction_passes(&mut nodes, &mut edges, &root_pairs, "root");
+        let mut seen2 = std::collections::HashSet::new();
+        edges.retain(|e| seen2.insert(e.stable_id()));
+        let edge_count_after_second = edges.len();
+
+        assert_eq!(
+            edge_count_after_first, edge_count_after_second,
+            "post-extraction passes are idempotent when dedup runs between calls"
+        );
+    }
+
+    #[test]
+    fn test_run_post_extraction_passes_no_frameworks_without_imports() {
+        use crate::graph::{ExtractionSource, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        let mut nodes = vec![Node {
+            id: NodeId {
+                root: "root".into(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "my_fn".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            line_start: 1,
+            line_end: 1,
+            signature: "my_fn".into(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        }];
+        let mut edges: Vec<crate::graph::Edge> = vec![];
+        let root_pairs: Vec<(String, PathBuf)> = vec![];
+        let detected = super::run_post_extraction_passes(&mut nodes, &mut edges, &root_pairs, "root");
+        assert!(
+            detected.is_empty(),
+            "no Import nodes means no detected frameworks, got: {:?}", detected
+        );
     }
 
     /// ExtractorConfigPass is registered in `with_builtins()`.
