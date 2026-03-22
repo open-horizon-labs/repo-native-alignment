@@ -229,17 +229,16 @@ else
   SKIP=$((SKIP+1))
 fi
 
-# ── PENDING (queue after agents complete) ────────────────────────────────────
-echo "" && echo "--- Pending Features (SKIP until merged) ---"
-check "OpenAPI bidirectional (#465)" \
-  "grep -r 'openapi_bidirectional\|OpenApiBidirectional\|operationId.*Implements' $RNA_REPO/src/extract/ 2>/dev/null | wc -l" "[1-9]" \
-  "#465 not yet merged"
-check "gRPC service edges (#466)" \
-  "repo-native-alignment search '' --repo $RNA_REPO --kind grpc_service --limit 1 2>/dev/null | grep -c grpc_service" "[1-9]" \
-  "#466 not yet merged"
-check "Module split structure (#492)" \
-  "ls $RNA_REPO/src/consumers/ 2>/dev/null | wc -l" "[1-9]" \
-  "#492 not yet merged"
+# ── MERGED FEATURES ────────────────────────────────────────────────────────
+echo "" && echo "--- Merged Features ---"
+check "OpenAPI bidirectional (#465): OpenApiSdkLinkPass exists" \
+  "grep -r 'OpenApiSdkLinkPass\|openapi_sdk_link\|operationId.*Implements' $RNA_REPO/src/ 2>/dev/null | grep -v test | wc -l" "[1-9]"
+check "gRPC pass exists (#466)" \
+  "grep -r 'GrpcClientCallsPass\|grpc_client_calls' $RNA_REPO/src/ 2>/dev/null | grep -v test | wc -l" "[1-9]"
+check "Module split: src/consumers/ exists (#492)" \
+  "ls $RNA_REPO/src/consumers/ 2>/dev/null | wc -l" "[1-9]"
+check "EventBus trait exists (#479)" \
+  "grep -r 'trait ExtractionConsumer\|ExtractionEvent' $RNA_REPO/src/ 2>/dev/null | wc -l" "[1-9]"
 check "Pipeline wired to EventBus (#502)" \
   "grep -r 'bus.emit.*RootDiscovered\|EventBus::new' $RNA_REPO/src/server/graph.rs 2>/dev/null | wc -l" "[1-9]" \
   "#502 not yet merged"

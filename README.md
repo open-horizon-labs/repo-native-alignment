@@ -201,6 +201,8 @@ The system compounds from here. Agents use `search` to discover relevant context
 
 **Root scoping:** All query tools default to the primary workspace root (`--repo`). Pass `root: "all"` for cross-root search, or `root: "<slug>"` for a specific root. Non-code roots (.oh/ artifacts, commits, Notes) always pass through regardless of root filter.
 
+**Worktree-aware queries:** Agents working in a git worktree can query their own code by passing the absolute path: `search(query="...", repo="/absolute/path/to/worktree")`. The worktree must be scanned first: `repo-native-alignment scan --repo /path/to/worktree`. Keyword and graph traversal search are available; semantic search requires a separate scan-time embedding index in the worktree.
+
 **Auto-discovered roots:** RNA automatically adds git worktrees and Claude Code memory as additional roots. Use `list_roots` to see what's active.
 
 **Declared roots:** Declare intentionally related repos by slug in `.oh/config.toml`:
