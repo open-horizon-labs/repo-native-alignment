@@ -39,33 +39,43 @@ use super::tools::{OutcomeProgress, RepoMap, Search};
 use super::RnaHandler;
 
 impl RnaHandler {
-    /// Resolve an optional `repo` path string to a canonical [`PathBuf`].
+    /// Resolve a `repo` path string to a canonical [`PathBuf`].
     ///
-    /// Accepts absolute paths. Relative paths are resolved against the server's
-    /// configured repo root (not the process CWD, which is undefined in MCP).
-    fn resolve_repo_path(&self, repo: &str) -> PathBuf {
+    /// Only absolute paths are accepted. Relative paths are rejected with an
+    /// error message because MCP has no caller CWD concept — a relative path
+    /// is always ambiguous and would silently resolve to the server's own repo
+    /// root, which defeats the purpose of the `repo` parameter.
+    ///
+    /// Use an absolute path: `repo="/absolute/path/to/worktree"`.
+    fn resolve_repo_path(&self, repo: &str) -> Result<PathBuf, String> {
         let p = PathBuf::from(repo);
         if p.is_absolute() {
-            p
+            Ok(p)
         } else {
-            self.repo_root.join(p)
+            Err(format!(
+                "The `repo` parameter requires an absolute path, got \"{}\". \
+                 MCP has no caller CWD context, so relative paths are ambiguous. \
+                 Use an absolute path: repo=\"/absolute/path/to/worktree\"",
+                repo
+            ))
         }
     }
 
     /// Load a [`GraphState`] from an external repo path's LanceDB.
     ///
-    /// Returns `Err` with a human-readable message if loading fails (e.g. the
-    /// repo has not been scanned yet).
-    async fn load_external_graph(&self, repo: &str) -> Result<GraphState, String> {
-        let repo_path = self.resolve_repo_path(repo);
-        load_graph_from_lance(&repo_path)
+    /// Returns `Ok((GraphState, PathBuf))` on success, or `Err` with a
+    /// human-readable message (e.g. the repo has not been scanned yet).
+    async fn load_external_graph(&self, repo: &str) -> Result<(GraphState, PathBuf), String> {
+        let repo_path = self.resolve_repo_path(repo)?;
+        let graph = load_graph_from_lance(&repo_path)
             .await
             .map_err(|e| format!(
                 "Failed to load graph from repo \"{}\": {}. \
                  Ensure the repo has been scanned: \
                  repo-native-alignment scan --repo \"{}\"",
                 repo_path.display(), e, repo_path.display()
-            ))
+            ))?;
+        Ok((graph, repo_path))
     }
 
     pub(crate) async fn handle_search(&self, args: Search) -> Result<CallToolResult, CallToolError> {
@@ -74,11 +84,10 @@ impl RnaHandler {
         // When `repo` is provided, load an external graph from that path.
         // Semantic search is skipped (no embed_index for external repos).
         if let Some(ref repo) = args.repo {
-            let external_graph = match self.load_external_graph(repo).await {
-                Ok(g) => g,
+            let (external_graph, repo_path) = match self.load_external_graph(repo).await {
+                Ok(pair) => pair,
                 Err(e) => return Ok(text_result(e)),
             };
-            let repo_path = self.resolve_repo_path(repo);
             // No root filter: show all nodes from the external repo's graph.
             let ctx = SearchContext {
                 graph_state: &external_graph,
@@ -107,11 +116,10 @@ impl RnaHandler {
     pub(crate) async fn handle_outcome_progress(&self, args: OutcomeProgress) -> Result<CallToolResult, CallToolError> {
         // When `repo` is provided, load an external graph from that path.
         if let Some(ref repo) = args.repo {
-            let external_graph = match self.load_external_graph(repo).await {
-                Ok(g) => g,
+            let (external_graph, repo_path) = match self.load_external_graph(repo).await {
+                Ok(pair) => pair,
                 Err(e) => return Ok(text_result(e)),
             };
-            let repo_path = self.resolve_repo_path(repo);
             let params = OutcomeProgressParams {
                 outcome_id: args.outcome_id,
                 include_impact: args.include_impact.unwrap_or(false),
@@ -161,11 +169,10 @@ impl RnaHandler {
     pub(crate) async fn handle_repo_map(&self, args: RepoMap) -> Result<CallToolResult, CallToolError> {
         // When `repo` is provided, load an external graph from that path.
         if let Some(ref repo) = args.repo {
-            let external_graph = match self.load_external_graph(repo).await {
-                Ok(g) => g,
+            let (external_graph, repo_path) = match self.load_external_graph(repo).await {
+                Ok(pair) => pair,
                 Err(e) => return Ok(text_result(e)),
             };
-            let repo_path = self.resolve_repo_path(repo);
             let params = RepoMapParams {
                 top_n: args.top_n.unwrap_or(15) as usize,
                 root_filter: None,
@@ -624,23 +631,25 @@ mod tests {
     fn test_resolve_repo_path_absolute_passthrough() {
         let root = PathBuf::from("/srv/main-repo");
         let handler = make_handler(&root);
-        let resolved = handler.resolve_repo_path("/path/to/worktree");
+        let resolved = handler.resolve_repo_path("/path/to/worktree").unwrap();
         assert_eq!(resolved, PathBuf::from("/path/to/worktree"));
     }
 
     #[test]
-    fn test_resolve_repo_path_relative_joins_repo_root() {
+    fn test_resolve_repo_path_relative_is_rejected() {
         let root = PathBuf::from("/srv/main-repo");
         let handler = make_handler(&root);
-        let resolved = handler.resolve_repo_path(".claude/worktrees/my-feature");
-        assert_eq!(resolved, PathBuf::from("/srv/main-repo/.claude/worktrees/my-feature"));
+        let result = handler.resolve_repo_path(".claude/worktrees/my-feature");
+        assert!(result.is_err(), "relative path should be rejected");
+        let err = result.unwrap_err();
+        assert!(err.contains("absolute path"), "error should mention absolute path: {}", err);
     }
 
     #[test]
-    fn test_resolve_repo_path_dot_joins_repo_root() {
+    fn test_resolve_repo_path_dot_is_rejected() {
         let root = PathBuf::from("/srv/main-repo");
         let handler = make_handler(&root);
-        let resolved = handler.resolve_repo_path(".");
-        assert_eq!(resolved, PathBuf::from("/srv/main-repo/."));
+        let result = handler.resolve_repo_path(".");
+        assert!(result.is_err(), "relative path '.' should be rejected");
     }
 }
