@@ -841,6 +841,28 @@ impl RnaHandler {
                 );
                 all_edges.extend(subsystem_fw_edges);
             }
+
+            // 6e. Extend petgraph index to include newly emitted virtual nodes
+            // (subsystem, framework, channel, event) and their edges. Step 5 built
+            // the index BEFORE these nodes existed, so agents traversing the graph
+            // would miss them. Use targeted incremental updates (not full rebuild)
+            // to keep this O(new nodes + new edges) instead of O(all nodes).
+            for node in &all_nodes {
+                if matches!(&node.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+                    index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+                }
+            }
+            for edge in &all_edges {
+                if matches!(&edge.to.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+                    index.add_edge(
+                        &edge.from.to_stable_id(),
+                        &edge.from.kind.to_string(),
+                        &edge.to.to_stable_id(),
+                        &edge.to.kind.to_string(),
+                        edge.kind.clone(),
+                    );
+                }
+            }
         }
 
         // 7. Persist graph to LanceDB
@@ -1320,6 +1342,10 @@ impl RnaHandler {
                 for node in &sub_result.nodes {
                     upsert_node_ids.insert(node.stable_id());
                 }
+                // BelongsTo edges must be persisted too — include in upsert_edges
+                // so LanceDB gets the full delta (nodes without edges are queryable
+                // as nodes but not traversable as graph endpoints).
+                upsert_edges.extend(sub_result.edges.iter().cloned());
                 graph.nodes.extend(sub_result.nodes);
                 graph.edges.extend(sub_result.edges);
             }
