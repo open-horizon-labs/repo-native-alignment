@@ -442,6 +442,37 @@ mod tests {
         }
     }
 
+    /// Adversarial: when one production name is a prefix of another (e.g.
+    /// "parse" and "parse_config"), LeftmostLongest will match only the
+    /// longer pattern at any overlapping position.  Verify this produces
+    /// deterministic, sensible results — specifically, no panics and no
+    /// out-of-bounds pattern indices.
+    #[test]
+    fn adversarial_prefix_related_prod_names() {
+        let nodes = vec![
+            make_fn("parse", false),
+            make_fn("parse_config", false),
+            make_fn("test_parse_config_values", true),
+        ];
+        let edges = tested_by_pass(&nodes);
+        // With LeftmostLongest, "parse_config" wins over "parse" at the same
+        // offset. We expect at least one edge (to "parse_config").
+        // We do NOT assert a specific count — the exact behavior is a
+        // documented intentional change from str::contains (fewer false positives).
+        assert!(
+            !edges.is_empty(),
+            "expected at least one TestedBy edge; got 0"
+        );
+        // Every emitted edge must reference a valid prod node.
+        for edge in &edges {
+            let to_name = &edge.to.name;
+            assert!(
+                to_name == "parse" || to_name == "parse_config",
+                "edge.to.name '{}' must be one of the prod functions", to_name
+            );
+        }
+    }
+
     /// Adversarial: mix of struct nodes and function nodes — struct nodes
     /// with test-like names must not produce edges.
     #[test]
