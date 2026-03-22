@@ -34,7 +34,8 @@ pub const SCHEMA_VERSION: u32 = 16; // slug portability: root_id now uses direct
 /// nodes and adds UsesFramework/Produces/Consumes EdgeKinds.
 /// Bumped to 7 for pub/sub + websocket extractors (#464/#467): Produces/Consumes edges,
 /// channel/event nodes. Gates nextjs_routing_pass on framework detection.
-pub const EXTRACTION_VERSION: u32 = 7;
+/// Bumped to 8 for cross-file import-calls pass (#462).
+pub const EXTRACTION_VERSION: u32 = 8;
 
 /// Arrow schema for the `symbols` table.
 ///
