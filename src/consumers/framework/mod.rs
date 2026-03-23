@@ -9,4 +9,5 @@
 pub mod fastapi;
 pub mod nextjs;
 pub mod pubsub;
+pub mod sdk;
 pub mod websocket;
