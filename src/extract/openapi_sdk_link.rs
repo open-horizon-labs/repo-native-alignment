@@ -120,6 +120,48 @@ fn normalize_url_path(path: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP method inference from SDK function name
+// ---------------------------------------------------------------------------
+
+/// Infer the HTTP method from a generated SDK function name.
+///
+/// SDK generators like `@hey-api/openapi-ts` prefix function names with the
+/// HTTP verb in camelCase: `getUsers` → `GET`, `postWorkspaces` → `POST`, etc.
+///
+/// | Input                            | Output   |
+/// |----------------------------------|----------|
+/// | `getWorkspacesIdExpertunities`   | `GET`    |
+/// | `postAdminAgents`                | `POST`   |
+/// | `deleteWorkspacesId`             | `DELETE` |
+/// | `patchResourcesId`               | `PATCH`  |
+/// | `putWorkspacesIdDocument`        | `PUT`    |
+/// | `unknownPrefix`                  | `GET`    |  (default)
+///
+/// Returns the method in uppercase. Defaults to `"GET"` for unrecognised prefixes.
+fn infer_method_from_sdk_fn_name(name: &str) -> String {
+    let name_lower = name.to_lowercase();
+    for &(prefix, method) in &[
+        ("delete", "DELETE"),
+        ("patch", "PATCH"),
+        ("post", "POST"),
+        ("put", "PUT"),
+        ("head", "HEAD"),
+        ("options", "OPTIONS"),
+        ("get", "GET"),
+    ] {
+        if name_lower.starts_with(prefix) {
+            // Verify the character after the prefix is uppercase (camelCase boundary)
+            // or the name IS the prefix (e.g. a function literally named "get").
+            let rest = &name[prefix.len()..];
+            if rest.is_empty() || rest.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                return method.to_string();
+            }
+        }
+    }
+    "GET".to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Generated-file detection
 // ---------------------------------------------------------------------------
 
@@ -178,9 +220,11 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
     // Phase 1a: build a map from normalised operation_id → Vec<NodeId> for all
     // ApiEndpoint nodes that carry an `operation_id` in their metadata.
     let mut endpoint_by_op_id: HashMap<String, Vec<NodeId>> = HashMap::new();
-    // Phase 1b: build a map from normalised http_path → Vec<NodeId> for all
-    // ApiEndpoint nodes (used by the URL co-location fallback strategy).
-    let mut endpoint_by_path: HashMap<String, Vec<NodeId>> = HashMap::new();
+    // Phase 1b: build a map from (normalised_path, normalised_method) → Vec<NodeId>
+    // for all ApiEndpoint nodes (used by the URL co-location fallback strategy).
+    // Using (path, method) instead of path alone avoids treating GET/POST on the
+    // same path as ambiguous — each method is a distinct endpoint.
+    let mut endpoint_by_path_method: HashMap<(String, String), Vec<NodeId>> = HashMap::new();
 
     for node in all_nodes {
         if node.id.kind != NodeKind::ApiEndpoint {
@@ -193,24 +237,37 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
             }
         if let Some(http_path) = node.metadata.get("http_path")
             && !http_path.is_empty() {
-                let key = normalize_url_path(http_path);
-                endpoint_by_path.entry(key).or_default().push(node.id.clone());
+                let norm_path = normalize_url_path(http_path);
+                // Extract the HTTP method from the endpoint name (e.g. "GET /users/{id}")
+                // or from the http_method metadata field.
+                let method = node.metadata.get("http_method")
+                    .map(|m| m.to_uppercase())
+                    .unwrap_or_else(|| {
+                        // Fall back to extracting from node name: "GET /path" → "GET"
+                        node.id.name.split_whitespace().next()
+                            .unwrap_or("GET")
+                            .to_uppercase()
+                    });
+                endpoint_by_path_method.entry((norm_path, method)).or_default().push(node.id.clone());
             }
     }
 
     // Fast path: no ApiEndpoints means no edges to emit regardless of strategy.
-    if endpoint_by_op_id.is_empty() && endpoint_by_path.is_empty() {
+    if endpoint_by_op_id.is_empty() && endpoint_by_path_method.is_empty() {
         return Vec::new();
     }
 
-    // Phase 1c: build a map from (file, line) → Vec<normalized_path> for all
+    // Phase 1c: build a map from (root, file, line) → Vec<normalized_path> for all
     // synthetic Const nodes (URL string literals) in generated SDK files.
     // These are the embedded URLs in SDK function bodies, e.g.:
     //   `{ url: '/workspaces/{id}/expertunities', ...options }`
     // The string_literals extractor creates a Const node for each URL string,
     // and it appears on the same line as the enclosing SDK function.
-    let mut url_consts_by_file_line: HashMap<(PathBuf, usize), Vec<String>> = HashMap::new();
-    if !endpoint_by_path.is_empty() {
+    //
+    // Root is included in the key to prevent cross-root contamination in monorepos
+    // where two roots may contain different versions of the same SDK filename.
+    let mut url_consts_by_root_file_line: HashMap<(String, PathBuf, usize), Vec<String>> = HashMap::new();
+    if !endpoint_by_path_method.is_empty() {
         for node in all_nodes {
             if node.id.kind != NodeKind::Const {
                 continue;
@@ -227,8 +284,8 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
             if !path_str.starts_with('/') || path_str.len() <= 1 {
                 continue;
             }
-            let key = (node.id.file.clone(), node.line_start);
-            url_consts_by_file_line
+            let key = (node.id.root.clone(), node.id.file.clone(), node.line_start);
+            url_consts_by_root_file_line
                 .entry(key)
                 .or_default()
                 .push(normalize_url_path(path_str));
@@ -266,17 +323,25 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
         }
 
         // Strategy 2: URL path co-location fallback.
-        // Look for URL-shaped Const nodes in the same file on the same line.
+        // Look for URL-shaped Const nodes in the same root+file on the same line.
         // Each such Const is a string literal embedded in the SDK function body.
-        if url_consts_by_file_line.is_empty() {
+        if url_consts_by_root_file_line.is_empty() {
             continue;
         }
-        let file_line_key = (node.id.file.clone(), node.line_start);
-        if let Some(url_paths) = url_consts_by_file_line.get(&file_line_key) {
-            // Collect all ApiEndpoint NodeIds reachable via any URL path on this line.
+
+        // Infer the HTTP method from the SDK function name prefix (camelCase convention
+        // used by @hey-api/openapi-ts: getXxx, postXxx, deleteXxx, etc.).
+        // This lets us disambiguate GET /users from POST /users on the same line.
+        let inferred_method = infer_method_from_sdk_fn_name(&node.id.name);
+
+        let file_line_key = (node.id.root.clone(), node.id.file.clone(), node.line_start);
+        if let Some(url_paths) = url_consts_by_root_file_line.get(&file_line_key) {
+            // Collect all ApiEndpoint NodeIds reachable via any URL path on this line,
+            // filtered to the inferred HTTP method.
             let mut matched_ep_ids: Vec<NodeId> = Vec::new();
             for norm_path in url_paths {
-                if let Some(ep_ids) = endpoint_by_path.get(norm_path) {
+                let pm_key = (norm_path.clone(), inferred_method.clone());
+                if let Some(ep_ids) = endpoint_by_path_method.get(&pm_key) {
                     matched_ep_ids.extend(ep_ids.iter().cloned());
                 }
             }
@@ -354,6 +419,13 @@ mod tests {
         }
         if !http_path.is_empty() {
             metadata.insert("http_path".to_string(), http_path.to_string());
+        }
+        // Extract http_method from node name (e.g. "GET /workspaces/{id}/foo" → "GET").
+        // If the name starts with a known HTTP method, set it in metadata so the pass
+        // can use (path, method) keying for unambiguous matching.
+        let method = name.split_whitespace().next().unwrap_or("GET").to_uppercase();
+        if ["GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS"].contains(&method.as_str()) {
+            metadata.insert("http_method".to_string(), method);
         }
         Node {
             id: NodeId {
@@ -892,5 +964,103 @@ mod tests {
         let from_names: Vec<_> = edges.iter().map(|e| e.from.name.as_str()).collect();
         assert!(from_names.contains(&"getWorkspacesIdExpertunities"));
         assert!(from_names.contains(&"getWorkspacesIdActivities"));
+    }
+
+    /// CodeRabbit Finding #1: cross-root contamination prevention.
+    ///
+    /// When two roots both have an SDK file with the same relative path, a function
+    /// in root A must NOT match a URL Const from root B even on the same file+line.
+    #[test]
+    fn test_url_colocation_cross_root_contamination_prevented() {
+        let sdk_file = "src/api/sdk.gen.ts"; // same path in both roots
+
+        // Root A: SDK function at line 5
+        let mut sdk_fn_a = make_sdk_fn_at_line("getItems", sdk_file, 5);
+        sdk_fn_a.id.root = "service-a".to_string();
+
+        // Root B: URL const at line 5 (same file path, same line, BUT different root)
+        let mut url_const_b = make_url_const("/items", sdk_file, 5);
+        url_const_b.id.root = "service-b".to_string();
+
+        // Endpoint in root B
+        let mut ep_b = make_api_endpoint_with_path(
+            "GET /items", "", "/items", "service-b/src/api/routes.py",
+        );
+        ep_b.id.root = "service-b".to_string();
+
+        let nodes = vec![sdk_fn_a, url_const_b, ep_b];
+        let edges = openapi_sdk_link_pass(&nodes);
+
+        assert!(
+            edges.is_empty(),
+            "cross-root URL Const must not pollute SDK function from a different root, got: {:?}", edges
+        );
+    }
+
+    /// CodeRabbit Finding #1 (positive case): same root works correctly.
+    #[test]
+    fn test_url_colocation_same_root_links() {
+        let sdk_file = "src/api/sdk.gen.ts";
+
+        let mut sdk_fn = make_sdk_fn_at_line("getItems", sdk_file, 5);
+        sdk_fn.id.root = "service-a".to_string();
+
+        let mut url_const = make_url_const("/items", sdk_file, 5);
+        url_const.id.root = "service-a".to_string(); // same root as function
+
+        let mut ep = make_api_endpoint_with_path(
+            "GET /items", "", "/items", "service-a/src/api/routes.py",
+        );
+        ep.id.root = "service-a".to_string();
+
+        let nodes = vec![sdk_fn, url_const, ep];
+        let edges = openapi_sdk_link_pass(&nodes);
+
+        assert_eq!(edges.len(), 1, "same-root URL Const must produce edge");
+    }
+
+    /// CodeRabbit Finding #2: GET and POST on the same path are disambiguated by method.
+    ///
+    /// When both GET /users and POST /users exist, `getUsers` SDK function should
+    /// link only to GET /users (not be treated as ambiguous because POST /users also exists).
+    #[test]
+    fn test_url_colocation_get_and_post_same_path_disambiguated() {
+        let sdk_file = "client/src/api.gen/sdk.gen.ts";
+        let nodes = vec![
+            // SDK functions infer method from name prefix
+            make_sdk_fn_at_line("getUsers", sdk_file, 10),
+            make_url_const("/users", sdk_file, 10),
+            make_sdk_fn_at_line("postUsers", sdk_file, 20),
+            make_url_const("/users", sdk_file, 20),
+            // Two endpoints on the same path, different methods
+            make_api_endpoint_with_path("GET /users", "", "/users", "src/api/users.py"),
+            make_api_endpoint_with_path("POST /users", "", "/users", "src/api/users.py"),
+        ];
+        let edges = openapi_sdk_link_pass(&nodes);
+
+        assert_eq!(edges.len(), 2, "GET and POST functions must each link independently, got: {:?}", edges);
+        let get_edge = edges.iter().find(|e| e.from.name == "getUsers");
+        let post_edge = edges.iter().find(|e| e.from.name == "postUsers");
+        assert!(get_edge.is_some(), "getUsers must have an edge");
+        assert!(post_edge.is_some(), "postUsers must have an edge");
+        assert_eq!(get_edge.unwrap().to.name, "GET /users", "getUsers must link to GET endpoint");
+        assert_eq!(post_edge.unwrap().to.name, "POST /users", "postUsers must link to POST endpoint");
+    }
+
+    /// Verify infer_method_from_sdk_fn_name helper.
+    #[test]
+    fn test_infer_method_from_sdk_fn_name() {
+        assert_eq!(infer_method_from_sdk_fn_name("getWorkspacesId"), "GET");
+        assert_eq!(infer_method_from_sdk_fn_name("postAdminAgents"), "POST");
+        assert_eq!(infer_method_from_sdk_fn_name("deleteWorkspacesId"), "DELETE");
+        assert_eq!(infer_method_from_sdk_fn_name("patchResourcesId"), "PATCH");
+        assert_eq!(infer_method_from_sdk_fn_name("putWorkspacesIdDocument"), "PUT");
+        assert_eq!(infer_method_from_sdk_fn_name("headHealth"), "HEAD");
+        assert_eq!(infer_method_from_sdk_fn_name("optionsHealth"), "OPTIONS");
+        // Default for unknown prefixes
+        assert_eq!(infer_method_from_sdk_fn_name("unknownFunction"), "GET");
+        // Single-word names that ARE the prefix (e.g. a function literally named "get")
+        assert_eq!(infer_method_from_sdk_fn_name("get"), "GET");
+        assert_eq!(infer_method_from_sdk_fn_name("post"), "POST");
     }
 }
