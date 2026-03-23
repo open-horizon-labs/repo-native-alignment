@@ -49,6 +49,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use crate::extract::cache::ConsumerCacheKey;
 use crate::graph::{Edge, Node};
 use crate::graph::index::Subsystem;
@@ -513,6 +515,7 @@ fn canonical_edge_key(edge: &crate::graph::Edge) -> String {
 ///
 /// The default impl returns `0`, which is correct for consumers with stable logic
 /// that never needs independent invalidation.
+#[async_trait]
 pub trait ExtractionConsumer: Send + Sync {
     /// Human-readable identifier for diagnostics.
     fn name(&self) -> &str;
@@ -526,7 +529,11 @@ pub trait ExtractionConsumer: Send + Sync {
     ///
     /// **Must not call `bus.register()` or create new consumers.**
     /// **Must not import or call other consumers directly.**
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>>;
+    ///
+    /// Async to allow inherently async consumers (e.g. `LspConsumer` running
+    /// LSP enrichment) without `block_in_place`. Non-async consumers simply
+    /// return a ready future — zero cost.
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>>;
 
     /// Consumer logic version for content-addressed cache invalidation.
     ///
@@ -570,10 +577,10 @@ pub trait ExtractionConsumer: Send + Sync {
 /// All consumers register at startup. The bus routes events to subscribers
 /// by matching `event.kind()` against each consumer's `subscribes_to()`.
 ///
-/// The bus is **synchronous** in Phase 2. A consumer's `on_event` return
-/// value (follow-on events) is appended to a work queue; the bus drains the
-/// queue depth-first. This preserves the ordering invariant from the original
-/// sequential pipeline.
+/// The bus is **async** (Phase 4). A consumer's `on_event` returns a future;
+/// the bus awaits it and appends follow-on events to a work queue, draining
+/// depth-first. This preserves the ordering invariant while allowing inherently
+/// async consumers (e.g. `LspConsumer`) to be awaited natively.
 ///
 /// # In-memory content-addressed cache
 ///
@@ -633,7 +640,10 @@ impl EventBus {
     /// Before calling `consumer.on_event(event)`, the bus checks the in-memory
     /// content-addressed cache. Cache hits replay stored follow-on events; cache
     /// misses run the consumer and store the result.
-    pub fn emit(&mut self, seed: ExtractionEvent) -> Vec<ExtractionEvent> {
+    ///
+    /// Async so that inherently async consumers (e.g. `LspConsumer`) can be
+    /// awaited natively without `block_in_place`.
+    pub async fn emit(&mut self, seed: ExtractionEvent) -> Vec<ExtractionEvent> {
         // Use VecDeque for O(1) front removal rather than O(n) Vec::remove(0).
         let mut queue: VecDeque<ExtractionEvent> = VecDeque::new();
         queue.push_back(seed);
@@ -675,7 +685,7 @@ impl EventBus {
                     }
 
                     // Cache miss: run the consumer and store the result.
-                    match consumer.on_event(&event) {
+                    match consumer.on_event(&event).await {
                         Ok(new_events) => {
                             if !new_events.is_empty() {
                                 tracing::debug!(
@@ -704,7 +714,7 @@ impl EventBus {
                     }
                 } else {
                     // Non-cacheable: always run on_event directly, no cache interaction.
-                    match consumer.on_event(&event) {
+                    match consumer.on_event(&event).await {
                         Ok(mut new_events) => {
                             if !new_events.is_empty() {
                                 tracing::debug!(
@@ -746,10 +756,10 @@ impl EventBus {
     }
 
     /// Emit multiple seed events (one per discovered root), process all follow-ons.
-    pub fn emit_all(&mut self, seeds: impl IntoIterator<Item = ExtractionEvent>) -> Vec<ExtractionEvent> {
+    pub async fn emit_all(&mut self, seeds: impl IntoIterator<Item = ExtractionEvent>) -> Vec<ExtractionEvent> {
         let mut all: Vec<ExtractionEvent> = Vec::new();
         for seed in seeds {
-            all.extend(self.emit(seed));
+            all.extend(self.emit(seed).await);
         }
         all
     }
@@ -799,10 +809,11 @@ mod tests {
         count: Arc<AtomicUsize>,
     }
 
+    #[async_trait]
     impl ExtractionConsumer for CountingConsumer {
         fn name(&self) -> &str { self.name }
         fn subscribes_to(&self) -> &[ExtractionEventKind] { &self.kinds }
-        fn on_event(&self, _event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        async fn on_event(&self, _event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
             self.count.fetch_add(1, Ordering::Relaxed);
             Ok(vec![])
         }
@@ -814,10 +825,11 @@ mod tests {
         emits: Vec<ExtractionEvent>,
     }
 
+    #[async_trait]
     impl ExtractionConsumer for EmittingConsumer {
         fn name(&self) -> &str { self.name }
         fn subscribes_to(&self) -> &[ExtractionEventKind] { std::slice::from_ref(&self.listens) }
-        fn on_event(&self, _event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        async fn on_event(&self, _event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
             Ok(self.emits.clone())
         }
     }
@@ -839,16 +851,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_empty_bus_emits_nothing() {
+    #[tokio::test]
+    async fn test_empty_bus_emits_nothing() {
         let mut bus = EventBus::new();
-        let events = bus.emit(make_root_discovered());
+        let events = bus.emit(make_root_discovered()).await;
         // Seed event is always in emitted list
         assert_eq!(events.len(), 1);
     }
 
-    #[test]
-    fn test_consumer_receives_matching_event() {
+    #[tokio::test]
+    async fn test_consumer_receives_matching_event() {
         let count = Arc::new(AtomicUsize::new(0));
         let mut bus = EventBus::new();
         bus.register(Box::new(CountingConsumer {
@@ -857,12 +869,12 @@ mod tests {
             count: Arc::clone(&count),
         }));
 
-        bus.emit(make_root_discovered());
+        bus.emit(make_root_discovered()).await;
         assert_eq!(count.load(Ordering::Relaxed), 1);
     }
 
-    #[test]
-    fn test_consumer_ignores_non_matching_event() {
+    #[tokio::test]
+    async fn test_consumer_ignores_non_matching_event() {
         let count = Arc::new(AtomicUsize::new(0));
         let mut bus = EventBus::new();
         bus.register(Box::new(CountingConsumer {
@@ -871,12 +883,12 @@ mod tests {
             count: Arc::clone(&count),
         }));
 
-        bus.emit(make_root_discovered());
+        bus.emit(make_root_discovered()).await;
         assert_eq!(count.load(Ordering::Relaxed), 0, "counter must not fire for non-matching event");
     }
 
-    #[test]
-    fn test_follow_on_events_are_routed() {
+    #[tokio::test]
+    async fn test_follow_on_events_are_routed() {
         // EmittingConsumer listens for RootDiscovered, emits RootExtracted.
         // CountingConsumer listens for RootExtracted.
         // If routing works, counting consumer fires once.
@@ -894,13 +906,13 @@ mod tests {
             count: Arc::clone(&count),
         }));
 
-        let emitted = bus.emit(make_root_discovered());
+        let emitted = bus.emit(make_root_discovered()).await;
         assert_eq!(count.load(Ordering::Relaxed), 1, "follow-on event must be routed");
         assert_eq!(emitted.len(), 2, "emitted list must contain seed + follow-on");
     }
 
-    #[test]
-    fn test_depth_first_ordering() {
+    #[tokio::test]
+    async fn test_depth_first_ordering() {
         // Emitter1 listens RootDiscovered → emits [RootExtracted, PassesComplete]
         // Counter counts PassesComplete
         // Depth-first: RootDiscovered → RootExtracted (processed first) → PassesComplete
@@ -926,22 +938,23 @@ mod tests {
             count: Arc::clone(&count),
         }));
 
-        let emitted = bus.emit(make_root_discovered());
+        let emitted = bus.emit(make_root_discovered()).await;
         assert_eq!(emitted.len(), 3);
         assert!(matches!(emitted[0], ExtractionEvent::RootDiscovered { .. }));
         assert!(matches!(emitted[1], ExtractionEvent::RootExtracted { .. }));
         assert!(matches!(emitted[2], ExtractionEvent::PassesComplete { .. }));
     }
 
-    #[test]
-    fn test_consumer_error_does_not_stop_bus() {
+    #[tokio::test]
+    async fn test_consumer_error_does_not_stop_bus() {
         struct FailingConsumer;
+        #[async_trait]
         impl ExtractionConsumer for FailingConsumer {
             fn name(&self) -> &str { "failing" }
             fn subscribes_to(&self) -> &[ExtractionEventKind] {
                 &[ExtractionEventKind::RootDiscovered]
             }
-            fn on_event(&self, _event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+            async fn on_event(&self, _event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
                 Err(anyhow::anyhow!("test error"))
             }
         }
@@ -955,12 +968,12 @@ mod tests {
             count: Arc::clone(&count),
         }));
 
-        bus.emit(make_root_discovered());
+        bus.emit(make_root_discovered()).await;
         assert_eq!(count.load(Ordering::Relaxed), 1, "second consumer must still run after first fails");
     }
 
-    #[test]
-    fn test_emit_all_processes_all_seeds() {
+    #[tokio::test]
+    async fn test_emit_all_processes_all_seeds() {
         let count = Arc::new(AtomicUsize::new(0));
         let mut bus = EventBus::new();
         bus.register(Box::new(CountingConsumer {
@@ -977,12 +990,12 @@ mod tests {
             ExtractionEvent::RootDiscovered { slug: "b".into(), path: PathBuf::from("."), lsp_only: false },
             ExtractionEvent::RootDiscovered { slug: "c".into(), path: PathBuf::from("."), lsp_only: false },
         ];
-        bus.emit_all(seeds);
+        bus.emit_all(seeds).await;
         assert_eq!(count.load(Ordering::Relaxed), 3);
     }
 
-    #[test]
-    fn test_multiple_consumers_same_event() {
+    #[tokio::test]
+    async fn test_multiple_consumers_same_event() {
         let count_a = Arc::new(AtomicUsize::new(0));
         let count_b = Arc::new(AtomicUsize::new(0));
         let mut bus = EventBus::new();
@@ -997,15 +1010,15 @@ mod tests {
             count: Arc::clone(&count_b),
         }));
 
-        bus.emit(make_root_discovered());
+        bus.emit(make_root_discovered()).await;
         assert_eq!(count_a.load(Ordering::Relaxed), 1);
         assert_eq!(count_b.load(Ordering::Relaxed), 1);
     }
 
     /// Adversarial: a consumer registered BEFORE the emitter for a follow-on event
     /// must still receive that event (the bus routes ALL events including follow-ons).
-    #[test]
-    fn test_consumer_receives_follow_on_regardless_of_registration_order() {
+    #[tokio::test]
+    async fn test_consumer_receives_follow_on_regardless_of_registration_order() {
         let count = Arc::new(AtomicUsize::new(0));
         let mut bus = EventBus::new();
 
@@ -1022,7 +1035,7 @@ mod tests {
             emits: vec![make_root_extracted()],
         }));
 
-        bus.emit(make_root_discovered());
+        bus.emit(make_root_discovered()).await;
         assert_eq!(count.load(Ordering::Relaxed), 1,
             "counter registered before emitter must still receive follow-on event");
     }
@@ -1083,10 +1096,11 @@ mod tests {
     #[test]
     fn test_default_consumer_version_is_zero() {
         struct ZeroConsumer;
+        #[async_trait]
         impl ExtractionConsumer for ZeroConsumer {
             fn name(&self) -> &str { "zero" }
             fn subscribes_to(&self) -> &[ExtractionEventKind] { &[] }
-            fn on_event(&self, _: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> { Ok(vec![]) }
+            async fn on_event(&self, _: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> { Ok(vec![]) }
         }
         assert_eq!(ZeroConsumer.version(), 0);
     }
@@ -1095,10 +1109,11 @@ mod tests {
     #[test]
     fn test_consumer_can_override_version() {
         struct VersionedConsumer;
+        #[async_trait]
         impl ExtractionConsumer for VersionedConsumer {
             fn name(&self) -> &str { "versioned" }
             fn subscribes_to(&self) -> &[ExtractionEventKind] { &[] }
-            fn on_event(&self, _: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> { Ok(vec![]) }
+            async fn on_event(&self, _: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> { Ok(vec![]) }
             fn version(&self) -> u64 { 42 }
         }
         assert_eq!(VersionedConsumer.version(), 42);
@@ -1177,8 +1192,8 @@ mod tests {
 
     /// Cache hit: the second emit with the same event and consumer version
     /// must NOT call on_event again (count stays at 1).
-    #[test]
-    fn test_cache_hit_prevents_second_on_event_call() {
+    #[tokio::test]
+    async fn test_cache_hit_prevents_second_on_event_call() {
         let count = Arc::new(AtomicUsize::new(0));
         let mut bus = EventBus::new();
         bus.register(Box::new(CountingConsumer {
@@ -1188,17 +1203,17 @@ mod tests {
         }));
 
         // First emit: cache miss → on_event is called.
-        bus.emit(make_root_discovered());
+        bus.emit(make_root_discovered()).await;
         assert_eq!(count.load(Ordering::Relaxed), 1, "first emit must call on_event");
 
         // Second emit with same event: cache hit → on_event must NOT be called again.
-        bus.emit(make_root_discovered());
+        bus.emit(make_root_discovered()).await;
         assert_eq!(count.load(Ordering::Relaxed), 1, "second identical emit must not call on_event (cache hit)");
     }
 
     /// Cache miss: different payloads must each call on_event.
-    #[test]
-    fn test_cache_miss_on_different_payload() {
+    #[tokio::test]
+    async fn test_cache_miss_on_different_payload() {
         let count = Arc::new(AtomicUsize::new(0));
         let mut bus = EventBus::new();
         bus.register(Box::new(CountingConsumer {
@@ -1218,17 +1233,17 @@ mod tests {
             lsp_only: false,
         };
 
-        bus.emit(event_a);
+        bus.emit(event_a).await;
         assert_eq!(count.load(Ordering::Relaxed), 1, "first payload must call on_event");
 
-        bus.emit(event_b);
+        bus.emit(event_b).await;
         assert_eq!(count.load(Ordering::Relaxed), 2, "different payload must call on_event again (cache miss)");
     }
 
     /// Cache hit replays follow-on events: even when on_event is skipped,
     /// the cached follow-on events must still be dispatched.
-    #[test]
-    fn test_cache_hit_replays_follow_on_events() {
+    #[tokio::test]
+    async fn test_cache_hit_replays_follow_on_events() {
         let follow_count = Arc::new(AtomicUsize::new(0));
         let mut bus = EventBus::new();
 
@@ -1246,14 +1261,14 @@ mod tests {
         }));
 
         // First emit: emitter runs, produces follow-on, counter fires for it.
-        bus.emit(make_root_discovered());
+        bus.emit(make_root_discovered()).await;
         assert_eq!(follow_count.load(Ordering::Relaxed), 1, "first emit: follow-on must fire");
 
         // Second emit with same event: emitter is cached (skips on_event) but
         // its cached follow-on (RootExtracted) must still be replayed and routed.
         // The counter consumer for RootExtracted also caches, so its count stays 1
         // (second RootExtracted has same payload → cache hit on counter too).
-        bus.emit(make_root_discovered());
+        bus.emit(make_root_discovered()).await;
         assert_eq!(
             follow_count.load(Ordering::Relaxed), 1,
             "second identical emit: both emitter (cached) and counter (cached) must not double-fire"
@@ -1261,8 +1276,8 @@ mod tests {
     }
 
     /// cache_len() reflects the number of cached consumer×event key entries.
-    #[test]
-    fn test_cache_len_grows_with_misses() {
+    #[tokio::test]
+    async fn test_cache_len_grows_with_misses() {
         let mut bus = EventBus::new();
         bus.register(Box::new(CountingConsumer {
             name: "counter",
@@ -1271,17 +1286,17 @@ mod tests {
         }));
 
         assert_eq!(bus.cache_len(), 0, "cache starts empty");
-        bus.emit(make_root_discovered());
+        bus.emit(make_root_discovered()).await;
         assert_eq!(bus.cache_len(), 1, "one consumer × one event → one cache entry");
 
         // Same event again: hit, no new entry.
-        bus.emit(make_root_discovered());
+        bus.emit(make_root_discovered()).await;
         assert_eq!(bus.cache_len(), 1, "cache hit must not grow cache_len");
     }
 
     /// clear_cache() resets the cache so the next emit re-runs consumers.
-    #[test]
-    fn test_clear_cache_forces_on_event_rerun() {
+    #[tokio::test]
+    async fn test_clear_cache_forces_on_event_rerun() {
         let count = Arc::new(AtomicUsize::new(0));
         let mut bus = EventBus::new();
         bus.register(Box::new(CountingConsumer {
@@ -1290,13 +1305,13 @@ mod tests {
             count: Arc::clone(&count),
         }));
 
-        bus.emit(make_root_discovered());
+        bus.emit(make_root_discovered()).await;
         assert_eq!(count.load(Ordering::Relaxed), 1);
 
         bus.clear_cache();
 
         // After clearing, same event must re-run on_event.
-        bus.emit(make_root_discovered());
+        bus.emit(make_root_discovered()).await;
         assert_eq!(count.load(Ordering::Relaxed), 2, "after clear_cache, on_event must run again");
     }
 }

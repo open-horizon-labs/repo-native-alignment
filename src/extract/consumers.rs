@@ -25,6 +25,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
+use async_trait::async_trait;
+
 use crate::extract::ExtractorRegistry;
 use crate::extract::event_bus::{ExtractionConsumer, ExtractionEvent, ExtractionEventKind};
 use crate::extract::scan_stats::{ScanStats, ScanStatsConsumer};
@@ -47,6 +49,7 @@ use crate::graph::Node;
 /// establishes the subscription slot for Phase 4+ when manifest is promoted.
 pub struct ManifestConsumer;
 
+#[async_trait]
 impl ExtractionConsumer for ManifestConsumer {
     fn name(&self) -> &str { "manifest" }
 
@@ -54,7 +57,7 @@ impl ExtractionConsumer for ManifestConsumer {
         &[ExtractionEventKind::RootDiscovered]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::RootDiscovered { slug, .. } = event else {
             return Ok(vec![]);
         };
@@ -89,6 +92,7 @@ impl Default for TreeSitterConsumer {
     }
 }
 
+#[async_trait]
 impl ExtractionConsumer for TreeSitterConsumer {
     fn name(&self) -> &str { "tree_sitter" }
 
@@ -96,7 +100,7 @@ impl ExtractionConsumer for TreeSitterConsumer {
         &[ExtractionEventKind::RootDiscovered]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::RootDiscovered { slug, path, lsp_only } = event else {
             return Ok(vec![]);
         };
@@ -165,6 +169,7 @@ impl ExtractionConsumer for TreeSitterConsumer {
 /// Emits: `LanguageDetected` (one per language found)
 pub struct LanguageAccumulatorConsumer;
 
+#[async_trait]
 impl ExtractionConsumer for LanguageAccumulatorConsumer {
     fn name(&self) -> &str { "language_accumulator" }
 
@@ -172,7 +177,7 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
         &[ExtractionEventKind::RootExtracted]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::RootExtracted { slug, nodes, .. } = event else {
             return Ok(vec![]);
         };
@@ -227,6 +232,7 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
 /// the resulting edges in `PassesComplete`. No duplicate computation occurs here.
 pub struct ApiLinkConsumer;
 
+#[async_trait]
 impl ExtractionConsumer for ApiLinkConsumer {
     fn name(&self) -> &str { "api_link" }
 
@@ -234,7 +240,7 @@ impl ExtractionConsumer for ApiLinkConsumer {
         &[ExtractionEventKind::AllEnrichmentsDone]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::AllEnrichmentsDone { slug, .. } = event else {
             return Ok(vec![]);
         };
@@ -262,6 +268,7 @@ impl ExtractionConsumer for ApiLinkConsumer {
 /// the resulting edges in `PassesComplete`. No duplicate computation occurs here.
 pub struct TestedByConsumer;
 
+#[async_trait]
 impl ExtractionConsumer for TestedByConsumer {
     fn name(&self) -> &str { "tested_by" }
 
@@ -269,7 +276,7 @@ impl ExtractionConsumer for TestedByConsumer {
         &[ExtractionEventKind::AllEnrichmentsDone]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::AllEnrichmentsDone { slug, .. } = event else {
             return Ok(vec![]);
         };
@@ -305,6 +312,7 @@ impl ExtractionConsumer for TestedByConsumer {
 /// Emits: `PassComplete`
 pub struct FastapiRouterPrefixConsumer;
 
+#[async_trait]
 impl ExtractionConsumer for FastapiRouterPrefixConsumer {
     fn name(&self) -> &str { "fastapi_router_prefix" }
 
@@ -312,7 +320,7 @@ impl ExtractionConsumer for FastapiRouterPrefixConsumer {
         &[ExtractionEventKind::FrameworkDetected]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
             return Ok(vec![]);
         };
@@ -355,6 +363,7 @@ impl ExtractionConsumer for FastapiRouterPrefixConsumer {
 /// Emits: `PassComplete`
 pub struct SdkPathInferenceConsumer;
 
+#[async_trait]
 impl ExtractionConsumer for SdkPathInferenceConsumer {
     fn name(&self) -> &str { "sdk_path_inference" }
 
@@ -362,7 +371,7 @@ impl ExtractionConsumer for SdkPathInferenceConsumer {
         &[ExtractionEventKind::FrameworkDetected]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
             return Ok(vec![]);
         };
@@ -434,6 +443,7 @@ impl EnrichmentFinalizer {
     }
 }
 
+#[async_trait]
 impl ExtractionConsumer for EnrichmentFinalizer {
     fn name(&self) -> &str { "enrichment_finalizer" }
 
@@ -441,7 +451,7 @@ impl ExtractionConsumer for EnrichmentFinalizer {
         &[ExtractionEventKind::AllEnrichmentsDone]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::AllEnrichmentsDone { slug, nodes, edges, lsp_edges, lsp_nodes, updated_nodes } = event else {
             return Ok(vec![]);
         };
@@ -726,6 +736,7 @@ impl EnrichmentFinalizer {
 /// monitoring/signalling.
 pub struct FrameworkDetectionConsumer;
 
+#[async_trait]
 impl ExtractionConsumer for FrameworkDetectionConsumer {
     fn name(&self) -> &str { "framework_detection" }
 
@@ -733,7 +744,7 @@ impl ExtractionConsumer for FrameworkDetectionConsumer {
         &[ExtractionEventKind::FrameworkDetected]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::FrameworkDetected { slug, framework, nodes } = event else {
             return Ok(vec![]);
         };
@@ -783,6 +794,7 @@ impl NextjsRoutingConsumer {
     }
 }
 
+#[async_trait]
 impl ExtractionConsumer for NextjsRoutingConsumer {
     fn name(&self) -> &str { "nextjs_routing" }
 
@@ -790,7 +802,7 @@ impl ExtractionConsumer for NextjsRoutingConsumer {
         &[ExtractionEventKind::FrameworkDetected]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
             return Ok(vec![]);
         };
@@ -834,6 +846,7 @@ impl ExtractionConsumer for NextjsRoutingConsumer {
 /// Emits: `PassComplete`
 pub struct PubSubConsumer;
 
+#[async_trait]
 impl ExtractionConsumer for PubSubConsumer {
     fn name(&self) -> &str { "pubsub" }
 
@@ -841,7 +854,7 @@ impl ExtractionConsumer for PubSubConsumer {
         &[ExtractionEventKind::FrameworkDetected]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
             return Ok(vec![]);
         };
@@ -874,6 +887,7 @@ impl ExtractionConsumer for PubSubConsumer {
 /// Emits: `PassComplete`
 pub struct WebSocketConsumer;
 
+#[async_trait]
 impl ExtractionConsumer for WebSocketConsumer {
     fn name(&self) -> &str { "websocket" }
 
@@ -881,7 +895,7 @@ impl ExtractionConsumer for WebSocketConsumer {
         &[ExtractionEventKind::FrameworkDetected]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
             return Ok(vec![]);
         };
@@ -911,6 +925,7 @@ impl ExtractionConsumer for WebSocketConsumer {
 /// Emits: `PassComplete`
 pub struct OpenApiConsumer;
 
+#[async_trait]
 impl ExtractionConsumer for OpenApiConsumer {
     fn name(&self) -> &str { "openapi_bidirectional" }
 
@@ -918,7 +933,7 @@ impl ExtractionConsumer for OpenApiConsumer {
         &[ExtractionEventKind::RootExtracted]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::RootExtracted { slug, nodes, .. } = event else {
             return Ok(vec![]);
         };
@@ -950,6 +965,7 @@ impl ExtractionConsumer for OpenApiConsumer {
 /// Emits: `PassComplete`
 pub struct GrpcConsumer;
 
+#[async_trait]
 impl ExtractionConsumer for GrpcConsumer {
     fn name(&self) -> &str { "grpc_proto" }
 
@@ -957,7 +973,7 @@ impl ExtractionConsumer for GrpcConsumer {
         &[ExtractionEventKind::RootExtracted]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::RootExtracted { slug, nodes, .. } = event else {
             return Ok(vec![]);
         };
@@ -1024,6 +1040,7 @@ impl CustomExtractorConsumer {
     }
 }
 
+#[async_trait]
 impl ExtractionConsumer for CustomExtractorConsumer {
     fn name(&self) -> &str { "custom_extractor" }
 
@@ -1031,7 +1048,7 @@ impl ExtractionConsumer for CustomExtractorConsumer {
         &[ExtractionEventKind::FrameworkDetected]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
             return Ok(vec![]);
         };
@@ -1068,16 +1085,14 @@ impl ExtractionConsumer for CustomExtractorConsumer {
 
 /// Subscribes to `LanguageDetected` and runs real LSP enrichment for the given language.
 ///
-/// **Phase 3 real implementation.** Holds an `Arc<dyn Enricher>` for its language.
-/// In `on_event(LanguageDetected)`, calls `enricher.enrich()` via
-/// `tokio::task::block_in_place` (safe in a tokio multi-thread context) and returns a
-/// real `EnrichmentComplete` with actual edges and virtual nodes.
+/// **Phase 4 async implementation.** Holds an `Arc<dyn Enricher>` for its language.
+/// In `on_event(LanguageDetected)`, directly awaits `enricher.enrich()` — no
+/// `block_in_place` needed since the bus is now async.
 ///
 /// Per the ADR: "Consumer of LanguageDetected(lang, nodes): LSP enrichers — ALL fire
-/// concurrently, one per language." Parallel execution across languages falls out of
-/// the architecture when the event bus gains async support (Phase 4+). In the current
-/// synchronous bus each `LspConsumer` runs in registration order, but each runs to
-/// completion so the enricher I/O is properly serialized without races.
+/// concurrently, one per language." The async bus enables future parallel execution
+/// across languages. Currently the bus awaits consumers sequentially in registration
+/// order.
 ///
 /// Subscribes to: `LanguageDetected`
 /// Emits: `EnrichmentComplete` (with real edges and virtual nodes from LSP)
@@ -1092,6 +1107,7 @@ pub struct LspConsumer {
     pub lsp_roots: Arc<Vec<(String, PathBuf)>>,
 }
 
+#[async_trait]
 impl ExtractionConsumer for LspConsumer {
     fn name(&self) -> &str { "lsp" }
 
@@ -1099,7 +1115,7 @@ impl ExtractionConsumer for LspConsumer {
         &[ExtractionEventKind::LanguageDetected]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::LanguageDetected { slug, language, nodes } = event else {
             return Ok(vec![]);
         };
@@ -1135,49 +1151,17 @@ impl ExtractionConsumer for LspConsumer {
             drop(index);
         }
 
-        // Run async LSP enrichment synchronously within the sync event bus.
-        // `block_in_place` offloads the current task off a tokio worker thread so
-        // the runtime can schedule other work while we block. This is ONLY safe in
-        // a multi-threaded tokio runtime (the MCP server path uses `tokio::main`
-        // which defaults to multi-thread).
-        //
-        // For single-threaded runtimes (unit tests using `#[tokio::test]`) or
-        // non-tokio contexts, we skip LSP enrichment gracefully.
-        let enrichment_result = match tokio::runtime::Handle::try_current() {
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| {
-                    handle.block_on(async {
-                        // Build an index from the nodes visible to this enricher so that
-                        // enrichers that resolve or deduplicate through the index (e.g., future
-                        // enrichers beyond LspEnricher) see a populated graph rather than an
-                        // empty one. LspEnricher currently ignores the index (_index param),
-                        // but this keeps the contract correct for any enricher that does use it.
-                        let mut index = crate::graph::index::GraphIndex::new();
-                        for node in &nodes_vec {
-                            index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
-                        }
-                        enricher.enrich(&nodes_vec, &index, &repo_root).await
-                    })
-                })
+        // Run LSP enrichment natively async — the bus is async so we can await
+        // directly without block_in_place.
+        let enrichment_result = {
+            // Build an index from the nodes visible to this enricher so that
+            // enrichers that resolve or deduplicate through the index see a
+            // populated graph rather than an empty one.
+            let mut index = crate::graph::index::GraphIndex::new();
+            for node in &nodes_vec {
+                index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
             }
-            Ok(_) => {
-                // Single-threaded runtime (e.g., #[tokio::test]) — block_in_place would
-                // panic. Skip LSP enrichment and emit empty EnrichmentComplete so
-                // AllEnrichmentsGate can proceed.
-                tracing::debug!(
-                    "LspConsumer({}): single-thread runtime, skipping enrichment (test path)",
-                    self.language,
-                );
-                Ok(crate::extract::EnrichmentResult::default())
-            }
-            Err(_) => {
-                // No tokio runtime — return empty enrichment (sync-only path).
-                tracing::debug!(
-                    "LspConsumer({}): no tokio runtime, skipping enrichment",
-                    self.language,
-                );
-                Ok(crate::extract::EnrichmentResult::default())
-            }
+            enricher.enrich(&nodes_vec, &index, &repo_root).await
         };
 
         match enrichment_result {
@@ -1298,6 +1282,7 @@ impl Default for AllEnrichmentsGate {
     }
 }
 
+#[async_trait]
 impl ExtractionConsumer for AllEnrichmentsGate {
     fn name(&self) -> &str { "all_enrichments_gate" }
 
@@ -1305,7 +1290,7 @@ impl ExtractionConsumer for AllEnrichmentsGate {
         &[ExtractionEventKind::RootExtracted, ExtractionEventKind::EnrichmentComplete]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let mut state = self.state.lock().expect("AllEnrichmentsGate mutex poisoned");
 
         match event {
@@ -1491,6 +1476,7 @@ impl EmbeddingIndexerConsumer {
     }
 }
 
+#[async_trait]
 impl ExtractionConsumer for EmbeddingIndexerConsumer {
     fn name(&self) -> &str { "embedding_indexer" }
 
@@ -1498,7 +1484,7 @@ impl ExtractionConsumer for EmbeddingIndexerConsumer {
         &[ExtractionEventKind::RootExtracted]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::RootExtracted { slug, nodes, .. } = event else {
             return Ok(vec![]);
         };
@@ -1607,6 +1593,7 @@ impl LanceDBConsumer {
     }
 }
 
+#[async_trait]
 impl ExtractionConsumer for LanceDBConsumer {
     fn name(&self) -> &str { "lancedb_persist" }
 
@@ -1614,7 +1601,7 @@ impl ExtractionConsumer for LanceDBConsumer {
         &[ExtractionEventKind::PassesComplete]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::PassesComplete { slug, nodes, edges, .. } = event else {
             return Ok(vec![]);
         };
@@ -1693,6 +1680,7 @@ impl ExtractionConsumer for LanceDBConsumer {
 /// Emits: `SubsystemNodesComplete`
 pub struct SubsystemConsumer;
 
+#[async_trait]
 impl ExtractionConsumer for SubsystemConsumer {
     fn name(&self) -> &str { "subsystem" }
 
@@ -1700,7 +1688,7 @@ impl ExtractionConsumer for SubsystemConsumer {
         &[ExtractionEventKind::CommunityDetectionComplete]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         let ExtractionEvent::CommunityDetectionComplete { slug, subsystems, nodes } = event else {
             return Ok(vec![]);
         };
@@ -2053,7 +2041,7 @@ impl crate::extract::Enricher for NoopEnricher {
 /// Returns `Err` if the bus does not produce a `PassesComplete` event.
 /// This is a pipeline invariant violation (`EnrichmentFinalizer` always emits
 /// `PassesComplete`), so `Err` here indicates a logic bug, not a transient error.
-pub fn emit_enrichment_pipeline(
+pub async fn emit_enrichment_pipeline(
     nodes: Vec<crate::graph::Node>,
     edges: Vec<crate::graph::Edge>,
     root_pairs: Vec<(String, PathBuf)>,
@@ -2073,7 +2061,7 @@ pub fn emit_enrichment_pipeline(
         path: repo_root,
         nodes: Arc::clone(&nodes_arc),
         edges: Arc::clone(&edges_arc),
-    });
+    }).await;
 
     // Collect PassesComplete — produced by EnrichmentFinalizer.
     // PassesComplete is a pipeline invariant: EnrichmentFinalizer always emits it.
@@ -2119,7 +2107,7 @@ pub fn emit_enrichment_pipeline(
 /// # Errors
 /// Returns `Err` only if `SubsystemConsumer::on_event` itself fails, which should
 /// not happen in practice (the function is infallible for well-formed inputs).
-pub fn emit_community_detection(
+pub async fn emit_community_detection(
     slug: String,
     subsystems: Vec<crate::graph::index::Subsystem>,
     nodes: Vec<crate::graph::Node>,
@@ -2133,7 +2121,7 @@ pub fn emit_community_detection(
         slug,
         subsystems: Arc::from(subsystems.into_boxed_slice()),
         nodes: Arc::from(nodes.into_boxed_slice()),
-    });
+    }).await;
 
     // Collect SubsystemNodesComplete — emitted by SubsystemConsumer.
     let sub_complete = events.into_iter().find(|e| {
@@ -2169,8 +2157,8 @@ mod tests {
     use tempfile::TempDir;
 
     /// Verify ManifestConsumer subscribes to RootDiscovered and emits nothing.
-    #[test]
-    fn test_manifest_consumer_subscription() {
+    #[tokio::test]
+    async fn test_manifest_consumer_subscription() {
         let consumer = ManifestConsumer;
         assert!(consumer.subscribes_to().contains(&ExtractionEventKind::RootDiscovered));
         let event = ExtractionEvent::RootDiscovered {
@@ -2178,13 +2166,13 @@ mod tests {
             path: PathBuf::from("."),
             lsp_only: false,
         };
-        let result = consumer.on_event(&event).unwrap();
+        let result = consumer.on_event(&event).await.unwrap();
         assert!(result.is_empty(), "ManifestConsumer emits no follow-on events in Phase 2");
     }
 
     /// Verify LanguageAccumulatorConsumer groups nodes by language.
-    #[test]
-    fn test_language_accumulator_groups_by_language() {
+    #[tokio::test]
+    async fn test_language_accumulator_groups_by_language() {
         use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
         use std::collections::BTreeMap;
 
@@ -2218,7 +2206,7 @@ mod tests {
         };
 
         let consumer = LanguageAccumulatorConsumer;
-        let follow_ons = consumer.on_event(&event).unwrap();
+        let follow_ons = consumer.on_event(&event).await.unwrap();
 
         // Should emit LanguageDetected for "rust" and "python"
         assert_eq!(follow_ons.len(), 2, "Should emit one LanguageDetected per language");
@@ -2234,8 +2222,8 @@ mod tests {
     }
 
     /// Verify LanguageAccumulatorConsumer skips nodes with empty language.
-    #[test]
-    fn test_language_accumulator_skips_empty_language() {
+    #[tokio::test]
+    async fn test_language_accumulator_skips_empty_language() {
         use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
         use std::collections::BTreeMap;
 
@@ -2260,78 +2248,78 @@ mod tests {
             edges: std::sync::Arc::from([]),
         };
         let consumer = LanguageAccumulatorConsumer;
-        let follow_ons = consumer.on_event(&event).unwrap();
+        let follow_ons = consumer.on_event(&event).await.unwrap();
         assert!(follow_ons.is_empty(), "Empty language nodes must be skipped");
     }
 
     /// Verify TreeSitterConsumer skips lsp_only roots.
-    #[test]
-    fn test_tree_sitter_consumer_skips_lsp_only() {
+    #[tokio::test]
+    async fn test_tree_sitter_consumer_skips_lsp_only() {
         let consumer = TreeSitterConsumer::new();
         let event = ExtractionEvent::RootDiscovered {
             slug: "skills".into(),
             path: PathBuf::from("."),
             lsp_only: true,
         };
-        let result = consumer.on_event(&event).unwrap();
+        let result = consumer.on_event(&event).await.unwrap();
         assert!(result.is_empty(), "lsp_only roots must produce no RootExtracted event");
     }
 
     /// Verify PubSubConsumer only fires for broker frameworks.
-    #[test]
-    fn test_pubsub_consumer_fires_for_kafka() {
+    #[tokio::test]
+    async fn test_pubsub_consumer_fires_for_kafka() {
         let consumer = PubSubConsumer;
         let event = ExtractionEvent::FrameworkDetected {
             slug: "test".into(),
             framework: "kafka-python".into(),
             nodes: std::sync::Arc::from([]),
         };
-        let result = consumer.on_event(&event).unwrap();
+        let result = consumer.on_event(&event).await.unwrap();
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0], ExtractionEvent::PassComplete { pass_name: "pubsub", .. }));
     }
 
-    #[test]
-    fn test_pubsub_consumer_ignores_non_broker() {
+    #[tokio::test]
+    async fn test_pubsub_consumer_ignores_non_broker() {
         let consumer = PubSubConsumer;
         let event = ExtractionEvent::FrameworkDetected {
             slug: "test".into(),
             framework: "django".into(),
             nodes: std::sync::Arc::from([]),
         };
-        let result = consumer.on_event(&event).unwrap();
+        let result = consumer.on_event(&event).await.unwrap();
         assert!(result.is_empty());
     }
 
     /// Verify WebSocketConsumer fires only for socketio.
-    #[test]
-    fn test_websocket_consumer_fires_for_socketio() {
+    #[tokio::test]
+    async fn test_websocket_consumer_fires_for_socketio() {
         let consumer = WebSocketConsumer;
         let event = ExtractionEvent::FrameworkDetected {
             slug: "test".into(),
             framework: "socketio".into(),
             nodes: std::sync::Arc::from([]),
         };
-        let result = consumer.on_event(&event).unwrap();
+        let result = consumer.on_event(&event).await.unwrap();
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0], ExtractionEvent::PassComplete { pass_name: "websocket", .. }));
     }
 
-    #[test]
-    fn test_websocket_consumer_ignores_non_socketio() {
+    #[tokio::test]
+    async fn test_websocket_consumer_ignores_non_socketio() {
         let consumer = WebSocketConsumer;
         let event = ExtractionEvent::FrameworkDetected {
             slug: "test".into(),
             framework: "flask".into(),
             nodes: std::sync::Arc::from([]),
         };
-        let result = consumer.on_event(&event).unwrap();
+        let result = consumer.on_event(&event).await.unwrap();
         assert!(result.is_empty());
     }
 
     /// Verify build_builtin_bus registers consumers for all expected event kinds.
-    #[test]
-    fn test_builtin_bus_has_consumers_for_all_event_kinds() {
+    #[tokio::test]
+    async fn test_builtin_bus_has_consumers_for_all_event_kinds() {
         let (bus, _stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
         // Derive the exact expected count to catch regressions when languages are added/removed.
         let lsp_count = crate::extract::EnricherRegistry::with_builtins()
@@ -2356,8 +2344,8 @@ mod tests {
     }
 
     /// Verify build_builtin_bus returns a stats handle that shares state with the bus.
-    #[test]
-    fn test_builtin_bus_returns_scan_stats_handle() {
+    #[tokio::test]
+    async fn test_builtin_bus_returns_scan_stats_handle() {
         let (mut bus, stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
         // No activity yet
         assert!(!stats.read().unwrap().has_activity());
@@ -2367,7 +2355,7 @@ mod tests {
             slug: "test".into(),
             path: PathBuf::from("."),
             lsp_only: false,
-        });
+        }).await;
         assert!(
             stats.read().unwrap().has_activity(),
             "stats handle must reflect events fired through the bus"
@@ -2375,8 +2363,8 @@ mod tests {
     }
 
     /// Verify EnrichmentFinalizer emits PassesComplete on empty input.
-    #[test]
-    fn test_enrichment_finalizer_emits_passes_complete() {
+    #[tokio::test]
+    async fn test_enrichment_finalizer_emits_passes_complete() {
         let consumer = EnrichmentFinalizer::new(vec![], "test".into());
         let event = ExtractionEvent::AllEnrichmentsDone {
             slug: "test".into(),
@@ -2386,7 +2374,7 @@ mod tests {
             lsp_nodes: std::sync::Arc::from([]),
             updated_nodes: std::sync::Arc::from([]),
         };
-        let follow_ons = consumer.on_event(&event).unwrap();
+        let follow_ons = consumer.on_event(&event).await.unwrap();
         assert!(
             follow_ons.iter().any(|e| matches!(e, ExtractionEvent::PassesComplete { .. })),
             "EnrichmentFinalizer must always emit PassesComplete"
@@ -2397,8 +2385,8 @@ mod tests {
     ///
     /// `ApiLinkConsumer` is a subscription slot — the actual api_link_pass runs
     /// inside `EnrichmentFinalizer`. This consumer emits no events.
-    #[test]
-    fn test_api_link_consumer_subscription() {
+    #[tokio::test]
+    async fn test_api_link_consumer_subscription() {
         let consumer = ApiLinkConsumer;
         assert!(consumer.subscribes_to().contains(&ExtractionEventKind::AllEnrichmentsDone));
         let event = ExtractionEvent::AllEnrichmentsDone {
@@ -2409,7 +2397,7 @@ mod tests {
             lsp_nodes: std::sync::Arc::from([]),
             updated_nodes: std::sync::Arc::from([]),
         };
-        let result = consumer.on_event(&event).unwrap();
+        let result = consumer.on_event(&event).await.unwrap();
         assert!(result.is_empty(), "ApiLinkConsumer is a subscription slot — emits nothing");
     }
 
@@ -2417,8 +2405,8 @@ mod tests {
     ///
     /// `TestedByConsumer` is a subscription slot — the actual tested_by_pass runs
     /// inside `EnrichmentFinalizer`. This consumer emits no events.
-    #[test]
-    fn test_tested_by_consumer_subscription() {
+    #[tokio::test]
+    async fn test_tested_by_consumer_subscription() {
         let consumer = TestedByConsumer;
         assert!(consumer.subscribes_to().contains(&ExtractionEventKind::AllEnrichmentsDone));
         let event = ExtractionEvent::AllEnrichmentsDone {
@@ -2429,13 +2417,13 @@ mod tests {
             lsp_nodes: std::sync::Arc::from([]),
             updated_nodes: std::sync::Arc::from([]),
         };
-        let result = consumer.on_event(&event).unwrap();
+        let result = consumer.on_event(&event).await.unwrap();
         assert!(result.is_empty(), "TestedByConsumer is a subscription slot — emits nothing");
     }
 
     /// Verify FastapiRouterPrefixConsumer fires only for fastapi framework.
-    #[test]
-    fn test_fastapi_router_prefix_consumer_fires_for_fastapi() {
+    #[tokio::test]
+    async fn test_fastapi_router_prefix_consumer_fires_for_fastapi() {
         let consumer = FastapiRouterPrefixConsumer;
         // Matching framework
         let matching = ExtractionEvent::FrameworkDetected {
@@ -2443,7 +2431,7 @@ mod tests {
             framework: "fastapi".into(),
             nodes: std::sync::Arc::from([]),
         };
-        let result = consumer.on_event(&matching).unwrap();
+        let result = consumer.on_event(&matching).await.unwrap();
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0], ExtractionEvent::PassComplete { pass_name: "fastapi_router_prefix", .. }));
 
@@ -2453,13 +2441,13 @@ mod tests {
             framework: "flask".into(),
             nodes: std::sync::Arc::from([]),
         };
-        let result = consumer.on_event(&non_matching).unwrap();
+        let result = consumer.on_event(&non_matching).await.unwrap();
         assert!(result.is_empty());
     }
 
     /// Adversarial: CustomExtractorConsumer fires only for its declared framework.
-    #[test]
-    fn test_custom_extractor_consumer_framework_filter() {
+    #[tokio::test]
+    async fn test_custom_extractor_consumer_framework_filter() {
         let consumer = CustomExtractorConsumer {
             framework: "fastapi".into(),
             config_name: "fastapi-routes".into(),
@@ -2471,7 +2459,7 @@ mod tests {
             framework: "fastapi".into(),
             nodes: std::sync::Arc::from([]),
         };
-        let result = consumer.on_event(&matching).unwrap();
+        let result = consumer.on_event(&matching).await.unwrap();
         assert_eq!(result.len(), 1);
 
         // Non-matching → silent
@@ -2480,7 +2468,7 @@ mod tests {
             framework: "flask".into(),
             nodes: std::sync::Arc::from([]),
         };
-        let result = consumer.on_event(&non_matching).unwrap();
+        let result = consumer.on_event(&non_matching).await.unwrap();
         assert!(result.is_empty());
     }
 
@@ -2540,8 +2528,8 @@ mod tests {
 
     /// Integration: bus emit sequence starting from RootDiscovered.
     /// With a real temp directory, TreeSitterConsumer produces RootExtracted.
-    #[test]
-    fn test_bus_emit_root_discovered_produces_root_extracted() {
+    #[tokio::test]
+    async fn test_bus_emit_root_discovered_produces_root_extracted() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
         std::fs::write(
@@ -2561,7 +2549,7 @@ mod tests {
             slug: "test".to_string(),
             path: tmp.path().to_path_buf(),
             lsp_only: false,
-        });
+        }).await;
 
         // Must include RootExtracted somewhere in the emitted events
         let has_root_extracted = events.iter().any(|e| matches!(e, ExtractionEvent::RootExtracted { .. }));
@@ -2574,8 +2562,8 @@ mod tests {
 
     /// Verify LspConsumer fires only for its declared language.
     /// Uses a no-op enricher so the test doesn't try to start a real LSP server.
-    #[test]
-    fn test_lsp_consumer_fires_for_declared_language() {
+    #[tokio::test]
+    async fn test_lsp_consumer_fires_for_declared_language() {
         let consumer = LspConsumer {
             language: "rust".into(),
             enricher: Arc::new(NoopEnricher { language: "rust".into() }),
@@ -2587,7 +2575,7 @@ mod tests {
             language: "rust".into(),
             nodes: std::sync::Arc::from([]),
         };
-        let result = consumer.on_event(&matching).unwrap();
+        let result = consumer.on_event(&matching).await.unwrap();
         // No tokio runtime in sync test context: the consumer falls back to the no-op path
         // and still emits EnrichmentComplete (with empty edges).
         assert_eq!(result.len(), 1, "LspConsumer must emit EnrichmentComplete for its language");
@@ -2597,8 +2585,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_lsp_consumer_ignores_other_language() {
+    #[tokio::test]
+    async fn test_lsp_consumer_ignores_other_language() {
         let consumer = LspConsumer {
             language: "rust".into(),
             enricher: Arc::new(NoopEnricher { language: "rust".into() }),
@@ -2610,13 +2598,13 @@ mod tests {
             language: "python".into(),
             nodes: std::sync::Arc::from([]),
         };
-        let result = consumer.on_event(&other_lang).unwrap();
+        let result = consumer.on_event(&other_lang).await.unwrap();
         assert!(result.is_empty(), "LspConsumer must ignore events for other languages");
     }
 
     /// Verify AllEnrichmentsGate emits AllEnrichmentsDone immediately when no supported languages.
-    #[test]
-    fn test_all_enrichments_gate_no_languages() {
+    #[tokio::test]
+    async fn test_all_enrichments_gate_no_languages() {
         let gate = AllEnrichmentsGate::new();
         // No nodes → no languages → gate fires immediately on RootExtracted.
         let event = ExtractionEvent::RootExtracted {
@@ -2625,7 +2613,7 @@ mod tests {
             nodes: std::sync::Arc::from([]),
             edges: std::sync::Arc::from([]),
         };
-        let result = gate.on_event(&event).unwrap();
+        let result = gate.on_event(&event).await.unwrap();
         assert_eq!(result.len(), 1, "Gate must emit AllEnrichmentsDone when expected==0");
         assert!(
             matches!(result[0], ExtractionEvent::AllEnrichmentsDone { .. }),
@@ -2634,8 +2622,8 @@ mod tests {
     }
 
     /// Verify AllEnrichmentsGate waits for all enrichments before emitting.
-    #[test]
-    fn test_all_enrichments_gate_waits_for_all() {
+    #[tokio::test]
+    async fn test_all_enrichments_gate_waits_for_all() {
         use crate::graph::{ExtractionSource, NodeId, NodeKind};
         use std::collections::BTreeMap;
 
@@ -2664,7 +2652,7 @@ mod tests {
             nodes: std::sync::Arc::from(vec![rust_node].into_boxed_slice()),
             edges: std::sync::Arc::from([]),
         };
-        let result = gate.on_event(&root_extracted).unwrap();
+        let result = gate.on_event(&root_extracted).await.unwrap();
         // expected=1, received=0 → no AllEnrichmentsDone yet.
         assert!(result.is_empty(), "Gate must not fire before all enrichments arrive");
 
@@ -2676,7 +2664,7 @@ mod tests {
             new_nodes: std::sync::Arc::from([]),
             updated_nodes: std::sync::Arc::from([]),
         };
-        let result = gate.on_event(&enrichment_done).unwrap();
+        let result = gate.on_event(&enrichment_done).await.unwrap();
         assert_eq!(result.len(), 1, "Gate must emit AllEnrichmentsDone after all enrichments");
         assert!(
             matches!(result[0], ExtractionEvent::AllEnrichmentsDone { .. }),
@@ -2686,10 +2674,8 @@ mod tests {
 
     /// Verify SubsystemConsumer subscribes to CommunityDetectionComplete and emits
     /// SubsystemNodesComplete (even when no subsystems are detected).
-    #[test]
-    fn test_subsystem_consumer_subscription() {
-        use crate::graph::index::Subsystem;
-
+    #[tokio::test]
+    async fn test_subsystem_consumer_subscription() {
         let consumer = SubsystemConsumer;
         assert!(
             consumer.subscribes_to().contains(&ExtractionEventKind::CommunityDetectionComplete),
@@ -2700,7 +2686,7 @@ mod tests {
             subsystems: std::sync::Arc::from([]),
             nodes: std::sync::Arc::from([]),
         };
-        let result = consumer.on_event(&event).unwrap();
+        let result = consumer.on_event(&event).await.unwrap();
         assert_eq!(result.len(), 1, "SubsystemConsumer must emit exactly one SubsystemNodesComplete");
         assert!(
             matches!(result[0], ExtractionEvent::SubsystemNodesComplete { .. }),
@@ -2709,8 +2695,8 @@ mod tests {
     }
 
     /// Verify LanceDBConsumer (stub) subscribes to PassesComplete and emits nothing.
-    #[test]
-    fn test_lancedb_consumer_subscription() {
+    #[tokio::test]
+    async fn test_lancedb_consumer_subscription() {
         let consumer = LanceDBConsumer::stub();
         assert!(consumer.subscribes_to().contains(&ExtractionEventKind::PassesComplete));
         let event = ExtractionEvent::PassesComplete {
@@ -2719,13 +2705,13 @@ mod tests {
             edges: std::sync::Arc::from([]),
             detected_frameworks: HashSet::new(),
         };
-        let result = consumer.on_event(&event).unwrap();
+        let result = consumer.on_event(&event).await.unwrap();
         assert!(result.is_empty(), "LanceDBConsumer stub emits nothing");
     }
 
     /// Verify EmbeddingIndexerConsumer (stub) subscribes to RootExtracted and emits nothing.
-    #[test]
-    fn test_embedding_indexer_consumer_subscription() {
+    #[tokio::test]
+    async fn test_embedding_indexer_consumer_subscription() {
         let consumer = EmbeddingIndexerConsumer::stub();
         assert!(consumer.subscribes_to().contains(&ExtractionEventKind::RootExtracted));
         let event = ExtractionEvent::RootExtracted {
@@ -2734,15 +2720,15 @@ mod tests {
             nodes: std::sync::Arc::from([]),
             edges: std::sync::Arc::from([]),
         };
-        let result = consumer.on_event(&event).unwrap();
+        let result = consumer.on_event(&event).await.unwrap();
         assert!(result.is_empty(), "EmbeddingIndexerConsumer stub emits nothing");
     }
 
     // ── emit_enrichment_pipeline tests ─────────────────────────────────────
 
     /// Verify emit_enrichment_pipeline returns Ok(PassesComplete data) on empty input.
-    #[test]
-    fn test_emit_enrichment_pipeline_empty_input() {
+    #[tokio::test]
+    async fn test_emit_enrichment_pipeline_empty_input() {
         let (nodes, edges, frameworks) = super::emit_enrichment_pipeline(
             vec![],
             vec![],
@@ -2750,15 +2736,15 @@ mod tests {
             "test".to_string(),
             PathBuf::from("."),
             super::BusOptions::default(),
-        ).expect("emit_enrichment_pipeline must not fail on empty input");
+        ).await.expect("emit_enrichment_pipeline must not fail on empty input");
         assert!(nodes.is_empty(), "empty input → empty nodes");
         assert!(edges.is_empty(), "empty input → empty edges");
         assert!(frameworks.is_empty(), "empty input → no frameworks");
     }
 
     /// Verify emit_enrichment_pipeline routes nodes through EnrichmentFinalizer.
-    #[test]
-    fn test_emit_enrichment_pipeline_preserves_input_nodes() {
+    #[tokio::test]
+    async fn test_emit_enrichment_pipeline_preserves_input_nodes() {
         use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
         use std::collections::BTreeMap;
 
@@ -2786,7 +2772,7 @@ mod tests {
             "test".to_string(),
             PathBuf::from("."),
             super::BusOptions::default(),
-        ).expect("emit_enrichment_pipeline must not fail with valid input");
+        ).await.expect("emit_enrichment_pipeline must not fail with valid input");
 
         assert!(
             out_nodes.iter().any(|n| n.id.name == "my_fn"),
@@ -2799,8 +2785,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Adversarial: `SdkPathInferenceConsumer` fires only for fastapi, silent for others.
-    #[test]
-    fn test_sdk_path_inference_consumer_fires_only_for_fastapi() {
+    #[tokio::test]
+    async fn test_sdk_path_inference_consumer_fires_only_for_fastapi() {
         let consumer = SdkPathInferenceConsumer;
         assert!(consumer.subscribes_to().contains(&ExtractionEventKind::FrameworkDetected));
 
@@ -2810,7 +2796,7 @@ mod tests {
             framework: "fastapi".into(),
             nodes: std::sync::Arc::from([]),
         };
-        let result = consumer.on_event(&fastapi_event).unwrap();
+        let result = consumer.on_event(&fastapi_event).await.unwrap();
         assert_eq!(result.len(), 1, "SdkPathInferenceConsumer must fire for fastapi");
         assert!(matches!(result[0], ExtractionEvent::PassComplete { pass_name: "sdk_path_inference", .. }));
 
@@ -2821,7 +2807,7 @@ mod tests {
                 framework: framework.to_string(),
                 nodes: std::sync::Arc::from([]),
             };
-            let result = consumer.on_event(&other_event).unwrap();
+            let result = consumer.on_event(&other_event).await.unwrap();
             assert!(
                 result.is_empty(),
                 "SdkPathInferenceConsumer must be silent for framework '{}', got {:?}",
@@ -2835,8 +2821,8 @@ mod tests {
     ///
     /// Verifies the double gate: import-based AND filesystem-based detection are
     /// both absent → `nextjs_routing_pass` is not invoked → no ApiEndpoint nodes.
-    #[test]
-    fn test_plain_ts_repo_without_nextjs_does_not_produce_api_endpoints() {
+    #[tokio::test]
+    async fn test_plain_ts_repo_without_nextjs_does_not_produce_api_endpoints() {
         use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
         use std::collections::BTreeMap;
 
@@ -2864,7 +2850,7 @@ mod tests {
             "client".to_string(),
             PathBuf::from("."),
             super::BusOptions::default(),
-        ).unwrap();
+        ).await.unwrap();
 
         // Must produce no ApiEndpoint nodes — nextjs_routing_pass must NOT fire
         let api_endpoints: Vec<_> = out_nodes
@@ -2884,8 +2870,8 @@ mod tests {
     /// Verifies the filesystem-based fallback: a repo with `pages/api/` directory
     /// but no `next/` imports (e.g., plain TypeScript handler functions) should
     /// still have `nextjs_routing_pass` invoked.
-    #[test]
-    fn test_nextjs_with_pages_dir_but_no_imports_gets_routing() {
+    #[tokio::test]
+    async fn test_nextjs_with_pages_dir_but_no_imports_gets_routing() {
         use tempfile::TempDir;
 
         let dir = TempDir::new().unwrap();
@@ -2923,7 +2909,7 @@ mod tests {
             "client".to_string(),
             PathBuf::from("."),
             super::BusOptions::default(),
-        ).unwrap();
+        ).await.unwrap();
 
         // Must find an ApiEndpoint node — filesystem-based gate must fire
         let api_endpoints: Vec<_> = out_nodes
@@ -2944,8 +2930,8 @@ mod tests {
     /// Runs `emit_enrichment_pipeline` with only a React import node — neither
     /// `fastapi_router_prefix_pass` nor `sdk_path_inference_pass` should be invoked.
     /// (Absence of errors + no state mutation from those passes = correct.)
-    #[test]
-    fn test_non_fastapi_repo_does_not_invoke_fastapi_passes() {
+    #[tokio::test]
+    async fn test_non_fastapi_repo_does_not_invoke_fastapi_passes() {
         use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
         use std::collections::BTreeMap;
 
@@ -2977,7 +2963,7 @@ mod tests {
             "app".to_string(),
             PathBuf::from("."),
             super::BusOptions::default(),
-        ).unwrap();
+        ).await.unwrap();
 
         assert!(
             !frameworks.contains("fastapi"),

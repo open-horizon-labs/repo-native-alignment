@@ -633,7 +633,7 @@ impl RnaHandler {
                         embed_idx: None, // embed handled by spawn_background_enrichment after graph is ready
                         lance_repo_root: None, // LanceDB persist handled directly after PageRank/subsystem passes
                     },
-                )?;
+                ).await?;
             all_nodes = enriched_nodes;
             all_edges = enriched_edges;
             all_detected_frameworks = detected_frameworks;
@@ -785,7 +785,7 @@ impl RnaHandler {
                     primary_slug.clone(),
                     subsystems.clone(),
                     all_nodes.clone(),
-                ).unwrap_or_else(|e| {
+                ).await.unwrap_or_else(|e| {
                     tracing::warn!("Subsystem promotion via bus failed (non-fatal): {}", e);
                     (vec![], vec![])
                 });
@@ -1144,7 +1144,7 @@ impl RnaHandler {
                         embed_idx: None, // embed handled below via targeted reindex_nodes after PageRank
                         lance_repo_root: None, // LanceDB persist handled below via persist_graph_incremental
                     },
-                ).map_err(|e| {
+                ).await.map_err(|e| {
                     // Pipeline invariant violated — abort the incremental update so the
                     // partial graph is not persisted. Scanner state is not committed on
                     // Err return, so the next scan will retry the full pass sequence.
@@ -1292,7 +1292,7 @@ impl RnaHandler {
                     primary_slug.clone(),
                     subsystems.clone(),
                     graph.nodes.clone(),
-                ).unwrap_or_else(|e| {
+                ).await.unwrap_or_else(|e| {
                     tracing::warn!("Incremental subsystem promotion via bus failed (non-fatal): {}", e);
                     (vec![], vec![])
                 });

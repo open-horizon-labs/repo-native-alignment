@@ -295,7 +295,7 @@ impl RnaHandler {
                                 embed_idx: None, // embed handled by background scanner's own reindex pass
                                 lance_repo_root: None, // LanceDB persist handled by background scanner's lance_deltas
                             },
-                        ) {
+                        ).await {
                             Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
                                 graph_state.nodes = enriched_nodes;
                                 graph_state.edges = enriched_edges;
@@ -589,20 +589,18 @@ impl RnaHandler {
             // Consume bg_nodes/bg_edges via move (no redundant clone; these are the only owners).
             // LanceDB persist is handled below after replacing the in-memory graph.
             let bus_repo_root = bg_repo_root.clone();
-            let result = tokio::task::block_in_place(move || {
-                crate::extract::consumers::emit_enrichment_pipeline(
-                    bg_nodes,
-                    bg_edges,
-                    root_pairs,
-                    primary_slug,
-                    bus_repo_root,
-                    crate::extract::consumers::BusOptions {
-                        scan_stats: Some(bg_scan_stats),
-                        embed_idx: None,
-                        lance_repo_root: None,
-                    },
-                )
-            });
+            let result = crate::extract::consumers::emit_enrichment_pipeline(
+                bg_nodes,
+                bg_edges,
+                root_pairs,
+                primary_slug,
+                bus_repo_root,
+                crate::extract::consumers::BusOptions {
+                    scan_stats: Some(bg_scan_stats),
+                    embed_idx: None,
+                    lance_repo_root: None,
+                },
+            ).await;
 
             let (mut enriched_nodes, mut enriched_edges, _detected_frameworks) = match result {
                 Ok(r) => r,

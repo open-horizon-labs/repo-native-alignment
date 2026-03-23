@@ -43,6 +43,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use async_trait::async_trait;
+
 use crate::extract::event_bus::{ExtractionConsumer, ExtractionEvent, ExtractionEventKind};
 
 // ---------------------------------------------------------------------------
@@ -156,6 +158,7 @@ impl Default for ScanStatsConsumer {
     }
 }
 
+#[async_trait]
 impl ExtractionConsumer for ScanStatsConsumer {
     fn name(&self) -> &str {
         "scan_stats"
@@ -171,7 +174,7 @@ impl ExtractionConsumer for ScanStatsConsumer {
         ]
     }
 
-    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         // Acquire an exclusive write lock. The lock is short-lived (a few HashMap ops)
         // and uncontested in normal operation — the extraction thread is the only writer.
         let mut stats = self.stats.write().map_err(|e| anyhow::anyhow!("ScanStatsConsumer lock poisoned: {}", e))?;
@@ -295,51 +298,51 @@ mod tests {
         std::sync::Arc::from([])
     }
 
-    #[test]
-    fn test_root_discovered_increments_queued() {
+    #[tokio::test]
+    async fn test_root_discovered_increments_queued() {
         let c = make_consumer();
         let event = ExtractionEvent::RootDiscovered {
             slug: slug("api"),
             path: PathBuf::from("."),
             lsp_only: false,
         };
-        c.on_event(&event).unwrap();
+        c.on_event(&event).await.unwrap();
 
         let stats = c.stats.read().unwrap();
         assert_eq!(stats.roots_queued, 1);
         assert!(stats.has_activity());
     }
 
-    #[test]
-    fn test_multiple_roots_discovered() {
+    #[tokio::test]
+    async fn test_multiple_roots_discovered() {
         let c = make_consumer();
         for name in ["api", "frontend", "infra"] {
             c.on_event(&ExtractionEvent::RootDiscovered {
                 slug: slug(name),
                 path: PathBuf::from("."),
                 lsp_only: false,
-            }).unwrap();
+            }).await.unwrap();
         }
         let stats = c.stats.read().unwrap();
         assert_eq!(stats.roots_queued, 3);
     }
 
-    #[test]
-    fn test_root_extracted_records_stats() {
+    #[tokio::test]
+    async fn test_root_extracted_records_stats() {
         let c = make_consumer();
         // RootDiscovered first
         c.on_event(&ExtractionEvent::RootDiscovered {
             slug: slug("api"),
             path: PathBuf::from("."),
             lsp_only: false,
-        }).unwrap();
+        }).await.unwrap();
         // Then RootExtracted
         c.on_event(&ExtractionEvent::RootExtracted {
             slug: slug("api"),
             path: PathBuf::from("."),
             nodes: std::sync::Arc::from(vec![].into_boxed_slice()),
             edges: std::sync::Arc::from(vec![].into_boxed_slice()),
-        }).unwrap();
+        }).await.unwrap();
         let stats = c.stats.read().unwrap();
         let extracted = stats.roots_extracted.get("api").expect("api should be in roots_extracted");
         assert_eq!(extracted.symbol_count, 0);
@@ -347,34 +350,34 @@ mod tests {
         assert!(stats.is_root_in_progress("api"), "root should be in-progress after RootExtracted");
     }
 
-    #[test]
-    fn test_language_detected_adds_to_in_flight() {
+    #[tokio::test]
+    async fn test_language_detected_adds_to_in_flight() {
         let c = make_consumer();
         c.on_event(&ExtractionEvent::LanguageDetected {
             slug: slug("api"),
             language: "rust".into(),
             nodes: empty_arc_nodes(),
-        }).unwrap();
+        }).await.unwrap();
         c.on_event(&ExtractionEvent::LanguageDetected {
             slug: slug("api"),
             language: "python".into(),
             nodes: empty_arc_nodes(),
-        }).unwrap();
+        }).await.unwrap();
         let stats = c.stats.read().unwrap();
         let in_flight = stats.languages_in_flight.get("api").expect("api should have in-flight langs");
         assert!(in_flight.contains(&"rust".to_string()));
         assert!(in_flight.contains(&"python".to_string()));
     }
 
-    #[test]
-    fn test_enrichment_complete_moves_lang_from_in_flight_to_done() {
+    #[tokio::test]
+    async fn test_enrichment_complete_moves_lang_from_in_flight_to_done() {
         let c = make_consumer();
         // Add rust to in-flight
         c.on_event(&ExtractionEvent::LanguageDetected {
             slug: slug("api"),
             language: "rust".into(),
             nodes: empty_arc_nodes(),
-        }).unwrap();
+        }).await.unwrap();
         // Complete enrichment for rust
         c.on_event(&ExtractionEvent::EnrichmentComplete {
             slug: slug("api"),
@@ -382,7 +385,7 @@ mod tests {
             added_edges: empty_arc_edges(),
             new_nodes: empty_arc_nodes(),
             updated_nodes: std::sync::Arc::from([]),
-        }).unwrap();
+        }).await.unwrap();
         let stats = c.stats.read().unwrap();
         let in_flight = stats.languages_in_flight.get("api").map(|v| v.as_slice()).unwrap_or(&[]);
         assert!(!in_flight.contains(&"rust".to_string()), "rust should no longer be in-flight");
@@ -390,8 +393,8 @@ mod tests {
         assert!(done.contains(&"rust".to_string()), "rust should be in done langs");
     }
 
-    #[test]
-    fn test_enrichment_complete_records_lsp_edge_count() {
+    #[tokio::test]
+    async fn test_enrichment_complete_records_lsp_edge_count() {
         use crate::graph::{Edge, EdgeKind, ExtractionSource, Confidence, NodeId, NodeKind};
         use std::path::PathBuf as Pb;
         let c = make_consumer();
@@ -410,14 +413,14 @@ mod tests {
             slug: slug("api"),
             language: "rust".into(),
             nodes: empty_arc_nodes(),
-        }).unwrap();
+        }).await.unwrap();
         c.on_event(&ExtractionEvent::EnrichmentComplete {
             slug: slug("api"),
             language: "rust".into(),
             added_edges: std::sync::Arc::from(edges.into_boxed_slice()),
             new_nodes: empty_arc_nodes(),
             updated_nodes: std::sync::Arc::from([]),
-        }).unwrap();
+        }).await.unwrap();
 
         let stats = c.stats.read().unwrap();
         let count = stats.lsp_edge_counts
@@ -426,32 +429,32 @@ mod tests {
         assert_eq!(count, 3, "lsp_edge_count should reflect added_edges length");
     }
 
-    #[test]
-    fn test_passes_complete_marks_root_complete_and_clears_intermediate() {
+    #[tokio::test]
+    async fn test_passes_complete_marks_root_complete_and_clears_intermediate() {
         let c = make_consumer();
         // Simulate full pipeline for "api"
         c.on_event(&ExtractionEvent::RootDiscovered {
             slug: slug("api"), path: PathBuf::from("."), lsp_only: false,
-        }).unwrap();
+        }).await.unwrap();
         c.on_event(&ExtractionEvent::RootExtracted {
             slug: slug("api"), path: PathBuf::from("."),
             nodes: std::sync::Arc::from(vec![].into_boxed_slice()),
             edges: std::sync::Arc::from(vec![].into_boxed_slice()),
-        }).unwrap();
+        }).await.unwrap();
         c.on_event(&ExtractionEvent::LanguageDetected {
             slug: slug("api"), language: "rust".into(), nodes: empty_arc_nodes(),
-        }).unwrap();
+        }).await.unwrap();
         c.on_event(&ExtractionEvent::EnrichmentComplete {
             slug: slug("api"), language: "rust".into(),
             added_edges: empty_arc_edges(), new_nodes: empty_arc_nodes(),
             updated_nodes: std::sync::Arc::from([]),
-        }).unwrap();
+        }).await.unwrap();
         c.on_event(&ExtractionEvent::PassesComplete {
             slug: slug("api"),
             nodes: std::sync::Arc::from(vec![].into_boxed_slice()),
             edges: std::sync::Arc::from(vec![].into_boxed_slice()),
             detected_frameworks: std::collections::HashSet::new(),
-        }).unwrap();
+        }).await.unwrap();
 
         let stats = c.stats.read().unwrap();
         assert!(stats.is_root_complete("api"), "root should be complete after PassesComplete");
@@ -460,8 +463,8 @@ mod tests {
         assert!(!stats.languages_in_flight.contains_key("api"), "in-flight languages should be cleared");
     }
 
-    #[test]
-    fn test_no_activity_when_empty() {
+    #[tokio::test]
+    async fn test_no_activity_when_empty() {
         let c = make_consumer();
         let stats = c.stats.read().unwrap();
         assert!(!stats.has_activity(), "fresh consumer has no activity");
@@ -470,14 +473,14 @@ mod tests {
     }
 
     /// Verify that stats_handle() and the consumer share the same allocation.
-    #[test]
-    fn test_stats_handle_shares_same_arc() {
+    #[tokio::test]
+    async fn test_stats_handle_shares_same_arc() {
         let c = make_consumer();
         let handle = c.stats_handle();
         // Mutate through the consumer's internal Arc
         c.on_event(&ExtractionEvent::RootDiscovered {
             slug: slug("test"), path: PathBuf::from("."), lsp_only: false,
-        }).unwrap();
+        }).await.unwrap();
         // Read through the handle — must see the mutation
         let stats = handle.read().unwrap();
         assert_eq!(stats.roots_queued, 1, "stats_handle must share the same Arc as the consumer");
@@ -485,8 +488,8 @@ mod tests {
 
     /// Adversarial: EnrichmentComplete for a language that was never in-flight
     /// must not panic and must still add the language to done.
-    #[test]
-    fn test_enrichment_complete_without_prior_language_detected() {
+    #[tokio::test]
+    async fn test_enrichment_complete_without_prior_language_detected() {
         let c = make_consumer();
         // No LanguageDetected fired before this
         let result = c.on_event(&ExtractionEvent::EnrichmentComplete {
@@ -495,7 +498,7 @@ mod tests {
             added_edges: empty_arc_edges(),
             new_nodes: empty_arc_nodes(),
             updated_nodes: std::sync::Arc::from([]),
-        });
+        }).await;
         assert!(result.is_ok(), "should not fail even without prior LanguageDetected");
         let stats = c.stats.read().unwrap();
         let done = stats.languages_done.get("api").expect("api should be in done");
@@ -503,15 +506,15 @@ mod tests {
     }
 
     /// Adversarial: PassesComplete before RootDiscovered — must not panic.
-    #[test]
-    fn test_passes_complete_without_prior_discovered() {
+    #[tokio::test]
+    async fn test_passes_complete_without_prior_discovered() {
         let c = make_consumer();
         let result = c.on_event(&ExtractionEvent::PassesComplete {
             slug: slug("api"),
             nodes: std::sync::Arc::from(vec![].into_boxed_slice()),
             edges: std::sync::Arc::from(vec![].into_boxed_slice()),
             detected_frameworks: std::collections::HashSet::new(),
-        });
+        }).await;
         assert!(result.is_ok(), "PassesComplete without prior events must not panic");
         // Root is complete despite no prior events
         let stats = c.stats.read().unwrap();
