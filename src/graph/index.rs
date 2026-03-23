@@ -191,11 +191,10 @@ impl GraphIndex {
 
         for edge_ref in edges {
             // Filter by edge type if specified
-            if let Some(types) = edge_types {
-                if !types.contains(&edge_ref.weight().edge_type) {
+            if let Some(types) = edge_types
+                && !types.contains(&edge_ref.weight().edge_type) {
                     continue;
                 }
-            }
 
             let neighbor_idx = match direction {
                 Direction::Outgoing => edge_ref.target(),
@@ -228,11 +227,10 @@ impl GraphIndex {
 
         for edge_ref in edges {
             let kind = &edge_ref.weight().edge_type;
-            if let Some(types) = edge_types {
-                if !types.contains(kind) {
+            if let Some(types) = edge_types
+                && !types.contains(kind) {
                     continue;
                 }
-            }
 
             let neighbor_idx = match direction {
                 Direction::Outgoing => edge_ref.target(),
@@ -275,11 +273,10 @@ impl GraphIndex {
             }
 
             for edge_ref in self.graph.edges_directed(current, Direction::Outgoing) {
-                if let Some(types) = edge_types {
-                    if !types.contains(&edge_ref.weight().edge_type) {
+                if let Some(types) = edge_types
+                    && !types.contains(&edge_ref.weight().edge_type) {
                         continue;
                     }
-                }
 
                 let neighbor = edge_ref.target();
                 if visited.insert(neighbor) {
@@ -325,11 +322,10 @@ impl GraphIndex {
             }
 
             for edge_ref in self.graph.edges_directed(current, Direction::Incoming) {
-                if let Some(types) = edge_types {
-                    if !types.contains(&edge_ref.weight().edge_type) {
+                if let Some(types) = edge_types
+                    && !types.contains(&edge_ref.weight().edge_type) {
                         continue;
                     }
-                }
 
                 let neighbor = edge_ref.source();
                 if visited.insert(neighbor) {
@@ -440,12 +436,8 @@ impl GraphIndex {
         let calls_default = [EdgeKind::Calls];
         let filter = edge_types.unwrap_or(&calls_default);
 
-        let Some(&from_idx) = self.node_lookup.get(from_id) else {
-            return None;
-        };
-        let Some(&to_idx) = self.node_lookup.get(to_id) else {
-            return None;
-        };
+        let from_idx = *self.node_lookup.get(from_id)?;
+        let to_idx = *self.node_lookup.get(to_id)?;
 
         if from_idx == to_idx {
             return Some(Vec::new());
@@ -849,11 +841,10 @@ impl GraphIndex {
                     member_ids.push(nr.id.clone());
                     if nr.node_type == "module" {
                         // Extract the node name from the stable ID: "root:file:name:kind"
-                        if let Some(before_kind) = nr.id.rsplit_once(':') {
-                            if let Some((_, name)) = before_kind.0.rsplit_once(':') {
+                        if let Some(before_kind) = nr.id.rsplit_once(':')
+                            && let Some((_, name)) = before_kind.0.rsplit_once(':') {
                                 module_names.push(name.to_string());
                             }
-                        }
                     }
                 }
             }
@@ -1056,8 +1047,7 @@ fn louvain_phase2(
     // incrementally. This avoids the O(N) scan per round.
     let mut comm_sizes: HashMap<usize, usize> = HashMap::new();
     let mut community_members: HashMap<usize, Vec<usize>> = HashMap::new();
-    for node in 0..n {
-        let c = community[node];
+    for (node, &c) in community.iter().enumerate().take(n) {
         *comm_sizes.entry(c).or_default() += 1;
         community_members.entry(c).or_default().push(node);
     }
@@ -1367,7 +1357,7 @@ fn compute_cluster_name(
         }
         if let Some((name, _)) = name_counts
             .into_iter()
-            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)))
         {
             return name.to_string();
         }
@@ -1431,7 +1421,7 @@ fn compute_cluster_name(
         }
         if let Some((name, _)) = first_counts
             .into_iter()
-            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)))
         {
             return name.to_string();
         }

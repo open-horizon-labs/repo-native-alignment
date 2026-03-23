@@ -14,11 +14,11 @@ use petgraph::Direction;
 ///
 /// Lower value = higher priority. The tiers are:
 /// - 0: Primary definitions (function, struct, trait, enum) — these are the
-///       symbols developers most often search for.
+///   symbols developers most often search for.
 /// - 1: Secondary definitions (const, field, impl) and any other kind — still
-///       definitions but less commonly the direct search target.
+///   definitions but less commonly the direct search target.
 /// - 2: Imports and modules — re-exports and namespace nodes. Ranked lowest
-///       because they point to definitions rather than being definitions.
+///   because they point to definitions rather than being definitions.
 ///
 /// Note: there is no gap in values (0, 1, 2). Earlier versions used 0, 1, 3
 /// which was a bug.
@@ -143,8 +143,8 @@ pub fn is_test_file(n: &Node) -> bool {
 ///
 /// 5. **Edge count (connectivity)** — symbols with more incoming + outgoing
 ///    edges are more central to the codebase and likely more relevant.
-pub fn sort_symbol_matches<'a>(
-    matches: &mut [&'a Node],
+pub fn sort_symbol_matches(
+    matches: &mut [&Node],
     query_lower: &str,
     index: &GraphIndex,
 ) {

@@ -367,14 +367,13 @@ fn collect_nodes(
             }
 
             // Static vs instance method detection for functions inside a scope.
-            if node_kind == NodeKind::Function && parent_scope.is_some() {
-                if let Some(is_static) = detect_is_static(node, source, config) {
+            if node_kind == NodeKind::Function && parent_scope.is_some()
+                && let Some(is_static) = detect_is_static(node, source, config) {
                     metadata.insert(
                         "is_static".to_string(),
                         if is_static { "true" } else { "false" }.to_string(),
                     );
                 }
-            }
 
             // Decorator/attribute collection.
             if !config.decorator_node_kinds.is_empty() {
@@ -434,8 +433,8 @@ fn collect_nodes(
             // Generic type parameter extraction.
             if let Some(tp_kind) = config.type_param_node_kind {
                 for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32) {
-                        if child.kind() == tp_kind {
+                    if let Some(child) = node.child(i as u32)
+                        && child.kind() == tp_kind {
                             if let Ok(text) = child.utf8_text(source) {
                                 let text = text.trim();
                                 if !text.is_empty() {
@@ -447,7 +446,6 @@ fn collect_nodes(
                             }
                             break;
                         }
-                    }
                 }
             }
 
@@ -464,8 +462,8 @@ fn collect_nodes(
 
             // Const value extraction.
             if node_kind == NodeKind::Const {
-                if let Some(value_field) = config.const_value_field {
-                    if let Some(val_node) = node.child_by_field_name(value_field) {
+                if let Some(value_field) = config.const_value_field
+                    && let Some(val_node) = node.child_by_field_name(value_field) {
                         let val = val_node.utf8_text(source).unwrap_or("").trim().to_string();
                         let is_scalar = val.starts_with('"') || val.starts_with('\'')
                             || val.starts_with('`')
@@ -478,7 +476,6 @@ fn collect_nodes(
                             metadata.insert("value".to_string(), stripped.to_string());
                         }
                     }
-                }
                 metadata.insert("synthetic".to_string(), "false".to_string());
             }
 
@@ -569,12 +566,12 @@ fn collect_nodes(
                         kind: NodeKind::Function,
                     };
                     // Parameter types
-                    if let Some(param_field) = config.param_container_field {
-                        if let Some(params) = node.child_by_field_name(param_field) {
-                            if let Some(type_field) = config.param_type_field {
+                    if let Some(param_field) = config.param_container_field
+                        && let Some(params) = node.child_by_field_name(param_field)
+                            && let Some(type_field) = config.param_type_field {
                                 for i in 0..params.child_count() {
-                                    if let Some(param) = params.child(i as u32) {
-                                        if let Some(tn) = param.child_by_field_name(type_field) {
+                                    if let Some(param) = params.child(i as u32)
+                                        && let Some(tn) = param.child_by_field_name(type_field) {
                                             let type_text = tn.utf8_text(source).unwrap_or("");
                                             if let Some(type_name) = extract_user_type(type_text, config.type_requires_uppercase) {
                                                 edges.push(Edge {
@@ -591,14 +588,11 @@ fn collect_nodes(
                                                 });
                                             }
                                         }
-                                    }
                                 }
                             }
-                        }
-                    }
                     // Return type (independent of param extraction)
-                    if let Some(ret_field) = config.return_type_field {
-                        if let Some(rn) = node.child_by_field_name(ret_field) {
+                    if let Some(ret_field) = config.return_type_field
+                        && let Some(rn) = node.child_by_field_name(ret_field) {
                             let ret_text = rn.utf8_text(source).unwrap_or("");
                             if let Some(type_name) = extract_user_type(ret_text, config.type_requires_uppercase) {
                                 edges.push(Edge {
@@ -615,7 +609,6 @@ fn collect_nodes(
                                 });
                             }
                         }
-                    }
                 }
             }
 
@@ -671,8 +664,8 @@ fn collect_nodes(
             }
 
             // Trait implementation edge.
-            if node_kind == NodeKind::Impl {
-                if let Some(trait_node) = node.child_by_field_name("trait") {
+            if node_kind == NodeKind::Impl
+                && let Some(trait_node) = node.child_by_field_name("trait") {
                     let trait_name = trait_node.utf8_text(source).unwrap_or("?").to_string();
                     if let Some(type_node) = node.child_by_field_name("type") {
                         let type_name = type_node.utf8_text(source).unwrap_or("?").to_string();
@@ -695,7 +688,6 @@ fn collect_nodes(
                         });
                     }
                 }
-            }
 
             // Scope propagation into children.
             if config.scope_parent_kinds.contains(&kind_str) {
@@ -915,11 +907,11 @@ fn detect_is_static_python(node: tree_sitter::Node, source: &[u8]) -> Option<boo
     let mut has_classmethod = false;
 
     // Check if this function is wrapped in a decorated_definition
-    if let Some(parent) = node.parent() {
-        if parent.kind() == "decorated_definition" {
+    if let Some(parent) = node.parent()
+        && parent.kind() == "decorated_definition" {
             for i in 0..parent.child_count() {
-                if let Some(child) = parent.child(i as u32) {
-                    if child.kind() == "decorator" {
+                if let Some(child) = parent.child(i as u32)
+                    && child.kind() == "decorator" {
                         let dec_text = child.utf8_text(source).unwrap_or("");
                         if dec_text.contains("staticmethod") {
                             has_staticmethod = true;
@@ -928,10 +920,8 @@ fn detect_is_static_python(node: tree_sitter::Node, source: &[u8]) -> Option<boo
                             has_classmethod = true;
                         }
                     }
-                }
             }
         }
-    }
 
     if has_staticmethod {
         return Some(true);
@@ -940,8 +930,8 @@ fn detect_is_static_python(node: tree_sitter::Node, source: &[u8]) -> Option<boo
     // Check first parameter name
     if let Some(params) = node.child_by_field_name("parameters") {
         for i in 0..params.child_count() {
-            if let Some(param) = params.child(i as u32) {
-                if param.is_named() && param.kind() != "," {
+            if let Some(param) = params.child(i as u32)
+                && param.is_named() && param.kind() != "," {
                     let param_name = param.child_by_field_name("name")
                         .or_else(|| {
                             // Simple identifier parameter (no type annotation)
@@ -955,7 +945,6 @@ fn detect_is_static_python(node: tree_sitter::Node, source: &[u8]) -> Option<boo
                     // First param is something else and no @staticmethod -> static
                     return Some(true);
                 }
-            }
         }
         // No parameters and no @staticmethod -> static
         Some(true)
@@ -1025,19 +1014,16 @@ fn collect_decorators(
     //     decorator: @app.route("/api")
     //     decorator: @login_required
     //     function_definition: def foo(): ...
-    if let Some(parent) = node.parent() {
-        if parent.kind() == "decorated_definition" {
+    if let Some(parent) = node.parent()
+        && parent.kind() == "decorated_definition" {
             for i in 0..parent.child_count() {
-                if let Some(child) = parent.child(i as u32) {
-                    if config.decorator_node_kinds.contains(&child.kind()) {
-                        if let Ok(text) = child.utf8_text(source) {
+                if let Some(child) = parent.child(i as u32)
+                    && config.decorator_node_kinds.contains(&child.kind())
+                        && let Ok(text) = child.utf8_text(source) {
                             decorators.push(text.trim().to_string());
                         }
-                    }
-                }
             }
         }
-    }
 
     // Strategy 2: Previous siblings (Rust attribute_item, TS decorator, C# attribute_list, Kotlin annotation).
     // Walk backward through siblings collecting decorator nodes.
@@ -1068,19 +1054,16 @@ fn collect_decorators(
     // which is a child of the declaration itself.
     if decorators.is_empty() {
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
-                if child.kind() == "modifiers" {
+            if let Some(child) = node.child(i as u32)
+                && child.kind() == "modifiers" {
                     for j in 0..child.child_count() {
-                        if let Some(mod_child) = child.child(j as u32) {
-                            if config.decorator_node_kinds.contains(&mod_child.kind()) {
-                                if let Ok(text) = mod_child.utf8_text(source) {
+                        if let Some(mod_child) = child.child(j as u32)
+                            && config.decorator_node_kinds.contains(&mod_child.kind())
+                                && let Ok(text) = mod_child.utf8_text(source) {
                                     decorators.push(text.trim().to_string());
                                 }
-                            }
-                        }
                     }
                 }
-            }
         }
     }
 
@@ -1089,13 +1072,11 @@ fn collect_decorators(
     // node (accessible via field "decorator" or by kind match on children).
     if decorators.is_empty() {
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
-                if config.decorator_node_kinds.contains(&child.kind()) {
-                    if let Ok(text) = child.utf8_text(source) {
+            if let Some(child) = node.child(i as u32)
+                && config.decorator_node_kinds.contains(&child.kind())
+                    && let Ok(text) = child.utf8_text(source) {
                         decorators.push(text.trim().to_string());
                     }
-                }
-            }
         }
     }
 
@@ -1170,20 +1151,19 @@ fn collect_doc_comment(
     // whose value is a string literal. Controlled by config.docstring_in_body
     // to avoid language-specific logic in generic.rs.
     // This handles `def foo(): """docstring""" ...`
-    if comment_lines.is_empty() && config.docstring_in_body {
-        if let Some(body_node) = node.child_by_field_name("body") {
+    if comment_lines.is_empty() && config.docstring_in_body
+        && let Some(body_node) = node.child_by_field_name("body") {
             for i in 0..body_node.child_count() {
                 if let Some(child) = body_node.child(i as u32) {
                     if child.kind() == "expression_statement" {
-                        if let Some(inner) = child.child(0) {
-                            if inner.kind() == "string" || inner.kind() == "string_literal" {
+                        if let Some(inner) = child.child(0)
+                            && (inner.kind() == "string" || inner.kind() == "string_literal") {
                                 let raw = inner.utf8_text(source).unwrap_or("").trim();
                                 let cleaned = strip_comment_markers(raw, language_name);
                                 if !cleaned.is_empty() {
                                     comment_lines.push(cleaned);
                                 }
                             }
-                        }
                         break; // Only the first statement matters
                     }
                     // Skip decorators and blanks at the start
@@ -1193,7 +1173,6 @@ fn collect_doc_comment(
                 }
             }
         }
-    }
 
     comment_lines.join(" ")
 }
@@ -1269,7 +1248,7 @@ pub(super) fn extract_user_type(type_text: &str, require_uppercase: bool) -> Opt
         .trim_start_matches("const ")
         .trim();
     // Take first identifier (before `<` generics, `::` paths, `[` arrays, or `|` unions)
-    let ident = s.split(|c: char| c == '<' || c == ':' || c == ' ' || c == '[' || c == '|' || c == '?')
+    let ident = s.split(['<', ':', ' ', '[', '|', '?'])
         .next()
         .unwrap_or("")
         .trim();
@@ -1449,12 +1428,12 @@ fn infer_method_from_name(name: &str, default: &str) -> String {
 ///
 /// Called from [`GenericExtractor::run`] after normal manual traversal, so it
 /// is purely additive — existing extraction is unaffected.
-
 /// How many lines after the last decorator row to search for the handler
 /// function definition. One extra line accommodates languages (e.g., Go)
 /// where the function signature starts directly below the decorator.
 const HANDLER_SEARCH_WINDOW: usize = 3;
 
+#[allow(clippy::too_many_arguments)]
 fn run_route_queries(
     configs: &[RouteQueryConfig],
     compiled: &[Option<QueryExtractor>],
@@ -1505,6 +1484,24 @@ fn run_route_queries(
             metadata.insert("http_path".to_string(), http_path.clone());
             metadata.insert("route_query_label".to_string(), cfg.label.to_string());
             metadata.insert("synthetic".to_string(), "false".to_string());
+
+            // Store the router variable name (the object before `.method`) so
+            // that the FastAPI router prefix pass can prepend `APIRouter(prefix=...)`
+            // to the path.  For `@workspace_router.get("/path")`, `@name` captures
+            // `workspace_router.get` → strip the last `.xxx` suffix to get
+            // `workspace_router`.  For bare identifiers like `@app.route` the same
+            // logic strips `.route`, leaving `app`.  For identifiers with no dot
+            // (unusual but valid) the full name is stored.
+            if let Some(name_capture) = capture.get("name") {
+                let router_var = if let Some(dot_pos) = name_capture.rfind('.') {
+                    &name_capture[..dot_pos]
+                } else {
+                    name_capture
+                };
+                if !router_var.is_empty() {
+                    metadata.insert("router_var".to_string(), router_var.to_string());
+                }
+            }
 
             // The decorator ends at `capture.end_row` (0-indexed). The handler
             // function definition begins on the very next line or within a small
@@ -1577,11 +1574,10 @@ fn detect_is_async(node: tree_sitter::Node, source: &[u8]) -> bool {
     // Covers tree-sitter-rust where `async` is an anonymous child of `function_item`,
     // and tree-sitter-typescript where `async` is a named child of `function_declaration`.
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
-            if child.kind() == "async" {
+        if let Some(child) = node.child(i as u32)
+            && child.kind() == "async" {
                 return true;
             }
-        }
     }
     // Strategy 3: fallback — inspect the raw source text of the function node.
     // Some grammar versions don't expose `async` as a separate child. This is a
@@ -1760,7 +1756,7 @@ fn parse_decorator_trait_names(dec: &str) -> Option<Vec<String>> {
         let names: Vec<String> = inner
             .split(',')
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty() && s.chars().next().map_or(false, |c| c.is_ascii_uppercase()))
+            .filter(|s| !s.is_empty() && s.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
             .collect();
         return if names.is_empty() { None } else { Some(names) };
     }
@@ -1770,14 +1766,14 @@ fn parse_decorator_trait_names(dec: &str) -> Option<Vec<String>> {
     let bare = if dec.starts_with("#[") {
         let inner = dec.trim_start_matches("#[").trim_end_matches(']');
         // Take the identifier before any `(` or `::`
-        inner.split(|c: char| c == '(' || c == ':').next().unwrap_or("").trim()
+        inner.split(['(', ':']).next().unwrap_or("").trim()
     } else if dec.starts_with('@') {
         // Python / TypeScript / Java / Kotlin annotation
         let inner = dec.trim_start_matches('@');
         // Take the identifier before any `(` or `.`
-        inner.split(|c: char| c == '(' || c == '.').next().unwrap_or("").trim()
+        inner.split(['(', '.']).next().unwrap_or("").trim()
     } else {
-        dec.split(|c: char| c == '(' || c == ':' || c == '.').next().unwrap_or("").trim()
+        dec.split(['(', ':', '.']).next().unwrap_or("").trim()
     };
 
     if bare.is_empty() {
@@ -1845,7 +1841,7 @@ fn parse_decorator_trait_names(dec: &str) -> Option<Vec<String>> {
                 }
             })
             .collect::<String>()
-    } else if bare.chars().next().map_or(false, |c| c.is_ascii_lowercase()) {
+    } else if bare.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
         // lowercase → capitalize first char (e.g. `@injectable` → `Injectable`)
         let mut c = bare.chars();
         match c.next() {
@@ -1932,9 +1928,9 @@ fn collect_calls(
     let enclosing = if new_enclosing.is_some() { &new_enclosing } else { enclosing_fn };
 
     // If we're inside a function, check for call expressions.
-    if let Some(caller_name) = enclosing {
-        if let Some((call_kind, name_field)) = config.call_expr_kinds {
-            if kind == call_kind {
+    if let Some(caller_name) = enclosing
+        && let Some((call_kind, name_field)) = config.call_expr_kinds
+            && kind == call_kind {
                 // Reject qualified calls: Java `obj.helper()` has an `object` field;
                 // Ruby `obj.method()` has a `receiver` field. Skip these — they are
                 // method dispatches, not bare same-file function calls.
@@ -1947,8 +1943,8 @@ fn collect_calls(
                     if let Some(callee_node) = node.child_by_field_name(name_field) {
                         let callee_kind = callee_node.kind();
                         // Only resolve bare identifiers — skip method chains, scoped paths, etc.
-                        if callee_kind == "identifier" || callee_kind == "simple_identifier" {
-                            if let Ok(callee_name) = callee_node.utf8_text(source) {
+                        if (callee_kind == "identifier" || callee_kind == "simple_identifier")
+                            && let Ok(callee_name) = callee_node.utf8_text(source) {
                                 let callee_name = callee_name.trim();
                                 if file_fns.contains(callee_name) && callee_name != caller_name {
                                     edges.push(Edge {
@@ -1970,12 +1966,9 @@ fn collect_calls(
                                     });
                                 }
                             }
-                        }
                     }
                 }
             }
-        }
-    }
 
     // Recurse into children, passing the (possibly updated) enclosing context.
     for i in 0..node.child_count() {
@@ -2109,11 +2102,10 @@ fn collect_use_targets_inner(node: tree_sitter::Node, source: &[u8], targets: &m
             } else {
                 // Fallback: iterate children but skip the path field
                 for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32) {
-                        if child.kind() == "use_list" {
+                    if let Some(child) = node.child(i as u32)
+                        && child.kind() == "use_list" {
                             collect_use_targets_inner(child, source, targets);
                         }
-                    }
                 }
             }
         }
@@ -2128,14 +2120,13 @@ fn collect_use_targets_inner(node: tree_sitter::Node, source: &[u8], targets: &m
         // use_as_clause: `Bar as Baz` — take the alias (Baz) as the exported name
         "use_as_clause" => {
             // The second named child is the alias
-            if let Some(alias) = node.child_by_field_name("alias") {
-                if let Ok(text) = alias.utf8_text(source) {
+            if let Some(alias) = node.child_by_field_name("alias")
+                && let Ok(text) = alias.utf8_text(source) {
                     let t = text.trim().to_string();
                     if !t.is_empty() && t != "self" && t != "_" {
                         targets.push(t);
                     }
                 }
-            }
         }
         // scoped_identifier: `crate::foo::Bar` — take the last segment
         "scoped_identifier" => {
@@ -2214,9 +2205,7 @@ fn detect_export_ts(
     // `export { X as Y }` → target is Y (the external name).
     let target = text
         .trim_end_matches(';')
-        .split([' ', '{', '}', ','])
-        .filter(|s| !s.is_empty() && *s != "export" && *s != "from")
-        .next()
+        .split([' ', '{', '}', ',']).find(|s| !s.is_empty() && *s != "export" && *s != "from")
         .unwrap_or("")
         .trim();
     if target.is_empty() {

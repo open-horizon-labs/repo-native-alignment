@@ -13,6 +13,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct PhpExtractor;
 
+impl Default for PhpExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PhpExtractor {
     pub fn new() -> Self {
         Self

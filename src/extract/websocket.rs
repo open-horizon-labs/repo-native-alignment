@@ -124,7 +124,7 @@ static LIFECYCLE_EVENTS: &[&str] = &[
 ];
 
 fn is_lifecycle_event(name: &str) -> bool {
-    LIFECYCLE_EVENTS.iter().any(|e| *e == name)
+    LIFECYCLE_EVENTS.contains(&name)
 }
 
 // ---------------------------------------------------------------------------

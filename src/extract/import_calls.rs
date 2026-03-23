@@ -303,7 +303,7 @@ pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
             .trim_end_matches(';');
         return after_import
             .split(',')
-            .map(|s| s.trim().split_whitespace().next().unwrap_or("").to_string())
+            .map(|s| s.split_whitespace().next().unwrap_or("").to_string())
             .filter(|s| !s.is_empty() && s != "*")
             .collect();
     }
@@ -331,8 +331,8 @@ pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
             .trim()
             .trim_end_matches(';');
         // Brace group: `{A, B}`
-        if let Some(brace_start) = after.rfind('{') {
-            if let Some(brace_end) = after.rfind('}') {
+        if let Some(brace_start) = after.rfind('{')
+            && let Some(brace_end) = after.rfind('}') {
                 let inner = &after[brace_start + 1..brace_end];
                 return inner
                     .split(',')
@@ -343,7 +343,6 @@ pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
                     .filter(|s| !s.is_empty() && s != "*" && s != "self")
                     .collect();
             }
-        }
         // Bare path: `use crate::foo::Bar`
         if let Some(last_segment) = after.split("::").last() {
             let name = last_segment.trim();
@@ -517,19 +516,17 @@ pub(crate) fn body_contains_call(body: &str, name: &str) -> bool {
         //
         // Reject: alphanumeric, `_`, `$` (JS identifier chars), `.` (method call),
         //         `:` (scoped path).
-        if idx > 0 {
-            if let Some(prev_char) = search[..idx].chars().last() {
-                if prev_char == '.'
+        if idx > 0
+            && let Some(prev_char) = search[..idx].chars().last()
+                && (prev_char == '.'
                     || prev_char == ':'
                     || prev_char == '_'
                     || prev_char == '$'
-                    || prev_char.is_ascii_alphanumeric()
+                    || prev_char.is_ascii_alphanumeric())
                 {
                     search = &search[advance..];
                     continue;
                 }
-            }
-        }
 
         // Reject declaration contexts: `function name(`, `def name(`, `fn name(`,
         // `const name(`, `class name(` — these define the symbol, not call it.

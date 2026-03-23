@@ -19,6 +19,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct JavaScriptExtractor;
 
+impl Default for JavaScriptExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JavaScriptExtractor {
     pub fn new() -> Self {
         Self
@@ -196,9 +202,9 @@ fn collect_js_specials(
             };
 
             for i in 0..node.child_count() {
-                if let Some(decl) = node.child(i as u32) {
-                    if decl.kind() == "variable_declarator" {
-                        if let Some(name_node) = decl.child_by_field_name("name") {
+                if let Some(decl) = node.child(i as u32)
+                    && decl.kind() == "variable_declarator"
+                        && let Some(name_node) = decl.child_by_field_name("name") {
                             let name_str =
                                 name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
                             if name_str.starts_with('{') || name_str.starts_with('[') {
@@ -314,8 +320,6 @@ fn collect_js_specials(
                                 }
                             }
                         }
-                    }
-                }
             }
         }
         "import_statement" => {
@@ -418,9 +422,9 @@ fn collect_js_specials(
                     }
 
                     // Find parent class name and emit Defines edge
-                    if let Some(class_node) = find_ancestor_class(node) {
-                        if let Some(class_name_node) = class_node.child_by_field_name("name") {
-                            if let Ok(class_name) = class_name_node.utf8_text(source) {
+                    if let Some(class_node) = find_ancestor_class(node)
+                        && let Some(class_name_node) = class_node.child_by_field_name("name")
+                            && let Ok(class_name) = class_name_node.utf8_text(source) {
                                 metadata.insert(
                                     "parent_scope".to_string(),
                                     class_name.to_string(),
@@ -435,8 +439,6 @@ fn collect_js_specials(
                                     edges,
                                 );
                             }
-                        }
-                    }
 
                     nodes.push(Node {
                         id: NodeId {

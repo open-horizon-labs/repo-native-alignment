@@ -113,12 +113,11 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
         if node.id.kind != NodeKind::ApiEndpoint {
             continue;
         }
-        if let Some(op_id) = node.metadata.get("operation_id") {
-            if !op_id.is_empty() {
+        if let Some(op_id) = node.metadata.get("operation_id")
+            && !op_id.is_empty() {
                 let key = normalize_operation_id(op_id);
                 endpoint_by_op_id.entry(key).or_default().push(node.id.clone());
             }
-        }
     }
 
     if endpoint_by_op_id.is_empty() {

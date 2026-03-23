@@ -1,6 +1,10 @@
 //! Workspace root listing with per-root scan stats and LSP status.
 
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
+
+/// Per-root stats tuple: (node_count, edge_count) and language set.
+type RootStatsMap = (HashMap<String, (usize, usize)>, HashMap<String, BTreeSet<String>>);
 
 use crate::server::state::{LspEnrichmentStatus, LspState};
 
@@ -59,10 +63,7 @@ pub fn list_roots_from_slugs(
 
     // Pre-compute per-root stats in a single pass over nodes and edges.
     // This keeps list_roots_from_slugs O(nodes + edges + roots) rather than O(roots × nodes).
-    let (root_stats, root_langs_map): (
-        std::collections::HashMap<String, (usize, usize)>,
-        std::collections::HashMap<String, std::collections::BTreeSet<String>>,
-    ) = if let Some(gs) = graph_state {
+    let (root_stats, root_langs_map): RootStatsMap = if let Some(gs) = graph_state {
         let mut node_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let mut edge_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let mut langs: std::collections::HashMap<String, std::collections::BTreeSet<String>> = std::collections::HashMap::new();
@@ -128,13 +129,12 @@ pub fn list_roots_from_slugs(
             }
 
             // LSP working line.
-            if lsp_complete {
-                if let Some(ref name) = lsp_server_name {
+            if lsp_complete
+                && let Some(ref name) = lsp_server_name {
                     // edge_count() returns all LSP-enriched edges (Calls, ReferencedBy, Implements, etc.)
                     line.push_str(&format!("\n  LSP: {} ({} edges)",
                         name, format_count(lsp_edge_count)));
                 }
-            }
 
             // Languages line — show detected languages for this root.
             let empty_langs = std::collections::BTreeSet::new();
@@ -197,7 +197,7 @@ fn format_count(n: usize) -> String {
     let mut result = String::new();
     let len = chars.len();
     for (i, ch) in chars.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
+        if i > 0 && (len - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(*ch);

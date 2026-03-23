@@ -424,8 +424,8 @@ pub fn subsystem_framework_aggregation_pass(all_nodes: &[Node]) -> Vec<crate::gr
         };
         for (fw_id, count) in fw_counts {
             let fraction = *count as f64 / total as f64;
-            if fraction >= SUBSYSTEM_FRAMEWORK_THRESHOLD {
-                if let Some(fw_node_id) = framework_node_ids.get(fw_id) {
+            if fraction >= SUBSYSTEM_FRAMEWORK_THRESHOLD
+                && let Some(fw_node_id) = framework_node_ids.get(fw_id) {
                     edges.push(Edge {
                         from: sub_node_id.clone(),
                         to: fw_node_id.clone(),
@@ -441,7 +441,6 @@ pub fn subsystem_framework_aggregation_pass(all_nodes: &[Node]) -> Vec<crate::gr
                         total
                     );
                 }
-            }
         }
     }
 

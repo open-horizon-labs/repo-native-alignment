@@ -14,6 +14,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct JsonExtractor;
 
+impl Default for JsonExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JsonExtractor {
     pub fn new() -> Self {
         Self

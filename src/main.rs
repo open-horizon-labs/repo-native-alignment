@@ -24,6 +24,7 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     Setup(SetupArgs), Test(TestArgs), Scan(ScanArgs), Search(SearchArgs), Graph(GraphArgs), Stats(StatsArgs),
     /// Track progress on a business outcome

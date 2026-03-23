@@ -16,6 +16,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct ElixirExtractor;
 
+impl Default for ElixirExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ElixirExtractor {
     pub fn new() -> Self {
         Self
@@ -103,8 +109,8 @@ fn collect_elixir_nodes(
                 }
                 "def" | "defp" => {
                     // def function_name(args) do ... end
-                    if let Some(args) = node.child(1) {
-                        if let Some(fn_name) = extract_elixir_function_name(args, source) {
+                    if let Some(args) = node.child(1)
+                        && let Some(fn_name) = extract_elixir_function_name(args, source) {
                             let qualified = match scope {
                                 Some(s) => format!("{}.{}", s, fn_name),
                                 None => fn_name.clone(),
@@ -128,12 +134,11 @@ fn collect_elixir_nodes(
                                 source: ExtractionSource::TreeSitter,
                             });
                         }
-                    }
                 }
                 "defmacro" | "defmacrop" => {
                     // defmacro macro_name(args) do ... end
-                    if let Some(args) = node.child(1) {
-                        if let Some(macro_fn_name) = extract_elixir_function_name(args, source) {
+                    if let Some(args) = node.child(1)
+                        && let Some(macro_fn_name) = extract_elixir_function_name(args, source) {
                             let qualified = match scope {
                                 Some(s) => format!("{}.{}", s, macro_fn_name),
                                 None => macro_fn_name.clone(),
@@ -157,7 +162,6 @@ fn collect_elixir_nodes(
                                 source: ExtractionSource::TreeSitter,
                             });
                         }
-                    }
                 }
                 _ => {}
             }

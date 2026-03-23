@@ -98,6 +98,12 @@ pub struct RustExtractor {
     // Parser is not Send, so we create one per extract() call.
 }
 
+impl Default for RustExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RustExtractor {
     pub fn new() -> Self {
         Self {}
@@ -211,8 +217,8 @@ fn detect_topology_patterns(
 ) {
     let kind = node.kind();
 
-    if kind == "call_expression" {
-        if let Some(func_node) = node.child_by_field_name("function") {
+    if kind == "call_expression"
+        && let Some(func_node) = node.child_by_field_name("function") {
             let func_text = func_node.utf8_text(source).unwrap_or("");
 
             // Find the enclosing function for context
@@ -247,7 +253,6 @@ fn detect_topology_patterns(
                 ));
             }
         }
-    }
 
     // Recurse
     for i in 0..node.child_count() {
@@ -261,11 +266,10 @@ fn detect_topology_patterns(
 fn find_enclosing_function(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
     let mut current = node.parent();
     while let Some(parent) = current {
-        if parent.kind() == "function_item" {
-            if let Some(name_node) = parent.child_by_field_name("name") {
+        if parent.kind() == "function_item"
+            && let Some(name_node) = parent.child_by_field_name("name") {
                 return name_node.utf8_text(source).ok().map(|s| s.to_string());
             }
-        }
         current = parent.parent();
     }
     None

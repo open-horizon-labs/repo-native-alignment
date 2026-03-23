@@ -21,6 +21,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct DockerfileExtractor;
 
+impl Default for DockerfileExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DockerfileExtractor {
     pub fn new() -> Self {
         Self
