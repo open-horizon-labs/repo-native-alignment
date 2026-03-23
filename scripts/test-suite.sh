@@ -369,7 +369,7 @@ check "ADR: PostExtractionRegistry zero .rs references in src/ (#523)" \
 check "ADR: subsystem_node_pass indexed by RNA (#542)" \
   "repo-native-alignment search 'subsystem_node_pass' --repo $RNA_REPO --kind function --limit 3 2>/dev/null" "subsystem_node_pass"
 check "ADR: subsystem_node_pass bypass tracked in open issue #542" \
-  "gh issue view 542 --repo open-horizon-labs/repo-native-alignment 2>/dev/null || echo 'SKIP_NO_GH'" "OPEN\|SKIP_NO_GH"
+  "gh issue view 542 --repo open-horizon-labs/repo-native-alignment --json state -q '.state' 2>/dev/null || echo 'SKIP_NO_GH'" "OPEN\|SKIP_NO_GH"
 
 echo ""
 echo "=== RESULTS: $PASS passed, $FAIL failed, $SKIP skipped ==="
