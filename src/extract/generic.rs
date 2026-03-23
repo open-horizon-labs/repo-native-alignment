@@ -4104,6 +4104,38 @@ def get_items():
         );
     }
 
+    /// Verify that the Python extractor emits ApiEndpoint nodes for FastAPI-style
+    /// router-method decorators (the IC pattern: `@router_var.get("/path")`).
+    #[test]
+    fn test_python_extractor_emits_api_endpoint_for_fastapi_router_method() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let ext = GenericExtractor::new(&PYTHON_CONFIG);
+        let code = r#"
+from fastapi import APIRouter
+
+roles_router = APIRouter(prefix="/admin/roles")
+
+@roles_router.get("/")
+def list_roles():
+    return {}
+
+@roles_router.post("/users/{user_id}/roles")
+def assign_role_to_user(user_id: str, role_name: str):
+    pass
+"#;
+        let result = ext.run(Path::new("roles.py"), code).unwrap();
+        let api_nodes: Vec<_> = result.nodes.iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(api_nodes.len(), 2,
+            "should emit 2 ApiEndpoint nodes for FastAPI router-method decorators, got: {:?}",
+            api_nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>());
+        assert!(
+            api_nodes.iter().any(|n| n.metadata.get("http_method").map(|m| m == "POST").unwrap_or(false)),
+            "should infer POST from @roles_router.post"
+        );
+    }
+
     /// Verify that the TypeScript extractor emits ApiEndpoint nodes for NestJS routes.
     #[test]
     fn test_typescript_extractor_emits_api_endpoint_for_nestjs() {
