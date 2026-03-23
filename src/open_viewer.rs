@@ -279,19 +279,13 @@ pub async fn run(repo: PathBuf) -> anyhow::Result<()> {
 }
 
 fn open_browser(url: &str) -> anyhow::Result<()> {
-    // macOS: `open`, Linux: `xdg-open`, Windows: `start`
     #[cfg(target_os = "macos")]
-    let cmd = "open";
+    { let _ = std::process::Command::new("open").arg(url).spawn()?; }
     #[cfg(target_os = "linux")]
-    let cmd = "xdg-open";
+    { let _ = std::process::Command::new("xdg-open").arg(url).spawn()?; }
     #[cfg(target_os = "windows")]
-    let cmd = "cmd";
-
-    #[cfg(not(target_os = "windows"))]
-    std::process::Command::new(cmd).arg(url).spawn()?;
-
-    #[cfg(target_os = "windows")]
-    std::process::Command::new(cmd).args(["/c", "start", url]).spawn()?;
-
+    { let _ = std::process::Command::new("cmd").args(["/c", "start", url]).spawn()?; }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    { eprintln!("Automatic browser open not supported on this platform. Open: {url}"); }
     Ok(())
 }
