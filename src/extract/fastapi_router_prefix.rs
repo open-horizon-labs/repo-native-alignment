@@ -323,15 +323,31 @@ fn parse_quoted_string(s: &str) -> Option<String> {
 
 /// Apply a router prefix to an `ApiEndpoint` node in place.
 ///
+/// This function is **idempotent**: running it twice on the same node with the
+/// same prefix produces the same result.  The original local path is preserved
+/// in `metadata["http_path_local"]` on first application; subsequent calls
+/// derive the full path from that stable value rather than the already-prefixed
+/// `http_path`, preventing `/api/api/...` double-prefixing on repeated pass runs.
+///
 /// Updates:
-/// - `metadata["http_path"]` — prepend prefix (join with `/` normalisation)
+/// - `metadata["http_path_local"]` — set once to the original local path
+/// - `metadata["http_path"]` — full path = `prefix + local`
 /// - `id.name` — `"METHOD /full/path"`
 /// - `signature` — `"[route_decorator] METHOD /full/path"`
 fn apply_prefix(node: &mut Node, prefix: &str) {
-    let local_path = match node.metadata.get("http_path") {
-        Some(p) => p.clone(),
-        None => return,
+    // Use the already-stored local path if present (idempotency guard), otherwise
+    // read the current http_path and save it as the stable local path.
+    let local_path = if let Some(local) = node.metadata.get("http_path_local") {
+        local.clone()
+    } else {
+        let raw = match node.metadata.get("http_path") {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        node.metadata.insert("http_path_local".to_string(), raw.clone());
+        raw
     };
+
     let method = node
         .metadata
         .get("http_method")
@@ -485,6 +501,38 @@ items_router = APIRouter(prefix="/items")
         assert_eq!(node.metadata.get("http_path").map(|s| s.as_str()), Some("/workspaces/{id}/expertunities"));
         assert_eq!(node.id.name, "GET /workspaces/{id}/expertunities");
         assert_eq!(node.signature, "[route_decorator] GET /workspaces/{id}/expertunities");
+    }
+
+    /// Verifies that `apply_prefix` is idempotent: calling it twice with the same
+    /// prefix produces the same result as calling it once (no double-prefixing).
+    ///
+    /// This guards against the `/api/api/...` regression that occurs when the pass
+    /// is run on cached clean-root nodes during full builds or on the in-memory
+    /// graph during incremental updates (CodeRabbit finding, PR #528).
+    #[test]
+    fn test_apply_prefix_is_idempotent() {
+        let mut node = make_api_endpoint(
+            "routers/workspaces.py",
+            "GET /expertunities",
+            "GET",
+            "/expertunities",
+            Some("workspace_router"),
+        );
+        apply_prefix(&mut node, "/workspaces/{id}");
+        // Second call with the same prefix must not double-prefix.
+        apply_prefix(&mut node, "/workspaces/{id}");
+        assert_eq!(
+            node.metadata.get("http_path").map(|s| s.as_str()),
+            Some("/workspaces/{id}/expertunities"),
+            "second apply_prefix call must not double-prefix"
+        );
+        assert_eq!(node.id.name, "GET /workspaces/{id}/expertunities");
+        // The original local path must be preserved in http_path_local.
+        assert_eq!(
+            node.metadata.get("http_path_local").map(|s| s.as_str()),
+            Some("/expertunities"),
+            "http_path_local must be set to the original local path"
+        );
     }
 
     // ── fastapi_router_prefix_pass (integration) ──────────────────────────

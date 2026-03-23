@@ -622,18 +622,25 @@ impl RnaHandler {
 
             // Count LSP edges added by LspConsumer during bus execution.
             // These are ExtractionSource::Lsp edges in all_edges.
+            // Use only LSP-sourced edges to drive the status: non-LSP Calls edges
+            // (e.g. from GrpcClientCallsPass) must not falsely mark LSP as complete,
+            // and a metadata-only enrichment (updated_nodes, no new edges) must not
+            // report as unavailable.
             if spawn_background {
                 let lsp_edge_count = all_edges.iter()
                     .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
                     .count();
-                let call_edge_count = all_edges.iter()
-                    .filter(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
+                let lsp_call_edge_count = all_edges.iter()
+                    .filter(|e| {
+                        e.source == crate::graph::ExtractionSource::Lsp
+                            && matches!(e.kind, crate::graph::EdgeKind::Calls)
+                    })
                     .count();
-                if lsp_edge_count > 0 || call_edge_count > 0 {
-                    self.lsp_status.set_complete(call_edge_count);
+                if lsp_edge_count > 0 {
+                    self.lsp_status.set_complete(lsp_call_edge_count);
                     tracing::info!(
-                        "LSP enrichment complete (via bus): {} call edges, {} total LSP edges",
-                        call_edge_count, lsp_edge_count,
+                        "LSP enrichment complete (via bus): {} LSP call edges, {} total LSP edges",
+                        lsp_call_edge_count, lsp_edge_count,
                     );
                 } else {
                     // No LSP edges — either no server available or no enrichable nodes.

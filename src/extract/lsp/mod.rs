@@ -1916,9 +1916,26 @@ impl Enricher for LspEnricher {
                                     Self::outgoing_calls_p(&transport, &item),
                                 );
 
+                                // Build a precomputed (file, name) → NodeId index once for O(1)
+                                // lookup during incoming and outgoing call resolution.
+                                // Without this, each per-call `.iter().filter().find()` scan is
+                                // O(matching_refs), making the entire block O(calls × nodes).
+                                // Ambiguous buckets (same file+name) fall back to line-based
+                                // disambiguation via `find_enclosing_symbol`.
+                                let matching_refs: Vec<&Node> = matching_owned.iter().collect();
+                                let mut refs_by_file_name: std::collections::HashMap<
+                                    (std::path::PathBuf, String),
+                                    Vec<NodeId>,
+                                > = std::collections::HashMap::new();
+                                for n in &matching_refs {
+                                    refs_by_file_name
+                                        .entry((n.id.file.clone(), n.id.name.clone()))
+                                        .or_default()
+                                        .push(n.id.clone());
+                                }
+
                                 // Process incoming calls
                                 if let Ok(calls) = incoming_result {
-                                    let matching_refs: Vec<&Node> = matching_owned.iter().collect();
                                     for call in &calls {
                                         let caller_uri = &call["from"]["uri"];
                                         let caller_name = call["from"]["name"].as_str().unwrap_or("");
@@ -1936,10 +1953,12 @@ impl Enricher for LspEnricher {
                                                 continue;
                                             }
 
-                                            let caller_id = matching_refs.iter()
-                                                .filter(|n| n.id.file == caller_path).find(|n| n.id.name == caller_name)
-                                                .map(|n| n.id.clone())
-                                                .or_else(|| find_enclosing_symbol(&matching_refs, &caller_path, caller_line));
+                                            let key = (caller_path.clone(), caller_name.to_string());
+                                            let caller_id = match refs_by_file_name.get(&key) {
+                                                Some(ids) if ids.len() == 1 => Some(ids[0].clone()),
+                                                Some(_) => find_enclosing_symbol(&matching_refs, &caller_path, caller_line),
+                                                None => find_enclosing_symbol(&matching_refs, &caller_path, caller_line),
+                                            };
 
                                             if let Some(caller) = caller_id {
                                                 if caller.name == node.id.name && caller.file == node.id.file {
@@ -1959,7 +1978,6 @@ impl Enricher for LspEnricher {
 
                                 // Process outgoing calls
                                 if let Ok(calls) = outgoing_result {
-                                    let matching_refs: Vec<&Node> = matching_owned.iter().collect();
                                     for call in &calls {
                                         let callee_uri = &call["to"]["uri"];
                                         let callee_name = call["to"]["name"].as_str().unwrap_or("");
@@ -2016,10 +2034,12 @@ impl Enricher for LspEnricher {
                                                 continue;
                                             }
 
-                                            let callee_id = matching_refs.iter()
-                                                .filter(|n| n.id.file == callee_path).find(|n| n.id.name == callee_name)
-                                                .map(|n| n.id.clone())
-                                                .or_else(|| find_enclosing_symbol(&matching_refs, &callee_path, callee_line));
+                                            let key = (callee_path.clone(), callee_name.to_string());
+                                            let callee_id = match refs_by_file_name.get(&key) {
+                                                Some(ids) if ids.len() == 1 => Some(ids[0].clone()),
+                                                Some(_) => find_enclosing_symbol(&matching_refs, &callee_path, callee_line),
+                                                None => find_enclosing_symbol(&matching_refs, &callee_path, callee_line),
+                                            };
 
                                             if let Some(callee) = callee_id {
                                                 if callee.name == node.id.name && callee.file == node.id.file {

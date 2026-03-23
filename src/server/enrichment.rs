@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 /// LanceDB persist delta: (root_slug, root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove)
-type LanceDelta = (String, PathBuf, Vec<Node>, Vec<Edge>, Vec<String>, Vec<PathBuf>);
+type LanceDelta = (String, PathBuf, Vec<Node>, Vec<Edge>, Vec<String>, std::collections::HashSet<PathBuf>);
 use std::sync::Arc;
 
 use crate::embed::EmbeddingIndex;
@@ -195,7 +195,10 @@ impl RnaHandler {
                             scan.new_files.len(),
                             scan.deleted_files.len()
                         );
-                        let files_to_remove: Vec<PathBuf> = scan
+                        // Use a HashSet for O(1) membership checks during retain/filter
+                        // instead of O(n) Vec::contains / iter().any(). With a Vec the
+                        // retain loops over nodes/edges become O(nodes × files_to_remove).
+                        let files_to_remove: std::collections::HashSet<PathBuf> = scan
                             .deleted_files
                             .iter()
                             .chain(scan.changed_files.iter())
@@ -208,9 +211,8 @@ impl RnaHandler {
                             .iter()
                             .filter(|e| {
                                 e.from.root == *root_slug
-                                    && files_to_remove
-                                        .iter()
-                                        .any(|f| e.from.file == *f || e.to.file == *f)
+                                    && (files_to_remove.contains(&e.from.file)
+                                        || files_to_remove.contains(&e.to.file))
                             })
                             .map(|e| e.stable_id())
                             .collect();
@@ -221,9 +223,8 @@ impl RnaHandler {
                         });
                         graph_state.edges.retain(|e| {
                             e.from.root != *root_slug
-                                || !files_to_remove
-                                    .iter()
-                                    .any(|f| e.from.file == *f || e.to.file == *f)
+                                || (!files_to_remove.contains(&e.from.file)
+                                    && !files_to_remove.contains(&e.to.file))
                         });
                         let mut extraction = registry.extract_scan_result(root_path, scan);
                         for node in &mut extraction.nodes {
@@ -351,7 +352,7 @@ impl RnaHandler {
                                 new_nodes,
                                 new_edges,
                                 Vec::new(), // no deletions — passes only add
-                                Vec::new(), // no files removed
+                                std::collections::HashSet::new(), // no files removed
                             ));
                         }
                     }
@@ -389,12 +390,13 @@ impl RnaHandler {
                 for (slug, root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove) in lance_deltas {
                     let persist_result = {
                         let _lance_guard = lance_write_lock.lock().await;
+                        let files_to_remove_vec: Vec<PathBuf> = files_to_remove.into_iter().collect();
                         persist_graph_incremental(
                             &root_path,
                             &upsert_nodes,
                             &upsert_edges,
                             &deleted_edge_ids,
-                            &files_to_remove,
+                            &files_to_remove_vec,
                         )
                         .await
                     };

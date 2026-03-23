@@ -266,10 +266,6 @@ impl PostExtractionRegistry {
         // Unconditional: applies_when always true; cost is zero when the directory
         // doesn't exist (load_extractor_configs returns early).
         reg.register(Box::new(ExtractorConfigPass));
-        // Group 5: FastAPI router prefix resolution — must run after route extraction
-        // (api_link has already consumed the raw paths). Unconditional: the pass
-        // self-gates on the presence of Python ApiEndpoint nodes with router_var metadata.
-        reg.register(Box::new(FastapiRouterPrefixPass));
         reg
     }
 }
