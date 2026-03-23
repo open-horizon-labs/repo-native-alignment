@@ -255,7 +255,7 @@ echo "" && echo "--- FastAPI Router Prefix Pass (#519) ---"
 check "FastapiRouterPrefixPass struct defined (#519)" \
   "grep -r 'FastapiRouterPrefixPass\|fastapi_router_prefix' $RNA_REPO/src/ 2>/dev/null | grep -v test | wc -l" "[1-9]"
 check "FastapiRouterPrefixPass registered in with_builtins (#519)" \
-  "grep -r 'FastapiRouterPrefixPass' $RNA_REPO/src/extract/post_extraction.rs 2>/dev/null | wc -l" "^1$"
+  "grep -c 'reg.register.*FastapiRouterPrefixPass' $RNA_REPO/src/extract/post_extraction.rs 2>/dev/null" "^1$"
 check "EXTRACTION_VERSION >= 13 for router_var metadata (#519)" \
   "grep 'EXTRACTION_VERSION' $RNA_REPO/src/graph/store.rs | grep -o '[0-9]*' | tail -1" "1[3-9]\|[2-9][0-9]"
 check "router_var metadata extracted in generic.rs (#519)" \
@@ -264,9 +264,9 @@ check "router_var metadata extracted in generic.rs (#519)" \
 # ── SKIP WORKTREES WITH OWN CACHE (#524) ─────────────────────────────────
 echo "" && echo "--- Skip Worktrees with Own Cache (#524) ---"
 check "is_worktree_with_own_cache defined in walk.rs (#524)" \
-  "grep -c 'is_worktree_with_own_cache' $RNA_REPO/src/extract/walk.rs 2>/dev/null" "[1-9]"
+  "grep -c 'is_worktree_with_own_cache' $RNA_REPO/src/walk.rs 2>/dev/null" "[1-9]"
 check "worktree skip called from scanner.rs (#524)" \
-  "grep -c 'is_worktree_with_own_cache\|skip.*worktree\|worktree.*skip' $RNA_REPO/src/extract/scanner.rs 2>/dev/null || grep -c 'is_worktree_with_own_cache' $RNA_REPO/src/extract/walk.rs 2>/dev/null" "[1-9]"
+  "grep -c 'is_worktree_with_own_cache' $RNA_REPO/src/scanner.rs 2>/dev/null" "[1-9]"
 
 # ── SCANSTATSCONSUMER / LIVE LIST_ROOTS (#527) ────────────────────────────
 echo "" && echo "--- ScanStatsConsumer / live list_roots (#527) ---"
@@ -306,7 +306,7 @@ check "EXTRACTION_VERSION >= 14 for http_path_local field (#531)" \
 check "http_path_local stored for idempotency (#531)" \
   "grep -c 'http_path_local' $RNA_REPO/src/extract/fastapi_router_prefix.rs 2>/dev/null" "[1-9]"
 check "FastapiRouterPrefixPass registered exactly once in with_builtins (#531)" \
-  "grep -c 'FastapiRouterPrefixPass' $RNA_REPO/src/extract/post_extraction.rs 2>/dev/null" "^1$"
+  "grep -c 'reg.register.*FastapiRouterPrefixPass' $RNA_REPO/src/extract/post_extraction.rs 2>/dev/null" "^1$"
 
 # ── CONTENT-ADDRESSED CONSUMER CACHE (#526/#533) ─────────────────────────
 echo "" && echo "--- Content-addressed consumer cache (#526) ---"
