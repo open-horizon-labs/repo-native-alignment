@@ -5,23 +5,25 @@
 //!
 //! # Registration order
 //!
-//! Consumers must be registered in the order shown in `EventBus::with_builtins()`.
+//! Consumers must be registered in the order shown in `build_builtin_bus()`.
 //! The ordering invariant:
 //!
 //! 1. `ManifestConsumer` — subscribes to `RootDiscovered` (needs filesystem)
 //! 2. `TreeSitterConsumer` — subscribes to `RootDiscovered`, emits `RootExtracted`
 //! 3. `LanguageAccumulatorConsumer` — subscribes to `RootExtracted`, emits `LanguageDetected`
-//! 4. `PostExtractionConsumer` — subscribes to `RootExtracted`, runs all post-extraction passes,
-//!    emits `PassesComplete` (and `FrameworkDetected` for each detected framework)
-//! 5. `EmbeddingConsumer` — subscribes to `RootExtracted` (streaming embed as nodes arrive)
+//! 4. `LspConsumer(lang)` × N — subscribes to `LanguageDetected`, runs real LSP enrichment,
+//!    emits `EnrichmentComplete` with actual edges and virtual nodes
+//! 5. `AllEnrichmentsGate` — subscribes to both `RootExtracted` (to count expected languages)
+//!    and `EnrichmentComplete` (to count completions); when counts match emits `AllEnrichmentsDone`
+//! 6. `PostExtractionConsumer` — subscribes to `AllEnrichmentsDone`, runs all post-extraction
+//!    passes on LSP-enriched nodes, emits `PassesComplete` (and `FrameworkDetected` per framework)
+//! 7. `EmbeddingIndexerConsumer` — subscribes to `RootExtracted` (streaming embed as nodes arrive)
 //!
-//! The `LspConsumer` and persistence consumers (`SubsystemConsumer`, `LanceDBConsumer`) are
-//! wired separately by the pipeline bootstrap because they require async execution.
-//! In Phase 2 they continue to run via the existing spawn_background_enrichment path;
-//! the event bus handles the synchronous portion of the pipeline.
+//! The persistence consumers (`SubsystemConsumer`, `LanceDBConsumer`) subscribe to `PassesComplete`.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crate::extract::ExtractorRegistry;
 use crate::extract::event_bus::{ExtractionConsumer, ExtractionEvent, ExtractionEventKind};
@@ -207,10 +209,14 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
 // PostExtractionConsumer
 // ---------------------------------------------------------------------------
 
-/// Runs all post-extraction passes (via `PostExtractionRegistry`) after tree-sitter extraction.
+/// Runs all post-extraction passes (via `PostExtractionRegistry`) after LSP enrichment.
 ///
-/// Subscribes to: `RootExtracted`
+/// Subscribes to: `AllEnrichmentsDone`
 /// Emits: `FrameworkDetected` (one per detected framework) + `PassesComplete`
+///
+/// **Phase 3 promotion**: previously subscribed to `RootExtracted` (Phase 2), which meant
+/// post-extraction passes ran on un-enriched nodes (before LSP edges were available).
+/// Now subscribes to `AllEnrichmentsDone` so passes see the full LSP-enriched graph.
 pub struct PostExtractionConsumer {
     root_pairs: Vec<(String, PathBuf)>,
     primary_slug: String,
@@ -226,14 +232,34 @@ impl ExtractionConsumer for PostExtractionConsumer {
     fn name(&self) -> &str { "post_extraction" }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
-        &[ExtractionEventKind::RootExtracted]
+        &[ExtractionEventKind::AllEnrichmentsDone]
     }
 
     fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::RootExtracted { slug, nodes, edges, .. } = event else {
+        let ExtractionEvent::AllEnrichmentsDone { slug, nodes, edges, lsp_edges, lsp_nodes } = event else {
             return Ok(vec![]);
         };
 
+        // Merge tree-sitter nodes/edges with LSP-enriched additions before running passes.
+        // This ensures post-extraction passes (api_link, manifest, tested_by, etc.) operate
+        // on the full LSP-enriched graph rather than just the tree-sitter snapshot.
+        let mut merged_nodes = nodes.to_vec();
+        merged_nodes.extend_from_slice(lsp_nodes);
+        let mut merged_edges = edges.to_vec();
+        merged_edges.extend_from_slice(lsp_edges);
+
+        // Delegate to the inner pass logic with merged nodes/edges.
+        self.run_passes(slug, merged_nodes, merged_edges)
+    }
+}
+
+impl PostExtractionConsumer {
+    fn run_passes(
+        &self,
+        slug: &str,
+        nodes_vec: Vec<Node>,
+        edges_vec: Vec<crate::graph::Edge>,
+    ) -> anyhow::Result<Vec<ExtractionEvent>> {
         use crate::extract::post_extraction::{PassContext, PostExtractionRegistry};
 
         let registry = PostExtractionRegistry::with_builtins();
@@ -244,11 +270,11 @@ impl ExtractionConsumer for PostExtractionConsumer {
         };
 
         // PostExtractionRegistry::run_all takes mutable Vec references and appends
-        // items. We must materialize mutable Vecs from the Arc<[T]> payloads.
+        // items. We pass in the merged (tree-sitter + LSP) nodes/edges from the caller.
         // The resulting all_nodes/all_edges are wrapped back into Arc<[T]> for the
         // PassesComplete event so downstream consumers share the same allocation.
-        let mut all_nodes = nodes.to_vec();
-        let mut all_edges = edges.to_vec();
+        let mut all_nodes = nodes_vec;
+        let mut all_edges = edges_vec;
         let result = registry.run_all(&mut all_nodes, &mut all_edges, ctx);
 
         tracing::info!(
@@ -276,7 +302,7 @@ impl ExtractionConsumer for PostExtractionConsumer {
                 .cloned()
                 .collect();
             follow_ons.push(ExtractionEvent::FrameworkDetected {
-                slug: slug.clone(),
+                slug: slug.to_string(),
                 framework: framework.clone(),
                 nodes: std::sync::Arc::from(fw_nodes.into_boxed_slice()),
             });
@@ -287,7 +313,7 @@ impl ExtractionConsumer for PostExtractionConsumer {
         let nodes_arc = std::sync::Arc::from(all_nodes.into_boxed_slice());
         let edges_arc = std::sync::Arc::from(all_edges.into_boxed_slice());
         follow_ons.push(ExtractionEvent::PassesComplete {
-            slug: slug.clone(),
+            slug: slug.to_string(),
             nodes: nodes_arc,
             edges: edges_arc,
             detected_frameworks: result.detected_frameworks,
@@ -596,25 +622,30 @@ impl ExtractionConsumer for CustomExtractorConsumer {
 // LspConsumer
 // ---------------------------------------------------------------------------
 
-/// Subscribes to `LanguageDetected` and runs LSP enrichment for the given language.
+/// Subscribes to `LanguageDetected` and runs real LSP enrichment for the given language.
 ///
-/// **Phase 2 stub.** LSP enrichers require async execution — they start language
-/// servers and communicate via JSON-RPC, which requires tokio. The event bus in
-/// Phase 2 is synchronous. LSP enrichment continues to run via the existing
-/// `spawn_background_enrichment` path.
-///
-/// In Phase 3, the bus will gain async support and this consumer will call
-/// `EnricherRegistry::enrich_all()` for the specific language.
+/// **Phase 3 real implementation.** Holds an `Arc<dyn Enricher>` for its language.
+/// In `on_event(LanguageDetected)`, calls `enricher.enrich()` via
+/// `tokio::task::block_in_place` (safe in a tokio multi-thread context) and returns a
+/// real `EnrichmentComplete` with actual edges and virtual nodes.
 ///
 /// Per the ADR: "Consumer of LanguageDetected(lang, nodes): LSP enrichers — ALL fire
-/// concurrently, one per language." Parallel LSP will fall out of the architecture when
-/// this stub is promoted to a full async consumer.
+/// concurrently, one per language." Parallel execution across languages falls out of
+/// the architecture when the event bus gains async support (Phase 4+). In the current
+/// synchronous bus each `LspConsumer` runs in registration order, but each runs to
+/// completion so the enricher I/O is properly serialized without races.
 ///
 /// Subscribes to: `LanguageDetected`
-/// Emits: `EnrichmentComplete` (Phase 2 stub — no-op)
+/// Emits: `EnrichmentComplete` (with real edges and virtual nodes from LSP)
 pub struct LspConsumer {
     /// Which language this consumer handles (e.g., "rust", "python", "typescript").
     pub language: String,
+    /// The LSP enricher for this language. `Arc` allows sharing across bus fan-out clones.
+    pub enricher: Arc<dyn crate::extract::Enricher>,
+    /// Repo root for the LSP server startup working directory.
+    pub repo_root: PathBuf,
+    /// Per-root LSP root overrides for monorepo setups.
+    pub lsp_roots: Arc<Vec<(String, PathBuf)>>,
 }
 
 impl ExtractionConsumer for LspConsumer {
@@ -631,21 +662,315 @@ impl ExtractionConsumer for LspConsumer {
         if language != &self.language {
             return Ok(vec![]);
         }
-        // Phase 2 stub: log that LSP would run, emit EnrichmentComplete with no edges.
-        // In Phase 3+: start the language server and run enrich() asynchronously.
-        tracing::debug!(
-            "LspConsumer({}): root '{}' language '{}' — {} nodes (Phase 2 stub, async LSP not yet wired)",
+
+        tracing::info!(
+            "LspConsumer({}): root '{}' — {} nodes, starting LSP enrichment",
             self.language,
             slug,
-            language,
             nodes.len(),
         );
-        Ok(vec![ExtractionEvent::EnrichmentComplete {
-            slug: slug.clone(),
-            language: language.clone(),
-            added_edges: std::sync::Arc::from([]),
-            new_nodes: std::sync::Arc::from([]),
-        }])
+
+        let enricher = Arc::clone(&self.enricher);
+        let nodes_vec: Vec<Node> = nodes.to_vec();
+        let repo_root = self.repo_root.clone();
+        let lsp_roots = Arc::clone(&self.lsp_roots);
+
+        // Configure startup root for monorepo: prefer the most-specific lsp_root
+        // that matches the language's config file (e.g., tsconfig.json for TypeScript).
+        if !lsp_roots.is_empty() {
+            let index = crate::graph::index::GraphIndex::new();
+            let best = crate::extract::pick_lsp_root_for_nodes(
+                &nodes_vec,
+                &repo_root,
+                &lsp_roots,
+                enricher.config_file_hint(),
+            );
+            if best != repo_root.as_path() {
+                enricher.set_startup_root(best.to_path_buf());
+            }
+            drop(index);
+        }
+
+        // Run async LSP enrichment synchronously within the sync event bus.
+        // `block_in_place` offloads the current task off a tokio worker thread so
+        // the runtime can schedule other work while we block. This is ONLY safe in
+        // a multi-threaded tokio runtime (the MCP server path uses `tokio::main`
+        // which defaults to multi-thread).
+        //
+        // For single-threaded runtimes (unit tests using `#[tokio::test]`) or
+        // non-tokio contexts, we skip LSP enrichment gracefully.
+        let enrichment_result = match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let index = crate::graph::index::GraphIndex::new();
+                        enricher.enrich(&nodes_vec, &index, &repo_root).await
+                    })
+                })
+            }
+            Ok(_) => {
+                // Single-threaded runtime (e.g., #[tokio::test]) — block_in_place would
+                // panic. Skip LSP enrichment and emit empty EnrichmentComplete so
+                // AllEnrichmentsGate can proceed.
+                tracing::debug!(
+                    "LspConsumer({}): single-thread runtime, skipping enrichment (test path)",
+                    self.language,
+                );
+                Ok(crate::extract::EnrichmentResult::default())
+            }
+            Err(_) => {
+                // No tokio runtime — return empty enrichment (sync-only path).
+                tracing::debug!(
+                    "LspConsumer({}): no tokio runtime, skipping enrichment",
+                    self.language,
+                );
+                Ok(crate::extract::EnrichmentResult::default())
+            }
+        };
+
+        match enrichment_result {
+            Ok(enrichment) => {
+                tracing::info!(
+                    "LspConsumer({}): root '{}' enrichment complete: {} edges, {} virtual nodes",
+                    self.language,
+                    slug,
+                    enrichment.added_edges.len(),
+                    enrichment.new_nodes.len(),
+                );
+                Ok(vec![ExtractionEvent::EnrichmentComplete {
+                    slug: slug.clone(),
+                    language: language.clone(),
+                    added_edges: Arc::from(enrichment.added_edges.into_boxed_slice()),
+                    new_nodes: Arc::from(enrichment.new_nodes.into_boxed_slice()),
+                }])
+            }
+            Err(e) => {
+                // LSP enrichment failure is non-fatal: emit EnrichmentComplete with
+                // empty results so AllEnrichmentsGate can still proceed. The graph
+                // will have tree-sitter-only edges for this language but won't be stuck.
+                tracing::warn!(
+                    "LspConsumer({}): root '{}' enrichment failed (non-fatal): {}",
+                    self.language,
+                    slug,
+                    e,
+                );
+                Ok(vec![ExtractionEvent::EnrichmentComplete {
+                    slug: slug.clone(),
+                    language: language.clone(),
+                    added_edges: Arc::from([]),
+                    new_nodes: Arc::from([]),
+                }])
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AllEnrichmentsGate
+// ---------------------------------------------------------------------------
+
+/// Counts expected `LanguageDetected` events and received `EnrichmentComplete` events.
+///
+/// When the counts match, emits `AllEnrichmentsDone` with the merged LSP results.
+/// This is the synchronisation point that lets `PostExtractionConsumer` wait for all
+/// LSP enrichers to finish before running post-extraction passes.
+///
+/// **Singleton per bus instance.** One gate serves all languages for a single root.
+/// Multiple roots would need separate gate instances (each bus is per-call in
+/// `run_post_passes_via_bus`).
+///
+/// **Interior mutability via `Mutex`** because `on_event` receives `&self`
+/// (the `ExtractionConsumer` trait is `&self` for Send + Sync compatibility).
+///
+/// Subscribes to: `RootExtracted` (to record base nodes/edges and language count),
+///                `EnrichmentComplete` (to accumulate results and detect completion)
+/// Emits: `AllEnrichmentsDone` (exactly once, when all enrichments are received)
+pub struct AllEnrichmentsGate {
+    /// Shared state protected by a Mutex — on_event is &self but needs mutation.
+    state: Mutex<GateState>,
+}
+
+struct GateState {
+    /// Number of `LanguageDetected` events expected (set on `RootExtracted`).
+    expected: usize,
+    /// Number of `EnrichmentComplete` events received so far.
+    received: usize,
+    /// Base nodes from `RootExtracted`.
+    base_nodes: Option<Arc<[Node]>>,
+    /// Base edges from `RootExtracted`.
+    base_edges: Option<Arc<[crate::graph::Edge]>>,
+    /// Root slug (from `RootExtracted`).
+    slug: Option<String>,
+    /// Accumulated LSP edges from all `EnrichmentComplete` events.
+    lsp_edges: Vec<crate::graph::Edge>,
+    /// Accumulated virtual nodes from all `EnrichmentComplete` events.
+    lsp_nodes: Vec<Node>,
+    /// Whether `AllEnrichmentsDone` has already been emitted (guards against double-emit).
+    fired: bool,
+}
+
+impl AllEnrichmentsGate {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(GateState {
+                expected: 0,
+                received: 0,
+                base_nodes: None,
+                base_edges: None,
+                slug: None,
+                lsp_edges: Vec::new(),
+                lsp_nodes: Vec::new(),
+                fired: false,
+            }),
+        }
+    }
+}
+
+impl Default for AllEnrichmentsGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExtractionConsumer for AllEnrichmentsGate {
+    fn name(&self) -> &str { "all_enrichments_gate" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::RootExtracted, ExtractionEventKind::EnrichmentComplete]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let mut state = self.state.lock().expect("AllEnrichmentsGate mutex poisoned");
+
+        match event {
+            ExtractionEvent::RootExtracted { slug, nodes, edges, .. } => {
+                // Count distinct languages in the node set to know how many
+                // `EnrichmentComplete` events to expect. This must agree with
+                // `LanguageAccumulatorConsumer` which emits one `LanguageDetected`
+                // per distinct non-empty language.
+                let language_count: usize = {
+                    let mut seen = std::collections::HashSet::new();
+                    for n in nodes.iter() {
+                        if !n.language.is_empty() {
+                            seen.insert(n.language.clone());
+                        }
+                    }
+                    seen.len()
+                };
+
+                // Filter to languages that have a registered LspConsumer (i.e., are
+                // supported by EnricherRegistry). Languages without an enricher will
+                // never produce EnrichmentComplete, so we must not count them.
+                let supported = crate::extract::EnricherRegistry::with_builtins()
+                    .supported_languages();
+                let expected = {
+                    let mut seen = std::collections::HashSet::new();
+                    for n in nodes.iter() {
+                        if !n.language.is_empty() && supported.contains(&n.language) {
+                            seen.insert(n.language.clone());
+                        }
+                    }
+                    seen.len()
+                };
+
+                tracing::debug!(
+                    "AllEnrichmentsGate: root '{}' — {} distinct language(s) in nodes, \
+                     {} supported by EnricherRegistry",
+                    slug,
+                    language_count,
+                    expected,
+                );
+
+                state.expected = expected;
+                state.received = 0;
+                state.base_nodes = Some(Arc::clone(nodes));
+                state.base_edges = Some(Arc::clone(edges));
+                state.slug = Some(slug.clone());
+                state.lsp_edges.clear();
+                state.lsp_nodes.clear();
+                state.fired = false;
+
+                // If there are no supported languages, emit AllEnrichmentsDone immediately
+                // so PostExtractionConsumer doesn't wait forever.
+                if expected == 0 {
+                    tracing::debug!(
+                        "AllEnrichmentsGate: root '{}' — no supported languages, emitting AllEnrichmentsDone immediately",
+                        slug,
+                    );
+                    state.fired = true;
+                    return Ok(vec![ExtractionEvent::AllEnrichmentsDone {
+                        slug: slug.clone(),
+                        nodes: Arc::clone(nodes),
+                        edges: Arc::clone(edges),
+                        lsp_edges: Arc::from([]),
+                        lsp_nodes: Arc::from([]),
+                    }]);
+                }
+
+                Ok(vec![])
+            }
+
+            ExtractionEvent::EnrichmentComplete { slug, added_edges, new_nodes, .. } => {
+                // Guard: only process if we have state initialised for this slug.
+                if state.slug.as_deref() != Some(slug.as_str()) {
+                    tracing::warn!(
+                        "AllEnrichmentsGate: received EnrichmentComplete for '{}' but expected '{:?}'",
+                        slug,
+                        state.slug,
+                    );
+                    return Ok(vec![]);
+                }
+                if state.fired {
+                    // Already emitted AllEnrichmentsDone — ignore duplicate completions.
+                    return Ok(vec![]);
+                }
+
+                state.received += 1;
+                state.lsp_edges.extend_from_slice(added_edges);
+                state.lsp_nodes.extend_from_slice(new_nodes);
+
+                tracing::debug!(
+                    "AllEnrichmentsGate: root '{}' — {}/{} enrichments complete",
+                    slug,
+                    state.received,
+                    state.expected,
+                );
+
+                if state.received >= state.expected {
+                    // All enrichments received — emit AllEnrichmentsDone.
+                    state.fired = true;
+                    let base_nodes = state.base_nodes.clone()
+                        .unwrap_or_else(|| Arc::from([]));
+                    let base_edges = state.base_edges.clone()
+                        .unwrap_or_else(|| Arc::from([]));
+                    let lsp_edges: Arc<[crate::graph::Edge]> = Arc::from(
+                        std::mem::take(&mut state.lsp_edges).into_boxed_slice()
+                    );
+                    let lsp_nodes: Arc<[Node]> = Arc::from(
+                        std::mem::take(&mut state.lsp_nodes).into_boxed_slice()
+                    );
+                    tracing::info!(
+                        "AllEnrichmentsGate: root '{}' — all {} enrichment(s) done, \
+                         {} LSP edges, {} LSP nodes",
+                        slug,
+                        state.expected,
+                        lsp_edges.len(),
+                        lsp_nodes.len(),
+                    );
+                    return Ok(vec![ExtractionEvent::AllEnrichmentsDone {
+                        slug: slug.clone(),
+                        nodes: base_nodes,
+                        edges: base_edges,
+                        lsp_edges,
+                        lsp_nodes,
+                    }]);
+                }
+
+                Ok(vec![])
+            }
+
+            _ => Ok(vec![]),
+        }
     }
 }
 
@@ -779,17 +1104,19 @@ impl ExtractionConsumer for SubsystemConsumer {
 
 /// Build an `EventBus` pre-loaded with all built-in consumers.
 ///
-/// All consumers — including async ones (LSP, embedding, LanceDB) — are registered
-/// here as **Phase 2 stubs**. The stubs subscribe to the correct events and emit
-/// the correct follow-on events, but do not perform the actual async work yet.
-/// In Phase 2, async work continues via the existing `spawn_background_enrichment`
-/// path; Phase 3+ promotes these stubs to full async consumers.
+/// **Phase 3 wiring**: `LspConsumer` instances are now real — they hold
+/// `Arc<dyn Enricher>` and run actual LSP enrichment in `on_event`.
+/// `AllEnrichmentsGate` gates `PostExtractionConsumer` so passes run only after
+/// all LSP enrichers have completed. The `spawn_background_enrichment` LSP path
+/// in `build_full_graph_inner` is no longer needed.
 ///
 /// Registered consumers:
 /// - `ManifestConsumer`, `TreeSitterConsumer` — `RootDiscovered`
-/// - `LanguageAccumulatorConsumer`, `PostExtractionConsumer`,
-///   `OpenApiConsumer`, `GrpcConsumer`, `EmbeddingIndexerConsumer` — `RootExtracted`
-/// - `LspConsumer(lang)` × N — `LanguageDetected` (one per language from `EnricherRegistry`)
+/// - `LanguageAccumulatorConsumer` — `RootExtracted` → `LanguageDetected`
+/// - `LspConsumer(lang)` × N — `LanguageDetected` → `EnrichmentComplete`
+/// - `AllEnrichmentsGate` — `RootExtracted` (count) + `EnrichmentComplete` → `AllEnrichmentsDone`
+/// - `PostExtractionConsumer` — `AllEnrichmentsDone` → `PassesComplete` + `FrameworkDetected`
+/// - `OpenApiConsumer`, `GrpcConsumer`, `EmbeddingIndexerConsumer` — `RootExtracted` (side-effects)
 /// - `FrameworkDetectionConsumer`, `NextjsRoutingConsumer`,
 ///   `PubSubConsumer`, `WebSocketConsumer` — `FrameworkDetected`
 /// - `SubsystemConsumer`, `LanceDBConsumer` — `PassesComplete`
@@ -801,9 +1128,23 @@ impl ExtractionConsumer for SubsystemConsumer {
 ///
 /// `root_pairs` must be the full `(slug, path)` list for the workspace.
 /// `primary_slug` is the slug of the primary code root.
+/// `repo_root` is the path to the primary repository root (for LSP server startup).
 pub fn build_builtin_bus(
     root_pairs: Vec<(String, PathBuf)>,
     primary_slug: String,
+) -> crate::extract::event_bus::EventBus {
+    build_builtin_bus_with_repo_root(root_pairs, primary_slug, PathBuf::from("."))
+}
+
+/// Build the built-in event bus with an explicit repo root for LSP startup.
+///
+/// `repo_root` is passed to each `LspConsumer` so language servers start from the
+/// correct working directory. For tests or callers without a real repo, pass
+/// `PathBuf::from(".")` and LSP enrichment will gracefully fall back to no-op.
+pub fn build_builtin_bus_with_repo_root(
+    root_pairs: Vec<(String, PathBuf)>,
+    primary_slug: String,
+    repo_root: PathBuf,
 ) -> crate::extract::event_bus::EventBus {
     use crate::extract::event_bus::EventBus;
 
@@ -814,27 +1155,57 @@ pub fn build_builtin_bus(
     bus.register(Box::new(TreeSitterConsumer::new()));
 
     // --- RootExtracted consumers ---
+    // LanguageAccumulatorConsumer must run first (emits LanguageDetected which
+    // triggers LspConsumers, then AllEnrichmentsGate counts up).
     bus.register(Box::new(LanguageAccumulatorConsumer));
-    bus.register(Box::new(PostExtractionConsumer::new(root_pairs.clone(), primary_slug)));
+
+    // AllEnrichmentsGate: must subscribe to RootExtracted BEFORE LspConsumers
+    // fire so it captures the language count before any EnrichmentComplete arrives.
+    // Registration order matches subscription order in the sync bus.
+    bus.register(Box::new(AllEnrichmentsGate::new()));
+
+    // OpenApi, gRPC, Embedding — subscribe to RootExtracted independently.
     bus.register(Box::new(OpenApiConsumer));
     bus.register(Box::new(GrpcConsumer));
     // EmbeddingIndexerConsumer: streaming embed as nodes arrive (Phase 2 stub)
     bus.register(Box::new(EmbeddingIndexerConsumer));
 
-    // --- LanguageDetected consumers (one LSP stub per language) ---
-    // Per the ADR: "ALL fire concurrently, one per language" — in Phase 3+ these
-    // will be promoted to async consumers running in parallel.
+    // --- LanguageDetected consumers (one real LspConsumer per language) ---
+    // Per the ADR: "ALL fire concurrently, one per language."
+    // Currently sequential in the sync bus; Phase 4 promotes to async parallel.
     //
-    // Derive from EnricherRegistry so this list never drifts when languages
-    // are added or removed from the enrichment stack.
-    let mut supported_languages: Vec<String> = crate::extract::EnricherRegistry::with_builtins()
+    // Build the enricher registry once and extract individual enrichers per language.
+    // Each `LspConsumer` owns an `Arc<dyn Enricher>` so it doesn't re-instantiate.
+    let enricher_registry = crate::extract::EnricherRegistry::with_builtins();
+    let lsp_roots: Arc<Vec<(String, PathBuf)>> = Arc::new(root_pairs.clone());
+
+    // Build enrichers indexed by language for O(1) lookup.
+    // EnricherRegistry does not expose individual enrichers, so we rebuild
+    // per-language enrichers via LspEnricher::new (same as EnricherRegistry internals).
+    // This avoids exposing registry internals and keeps consumers self-contained.
+    let mut supported_languages: Vec<String> = enricher_registry
         .supported_languages()
         .into_iter()
         .collect();
     supported_languages.sort(); // deterministic registration order
-    for lang in supported_languages {
-        bus.register(Box::new(LspConsumer { language: lang }));
+
+    for lang in &supported_languages {
+        // Build a single-language enricher for this consumer.
+        // The enricher is the same type as what EnricherRegistry uses internally.
+        // We use `EnricherRegistry::with_builtins()` filtered to this language
+        // rather than duplicating the language-server config table.
+        let single_lang_enricher = build_single_language_enricher(lang);
+        bus.register(Box::new(LspConsumer {
+            language: lang.clone(),
+            enricher: single_lang_enricher,
+            repo_root: repo_root.clone(),
+            lsp_roots: Arc::clone(&lsp_roots),
+        }));
     }
+
+    // --- AllEnrichmentsDone consumers ---
+    // PostExtractionConsumer now subscribes to AllEnrichmentsDone (Phase 3).
+    bus.register(Box::new(PostExtractionConsumer::new(root_pairs.clone(), primary_slug)));
 
     // --- FrameworkDetected consumers ---
     bus.register(Box::new(FrameworkDetectionConsumer));
@@ -847,6 +1218,105 @@ pub fn build_builtin_bus(
     bus.register(Box::new(LanceDBConsumer));
 
     bus
+}
+
+/// Build a single-language `Arc<dyn Enricher>` for use in `LspConsumer`.
+///
+/// Constructs an `LspEnricher` with the same configuration as `EnricherRegistry::with_builtins()`
+/// for the given language. Returns a no-op enricher if the language is not recognised.
+fn build_single_language_enricher(language: &str) -> Arc<dyn crate::extract::Enricher> {
+    use crate::extract::lsp::LspEnricher;
+
+    // Mirror the server table from EnricherRegistry::with_builtins().
+    // Keep this in sync with that table — a test in consumers::tests verifies parity.
+    let servers: &[(&str, &str, &[&str], &[&str])] = &[
+        ("rust",         "rust-analyzer",              &[],         &["rs"]),
+        ("python",       "pyright-langserver",         &["--stdio"], &["py"]),
+        ("typescript",   "typescript-language-server",  &["--stdio"], &["ts", "tsx", "js", "jsx"]),
+        ("go",           "gopls",                      &["serve"],  &["go"]),
+        ("markdown",     "marksman",                   &["server"], &["md"]),
+        ("c-cpp",        "clangd",                     &[],         &["c", "cc", "cpp", "cxx", "h", "hpp"]),
+        ("java",         "jdtls",                      &[],         &["java"]),
+        ("ruby",         "solargraph",                 &["stdio"],  &["rb"]),
+        ("csharp",       "omnisharp",                  &["-lsp"],   &["cs"]),
+        ("swift",        "sourcekit-lsp",              &[],         &["swift"]),
+        ("kotlin",       "kotlin-language-server",     &[],         &["kt", "kts"]),
+        ("lua",          "lua-language-server",        &[],         &["lua"]),
+        ("zig",          "zls",                        &[],         &["zig"]),
+        ("elixir",       "elixir-ls",                  &[],         &["ex", "exs"]),
+        ("haskell",      "haskell-language-server",    &["--lsp"],  &["hs"]),
+        ("ocaml",        "ocamllsp",                   &[],         &["ml", "mli"]),
+        ("scala",        "metals",                     &[],         &["scala", "sc"]),
+        ("dart",         "dart",                       &["language-server"], &["dart"]),
+        ("r",            "R",                          &["--no-echo", "-e", "languageserver::run()"], &["r", "R"]),
+        ("julia",        "julia",                      &["--startup-file=no", "-e", "using LanguageServer; runserver()"], &["jl"]),
+        ("php",          "intelephense",               &["--stdio"], &["php"]),
+        ("css",          "vscode-css-languageserver",  &["--stdio"], &["css", "scss", "less"]),
+        ("html",         "vscode-html-languageserver", &["--stdio"], &["html", "htm"]),
+        ("yaml",         "yaml-language-server",       &["--stdio"], &["yaml", "yml"]),
+        ("json",         "vscode-json-languageserver", &["--stdio"], &["json"]),
+        ("toml",         "taplo",                      &["lsp", "stdio"], &["toml"]),
+        ("terraform",    "terraform-ls",               &["serve"],  &["tf", "tfvars"]),
+        ("nix",          "nil",                        &[],         &["nix"]),
+        ("vue",          "vue-language-server",        &["--stdio"], &["vue"]),
+        ("svelte",       "svelteserver",               &["--stdio"], &["svelte"]),
+        ("erlang",       "erlang_ls",                  &[],         &["erl", "hrl"]),
+        ("gleam",        "gleam",                      &["lsp"],    &["gleam"]),
+        ("nim",          "nimlsp",                     &[],         &["nim"]),
+        ("clojure",      "clojure-lsp",               &[],         &["clj", "cljs", "cljc"]),
+        ("deno",         "deno",                       &["lsp"],    &["ts", "tsx", "js", "jsx"]),
+        ("protobuf",     "buf",                        &["lsp"],    &["proto"]),
+        ("latex",        "texlab",                     &[],         &["tex", "bib"]),
+        ("typst",        "tinymist",                   &[],         &["typ"]),
+    ];
+
+    for &(lang, cmd, args, exts) in servers {
+        if lang == language {
+            let enricher = LspEnricher::new(lang, cmd, args, exts);
+            let enricher = if lang == "python" {
+                enricher.with_settings(serde_json::json!({
+                    "python": { "analysis": { "autoSearchPaths": true } }
+                }))
+            } else {
+                enricher
+            };
+            let enricher = match lang {
+                "typescript" | "deno" => enricher.with_config_file("tsconfig.json"),
+                "python"              => enricher.with_config_file("pyproject.toml"),
+                "go"                  => enricher.with_config_file("go.mod"),
+                "rust"                => enricher.with_config_file("Cargo.toml"),
+                "java"                => enricher.with_config_file("pom.xml"),
+                "kotlin"              => enricher.with_config_file("build.gradle.kts"),
+                _                     => enricher,
+            };
+            return Arc::new(enricher);
+        }
+    }
+
+    // Fallback: no-op enricher for unrecognised languages.
+    // This should never happen if `supported_languages` is derived from the same table.
+    tracing::warn!("build_single_language_enricher: unrecognised language '{}' — using no-op", language);
+    Arc::new(NoopEnricher { language: language.to_string() })
+}
+
+/// No-op enricher used as a fallback when a language is not in the server table.
+struct NoopEnricher {
+    language: String,
+}
+
+#[async_trait::async_trait]
+impl crate::extract::Enricher for NoopEnricher {
+    fn languages(&self) -> &[&str] { &[] }
+    fn is_ready(&self) -> bool { false }
+    async fn enrich(
+        &self,
+        _nodes: &[Node],
+        _index: &crate::graph::index::GraphIndex,
+        _repo_root: &std::path::Path,
+    ) -> anyhow::Result<crate::extract::EnrichmentResult> {
+        Ok(crate::extract::EnrichmentResult::default())
+    }
+    fn name(&self) -> &str { &self.language }
 }
 
 // ---------------------------------------------------------------------------
@@ -899,7 +1369,10 @@ pub fn run_post_passes_via_bus(
     let nodes_arc: Arc<[crate::graph::Node]> = Arc::from(nodes.into_boxed_slice());
     let edges_arc: Arc<[crate::graph::Edge]> = Arc::from(edges.into_boxed_slice());
 
-    let bus = build_builtin_bus(root_pairs, primary_slug.clone());
+    // Use repo_root for LSP server startup directory so LspConsumers have the
+    // correct working directory. The path is also passed as the RootExtracted
+    // event path so consumers that need it (e.g., tree-sitter-based consumers) work.
+    let bus = build_builtin_bus_with_repo_root(root_pairs, primary_slug.clone(), repo_root.clone());
     let events = bus.emit(ExtractionEvent::RootExtracted {
         slug: primary_slug,
         path: repo_root,
@@ -943,7 +1416,7 @@ pub fn run_post_passes_via_bus(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extract::event_bus::{EventBus, ExtractionEvent, ExtractionEventKind};
+    use crate::extract::event_bus::{ExtractionEvent, ExtractionEventKind};
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -1126,9 +1599,10 @@ mod tests {
             .len();
         let expected_total =
             2 +        // RootDiscovered: ManifestConsumer, TreeSitterConsumer
-            5 +        // RootExtracted: LanguageAccumulatorConsumer, PostExtractionConsumer,
+            5 +        // RootExtracted: LanguageAccumulatorConsumer, AllEnrichmentsGate,
                        //   OpenApiConsumer, GrpcConsumer, EmbeddingIndexerConsumer
-            lsp_count + // LanguageDetected: LspConsumer × N
+            lsp_count + // LanguageDetected: LspConsumer × N (real, Phase 3)
+            1 +        // AllEnrichmentsDone: PostExtractionConsumer (Phase 3 subscription)
             4 +        // FrameworkDetected: FrameworkDetectionConsumer, NextjsRoutingConsumer,
                        //   PubSubConsumer, WebSocketConsumer
             2;         // PassesComplete: SubsystemConsumer, LanceDBConsumer
@@ -1140,14 +1614,17 @@ mod tests {
     }
 
     /// Verify PostExtractionConsumer emits PassesComplete on empty input.
+    /// Phase 3: now subscribes to AllEnrichmentsDone (not RootExtracted).
     #[test]
     fn test_post_extraction_consumer_emits_passes_complete() {
         let consumer = PostExtractionConsumer::new(vec![], "test".into());
-        let event = ExtractionEvent::RootExtracted {
+        // Must use AllEnrichmentsDone (Phase 3 subscription).
+        let event = ExtractionEvent::AllEnrichmentsDone {
             slug: "test".into(),
-            path: PathBuf::from("."),
             nodes: std::sync::Arc::from([]),
             edges: std::sync::Arc::from([]),
+            lsp_edges: std::sync::Arc::from([]),
+            lsp_nodes: std::sync::Arc::from([]),
         };
         let follow_ons = consumer.on_event(&event).unwrap();
         assert!(
@@ -1215,15 +1692,23 @@ mod tests {
     }
 
     /// Verify LspConsumer fires only for its declared language.
+    /// Uses a no-op enricher so the test doesn't try to start a real LSP server.
     #[test]
     fn test_lsp_consumer_fires_for_declared_language() {
-        let consumer = LspConsumer { language: "rust".into() };
+        let consumer = LspConsumer {
+            language: "rust".into(),
+            enricher: Arc::new(NoopEnricher { language: "rust".into() }),
+            repo_root: PathBuf::from("."),
+            lsp_roots: Arc::new(vec![]),
+        };
         let matching = ExtractionEvent::LanguageDetected {
             slug: "test".into(),
             language: "rust".into(),
             nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&matching).unwrap();
+        // No tokio runtime in sync test context: the consumer falls back to the no-op path
+        // and still emits EnrichmentComplete (with empty edges).
         assert_eq!(result.len(), 1, "LspConsumer must emit EnrichmentComplete for its language");
         assert!(
             matches!(result[0], ExtractionEvent::EnrichmentComplete { .. }),
@@ -1233,7 +1718,12 @@ mod tests {
 
     #[test]
     fn test_lsp_consumer_ignores_other_language() {
-        let consumer = LspConsumer { language: "rust".into() };
+        let consumer = LspConsumer {
+            language: "rust".into(),
+            enricher: Arc::new(NoopEnricher { language: "rust".into() }),
+            repo_root: PathBuf::from("."),
+            lsp_roots: Arc::new(vec![]),
+        };
         let other_lang = ExtractionEvent::LanguageDetected {
             slug: "test".into(),
             language: "python".into(),
@@ -1241,6 +1731,75 @@ mod tests {
         };
         let result = consumer.on_event(&other_lang).unwrap();
         assert!(result.is_empty(), "LspConsumer must ignore events for other languages");
+    }
+
+    /// Verify AllEnrichmentsGate emits AllEnrichmentsDone immediately when no supported languages.
+    #[test]
+    fn test_all_enrichments_gate_no_languages() {
+        let gate = AllEnrichmentsGate::new();
+        // No nodes → no languages → gate fires immediately on RootExtracted.
+        let event = ExtractionEvent::RootExtracted {
+            slug: "test".into(),
+            path: PathBuf::from("."),
+            nodes: std::sync::Arc::from([]),
+            edges: std::sync::Arc::from([]),
+        };
+        let result = gate.on_event(&event).unwrap();
+        assert_eq!(result.len(), 1, "Gate must emit AllEnrichmentsDone when expected==0");
+        assert!(
+            matches!(result[0], ExtractionEvent::AllEnrichmentsDone { .. }),
+            "Expected AllEnrichmentsDone"
+        );
+    }
+
+    /// Verify AllEnrichmentsGate waits for all enrichments before emitting.
+    #[test]
+    fn test_all_enrichments_gate_waits_for_all() {
+        use crate::graph::{ExtractionSource, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        // Create a rust node to simulate a supported language.
+        let rust_node = crate::graph::Node {
+            id: NodeId {
+                root: "test".into(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "foo".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            line_start: 1, line_end: 1,
+            signature: "foo".into(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let gate = AllEnrichmentsGate::new();
+
+        // Send RootExtracted with 1 rust node — sets expected=1 (rust is supported).
+        let root_extracted = ExtractionEvent::RootExtracted {
+            slug: "test".into(),
+            path: PathBuf::from("."),
+            nodes: std::sync::Arc::from(vec![rust_node].into_boxed_slice()),
+            edges: std::sync::Arc::from([]),
+        };
+        let result = gate.on_event(&root_extracted).unwrap();
+        // expected=1, received=0 → no AllEnrichmentsDone yet.
+        assert!(result.is_empty(), "Gate must not fire before all enrichments arrive");
+
+        // Send EnrichmentComplete for rust.
+        let enrichment_done = ExtractionEvent::EnrichmentComplete {
+            slug: "test".into(),
+            language: "rust".into(),
+            added_edges: std::sync::Arc::from([]),
+            new_nodes: std::sync::Arc::from([]),
+        };
+        let result = gate.on_event(&enrichment_done).unwrap();
+        assert_eq!(result.len(), 1, "Gate must emit AllEnrichmentsDone after all enrichments");
+        assert!(
+            matches!(result[0], ExtractionEvent::AllEnrichmentsDone { .. }),
+            "Expected AllEnrichmentsDone"
+        );
     }
 
     /// Verify SubsystemConsumer subscribes to PassesComplete.

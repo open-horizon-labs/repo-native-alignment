@@ -401,7 +401,7 @@ impl Default for ExtractorRegistry {
 ///    the root that covers the most nodes.
 ///
 /// 3. **Primary root default:** if no candidate matches any node, return `primary_root`.
-fn pick_lsp_root_for_nodes<'a>(
+pub fn pick_lsp_root_for_nodes<'a>(
     nodes: &[crate::graph::Node],
     primary_root: &'a Path,
     lsp_roots: &'a [(String, std::path::PathBuf)],

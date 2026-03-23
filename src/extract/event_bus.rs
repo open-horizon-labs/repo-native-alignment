@@ -124,6 +124,27 @@ pub enum ExtractionEvent {
         edges: Arc<[Edge]>,
         detected_frameworks: HashSet<String>,
     },
+
+    /// All LSP enrichments for a root are done.
+    ///
+    /// Fired by `AllEnrichmentsGate` after every `EnrichmentComplete` for a given
+    /// root has been received. Carries the merged LSP edges and virtual nodes from
+    /// all per-language enrichers.
+    ///
+    /// `PostExtractionConsumer` subscribes to this event (Phase 3+) so that
+    /// post-extraction passes run on LSP-enriched nodes. In Phase 2 it subscribed
+    /// to `RootExtracted` and ran before LSP — this event fixes that ordering.
+    AllEnrichmentsDone {
+        slug: String,
+        /// Base nodes from `RootExtracted` (tree-sitter output).
+        nodes: Arc<[Node]>,
+        /// Base edges from `RootExtracted` (tree-sitter output).
+        edges: Arc<[Edge]>,
+        /// Additional edges produced by LSP enrichment.
+        lsp_edges: Arc<[Edge]>,
+        /// Virtual nodes added by LSP enrichment (e.g., external callee stubs).
+        lsp_nodes: Arc<[Node]>,
+    },
 }
 
 /// Discriminant for `ExtractionEvent` — used in `subscribes_to`.
@@ -136,6 +157,7 @@ pub enum ExtractionEventKind {
     FrameworkDetected,
     PassComplete,
     PassesComplete,
+    AllEnrichmentsDone,
 }
 
 impl ExtractionEvent {
@@ -149,6 +171,7 @@ impl ExtractionEvent {
             ExtractionEvent::FrameworkDetected { .. } => ExtractionEventKind::FrameworkDetected,
             ExtractionEvent::PassComplete { .. }    => ExtractionEventKind::PassComplete,
             ExtractionEvent::PassesComplete { .. }  => ExtractionEventKind::PassesComplete,
+            ExtractionEvent::AllEnrichmentsDone { .. } => ExtractionEventKind::AllEnrichmentsDone,
         }
     }
 }
