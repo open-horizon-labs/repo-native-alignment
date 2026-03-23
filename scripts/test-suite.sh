@@ -123,16 +123,17 @@ echo "" && echo "--- Append-only LanceDB with scan_version (#496) ---"
 check "sentinel schema_version >= 17 (scan_version column)" \
   "python3 -c \"import json; d=json.load(open('$RNA_REPO/.oh/.cache/extract_completed.json')); print(d['schema_version'])\" 2>/dev/null" "1[7-9]\|[2-9][0-9]"
 
-# ── PostExtractionRegistry (#493) ────────────────────────────────────────────
-# The PostExtractionRegistry struct must exist in post_extraction.rs and must
-# expose with_builtins() and run_all() (architectural constraint).
-echo "" && echo "--- PostExtractionRegistry (#493) ---"
-check "PostExtractionRegistry struct defined" \
-  "grep -c 'pub struct PostExtractionRegistry' $RNA_REPO/src/extract/post_extraction.rs" "[1-9]"
-check "PostExtractionRegistry::with_builtins exists" \
-  "grep -c 'fn with_builtins' $RNA_REPO/src/extract/post_extraction.rs" "[1-9]"
-check "PostExtractionRegistry::run_all exists" \
-  "grep -c 'fn run_all' $RNA_REPO/src/extract/post_extraction.rs" "[1-9]"
+# ── PostExtractionRegistry (#493 / #523) ─────────────────────────────────────
+# PR #523 eliminated PostExtractionRegistry entirely — post_extraction.rs was deleted.
+# These checks verify the elimination is complete and the event-driven architecture
+# replaced it cleanly.
+echo "" && echo "--- PostExtractionRegistry eliminated (#523) ---"
+check "post_extraction.rs deleted (#523)" \
+  "test ! -f $RNA_REPO/src/extract/post_extraction.rs && echo deleted" "deleted"
+check "PostExtractionRegistry absent from src/ (#523)" \
+  "grep -r 'PostExtractionRegistry' $RNA_REPO/src/ 2>/dev/null | wc -l | tr -d ' '" "^0$"
+check "EnrichmentFinalizer replaced PostExtractionRegistry (#523)" \
+  "grep -c 'pub struct EnrichmentFinalizer' $RNA_REPO/src/extract/consumers.rs" "[1-9]"
 
 # ── EventBus / ExtractionConsumer (#479 / #500) ───────────────────────────────
 echo "" && echo "--- EventBus / ExtractionConsumer (#479) ---"
@@ -254,8 +255,8 @@ check "Pipeline references EventBus (#502)" \
 echo "" && echo "--- FastAPI Router Prefix Pass (#519) ---"
 check "FastapiRouterPrefixPass struct defined (#519)" \
   "grep -r 'FastapiRouterPrefixPass\|fastapi_router_prefix' $RNA_REPO/src/ 2>/dev/null | grep -v test | wc -l" "[1-9]"
-check "FastapiRouterPrefixPass registered in with_builtins (#519)" \
-  "grep -c 'reg.register.*FastapiRouterPrefixPass' $RNA_REPO/src/extract/post_extraction.rs 2>/dev/null" "^1$"
+check "FastapiRouterPrefixConsumer registered in build_builtin_bus (#519/#523)" \
+  "grep -c 'FastapiRouterPrefixConsumer' $RNA_REPO/src/extract/consumers.rs 2>/dev/null" "[1-9]"
 check "EXTRACTION_VERSION >= 13 for router_var metadata (#519)" \
   "grep 'EXTRACTION_VERSION' $RNA_REPO/src/graph/store.rs | grep -o '[0-9]*' | tail -1" "1[3-9]\|[2-9][0-9]"
 check "router_var metadata extracted in generic.rs (#519)" \
@@ -287,8 +288,8 @@ check "AllEnrichmentsGate struct defined (#528)" \
   "grep -c 'AllEnrichmentsGate\|struct AllEnrichments' $RNA_REPO/src/extract/consumers.rs 2>/dev/null" "[1-9]"
 check "AllEnrichmentsDone event defined (#528)" \
   "grep -c 'AllEnrichmentsDone' $RNA_REPO/src/extract/event_bus.rs 2>/dev/null" "[1-9]"
-check "PostExtractionConsumer subscribes to AllEnrichmentsDone (#528)" \
-  "grep -A5 'fn subscribes_to.*PostExtraction\|PostExtractionConsumer' $RNA_REPO/src/extract/consumers.rs 2>/dev/null | grep -c 'AllEnrichmentsDone'" "[1-9]"
+check "EnrichmentFinalizer subscribes to AllEnrichmentsDone (#528/#523)" \
+  "grep -A5 'impl ExtractionConsumer for EnrichmentFinalizer' $RNA_REPO/src/extract/consumers.rs 2>/dev/null | grep -c 'AllEnrichmentsDone'" "[1-9]"
 
 # ── EMBEDDINGINDEXERCONSUMER + LANCEDBCONSUMER FROM STUBS (#530) ──────────
 echo "" && echo "--- EmbeddingIndexerConsumer + LanceDBConsumer from stubs (#530) ---"
@@ -305,8 +306,8 @@ check "EXTRACTION_VERSION >= 14 for http_path_local field (#531)" \
   "grep 'EXTRACTION_VERSION' $RNA_REPO/src/graph/store.rs | grep -o '[0-9]*' | tail -1" "1[4-9]\|[2-9][0-9]"
 check "http_path_local stored for idempotency (#531)" \
   "grep -c 'http_path_local' $RNA_REPO/src/extract/fastapi_router_prefix.rs 2>/dev/null" "[1-9]"
-check "FastapiRouterPrefixPass registered exactly once in with_builtins (#531)" \
-  "grep -c 'reg.register.*FastapiRouterPrefixPass' $RNA_REPO/src/extract/post_extraction.rs 2>/dev/null" "^1$"
+check "FastapiRouterPrefixConsumer present in consumers.rs (#531/#523)" \
+  "grep -c 'FastapiRouterPrefixConsumer' $RNA_REPO/src/extract/consumers.rs 2>/dev/null" "[1-9]"
 
 # ── CONTENT-ADDRESSED CONSUMER CACHE (#526/#533) ─────────────────────────
 echo "" && echo "--- Content-addressed consumer cache (#526) ---"
@@ -316,6 +317,59 @@ check "ExtractionConsumer::version() trait method (#526)" \
   "grep -c 'fn version.*u64\|version().*u64' $RNA_REPO/src/extract/event_bus.rs 2>/dev/null" "[1-9]"
 check "EventBus has cache HashMap (#526)" \
   "grep -c 'cache.*HashMap\|HashMap.*cache\|consumer_cache' $RNA_REPO/src/extract/event_bus.rs 2>/dev/null" "[1-9]"
+
+# ── ADR ARCHITECTURE CONSTRAINTS (#543) ──────────────────────────────────────
+# RNA enforces its own architecture using its own graph. Each constraint uses the
+# RNA CLI (search + graph) as the assertion mechanism, with grep as a fallback for
+# absence proofs (RNA search can match .oh/ session docs that mention removed types).
+# A failing check means a structural invariant was broken — reopen the relevant issue.
+#
+# ADR source: .oh/sessions/522-post-523-audit.md + issue #543
+echo "" && echo "--- ADR Architecture Constraints (#543) ---"
+
+# Constraint 1: No consumer cross-imports — PostExtractionRegistry gone from src/
+# PostExtractionRegistry was eliminated in #523. Grep src/ directly: RNA search picks
+# up session docs that mention it, but grep on src/ is the definitive absence proof.
+check "ADR: PostExtractionRegistry absent from src/ (#523)" \
+  "grep -r 'PostExtractionRegistry' $RNA_REPO/src/ 2>/dev/null | wc -l | tr -d ' '" "^0$"
+
+# Constraint 2: No broker-specific logic in server/
+# server/ must not contain framework conditionals — that logic belongs in consumers.
+# RNA query form: search 'framework ==' --file src/server would miss grep-only strings.
+check "ADR: no 'if framework ==' in src/server/ (#523)" \
+  "grep -r 'framework ==' $RNA_REPO/src/server/ 2>/dev/null | grep -v '//' | wc -l | tr -d ' '" "^0$"
+
+# Constraint 3: api_link_pass only called from EnrichmentFinalizer (not server/)
+# All pass calls must flow through the consumer bus. RNA graph query verifies the
+# function is indexed; grep on server/ verifies no direct bypass exists.
+check "ADR: api_link_pass not bypassed in src/server/ (#523)" \
+  "grep -r 'api_link_pass' $RNA_REPO/src/server/ 2>/dev/null | grep -v '//' | wc -l | tr -d ' '" "^0$"
+check "ADR: api_link_pass indexed by RNA (function kind) (#543)" \
+  "repo-native-alignment search 'api_link_pass' --repo $RNA_REPO --kind function --limit 3 2>/dev/null" "api_link_pass"
+
+# Constraint 4: FastapiRouterPrefixConsumer only fires on fastapi
+# It must subscribe to FrameworkDetected, not AllEnrichmentsDone or unconditionally.
+# RNA verifies the consumer is indexed; grep verifies the subscription event kind.
+check "ADR: FastapiRouterPrefixConsumer subscribes to FrameworkDetected (#537/#523)" \
+  "grep -A5 'impl ExtractionConsumer for FastapiRouterPrefixConsumer' $RNA_REPO/src/extract/consumers.rs 2>/dev/null | grep -c 'FrameworkDetected'" "[1-9]"
+check "ADR: FastapiRouterPrefixConsumer indexed as struct by RNA (#543)" \
+  "repo-native-alignment search 'FastapiRouterPrefixConsumer' --repo $RNA_REPO --kind struct --limit 3 2>/dev/null" "FastapiRouterPrefixConsumer"
+
+# Constraint 5: PostExtractionRegistry fully gone from all Rust source
+# Definitive check: grep across all .rs files under src/. Zero hits required.
+check "ADR: PostExtractionRegistry zero .rs references in src/ (#523)" \
+  "grep -r 'PostExtractionRegistry' $RNA_REPO/src/ --include='*.rs' 2>/dev/null | wc -l | tr -d ' '" "^0$"
+
+# Constraint 6: subsystem_node_pass has a tracked stub (issue #542)
+# The function must be RNA-indexable (still lives in subsystem_pass.rs) AND the
+# tracking issue must be open (state: OPEN). When issue #542 is closed (stub promoted
+# to real consumer), this check will fail on the OPEN pattern — that's intentional.
+# Remove this check when SubsystemConsumer.on_event is fully implemented.
+# Note: requires 'gh' CLI; skip gracefully if not available in the environment.
+check "ADR: subsystem_node_pass indexed by RNA (#542)" \
+  "repo-native-alignment search 'subsystem_node_pass' --repo $RNA_REPO --kind function --limit 3 2>/dev/null" "subsystem_node_pass"
+check "ADR: subsystem_node_pass bypass tracked in open issue #542" \
+  "gh issue view 542 --repo open-horizon-labs/repo-native-alignment --json state -q '.state' 2>/dev/null || echo 'SKIP_NO_GH'" "OPEN\|SKIP_NO_GH"
 
 echo ""
 echo "=== RESULTS: $PASS passed, $FAIL failed, $SKIP skipped ==="
