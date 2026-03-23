@@ -254,7 +254,28 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::ListRoots(args)) => {
             init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?;
-            println!("{}", service::list_roots(&repo_root)); return Ok(());
+            eprintln!("Scanning {}...", repo_root.display());
+            let handler = RnaHandler { repo_root: repo_root.clone(), ..Default::default() };
+            let gs = handler.build_full_graph().await?;
+            let index_map = gs.node_index_map();
+            // Start with graph-derived slugs (roots that have extracted nodes).
+            let mut active_slugs: std::collections::HashSet<String> =
+                repo_native_alignment::server::state::GraphState::root_slugs_from_index_map(&index_map)
+                    .into_iter()
+                    .collect();
+            // Union with all configured roots so declared roots with zero nodes still appear.
+            for r in WorkspaceConfig::load()
+                .with_primary_root(repo_root.clone())
+                .with_worktrees(&repo_root)
+                .with_claude_memory(&repo_root)
+                .with_agent_memories(&repo_root)
+                .with_declared_roots(&repo_root)
+                .resolved_roots()
+            {
+                active_slugs.insert(r.slug);
+            }
+            println!("{}", service::list_roots_from_slugs(&repo_root, &active_slugs, Some(&gs), None, None));
+            return Ok(());
         }
         Some(Commands::RepoMap(args)) => {
             init_tracing("warn", log_path.as_deref());
