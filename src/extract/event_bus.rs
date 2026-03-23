@@ -21,7 +21,8 @@
 //!         → LanguageAccumulatorConsumer → LanguageDetected(lang, nodes) per language
 //!             → LspConsumer (one per language, sequential in Phase 2)
 //!               → EnrichmentComplete(lang, edges)
-//!         → PostExtractionConsumer → PassesComplete(nodes, edges)
+//!         → ApiLinkConsumer, TestedByConsumer → PassComplete (monitoring)
+//!         → EnrichmentFinalizer → PassesComplete(nodes, edges)
 //!             → SubsystemConsumer → SubsystemsDetected(...)
 //!             → LanceDBConsumer (persist)
 //!         → EmbeddingConsumer (streaming)
@@ -136,7 +137,7 @@ pub enum ExtractionEvent {
     /// root has been received. Carries the merged LSP edges and virtual nodes from
     /// all per-language enrichers.
     ///
-    /// `PostExtractionConsumer` subscribes to this event (Phase 3+) so that
+    /// `EnrichmentFinalizer` subscribes to this event so that
     /// post-extraction passes run on LSP-enriched nodes. In Phase 2 it subscribed
     /// to `RootExtracted` and ran before LSP — this event fixes that ordering.
     AllEnrichmentsDone {

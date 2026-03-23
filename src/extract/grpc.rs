@@ -41,10 +41,9 @@
 //!
 //! # Placement
 //!
-//! Registered in `PostExtractionRegistry` with `applies_when` gating on
-//! `grpc-python`, `grpc-go`, `grpc-js`, or `grpc-java` frameworks (set by
-//! `FrameworkDetectionPass`). Runs after framework detection, before
-//! LanceDB persist.
+//! Called from `EnrichmentFinalizer` gated on `grpc-python`, `grpc-go`,
+//! `grpc-js`, or `grpc-java` framework detection. Runs after framework
+//! detection, before LanceDB persist.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
