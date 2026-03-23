@@ -103,36 +103,46 @@ use crate::extract::openapi_sdk_link::is_generated_sdk_file_pub;
 ///
 /// [`fastapi_router_prefix_pass`]: super::fastapi_router_prefix::fastapi_router_prefix_pass
 pub fn sdk_path_inference_pass(nodes: &mut [Node]) {
-    // Phase 1: Collect all URL paths from Const nodes in generated SDK files.
-    // The string-literal harvester stores the path as the node `name`.
+    // Phase 1: Collect all URL paths from Const nodes in generated SDK files,
+    // grouped by root slug to prevent cross-service contamination.
     //
-    // These are the authoritative full paths from the OpenAPI-generated SDK.
-    let sdk_paths: Vec<String> = nodes
-        .iter()
-        .filter(|n| {
-            n.id.kind == NodeKind::Const
-                && is_generated_sdk_file_pub(&n.id.file)
-                && n.id.name.starts_with('/')
-                && n.id.name.len() > 1
-        })
-        .map(|n| n.id.name.clone())
-        .collect();
+    // Grouping by root ensures that in a monorepo where service-A and service-B
+    // each have a `/items` endpoint with separate generated SDKs, an endpoint
+    // in service-A's root only matches SDK paths from service-A's root.
+    //
+    // The string-literal harvester stores the path as the node `name`.
+    use std::collections::HashMap;
+    let mut sdk_paths_by_root: HashMap<String, Vec<String>> = HashMap::new();
+    for n in nodes.iter() {
+        if n.id.kind == NodeKind::Const
+            && is_generated_sdk_file_pub(&n.id.file)
+            && n.id.name.starts_with('/')
+            && n.id.name.len() > 1
+        {
+            sdk_paths_by_root
+                .entry(n.id.root.clone())
+                .or_default()
+                .push(n.id.name.clone());
+        }
+    }
 
-    if sdk_paths.is_empty() {
+    if sdk_paths_by_root.is_empty() {
         return;
     }
 
-    // Phase 2: Normalise SDK paths for suffix matching.
-    // Keep the list deduplicated (multiple Const nodes for the same path can
-    // appear if the SDK references it in both a one-liner and an object form).
-    let mut unique_sdk_paths = sdk_paths;
-    unique_sdk_paths.sort_unstable();
-    unique_sdk_paths.dedup();
-
-    tracing::debug!(
-        "sdk_path_inference: {} unique SDK URL paths available for suffix matching",
-        unique_sdk_paths.len(),
-    );
+    // Phase 2: Deduplicate SDK paths per root.
+    let mut unique_sdk_paths_by_root: HashMap<String, Vec<String>> =
+        HashMap::with_capacity(sdk_paths_by_root.len());
+    for (root, mut paths) in sdk_paths_by_root {
+        paths.sort_unstable();
+        paths.dedup();
+        tracing::debug!(
+            "sdk_path_inference: root '{}' — {} unique SDK URL paths for suffix matching",
+            root,
+            paths.len(),
+        );
+        unique_sdk_paths_by_root.insert(root, paths);
+    }
 
     // Phase 3: Update ApiEndpoint nodes whose http_path is still local.
     let mut patched = 0usize;
@@ -154,8 +164,15 @@ pub fn sdk_path_inference_pass(nodes: &mut [Node]) {
             _ => continue,
         };
 
-        // Find all SDK paths that end with this local path, with a proper
-        // segment boundary (the char before the suffix must be `/`).
+        // Look up SDK paths ONLY from the same root as this endpoint.
+        // Cross-root matching is rejected to prevent false positives in monorepos
+        // where multiple services share suffix paths (e.g., /items in two services).
+        let unique_sdk_paths = match unique_sdk_paths_by_root.get(&node.id.root) {
+            Some(paths) => paths,
+            None => continue, // no SDK paths in this root → skip
+        };
+
+        // Find all SDK paths that end with this local path.
         let matches: Vec<&str> = unique_sdk_paths
             .iter()
             .filter(|sdk| is_proper_suffix(sdk, &local_path))
@@ -308,9 +325,10 @@ mod tests {
     // --- helper factories ---
 
     fn make_sdk_const(path: &str) -> Node {
+        // Uses root "repo" — must match make_api_endpoint root for same-root scoping.
         Node {
             id: NodeId {
-                root: "frontend".to_string(),
+                root: "repo".to_string(),
                 file: PathBuf::from("src/api/sdk.gen.ts"),
                 name: path.to_string(),
                 kind: NodeKind::Const,
@@ -332,9 +350,10 @@ mod tests {
         if already_patched {
             metadata.insert("http_path_local".to_string(), http_path.to_string());
         }
+        // Uses root "repo" — must match make_sdk_const root for same-root scoping.
         Node {
             id: NodeId {
-                root: "backend".to_string(),
+                root: "repo".to_string(),
                 file: PathBuf::from("src/api/workspaces/id/expertunities.py"),
                 name: format!("{} {}", method, http_path),
                 kind: NodeKind::ApiEndpoint,
@@ -626,6 +645,85 @@ mod tests {
             ep.metadata.get("http_path").map(|s| s.as_str()),
             Some("/expertunities"),
             "hyphenated SDK filename must not be used for inference"
+        );
+    }
+
+    // --- cross-service isolation (CodeRabbit major finding) ---
+
+    /// Monorepo regression: service-A endpoint must NOT be rewritten using service-B's SDK.
+    ///
+    /// Two services both have a `/items` route, each with their own generated SDK:
+    /// - service-A SDK has `/workspaces/{id}/items`
+    /// - service-B SDK has `/admin/items`
+    ///
+    /// service-A's `GET /items` endpoint must only match service-A's SDK paths.
+    /// With root-scoped matching, service-B's `/admin/items` is invisible to service-A.
+    #[test]
+    fn test_cross_service_no_contamination() {
+        // service-A endpoint in root "service-a"
+        let mut ep_a = make_api_endpoint("/items", "GET", false);
+        ep_a.id.root = "service-a".to_string();
+
+        // service-A SDK const in root "service-a"
+        let mut sdk_a = make_sdk_const("/workspaces/{id}/items");
+        sdk_a.id.root = "service-a".to_string();
+
+        // service-B SDK const in root "service-b" — DIFFERENT service
+        let mut sdk_b = make_sdk_const("/admin/items");
+        sdk_b.id.root = "service-b".to_string();
+        sdk_b.id.file = PathBuf::from("apps/service-b/sdk.gen.ts");
+
+        let mut nodes = vec![sdk_a, sdk_b, ep_a];
+
+        sdk_path_inference_pass(&mut nodes);
+
+        let ep = nodes.iter().find(|n| n.id.kind == NodeKind::ApiEndpoint).unwrap();
+        // service-A endpoint must use only service-A's SDK → /workspaces/{id}/items
+        // service-B's /admin/items must NOT contaminate it.
+        assert_eq!(
+            ep.metadata.get("http_path").map(|s| s.as_str()),
+            Some("/workspaces/{id}/items"),
+            "cross-service SDK contamination must not occur"
+        );
+    }
+
+    /// Monorepo: two services with colliding suffixes — each endpoint gets only its own service's path.
+    #[test]
+    fn test_two_services_each_get_own_full_path() {
+        // service-a: GET /items endpoint, SDK has /workspaces/{id}/items
+        let mut ep_a = make_api_endpoint("/items", "GET", false);
+        ep_a.id.root = "service-a".to_string();
+        let mut sdk_a = make_sdk_const("/workspaces/{id}/items");
+        sdk_a.id.root = "service-a".to_string();
+
+        // service-b: GET /items endpoint, SDK has /admin/items
+        let mut ep_b = make_api_endpoint("/items", "GET", false);
+        ep_b.id.root = "service-b".to_string();
+        ep_b.id.file = PathBuf::from("apps/service-b/routes.py");
+        let mut sdk_b = make_sdk_const("/admin/items");
+        sdk_b.id.root = "service-b".to_string();
+        sdk_b.id.file = PathBuf::from("apps/service-b/sdk.gen.ts");
+
+        let mut nodes = vec![sdk_a, sdk_b, ep_a, ep_b];
+
+        sdk_path_inference_pass(&mut nodes);
+
+        let ep_a_result = nodes.iter().find(|n| {
+            n.id.kind == NodeKind::ApiEndpoint && n.id.root == "service-a"
+        }).unwrap();
+        let ep_b_result = nodes.iter().find(|n| {
+            n.id.kind == NodeKind::ApiEndpoint && n.id.root == "service-b"
+        }).unwrap();
+
+        assert_eq!(
+            ep_a_result.metadata.get("http_path").map(|s| s.as_str()),
+            Some("/workspaces/{id}/items"),
+            "service-A endpoint must get service-A's full path"
+        );
+        assert_eq!(
+            ep_b_result.metadata.get("http_path").map(|s| s.as_str()),
+            Some("/admin/items"),
+            "service-B endpoint must get service-B's full path"
         );
     }
 }
