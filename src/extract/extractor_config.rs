@@ -638,30 +638,39 @@ fn extract_nth_arg_quoted_from_open(at_paren: &str, n: usize) -> Option<String> 
 /// Returns an empty `Vec` for any import text that does not match the
 /// `from ... import ...` pattern (e.g., bare `import os`).
 fn synthesize_from_import_paths(import_text: &str) -> Vec<String> {
-    // Normalize whitespace so the pattern matching is robust.
-    let text = import_text.trim();
+    // Use split_whitespace() so tabs, newlines, or multiple spaces are all
+    // handled correctly. This matches any `from <module> import <names>` form
+    // regardless of how the whitespace was normalised in the source file.
+    let mut parts = import_text.split_whitespace();
 
-    // Match `from <module> import <names>` (case-sensitive; Python only uses lowercase).
-    // We also strip a leading `from ` (with space).
-    let rest = match text.strip_prefix("from ") {
-        Some(r) => r,
-        None => return Vec::new(),
+    // First token must be "from".
+    if parts.next() != Some("from") {
+        return Vec::new();
+    }
+
+    // Second token is the module name.
+    let module = match parts.next() {
+        Some(m) if !m.is_empty() => m,
+        _ => return Vec::new(),
     };
 
-    // Split on ` import ` (with spaces) to separate module from imported names.
-    let (module_part, names_part) = match rest.split_once(" import ") {
-        Some(pair) => pair,
-        None => return Vec::new(),
-    };
+    // Third token must be "import".
+    if parts.next() != Some("import") {
+        return Vec::new();
+    }
 
-    let module = module_part.trim();
-    if module.is_empty() {
+    // Remaining tokens form the names list (possibly with commas, parens, aliases).
+    let names_part = parts.collect::<Vec<_>>().join(" ");
+    if names_part.is_empty() {
         return Vec::new();
     }
 
     // The names part may be `Y`, `Y1, Y2`, `(Y1, Y2)`, or `*`.
-    // Strip optional parentheses.
-    let names_raw = names_part.trim().trim_matches(|c| c == '(' || c == ')');
+    // Strip optional surrounding parentheses then split on commas.
+    let names_raw = names_part
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
 
     names_raw
         .split(',')
@@ -917,6 +926,13 @@ decorator = true
         let mut result = synthesize_from_import_paths("from os.path import (join, exists)");
         result.sort();
         assert_eq!(result, vec!["os.path.exists", "os.path.join"]);
+    }
+
+    #[test]
+    fn test_synthesize_with_tabs_and_extra_spaces() {
+        // Whitespace robustness: tabs and multi-space separators must work.
+        let result = synthesize_from_import_paths("from\tgoogle.cloud\timport\tpubsub_v1");
+        assert_eq!(result, vec!["google.cloud.pubsub_v1"]);
     }
 
     #[test]
