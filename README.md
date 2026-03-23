@@ -197,13 +197,13 @@ The system compounds from here. Agents use `search` to discover relevant context
 | `search` | Code symbols, artifacts, commits, and markdown — flat or graph traversal (`mode`: neighbors, impact, reachable, tests_for, cycles, path). `cycles`: detect circular dependency rings (optionally scoped to one node). `path`: shortest directed call chain between two nodes (use `node=` for start, `query=` for destination). Scope to a subsystem (`subsystem=`), filter cross-subsystem edges (`target_subsystem=`), use `depth=2` with neighbors to walk N levels deep, use `compact: true` for ~25x fewer tokens, `rerank: true` for precision. Short node IDs resolve automatically. |
 | `repo_map` | Repository orientation: **detected subsystems** with their key interfaces, top symbols by importance, hotspot files, active outcomes, entry points. One call replaces an exploratory loop. |
 | `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols. Optional `include_impact: true` for risk-classified blast radius. |
-| `list_roots` | Show configured workspace roots with scan recency, symbol/edge counts, and LSP enrichment status. Includes LSP servers available to install for each root's detected languages. |
+| `list_roots` | Show configured workspace roots with live scan stats (symbols, edges, detected frameworks, LSP edge counts per language, scan phase). Stats are live during active scans and fall back to sentinel files on cold start. Includes LSP servers available to install for each root's detected languages. |
 
 **Root scoping:** All query tools default to the primary workspace root (`--repo`). Pass `root: "all"` for cross-root search, or `root: "<slug>"` for a specific root. Non-code roots (.oh/ artifacts, commits, Notes) always pass through regardless of root filter.
 
 **Worktree-aware queries:** Agents working in a git worktree can query their own code by passing the absolute path: `search(query="...", repo="/absolute/path/to/worktree")`. The worktree must be scanned first: `repo-native-alignment scan --repo /path/to/worktree`. Keyword and graph traversal search are available; semantic search requires a separate scan-time embedding index in the worktree.
 
-**Auto-discovered roots:** RNA automatically adds git worktrees and Claude Code memory as additional roots. Worktrees that maintain their own RNA cache (`.oh/.cache/lance/` directory present) are skipped — their code stays in their own index. Use `list_roots` to see what's active.
+**Auto-discovered roots:** RNA automatically adds git worktrees and Claude Code memory as additional roots. Worktrees that maintain their own RNA cache (`.oh/.cache/lance/` directory present) are skipped automatically — their code stays in their own index, preventing double-indexing. Use `list_roots` to see what's active.
 
 **Declared roots:** Declare intentionally related repos by slug in `.oh/config.toml`:
 
@@ -266,10 +266,11 @@ The MCP server builds an index automatically on first query. For best results �
 ```bash
 repo-native-alignment scan --repo . --full
 
-# Scan+Extract: 8,700 symbols across 210 files in 0.6s
-# Embed: 2,800 items in 30s
-# LSP: 8,200 call edges in 50s
-# Done in 50s
+# TreeSitter: 10,000+ symbols across 280+ files (rayon parallel, all cores)
+# LSP: pyright + tsserver start concurrently (parallel enrichment)
+# Post-extraction passes: subsystem detection, framework detection, BelongsTo edges
+# Embed: streams in parallel with LSP enrichment
+# Done in ~50s (repeat scans ~0.1s on no-change)
 ```
 
 Without `--full`, the scan skips language server analysis — subsystem detection and "what calls this" queries won't work.
@@ -339,8 +340,8 @@ edge_kind = "Consumes"
 **How it works:**
 1. `applies_when.language` — only fires on nodes in that language
 2. `applies_when.imports_contain` — only fires when at least one Import node contains this string (gates on the library being actually imported)
-3. `function_pattern` — substring to look for in function bodies
-4. `arg_position` (or `topic_arg`) — zero-indexed position of the argument that holds the topic/channel name (must be a string literal)
+3. `function_pattern` — substring or glob (`*` matches any sequence of identifier characters) to look for in function bodies. Examples: `"bus.publish"`, `"publish_*"`, `"*.send"`
+4. `topic_arg` (or `arg_position`) — zero-indexed position of the argument holding the topic/channel name (must be a string literal). **When omitted, the matched function name itself becomes the channel name** — useful for fixed-routing wrappers and decorator-registered consumers
 5. `edge_kind` — `"Produces"` or `"Consumes"`
 6. `decorator` — (optional, default `false`) set to `true` when `function_pattern` is a decorator name (e.g., `@bus.subscribe`) — the body-text heuristic matches decorator patterns the same way as call patterns
 
@@ -380,7 +381,9 @@ RNA works standalone. These add organizational context and workflow structure:
 
 ## Status
 
-4 MCP tools, 10 CLI subcommands. Extracts symbols from 22 languages, builds a call graph via language server analysis, detects architectural subsystems automatically. Ships as a Claude Code plugin. CLI and MCP share the same index and service layer.
+4 MCP tools, 10 CLI subcommands. Extracts symbols from 22 languages, builds a call graph via language server analysis, detects architectural subsystems and frameworks automatically. Ships as a Claude Code plugin. CLI and MCP share the same index and service layer.
+
+**v0.1.15 (current):** EventBus/consumer architecture, parallel LSP enrichment, per-consumer content-addressed cache, live scan stats in `list_roots`, config-driven extractors (`.oh/extractors/*.toml`), worktree own-cache detection, FastAPI router prefix resolution. SCHEMA_VERSION 18, EXTRACTION_VERSION 14 (deprecated — new invalidation is driven by `ExtractionConsumer::version()` per consumer; the global integer is still read on cold start for backward-compatible sentinel detection).
 
 ### Platform Support
 
