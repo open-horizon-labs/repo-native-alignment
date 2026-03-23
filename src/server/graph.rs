@@ -347,13 +347,18 @@ impl RnaHandler {
                     // The heuristic fails when LSP ran but persist failed -- the
                     // edges are in memory but not durable, so the next restart
                     // would incorrectly skip re-enrichment (#477).
+                    //
+                    // FIX(bus path): When the sentinel is absent, route through the event bus
+                    // (LspConsumer → EnrichmentComplete → AllEnrichmentsGate → AllEnrichmentsDone
+                    // → EnrichmentFinalizer → PassesComplete) so ScanStatsConsumer correctly
+                    // tracks LSP completion. The old spawn_lsp_enrichment bypassed all of these.
                     if spawn_background {
                         let lsp_sentinel = super::sentinel::read_lsp_sentinel(&self.repo_root);
                         if lsp_sentinel.is_none() {
                             tracing::info!(
-                                "LSP sentinel absent -- spawning background LSP enrichment"
+                                "LSP sentinel absent -- spawning background LSP enrichment via bus"
                             );
-                            self.spawn_lsp_enrichment(&state.nodes);
+                            self.spawn_lsp_enrichment_via_bus(&state.nodes, &state.edges);
                         } else {
                             tracing::info!(
                                 "LSP sentinel present -- LSP enrichment already persisted, skipping"
