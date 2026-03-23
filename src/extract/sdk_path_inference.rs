@@ -105,9 +105,14 @@ use crate::extract::openapi_sdk_link::is_generated_sdk_file_pub;
 pub fn sdk_path_inference_pass(nodes: &mut [Node]) {
     // Fast-path: if no TypeScript or JavaScript Const nodes exist, there can be
     // no generated SDK paths — return immediately without calling
-    // `is_generated_sdk_file_pub` on any node.  On Rust/Python-only repos this
-    // is O(1) (the `any` short-circuits on the first TS/JS node, or exits
-    // immediately when none exist), avoiding all filename-pattern checks.
+    // `is_generated_sdk_file_pub` on any node.
+    //
+    // Cost: one O(N) linear scan comparing struct fields only (enum tag +
+    // string-slice match, no heap allocation).  On repos WITH TS/JS nodes the
+    // `any` short-circuits at the first match; on Rust/Python-only repos it
+    // exhausts the iterator returning false — still O(N), but each check is
+    // ~3–5 ns instead of the ~50–200 ns `to_lowercase()` allocation that
+    // `is_generated_sdk_file_pub` would otherwise perform on every Const node.
     //
     // Generated SDK files are TypeScript/JavaScript by definition (e.g.,
     // `sdk.gen.ts`, `client.generated.ts`).  Checking Python or Rust Const
