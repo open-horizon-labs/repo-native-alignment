@@ -329,7 +329,7 @@ async function loadFrameworks(signal) {
 
   // Compact search output lines: "- **name** `stable_id` ..."
   for (const line of text.split('\n')) {
-    const m = line.match(/`([^`]+:[^`]+:[^`]+:[^`]+)`/);
+    const m = line.match(/`([^`]+:[^`]+:[^`]+)`/);
     if (!m) continue;
     const stableId = m[1];
     if (seenIds.has(stableId)) continue;
@@ -410,8 +410,10 @@ async function loadRepoMap() {
     runLayout(document.getElementById('layout-select').value);
 
     // Always try to augment with framework nodes (non-blocking)
-    const subsysCount = (text.match(/## Subsystems/) ? 1 : 0);
-    if (subsysCount === 0) {
+    // Use the parsed nodes to detect the fallback path, not the raw header.
+    // The ## Subsystems section may exist but be empty or filtered out.
+    const hasSubsystemNodes = nodes.some(n => n.kind === 'subsystem');
+    if (!hasSubsystemNodes) {
       // Fallback path: also load frameworks to enrich the hotspot/entry-point view
       setStatus(`Loaded ${nodes.length} nodes from hotspot/entry-point fallback. Fetching frameworks...`);
       const fwCount = await loadFrameworks(signal);
