@@ -1979,14 +1979,6 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    fn make_root_discovered(slug: &str, path: PathBuf) -> ExtractionEvent {
-        ExtractionEvent::RootDiscovered {
-            slug: slug.to_string(),
-            path,
-            lsp_only: false,
-        }
-    }
-
     /// Verify ManifestConsumer subscribes to RootDiscovered and emits nothing.
     #[test]
     fn test_manifest_consumer_subscription() {
@@ -2151,7 +2143,7 @@ mod tests {
     /// Verify build_builtin_bus registers consumers for all expected event kinds.
     #[test]
     fn test_builtin_bus_has_consumers_for_all_event_kinds() {
-        let (mut bus, _stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
+        let (bus, _stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
         // Derive the exact expected count to catch regressions when languages are added/removed.
         let lsp_count = crate::extract::EnricherRegistry::with_builtins()
             .supported_languages()
