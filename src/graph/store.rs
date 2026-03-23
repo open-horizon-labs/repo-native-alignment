@@ -52,7 +52,12 @@ pub const SCHEMA_VERSION: u32 = 18; // gRPC proto columns: parent_service, rpc_r
 /// stores `router_var` metadata on ApiEndpoint nodes, and the new post-extraction pass
 /// prepends `APIRouter(prefix=...)` values to `http_path`. Older caches lack the
 /// `router_var` field and unresolved paths must be re-extracted.
-pub const EXTRACTION_VERSION: u32 = 13;
+/// Bumped to 14 for idempotent FastAPI prefix rewrite (#528 followup): `apply_prefix()`
+/// now stores `http_path_local` (original local path) as an idempotency guard. Older
+/// cached nodes have a prefixed `http_path` but no `http_path_local`, so the pass would
+/// double-prefix them on the next run. Re-extraction ensures all ApiEndpoint nodes have
+/// the stable local path stored before the prefix is applied.
+pub const EXTRACTION_VERSION: u32 = 14;
 
 /// Arrow schema for the `symbols` table.
 ///
