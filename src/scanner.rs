@@ -272,10 +272,12 @@ impl PatternConfig {
 /// Default is `Warning` (store Error + Warning, filter Information + Hint).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum DiagnosticMinSeverity {
     /// Store only errors (severity 1).
     Error,
     /// Store errors and warnings (severity ≤ 2). **Default.**
+    #[default]
     Warning,
     /// Store errors, warnings, and information (severity ≤ 3).
     Information,
@@ -283,11 +285,6 @@ pub enum DiagnosticMinSeverity {
     Hint,
 }
 
-impl Default for DiagnosticMinSeverity {
-    fn default() -> Self {
-        Self::Warning
-    }
-}
 
 impl DiagnosticMinSeverity {
     /// Return the maximum LSP severity integer that should be stored.

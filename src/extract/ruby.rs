@@ -16,6 +16,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct RubyExtractor;
 
+impl Default for RubyExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RubyExtractor {
     pub fn new() -> Self {
         Self
@@ -55,8 +61,8 @@ fn collect_constant_assignments(
 ) {
     match node.kind() {
         "assignment" => {
-            if let Some(lhs) = node.child_by_field_name("left") {
-                if lhs.kind() == "constant" {
+            if let Some(lhs) = node.child_by_field_name("left")
+                && lhs.kind() == "constant" {
                     let name_str = lhs.utf8_text(source).unwrap_or("").trim().to_string();
                     if !name_str.is_empty() && name_str.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
                         let body = node.utf8_text(source).unwrap_or("").to_string();
@@ -96,7 +102,6 @@ fn collect_constant_assignments(
                         });
                     }
                 }
-            }
         }
         "class" | "singleton_class" | "module" => {
             // Track scope for qualified constant names

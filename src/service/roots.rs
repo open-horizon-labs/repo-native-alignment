@@ -1,6 +1,12 @@
 //! Workspace root listing with per-root scan stats and LSP status.
 
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
+
+/// Per-root stats: `(node_count, edge_count)`.
+type RootStats = HashMap<String, (usize, usize)>;
+/// Per-root detected languages.
+type RootLangsMap = HashMap<String, BTreeSet<String>>;
 
 use crate::server::state::{LspEnrichmentStatus, LspState};
 
@@ -59,13 +65,10 @@ pub fn list_roots_from_slugs(
 
     // Pre-compute per-root stats in a single pass over nodes and edges.
     // This keeps list_roots_from_slugs O(nodes + edges + roots) rather than O(roots × nodes).
-    let (root_stats, root_langs_map): (
-        std::collections::HashMap<String, (usize, usize)>,
-        std::collections::HashMap<String, std::collections::BTreeSet<String>>,
-    ) = if let Some(gs) = graph_state {
-        let mut node_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut edge_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut langs: std::collections::HashMap<String, std::collections::BTreeSet<String>> = std::collections::HashMap::new();
+    let (root_stats, root_langs_map): (RootStats, RootLangsMap) = if let Some(gs) = graph_state {
+        let mut node_counts: HashMap<String, usize> = HashMap::new();
+        let mut edge_counts: HashMap<String, usize> = HashMap::new();
+        let mut langs: HashMap<String, BTreeSet<String>> = HashMap::new();
         for n in &gs.nodes {
             *node_counts.entry(n.id.root.clone()).or_insert(0) += 1;
             langs.entry(n.id.root.clone()).or_default().insert(n.language.to_lowercase());
@@ -128,13 +131,12 @@ pub fn list_roots_from_slugs(
             }
 
             // LSP working line.
-            if lsp_complete {
-                if let Some(ref name) = lsp_server_name {
+            if lsp_complete
+                && let Some(ref name) = lsp_server_name {
                     // edge_count() returns all LSP-enriched edges (Calls, ReferencedBy, Implements, etc.)
                     line.push_str(&format!("\n  LSP: {} ({} edges)",
                         name, format_count(lsp_edge_count)));
                 }
-            }
 
             // Languages line — show detected languages for this root.
             let empty_langs = std::collections::BTreeSet::new();
@@ -197,7 +199,7 @@ fn format_count(n: usize) -> String {
     let mut result = String::new();
     let len = chars.len();
     for (i, ch) in chars.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
+        if i > 0 && (len - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(*ch);

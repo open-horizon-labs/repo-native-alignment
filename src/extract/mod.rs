@@ -266,7 +266,7 @@ impl ExtractorRegistry {
         let mut result = ExtractionResult::default();
 
         for extractor in &self.extractors {
-            if !extractor.extensions().iter().any(|e| *e == ext) {
+            if !extractor.extensions().contains(&ext) {
                 continue;
             }
             if !extractor.can_handle(path, content) {

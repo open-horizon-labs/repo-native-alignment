@@ -32,6 +32,7 @@
 //!
 //! 1. Implement `ExtractionConsumer`.
 //! 2. Register it in `EventBus::with_builtins()`.
+//!
 //! Done — no changes to `graph.rs` or `enrichment.rs`.
 //!
 //! # ADR audit constraints

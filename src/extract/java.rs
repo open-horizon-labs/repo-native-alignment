@@ -18,6 +18,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct JavaExtractor;
 
+impl Default for JavaExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JavaExtractor {
     pub fn new() -> Self {
         Self
@@ -76,9 +82,9 @@ fn collect_java_specials(
 
                 // Find the variable_declarator child for name/value
                 for i in 0..node.child_count() {
-                    if let Some(decl) = node.child(i as u32) {
-                        if decl.kind() == "variable_declarator" {
-                            if let Some(name_node) = decl.child_by_field_name("name") {
+                    if let Some(decl) = node.child(i as u32)
+                        && decl.kind() == "variable_declarator"
+                            && let Some(name_node) = decl.child_by_field_name("name") {
                                 let name = name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
                                 let sig = decl_text.lines().next().unwrap_or("").trim().to_string();
                                 let value_str = decl
@@ -113,8 +119,6 @@ fn collect_java_specials(
                                     source: ExtractionSource::TreeSitter,
                                 });
                             }
-                        }
-                    }
                 }
             }
         }

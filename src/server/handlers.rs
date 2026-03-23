@@ -329,7 +329,7 @@ fn group_by_first_hop(
     // Pre-compute reachability sets per first-hop neighbor to avoid O(N^2).
     let mut reachability_cache: std::collections::HashMap<String, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
-    for (_kind, fh_ids) in &first_hop {
+    for fh_ids in first_hop.values() {
         for fh_id in fh_ids {
             reachability_cache.entry(fh_id.clone()).or_insert_with(|| {
                 index.reachable(fh_id, 10, edge_filter)
@@ -351,13 +351,12 @@ fn group_by_first_hop(
             let mut assigned = false;
             for (kind, fh_ids) in &first_hop {
                 for fh_id in fh_ids {
-                    if let Some(reachable_set) = reachability_cache.get(fh_id) {
-                        if reachable_set.contains(id) {
+                    if let Some(reachable_set) = reachability_cache.get(fh_id)
+                        && reachable_set.contains(id) {
                             groups.entry(kind.clone()).or_default().push(id.clone());
                             assigned = true;
                             break;
                         }
-                    }
                 }
                 if assigned { break; }
             }

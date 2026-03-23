@@ -18,6 +18,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct CSharpExtractor;
 
+impl Default for CSharpExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CSharpExtractor {
     pub fn new() -> Self {
         Self
@@ -79,9 +85,9 @@ fn collect_csharp_specials(
                         // C# field_declaration -> variable_declaration -> variable_declarator
                         if child.kind() == "variable_declaration" {
                             for j in 0..child.child_count() {
-                                if let Some(decl) = child.child(j as u32) {
-                                    if decl.kind() == "variable_declarator" {
-                                        if let Some(name_node) = decl.child_by_field_name("name") {
+                                if let Some(decl) = child.child(j as u32)
+                                    && decl.kind() == "variable_declarator"
+                                        && let Some(name_node) = decl.child_by_field_name("name") {
                                             let name = name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
                                             let sig = decl_text.lines().next().unwrap_or("").trim().to_string();
                                             // Value may be in equals_value_clause
@@ -115,8 +121,6 @@ fn collect_csharp_specials(
                                                 source: ExtractionSource::TreeSitter,
                                             });
                                         }
-                                    }
-                                }
                             }
                         }
                     }

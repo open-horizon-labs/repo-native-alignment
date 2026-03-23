@@ -16,6 +16,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct PythonExtractor;
 
+impl Default for PythonExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PythonExtractor {
     pub fn new() -> Self {
         Self
@@ -54,9 +60,9 @@ fn collect_allcaps_consts(
 ) {
     if node.kind() == "expression_statement" {
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
-                if child.kind() == "assignment" {
-                    if let Some(lhs) = child.child_by_field_name("left") {
+            if let Some(child) = node.child(i as u32)
+                && child.kind() == "assignment"
+                    && let Some(lhs) = child.child_by_field_name("left") {
                         let name_str = lhs.utf8_text(source).unwrap_or("").trim().to_string();
                         if !name_str.is_empty()
                             && name_str.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
@@ -69,11 +75,10 @@ fn collect_allcaps_consts(
                             let body = child.utf8_text(source).unwrap_or("").to_string();
                             let signature = body.lines().next().unwrap_or("").trim().to_string();
                             let mut metadata = BTreeMap::new();
-                            if let Some(ref v) = value_str {
-                                if !v.starts_with('[') && !v.starts_with('{') && !v.starts_with('(') {
+                            if let Some(ref v) = value_str
+                                && !v.starts_with('[') && !v.starts_with('{') && !v.starts_with('(') {
                                     metadata.insert("value".to_string(), v.clone());
                                 }
-                            }
                             metadata.insert("synthetic".to_string(), "false".to_string());
                             nodes.push(Node {
                                 id: NodeId {
@@ -92,8 +97,6 @@ fn collect_allcaps_consts(
                             });
                         }
                     }
-                }
-            }
         }
     }
 

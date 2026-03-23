@@ -21,6 +21,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct CExtractor;
 
+impl Default for CExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CExtractor {
     pub fn new() -> Self {
         Self
@@ -62,11 +68,10 @@ fn extract_c_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
             .and_then(|n| extract_c_name(n, source)),
         "pointer_declarator" => {
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
-                    if let Some(name) = extract_c_name(child, source) {
+                if let Some(child) = node.child(i as u32)
+                    && let Some(name) = extract_c_name(child, source) {
                         return Some(name);
                     }
-                }
             }
             None
         }
@@ -81,9 +86,9 @@ fn collect_c_functions(
     source: &[u8],
     nodes: &mut Vec<Node>,
 ) {
-    if node.kind() == "function_definition" {
-        if let Some(declarator) = node.child_by_field_name("declarator") {
-            if let Some(name) = extract_c_name(declarator, source) {
+    if node.kind() == "function_definition"
+        && let Some(declarator) = node.child_by_field_name("declarator")
+            && let Some(name) = extract_c_name(declarator, source) {
                 let body = node.utf8_text(source).unwrap_or("").to_string();
                 let sig = body.lines().next().unwrap_or("").trim().to_string();
 
@@ -103,8 +108,6 @@ fn collect_c_functions(
                     source: ExtractionSource::TreeSitter,
                 });
             }
-        }
-    }
 
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {

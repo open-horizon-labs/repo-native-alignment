@@ -21,6 +21,12 @@ use super::{ExtractionResult, Extractor};
 /// Protobuf schema extractor using line-based parsing.
 pub struct ProtoExtractor;
 
+impl Default for ProtoExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProtoExtractor {
     pub fn new() -> Self {
         Self
@@ -147,8 +153,9 @@ impl Extractor for ProtoExtractor {
                     let block_start = i;
                     let block_end = find_block_end(&lines, i);
                     // Emit each enum value as a Const
-                    for j in (block_start + 1)..block_end {
-                        let ev_line = lines[j].trim();
+                    for (j, ev_line_raw) in lines.get((block_start + 1)..block_end).unwrap_or(&[]).iter().enumerate() {
+                        let j = block_start + 1 + j;
+                        let ev_line = ev_line_raw.trim();
                         if ev_line.is_empty() || ev_line.starts_with("//") || ev_line.starts_with("option ") {
                             continue;
                         }
@@ -299,8 +306,9 @@ fn extract_message_fields(
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
 ) {
-    for j in start..end {
-        let field_line = lines[j].trim();
+    for (j_offset, field_line_raw) in lines.get(start..end).unwrap_or(&[]).iter().enumerate() {
+        let j = start + j_offset;
+        let field_line = field_line_raw.trim();
         // Skip empty lines, comments, closing braces, nested messages, options
         if field_line.is_empty()
             || field_line.starts_with("//")
@@ -381,8 +389,9 @@ fn extract_rpc_methods(
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
 ) {
-    for j in start..end {
-        let rpc_line = lines[j].trim();
+    for (j_offset, rpc_line_raw) in lines.get(start..end).unwrap_or(&[]).iter().enumerate() {
+        let j = start + j_offset;
+        let rpc_line = rpc_line_raw.trim();
         if !rpc_line.starts_with("rpc ") {
             continue;
         }

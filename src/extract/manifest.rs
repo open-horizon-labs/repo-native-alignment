@@ -90,47 +90,43 @@ fn scan_root(root_slug: &str, root_path: &Path) -> ManifestResult {
     for dir in &candidate_dirs {
         // JS / TypeScript
         let pkg_json = dir.join("package.json");
-        if pkg_json.exists() {
-            if let Ok(content) = std::fs::read_to_string(&pkg_json) {
+        if pkg_json.exists()
+            && let Ok(content) = std::fs::read_to_string(&pkg_json) {
                 let manifest_file = relative_to(root_path, &pkg_json);
                 let (n, e) = parse_package_json(&content, &manifest_file, root_slug);
                 nodes.extend(n);
                 edges.extend(e);
             }
-        }
 
         // Python — pyproject.toml
         let pyproject = dir.join("pyproject.toml");
-        if pyproject.exists() {
-            if let Ok(content) = std::fs::read_to_string(&pyproject) {
+        if pyproject.exists()
+            && let Ok(content) = std::fs::read_to_string(&pyproject) {
                 let manifest_file = relative_to(root_path, &pyproject);
                 let (n, e) = parse_pyproject_toml(&content, &manifest_file, root_slug);
                 nodes.extend(n);
                 edges.extend(e);
             }
-        }
 
         // Python — requirements.txt
         let requirements = dir.join("requirements.txt");
-        if requirements.exists() {
-            if let Ok(content) = std::fs::read_to_string(&requirements) {
+        if requirements.exists()
+            && let Ok(content) = std::fs::read_to_string(&requirements) {
                 let manifest_file = relative_to(root_path, &requirements);
                 let (n, e) = parse_requirements_txt(&content, &manifest_file, root_slug);
                 nodes.extend(n);
                 edges.extend(e);
             }
-        }
 
         // Go — go.mod
         let go_mod = dir.join("go.mod");
-        if go_mod.exists() {
-            if let Ok(content) = std::fs::read_to_string(&go_mod) {
+        if go_mod.exists()
+            && let Ok(content) = std::fs::read_to_string(&go_mod) {
                 let manifest_file = relative_to(root_path, &go_mod);
                 let (n, e) = parse_go_mod(&content, &manifest_file, root_slug);
                 nodes.extend(n);
                 edges.extend(e);
             }
-        }
     }
 
     ManifestResult { nodes, edges }
@@ -535,8 +531,8 @@ pub fn parse_go_mod(
     for line in content.lines() {
         let trimmed = line.trim();
 
-        if trimmed.starts_with("module ") {
-            let path = trimmed["module ".len()..].trim();
+        if let Some(path_str) = trimmed.strip_prefix("module ") {
+            let path = path_str.trim();
             // Use the full module path as the node name (e.g. "github.com/foo/bar").
             module_name = path.to_string();
         } else if trimmed == "require (" {
@@ -550,9 +546,9 @@ pub fn parse_go_mod(
                     deps.push(dep);
                 }
             }
-        } else if trimmed.starts_with("require ") {
+        } else if let Some(rest_str) = trimmed.strip_prefix("require ") {
             // Single-line require: `require github.com/foo/bar v1.0.0`
-            let rest = trimmed["require ".len()..].trim();
+            let rest = rest_str.trim();
             if let Some(dep) = parse_go_require_line(rest) {
                 deps.push(dep);
             }

@@ -20,6 +20,12 @@ use super::{ExtractionResult, Extractor};
 /// TypeScript tree-sitter extractor (handles .ts and .tsx files).
 pub struct TypeScriptExtractor;
 
+impl Default for TypeScriptExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TypeScriptExtractor {
     pub fn new() -> Self {
         Self
@@ -96,7 +102,7 @@ fn build_arrow_signature(
     let return_type = value_node
         .child_by_field_name("return_type")
         .and_then(|rt| rt.utf8_text(source).ok())
-        .map(|s| format!("{}", s.trim()))
+        .map(|s| s.trim().to_string())
         .unwrap_or_default();
 
     if value_kind == "arrow_function" {
@@ -206,8 +212,8 @@ fn emit_ts_type_edges(
     // Parameter types: walk formal_parameters children looking for type annotations
     if let Some(params) = value_node.child_by_field_name("parameters") {
         for i in 0..params.child_count() {
-            if let Some(param) = params.child(i as u32) {
-                if let Some(tn) = param.child_by_field_name("type") {
+            if let Some(param) = params.child(i as u32)
+                && let Some(tn) = param.child_by_field_name("type") {
                     let type_text = tn.utf8_text(source).unwrap_or("");
                     // type_requires_uppercase = true for TypeScript
                     if let Some(type_name) = extract_user_type(type_text, true) {
@@ -225,7 +231,6 @@ fn emit_ts_type_edges(
                         });
                     }
                 }
-            }
         }
     }
 
@@ -293,9 +298,9 @@ fn collect_ts_specials(
             };
 
             for i in 0..node.child_count() {
-                if let Some(decl) = node.child(i as u32) {
-                    if decl.kind() == "variable_declarator" {
-                        if let Some(name_node) = decl.child_by_field_name("name") {
+                if let Some(decl) = node.child(i as u32)
+                    && decl.kind() == "variable_declarator"
+                        && let Some(name_node) = decl.child_by_field_name("name") {
                             let name_str =
                                 name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
                             // Skip destructuring patterns
@@ -412,8 +417,6 @@ fn collect_ts_specials(
                                 }
                             }
                         }
-                    }
-                }
             }
         }
         "import_statement" => {
@@ -609,7 +612,7 @@ fn collect_ts_specials(
                     let return_type = value_n
                         .child_by_field_name("return_type")
                         .and_then(|rt| rt.utf8_text(source).ok())
-                        .map(|s| format!("{}", s.trim()))
+                        .map(|s| s.trim().to_string())
                         .unwrap_or_default();
 
                     let signature = if value_n.kind() == "arrow_function" {
@@ -644,9 +647,9 @@ fn collect_ts_specials(
                     }
 
                     // Determine parent scope (class name) and emit Defines edge
-                    if let Some(class_node) = find_ancestor_class(node) {
-                        if let Some(class_name_node) = class_node.child_by_field_name("name") {
-                            if let Ok(class_name) = class_name_node.utf8_text(source) {
+                    if let Some(class_node) = find_ancestor_class(node)
+                        && let Some(class_name_node) = class_node.child_by_field_name("name")
+                            && let Ok(class_name) = class_name_node.utf8_text(source) {
                                 metadata.insert(
                                     "parent_scope".to_string(),
                                     class_name.to_string(),
@@ -659,8 +662,6 @@ fn collect_ts_specials(
                                     edges,
                                 );
                             }
-                        }
-                    }
 
                     // Emit DependsOn edges for parameter/return types
                     emit_ts_type_edges(path, &name_str, value_n, source, edges);

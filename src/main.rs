@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    Setup(SetupArgs), Test(TestArgs), Scan(ScanArgs), Search(SearchArgs), Graph(GraphArgs), Stats(StatsArgs),
+    Setup(SetupArgs), Test(TestArgs), Scan(ScanArgs), Search(Box<SearchArgs>), Graph(GraphArgs), Stats(StatsArgs),
     /// Track progress on a business outcome
     OutcomeProgress(OutcomeProgressCli),
     /// List configured workspace roots

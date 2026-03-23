@@ -90,8 +90,8 @@ async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchCon
         sections.push(format!("### Code symbols ({} result(s))\n\n{}", matches.len(), md));
     }
 
-    if params.include_artifacts && !query_str.is_empty() {
-        if let Some(embed_idx) = ctx.embed_index {
+    if params.include_artifacts && !query_str.is_empty()
+        && let Some(embed_idx) = ctx.embed_index {
             match embed_idx.search_with_mode(query_str, params.artifact_types.as_deref(), limit, search_mode).await {
                 Ok(SearchOutcome::Results(results)) => {
                     let filtered: Vec<_> = results.into_iter()
@@ -107,10 +107,9 @@ async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchCon
                 Err(e) => sections.push(format!("Artifact search error: {}", e)),
             }
         }
-    }
 
-    if params.include_markdown && !query_str.is_empty() {
-        if let Ok(chunks) = crate::markdown::extract_markdown_chunks(ctx.repo_root) {
+    if params.include_markdown && !query_str.is_empty()
+        && let Ok(chunks) = crate::markdown::extract_markdown_chunks(ctx.repo_root) {
             let filtered_chunks: Vec<_> = if let Some(ref slug) = ctx.root_filter {
                 let workspace = crate::roots::WorkspaceConfig::load().with_primary_root(ctx.repo_root.to_path_buf()).with_worktrees(ctx.repo_root).with_claude_memory(ctx.repo_root).with_agent_memories(ctx.repo_root).with_declared_roots(ctx.repo_root);
                 let root_path = workspace.resolved_roots().into_iter().find(|r| r.slug.eq_ignore_ascii_case(slug)).map(|r| r.path);
@@ -122,7 +121,6 @@ async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchCon
                 sections.push(format!("### Markdown ({} result(s))\n\n{}", scored.len().min(limit), md));
             }
         }
-    }
 
     let freshness = format_freshness_full(graph_state.nodes.len(), graph_state.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
     if sections.is_empty() { format!("No results matching \"{}\".{}", query_str, freshness) }
@@ -172,11 +170,11 @@ async fn flat_code_symbol_search<'a>(
     // Closure: does a node pass path/name + all active filters?
     let node_passes_filters = |n: &Node| -> bool {
         if complexity_search && n.id.kind != NodeKind::Function { return false; }
-        if let Some(ref kf) = params.kind { if n.id.kind.to_string().to_lowercase() != kf.to_lowercase() { return false; } }
-        if let Some(ref lf) = params.language { if n.language.to_lowercase() != lf.to_lowercase() { return false; } }
-        if let Some(ref ff) = params.file { if !n.id.file.to_string_lossy().contains(ff.as_str()) { return false; } }
+        if let Some(ref kf) = params.kind && n.id.kind.to_string().to_lowercase() != kf.to_lowercase() { return false; }
+        if let Some(ref lf) = params.language && n.language.to_lowercase() != lf.to_lowercase() { return false; }
+        if let Some(ref ff) = params.file && !n.id.file.to_string_lossy().contains(ff.as_str()) { return false; }
         if !node_passes_root_filter(&n.id.root, &ctx.root_filter, &ctx.non_code_slugs) { return false; }
-        if let Some(sf) = params.synthetic { if (n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false)) != sf { return false; } }
+        if let Some(sf) = params.synthetic && (n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false)) != sf { return false; }
         if let Some(min_cc) = params.min_complexity {
             let Some(cc) = n.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()) else { return false; };
             if cc < min_cc { return false; }
@@ -761,11 +759,10 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
             let mut seen: HashSet<&str> = HashSet::new();
             for ids in merged_groups.values() {
                 for id in ids {
-                    if let Some(node) = gs.node_by_stable_id(id, &node_index_map) {
-                        if !crate::server::helpers::is_hidden_traversal_kind(&node.id.kind) {
+                    if let Some(node) = gs.node_by_stable_id(id, &node_index_map)
+                        && !crate::server::helpers::is_hidden_traversal_kind(&node.id.kind) {
                             seen.insert(id.as_str());
                         }
-                    }
                 }
             }
             seen.len()
@@ -1049,15 +1046,12 @@ fn resolve_entry_points_by_name<'a>(
         }
 
         // Apply filters (kind, language, file, root).
-        if let Some(ref kf) = params.kind {
-            if n.id.kind.to_string().to_lowercase() != kf.to_lowercase() { return false; }
-        }
-        if let Some(ref lf) = params.language {
-            if n.language.to_lowercase() != lf.to_lowercase() { return false; }
-        }
-        if let Some(ref ff) = params.file {
-            if !n.id.file.to_string_lossy().contains(ff.as_str()) { return false; }
-        }
+        if let Some(ref kf) = params.kind
+            && n.id.kind.to_string().to_lowercase() != kf.to_lowercase() { return false; }
+        if let Some(ref lf) = params.language
+            && n.language.to_lowercase() != lf.to_lowercase() { return false; }
+        if let Some(ref ff) = params.file
+            && !n.id.file.to_string_lossy().contains(ff.as_str()) { return false; }
         if !node_passes_root_filter(&n.id.root, &ctx.root_filter, &ctx.non_code_slugs) {
             return false;
         }

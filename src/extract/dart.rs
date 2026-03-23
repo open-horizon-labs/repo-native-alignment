@@ -13,6 +13,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct DartExtractor;
 
+impl Default for DartExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DartExtractor {
     pub fn new() -> Self {
         Self

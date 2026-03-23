@@ -372,15 +372,14 @@ pub(crate) async fn get_stored_root_ids(repo_root: &Path) -> anyhow::Result<Vec<
         let batches: Vec<arrow_array::RecordBatch> = stream.try_collect().await?;
 
         for batch in &batches {
-            if let Some(col) = batch.column_by_name("root_id") {
-                if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+            if let Some(col) = batch.column_by_name("root_id")
+                && let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
                     for i in 0..arr.len() {
                         if !arr.is_null(i) {
                             root_ids.insert(arr.value(i).to_string());
                         }
                     }
                 }
-            }
         }
     }
 
@@ -415,15 +414,14 @@ pub(crate) async fn delete_nodes_for_roots(repo_root: &Path, slugs: &[String]) -
 
     // Delete from all tables that carry a root_id column.
     for table_name in ["symbols", "edges", "file_index", "pr_merges"] {
-        if let Ok(tbl) = db.open_table(table_name).execute().await {
-            if let Err(e) = tbl.delete(&predicate).await {
+        if let Ok(tbl) = db.open_table(table_name).execute().await
+            && let Err(e) = tbl.delete(&predicate).await {
                 tracing::warn!(
                     "Failed to delete {} for removed worktrees: {}",
                     table_name,
                     e
                 );
             }
-        }
     }
 
     tracing::info!(
@@ -987,8 +985,8 @@ pub(crate) async fn persist_graph_incremental(
     // ── Symbols (nodes) table: delete then upsert ──
     {
         // 1. Delete symbols for removed/changed files first so upsert is clean.
-        if !deleted_files.is_empty() {
-            if let Ok(tbl) = db.open_table("symbols").execute().await {
+        if !deleted_files.is_empty()
+            && let Ok(tbl) = db.open_table("symbols").execute().await {
                 let quoted: Vec<String> = deleted_files
                     .iter()
                     .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
@@ -998,7 +996,6 @@ pub(crate) async fn persist_graph_incremental(
                     tracing::warn!("Failed to delete symbols for removed files: {}", e);
                 }
             }
-        }
 
         // 2. Upsert changed/added nodes (insert new, update existing by stable id).
         if !upsert_nodes.is_empty() {
@@ -1058,8 +1055,8 @@ pub(crate) async fn persist_graph_incremental(
     // ── Edges table: delete then upsert ──
     {
         // 1. Delete edges that referenced removed/changed files (by stable edge ID).
-        if !deleted_edge_ids.is_empty() {
-            if let Ok(tbl) = db.open_table("edges").execute().await {
+        if !deleted_edge_ids.is_empty()
+            && let Ok(tbl) = db.open_table("edges").execute().await {
                 let quoted: Vec<String> = deleted_edge_ids
                     .iter()
                     .map(|id| format!("'{}'", id.replace('\'', "''")))
@@ -1069,7 +1066,6 @@ pub(crate) async fn persist_graph_incremental(
                     tracing::warn!("Failed to delete edges for removed files: {}", e);
                 }
             }
-        }
 
         // 2. Upsert changed/added edges.
         if !upsert_edges.is_empty() {
@@ -1259,192 +1255,164 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 let file_path = PathBuf::from(file_paths.value(i));
                 let language = infer_language_from_path(&file_path);
                 let mut metadata: BTreeMap<String, String> = BTreeMap::new();
-                if let Some(col) = meta_virtual_col {
-                    if !col.is_null(i) && col.value(i) {
+                if let Some(col) = meta_virtual_col
+                    && !col.is_null(i) && col.value(i) {
                         metadata.insert("virtual".to_string(), "true".to_string());
                     }
-                }
-                if let Some(col) = meta_package_col {
-                    if !col.is_null(i) {
+                if let Some(col) = meta_package_col
+                    && !col.is_null(i) {
                         metadata.insert("package".to_string(), col.value(i).to_string());
                     }
-                }
-                if let Some(col) = meta_name_col_col {
-                    if !col.is_null(i) {
+                if let Some(col) = meta_name_col_col
+                    && !col.is_null(i) {
                         metadata.insert("name_col".to_string(), col.value(i).to_string());
                     }
-                }
-                if let Some(col) = value_col {
-                    if !col.is_null(i) {
+                if let Some(col) = value_col
+                    && !col.is_null(i) {
                         metadata.insert("value".to_string(), col.value(i).to_string());
                     }
-                }
-                if let Some(col) = synthetic_col {
-                    if !col.is_null(i) {
+                if let Some(col) = synthetic_col
+                    && !col.is_null(i) {
                         metadata.insert("synthetic".to_string(), if col.value(i) { "true" } else { "false" }.to_string());
                     }
-                }
-                if let Some(col) = cyclomatic_col {
-                    if !col.is_null(i) {
+                if let Some(col) = cyclomatic_col
+                    && !col.is_null(i) {
                         metadata.insert("cyclomatic".to_string(), col.value(i).to_string());
                     }
-                }
-                if let Some(col) = importance_col {
-                    if !col.is_null(i) {
+                if let Some(col) = importance_col
+                    && !col.is_null(i) {
                         metadata.insert("importance".to_string(), format!("{:.6}", col.value(i)));
                     }
-                }
-                if let Some(col) = storage_col {
-                    if !col.is_null(i) {
+                if let Some(col) = storage_col
+                    && !col.is_null(i) {
                         metadata.insert("storage".to_string(), col.value(i).to_string());
                     }
-                }
-                if let Some(col) = mutable_col {
-                    if !col.is_null(i) && col.value(i) {
+                if let Some(col) = mutable_col
+                    && !col.is_null(i) && col.value(i) {
                         metadata.insert("mutable".to_string(), "true".to_string());
                     }
-                }
-                if let Some(col) = decorators_col {
-                    if !col.is_null(i) {
+                if let Some(col) = decorators_col
+                    && !col.is_null(i) {
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("decorators".to_string(), val.to_string());
                         }
                     }
-                }
-                if let Some(col) = type_params_col {
-                    if !col.is_null(i) {
+                if let Some(col) = type_params_col
+                    && !col.is_null(i) {
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("type_params".to_string(), val.to_string());
                         }
                     }
-                }
-                if let Some(col) = pattern_hint_col {
-                    if !col.is_null(i) {
+                if let Some(col) = pattern_hint_col
+                    && !col.is_null(i) {
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("pattern_hint".to_string(), val.to_string());
                         }
                     }
-                }
-                if let Some(col) = is_static_col {
-                    if !col.is_null(i) {
+                if let Some(col) = is_static_col
+                    && !col.is_null(i) {
                         metadata.insert("is_static".to_string(), if col.value(i) { "true" } else { "false" }.to_string());
                     }
-                }
-                if let Some(col) = is_async_col {
-                    if !col.is_null(i) && col.value(i) {
+                if let Some(col) = is_async_col
+                    && !col.is_null(i) && col.value(i) {
                         metadata.insert("is_async".to_string(), "true".to_string());
                     }
-                }
-                if let Some(col) = is_test_col {
-                    if !col.is_null(i) && col.value(i) {
+                if let Some(col) = is_test_col
+                    && !col.is_null(i) && col.value(i) {
                         metadata.insert("is_test".to_string(), "true".to_string());
                     }
-                }
-                if let Some(col) = visibility_col {
-                    if !col.is_null(i) {
+                if let Some(col) = visibility_col
+                    && !col.is_null(i) {
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("visibility".to_string(), val.to_string());
                         }
                     }
-                }
-                if let Some(col) = exported_col {
-                    if !col.is_null(i) && col.value(i) {
+                if let Some(col) = exported_col
+                    && !col.is_null(i) && col.value(i) {
                         metadata.insert("exported".to_string(), "true".to_string());
                     }
-                }
-                if let Some(col) = diag_severity_col {
-                    if !col.is_null(i) {
+                if let Some(col) = diag_severity_col
+                    && !col.is_null(i) {
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("diagnostic_severity".to_string(), val.to_string());
                         }
                     }
-                }
-                if let Some(col) = diag_source_col {
-                    if !col.is_null(i) {
+                if let Some(col) = diag_source_col
+                    && !col.is_null(i) {
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("diagnostic_source".to_string(), val.to_string());
                         }
                     }
-                }
-                if let Some(col) = diag_message_col {
-                    if !col.is_null(i) {
+                if let Some(col) = diag_message_col
+                    && !col.is_null(i) {
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("diagnostic_message".to_string(), val.to_string());
                         }
                     }
-                }
-                if let Some(col) = diag_range_col {
-                    if !col.is_null(i) {
+                if let Some(col) = diag_range_col
+                    && !col.is_null(i) {
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("diagnostic_range".to_string(), val.to_string());
                         }
                     }
-                }
-                if let Some(col) = diag_timestamp_col {
-                    if !col.is_null(i) {
+                if let Some(col) = diag_timestamp_col
+                    && !col.is_null(i) {
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("diagnostic_timestamp".to_string(), val.to_string());
                         }
                     }
-                }
-                if let Some(col) = http_method_col {
-                    if !col.is_null(i) {
+                if let Some(col) = http_method_col
+                    && !col.is_null(i) {
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("http_method".to_string(), val.to_string());
                         }
                     }
-                }
-                if let Some(col) = http_path_col {
-                    if !col.is_null(i) {
+                if let Some(col) = http_path_col
+                    && !col.is_null(i) {
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("http_path".to_string(), val.to_string());
                         }
                     }
-                }
-                if let Some(col) = doc_comment_col {
-                    if !col.is_null(i) {
+                if let Some(col) = doc_comment_col
+                    && !col.is_null(i) {
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("doc_comment".to_string(), val.to_string());
                         }
                     }
-                }
                 // gRPC / proto columns — restore metadata for GrpcClientCallsPass (#466)
-                if let Some(col) = parent_service_col {
-                    if !col.is_null(i) {
+                if let Some(col) = parent_service_col
+                    && !col.is_null(i) {
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("parent_service".to_string(), val.to_string());
                         }
                     }
-                }
-                if let Some(col) = rpc_request_type_col {
-                    if !col.is_null(i) {
+                if let Some(col) = rpc_request_type_col
+                    && !col.is_null(i) {
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("request_type".to_string(), val.to_string());
                         }
                     }
-                }
-                if let Some(col) = rpc_response_type_col {
-                    if !col.is_null(i) {
+                if let Some(col) = rpc_response_type_col
+                    && !col.is_null(i) {
                         let val = col.value(i);
                         if !val.is_empty() {
                             metadata.insert("response_type".to_string(), val.to_string());
                         }
                     }
-                }
                 nodes.push(Node {
                     id: NodeId {
                         root: root_ids.value(i).to_string(),

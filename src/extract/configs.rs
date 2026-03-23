@@ -21,7 +21,7 @@ use super::query::RouteQueryConfig;
 /// - `@app.route("/path")`
 /// - `@router.get("/path")`
 /// - `@app.post("/path")`
-/// etc.
+/// - etc.
 ///
 /// The `@name` capture is the full function (attribute access or identifier),
 /// and `@path` is the first string argument.

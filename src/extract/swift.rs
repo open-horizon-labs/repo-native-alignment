@@ -16,6 +16,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct SwiftExtractor;
 
+impl Default for SwiftExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SwiftExtractor {
     pub fn new() -> Self {
         Self
@@ -55,8 +61,8 @@ fn collect_let_consts(
     if node.kind() == "property_declaration" {
         let decl_text = node.utf8_text(source).unwrap_or("").to_string();
         // Only module-level (no class scope) `let` bindings
-        if decl_text.trim_start().starts_with("let ") && !has_class_ancestor(node) {
-            if let Some(name_node) = node.child_by_field_name("name") {
+        if decl_text.trim_start().starts_with("let ") && !has_class_ancestor(node)
+            && let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
                 let sig = decl_text.lines().next().unwrap_or("").trim().to_string();
                 let value_str = decl_text.find('=')
@@ -89,7 +95,6 @@ fn collect_let_consts(
                 });
                 return;
             }
-        }
     }
 
     for i in 0..node.child_count() {
