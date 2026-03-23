@@ -250,6 +250,73 @@ check "EventBus trait exists (#479)" \
 check "Pipeline references EventBus (#502)" \
   "grep -r 'EventBus\|PostExtractionConsumer\|RootDiscovered' $RNA_REPO/src/server/graph.rs 2>/dev/null | wc -l" "[1-9]"
 
+# ── FASTAPI ROUTER PREFIX PASS (#519) ─────────────────────────────────────
+echo "" && echo "--- FastAPI Router Prefix Pass (#519) ---"
+check "FastapiRouterPrefixPass struct defined (#519)" \
+  "grep -r 'FastapiRouterPrefixPass\|fastapi_router_prefix' $RNA_REPO/src/ 2>/dev/null | grep -v test | wc -l" "[1-9]"
+check "FastapiRouterPrefixPass registered in with_builtins (#519)" \
+  "grep -r 'FastapiRouterPrefixPass' $RNA_REPO/src/extract/post_extraction.rs 2>/dev/null | wc -l" "^1$"
+check "EXTRACTION_VERSION >= 13 for router_var metadata (#519)" \
+  "grep 'EXTRACTION_VERSION' $RNA_REPO/src/graph/store.rs | grep -o '[0-9]*' | tail -1" "1[3-9]\|[2-9][0-9]"
+check "router_var metadata extracted in generic.rs (#519)" \
+  "grep -c 'router_var' $RNA_REPO/src/extract/generic.rs 2>/dev/null" "[1-9]"
+
+# ── SKIP WORKTREES WITH OWN CACHE (#524) ─────────────────────────────────
+echo "" && echo "--- Skip Worktrees with Own Cache (#524) ---"
+check "is_worktree_with_own_cache defined in walk.rs (#524)" \
+  "grep -c 'is_worktree_with_own_cache' $RNA_REPO/src/extract/walk.rs 2>/dev/null" "[1-9]"
+check "worktree skip called from scanner.rs (#524)" \
+  "grep -c 'is_worktree_with_own_cache\|skip.*worktree\|worktree.*skip' $RNA_REPO/src/extract/scanner.rs 2>/dev/null || grep -c 'is_worktree_with_own_cache' $RNA_REPO/src/extract/walk.rs 2>/dev/null" "[1-9]"
+
+# ── SCANSTATSCONSUMER / LIVE LIST_ROOTS (#527) ────────────────────────────
+echo "" && echo "--- ScanStatsConsumer / live list_roots (#527) ---"
+check "ScanStatsConsumer struct defined (#527)" \
+  "grep -r 'struct ScanStatsConsumer\|pub struct ScanStats' $RNA_REPO/src/ 2>/dev/null | wc -l" "[1-9]"
+check "build_builtin_bus returns scan_stats handle (#527)" \
+  "grep -c 'scan_stats\|ScanStats' $RNA_REPO/src/extract/consumers.rs 2>/dev/null" "[1-9]"
+check "list_roots uses scan_stats (#527)" \
+  "grep -c 'scan_stats\|ScanStats' $RNA_REPO/src/service/roots.rs 2>/dev/null || grep -c 'scan_stats' $RNA_REPO/src/server/handlers.rs 2>/dev/null" "[1-9]"
+check "list-roots output contains timing or slug (#527)" \
+  "repo-native-alignment list-roots --repo $RNA_REPO 2>/dev/null" "slug\|scan\|ago\|symbol"
+
+# ── LSPCONSUMER SINGLETON + ALLENRICHMENTSGATE (#528) ─────────────────────
+echo "" && echo "--- LspConsumer singleton + AllEnrichmentsGate (#528) ---"
+check "LspConsumer holds Arc<dyn Enricher> (#528)" \
+  "grep -c 'Arc.*dyn.*Enricher\|Arc<dyn Enricher>' $RNA_REPO/src/extract/consumers.rs 2>/dev/null" "[1-9]"
+check "AllEnrichmentsGate struct defined (#528)" \
+  "grep -c 'AllEnrichmentsGate\|struct AllEnrichments' $RNA_REPO/src/extract/consumers.rs 2>/dev/null" "[1-9]"
+check "AllEnrichmentsDone event defined (#528)" \
+  "grep -c 'AllEnrichmentsDone' $RNA_REPO/src/extract/event_bus.rs 2>/dev/null" "[1-9]"
+check "PostExtractionConsumer subscribes to AllEnrichmentsDone (#528)" \
+  "grep -A5 'fn subscribes_to.*PostExtraction\|PostExtractionConsumer' $RNA_REPO/src/extract/consumers.rs 2>/dev/null | grep -c 'AllEnrichmentsDone'" "[1-9]"
+
+# ── EMBEDDINGINDEXERCONSUMER + LANCEDBCONSUMER FROM STUBS (#530) ──────────
+echo "" && echo "--- EmbeddingIndexerConsumer + LanceDBConsumer from stubs (#530) ---"
+check "EmbeddingIndexerConsumer::new defined (#530)" \
+  "grep -c 'fn new.*EmbeddingIndex\|EmbeddingIndexerConsumer.*new\|impl EmbeddingIndexerConsumer' $RNA_REPO/src/extract/consumers.rs 2>/dev/null" "[1-9]"
+check "EmbeddingIndexerConsumer::stub defined (#530)" \
+  "grep -c 'fn stub\|stub()' $RNA_REPO/src/extract/consumers.rs 2>/dev/null" "[1-9]"
+check "All production lance_repo_root opts are None (#530)" \
+  "grep -c 'BusOptions\|lance_repo_root.*None\|embed_idx.*None' $RNA_REPO/src/server/graph.rs 2>/dev/null" "[1-9]"
+
+# ── FASTAPI PREFIX IDEMPOTENCY + EXTRACTION_VERSION BUMP (#531) ───────────
+echo "" && echo "--- FastAPI prefix idempotency + EXTRACTION_VERSION bump (#531) ---"
+check "EXTRACTION_VERSION >= 14 for http_path_local field (#531)" \
+  "grep 'EXTRACTION_VERSION' $RNA_REPO/src/graph/store.rs | grep -o '[0-9]*' | tail -1" "1[4-9]\|[2-9][0-9]"
+check "http_path_local stored for idempotency (#531)" \
+  "grep -c 'http_path_local' $RNA_REPO/src/extract/fastapi_router_prefix.rs 2>/dev/null" "[1-9]"
+check "FastapiRouterPrefixPass registered exactly once in with_builtins (#531)" \
+  "grep -c 'FastapiRouterPrefixPass' $RNA_REPO/src/extract/post_extraction.rs 2>/dev/null" "^1$"
+
+# ── CONTENT-ADDRESSED CONSUMER CACHE (#526/#533) ─────────────────────────
+echo "" && echo "--- Content-addressed consumer cache (#526) ---"
+check "ConsumerCacheKey struct defined (#526)" \
+  "grep -c 'ConsumerCacheKey\|struct.*CacheKey' $RNA_REPO/src/extract/cache.rs 2>/dev/null" "[1-9]"
+check "ExtractionConsumer::version() trait method (#526)" \
+  "grep -c 'fn version.*u64\|version().*u64' $RNA_REPO/src/extract/event_bus.rs 2>/dev/null" "[1-9]"
+check "EventBus has cache HashMap (#526)" \
+  "grep -c 'cache.*HashMap\|HashMap.*cache\|consumer_cache' $RNA_REPO/src/extract/event_bus.rs 2>/dev/null" "[1-9]"
+
 echo ""
 echo "=== RESULTS: $PASS passed, $FAIL failed, $SKIP skipped ==="
 if [ "$FAIL" -eq 0 ]; then
