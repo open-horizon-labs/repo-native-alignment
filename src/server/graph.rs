@@ -591,12 +591,26 @@ impl RnaHandler {
         //
         // ADR Constraint 4: no direct pass function calls in src/server/.
         {
+            // Non-lsp-only roots for tree-sitter extraction context.
             let root_pairs: Vec<(String, std::path::PathBuf)> = workspace
                 .resolved_roots()
                 .iter()
+                .filter(|r| !r.config.lsp_only)
+                .map(|r| (r.slug.clone(), r.path.clone()))
+                .collect();
+            // lsp_only roots are passed separately so LspConsumer and PostExtractionConsumer
+            // can reach them. build_builtin_bus combines them for nextjs_routing_pass and
+            // manifest_pass (path-based passes that must scan all roots including lsp_only
+            // subdirectory roots, e.g. client/ for Next.js ApiEndpoint nodes).
+            let lsp_only_roots: Vec<(String, std::path::PathBuf)> = workspace
+                .resolved_roots()
+                .iter()
+                .filter(|r| r.config.lsp_only)
                 .map(|r| (r.slug.clone(), r.path.clone()))
                 .collect();
             let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
+            // Mark LSP as running before the (potentially slow) bus call.
+            self.lsp_status.set_running();
             let (enriched_nodes, enriched_edges, detected_frameworks) =
                 crate::extract::consumers::run_post_passes_via_bus(
                     all_nodes,
@@ -604,10 +618,20 @@ impl RnaHandler {
                     root_pairs,
                     primary_slug,
                     self.repo_root.clone(),
+                    lsp_only_roots,
                 )?;
             all_nodes = enriched_nodes;
             all_edges = enriched_edges;
             all_detected_frameworks = detected_frameworks;
+            // LSP enrichment ran synchronously inside the bus. Count LSP edges.
+            let lsp_edge_count = all_edges.iter()
+                .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
+                .count();
+            if lsp_edge_count > 0 {
+                self.lsp_status.set_complete(lsp_edge_count);
+            } else {
+                self.lsp_status.set_unavailable();
+            }
         }
 
         // Dedup immediately after post-extraction passes so the graph index,
@@ -885,7 +909,10 @@ impl RnaHandler {
         };
 
         if spawn_background {
-            self.spawn_background_enrichment(&all_nodes);
+            // LSP enrichment now runs synchronously through the event bus (LspConsumer
+            // via block_in_place) before we reach this point — run_post_passes_via_bus
+            // above includes LSP in its pipeline. Only embedding is deferred to background.
+            self.spawn_background_embedding(&all_nodes);
         }
 
         Ok(GraphState {
@@ -1075,6 +1102,7 @@ impl RnaHandler {
                     root_pairs_incremental,
                     primary_slug.clone(),
                     self.repo_root.clone(),
+                    vec![],
                 ).map_err(|e| {
                     // Pipeline invariant violated — abort the incremental update so the
                     // partial graph is not persisted. Scanner state is not committed on

@@ -19,11 +19,12 @@
 //!     → ManifestConsumer (per root)
 //!     → TreeSitterConsumer → RootExtracted(slug, nodes, edges)
 //!         → LanguageAccumulatorConsumer → LanguageDetected(lang, nodes) per language
-//!             → LspConsumer (one per language, sequential in Phase 2)
+//!             → LspConsumer (one per language, concurrent via block_in_place)
 //!               → EnrichmentComplete(lang, edges)
-//!         → PostExtractionConsumer → PassesComplete(nodes, edges)
-//!             → SubsystemConsumer → SubsystemsDetected(...)
-//!             → LanceDBConsumer (persist)
+//!         → AllEnrichmentsGate → AllEnrichmentsDone(merged nodes/edges)
+//!             → PostExtractionConsumer → PassesComplete(nodes, edges)
+//!                 → SubsystemConsumer
+//!                 → LanceDBConsumer (persist)
 //!         → EmbeddingConsumer (streaming)
 //! ```
 //!
@@ -124,6 +125,24 @@ pub enum ExtractionEvent {
         edges: Arc<[Edge]>,
         detected_frameworks: HashSet<String>,
     },
+
+    /// All LSP enrichments for a slug have completed.
+    ///
+    /// Emitted by `AllEnrichmentsGate` when every `LanguageDetected` event for a slug
+    /// has been matched by a corresponding `EnrichmentComplete`. Carries the merged
+    /// nodes and edges from the original extraction plus all LSP-added content.
+    ///
+    /// `PostExtractionConsumer` subscribes to this event so post-extraction passes run
+    /// on the fully LSP-enriched graph rather than on the raw tree-sitter output.
+    AllEnrichmentsDone {
+        slug: String,
+        /// Original extracted nodes merged with LSP-added virtual nodes.
+        nodes: Arc<[Node]>,
+        /// Original extracted edges merged with LSP-added cross-file edges.
+        edges: Arc<[Edge]>,
+        /// Path to the repository root (forwarded from `RootExtracted`).
+        path: PathBuf,
+    },
 }
 
 /// Discriminant for `ExtractionEvent` — used in `subscribes_to`.
@@ -133,6 +152,7 @@ pub enum ExtractionEventKind {
     RootExtracted,
     LanguageDetected,
     EnrichmentComplete,
+    AllEnrichmentsDone,
     FrameworkDetected,
     PassComplete,
     PassesComplete,
@@ -146,6 +166,7 @@ impl ExtractionEvent {
             ExtractionEvent::RootExtracted { .. }   => ExtractionEventKind::RootExtracted,
             ExtractionEvent::LanguageDetected { .. }  => ExtractionEventKind::LanguageDetected,
             ExtractionEvent::EnrichmentComplete { .. } => ExtractionEventKind::EnrichmentComplete,
+            ExtractionEvent::AllEnrichmentsDone { .. } => ExtractionEventKind::AllEnrichmentsDone,
             ExtractionEvent::FrameworkDetected { .. } => ExtractionEventKind::FrameworkDetected,
             ExtractionEvent::PassComplete { .. }    => ExtractionEventKind::PassComplete,
             ExtractionEvent::PassesComplete { .. }  => ExtractionEventKind::PassesComplete,

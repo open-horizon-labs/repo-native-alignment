@@ -400,7 +400,7 @@ impl Default for ExtractorRegistry {
 ///    the root that covers the most nodes.
 ///
 /// 3. **Primary root default:** if no candidate matches any node, return `primary_root`.
-fn pick_lsp_root_for_nodes<'a>(
+pub fn pick_lsp_root_for_nodes<'a>(
     nodes: &[crate::graph::Node],
     primary_root: &'a Path,
     lsp_roots: &'a [(String, std::path::PathBuf)],
@@ -660,6 +660,27 @@ impl EnricherRegistry {
         }
 
         result
+    }
+
+    /// Decompose the registry into a per-language `Arc<dyn Enricher>` map.
+    ///
+    /// Each enricher's first declared language becomes its map key. When an enricher
+    /// declares multiple languages (e.g., TypeScript + JavaScript), only the first
+    /// language is used as the key; the enricher is still called for any language
+    /// in its `languages()` slice when building `LspConsumer` instances.
+    ///
+    /// Consumes `self` to avoid cloning enrichers. Used by `build_builtin_bus` to
+    /// distribute per-language enrichers to `LspConsumer` instances.
+    pub fn into_per_language_map(self) -> std::collections::HashMap<String, std::sync::Arc<dyn Enricher>> {
+        let mut map: std::collections::HashMap<String, std::sync::Arc<dyn Enricher>> = std::collections::HashMap::new();
+        for enricher in self.enrichers {
+            let enricher_arc: std::sync::Arc<dyn Enricher> = std::sync::Arc::from(enricher);
+            for lang in enricher_arc.languages() {
+                // First enricher registered for a language wins.
+                map.entry(lang.to_string()).or_insert_with(|| std::sync::Arc::clone(&enricher_arc));
+            }
+        }
+        map
     }
 
     /// Number of registered enrichers.
