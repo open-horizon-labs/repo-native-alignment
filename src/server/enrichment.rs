@@ -1,4 +1,6 @@
 //! Background enrichment: LSP enrichment, embedding pipeline, and background scanner.
+// EXTRACTION_VERSION is deprecated (#526) but still used for backward-compat migration.
+#![allow(deprecated)]
 
 use std::path::PathBuf;
 

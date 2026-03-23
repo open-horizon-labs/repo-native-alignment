@@ -1,4 +1,6 @@
 //! MCP server: RnaHandler, graph building, background scanner, and MCP dispatch.
+// EXTRACTION_VERSION is deprecated (#526) but still used in tests and log messages.
+#![allow(deprecated)]
 
 pub mod tools;
 pub mod store;

@@ -182,6 +182,184 @@ impl ExtractionEvent {
             ExtractionEvent::AllEnrichmentsDone { .. } => ExtractionEventKind::AllEnrichmentsDone,
         }
     }
+
+    /// Produce a stable byte representation of this event's payload for content-addressed
+    /// cache key computation.
+    ///
+    /// The bytes must be **deterministic** across runs for the same logical payload.
+    /// They do not need to be deserializable — they exist only for hashing.
+    ///
+    /// # Design notes
+    ///
+    /// - Node/edge payloads are serialized via their `stable_id()` / edge key strings
+    ///   (sorted for determinism) rather than full JSON blobs, to keep the hash stable
+    ///   even if field ordering in serialization changes.
+    /// - Path-like fields use their lossy string form.
+    /// - Lightweight events (e.g., `PassComplete`) only hash their string fields.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        // Write kind discriminant first so different variants never collide.
+        buf.extend_from_slice(self.kind_tag().as_bytes());
+        buf.push(b'\n');
+
+        match self {
+            ExtractionEvent::RootDiscovered { slug, path, lsp_only } => {
+                buf.extend_from_slice(slug.as_bytes());
+                buf.push(b'\t');
+                buf.extend_from_slice(path.to_string_lossy().as_bytes());
+                buf.push(b'\t');
+                buf.push(if *lsp_only { b'1' } else { b'0' });
+            }
+            ExtractionEvent::RootExtracted { slug, path, nodes, edges } => {
+                buf.extend_from_slice(slug.as_bytes());
+                buf.push(b'\t');
+                buf.extend_from_slice(path.to_string_lossy().as_bytes());
+                // Sort node stable_ids for determinism.
+                let mut node_ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
+                node_ids.sort_unstable();
+                for id in &node_ids {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(id.as_bytes());
+                }
+                // Sort edge keys for determinism.
+                let mut edge_keys: Vec<String> = edges.iter().map(canonical_edge_key).collect();
+                edge_keys.sort_unstable();
+                for key in &edge_keys {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(key.as_bytes());
+                }
+            }
+            ExtractionEvent::LanguageDetected { slug, language, nodes } => {
+                buf.extend_from_slice(slug.as_bytes());
+                buf.push(b'\t');
+                buf.extend_from_slice(language.as_bytes());
+                let mut node_ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
+                node_ids.sort_unstable();
+                for id in &node_ids {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(id.as_bytes());
+                }
+            }
+            ExtractionEvent::EnrichmentComplete { slug, language, added_edges, new_nodes, updated_nodes } => {
+                buf.extend_from_slice(slug.as_bytes());
+                buf.push(b'\t');
+                buf.extend_from_slice(language.as_bytes());
+                let mut node_ids: Vec<String> = new_nodes.iter().map(|n| n.stable_id()).collect();
+                node_ids.sort_unstable();
+                for id in &node_ids {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(id.as_bytes());
+                }
+                let mut edge_keys: Vec<String> = added_edges.iter().map(canonical_edge_key).collect();
+                edge_keys.sort_unstable();
+                for key in &edge_keys {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(key.as_bytes());
+                }
+                // Include updated_node ids (not values) for determinism.
+                let mut patch_ids: Vec<&str> = updated_nodes.iter().map(|(id, _)| id.as_str()).collect();
+                patch_ids.sort_unstable();
+                for id in &patch_ids {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(id.as_bytes());
+                }
+            }
+            ExtractionEvent::FrameworkDetected { slug, framework, nodes } => {
+                buf.extend_from_slice(slug.as_bytes());
+                buf.push(b'\t');
+                buf.extend_from_slice(framework.as_bytes());
+                let mut node_ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
+                node_ids.sort_unstable();
+                for id in &node_ids {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(id.as_bytes());
+                }
+            }
+            ExtractionEvent::PassComplete { pass_name, added_nodes, added_edges } => {
+                buf.extend_from_slice(pass_name.as_bytes());
+                buf.push(b'\t');
+                buf.extend_from_slice(added_nodes.to_string().as_bytes());
+                buf.push(b'\t');
+                buf.extend_from_slice(added_edges.to_string().as_bytes());
+            }
+            ExtractionEvent::PassesComplete { slug, nodes, edges, detected_frameworks } => {
+                buf.extend_from_slice(slug.as_bytes());
+                let mut node_ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
+                node_ids.sort_unstable();
+                for id in &node_ids {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(id.as_bytes());
+                }
+                let mut edge_keys: Vec<String> = edges.iter().map(canonical_edge_key).collect();
+                edge_keys.sort_unstable();
+                for key in &edge_keys {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(key.as_bytes());
+                }
+                let mut frameworks: Vec<&str> = detected_frameworks.iter().map(|s| s.as_str()).collect();
+                frameworks.sort_unstable();
+                for f in &frameworks {
+                    buf.push(b'\t');
+                    buf.extend_from_slice(f.as_bytes());
+                }
+            }
+            ExtractionEvent::AllEnrichmentsDone { slug, nodes, edges, lsp_edges, lsp_nodes, updated_nodes } => {
+                buf.extend_from_slice(slug.as_bytes());
+                let mut node_ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
+                node_ids.sort_unstable();
+                for id in &node_ids {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(id.as_bytes());
+                }
+                let mut lsp_node_ids: Vec<String> = lsp_nodes.iter().map(|n| n.stable_id()).collect();
+                lsp_node_ids.sort_unstable();
+                for id in &lsp_node_ids {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(id.as_bytes());
+                }
+                let mut edge_keys: Vec<String> = edges.iter().map(canonical_edge_key).collect();
+                edge_keys.sort_unstable();
+                for key in &edge_keys {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(key.as_bytes());
+                }
+                let mut lsp_edge_keys: Vec<String> = lsp_edges.iter().map(canonical_edge_key).collect();
+                lsp_edge_keys.sort_unstable();
+                for key in &lsp_edge_keys {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(key.as_bytes());
+                }
+                let mut patch_ids: Vec<&str> = updated_nodes.iter().map(|(id, _)| id.as_str()).collect();
+                patch_ids.sort_unstable();
+                for id in &patch_ids {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(id.as_bytes());
+                }
+            }
+        }
+        buf
+    }
+
+    /// Short lowercase tag for the event kind — used as a prefix in `canonical_bytes`.
+    fn kind_tag(&self) -> &'static str {
+        match self {
+            ExtractionEvent::RootDiscovered { .. }    => "root_discovered",
+            ExtractionEvent::RootExtracted { .. }     => "root_extracted",
+            ExtractionEvent::LanguageDetected { .. }  => "language_detected",
+            ExtractionEvent::EnrichmentComplete { .. } => "enrichment_complete",
+            ExtractionEvent::FrameworkDetected { .. } => "framework_detected",
+            ExtractionEvent::PassComplete { .. }      => "pass_complete",
+            ExtractionEvent::PassesComplete { .. }    => "passes_complete",
+            ExtractionEvent::AllEnrichmentsDone { .. } => "all_enrichments_done",
+        }
+    }
+}
+
+/// Stable string key for an edge — used in canonical_bytes for deterministic hashing.
+///
+/// Uses `Edge::stable_id()` which encodes `from->kind->to`.
+fn canonical_edge_key(edge: &crate::graph::Edge) -> String {
+    edge.stable_id()
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +376,24 @@ impl ExtractionEvent {
 /// Consumers return a `Vec<ExtractionEvent>` — zero or more follow-on events
 /// that the bus will route to other subscribers. This replaces the old pattern
 /// of directly calling the next stage.
+///
+/// # Content-addressed cache keys
+///
+/// Each consumer declares a `version() -> u64`. Combined with
+/// `blake3(event.canonical_bytes())`, this forms the cache key
+/// `(payload_hash, consumer_version)` used by
+/// [`crate::extract::cache::ConsumerCacheKey`].
+///
+/// - Changing the event payload (upstream output changed) → payload hash changes →
+///   all downstream consumers automatically re-process.
+/// - Bumping a single consumer's `version()` → only that consumer re-runs;
+///   all other consumers continue to hit the cache.
+/// - Config-driven consumers (`.oh/extractors/*.toml`) override `version()` with
+///   `blake3(toml_file_contents)` so config edits auto-invalidate without any
+///   manual version bump.
+///
+/// The default impl returns `0`, which is correct for consumers with stable logic
+/// that never needs independent invalidation.
 pub trait ExtractionConsumer: Send + Sync {
     /// Human-readable identifier for diagnostics.
     fn name(&self) -> &str;
@@ -212,6 +408,21 @@ pub trait ExtractionConsumer: Send + Sync {
     /// **Must not call `bus.register()` or create new consumers.**
     /// **Must not import or call other consumers directly.**
     fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>>;
+
+    /// Consumer logic version for content-addressed cache invalidation.
+    ///
+    /// The cache key for a consumer+event pair is
+    /// `(blake3(event.canonical_bytes()), consumer.version())`.
+    ///
+    /// - Bump this when the consumer's extraction logic changes in a way that
+    ///   would produce different output for the same input event.
+    /// - Config-driven consumers should compute this from `blake3(config_bytes)[..8]`
+    ///   as a `u64` so config edits auto-invalidate.
+    /// - Consumers with stable logic that never changes independently should
+    ///   leave this at the default `0`.
+    fn version(&self) -> u64 {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -560,5 +771,91 @@ mod tests {
         bus.emit(make_root_discovered());
         assert_eq!(count.load(Ordering::Relaxed), 1,
             "counter registered before emitter must still receive follow-on event");
+    }
+
+    // -----------------------------------------------------------------------
+    // canonical_bytes and version() tests
+    // -----------------------------------------------------------------------
+
+    /// Identical events produce identical canonical_bytes.
+    #[test]
+    fn test_canonical_bytes_deterministic() {
+        let e1 = make_root_discovered();
+        let e2 = make_root_discovered();
+        assert_eq!(e1.canonical_bytes(), e2.canonical_bytes());
+    }
+
+    /// Different slugs produce different canonical_bytes.
+    #[test]
+    fn test_canonical_bytes_slug_changes_output() {
+        let e1 = ExtractionEvent::RootDiscovered {
+            slug: "repo-a".to_string(),
+            path: PathBuf::from("."),
+            lsp_only: false,
+        };
+        let e2 = ExtractionEvent::RootDiscovered {
+            slug: "repo-b".to_string(),
+            path: PathBuf::from("."),
+            lsp_only: false,
+        };
+        assert_ne!(e1.canonical_bytes(), e2.canonical_bytes());
+    }
+
+    /// Different event kinds produce different canonical_bytes (kind tag prefix).
+    #[test]
+    fn test_canonical_bytes_kind_tag_differs() {
+        let rd = make_root_discovered();
+        let re = make_root_extracted();
+        assert_ne!(rd.canonical_bytes(), re.canonical_bytes());
+    }
+
+    /// lsp_only flag changes canonical_bytes.
+    #[test]
+    fn test_canonical_bytes_lsp_only_changes_output() {
+        let e1 = ExtractionEvent::RootDiscovered {
+            slug: "x".to_string(),
+            path: PathBuf::from("."),
+            lsp_only: false,
+        };
+        let e2 = ExtractionEvent::RootDiscovered {
+            slug: "x".to_string(),
+            path: PathBuf::from("."),
+            lsp_only: true,
+        };
+        assert_ne!(e1.canonical_bytes(), e2.canonical_bytes());
+    }
+
+    /// Default consumer version is 0.
+    #[test]
+    fn test_default_consumer_version_is_zero() {
+        struct ZeroConsumer;
+        impl ExtractionConsumer for ZeroConsumer {
+            fn name(&self) -> &str { "zero" }
+            fn subscribes_to(&self) -> &[ExtractionEventKind] { &[] }
+            fn on_event(&self, _: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> { Ok(vec![]) }
+        }
+        assert_eq!(ZeroConsumer.version(), 0);
+    }
+
+    /// Consumer can override version().
+    #[test]
+    fn test_consumer_can_override_version() {
+        struct VersionedConsumer;
+        impl ExtractionConsumer for VersionedConsumer {
+            fn name(&self) -> &str { "versioned" }
+            fn subscribes_to(&self) -> &[ExtractionEventKind] { &[] }
+            fn on_event(&self, _: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> { Ok(vec![]) }
+            fn version(&self) -> u64 { 42 }
+        }
+        assert_eq!(VersionedConsumer.version(), 42);
+    }
+
+    /// canonical_bytes + blake3 produces a stable 32-byte hash.
+    #[test]
+    fn test_canonical_bytes_blake3_hash_length() {
+        let event = make_root_discovered();
+        let bytes = event.canonical_bytes();
+        let hash = blake3::hash(&bytes);
+        assert_eq!(hash.as_bytes().len(), 32);
     }
 }
