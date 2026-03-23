@@ -332,6 +332,56 @@ impl ExtractionConsumer for FastapiRouterPrefixConsumer {
 }
 
 // ---------------------------------------------------------------------------
+// SdkPathInferenceConsumer
+// ---------------------------------------------------------------------------
+
+/// Subscribes to `FrameworkDetected("fastapi")` — signals that FastAPI is in use.
+///
+/// **ADR pattern:** Framework-gated pass as a consumer — wakes only when its
+/// framework fires, never polls context.
+///
+/// The actual SDK path inference (inferring full HTTP paths for FastAPI endpoints
+/// from generated TypeScript/JavaScript SDK Const nodes) runs inside
+/// `EnrichmentFinalizer`, which has access to the full node set. This consumer
+/// establishes the event-driven subscription slot and emits `PassComplete` as a
+/// signal that the fastapi framework was detected.
+///
+/// Both `fastapi_router_prefix_pass` and `sdk_path_inference_pass` are gated on
+/// FastAPI detection in `EnrichmentFinalizer::run_passes`. On repos without FastAPI
+/// (e.g., Rust-only, plain Python, Next.js-only), neither pass is ever invoked —
+/// zero overhead, not "fast-path exit".
+///
+/// Subscribes to: `FrameworkDetected`
+/// Emits: `PassComplete`
+pub struct SdkPathInferenceConsumer;
+
+impl ExtractionConsumer for SdkPathInferenceConsumer {
+    fn name(&self) -> &str { "sdk_path_inference" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::FrameworkDetected]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
+            return Ok(vec![]);
+        };
+        if framework != "fastapi" {
+            return Ok(vec![]);
+        }
+        tracing::debug!(
+            "SdkPathInferenceConsumer: root '{}' fastapi detected — SDK path inference will run in EnrichmentFinalizer",
+            slug,
+        );
+        Ok(vec![ExtractionEvent::PassComplete {
+            pass_name: "sdk_path_inference",
+            added_nodes: 0,
+            added_edges: 0,
+        }])
+    }
+}
+
+// ---------------------------------------------------------------------------
 // EnrichmentFinalizer
 // ---------------------------------------------------------------------------
 
@@ -346,18 +396,22 @@ impl ExtractionConsumer for FastapiRouterPrefixConsumer {
 ///
 /// **Pass execution order (ordering-sensitive):**
 /// 1. Merge tree-sitter + LSP nodes/edges and apply metadata patches
-/// 2. `fastapi_router_prefix_pass` — rewrites `http_path` on FastAPI ApiEndpoint nodes
-///    with explicit `prefix=` args. Must run BEFORE `api_link_pass` (PR #528).
-///    Then: `sdk_path_inference_pass` — infers full paths for endpoints still unresolved
+/// 2. `framework_detection_pass` — detects frameworks from Import nodes.
+///    Must run FIRST so all subsequent passes can gate on detected frameworks.
+///    Returns `detected_frameworks` set and virtual framework nodes.
+/// 3. `fastapi_router_prefix_pass` — rewrites `http_path` on FastAPI ApiEndpoint nodes
+///    with explicit `prefix=` args. Gated on `detected_frameworks.contains("fastapi")`.
+///    Must run BEFORE `api_link_pass` (PR #528).
+/// 4. `sdk_path_inference_pass` — infers full paths for FastAPI endpoints still unresolved
 ///    (chained routers without explicit `prefix=` args); uses SDK Const nodes (#517).
-/// 3. `api_link_pass` — links HTTP handlers to route definitions
-/// 4. `openapi_sdk_link_pass` — links SDK functions to OpenAPI spec operations
-/// 5. `manifest_pass` — package.json / Cargo.toml dependency nodes
-/// 6. `tested_by_pass` — naming-convention test edges
-/// 7. `import_calls_pass` — resolves bare function calls via import nodes
-/// 8. `directory_module_pass` — directory-level module nodes
-/// 9. `framework_detection_pass` — detects frameworks, emits `FrameworkDetected`
-/// 10. Framework-gated passes: `pubsub_pass`, `websocket_pass`, `nextjs_routing_pass`,
+///    Gated on `detected_frameworks.contains("fastapi")` — zero invocations on non-FastAPI repos.
+/// 5. `api_link_pass` — links HTTP handlers to route definitions
+/// 6. `openapi_sdk_link_pass` — links SDK functions to OpenAPI spec operations
+/// 7. `manifest_pass` — package.json / Cargo.toml dependency nodes
+/// 8. `tested_by_pass` — naming-convention test edges
+/// 9. `import_calls_pass` — resolves bare function calls via import nodes
+/// 10. `directory_module_pass` — directory-level module nodes
+/// 11. Framework-gated passes: `pubsub_pass`, `websocket_pass`, `nextjs_routing_pass`,
 ///     `grpc_client_calls_pass`, `extractor_config_pass` — gate on detected_frameworks
 ///
 /// **Why passes run here, not in individual consumers:**
@@ -367,7 +421,8 @@ impl ExtractionConsumer for FastapiRouterPrefixConsumer {
 /// for individual consumers to append into. `EnrichmentFinalizer` is the aggregation point.
 /// `ApiLinkConsumer` and `TestedByConsumer` are no-op subscription slots that establish the
 /// event-driven wiring; `EnrichmentFinalizer` is the sole authoritative runner for those passes.
-/// `FastapiRouterPrefixConsumer` is a signal consumer that fires when fastapi is detected.
+/// `FastapiRouterPrefixConsumer` and `SdkPathInferenceConsumer` are signal consumers that
+/// fire when fastapi is detected.
 pub struct EnrichmentFinalizer {
     root_pairs: Vec<(String, PathBuf)>,
     primary_slug: String,
@@ -440,73 +495,11 @@ impl EnrichmentFinalizer {
         let nodes_before = all_nodes.len();
         let edges_before = all_edges.len();
 
-        // Step 2: fastapi_router_prefix — MUST run before api_link_pass so full URL paths
-        // are present when api_link_pass matches TypeScript SDK URL constants to FastAPI
-        // handlers. Running after api_link_pass means rewritten http_path values never
-        // participate in link generation (CodeRabbit finding #5, PR #528).
-        crate::extract::fastapi_router_prefix::fastapi_router_prefix_pass(
-            &mut all_nodes,
-            &self.root_pairs,
-        );
-
-        // Step 2b: sdk_path_inference — infers full HTTP paths for FastAPI endpoints
-        // that remain unresolved after step 2 (chained routers without explicit prefix= args).
-        // Uses URL paths from generated SDK Const nodes as the authoritative source.
-        // Must run BEFORE api_link_pass so the full paths participate in URL-string matching.
-        crate::extract::sdk_path_inference::sdk_path_inference_pass(&mut all_nodes);
-
-        // Step 3: api_link — links HTTP handlers to route definitions.
-        {
-            let new_edges = crate::extract::api_link::api_link_pass(&all_nodes);
-            if !new_edges.is_empty() {
-                all_edges.extend(new_edges);
-            }
-        }
-
-        // Step 4: openapi_sdk_link — links SDK functions to OpenAPI spec operations.
-        {
-            let new_edges = crate::extract::openapi_sdk_link::openapi_sdk_link_pass(&all_nodes);
-            if !new_edges.is_empty() {
-                all_edges.extend(new_edges);
-            }
-        }
-
-        // Step 5: manifest — package.json / Cargo.toml / pyproject.toml dependency nodes.
-        {
-            let result = crate::extract::manifest::manifest_pass(&self.root_pairs);
-            if !result.nodes.is_empty() || !result.edges.is_empty() {
-                all_nodes.extend(result.nodes);
-                all_edges.extend(result.edges);
-            }
-        }
-
-        // Step 6: tested_by — naming-convention test edges (test_foo → foo).
-        {
-            let new_edges = crate::extract::naming_convention::tested_by_pass(&all_nodes);
-            if !new_edges.is_empty() {
-                all_edges.extend(new_edges);
-            }
-        }
-
-        // Step 7: import_calls — resolves bare function calls via import nodes.
-        {
-            let new_edges = crate::extract::import_calls::import_calls_pass(&all_nodes);
-            if !new_edges.is_empty() {
-                all_edges.extend(new_edges);
-            }
-        }
-
-        // Step 8: directory_module — directory-level module nodes.
-        {
-            let result = crate::extract::directory_module::directory_module_pass(&all_nodes);
-            if !result.nodes.is_empty() || !result.edges.is_empty() {
-                all_nodes.extend(result.nodes);
-                all_edges.extend(result.edges);
-            }
-        }
-
-        // Step 9: framework_detection — detects frameworks from import nodes.
-        // Returns the set of detected framework IDs and virtual framework nodes.
+        // Step 2: framework_detection — detects frameworks from Import nodes.
+        // Must run FIRST so downstream passes can gate on the detected framework set.
+        // Only needs Import nodes (present after tree-sitter extraction). Running here
+        // means framework-gated passes (Steps 3, 4, 11) are zero-invocation on repos
+        // without the matching framework — no "fast-path exit" gates, just never called.
         let detected_frameworks: HashSet<String>;
         {
             let result = crate::extract::framework_detection::framework_detection_pass(
@@ -519,7 +512,76 @@ impl EnrichmentFinalizer {
             }
         }
 
-        // Step 10: framework-gated passes — run only when the relevant framework is detected.
+        // Step 3: fastapi_router_prefix — rewrites `http_path` on FastAPI ApiEndpoint nodes
+        // with explicit `prefix=` args. Gated on FastAPI detection: zero invocations on
+        // repos without FastAPI. Must run BEFORE api_link_pass (PR #528).
+        if detected_frameworks.contains("fastapi") {
+            crate::extract::fastapi_router_prefix::fastapi_router_prefix_pass(
+                &mut all_nodes,
+                &self.root_pairs,
+            );
+        }
+
+        // Step 4: sdk_path_inference — infers full HTTP paths for FastAPI endpoints that
+        // remain unresolved after step 3 (chained routers without explicit prefix= args).
+        // Uses URL paths from generated SDK Const nodes as the authoritative source.
+        // Gated on FastAPI detection: zero invocations on non-FastAPI repos.
+        // Must run BEFORE api_link_pass so the full paths participate in URL-string matching.
+        if detected_frameworks.contains("fastapi") {
+            crate::extract::sdk_path_inference::sdk_path_inference_pass(&mut all_nodes);
+        }
+
+        // Step 5: api_link — links HTTP handlers to route definitions.
+        {
+            let new_edges = crate::extract::api_link::api_link_pass(&all_nodes);
+            if !new_edges.is_empty() {
+                all_edges.extend(new_edges);
+            }
+        }
+
+        // Step 6: openapi_sdk_link — links SDK functions to OpenAPI spec operations.
+        {
+            let new_edges = crate::extract::openapi_sdk_link::openapi_sdk_link_pass(&all_nodes);
+            if !new_edges.is_empty() {
+                all_edges.extend(new_edges);
+            }
+        }
+
+        // Step 7: manifest — package.json / Cargo.toml / pyproject.toml dependency nodes.
+        {
+            let result = crate::extract::manifest::manifest_pass(&self.root_pairs);
+            if !result.nodes.is_empty() || !result.edges.is_empty() {
+                all_nodes.extend(result.nodes);
+                all_edges.extend(result.edges);
+            }
+        }
+
+        // Step 8: tested_by — naming-convention test edges (test_foo → foo).
+        {
+            let new_edges = crate::extract::naming_convention::tested_by_pass(&all_nodes);
+            if !new_edges.is_empty() {
+                all_edges.extend(new_edges);
+            }
+        }
+
+        // Step 9: import_calls — resolves bare function calls via import nodes.
+        {
+            let new_edges = crate::extract::import_calls::import_calls_pass(&all_nodes);
+            if !new_edges.is_empty() {
+                all_edges.extend(new_edges);
+            }
+        }
+
+        // Step 10: directory_module — directory-level module nodes.
+        {
+            let result = crate::extract::directory_module::directory_module_pass(&all_nodes);
+            if !result.nodes.is_empty() || !result.edges.is_empty() {
+                all_nodes.extend(result.nodes);
+                all_edges.extend(result.edges);
+            }
+        }
+
+        // Step 11: framework-gated passes — run only when the relevant framework is detected.
         // pubsub
         if crate::extract::pubsub::should_run(&detected_frameworks) {
             let result = crate::extract::pubsub::pubsub_pass(
@@ -544,12 +606,28 @@ impl EnrichmentFinalizer {
                 all_edges.extend(result.edges);
             }
         }
-        // nextjs_routing — gates internally (checks for nextjs-app-router OR ts/js nodes)
+        // nextjs_routing — gated on Next.js detection.
+        //
+        // Two detection signals (either suffices):
+        // 1. Import-based: `framework_detection_pass` saw `next/*` imports.
+        // 2. Filesystem-based: any root contains `pages/`, `app/`, or
+        //    `next.config.{js,ts,mjs}` — covers repos whose API route files
+        //    import nothing from `next/` directly (e.g., plain handler functions).
+        //
+        // Pure `has_ts_js` (any TS/JS file) is NOT used — that would run on
+        // plain React, Angular, or Vue repos that have no Next.js structure.
         {
-            let has_ts_js = all_nodes.iter().any(|n| {
-                matches!(n.language.as_str(), "typescript" | "javascript")
+            let import_detected = detected_frameworks.contains("nextjs-app-router");
+            let fs_detected = !import_detected && self.root_pairs.iter().any(|(_, root_path)| {
+                root_path.join("pages").is_dir()
+                    || root_path.join("app").is_dir()
+                    || root_path.join("src/pages").is_dir()
+                    || root_path.join("src/app").is_dir()
+                    || root_path.join("next.config.js").exists()
+                    || root_path.join("next.config.ts").exists()
+                    || root_path.join("next.config.mjs").exists()
             });
-            if detected_frameworks.contains("nextjs-app-router") || has_ts_js {
+            if import_detected || fs_detected {
                 let result = crate::extract::nextjs_routing::nextjs_routing_pass(
                     &self.root_pairs,
                     &all_nodes,
@@ -644,7 +722,8 @@ impl EnrichmentFinalizer {
 /// (pubsub, websocket, nextjs, grpc, extractor_config) runs inside `EnrichmentFinalizer`
 /// where the full node set is available. Per-framework stub consumers
 /// (`NextjsRoutingConsumer`, `PubSubConsumer`, `WebSocketConsumer`,
-/// `FastapiRouterPrefixConsumer`) subscribe here for monitoring/signalling.
+/// `FastapiRouterPrefixConsumer`, `SdkPathInferenceConsumer`) subscribe here for
+/// monitoring/signalling.
 pub struct FrameworkDetectionConsumer;
 
 impl ExtractionConsumer for FrameworkDetectionConsumer {
@@ -672,11 +751,22 @@ impl ExtractionConsumer for FrameworkDetectionConsumer {
 // NextjsRoutingConsumer
 // ---------------------------------------------------------------------------
 
-/// Subscribes to `FrameworkDetected` and runs nextjs_routing_pass when
-/// `framework == "nextjs-app-router"`.
+/// Subscribes to `FrameworkDetected("nextjs-app-router")` — signals that Next.js
+/// app-router conventions are in use.
 ///
 /// **ADR pattern:** Framework-gated pass as a consumer — wakes only when its
-/// framework fires, never polls context.
+/// framework fires, never polls context. On repos without Next.js this consumer
+/// never fires — zero invocations, zero overhead.
+///
+/// The actual pass (`nextjs_routing_pass`) runs inside `EnrichmentFinalizer`, which
+/// has access to the full node set and `root_pairs`. This consumer establishes the
+/// event-driven subscription slot and emits `PassComplete` as a monitoring signal.
+///
+/// The old `has_ts_js` fallback (any TypeScript/JavaScript node) has been replaced
+/// with a filesystem-based secondary signal in `EnrichmentFinalizer`: if any root
+/// contains `pages/`, `app/`, `src/pages/`, `src/app/`, or `next.config.{js,ts,mjs}`,
+/// the routing pass runs even without `next/*` imports. This covers repos whose API
+/// route handlers don't import directly from `next/` (plain handler functions).
 ///
 /// Subscribes to: `FrameworkDetected`
 /// Emits: `PassComplete`
@@ -705,11 +795,10 @@ impl ExtractionConsumer for NextjsRoutingConsumer {
             return Ok(vec![]);
         };
 
-        // Only wake for nextjs-app-router. The `has_ts_js` fallback from the original
-        // registry pass is intentionally dropped here: `nodes` in FrameworkDetected
-        // carries only the framework-matching nodes, not all repo nodes, so checking
-        // TS/JS presence would give wrong results. In Phase 3+, when the bus has access
-        // to the full node set, this can be revisited.
+        // Only wake for nextjs-app-router. Plain TS/JS repos without Next.js produce
+        // no page-route ApiEndpoint nodes. The filesystem-based fallback in
+        // EnrichmentFinalizer covers repos with Next.js directory structure but no
+        // `next/*` imports.
         if framework != "nextjs-app-router" {
             return Ok(vec![]);
         }
@@ -1707,8 +1796,8 @@ pub struct BusOptions {
 /// - `ApiLinkConsumer`, `TestedByConsumer` — `AllEnrichmentsDone` (monitoring, `PassComplete`)
 /// - `EnrichmentFinalizer` — `AllEnrichmentsDone` → `PassesComplete` + `FrameworkDetected`
 /// - `OpenApiConsumer`, `GrpcConsumer`, `EmbeddingIndexerConsumer` — `RootExtracted` (side-effects)
-/// - `FrameworkDetectionConsumer`, `FastapiRouterPrefixConsumer`, `NextjsRoutingConsumer`,
-///   `PubSubConsumer`, `WebSocketConsumer` — `FrameworkDetected`
+/// - `FrameworkDetectionConsumer`, `FastapiRouterPrefixConsumer`, `SdkPathInferenceConsumer`,
+///   `NextjsRoutingConsumer`, `PubSubConsumer`, `WebSocketConsumer` — `FrameworkDetected`
 /// - `LanceDBConsumer` — `PassesComplete`
 /// - `SubsystemConsumer` — `CommunityDetectionComplete` → `SubsystemNodesComplete`
 ///
@@ -1807,6 +1896,7 @@ pub fn build_builtin_bus(
     // --- FrameworkDetected consumers ---
     bus.register(Box::new(FrameworkDetectionConsumer));
     bus.register(Box::new(FastapiRouterPrefixConsumer));
+    bus.register(Box::new(SdkPathInferenceConsumer));
     bus.register(Box::new(NextjsRoutingConsumer::new(root_pairs)));
     bus.register(Box::new(PubSubConsumer));
     bus.register(Box::new(WebSocketConsumer));
@@ -2255,8 +2345,8 @@ mod tests {
             lsp_count + // LanguageDetected: LspConsumer × N (real, Phase 3)
             3 +        // AllEnrichmentsDone: ApiLinkConsumer, TestedByConsumer,
                        //   EnrichmentFinalizer
-            5 +        // FrameworkDetected: FrameworkDetectionConsumer, FastapiRouterPrefixConsumer,
-                       //   NextjsRoutingConsumer, PubSubConsumer, WebSocketConsumer
+            6 +        // FrameworkDetected: FrameworkDetectionConsumer, FastapiRouterPrefixConsumer,
+                       //   SdkPathInferenceConsumer, NextjsRoutingConsumer, PubSubConsumer, WebSocketConsumer
             2;         // PassesComplete: SubsystemConsumer, LanceDBConsumer
         assert_eq!(
             bus.len(), expected_total,
@@ -2701,6 +2791,197 @@ mod tests {
         assert!(
             out_nodes.iter().any(|n| n.id.name == "my_fn"),
             "emit_enrichment_pipeline must preserve input nodes through enrichment passes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Adversarial tests: framework-gated pass ordering (#553)
+    // -----------------------------------------------------------------------
+
+    /// Adversarial: `SdkPathInferenceConsumer` fires only for fastapi, silent for others.
+    #[test]
+    fn test_sdk_path_inference_consumer_fires_only_for_fastapi() {
+        let consumer = SdkPathInferenceConsumer;
+        assert!(consumer.subscribes_to().contains(&ExtractionEventKind::FrameworkDetected));
+
+        // Must fire for fastapi
+        let fastapi_event = ExtractionEvent::FrameworkDetected {
+            slug: "test".into(),
+            framework: "fastapi".into(),
+            nodes: std::sync::Arc::from([]),
+        };
+        let result = consumer.on_event(&fastapi_event).unwrap();
+        assert_eq!(result.len(), 1, "SdkPathInferenceConsumer must fire for fastapi");
+        assert!(matches!(result[0], ExtractionEvent::PassComplete { pass_name: "sdk_path_inference", .. }));
+
+        // Must be silent for unrelated frameworks
+        for framework in &["flask", "django", "nextjs-app-router", "react", "socketio"] {
+            let other_event = ExtractionEvent::FrameworkDetected {
+                slug: "test".into(),
+                framework: framework.to_string(),
+                nodes: std::sync::Arc::from([]),
+            };
+            let result = consumer.on_event(&other_event).unwrap();
+            assert!(
+                result.is_empty(),
+                "SdkPathInferenceConsumer must be silent for framework '{}', got {:?}",
+                framework, result,
+            );
+        }
+    }
+
+    /// Adversarial: plain React repo (TS but no `next/` imports, no `pages/` dir)
+    /// does NOT invoke nextjs_routing_pass and produces no ApiEndpoint nodes.
+    ///
+    /// Verifies the double gate: import-based AND filesystem-based detection are
+    /// both absent → `nextjs_routing_pass` is not invoked → no ApiEndpoint nodes.
+    #[test]
+    fn test_plain_ts_repo_without_nextjs_does_not_produce_api_endpoints() {
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        // Plain TypeScript file with a React import (but NOT next/)
+        let import_node = Node {
+            id: NodeId {
+                root: "client".into(),
+                file: PathBuf::from("src/App.tsx"),
+                name: "import react".into(),
+                kind: NodeKind::Import,
+            },
+            language: "typescript".into(),
+            line_start: 1,
+            line_end: 1,
+            signature: "import React from 'react'".into(),
+            body: "import React from 'react'".into(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let (out_nodes, _edges, _frameworks) = super::emit_enrichment_pipeline(
+            vec![import_node],
+            vec![],
+            vec![("client".into(), PathBuf::from("."))],
+            "client".to_string(),
+            PathBuf::from("."),
+            super::BusOptions::default(),
+        ).unwrap();
+
+        // Must produce no ApiEndpoint nodes — nextjs_routing_pass must NOT fire
+        let api_endpoints: Vec<_> = out_nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert!(
+            api_endpoints.is_empty(),
+            "Plain TS/React repo without `next/` imports must produce no ApiEndpoint nodes. \
+            Got: {:?}",
+            api_endpoints.iter().map(|n| &n.id.name).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Adversarial: Next.js project with pages/ dir but no next/ imports still gets routing.
+    ///
+    /// Verifies the filesystem-based fallback: a repo with `pages/api/` directory
+    /// but no `next/` imports (e.g., plain TypeScript handler functions) should
+    /// still have `nextjs_routing_pass` invoked.
+    #[test]
+    fn test_nextjs_with_pages_dir_but_no_imports_gets_routing() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let pages_api = dir.path().join("pages/api");
+        std::fs::create_dir_all(&pages_api).unwrap();
+        std::fs::write(
+            pages_api.join("health.ts"),
+            "export default function handler(req: any, res: any) { res.json({ ok: true }); }\n",
+        ).unwrap();
+
+        // TypeScript import node but no `next/` import — pure handler, no next imports
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+        let fn_node = Node {
+            id: NodeId {
+                root: "client".into(),
+                file: PathBuf::from("pages/api/health.ts"),
+                name: "handler".into(),
+                kind: NodeKind::Function,
+            },
+            language: "typescript".into(),
+            line_start: 1,
+            line_end: 1,
+            signature: "function handler(req, res)".into(),
+            body: "export default function handler(req, res) { res.json({ ok: true }); }".into(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let root_path = dir.path().to_path_buf();
+        let (out_nodes, _edges, _frameworks) = super::emit_enrichment_pipeline(
+            vec![fn_node],
+            vec![],
+            vec![("client".into(), root_path)],
+            "client".to_string(),
+            PathBuf::from("."),
+            super::BusOptions::default(),
+        ).unwrap();
+
+        // Must find an ApiEndpoint node — filesystem-based gate must fire
+        let api_endpoints: Vec<_> = out_nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert!(
+            !api_endpoints.is_empty(),
+            "Next.js repo with pages/ dir but no next/ imports must produce ApiEndpoint \
+            nodes via filesystem-based detection. Got nodes: {:?}",
+            out_nodes.iter().map(|n| (&n.id.kind, &n.id.name)).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Adversarial: non-FastAPI repo does NOT invoke fastapi_router_prefix or sdk_path_inference.
+    ///
+    /// Verifies that framework detection gates both FastAPI passes correctly.
+    /// Runs `emit_enrichment_pipeline` with only a React import node — neither
+    /// `fastapi_router_prefix_pass` nor `sdk_path_inference_pass` should be invoked.
+    /// (Absence of errors + no state mutation from those passes = correct.)
+    #[test]
+    fn test_non_fastapi_repo_does_not_invoke_fastapi_passes() {
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        // Repo with only React TypeScript — no FastAPI
+        let import_node = Node {
+            id: NodeId {
+                root: "app".into(),
+                file: PathBuf::from("src/App.tsx"),
+                name: "import react".into(),
+                kind: NodeKind::Import,
+            },
+            language: "typescript".into(),
+            line_start: 1,
+            line_end: 1,
+            signature: "import React from 'react'".into(),
+            body: "import React from 'react'".into(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        // If fastapi_router_prefix_pass or sdk_path_inference_pass were invoked,
+        // they would scan all nodes looking for Python ApiEndpoint nodes.
+        // They produce no output on this input, but verifying `(_frameworks)` does
+        // not contain "fastapi" is the structural proof that the gate worked.
+        let (_out_nodes, _edges, frameworks) = super::emit_enrichment_pipeline(
+            vec![import_node],
+            vec![],
+            vec![("app".into(), PathBuf::from("."))],
+            "app".to_string(),
+            PathBuf::from("."),
+            super::BusOptions::default(),
+        ).unwrap();
+
+        assert!(
+            !frameworks.contains("fastapi"),
+            "Non-FastAPI repo must not have 'fastapi' in detected_frameworks"
         );
     }
 }

@@ -1220,12 +1220,19 @@ mod tests {
         )
         .unwrap();
 
-        // lsp_only subdirectory root: a Next.js Pages Router API route
-        // pages/api/health.ts → ApiEndpoint node "ANY /api/health"
+        // lsp_only subdirectory root: a Next.js Pages Router API route.
+        // pages/api/health.ts → ApiEndpoint node "ANY /api/health".
+        // _app.tsx imports from 'next/app' so framework_detection_pass fires
+        // FrameworkDetected("nextjs-app-router"), which gates nextjs_routing_pass.
         std::fs::create_dir_all(client_dir.join("pages/api")).unwrap();
         std::fs::write(
             client_dir.join("pages/api/health.ts"),
             "export default function handler(req: any, res: any) { res.json({ ok: true }); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            client_dir.join("pages/_app.tsx"),
+            "import type { AppProps } from 'next/app';\nexport default function App({ Component, pageProps }: AppProps) { return <Component {...pageProps} />; }\n",
         )
         .unwrap();
 
@@ -1307,11 +1314,18 @@ mod tests {
         )
         .unwrap();
 
-        // lsp_only subdirectory root: a Next.js Pages Router API route
+        // lsp_only subdirectory root: a Next.js Pages Router API route.
+        // _app.tsx imports from 'next/app' so framework_detection_pass fires
+        // FrameworkDetected("nextjs-app-router"), which gates nextjs_routing_pass.
         std::fs::create_dir_all(client_dir.join("pages/api")).unwrap();
         std::fs::write(
             client_dir.join("pages/api/health.ts"),
             "export default function handler(req: any, res: any) { res.json({ ok: true }); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            client_dir.join("pages/_app.tsx"),
+            "import type { AppProps } from 'next/app';\nexport default function App({ Component, pageProps }: AppProps) { return <Component {...pageProps} />; }\n",
         )
         .unwrap();
 
