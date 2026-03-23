@@ -2769,4 +2769,136 @@ mod tests {
             "emit_enrichment_pipeline must preserve input nodes through enrichment passes"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Adversarial tests: framework-gated pass ordering (#553)
+    // -----------------------------------------------------------------------
+
+    /// Adversarial: `SdkPathInferenceConsumer` fires only for fastapi, silent for others.
+    #[test]
+    fn test_sdk_path_inference_consumer_fires_only_for_fastapi() {
+        let consumer = SdkPathInferenceConsumer;
+        assert!(consumer.subscribes_to().contains(&ExtractionEventKind::FrameworkDetected));
+
+        // Must fire for fastapi
+        let fastapi_event = ExtractionEvent::FrameworkDetected {
+            slug: "test".into(),
+            framework: "fastapi".into(),
+            nodes: std::sync::Arc::from([]),
+        };
+        let result = consumer.on_event(&fastapi_event).unwrap();
+        assert_eq!(result.len(), 1, "SdkPathInferenceConsumer must fire for fastapi");
+        assert!(matches!(result[0], ExtractionEvent::PassComplete { pass_name: "sdk_path_inference", .. }));
+
+        // Must be silent for unrelated frameworks
+        for framework in &["flask", "django", "nextjs-app-router", "react", "socketio"] {
+            let other_event = ExtractionEvent::FrameworkDetected {
+                slug: "test".into(),
+                framework: framework.to_string(),
+                nodes: std::sync::Arc::from([]),
+            };
+            let result = consumer.on_event(&other_event).unwrap();
+            assert!(
+                result.is_empty(),
+                "SdkPathInferenceConsumer must be silent for framework '{}', got {:?}",
+                framework, result,
+            );
+        }
+    }
+
+    /// Adversarial: pure TS/JS repo with no `next/` imports does NOT invoke nextjs_routing.
+    ///
+    /// Previously, the `has_ts_js` fallback in `EnrichmentFinalizer` caused `nextjs_routing_pass`
+    /// to run on any repo with TypeScript/JavaScript nodes, even without Next.js. This test
+    /// verifies the fallback is gone: a plain React (no Next.js) repo produces no ApiEndpoint nodes.
+    #[test]
+    fn test_plain_ts_repo_without_nextjs_does_not_produce_api_endpoints() {
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        // Plain TypeScript file with a React import (but NOT next/)
+        let import_node = Node {
+            id: NodeId {
+                root: "client".into(),
+                file: PathBuf::from("src/App.tsx"),
+                name: "import react".into(),
+                kind: NodeKind::Import,
+            },
+            language: "typescript".into(),
+            line_start: 1,
+            line_end: 1,
+            signature: "import React from 'react'".into(),
+            body: "import React from 'react'".into(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let (out_nodes, _edges, _frameworks) = super::emit_enrichment_pipeline(
+            vec![import_node],
+            vec![],
+            vec![("client".into(), PathBuf::from("."))],
+            "client".to_string(),
+            PathBuf::from("."),
+            super::BusOptions::default(),
+        ).unwrap();
+
+        // Must produce no ApiEndpoint nodes — nextjs_routing_pass must NOT fire
+        let api_endpoints: Vec<_> = out_nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert!(
+            api_endpoints.is_empty(),
+            "Plain TS/React repo without `next/` imports must produce no ApiEndpoint nodes. \
+            Got: {:?}",
+            api_endpoints.iter().map(|n| &n.id.name).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Adversarial: non-FastAPI repo does NOT invoke fastapi_router_prefix or sdk_path_inference.
+    ///
+    /// Verifies that framework detection gates both FastAPI passes correctly.
+    /// Runs `emit_enrichment_pipeline` with only a React import node — neither
+    /// `fastapi_router_prefix_pass` nor `sdk_path_inference_pass` should be invoked.
+    /// (Absence of errors + no state mutation from those passes = correct.)
+    #[test]
+    fn test_non_fastapi_repo_does_not_invoke_fastapi_passes() {
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        // Repo with only React TypeScript — no FastAPI
+        let import_node = Node {
+            id: NodeId {
+                root: "app".into(),
+                file: PathBuf::from("src/App.tsx"),
+                name: "import react".into(),
+                kind: NodeKind::Import,
+            },
+            language: "typescript".into(),
+            line_start: 1,
+            line_end: 1,
+            signature: "import React from 'react'".into(),
+            body: "import React from 'react'".into(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        // If fastapi_router_prefix_pass or sdk_path_inference_pass were invoked,
+        // they would scan all nodes looking for Python ApiEndpoint nodes.
+        // They produce no output on this input, but verifying `(_frameworks)` does
+        // not contain "fastapi" is the structural proof that the gate worked.
+        let (_out_nodes, _edges, frameworks) = super::emit_enrichment_pipeline(
+            vec![import_node],
+            vec![],
+            vec![("app".into(), PathBuf::from("."))],
+            "app".to_string(),
+            PathBuf::from("."),
+            super::BusOptions::default(),
+        ).unwrap();
+
+        assert!(
+            !frameworks.contains("fastapi"),
+            "Non-FastAPI repo must not have 'fastapi' in detected_frameworks"
+        );
+    }
 }
