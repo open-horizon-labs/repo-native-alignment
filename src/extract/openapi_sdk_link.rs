@@ -198,6 +198,11 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
             }
     }
 
+    // Fast path: no ApiEndpoints means no edges to emit regardless of strategy.
+    if endpoint_by_op_id.is_empty() && endpoint_by_path.is_empty() {
+        return Vec::new();
+    }
+
     // Phase 1c: build a map from (file, line) → Vec<normalized_path> for all
     // synthetic Const nodes (URL string literals) in generated SDK files.
     // These are the embedded URLs in SDK function bodies, e.g.:
