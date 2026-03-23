@@ -62,7 +62,7 @@ use crate::graph::{Node, NodeKind};
 ///
 /// Files are read at most once per unique path (via an internal cache).
 /// Non-readable files are silently skipped with a tracing warning.
-pub fn fastapi_router_prefix_pass(nodes: &mut Vec<Node>) {
+pub fn fastapi_router_prefix_pass(nodes: &mut [Node]) {
     // --- Performance characteristics ---
     //
     // This pass is self-gating: the first thing it does is collect Python
@@ -203,12 +203,12 @@ pub(crate) fn extract_router_prefixes_from_str(content: &str) -> HashMap<String,
 
         // If both "prefix" and a closing ")" are on the same line, try
         // the single-line parser directly.
-        if trimmed.contains("prefix") && trimmed.contains(')') {
-            if let Some((var, prefix)) = parse_api_router_assignment(trimmed) {
-                map.insert(var, prefix);
-                i += 1;
-                continue;
-            }
+        if trimmed.contains("prefix") && trimmed.contains(')')
+            && let Some((var, prefix)) = parse_api_router_assignment(trimmed)
+        {
+            map.insert(var, prefix);
+            i += 1;
+            continue;
         }
 
         // Possible multi-line declaration: collect lines until we see a
@@ -220,10 +220,10 @@ pub(crate) fn extract_router_prefixes_from_str(content: &str) -> HashMap<String,
             .collect::<Vec<_>>()
             .join(" ");
 
-        if combined.contains("prefix") {
-            if let Some((var, prefix)) = parse_api_router_assignment(&combined) {
-                map.insert(var, prefix);
-            }
+        if combined.contains("prefix")
+            && let Some((var, prefix)) = parse_api_router_assignment(&combined)
+        {
+            map.insert(var, prefix);
         }
 
         i += 1;
