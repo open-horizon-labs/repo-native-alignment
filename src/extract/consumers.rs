@@ -253,8 +253,16 @@ impl ExtractionConsumer for PostExtractionConsumer {
         // The patches reference nodes by stable_id and may target tree-sitter nodes not present
         // in `lsp_nodes`. Apply them to the merged set so post-extraction passes see updated metadata.
         if !updated_nodes.is_empty() {
+            // Build a stable_id → index map once (O(n)) so each patch lookup is O(1)
+            // rather than O(n), avoiding O(patches × nodes) on the hot post-pass path.
+            let node_pos: std::collections::HashMap<String, usize> = merged_nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.stable_id(), i))
+                .collect();
             for (node_id, patches) in updated_nodes.iter() {
-                if let Some(node) = merged_nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
+                if let Some(&idx) = node_pos.get(node_id) {
+                    let node = &mut merged_nodes[idx];
                     for (key, value) in patches {
                         node.metadata.insert(key.clone(), value.clone());
                     }
