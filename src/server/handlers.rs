@@ -157,11 +157,18 @@ impl RnaHandler {
             std::collections::HashSet::new()
         };
 
+        // Read the live scan stats from ScanStatsConsumer (populated during active scans).
+        // On cold start (no scan since process started) this will have no activity and
+        // list_roots_from_slugs will fall back to the graph-state/sentinel-file view.
+        let stats_guard = self.scan_stats.read().ok();
+        let scan_stats_ref = stats_guard.as_deref();
+
         let markdown = crate::service::list_roots_from_slugs(
             &self.repo_root,
             &active_slugs,
             graph_state_ref,
             Some(&self.lsp_status),
+            scan_stats_ref,
         );
         Ok(text_result(markdown))
     }

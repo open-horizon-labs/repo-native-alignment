@@ -81,6 +81,11 @@ pub struct RnaHandler {
     /// Populated from `[workspace.roots]` entries whose paths are subdirectories of `repo_root`.
     /// Each entry is `(slug, absolute_path)`.
     pub lsp_only_roots: Arc<Vec<(String, PathBuf)>>,
+    /// Live scan state maintained by `ScanStatsConsumer`.
+    /// Populated during active scans; empty/default until the first `RootDiscovered` event.
+    /// `list_roots` reads from this for in-progress status; falls back to sentinel files
+    /// on cold start when no bus events have fired for the current process lifetime.
+    pub scan_stats: Arc<std::sync::RwLock<crate::extract::scan_stats::ScanStats>>,
 }
 
 impl Default for RnaHandler {
@@ -99,6 +104,9 @@ impl Default for RnaHandler {
             non_code_root_slugs_cache: std::sync::Mutex::new(None),
             lance_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             lsp_only_roots: Arc::new(Vec::new()),
+            scan_stats: Arc::new(std::sync::RwLock::new(
+                crate::extract::scan_stats::ScanStats::default(),
+            )),
         }
     }
 }
