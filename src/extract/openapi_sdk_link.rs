@@ -76,12 +76,6 @@ pub fn normalize_operation_id(id: &str) -> String {
 /// - `generated_client.ts` / `generated_client.py`
 /// - `openapi_client.ts` / `openapi_client.py`
 /// - `api_client.py` / `api_client.go` (starts with `api_client.`)
-/// Public re-export of the generated-SDK file detector for use by
-/// [`sdk_path_inference_pass`](super::sdk_path_inference::sdk_path_inference_pass).
-pub fn is_generated_sdk_file_pub(path: &std::path::Path) -> bool {
-    is_generated_sdk_file(path)
-}
-
 fn is_generated_sdk_file(path: &std::path::Path) -> bool {
     let file_name = path
         .file_name()
@@ -95,6 +89,12 @@ fn is_generated_sdk_file(path: &std::path::Path) -> bool {
         || file_name.contains("generated_client")
         || file_name.contains("openapi_client")
         || file_name.starts_with("api_client.")
+}
+
+/// Public re-export of [`is_generated_sdk_file`] for use by
+/// `sdk_path_inference_pass` in the sibling module.
+pub fn is_generated_sdk_file_pub(path: &std::path::Path) -> bool {
+    is_generated_sdk_file(path)
 }
 
 // ---------------------------------------------------------------------------

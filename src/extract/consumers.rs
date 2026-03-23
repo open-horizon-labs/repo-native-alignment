@@ -347,11 +347,9 @@ impl ExtractionConsumer for FastapiRouterPrefixConsumer {
 /// **Pass execution order (ordering-sensitive):**
 /// 1. Merge tree-sitter + LSP nodes/edges and apply metadata patches
 /// 2. `fastapi_router_prefix_pass` — rewrites `http_path` on FastAPI ApiEndpoint nodes
-///    that have explicit `prefix=` args (same-file or `include_router`).
-///    Must run BEFORE `api_link_pass` (CodeRabbit finding #5, PR #528).
-/// 2b. `sdk_path_inference_pass` — infers full paths for endpoints still unresolved
-///    after step 2 (chained routers without explicit prefix= args), using URL paths
-///    from generated SDK Const nodes as the authoritative source (#517).
+///    with explicit `prefix=` args. Must run BEFORE `api_link_pass` (PR #528).
+///    Then: `sdk_path_inference_pass` — infers full paths for endpoints still unresolved
+///    (chained routers without explicit `prefix=` args); uses SDK Const nodes (#517).
 /// 3. `api_link_pass` — links HTTP handlers to route definitions
 /// 4. `openapi_sdk_link_pass` — links SDK functions to OpenAPI spec operations
 /// 5. `manifest_pass` — package.json / Cargo.toml dependency nodes
