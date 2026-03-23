@@ -221,6 +221,8 @@ edge_kind = "Consumes"
 
 The `imports_contain` check is a substring test against both `node.id.name` and `node.body` of every `NodeKind::Import` node. Different language extractors store import text in different fields, so both are checked.
 
+For Python's `from X import Y` style imports, RNA also synthesizes the dotted module path `X.Y` and tests that against the pattern. For example, `imports_contain = "google.cloud.pubsub"` matches both `from google.cloud.pubsub_v1 import PublisherClient` (raw text contains the pattern) and `from google.cloud import pubsub_v1` (synthesized path `google.cloud.pubsub_v1` contains the pattern as a prefix).
+
 #### `[[boundaries]]` fields
 
 | Field | Required | Description |
