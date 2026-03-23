@@ -169,14 +169,16 @@ pub enum ExtractionEvent {
     /// any direct coupling to `graph.rs`.
     ///
     /// `slug` is the primary root slug used to anchor subsystem node `stable_id`s.
+    ///
+    /// Note: edges are intentionally omitted. `subsystem_node_pass` and
+    /// `subsystem_framework_aggregation_pass` only read nodes, so passing the
+    /// full edge set would be pure overhead (O(N) clone for no benefit).
     CommunityDetectionComplete {
         slug: String,
         /// Detected subsystems from `GraphIndex::detect_communities()`.
         subsystems: Arc<[Subsystem]>,
         /// Full node set with PageRank importance written into `node.metadata`.
         nodes: Arc<[Node]>,
-        /// Full edge set at the point community detection finished.
-        edges: Arc<[Edge]>,
     },
 
     /// `SubsystemConsumer` has finished running `subsystem_node_pass` and
@@ -406,26 +408,34 @@ impl ExtractionEvent {
                     buf.extend_from_slice(values.as_bytes());
                 }
             }
-            ExtractionEvent::CommunityDetectionComplete { slug, subsystems, nodes, edges } => {
+            ExtractionEvent::CommunityDetectionComplete { slug, subsystems, nodes } => {
                 buf.extend_from_slice(slug.as_bytes());
-                // Hash subsystem names (sorted) as a proxy for the subsystem set.
-                let mut sub_names: Vec<&str> = subsystems.iter().map(|s| s.name.as_str()).collect();
-                sub_names.sort_unstable();
-                for name in &sub_names {
+                // Hash each subsystem's name AND sorted member_ids so that membership
+                // changes (nodes moving between clusters) invalidate the cache even when
+                // subsystem names remain the same.
+                let mut subs: Vec<(&str, Vec<&str>)> = subsystems
+                    .iter()
+                    .map(|s| {
+                        let mut members: Vec<&str> = s.member_ids.iter().map(|m| m.as_str()).collect();
+                        members.sort_unstable();
+                        (s.name.as_str(), members)
+                    })
+                    .collect();
+                // Sort by name for determinism.
+                subs.sort_unstable_by_key(|(name, _)| *name);
+                for (name, members) in &subs {
                     buf.push(b'\n');
                     buf.extend_from_slice(name.as_bytes());
+                    for m in members {
+                        buf.push(b':');
+                        buf.extend_from_slice(m.as_bytes());
+                    }
                 }
                 let mut node_ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
                 node_ids.sort_unstable();
                 for id in &node_ids {
                     buf.push(b'\n');
                     buf.extend_from_slice(id.as_bytes());
-                }
-                let mut edge_keys: Vec<String> = edges.iter().map(canonical_edge_key).collect();
-                edge_keys.sort_unstable();
-                for key in &edge_keys {
-                    buf.push(b'\n');
-                    buf.extend_from_slice(key.as_bytes());
                 }
             }
             ExtractionEvent::SubsystemNodesComplete { slug, added_nodes, added_edges } => {

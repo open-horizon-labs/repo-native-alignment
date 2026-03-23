@@ -1605,7 +1605,7 @@ impl ExtractionConsumer for SubsystemConsumer {
     }
 
     fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::CommunityDetectionComplete { slug, subsystems, nodes, .. } = event else {
+        let ExtractionEvent::CommunityDetectionComplete { slug, subsystems, nodes } = event else {
             return Ok(vec![]);
         };
 
@@ -2026,7 +2026,6 @@ pub fn emit_community_detection(
     slug: String,
     subsystems: Vec<crate::graph::index::Subsystem>,
     nodes: Vec<crate::graph::Node>,
-    edges: Vec<crate::graph::Edge>,
 ) -> anyhow::Result<(Vec<crate::graph::Node>, Vec<crate::graph::Edge>)> {
     use crate::extract::event_bus::{EventBus, ExtractionEvent};
 
@@ -2037,7 +2036,6 @@ pub fn emit_community_detection(
         slug,
         subsystems: Arc::from(subsystems.into_boxed_slice()),
         nodes: Arc::from(nodes.into_boxed_slice()),
-        edges: Arc::from(edges.into_boxed_slice()),
     });
 
     // Collect SubsystemNodesComplete — emitted by SubsystemConsumer.
@@ -2604,7 +2602,6 @@ mod tests {
             slug: "test".into(),
             subsystems: std::sync::Arc::from([]),
             nodes: std::sync::Arc::from([]),
-            edges: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&event).unwrap();
         assert_eq!(result.len(), 1, "SubsystemConsumer must emit exactly one SubsystemNodesComplete");

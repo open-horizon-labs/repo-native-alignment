@@ -780,7 +780,6 @@ impl RnaHandler {
                     primary_slug.clone(),
                     subsystems.clone(),
                     all_nodes.clone(),
-                    all_edges.clone(),
                 ).unwrap_or_else(|e| {
                     tracing::warn!("Subsystem promotion via bus failed (non-fatal): {}", e);
                     (vec![], vec![])
@@ -1288,7 +1287,6 @@ impl RnaHandler {
                     primary_slug.clone(),
                     subsystems.clone(),
                     graph.nodes.clone(),
-                    graph.edges.clone(),
                 ).unwrap_or_else(|e| {
                     tracing::warn!("Incremental subsystem promotion via bus failed (non-fatal): {}", e);
                     (vec![], vec![])
