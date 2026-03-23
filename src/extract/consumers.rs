@@ -1289,6 +1289,7 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
+    #[allow(dead_code)]
     fn make_root_discovered(slug: &str, path: PathBuf) -> ExtractionEvent {
         ExtractionEvent::RootDiscovered {
             slug: slug.to_string(),
