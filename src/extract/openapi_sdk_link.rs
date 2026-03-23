@@ -19,12 +19,39 @@
 //!
 //! This pass closes the first hop.
 //!
-//! # Matching strategy
+//! # Matching strategies
+//!
+//! ## Strategy 1: operation_id (primary)
 //!
 //! SDK function names are matched against `operation_id` metadata on `ApiEndpoint` nodes.
 //! Names are normalised with [`normalize_operation_id`] so that camelCase (`listUsers`),
 //! snake_case (`list_users`), and PascalCase (`ListUsers`) all compare equal. This handles
 //! the common case where Python SDKs use snake_case but the spec uses camelCase.
+//!
+//! Works when:
+//! - A checked-in OpenAPI YAML/JSON file is present in the repo, OR
+//! - The SDK generator embeds `operationId` into function names.
+//!
+//! ## Strategy 2: URL path co-location (fallback)
+//!
+//! Many SDK generators (e.g. `@hey-api/openapi-ts`) embed the full server URL as a string
+//! literal inside each generated function body:
+//!
+//! ```typescript
+//! export const getWorkspacesIdExpertunities = (...) =>
+//!   client.get({ url: '/workspaces/{id}/expertunities', ...options });
+//! ```
+//!
+//! `string_literals.rs` already extracts these as synthetic `Const` nodes whose `name` is
+//! the URL path.  When these `Const` nodes appear on the **same line** as a Function node
+//! in the same generated SDK file, the function is the SDK call for that URL.
+//!
+//! This pass builds a secondary map from `(file, line) → Vec<normalized_path>` using those
+//! Const nodes, then for each unmatched SDK Function, looks up any URL path on the same line
+//! and matches it against an `ApiEndpoint` whose `http_path` normalises to the same string.
+//!
+//! Works when no OpenAPI spec file is checked in but the SDK embeds the URL inline —
+//! the pattern used by `@hey-api/openapi-ts`, `openapi-fetch`, and similar generators.
 //!
 //! # Generated file detection
 //!
@@ -41,6 +68,7 @@
 //! ApiEndpoint links, which is a weaker, reference-only relationship.)
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
@@ -61,6 +89,34 @@ use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, N
 /// | `LIST_USERS`  | `listusers`  |
 pub fn normalize_operation_id(id: &str) -> String {
     id.replace('_', "").to_lowercase()
+}
+
+// ---------------------------------------------------------------------------
+// URL path normalisation (reuses logic from api_link.rs)
+// ---------------------------------------------------------------------------
+
+/// Normalise a URL path so that path-parameter styles compare equal.
+///
+/// | Input              | Output               |
+/// |--------------------|----------------------|
+/// | `/users/:id`       | `/users/<param>`     |
+/// | `/users/{id}`      | `/users/<param>`     |
+/// | `/users/[id]`      | `/users/<param>`     |
+/// | `/workspaces/{id}` | `/workspaces/<param>`|
+fn normalize_url_path(path: &str) -> String {
+    path.split('/')
+        .map(|seg| {
+            if seg.starts_with(':')
+                || (seg.starts_with('{') && seg.ends_with('}'))
+                || (seg.starts_with('[') && seg.ends_with(']'))
+            {
+                "<param>"
+            } else {
+                seg
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 // ---------------------------------------------------------------------------
@@ -104,17 +160,28 @@ pub fn is_generated_sdk_file_pub(path: &std::path::Path) -> bool {
 /// Post-extraction pass: emit `Implements` edges from generated SDK functions
 /// to their matching `ApiEndpoint` nodes.
 ///
+/// Uses two matching strategies (in order):
+///
+/// 1. **operation_id** — matches SDK function names against `operation_id`
+///    metadata on `ApiEndpoint` nodes (normalised case/underscore-insensitive).
+///    Works for repos with a checked-in OpenAPI spec.
+///
+/// 2. **URL path co-location** — for SDK generators (like `@hey-api/openapi-ts`)
+///    that embed the full server URL as a string literal inside each function,
+///    matches via `Const` nodes on the same line as the SDK Function.
+///    Works when no spec file is present but the SDK encodes the URL inline.
+///
 /// Call this **after all nodes have been merged** across roots. The SDK file and
 /// the OpenAPI spec are typically in different roots (or at least different files);
 /// running this pass per-delta would miss cross-file links.
-///
-/// Complexity: O(E + F) where E is the number of `ApiEndpoint` nodes with an
-/// `operation_id` and F is the number of Function nodes in generated SDK files —
-/// both are typically small.
 pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
-    // Phase 1: build a map from normalised operation_id → Vec<NodeId> for all
+    // Phase 1a: build a map from normalised operation_id → Vec<NodeId> for all
     // ApiEndpoint nodes that carry an `operation_id` in their metadata.
     let mut endpoint_by_op_id: HashMap<String, Vec<NodeId>> = HashMap::new();
+    // Phase 1b: build a map from normalised http_path → Vec<NodeId> for all
+    // ApiEndpoint nodes (used by the URL co-location fallback strategy).
+    let mut endpoint_by_path: HashMap<String, Vec<NodeId>> = HashMap::new();
+
     for node in all_nodes {
         if node.id.kind != NodeKind::ApiEndpoint {
             continue;
@@ -124,13 +191,46 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
                 let key = normalize_operation_id(op_id);
                 endpoint_by_op_id.entry(key).or_default().push(node.id.clone());
             }
+        if let Some(http_path) = node.metadata.get("http_path")
+            && !http_path.is_empty() {
+                let key = normalize_url_path(http_path);
+                endpoint_by_path.entry(key).or_default().push(node.id.clone());
+            }
     }
 
-    if endpoint_by_op_id.is_empty() {
-        return Vec::new();
+    // Phase 1c: build a map from (file, line) → Vec<normalized_path> for all
+    // synthetic Const nodes (URL string literals) in generated SDK files.
+    // These are the embedded URLs in SDK function bodies, e.g.:
+    //   `{ url: '/workspaces/{id}/expertunities', ...options }`
+    // The string_literals extractor creates a Const node for each URL string,
+    // and it appears on the same line as the enclosing SDK function.
+    let mut url_consts_by_file_line: HashMap<(PathBuf, usize), Vec<String>> = HashMap::new();
+    if !endpoint_by_path.is_empty() {
+        for node in all_nodes {
+            if node.id.kind != NodeKind::Const {
+                continue;
+            }
+            // Only synthetic Const nodes (string literals from harvest_string_literals).
+            if !node.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false) {
+                continue;
+            }
+            if !is_generated_sdk_file(&node.id.file) {
+                continue;
+            }
+            // Only URL-shaped values (starts with '/', length > 1).
+            let path_str = &node.id.name;
+            if !path_str.starts_with('/') || path_str.len() <= 1 {
+                continue;
+            }
+            let key = (node.id.file.clone(), node.line_start);
+            url_consts_by_file_line
+                .entry(key)
+                .or_default()
+                .push(normalize_url_path(path_str));
+        }
     }
 
-    // Phase 2: scan Function nodes in generated SDK files and match against the map.
+    // Phase 2: scan Function nodes in generated SDK files and match against the maps.
     let mut edges = Vec::new();
     for node in all_nodes {
         if node.id.kind != NodeKind::Function {
@@ -140,8 +240,9 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
             continue;
         }
 
-        let key = normalize_operation_id(&node.id.name);
-        if let Some(ep_ids) = endpoint_by_op_id.get(&key) {
+        // Strategy 1: operation_id match (primary).
+        let op_id_key = normalize_operation_id(&node.id.name);
+        if let Some(ep_ids) = endpoint_by_op_id.get(&op_id_key) {
             // Skip ambiguous matches: if multiple ApiEndpoint nodes share the same
             // normalized operation_id (e.g. two services in a monorepo both define
             // `listUsers`), linking to all of them would create false cross-service
@@ -155,6 +256,48 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
                     source: ExtractionSource::TreeSitter,
                     confidence: Confidence::Detected,
                 });
+            }
+            continue; // strategy 1 matched (or was ambiguous) — skip strategy 2
+        }
+
+        // Strategy 2: URL path co-location fallback.
+        // Look for URL-shaped Const nodes in the same file on the same line.
+        // Each such Const is a string literal embedded in the SDK function body.
+        if url_consts_by_file_line.is_empty() {
+            continue;
+        }
+        let file_line_key = (node.id.file.clone(), node.line_start);
+        if let Some(url_paths) = url_consts_by_file_line.get(&file_line_key) {
+            // Collect all ApiEndpoint NodeIds reachable via any URL path on this line.
+            let mut matched_ep_ids: Vec<NodeId> = Vec::new();
+            for norm_path in url_paths {
+                if let Some(ep_ids) = endpoint_by_path.get(norm_path) {
+                    matched_ep_ids.extend(ep_ids.iter().cloned());
+                }
+            }
+            // Deduplicate (multiple URL strings on the same line could point to the
+            // same endpoint after normalisation).
+            matched_ep_ids.sort_by(|a, b| a.to_stable_id().cmp(&b.to_stable_id()));
+            matched_ep_ids.dedup_by(|a, b| a.to_stable_id() == b.to_stable_id());
+
+            // Only emit when there is exactly one unambiguous match to avoid
+            // false cross-service edges in monorepos.
+            if matched_ep_ids.len() == 1 {
+                edges.push(Edge {
+                    from: node.id.clone(),
+                    to: matched_ep_ids.into_iter().next().unwrap(),
+                    kind: EdgeKind::Implements,
+                    source: ExtractionSource::TreeSitter,
+                    confidence: Confidence::Detected,
+                });
+            } else if matched_ep_ids.len() > 1 {
+                tracing::debug!(
+                    "openapi_sdk_link: skipping '{}' ({}:{}) — {} endpoints match URL path (ambiguous)",
+                    node.id.name,
+                    node.id.file.display(),
+                    node.line_start,
+                    matched_ep_ids.len(),
+                );
             }
         }
     }
@@ -174,6 +317,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_sdk_fn(name: &str, file: &str) -> Node {
+        make_sdk_fn_at_line(name, file, 1)
+    }
+
+    fn make_sdk_fn_at_line(name: &str, file: &str, line: usize) -> Node {
         Node {
             id: NodeId {
                 root: "frontend".to_string(),
@@ -182,8 +329,8 @@ mod tests {
                 kind: NodeKind::Function,
             },
             language: "typescript".to_string(),
-            line_start: 1,
-            line_end: 5,
+            line_start: line,
+            line_end: line,
             signature: format!("export async function {}(", name),
             body: String::new(),
             metadata: BTreeMap::new(),
@@ -192,8 +339,17 @@ mod tests {
     }
 
     fn make_api_endpoint(name: &str, op_id: &str, file: &str) -> Node {
+        make_api_endpoint_with_path(name, op_id, "", file)
+    }
+
+    fn make_api_endpoint_with_path(name: &str, op_id: &str, http_path: &str, file: &str) -> Node {
         let mut metadata = BTreeMap::new();
-        metadata.insert("operation_id".to_string(), op_id.to_string());
+        if !op_id.is_empty() {
+            metadata.insert("operation_id".to_string(), op_id.to_string());
+        }
+        if !http_path.is_empty() {
+            metadata.insert("http_path".to_string(), http_path.to_string());
+        }
         Node {
             id: NodeId {
                 root: "backend".to_string(),
@@ -208,6 +364,27 @@ mod tests {
             body: String::new(),
             metadata,
             source: ExtractionSource::Schema,
+        }
+    }
+
+    /// Make a synthetic URL Const node (as string_literals.rs would produce).
+    fn make_url_const(url_path: &str, file: &str, line: usize) -> Node {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("synthetic".to_string(), "true".to_string());
+        Node {
+            id: NodeId {
+                root: "frontend".to_string(),
+                file: PathBuf::from(file),
+                name: url_path.to_string(),
+                kind: NodeKind::Const,
+            },
+            language: "typescript".to_string(),
+            line_start: line,
+            line_end: line,
+            signature: format!("\"{}\"", url_path),
+            body: String::new(),
+            metadata,
+            source: ExtractionSource::TreeSitter,
         }
     }
 
@@ -231,6 +408,28 @@ mod tests {
     #[test]
     fn test_normalize_screaming_snake_case() {
         assert_eq!(normalize_operation_id("LIST_USERS"), "listusers");
+    }
+
+    // --- normalize_url_path ---
+
+    #[test]
+    fn test_normalize_url_path_curly_param() {
+        assert_eq!(normalize_url_path("/users/{id}"), "/users/<param>");
+    }
+
+    #[test]
+    fn test_normalize_url_path_colon_param() {
+        assert_eq!(normalize_url_path("/users/:id"), "/users/<param>");
+    }
+
+    #[test]
+    fn test_normalize_url_path_bracket_param() {
+        assert_eq!(normalize_url_path("/users/[id]"), "/users/<param>");
+    }
+
+    #[test]
+    fn test_normalize_url_path_no_params() {
+        assert_eq!(normalize_url_path("/workspaces/expertunities"), "/workspaces/expertunities");
     }
 
     // --- is_generated_sdk_file ---
@@ -296,7 +495,7 @@ mod tests {
         assert!(!is_generated_sdk_file(&PathBuf::from("src/client.py")));
     }
 
-    // --- openapi_sdk_link_pass ---
+    // --- openapi_sdk_link_pass: strategy 1 (operation_id) ---
 
     #[test]
     fn test_exact_camel_match_emits_implements_edge() {
@@ -341,8 +540,9 @@ mod tests {
     }
 
     #[test]
-    fn test_endpoint_without_operation_id_not_linked() {
-        // ApiEndpoint with no operation_id metadata must not be matched
+    fn test_endpoint_without_operation_id_not_linked_by_strategy1() {
+        // ApiEndpoint with no operation_id metadata — strategy 1 must not match.
+        // (strategy 2 would need a Const node too; no Const here → still no edge)
         let ep_no_op_id = {
             let mut n = make_api_endpoint("GET /users", "", "openapi/api.yaml");
             n.metadata.remove("operation_id");
@@ -354,7 +554,7 @@ mod tests {
         ];
         let edges = openapi_sdk_link_pass(&nodes);
 
-        assert!(edges.is_empty(), "endpoint without operation_id must not match");
+        assert!(edges.is_empty(), "endpoint without operation_id must not match via strategy 1");
     }
 
     #[test]
@@ -473,5 +673,219 @@ mod tests {
         let edges = openapi_sdk_link_pass(&nodes);
 
         assert_eq!(edges.len(), 1, "unique op_id must still produce edge");
+    }
+
+    // --- openapi_sdk_link_pass: strategy 2 (URL co-location) ---
+
+    /// Happy path: hey-api/openapi-ts style SDK — function and URL Const on the same line,
+    /// ApiEndpoint has http_path but no operation_id.
+    #[test]
+    fn test_url_colocation_emits_implements_edge() {
+        let sdk_file = "client/src/api.gen/sdk.gen.ts";
+        let nodes = vec![
+            // SDK function at line 10
+            make_sdk_fn_at_line("getWorkspacesIdExpertunities", sdk_file, 10),
+            // URL string literal on the same line (as hey-api/openapi-ts generates)
+            make_url_const("/workspaces/{id}/expertunities", sdk_file, 10),
+            // FastAPI ApiEndpoint with no operation_id but with http_path
+            make_api_endpoint_with_path(
+                "GET /workspaces/{id}/expertunities",
+                "",
+                "/workspaces/{id}/expertunities",
+                "ai_service/src/api/workspaces/id/expertunities.py",
+            ),
+        ];
+        let edges = openapi_sdk_link_pass(&nodes);
+
+        assert_eq!(edges.len(), 1, "URL co-location should produce 1 Implements edge, got: {:?}", edges);
+        let e = &edges[0];
+        assert_eq!(e.kind, EdgeKind::Implements);
+        assert_eq!(e.from.name, "getWorkspacesIdExpertunities");
+        assert_eq!(e.to.name, "GET /workspaces/{id}/expertunities");
+    }
+
+    /// URL co-location: path parameter styles should compare equal after normalisation.
+    #[test]
+    fn test_url_colocation_normalises_param_styles() {
+        let sdk_file = "client/src/api.gen/sdk.gen.ts";
+        // SDK has {id} style, endpoint also has {id} — should match after normalisation.
+        let nodes = vec![
+            make_sdk_fn_at_line("getWorkspacesId", sdk_file, 5),
+            make_url_const("/workspaces/{id}", sdk_file, 5),
+            make_api_endpoint_with_path(
+                "GET /workspaces/{id}",
+                "",
+                "/workspaces/{id}",
+                "src/api/workspaces.py",
+            ),
+        ];
+        let edges = openapi_sdk_link_pass(&nodes);
+        assert_eq!(edges.len(), 1, "param-normalised path match must produce edge");
+    }
+
+    /// URL co-location: Const node on a DIFFERENT line must not link.
+    #[test]
+    fn test_url_colocation_different_line_no_edge() {
+        let sdk_file = "client/src/api.gen/sdk.gen.ts";
+        let nodes = vec![
+            make_sdk_fn_at_line("getWorkspacesIdExpertunities", sdk_file, 10),
+            // Const at line 20 — NOT co-located
+            make_url_const("/workspaces/{id}/expertunities", sdk_file, 20),
+            make_api_endpoint_with_path(
+                "GET /workspaces/{id}/expertunities",
+                "",
+                "/workspaces/{id}/expertunities",
+                "ai_service/src/api/workspaces/id/expertunities.py",
+            ),
+        ];
+        let edges = openapi_sdk_link_pass(&nodes);
+        assert!(
+            edges.is_empty(),
+            "Const on different line must not produce edge, got: {:?}", edges
+        );
+    }
+
+    /// URL co-location: Const in a DIFFERENT file must not link.
+    #[test]
+    fn test_url_colocation_different_file_no_edge() {
+        let sdk_file = "client/src/api.gen/sdk.gen.ts";
+        let nodes = vec![
+            make_sdk_fn_at_line("getWorkspacesIdExpertunities", sdk_file, 10),
+            // Const in a different file
+            make_url_const("/workspaces/{id}/expertunities", "client/src/other.ts", 10),
+            make_api_endpoint_with_path(
+                "GET /workspaces/{id}/expertunities",
+                "",
+                "/workspaces/{id}/expertunities",
+                "ai_service/src/api/workspaces/id/expertunities.py",
+            ),
+        ];
+        let edges = openapi_sdk_link_pass(&nodes);
+        assert!(
+            edges.is_empty(),
+            "Const in different file must not produce edge, got: {:?}", edges
+        );
+    }
+
+    /// URL co-location: non-SDK file must not produce edge.
+    #[test]
+    fn test_url_colocation_non_sdk_file_no_edge() {
+        let non_sdk_file = "client/src/services/user_service.ts";
+        let nodes = vec![
+            make_sdk_fn_at_line("getWorkspacesIdExpertunities", non_sdk_file, 10),
+            make_url_const("/workspaces/{id}/expertunities", non_sdk_file, 10),
+            make_api_endpoint_with_path(
+                "GET /workspaces/{id}/expertunities",
+                "",
+                "/workspaces/{id}/expertunities",
+                "ai_service/src/api/workspaces/id/expertunities.py",
+            ),
+        ];
+        let edges = openapi_sdk_link_pass(&nodes);
+        assert!(
+            edges.is_empty(),
+            "function in non-SDK file must not produce edge via URL co-location, got: {:?}", edges
+        );
+    }
+
+    /// URL co-location: non-synthetic Const must not be used for matching.
+    #[test]
+    fn test_url_colocation_non_synthetic_const_no_edge() {
+        let sdk_file = "client/src/api.gen/sdk.gen.ts";
+        let mut non_synthetic_const = make_url_const("/workspaces/{id}/expertunities", sdk_file, 10);
+        // Remove the synthetic flag (or set to false)
+        non_synthetic_const.metadata.insert("synthetic".to_string(), "false".to_string());
+
+        let nodes = vec![
+            make_sdk_fn_at_line("getWorkspacesIdExpertunities", sdk_file, 10),
+            non_synthetic_const,
+            make_api_endpoint_with_path(
+                "GET /workspaces/{id}/expertunities",
+                "",
+                "/workspaces/{id}/expertunities",
+                "ai_service/src/api/workspaces/id/expertunities.py",
+            ),
+        ];
+        let edges = openapi_sdk_link_pass(&nodes);
+        assert!(
+            edges.is_empty(),
+            "non-synthetic Const must not be used for URL co-location, got: {:?}", edges
+        );
+    }
+
+    /// URL co-location: when ApiEndpoint has operation_id AND matching URL Const,
+    /// strategy 1 takes precedence and no duplicate edge is emitted.
+    #[test]
+    fn test_strategy1_takes_precedence_over_strategy2() {
+        let sdk_file = "client/src/api.gen/sdk.gen.ts";
+        let nodes = vec![
+            make_sdk_fn_at_line("listUsers", sdk_file, 10),
+            make_url_const("/users", sdk_file, 10),
+            // endpoint has BOTH operation_id AND http_path
+            make_api_endpoint_with_path("GET /users", "listUsers", "/users", "openapi/api.yaml"),
+        ];
+        let edges = openapi_sdk_link_pass(&nodes);
+        // Exactly one edge — strategy 1 matched first, strategy 2 was skipped.
+        assert_eq!(edges.len(), 1, "exactly one edge, no duplicate from strategy 2");
+        assert_eq!(edges[0].from.name, "listUsers");
+    }
+
+    /// URL co-location: ambiguous path (two endpoints share the same http_path after
+    /// normalisation) — must NOT emit any edge.
+    #[test]
+    fn test_url_colocation_ambiguous_path_no_edge() {
+        let sdk_file = "client/src/api.gen/sdk.gen.ts";
+        let nodes = vec![
+            make_sdk_fn_at_line("getWorkspacesId", sdk_file, 10),
+            make_url_const("/workspaces/{id}", sdk_file, 10),
+            // Two endpoints share the same normalised path
+            make_api_endpoint_with_path(
+                "GET /workspaces/{id}",
+                "",
+                "/workspaces/{id}",
+                "service-a/src/api/workspaces.py",
+            ),
+            make_api_endpoint_with_path(
+                "GET /workspaces/{id}",
+                "",
+                "/workspaces/{id}",
+                "service-b/src/api/workspaces.py",
+            ),
+        ];
+        let edges = openapi_sdk_link_pass(&nodes);
+        assert!(
+            edges.is_empty(),
+            "ambiguous path must not produce edge, got: {:?}", edges
+        );
+    }
+
+    /// URL co-location: multiple SDK functions in same file, each on a different
+    /// line with different URLs, must each link to their own endpoint.
+    #[test]
+    fn test_url_colocation_multiple_functions_independent() {
+        let sdk_file = "client/src/api.gen/sdk.gen.ts";
+        let nodes = vec![
+            make_sdk_fn_at_line("getWorkspacesIdExpertunities", sdk_file, 10),
+            make_url_const("/workspaces/{id}/expertunities", sdk_file, 10),
+            make_sdk_fn_at_line("getWorkspacesIdActivities", sdk_file, 20),
+            make_url_const("/workspaces/{id}/activities", sdk_file, 20),
+            make_api_endpoint_with_path(
+                "GET /workspaces/{id}/expertunities",
+                "",
+                "/workspaces/{id}/expertunities",
+                "ai_service/src/api/workspaces/id/expertunities.py",
+            ),
+            make_api_endpoint_with_path(
+                "GET /workspaces/{id}/activities",
+                "",
+                "/workspaces/{id}/activities",
+                "ai_service/src/api/workspaces/id/activities.py",
+            ),
+        ];
+        let edges = openapi_sdk_link_pass(&nodes);
+        assert_eq!(edges.len(), 2, "two functions must each link to their endpoint");
+        let from_names: Vec<_> = edges.iter().map(|e| e.from.name.as_str()).collect();
+        assert!(from_names.contains(&"getWorkspacesIdExpertunities"));
+        assert!(from_names.contains(&"getWorkspacesIdActivities"));
     }
 }
