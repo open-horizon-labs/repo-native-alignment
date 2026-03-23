@@ -12,6 +12,7 @@ pub mod fastapi_router_prefix;
 pub mod consumers;
 pub mod directory_module;
 pub mod event_bus;
+pub mod scan_stats;
 pub mod openapi_sdk_link;
 pub mod extractor_config;
 pub mod framework_detection;

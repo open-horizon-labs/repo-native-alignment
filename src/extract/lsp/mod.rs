@@ -2666,6 +2666,7 @@ impl Enricher for LspEnricher {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::str::FromStr;
 
     use super::*;
 

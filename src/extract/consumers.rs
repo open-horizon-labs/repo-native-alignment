@@ -22,9 +22,11 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use crate::extract::ExtractorRegistry;
 use crate::extract::event_bus::{ExtractionConsumer, ExtractionEvent, ExtractionEventKind};
+use crate::extract::scan_stats::{ScanStats, ScanStatsConsumer};
 use crate::graph::Node;
 
 // ---------------------------------------------------------------------------
@@ -786,6 +788,8 @@ impl ExtractionConsumer for SubsystemConsumer {
 /// path; Phase 3+ promotes these stubs to full async consumers.
 ///
 /// Registered consumers:
+/// - `ScanStatsConsumer` — `RootDiscovered`, `RootExtracted`, `LanguageDetected`,
+///   `EnrichmentComplete`, `PassesComplete` (singleton; writes into `scan_stats`)
 /// - `ManifestConsumer`, `TreeSitterConsumer` — `RootDiscovered`
 /// - `LanguageAccumulatorConsumer`, `PostExtractionConsumer`,
 ///   `OpenApiConsumer`, `GrpcConsumer`, `EmbeddingIndexerConsumer` — `RootExtracted`
@@ -801,13 +805,24 @@ impl ExtractionConsumer for SubsystemConsumer {
 ///
 /// `root_pairs` must be the full `(slug, path)` list for the workspace.
 /// `primary_slug` is the slug of the primary code root.
+/// `scan_stats` is the shared stats handle owned by `RnaHandler`. When `None`,
+/// a fresh throwaway `Arc` is created (used by `run_post_passes_via_bus` and tests).
+///
+/// Returns `(bus, scan_stats_arc)` where `scan_stats_arc` is either the passed-in
+/// `Arc` or the freshly created one.
 pub fn build_builtin_bus(
     root_pairs: Vec<(String, PathBuf)>,
     primary_slug: String,
-) -> crate::extract::event_bus::EventBus {
+    scan_stats: Option<Arc<RwLock<ScanStats>>>,
+) -> (crate::extract::event_bus::EventBus, Arc<RwLock<ScanStats>>) {
     use crate::extract::event_bus::EventBus;
 
     let mut bus = EventBus::new();
+
+    // --- ScanStatsConsumer (singleton — registered first so it sees every event) ---
+    let stats_arc = scan_stats.unwrap_or_else(|| Arc::new(RwLock::new(ScanStats::default())));
+    let scan_stats_consumer = ScanStatsConsumer { stats: Arc::clone(&stats_arc) };
+    bus.register(Box::new(scan_stats_consumer));
 
     // --- RootDiscovered consumers ---
     bus.register(Box::new(ManifestConsumer));
@@ -846,7 +861,7 @@ pub fn build_builtin_bus(
     bus.register(Box::new(SubsystemConsumer));
     bus.register(Box::new(LanceDBConsumer));
 
-    bus
+    (bus, stats_arc)
 }
 
 // ---------------------------------------------------------------------------
@@ -875,6 +890,8 @@ pub fn build_builtin_bus(
 /// * `root_pairs` - `(slug, path)` pairs for all workspace roots
 /// * `primary_slug` - slug of the primary code root
 /// * `repo_root` - path to the primary repository root (for the bus event)
+/// * `scan_stats` - optional shared stats handle from `RnaHandler`. When provided,
+///   the `ScanStatsConsumer` writes into this `Arc`; when `None`, a throwaway is used.
 ///
 /// # Returns
 /// `Ok((nodes, edges, detected_frameworks))` — the enriched graph and framework set.
@@ -891,6 +908,7 @@ pub fn run_post_passes_via_bus(
     root_pairs: Vec<(String, PathBuf)>,
     primary_slug: String,
     repo_root: PathBuf,
+    scan_stats: Option<Arc<RwLock<ScanStats>>>,
 ) -> anyhow::Result<(Vec<crate::graph::Node>, Vec<crate::graph::Edge>, std::collections::HashSet<String>)> {
     use crate::extract::event_bus::ExtractionEvent;
     use std::sync::Arc;
@@ -899,7 +917,7 @@ pub fn run_post_passes_via_bus(
     let nodes_arc: Arc<[crate::graph::Node]> = Arc::from(nodes.into_boxed_slice());
     let edges_arc: Arc<[crate::graph::Edge]> = Arc::from(edges.into_boxed_slice());
 
-    let bus = build_builtin_bus(root_pairs, primary_slug.clone());
+    let (bus, _stats) = build_builtin_bus(root_pairs, primary_slug.clone(), scan_stats);
     let events = bus.emit(ExtractionEvent::RootExtracted {
         slug: primary_slug,
         path: repo_root,
@@ -1119,12 +1137,13 @@ mod tests {
     /// Verify build_builtin_bus registers consumers for all expected event kinds.
     #[test]
     fn test_builtin_bus_has_consumers_for_all_event_kinds() {
-        let bus = build_builtin_bus(vec![], "test".into());
+        let (bus, _stats) = build_builtin_bus(vec![], "test".into(), None);
         // Derive the exact expected count to catch regressions when languages are added/removed.
         let lsp_count = crate::extract::EnricherRegistry::with_builtins()
             .supported_languages()
             .len();
         let expected_total =
+            1 +        // ScanStatsConsumer (singleton, registered first)
             2 +        // RootDiscovered: ManifestConsumer, TreeSitterConsumer
             5 +        // RootExtracted: LanguageAccumulatorConsumer, PostExtractionConsumer,
                        //   OpenApiConsumer, GrpcConsumer, EmbeddingIndexerConsumer
@@ -1136,6 +1155,25 @@ mod tests {
             bus.len(), expected_total,
             "Unexpected built-in consumer count: got {}, expected {} (lsp_count={})",
             bus.len(), expected_total, lsp_count
+        );
+    }
+
+    /// Verify build_builtin_bus returns a stats handle that shares state with the bus.
+    #[test]
+    fn test_builtin_bus_returns_scan_stats_handle() {
+        let (bus, stats) = build_builtin_bus(vec![], "test".into(), None);
+        // No activity yet
+        assert!(!stats.read().unwrap().has_activity());
+
+        // Emit RootDiscovered — the ScanStatsConsumer inside the bus should update stats.
+        bus.emit(crate::extract::event_bus::ExtractionEvent::RootDiscovered {
+            slug: "test".into(),
+            path: PathBuf::from("."),
+            lsp_only: false,
+        });
+        assert!(
+            stats.read().unwrap().has_activity(),
+            "stats handle must reflect events fired through the bus"
         );
     }
 
@@ -1195,9 +1233,10 @@ mod tests {
         // Need scan state dir
         std::fs::create_dir_all(tmp.path().join(".oh").join(".cache")).unwrap();
 
-        let bus = build_builtin_bus(
+        let (bus, _stats) = build_builtin_bus(
             vec![("test".to_string(), tmp.path().to_path_buf())],
             "test".to_string(),
+            None,
         );
         let events = bus.emit(ExtractionEvent::RootDiscovered {
             slug: "test".to_string(),
@@ -1303,6 +1342,7 @@ mod tests {
             vec![],
             "test".to_string(),
             PathBuf::from("."),
+            None,
         ).expect("run_post_passes_via_bus must not fail on empty input");
         assert!(nodes.is_empty(), "empty input → empty nodes");
         assert!(edges.is_empty(), "empty input → empty edges");
@@ -1343,6 +1383,7 @@ mod tests {
             vec![],
             "test".to_string(),
             PathBuf::from("."),
+            None,
         ).expect("run_post_passes_via_bus must not fail with valid input");
 
         // Output must contain the input node (passes should not drop it)

@@ -27,6 +27,7 @@ impl RnaHandler {
         let graph = Arc::clone(&self.graph);
         let repo_root = self.repo_root.clone();
         let lance_write_lock = Arc::clone(&self.lance_write_lock);
+        let scan_stats = Arc::clone(&self.scan_stats);
         tokio::spawn(async move {
             // Track root slugs from the previous tick to detect removed worktrees.
             // Seed from the current resolved roots so the first tick doesn't
@@ -286,6 +287,7 @@ impl RnaHandler {
                             root_pairs,
                             primary_slug.clone(),
                             repo_root.clone(),
+                            Some(Arc::clone(&scan_stats)),
                         ) {
                             Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
                                 graph_state.nodes = enriched_nodes;

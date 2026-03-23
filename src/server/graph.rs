@@ -602,6 +602,7 @@ impl RnaHandler {
                     root_pairs,
                     primary_slug,
                     self.repo_root.clone(),
+                    Some(Arc::clone(&self.scan_stats)),
                 )?;
             all_nodes = enriched_nodes;
             all_edges = enriched_edges;
@@ -1072,6 +1073,7 @@ impl RnaHandler {
                     root_pairs_incremental,
                     primary_slug.clone(),
                     self.repo_root.clone(),
+                    Some(Arc::clone(&self.scan_stats)),
                 ).map_err(|e| {
                     // Pipeline invariant violated — abort the incremental update so the
                     // partial graph is not persisted. Scanner state is not committed on
