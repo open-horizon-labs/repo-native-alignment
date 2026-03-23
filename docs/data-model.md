@@ -10,7 +10,7 @@ Authoritative sources: `src/graph/mod.rs`, `src/graph/store.rs`, `src/server/sto
 
 ## 1. LanceDB Column Store
 
-RNA persists data in LanceDB at `.oh/.cache/lance/` relative to the repository root. The current schema version is tracked in `.oh/.cache/lance/schema_version`. When this file does not match `SCHEMA_VERSION` (currently `18`), all LanceDB tables are dropped and rebuilt from scratch.
+RNA persists data in LanceDB at `.oh/.cache/lance/` relative to the repository root. The current schema version is tracked in `.oh/.cache/lance/schema_version`. When this file does not match `SCHEMA_VERSION` (currently `18`), the graph tables (`symbols`, `edges`, `pr_merges`, `file_index`) are dropped and rebuilt from scratch. The `artifacts` embedding table is managed separately and is not covered by `SCHEMA_VERSION` — it has its own schema validation at startup (see `artifacts` table section below).
 
 A separate `.oh/.cache/lance/extraction_version` file tracks the global extraction logic version (`EXTRACTION_VERSION`, currently `14`). This integer is **deprecated** as of v0.1.15 (#526) — per-consumer content-addressed cache keys have replaced the single global sentinel (see [Section 6](#6-content-addressed-consumer-cache)). The file is still read for backward-compatible sentinel detection on cold start, but new consumer invalidation is driven by `ExtractionConsumer::version()` return values, not this file.
 

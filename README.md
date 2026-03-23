@@ -383,7 +383,7 @@ RNA works standalone. These add organizational context and workflow structure:
 
 4 MCP tools, 10 CLI subcommands. Extracts symbols from 22 languages, builds a call graph via language server analysis, detects architectural subsystems and frameworks automatically. Ships as a Claude Code plugin. CLI and MCP share the same index and service layer.
 
-**v0.1.15 (current):** EventBus/consumer architecture, parallel LSP enrichment, per-consumer content-addressed cache, live scan stats in `list_roots`, config-driven extractors (`.oh/extractors/*.toml`), worktree own-cache detection, FastAPI router prefix resolution. SCHEMA_VERSION 18, EXTRACTION_VERSION 14 (deprecated — per-consumer `version()` replaces the global integer).
+**v0.1.15 (current):** EventBus/consumer architecture, parallel LSP enrichment, per-consumer content-addressed cache, live scan stats in `list_roots`, config-driven extractors (`.oh/extractors/*.toml`), worktree own-cache detection, FastAPI router prefix resolution. SCHEMA_VERSION 18, EXTRACTION_VERSION 14 (deprecated — new invalidation is driven by `ExtractionConsumer::version()` per consumer; the global integer is still read on cold start for backward-compatible sentinel detection).
 
 ### Platform Support
 

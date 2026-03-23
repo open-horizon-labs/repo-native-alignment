@@ -158,7 +158,7 @@ Each repo is a tenant. `tenant_id` = root slug. Multiple repos scanning simultan
 
 3. **Parallel LSP — COMPLETE** — `LspConsumer` subscribes to `LanguageDetected`. `AllEnrichmentsGate` waits for all enrichments then emits `AllEnrichmentsDone`. Merged as #528. Both language servers start concurrently.
 
-4. **#454 — DEFERRED** — Move `LanceDBPersist` and `EmbeddingIndexer` to singleton consumers for multi-repo support. `LanceDBConsumer` and `EmbeddingIndexerConsumer` were promoted from stubs to real implementations (#530), but full singleton promotion (shared across multiple server instances) is deferred to #454.
+4. **#454 — DEFERRED** — Move `LanceDBPersist` and `EmbeddingIndexer` to singleton consumers for multi-repo support. `LanceDBConsumer` and `EmbeddingIndexerConsumer` were given real implementations in #530, but all `build_builtin_bus` call sites still pass `lance_repo_root: None` — the consumers are wired as no-ops in the current pipeline. Full activation (passing a real repo root) and singleton promotion (shared across multiple server instances) are deferred to #454.
 
 ## What This Solves
 
