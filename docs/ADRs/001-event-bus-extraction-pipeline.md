@@ -1,7 +1,8 @@
 # RNA Event Bus Architecture
-**Status:** Design — pre-implementation
-**Issues:** #478 (plugin arch), #479 (event bus), #454 (multi-tenant store)
+**Status:** Implemented — Phase 2b complete (v0.1.15)
+**Issues:** #478 (plugin arch — merged), #479 (event bus — merged), #454 (multi-tenant store — deferred to future release)
 **Date:** 2026-03-22
+**Implementation PRs:** #493 (PostExtractionRegistry), #500 (EventBus + ExtractionConsumer trait), #515 (wire build_full_graph_inner to EventBus), #519 (FastAPI router prefix), #526/#533 (content-addressed cache keys), #527 (ScanStatsConsumer), #528 (AllEnrichmentsGate / parallel LSP), #530 (EmbeddingIndexerConsumer + LanceDBConsumer promotion)
 
 ---
 
@@ -151,17 +152,13 @@ Each repo is a tenant. `tenant_id` = root slug. Multiple repos scanning simultan
 
 ## Migration Path
 
-1. **#478** — Extract `PostExtractionRegistry` (trait + impl). This is the extractor plugin arch.
-   Each pass becomes a `PostExtractionPass` implementor with `applies_when()`.
+1. **#478 — COMPLETE** — Extract `PostExtractionRegistry` (trait + impl). Each pass is a `PostExtractionPass` implementor with `applies_when()`. Merged as #493.
 
-2. **#479** — Introduce `ExtractionEvent` enum and `EventBus`.
-   Wrap existing pipeline stages as consumers. No behavior change — just decouple.
+2. **#479 — COMPLETE** — Introduce `ExtractionEvent` enum and `EventBus`. Wrap existing pipeline stages as consumers. Merged as #500. `build_full_graph_inner` wired to EventBus in #515.
 
-3. **Parallel LSP** — Move LSP enrichers to subscribe to `LanguageDetected`.
-   Pyright and tsserver fire concurrently. Expected ~2× speedup on multi-language repos.
+3. **Parallel LSP — COMPLETE** — `LspConsumer` subscribes to `LanguageDetected`. `AllEnrichmentsGate` waits for all enrichments then emits `AllEnrichmentsDone`. Merged as #528. Both language servers start concurrently.
 
-4. **#454** — Move `LanceDBPersist` and `EmbeddingIndexer` to singleton consumers.
-   Centralize store. Per-repo agents become lightweight producers.
+4. **#454 — DEFERRED** — Move `LanceDBPersist` and `EmbeddingIndexer` to singleton consumers for multi-repo support. `LanceDBConsumer` and `EmbeddingIndexerConsumer` were promoted from stubs to real implementations (#530), but full singleton promotion (shared across multiple server instances) is deferred to #454.
 
 ## What This Solves
 

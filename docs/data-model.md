@@ -1,8 +1,8 @@
 # RNA Data Model
 
-This document describes the actual data model in RNA as of schema version 14. It covers the LanceDB column store, the in-memory graph structure, and how data flows from extraction through to MCP tool rendering.
+This document describes the actual data model in RNA as of schema version 18. It covers the LanceDB column store, the in-memory graph structure, and how data flows from extraction through to MCP tool rendering.
 
-Authoritative sources: `src/graph/mod.rs`, `src/graph/store.rs`, `src/server/store.rs`, `src/embed.rs`, `src/server/state.rs`, `src/graph/index.rs`.
+Authoritative sources: `src/graph/mod.rs`, `src/graph/store.rs`, `src/server/store.rs`, `src/embed.rs`, `src/server/state.rs`, `src/graph/index.rs`, `src/extract/event_bus.rs`, `src/extract/consumers.rs`, `src/extract/scan_stats.rs`, `src/extract/cache.rs`.
 
 **Keeping this doc in sync:** When you bump `SCHEMA_VERSION` in `src/graph/store.rs`, update the tables in section 1 of this file to match. The schema version number appears in the first paragraph of section 1.
 
@@ -10,9 +10,9 @@ Authoritative sources: `src/graph/mod.rs`, `src/graph/store.rs`, `src/server/sto
 
 ## 1. LanceDB Column Store
 
-RNA persists data in LanceDB at `.oh/.cache/lance/` relative to the repository root. The current schema version is tracked in `.oh/.cache/lance/schema_version`. When this file does not match `SCHEMA_VERSION` (currently `14`), all LanceDB tables are dropped and rebuilt from scratch.
+RNA persists data in LanceDB at `.oh/.cache/lance/` relative to the repository root. The current schema version is tracked in `.oh/.cache/lance/schema_version`. When this file does not match `SCHEMA_VERSION` (currently `18`), all LanceDB tables are dropped and rebuilt from scratch.
 
-A separate `.oh/.cache/lance/extraction_version` file tracks the source extraction logic version (`EXTRACTION_VERSION`, currently `2`). A mismatch clears per-root scan-state files so all source files are re-extracted, without dropping the LanceDB tables.
+A separate `.oh/.cache/lance/extraction_version` file tracks the global extraction logic version (`EXTRACTION_VERSION`, currently `14`). This integer is **deprecated** as of v0.1.15 (#526) — per-consumer content-addressed cache keys have replaced the single global sentinel (see [Section 6](#6-content-addressed-consumer-cache)). The file is still read for backward-compatible sentinel detection on cold start, but new consumer invalidation is driven by `ExtractionConsumer::version()` return values, not this file.
 
 ### `symbols` table
 
@@ -206,7 +206,8 @@ Key metadata keys stored in `Node.metadata` (all optional):
 | `diagnostic_source` | LSP server name for diagnostics |
 | `diagnostic_message` | Full diagnostic text |
 | `http_method` | For `NodeKind::ApiEndpoint` nodes |
-| `http_path` | HTTP path for API endpoint nodes |
+| `http_path` | HTTP path for API endpoint nodes (full path after router prefix resolution) |
+| `http_path_local` | Original local path fragment before router prefix concatenation (e.g., `"/list"` when a FastAPI `APIRouter(prefix="/orders")` is applied) — set once on first prefix application; subsequent applications read this value instead of re-prefixing |
 
 ### NodeKind
 
@@ -327,63 +328,63 @@ The `GraphIndex` supports: neighbors, BFS/DFS traversal, impact analysis (reacha
 
 ## 3. The Pipeline: Extraction to MCP Rendering
 
+As of v0.1.15, the extraction pipeline is event-driven. `build_full_graph_inner` fires `RootDiscovered` seed events into an `EventBus` pre-loaded with built-in consumers. Each consumer reacts to events and may emit follow-on events. The bus drains depth-first until no events remain.
+
 ```text
-Source files (any language)
+build_full_graph_inner
         |
         v
-Scanner (mtime + blake3 content hash)
-  -- detects changed/new/deleted files --
+EventBus.emit_all(RootDiscovered { slug, path })
         |
         v
-ExtractorRegistry (dispatches by file extension)
-  -- tree-sitter, schema, markdown extractors --
+TreeSitterConsumer (subscribes: RootDiscovered)
+  -- rayon parallel per-file extraction --
+  -- fires: RootExtracted { slug, nodes, edges }
         |
         v
-ExtractionResult { nodes: Vec<Node>, edges: Vec<Edge> }
+LanguageAccumulatorConsumer (subscribes: RootExtracted)
+  -- groups nodes by detected language --
+  -- fires: LanguageDetected { slug, language, nodes } (once per language)
         |
         v
-GraphState (in-memory Vec<Node>, Vec<Edge>)
-  -- subsystem detection runs (Louvain-like community detection on edge graph) --
-  -- PageRank runs (weighted by EdgeKind) -- scores stored in node.metadata["importance"]
-  -- subsystem name stored in node.metadata["subsystem"] --
-        |
-        +-- persist_graph_to_lance (full: DROP + CREATE) -------> LanceDB symbols + edges tables
-        |   OR
-        +-- persist_graph_incremental (incremental: merge_insert, file-scoped delete)
-        |
-        v
-GraphIndex (rebuilt from Vec<Edge> via rebuild_from_edges)
+LspConsumer × N (subscribes: LanguageDetected)
+  -- runs real LSP enricher for each language concurrently --
+  -- fires: EnrichmentComplete { slug, language, added_edges, new_nodes, updated_nodes }
+
+AllEnrichmentsGate (subscribes: RootExtracted + EnrichmentComplete)
+  -- counts expected vs received enrichments --
+  -- when counts match, fires: AllEnrichmentsDone { slug, nodes, edges, lsp_edges, lsp_nodes, updated_nodes }
         |
         v
-Background: LSP Enricher (language server auto-detected)
-  -- call hierarchy, type hierarchy, diagnostics --
+PostExtractionConsumer (subscribes: AllEnrichmentsDone)
+  -- runs PostExtractionRegistry passes over full LSP-enriched graph --
+  -- fires: PassesComplete { slug, nodes, edges, detected_frameworks }
+  -- may fire: FrameworkDetected { framework, nodes } (one per detected framework)
         |
         v
-EnrichmentResult {
-    added_edges: Vec<Edge>,             -- new Calls/Implements/TestedBy/etc. edges
-    updated_nodes: Vec<(id, patches)>,  -- metadata patches (e.g., doc links)
-    new_nodes: Vec<Node>,               -- virtual external nodes (root="external")
-}
+SubsystemConsumer (subscribes: PassesComplete)
+  -- Louvain community detection, PageRank --
+  -- updates node.metadata["subsystem"] and node.metadata["importance"]
         |
         v
-Graph patched in-memory + persist_graph_incremental
+LanceDBConsumer (subscribes: PassesComplete)
+  -- background persist: persist_graph_to_lance or persist_graph_incremental
+
+EmbeddingIndexerConsumer (subscribes: RootExtracted)
+  -- streams embed tasks in parallel with LSP enrichment --
+  -- re-embeds nodes whose text_hash changed
+
+ScanStatsConsumer (subscribes: all five event kinds)
+  -- maintains live ScanStats for list_roots queries (no file I/O)
+
+        v
+MCP tool call (e.g., search, repo_map, list_roots)
         |
         v
-Background: EmbeddingIndex (fastembed + LanceDB)
-  -- index_all_with_symbols: embeds code nodes, markdown sections, .oh/ artifacts, commits --
-  -- reindex_nodes: re-embeds only nodes whose text_hash changed --
-        |
-        v
-LanceDB artifacts table (vector + FTS + scalar filter columns)
-        |
-        v
-MCP tool call (e.g., search, graph_query, repo_map)
-        |
-        v
-service.rs / server/handlers.rs
+src/server/handlers.rs
   -- hybrid search: vector + FTS + RRF fusion via EmbeddingIndex --
   -- graph traversal: neighbors/impact/reachable via GraphIndex --
-  -- symbol lookup: O(1) via GraphState.node_index_map() --
+  -- list_roots: reads ScanStats (live) or sentinel files (cold-start fallback)
         |
         v
 MCP response (JSON)
@@ -393,8 +394,8 @@ MCP response (JSON)
 
 | Operation | Location |
 |-----------|----------|
-| Full graph build | `src/server/graph.rs::build_full_graph` |
-| Incremental graph update | `src/server/graph.rs::update_graph_incrementally` |
+| Full graph build | `src/server/graph.rs::build_full_graph_inner` |
+| EventBus construction | `src/extract/consumers.rs::build_builtin_bus` |
 | Persist full | `src/server/store.rs::persist_graph_to_lance` |
 | Persist incremental | `src/server/store.rs::persist_graph_incremental` |
 | Load from LanceDB | `src/server/store.rs::load_graph_from_lance` |
@@ -402,6 +403,7 @@ MCP response (JSON)
 | Embed symbols | `src/embed.rs::EmbeddingIndex::index_all_with_symbols` |
 | Hybrid search | `src/embed.rs::EmbeddingIndex::search` |
 | MCP search handler | `src/server/handlers.rs::handle_search` |
+| Live scan stats | `src/extract/scan_stats.rs::ScanStatsConsumer` |
 
 ---
 
@@ -441,3 +443,126 @@ Subsystems are detected automatically via community detection on the in-memory g
 **Querying by subsystem:** The `search()` MCP tool accepts a `subsystem` parameter that pushes a scalar filter (`subsystem = '...'`) into LanceDB before vector ranking. The `repo_map` tool reports detected subsystems with their member counts and cohesion scores.
 
 **How subsystems are named:** After community detection assigns cluster IDs, the cluster is named after the most-connected node in the cluster (typically a module or frequently-called function). Names are deterministic given the same graph topology.
+
+---
+
+## 6. Content-Addressed Consumer Cache
+
+As of v0.1.15 (#526, #533), per-consumer cache keys replace the single global `EXTRACTION_VERSION` integer for incremental extraction invalidation.
+
+### ConsumerCacheKey
+
+Defined in `src/extract/cache.rs`.
+
+```rust
+pub struct ConsumerCacheKey {
+    /// blake3 hash (hex string) of `event.canonical_bytes()`.
+    pub payload_hash: String,
+    /// Consumer's self-declared version (see `ExtractionConsumer::version()`).
+    pub consumer_version: u64,
+}
+```
+
+**Cache key semantics:**
+- `cache_key = (blake3(event.canonical_bytes()), consumer.version())`
+- Upstream output changes → payload hash changes → downstream cache misses automatically.
+- Consumer logic version bumps → only that consumer's entries miss.
+- Config-driven consumers (`CustomExtractorConsumer`) compute `version()` as `blake3(toml_file_contents)[..8]` as a `u64` — no manual bump needed when config changes.
+
+**`ExtractionConsumer::version()` trait method** (defined in `src/extract/event_bus.rs`):
+
+```rust
+fn version(&self) -> u64 {
+    0  // default: stable logic, never needs invalidation
+}
+```
+
+Bump when the consumer's extraction logic changes in a way that would produce different output for the same input event. Leave at `0` for consumers with stable, never-changing logic.
+
+**`is_cacheable()` trait method:**
+
+```rust
+fn is_cacheable(&self) -> bool {
+    true  // default: pure/stateless transformational consumers
+}
+```
+
+Override to `false` for consumers that:
+- Accumulate state across multiple `on_event` calls (e.g., `AllEnrichmentsGate`, `ScanStatsConsumer`).
+- Trigger external side-effects that must run every time (e.g., `LanceDBConsumer`, `EmbeddingIndexerConsumer`).
+- Read filesystem state beyond the event payload (e.g., `ManifestConsumer`, `TreeSitterConsumer`).
+
+**Migration from `EXTRACTION_VERSION`:** The global `EXTRACTION_VERSION` integer (`src/graph/store.rs`) is deprecated and kept only for backward-compatible sentinel reads on cold start. New invalidation is driven exclusively by `ConsumerCacheKey`.
+
+---
+
+## 7. EventBus Pipeline Types
+
+Defined in `src/extract/event_bus.rs` and `src/extract/consumers.rs`.
+
+### ExtractionConsumer trait
+
+```rust
+pub trait ExtractionConsumer: Send + Sync {
+    fn name(&self) -> &str;
+    fn subscribes_to(&self) -> &[ExtractionEventKind];
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>>;
+    fn version(&self) -> u64 { 0 }
+    fn is_cacheable(&self) -> bool { true }
+}
+```
+
+### EventBus
+
+Ordered consumer registry. Dispatches events depth-first. Holds an in-memory content-addressed cache keyed by `(consumer_name, ConsumerCacheKey)`.
+
+```rust
+pub struct EventBus {
+    // (internal)
+}
+// Key methods:
+// EventBus::new()
+// EventBus::register(consumer: Box<dyn ExtractionConsumer>)
+// EventBus::emit(event: ExtractionEvent)
+// EventBus::emit_all(seeds: Vec<ExtractionEvent>)
+```
+
+### BusOptions
+
+Groups optional dependency overrides for `build_builtin_bus` and `run_post_passes_via_bus`. Pass `BusOptions::default()` in test/stub mode.
+
+```rust
+pub struct BusOptions {
+    /// Shared ScanStats handle. When None, a fresh throwaway Arc is created.
+    pub scan_stats: Option<Arc<RwLock<ScanStats>>>,
+    /// When Some, EmbeddingIndexerConsumer streams embed tasks per RootExtracted.
+    pub embed_idx: Option<Arc<EmbeddingIndex>>,
+    /// When Some, LanceDBConsumer fires a background persist on PassesComplete.
+    pub lance_repo_root: Option<Arc<PathBuf>>,
+}
+```
+
+### ScanStats / ScanStatsConsumer
+
+Defined in `src/extract/scan_stats.rs`.
+
+`ScanStats` is live scan state maintained by `ScanStatsConsumer`. `list_roots` reads from this singleton for in-progress and complete status. Sentinel files (`extract_completed.json`) remain as a cold-start fallback.
+
+```rust
+pub struct ScanStats {
+    pub roots_queued: usize,
+    pub roots_extracted: HashMap<String, RootExtractedStats>,
+    pub languages_in_flight: HashMap<String, Vec<String>>,
+    pub languages_done: HashMap<String, Vec<String>>,
+    pub lsp_edge_counts: HashMap<String, HashMap<String, usize>>,
+    pub roots_complete: HashMap<String, RootCompleteStats>,
+}
+```
+
+`ScanStatsConsumer` subscribes to: `RootDiscovered`, `RootExtracted`, `LanguageDetected`, `EnrichmentComplete`, `PassesComplete`. It is non-cacheable (`is_cacheable() = false`) because it accumulates state across calls.
+
+### AllEnrichmentsDone / AllEnrichmentsGate
+
+`AllEnrichmentsGate` (defined in `src/extract/consumers.rs`) subscribes to both `RootExtracted` (to count expected languages) and `EnrichmentComplete` (to count completions). When all expected enrichments are received for a root, it emits `AllEnrichmentsDone { slug, nodes, edges, lsp_edges, lsp_nodes, updated_nodes }`.
+
+`PostExtractionConsumer` subscribes to `AllEnrichmentsDone` so post-extraction passes see the full LSP-enriched graph — not just the tree-sitter output. This replaces the former sequential pipeline where passes ran before LSP enrichment was available.

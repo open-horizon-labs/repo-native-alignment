@@ -91,7 +91,7 @@ RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents
 
 ## What RNA Does Better
 
-1. **More accurate graph** — 22-language tree-sitter extraction + 37 LSP servers for compiler-grade call/type hierarchy and `Implements` edges. Neither CGR nor CGC has LSP enrichment. RNA's edges come from the same language servers your editor uses.
+1. **More accurate graph** — 22-language tree-sitter extraction + 37 LSP servers for compiler-grade call/type hierarchy and `Implements` edges. Neither CGR nor CGC has LSP enrichment. RNA's edges come from the same language servers your editor uses. Multiple language servers run concurrently (EventBus `LanguageDetected` events), so Python + TypeScript + Rust LSP enrichment all start in parallel rather than sequentially.
 2. **Faster queries** — In-process, embedded index. No network hop, no Docker. Microsecond graph traversal, millisecond semantic search.
 3. **Deeper semantic search** — Function bodies (not just names), all markdown (chunked by heading with hierarchy), and commits in one vector space. Results are relevance-ranked with test file demotion. CGR embeds function bodies but with raw scores. CGC doesn't embed at all.
 4. **Semantic graph entry points** — `search(query="database pool", mode="impact")` works directly. No need to look up a `node_id` first. CGR and CGC require exact node identifiers.
@@ -103,10 +103,11 @@ RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents
 
 1. **Outcome-to-code structural joins** — `outcome_progress` traces declared business outcomes through tagged commits to symbols. No other tool connects "why" to "what."
 2. **Cross-session learning** — `.oh/metis/` persists practical wisdom across agent sessions, searchable via the same embedding index.
-3. **Staleness awareness** — `LSP: pending`, `LSP: enriched (N edges)`, "Embedding index: building" — agents know when to trust results and when to retry.
-4. **Self-tuning performance** — Adaptive batch sizing, background reindexing, lock-free double-buffered embedding index. `scan --full` is incremental when a cache exists — only changed files and nodes are reprocessed, dropping repeat scans from ~50s to ~0.1s on no-change runs.
+3. **Staleness awareness** — `list_roots` reads live scan stats during active scans (not just file sentinels after completion): symbols extracted, languages in-flight for LSP, edge counts per language, scan phase. Agents know exactly where in the pipeline a scan is.
+4. **Self-tuning performance** — Parallel tree-sitter extraction (rayon, all cores), parallel LSP enrichment (all language servers start concurrently via EventBus `LanguageDetected` events), lock-free double-buffered embedding index. `scan --full` is incremental when a cache exists — ~0.1s on no-change runs. Per-consumer content-addressed cache keys mean changing one consumer's logic only invalidates that consumer's results, not the entire cache.
 5. **Zero external dependencies** — Single binary, no Docker, no DB server, no API key.
-6. **Architecture-aware queries** — Subsystem detection (Louvain, phase-2 contraction) clusters symbols by actual coupling. Subsystem name, cohesion score, and interface list are available to agents on the first `repo_map` call — no tuning or config required.
+6. **Architecture-aware queries** — Subsystem detection (Louvain, phase-2 contraction) clusters symbols by actual coupling. Framework detection adds first-class `NodeKind::Other("framework")` nodes (e.g., `lancedb`, `tokio`, `fastapi`). Subsystem name, cohesion score, and interface list are available to agents on the first `repo_map` call — no tuning or config required.
+7. **Config-driven topology extraction** — Drop `.oh/extractors/*.toml` in any repo to add custom `Produces`/`Consumes` edges for any message broker, event bus, or RPC pattern. Glob patterns, optional topic-arg (function name as channel when omitted). No Rust, no build, no RNA release required.
 
 ## What Others Do That RNA Doesn't
 
