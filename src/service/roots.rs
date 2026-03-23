@@ -1,6 +1,10 @@
 //! Workspace root listing with per-root scan stats and LSP status.
 
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
+
+/// Per-root stats tuple: (node_count, edge_count) and language set.
+type RootStatsMap = (HashMap<String, (usize, usize)>, HashMap<String, BTreeSet<String>>);
 
 use crate::server::state::{LspEnrichmentStatus, LspState};
 
@@ -59,11 +63,7 @@ pub fn list_roots_from_slugs(
 
     // Pre-compute per-root stats in a single pass over nodes and edges.
     // This keeps list_roots_from_slugs O(nodes + edges + roots) rather than O(roots × nodes).
-    #[allow(clippy::type_complexity)]
-    let (root_stats, root_langs_map): (
-        std::collections::HashMap<String, (usize, usize)>,
-        std::collections::HashMap<String, std::collections::BTreeSet<String>>,
-    ) = if let Some(gs) = graph_state {
+    let (root_stats, root_langs_map): RootStatsMap = if let Some(gs) = graph_state {
         let mut node_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let mut edge_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let mut langs: std::collections::HashMap<String, std::collections::BTreeSet<String>> = std::collections::HashMap::new();

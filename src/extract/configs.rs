@@ -18,10 +18,12 @@ use super::query::RouteQueryConfig;
 /// Python Flask/FastAPI/Starlette/Django-ninja route decorator query.
 ///
 /// Matches decorators of the form:
-/// - `@app.route("/path")`
-/// - `@router.get("/path")`
-/// - `@app.post("/path")`
-/// - etc.
+///
+///  - `@app.route("/path")`
+///  - `@router.get("/path")`
+///  - `@app.post("/path")`
+///
+/// etc.
 ///
 /// The `@name` capture is the full function (attribute access or identifier),
 /// and `@path` is the first string argument.

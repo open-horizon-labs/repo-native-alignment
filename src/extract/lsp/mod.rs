@@ -23,6 +23,8 @@ use transport::{LspTransport, PipelinedTransport, path_to_uri, find_enclosing_sy
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 

@@ -531,8 +531,8 @@ pub fn parse_go_mod(
     for line in content.lines() {
         let trimmed = line.trim();
 
-        if let Some(path) = trimmed.strip_prefix("module ") {
-            let path = path.trim();
+        if let Some(stripped) = trimmed.strip_prefix("module ") {
+            let path = stripped.trim();
             // Use the full module path as the node name (e.g. "github.com/foo/bar").
             module_name = path.to_string();
         } else if trimmed == "require (" {
@@ -546,9 +546,9 @@ pub fn parse_go_mod(
                     deps.push(dep);
                 }
             }
-        } else if let Some(rest) = trimmed.strip_prefix("require ") {
+        } else if let Some(require_rest) = trimmed.strip_prefix("require ") {
             // Single-line require: `require github.com/foo/bar v1.0.0`
-            let rest = rest.trim();
+            let rest = require_rest.trim();
             if let Some(dep) = parse_go_require_line(rest) {
                 deps.push(dep);
             }

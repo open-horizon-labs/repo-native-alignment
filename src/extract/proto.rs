@@ -153,7 +153,8 @@ impl Extractor for ProtoExtractor {
                     let block_start = i;
                     let block_end = find_block_end(&lines, i);
                     // Emit each enum value as a Const
-                    for (j, ev_line_raw) in lines[(block_start + 1)..block_end].iter().enumerate().map(|(idx, s)| (block_start + 1 + idx, s)) {
+                    for (offset, ev_line_raw) in lines[(block_start + 1)..block_end].iter().enumerate() {
+                        let j = block_start + 1 + offset;
                         let ev_line = ev_line_raw.trim();
                         if ev_line.is_empty() || ev_line.starts_with("//") || ev_line.starts_with("option ") {
                             continue;
@@ -305,7 +306,8 @@ fn extract_message_fields(
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
 ) {
-    for (j, field_line_raw) in lines[start..end].iter().enumerate().map(|(idx, s)| (start + idx, s)) {
+    for (offset, field_line_raw) in lines[start..end].iter().enumerate() {
+        let j = start + offset;
         let field_line = field_line_raw.trim();
         // Skip empty lines, comments, closing braces, nested messages, options
         if field_line.is_empty()
@@ -387,7 +389,8 @@ fn extract_rpc_methods(
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
 ) {
-    for (j, rpc_line_raw) in lines[start..end].iter().enumerate().map(|(idx, s)| (start + idx, s)) {
+    for (offset, rpc_line_raw) in lines[start..end].iter().enumerate() {
+        let j = start + offset;
         let rpc_line = rpc_line_raw.trim();
         if !rpc_line.starts_with("rpc ") {
             continue;

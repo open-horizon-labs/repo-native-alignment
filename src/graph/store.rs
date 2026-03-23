@@ -48,7 +48,11 @@ pub const SCHEMA_VERSION: u32 = 18; // gRPC proto columns: parent_service, rpc_r
 /// Bumped to 12 for gRPC client calls pass (#466): detects `_pb2_grpc` / grpc-go /
 /// @grpc/ / io.grpc imports and emits Calls edges to proto RPC method nodes.
 /// Older caches lack these cross-boundary gRPC Calls edges and must be re-extracted.
-pub const EXTRACTION_VERSION: u32 = 12;
+/// Bumped to 13 for FastAPI router prefix pass (#517): route-decorator extraction now
+/// stores `router_var` metadata on ApiEndpoint nodes, and the new post-extraction pass
+/// prepends `APIRouter(prefix=...)` values to `http_path`. Older caches lack the
+/// `router_var` field and unresolved paths must be re-extracted.
+pub const EXTRACTION_VERSION: u32 = 13;
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -276,6 +280,19 @@ mod tests {
         assert!(
             EXTRACTION_VERSION >= 10,
             "EXTRACTION_VERSION must be >= 10 after extractor-config pass bump; got {}",
+            EXTRACTION_VERSION
+        );
+    }
+
+    #[test]
+    fn test_extraction_version_includes_fastapi_router_prefix_pass() {
+        // EXTRACTION_VERSION was bumped to 13 for the FastAPI router prefix pass (#517).
+        // Route-decorator extraction now stores `router_var` metadata on ApiEndpoint nodes,
+        // and the new post-extraction pass prepends APIRouter(prefix=...) to http_path.
+        // Caches built before version 13 lack `router_var` and must be re-extracted.
+        assert!(
+            EXTRACTION_VERSION >= 13,
+            "EXTRACTION_VERSION must be >= 13 after FastAPI router prefix pass bump; got {}",
             EXTRACTION_VERSION
         );
     }

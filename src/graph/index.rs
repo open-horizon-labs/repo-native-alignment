@@ -436,8 +436,8 @@ impl GraphIndex {
         let calls_default = [EdgeKind::Calls];
         let filter = edge_types.unwrap_or(&calls_default);
 
-        let &from_idx = self.node_lookup.get(from_id)?;
-        let &to_idx = self.node_lookup.get(to_id)?;
+        let from_idx = *self.node_lookup.get(from_id)?;
+        let to_idx = *self.node_lookup.get(to_id)?;
 
         if from_idx == to_idx {
             return Some(Vec::new());
@@ -1047,7 +1047,7 @@ fn louvain_phase2(
     // incrementally. This avoids the O(N) scan per round.
     let mut comm_sizes: HashMap<usize, usize> = HashMap::new();
     let mut community_members: HashMap<usize, Vec<usize>> = HashMap::new();
-    for (node, &c) in community.iter().enumerate() {
+    for (node, &c) in community.iter().enumerate().take(n) {
         *comm_sizes.entry(c).or_default() += 1;
         community_members.entry(c).or_default().push(node);
     }
