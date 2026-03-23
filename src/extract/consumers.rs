@@ -1022,18 +1022,35 @@ impl ExtractionConsumer for AllEnrichmentsGate {
 
 /// Subscribes to `RootExtracted` and streams nodes to the embedding index.
 ///
-/// **Phase 2 stub.** Embedding requires async LanceDB operations. In Phase 2,
-/// embedding continues to run via `spawn_background_enrichment` after the full
-/// graph is assembled. Phase 4 (#454) moves it here as a streaming consumer
-/// so vectors are available as soon as nodes are extracted.
-///
 /// Per the ADR: "Consumer of RootExtracted (streaming, as nodes arrive):
 /// EmbeddingIndexer — SINGLETON — embeds nodes as they're extracted incrementally
 /// via BLAKE3, doesn't wait for passes."
 ///
+/// When constructed with `Some(idx)`, fires a background tokio task to call
+/// `idx.reindex_nodes(nodes)` for each `RootExtracted` event. External nodes
+/// (root == "external") are filtered out — they have no source text to embed.
+///
+/// When constructed with `None` (stub mode, used in tests), logs a debug
+/// message and emits nothing — identical to the Phase 2 stub behaviour.
+///
 /// Subscribes to: `RootExtracted`
 /// Emits: nothing
-pub struct EmbeddingIndexerConsumer;
+pub struct EmbeddingIndexerConsumer {
+    /// Shared embedding index. `None` in stub/test mode; `Some` in production.
+    pub idx: Option<Arc<crate::embed::EmbeddingIndex>>,
+}
+
+impl EmbeddingIndexerConsumer {
+    /// Create a real consumer that will embed nodes as they arrive.
+    pub fn new(idx: Arc<crate::embed::EmbeddingIndex>) -> Self {
+        Self { idx: Some(idx) }
+    }
+
+    /// Create a stub consumer that does nothing (for tests and Phase 2 callers).
+    pub fn stub() -> Self {
+        Self { idx: None }
+    }
+}
 
 impl ExtractionConsumer for EmbeddingIndexerConsumer {
     fn name(&self) -> &str { "embedding_indexer" }
@@ -1046,13 +1063,61 @@ impl ExtractionConsumer for EmbeddingIndexerConsumer {
         let ExtractionEvent::RootExtracted { slug, nodes, .. } = event else {
             return Ok(vec![]);
         };
-        // Phase 2 stub: embedding runs via spawn_background_enrichment.
-        // Phase 4 (#454) promotes this to async streaming embed.
-        tracing::debug!(
-            "EmbeddingIndexerConsumer: root '{}' — {} nodes (Phase 2 stub, embed runs in background task)",
-            slug,
-            nodes.len(),
-        );
+
+        let Some(ref idx) = self.idx else {
+            tracing::debug!(
+                "EmbeddingIndexerConsumer: root '{}' — {} nodes (stub mode, embed deferred)",
+                slug,
+                nodes.len(),
+            );
+            return Ok(vec![]);
+        };
+
+        // Filter external/virtual nodes — they have no source text to embed.
+        let embeddable: Vec<Node> = nodes.iter()
+            .filter(|n| n.id.root != "external")
+            .cloned()
+            .collect();
+
+        if embeddable.is_empty() {
+            tracing::debug!(
+                "EmbeddingIndexerConsumer: root '{}' — no embeddable nodes",
+                slug,
+            );
+            return Ok(vec![]);
+        }
+
+        let idx_clone = Arc::clone(idx);
+        let slug_clone = slug.clone();
+        let count = embeddable.len();
+
+        // Spawn a background task. Uses `Handle::try_current()` so this is safe
+        // to call from both async contexts (MCP server) and sync tests using a
+        // current_thread runtime.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    match idx_clone.reindex_nodes(&embeddable).await {
+                        Ok(n) => tracing::info!(
+                            "EmbeddingIndexerConsumer: root '{}' — embedded {} / {} nodes",
+                            slug_clone, n, count,
+                        ),
+                        Err(e) => tracing::warn!(
+                            "EmbeddingIndexerConsumer: root '{}' — embed failed: {}",
+                            slug_clone, e,
+                        ),
+                    }
+                });
+            }
+            Err(_) => {
+                // No async runtime available (e.g., purely sync test). Log and skip.
+                tracing::debug!(
+                    "EmbeddingIndexerConsumer: root '{}' — no async runtime, skipping embed of {} nodes",
+                    slug, count,
+                );
+            }
+        }
+
         Ok(vec![])
     }
 }
@@ -1063,17 +1128,39 @@ impl ExtractionConsumer for EmbeddingIndexerConsumer {
 
 /// Subscribes to `PassesComplete` and persists the graph to LanceDB.
 ///
-/// **Phase 2 stub.** LanceDB persist requires async operations and the full
-/// graph (nodes + edges from all roots merged). In Phase 2, persistence runs
-/// via `persist_graph_to_lance` inside `build_full_graph_inner`. Phase 4 (#454)
-/// moves it here as a singleton consumer.
-///
 /// Per the ADR: "Consumer of PassesComplete: LanceDBPersist — SINGLETON —
 /// writes with tenant_id = root slug."
 ///
+/// When constructed with `Some(repo_root)`, fires a background tokio task to
+/// call `persist_graph_to_lance(repo_root, nodes, edges)` after all post-
+/// extraction passes have run.
+///
+/// When constructed with `None` (stub mode, used in tests), logs a debug
+/// message and emits nothing — preserving Phase 2 stub behaviour.
+///
+/// Note: the direct `persist_graph_to_lance` call in `build_full_graph_inner`
+/// is retained for ordering with sentinel writes and the `lance_write_lock`.
+/// This consumer provides a secondary/background persist path that fires as
+/// soon as `PassesComplete` is emitted during the bus run.
+///
 /// Subscribes to: `PassesComplete`
 /// Emits: nothing
-pub struct LanceDBConsumer;
+pub struct LanceDBConsumer {
+    /// Repository root for LanceDB path resolution. `None` in stub/test mode.
+    pub repo_root: Option<Arc<PathBuf>>,
+}
+
+impl LanceDBConsumer {
+    /// Create a real consumer that will persist the graph on `PassesComplete`.
+    pub fn new(repo_root: Arc<PathBuf>) -> Self {
+        Self { repo_root: Some(repo_root) }
+    }
+
+    /// Create a stub consumer that does nothing (for tests and Phase 2 callers).
+    pub fn stub() -> Self {
+        Self { repo_root: None }
+    }
+}
 
 impl ExtractionConsumer for LanceDBConsumer {
     fn name(&self) -> &str { "lancedb_persist" }
@@ -1086,14 +1173,51 @@ impl ExtractionConsumer for LanceDBConsumer {
         let ExtractionEvent::PassesComplete { slug, nodes, edges, .. } = event else {
             return Ok(vec![]);
         };
-        // Phase 2 stub: persist runs inside build_full_graph_inner.
-        // Phase 4 (#454) promotes this to async singleton consumer.
-        tracing::debug!(
-            "LanceDBConsumer: root '{}' — {} nodes, {} edges (Phase 2 stub, persist runs in graph pipeline)",
-            slug,
-            nodes.len(),
-            edges.len(),
-        );
+
+        let Some(ref repo_root) = self.repo_root else {
+            tracing::debug!(
+                "LanceDBConsumer: root '{}' — {} nodes, {} edges (stub mode, persist deferred)",
+                slug,
+                nodes.len(),
+                edges.len(),
+            );
+            return Ok(vec![]);
+        };
+
+        let repo_root_clone = Arc::clone(repo_root);
+        let nodes_vec: Vec<crate::graph::Node> = nodes.to_vec();
+        let edges_vec: Vec<crate::graph::Edge> = edges.to_vec();
+        let slug_clone = slug.clone();
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    match crate::server::store::persist_graph_to_lance(
+                        &repo_root_clone,
+                        &nodes_vec,
+                        &edges_vec,
+                    ).await {
+                        Ok(()) => tracing::info!(
+                            "LanceDBConsumer: root '{}' — persisted {} nodes, {} edges",
+                            slug_clone, nodes_vec.len(), edges_vec.len(),
+                        ),
+                        Err(e) => tracing::warn!(
+                            "LanceDBConsumer: root '{}' — persist failed: {}",
+                            slug_clone, e,
+                        ),
+                    }
+                });
+            }
+            Err(_) => {
+                tracing::debug!(
+                    "LanceDBConsumer: root '{}' — no async runtime, skipping persist of {} nodes, {} edges",
+                    slug,
+                    nodes.len(),
+                    edges.len(),
+                );
+            }
+        }
+
         Ok(vec![])
     }
 }
@@ -1144,6 +1268,21 @@ impl ExtractionConsumer for SubsystemConsumer {
 // EventBus::with_builtins
 // ---------------------------------------------------------------------------
 
+/// Optional dependency overrides for [`build_builtin_bus`] and [`run_post_passes_via_bus`].
+///
+/// Groups the three optional parameters that control which consumers are wired
+/// in real vs stub mode. All fields default to `None` (stub / throwaway).
+#[derive(Default)]
+pub struct BusOptions {
+    /// Shared `ScanStats` handle owned by `RnaHandler`. When `None`, a fresh
+    /// throwaway `Arc` is created. Only pass `Some` from server call sites.
+    pub scan_stats: Option<Arc<RwLock<ScanStats>>>,
+    /// When `Some`, `EmbeddingIndexerConsumer` streams embed tasks per `RootExtracted`.
+    pub embed_idx: Option<Arc<crate::embed::EmbeddingIndex>>,
+    /// When `Some`, `LanceDBConsumer` fires a background persist on `PassesComplete`.
+    pub lance_repo_root: Option<Arc<PathBuf>>,
+}
+
 /// Build an `EventBus` pre-loaded with all built-in consumers.
 ///
 /// **Phase 3 wiring**: `LspConsumer` instances are now real — they hold
@@ -1173,8 +1312,7 @@ impl ExtractionConsumer for SubsystemConsumer {
 /// `root_pairs` must be the full `(slug, path)` list for the workspace.
 /// `primary_slug` is the slug of the primary code root.
 /// `repo_root` is the path to the primary repository root (for LSP server startup).
-/// `scan_stats` is the shared stats handle owned by `RnaHandler`. When `None`,
-/// a fresh throwaway `Arc` is created (used by `run_post_passes_via_bus` and tests).
+/// `opts` bundles the optional dependency overrides; see [`BusOptions`].
 ///
 /// Returns `(bus, scan_stats_arc)` where `scan_stats_arc` is either the passed-in
 /// `Arc` or the freshly created one.
@@ -1182,8 +1320,9 @@ pub fn build_builtin_bus(
     root_pairs: Vec<(String, PathBuf)>,
     primary_slug: String,
     repo_root: PathBuf,
-    scan_stats: Option<Arc<RwLock<ScanStats>>>,
+    opts: BusOptions,
 ) -> (crate::extract::event_bus::EventBus, Arc<RwLock<ScanStats>>) {
+    let BusOptions { scan_stats, embed_idx, lance_repo_root } = opts;
     use crate::extract::event_bus::EventBus;
 
     let mut bus = EventBus::new();
@@ -1210,8 +1349,12 @@ pub fn build_builtin_bus(
     // OpenApi, gRPC, Embedding — subscribe to RootExtracted independently.
     bus.register(Box::new(OpenApiConsumer));
     bus.register(Box::new(GrpcConsumer));
-    // EmbeddingIndexerConsumer: streaming embed as nodes arrive (Phase 2 stub)
-    bus.register(Box::new(EmbeddingIndexerConsumer));
+    // EmbeddingIndexerConsumer: streaming embed as nodes arrive.
+    // Passes None in stub/test mode; Some(idx) in production for real streaming embed.
+    bus.register(Box::new(match embed_idx {
+        Some(idx) => EmbeddingIndexerConsumer::new(idx),
+        None => EmbeddingIndexerConsumer::stub(),
+    }));
 
     // --- LanguageDetected consumers (one real LspConsumer per language) ---
     // Per the ADR: "ALL fire concurrently, one per language."
@@ -1258,7 +1401,12 @@ pub fn build_builtin_bus(
 
     // --- PassesComplete consumers ---
     bus.register(Box::new(SubsystemConsumer));
-    bus.register(Box::new(LanceDBConsumer));
+    // LanceDBConsumer: persist graph on PassesComplete.
+    // Passes None in stub/test mode; Some(repo_root) in production.
+    bus.register(Box::new(match lance_repo_root {
+        Some(rr) => LanceDBConsumer::new(rr),
+        None => LanceDBConsumer::stub(),
+    }));
 
     (bus, stats_arc)
 }
@@ -1388,8 +1536,8 @@ impl crate::extract::Enricher for NoopEnricher {
 /// * `root_pairs` - `(slug, path)` pairs for all workspace roots
 /// * `primary_slug` - slug of the primary code root
 /// * `repo_root` - path to the primary repository root (for the bus event)
-/// * `scan_stats` - optional shared stats handle from `RnaHandler`. When provided,
-///   the `ScanStatsConsumer` writes into this `Arc`; when `None`, a throwaway is used.
+/// * `opts` - optional dependency overrides; see [`BusOptions`]. Pass
+///   `BusOptions::default()` for stub/test mode (all fields `None`).
 ///
 /// # Returns
 /// `Ok((nodes, edges, detected_frameworks))` — the enriched graph and framework set.
@@ -1406,10 +1554,9 @@ pub fn run_post_passes_via_bus(
     root_pairs: Vec<(String, PathBuf)>,
     primary_slug: String,
     repo_root: PathBuf,
-    scan_stats: Option<Arc<RwLock<ScanStats>>>,
+    opts: BusOptions,
 ) -> anyhow::Result<(Vec<crate::graph::Node>, Vec<crate::graph::Edge>, std::collections::HashSet<String>)> {
     use crate::extract::event_bus::ExtractionEvent;
-    use std::sync::Arc;
 
     // Wrap into Arc<[T]> for zero-copy bus fan-out.
     let nodes_arc: Arc<[crate::graph::Node]> = Arc::from(nodes.into_boxed_slice());
@@ -1418,7 +1565,7 @@ pub fn run_post_passes_via_bus(
     // Use repo_root for LSP server startup directory so LspConsumers have the
     // correct working directory. The path is also passed as the RootExtracted
     // event path so consumers that need it (e.g., tree-sitter-based consumers) work.
-    let (bus, _stats) = build_builtin_bus(root_pairs, primary_slug.clone(), repo_root.clone(), scan_stats);
+    let (bus, _stats) = build_builtin_bus(root_pairs, primary_slug.clone(), repo_root.clone(), opts);
     let events = bus.emit(ExtractionEvent::RootExtracted {
         slug: primary_slug,
         path: repo_root,
@@ -1638,7 +1785,7 @@ mod tests {
     /// Verify build_builtin_bus registers consumers for all expected event kinds.
     #[test]
     fn test_builtin_bus_has_consumers_for_all_event_kinds() {
-        let (bus, _stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), None);
+        let (bus, _stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
         // Derive the exact expected count to catch regressions when languages are added/removed.
         let lsp_count = crate::extract::EnricherRegistry::with_builtins()
             .supported_languages()
@@ -1663,7 +1810,7 @@ mod tests {
     /// Verify build_builtin_bus returns a stats handle that shares state with the bus.
     #[test]
     fn test_builtin_bus_returns_scan_stats_handle() {
-        let (bus, stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), None);
+        let (bus, stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
         // No activity yet
         assert!(!stats.read().unwrap().has_activity());
 
@@ -1743,7 +1890,7 @@ mod tests {
             vec![("test".to_string(), tmp.path().to_path_buf())],
             "test".to_string(),
             tmp.path().to_path_buf(),
-            None,
+            BusOptions::default(),
         );
         let events = bus.emit(ExtractionEvent::RootDiscovered {
             slug: "test".to_string(),
@@ -1887,10 +2034,10 @@ mod tests {
         assert!(result.is_empty(), "SubsystemConsumer Phase 2 stub emits nothing");
     }
 
-    /// Verify LanceDBConsumer subscribes to PassesComplete.
+    /// Verify LanceDBConsumer (stub) subscribes to PassesComplete and emits nothing.
     #[test]
     fn test_lancedb_consumer_subscription() {
-        let consumer = LanceDBConsumer;
+        let consumer = LanceDBConsumer::stub();
         assert!(consumer.subscribes_to().contains(&ExtractionEventKind::PassesComplete));
         let event = ExtractionEvent::PassesComplete {
             slug: "test".into(),
@@ -1899,13 +2046,13 @@ mod tests {
             detected_frameworks: HashSet::new(),
         };
         let result = consumer.on_event(&event).unwrap();
-        assert!(result.is_empty(), "LanceDBConsumer Phase 2 stub emits nothing");
+        assert!(result.is_empty(), "LanceDBConsumer stub emits nothing");
     }
 
-    /// Verify EmbeddingIndexerConsumer subscribes to RootExtracted.
+    /// Verify EmbeddingIndexerConsumer (stub) subscribes to RootExtracted and emits nothing.
     #[test]
     fn test_embedding_indexer_consumer_subscription() {
-        let consumer = EmbeddingIndexerConsumer;
+        let consumer = EmbeddingIndexerConsumer::stub();
         assert!(consumer.subscribes_to().contains(&ExtractionEventKind::RootExtracted));
         let event = ExtractionEvent::RootExtracted {
             slug: "test".into(),
@@ -1914,7 +2061,7 @@ mod tests {
             edges: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&event).unwrap();
-        assert!(result.is_empty(), "EmbeddingIndexerConsumer Phase 2 stub emits nothing");
+        assert!(result.is_empty(), "EmbeddingIndexerConsumer stub emits nothing");
     }
 
     // ── run_post_passes_via_bus tests ─────────────────────────────────────
@@ -1932,7 +2079,7 @@ mod tests {
             vec![],
             "test".to_string(),
             PathBuf::from("."),
-            None,
+            super::BusOptions::default(),
         ).expect("run_post_passes_via_bus must not fail on empty input");
         assert!(nodes.is_empty(), "empty input → empty nodes");
         assert!(edges.is_empty(), "empty input → empty edges");
@@ -1973,7 +2120,7 @@ mod tests {
             vec![],
             "test".to_string(),
             PathBuf::from("."),
-            None,
+            super::BusOptions::default(),
         ).expect("run_post_passes_via_bus must not fail with valid input");
 
         // Output must contain the input node (passes should not drop it)

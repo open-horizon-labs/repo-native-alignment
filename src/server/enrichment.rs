@@ -287,7 +287,11 @@ impl RnaHandler {
                             root_pairs,
                             primary_slug.clone(),
                             repo_root.clone(),
-                            Some(Arc::clone(&scan_stats)),
+                            crate::extract::consumers::BusOptions {
+                                scan_stats: Some(Arc::clone(&scan_stats)),
+                                embed_idx: None, // embed handled by background scanner's own reindex pass
+                                lance_repo_root: None, // LanceDB persist handled by background scanner's lance_deltas
+                            },
                         ) {
                             Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
                                 graph_state.nodes = enriched_nodes;
