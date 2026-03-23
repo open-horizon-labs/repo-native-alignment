@@ -294,11 +294,15 @@ function parseRepoMap(text) {
             seenIds.add(id);
             nodes.push({ id, label: fnName + '()', kind: 'function', size: 20, color: nodeColor('function', null) });
           }
-          // Link entry point to its file node if present
+          // Materialize a file node if it wasn't in the hotspot top-N
           const fileId = 'file:' + filePath;
-          if (seenIds.has(fileId)) {
-            edges.push({ source: fileId, target: id, label: 'defines' });
+          if (!seenIds.has(fileId)) {
+            const parts = filePath.replace(/\\/g, '/').split('/');
+            const label = parts.slice(-2).join('/');
+            seenIds.add(fileId);
+            nodes.push({ id: fileId, label, kind: 'module', size: 18, color: nodeColor('module', null) });
           }
+          edges.push({ source: fileId, target: id, label: 'defines' });
         }
       }
     }
@@ -314,15 +318,13 @@ async function loadFrameworks(signal) {
   try {
     text = await callTool('search', { kind: 'framework', limit: 20, compact: true }, signal);
   } catch (e) {
-    if (e.name !== 'AbortError') {
-      console.warn('Framework search failed (non-fatal):', e.message);
-    }
+    if (e.name === 'AbortError') throw e;
+    console.warn('Framework search failed (non-fatal):', e.message);
     return 0;
   }
   if (!text) return 0;
 
   const newNodes = [];
-  const newEdges = [];
   const seenIds = new Set(cy.nodes().map(n => n.id()));
 
   // Compact search output lines: "- **name** `stable_id` ..."
@@ -345,22 +347,13 @@ async function loadFrameworks(signal) {
         color: '#e85b5b',
       }
     });
-
-    // Draw UsesFramework edges to any file/subsystem nodes already in the graph
-    cy.nodes().forEach(existing => {
-      const existingId = existing.id();
-      // Heuristic: connect to subsystem/file nodes (not other frameworks, not entry points)
-      if (existingId.startsWith('subsystem:') || existingId.startsWith('file:')) {
-        const edgeId = existingId + '->uses->' + stableId;
-        if (!cy.getElementById(edgeId).length) {
-          newEdges.push({ data: { id: edgeId, source: existingId, target: stableId, label: 'uses' } });
-        }
-      }
-    });
+    // No invented edges: framework nodes render as standalone context nodes.
+    // The search result does not carry per-file usage pairs, so connecting every
+    // visible file/subsystem to every framework would assert false dependencies.
   }
 
   if (newNodes.length > 0) {
-    cy.add([...newNodes, ...newEdges]);
+    cy.add(newNodes);
     runLayout(document.getElementById('layout-select').value);
   }
   return newNodes.length;
