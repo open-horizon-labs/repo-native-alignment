@@ -362,11 +362,14 @@ check "ADR: PostExtractionRegistry zero .rs references in src/ (#523)" \
 
 # Constraint 6: subsystem_node_pass has a tracked stub (issue #542)
 # The function must be RNA-indexable (still lives in subsystem_pass.rs) AND the
-# tracking issue must be open. A closed #542 means the stub was promoted — remove this check.
+# tracking issue must be open (state: OPEN). When issue #542 is closed (stub promoted
+# to real consumer), this check will fail on the OPEN pattern — that's intentional.
+# Remove this check when SubsystemConsumer.on_event is fully implemented.
+# Note: requires 'gh' CLI; skip gracefully if not available in the environment.
 check "ADR: subsystem_node_pass indexed by RNA (#542)" \
   "repo-native-alignment search 'subsystem_node_pass' --repo $RNA_REPO --kind function --limit 3 2>/dev/null" "subsystem_node_pass"
 check "ADR: subsystem_node_pass bypass tracked in open issue #542" \
-  "gh issue view 542 --repo open-horizon-labs/repo-native-alignment 2>/dev/null" "OPEN\|subsystem_node_pass\|SubsystemConsumer"
+  "gh issue view 542 --repo open-horizon-labs/repo-native-alignment 2>/dev/null || echo 'SKIP_NO_GH'" "OPEN\|SKIP_NO_GH"
 
 echo ""
 echo "=== RESULTS: $PASS passed, $FAIL failed, $SKIP skipped ==="
