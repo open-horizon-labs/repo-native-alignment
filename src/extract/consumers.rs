@@ -219,12 +219,12 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
 /// Links HTTP handler nodes to route definitions by matching path strings.
 ///
 /// Subscribes to: `AllEnrichmentsDone`
-/// Emits: `PassComplete`
+/// Emits: nothing (no-op subscription slot)
 ///
-/// Runs `api_link_pass` on the full LSP-enriched node set. The added edges
-/// are reported via `PassComplete` for monitoring; the actual edge data is
-/// captured by `EnrichmentFinalizer` which also runs api_link_pass so that
-/// the edges appear in the final `PassesComplete` payload.
+/// This consumer establishes the event-driven subscription slot for `api_link_pass`.
+/// The actual pass logic and its output are handled exclusively by `EnrichmentFinalizer`,
+/// which runs `api_link_pass` as part of its ordered pass sequence and includes
+/// the resulting edges in `PassesComplete`. No duplicate computation occurs here.
 pub struct ApiLinkConsumer;
 
 impl ExtractionConsumer for ApiLinkConsumer {
@@ -235,22 +235,15 @@ impl ExtractionConsumer for ApiLinkConsumer {
     }
 
     fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::AllEnrichmentsDone { slug, nodes, lsp_nodes, .. } = event else {
+        let ExtractionEvent::AllEnrichmentsDone { slug, .. } = event else {
             return Ok(vec![]);
         };
-        let mut all_nodes: Vec<Node> = nodes.to_vec();
-        all_nodes.extend_from_slice(lsp_nodes);
-        let new_edges = crate::extract::api_link::api_link_pass(&all_nodes);
-        tracing::debug!(
-            "ApiLinkConsumer: root '{}' — {} api-link edge(s) detected",
-            slug,
-            new_edges.len(),
-        );
-        Ok(vec![ExtractionEvent::PassComplete {
-            pass_name: "api_link",
-            added_nodes: 0,
-            added_edges: new_edges.len(),
-        }])
+        // `EnrichmentFinalizer` is the authoritative runner for api_link_pass and
+        // includes its output in `PassesComplete`. This consumer is a subscription
+        // slot — it signals that the api_link pass participates in the event-driven
+        // pipeline. No pass re-execution here avoids duplicate work.
+        tracing::debug!("ApiLinkConsumer: root '{}' AllEnrichmentsDone received (pass runs in EnrichmentFinalizer)", slug);
+        Ok(vec![])
     }
 }
 
@@ -261,12 +254,12 @@ impl ExtractionConsumer for ApiLinkConsumer {
 /// Emits `TestedBy` edges between test functions and the functions they test.
 ///
 /// Subscribes to: `AllEnrichmentsDone`
-/// Emits: `PassComplete`
+/// Emits: nothing (no-op subscription slot)
 ///
-/// Runs `tested_by_pass` on the full LSP-enriched node set. The added edges
-/// are reported via `PassComplete` for monitoring; the actual edge data is
-/// captured by `EnrichmentFinalizer` which also runs tested_by_pass so that
-/// the edges appear in the final `PassesComplete` payload.
+/// This consumer establishes the event-driven subscription slot for `tested_by_pass`.
+/// The actual pass logic and its output are handled exclusively by `EnrichmentFinalizer`,
+/// which runs `tested_by_pass` as part of its ordered pass sequence and includes
+/// the resulting edges in `PassesComplete`. No duplicate computation occurs here.
 pub struct TestedByConsumer;
 
 impl ExtractionConsumer for TestedByConsumer {
@@ -277,22 +270,15 @@ impl ExtractionConsumer for TestedByConsumer {
     }
 
     fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::AllEnrichmentsDone { slug, nodes, lsp_nodes, .. } = event else {
+        let ExtractionEvent::AllEnrichmentsDone { slug, .. } = event else {
             return Ok(vec![]);
         };
-        let mut all_nodes: Vec<Node> = nodes.to_vec();
-        all_nodes.extend_from_slice(lsp_nodes);
-        let new_edges = crate::extract::naming_convention::tested_by_pass(&all_nodes);
-        tracing::debug!(
-            "TestedByConsumer: root '{}' — {} tested-by edge(s) detected",
-            slug,
-            new_edges.len(),
-        );
-        Ok(vec![ExtractionEvent::PassComplete {
-            pass_name: "tested_by",
-            added_nodes: 0,
-            added_edges: new_edges.len(),
-        }])
+        // `EnrichmentFinalizer` is the authoritative runner for tested_by_pass and
+        // includes its output in `PassesComplete`. This consumer is a subscription
+        // slot — it signals that the tested_by pass participates in the event-driven
+        // pipeline. No pass re-execution here avoids duplicate work.
+        tracing::debug!("TestedByConsumer: root '{}' AllEnrichmentsDone received (pass runs in EnrichmentFinalizer)", slug);
+        Ok(vec![])
     }
 }
 
@@ -378,9 +364,9 @@ impl ExtractionConsumer for FastapiRouterPrefixConsumer {
 /// must contribute edges to the `PassesComplete` payload. The event bus in Phase 2/3 is
 /// synchronous and `Arc<[T]>` payloads are immutable — there is no shared mutable accumulator
 /// for individual consumers to append into. `EnrichmentFinalizer` is the aggregation point.
-/// Individual pass consumers (`ApiLinkConsumer`, `TestedByConsumer`, `FastapiRouterPrefixConsumer`)
-/// run the same pass logic for monitoring/signalling purposes; `EnrichmentFinalizer` is the
-/// authoritative source for `PassesComplete`.
+/// `ApiLinkConsumer` and `TestedByConsumer` are no-op subscription slots that establish the
+/// event-driven wiring; `EnrichmentFinalizer` is the sole authoritative runner for those passes.
+/// `FastapiRouterPrefixConsumer` is a signal consumer that fires when fastapi is detected.
 pub struct EnrichmentFinalizer {
     root_pairs: Vec<(String, PathBuf)>,
     primary_slug: String,
@@ -2204,7 +2190,10 @@ mod tests {
         );
     }
 
-    /// Verify ApiLinkConsumer subscribes to AllEnrichmentsDone and emits PassComplete.
+    /// Verify ApiLinkConsumer subscribes to AllEnrichmentsDone and is a no-op.
+    ///
+    /// `ApiLinkConsumer` is a subscription slot — the actual api_link_pass runs
+    /// inside `EnrichmentFinalizer`. This consumer emits no events.
     #[test]
     fn test_api_link_consumer_subscription() {
         let consumer = ApiLinkConsumer;
@@ -2218,11 +2207,13 @@ mod tests {
             updated_nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&event).unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], ExtractionEvent::PassComplete { pass_name: "api_link", .. }));
+        assert!(result.is_empty(), "ApiLinkConsumer is a subscription slot — emits nothing");
     }
 
-    /// Verify TestedByConsumer subscribes to AllEnrichmentsDone and emits PassComplete.
+    /// Verify TestedByConsumer subscribes to AllEnrichmentsDone and is a no-op.
+    ///
+    /// `TestedByConsumer` is a subscription slot — the actual tested_by_pass runs
+    /// inside `EnrichmentFinalizer`. This consumer emits no events.
     #[test]
     fn test_tested_by_consumer_subscription() {
         let consumer = TestedByConsumer;
@@ -2236,8 +2227,7 @@ mod tests {
             updated_nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&event).unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], ExtractionEvent::PassComplete { pass_name: "tested_by", .. }));
+        assert!(result.is_empty(), "TestedByConsumer is a subscription slot — emits nothing");
     }
 
     /// Verify FastapiRouterPrefixConsumer fires only for fastapi framework.

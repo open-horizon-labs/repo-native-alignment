@@ -19,12 +19,14 @@
 //!     → ManifestConsumer (per root)
 //!     → TreeSitterConsumer → RootExtracted(slug, nodes, edges)
 //!         → LanguageAccumulatorConsumer → LanguageDetected(lang, nodes) per language
-//!             → LspConsumer (one per language, sequential in Phase 2)
+//!             → LspConsumer (one per language, sequential in Phase 3)
 //!               → EnrichmentComplete(lang, edges)
-//!         → ApiLinkConsumer, TestedByConsumer → PassComplete (monitoring)
-//!         → EnrichmentFinalizer → PassesComplete(nodes, edges)
-//!             → SubsystemConsumer → SubsystemsDetected(...)
-//!             → LanceDBConsumer (persist)
+//!         → AllEnrichmentsGate → AllEnrichmentsDone(nodes, edges, lsp_edges, …)
+//!             → ApiLinkConsumer (subscription slot, no-op)
+//!             → TestedByConsumer (subscription slot, no-op)
+//!             → EnrichmentFinalizer → PassesComplete(nodes, edges)
+//!                 → SubsystemConsumer → SubsystemsDetected(...)
+//!                 → LanceDBConsumer (persist)
 //!         → EmbeddingConsumer (streaming)
 //! ```
 //!

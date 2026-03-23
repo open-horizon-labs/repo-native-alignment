@@ -974,14 +974,13 @@ impl RnaHandler {
     /// When `pending_scan` is `None`, this method creates its own scanner and
     /// commits state only after the graph update succeeds.
     ///
-    /// When `spawn_lsp` is true (default for MCP server), LSP enrichment for
-    /// changed nodes is spawned as a background task. When false (CLI `--full`
-    /// incremental path), no LSP is spawned -- the caller handles it.
+    /// LSP enrichment runs synchronously inside `emit_enrichment_pipeline` via `LspConsumer`.
+    /// The `_spawn_lsp` parameter is kept for API compatibility but is no longer acted on.
     pub(crate) async fn update_graph_with_scan(
         &self,
         graph: &mut GraphState,
         pending_scan: Option<ScanResult>,
-        spawn_lsp: bool,
+        _spawn_lsp: bool,
     ) -> anyhow::Result<()> {
         // If no pre-computed scan, create a fresh scanner. We hold it so we
         // can commit state after successful processing.
@@ -1207,13 +1206,10 @@ impl RnaHandler {
                 .ensure_node(&node.stable_id(), &node.id.kind.to_string());
         }
 
-        // LSP enrichment is now handled synchronously by `LspConsumer` inside
-        // `emit_enrichment_pipeline` (called above, Phase 3 / issue #520).
-        // `spawn_incremental_lsp_enrichment` is NOT called here to avoid double-enrichment:
-        // the bus already ran every LspConsumer for all supported languages before this point.
-        // The `spawn_lsp` flag is retained for future use but currently has no effect on the
-        // incremental path — remove this comment when the flag is fully removed (#537).
-        let _ = spawn_lsp; // suppress unused-variable warning
+        // LSP enrichment is handled synchronously by `LspConsumer` inside
+        // `emit_enrichment_pipeline` (called above). `spawn_incremental_lsp_enrichment`
+        // is NOT called here: the bus already ran every LspConsumer for all supported
+        // languages before this point. `_spawn_lsp` is retained for API compatibility.
 
         // `changed_files` is still needed below for targeted re-embedding.
         let changed_files: std::collections::HashSet<_> = scan
