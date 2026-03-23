@@ -587,8 +587,8 @@ impl PostExtractionPass for FastapiRouterPrefixPass {
 
     fn applies_when(&self, _detected_frameworks: &HashSet<String>) -> bool { true }
 
-    fn run(&self, nodes: &mut Vec<Node>, _edges: &mut Vec<Edge>, _ctx: &PassContext) -> PassResult {
-        crate::extract::fastapi_router_prefix::fastapi_router_prefix_pass(nodes);
+    fn run(&self, nodes: &mut Vec<Node>, _edges: &mut Vec<Edge>, ctx: &PassContext) -> PassResult {
+        crate::extract::fastapi_router_prefix::fastapi_router_prefix_pass(nodes, &ctx.root_pairs);
         PassResult::empty()
     }
 }

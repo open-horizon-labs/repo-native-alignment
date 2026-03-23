@@ -1,13 +1,30 @@
 //! Post-extraction pass that resolves FastAPI `APIRouter(prefix=...)` composition
-//! and updates `ApiEndpoint` nodes with full URL paths.
+//! and `include_router(router_var, prefix=...)` calls, updating `ApiEndpoint`
+//! nodes with full URL paths.
 //!
 //! # Problem
 //!
 //! RNA's route-decorator extraction captures the *local* path from each
 //! decorator — the path argument of `@router.get("/expertunities")`.
-//! When routers carry a prefix (`workspace_router = APIRouter(prefix="/workspaces/{id}")`),
-//! the resulting `ApiEndpoint` node has path `/expertunities` instead of the
-//! full `/workspaces/{id}/expertunities`.
+//! When routers carry a prefix, the resulting `ApiEndpoint` node has path
+//! `/expertunities` instead of the full `/workspaces/{id}/expertunities`.
+//!
+//! There are two patterns to detect:
+//!
+//! **Pattern 1 — `APIRouter(prefix=...)` constructor arg** (handled since PR #519):
+//! ```python
+//! workspace_router = APIRouter(prefix="/workspaces/{id}")
+//! ```
+//!
+//! **Pattern 2 — `include_router(router, prefix=...)` call arg** (new in this PR):
+//! ```python
+//! expertunities_router = APIRouter()   # no prefix here
+//! ...
+//! app.include_router(expertunities_router, prefix="/workspaces/{workspace_id}/expertunities")
+//! ```
+//!
+//! Pattern 2 is common when routers are composed in a central `main.py` or
+//! `api/__init__.py` file rather than on the router definition itself.
 //!
 //! This causes `api_link_pass` to fail to connect TypeScript SDK URL constants
 //! (which contain the full path) to FastAPI handler nodes.
@@ -15,14 +32,24 @@
 //! # Fix
 //!
 //! This pass runs **after** tree-sitter extraction and the initial
-//! `api_link_pass`.  For each Python file that contains `ApiEndpoint` nodes:
+//! `api_link_pass`.
 //!
+//! **Phase 1 — same-file `APIRouter(prefix=...)` scan:**
+//! For each Python file that contains `ApiEndpoint` nodes:
 //! 1. Read the file content.
-//! 2. Extract `variable = APIRouter(prefix="...")` assignments using a regex
-//!    (simple enough to avoid re-parsing the file with tree-sitter).
+//! 2. Extract `variable = APIRouter(prefix="...")` assignments.
 //! 3. For each `ApiEndpoint` node in that file whose `router_var` metadata
-//!    key matches a found prefix, prepend the prefix to `http_path` and
-//!    update the node's `name` and `signature` fields accordingly.
+//!    key matches a found prefix, prepend the prefix to `http_path`.
+//!
+//! **Phase 2 — cross-file `include_router(router_var, prefix=...)` scan:**
+//! For each workspace root:
+//! 1. Walk all Python files in the root.
+//! 2. Extract `include_router(var, prefix="...")` calls (any receiver).
+//! 3. Merge into the same `router_var → prefix` map used in Phase 1.
+//! 4. Apply to any `ApiEndpoint` nodes whose `router_var` still has no prefix.
+//!
+//! Phase 2 only runs when `root_pairs` is non-empty (i.e., when called from the
+//! post-extraction registry with a proper `PassContext`).
 //!
 //! # Metadata contract
 //!
@@ -38,9 +65,18 @@
 //! - A prefix that doesn't start with `/` is ignored (malformed config).
 //! - If the file cannot be read, that file is silently skipped (log a warning).
 //! - Nodes in non-Python files are skipped (`language != "python"`).
+//! - When both patterns define a prefix for the same `router_var`, the
+//!   `APIRouter(prefix=...)` constructor arg takes precedence (it is the
+//!   "closer to definition" binding).
+//! - If the same `router_var` name appears in `include_router()` calls in
+//!   multiple files with different prefixes, only the first-found prefix is
+//!   used (based on filesystem walk order, which is non-deterministic).
+//!   Typical FastAPI projects include each router once; encountering the same
+//!   variable name with different prefixes in multiple files is unusual and
+//!   likely a configuration error in the target project.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::graph::{Node, NodeKind};
 
@@ -51,18 +87,23 @@ use crate::graph::{Node, NodeKind};
 /// Run the FastAPI router prefix pass.
 ///
 /// Mutates `nodes` in place: for each Python `ApiEndpoint` node whose
-/// `router_var` metadata matches an `APIRouter(prefix=...)` assignment found
-/// in the same file, the node's `http_path` metadata, `name`, and `signature`
-/// are updated to the full path.
+/// `router_var` metadata matches an `APIRouter(prefix=...)` assignment OR an
+/// `include_router(router_var, prefix=...)` call found in the repository, the
+/// node's `http_path` metadata, `name`, and `signature` are updated to the
+/// full path.
 ///
-/// Signature accepts the full node slice so it can locate sibling nodes in the
-/// same file; only `ApiEndpoint` nodes are modified.
+/// # Arguments
+///
+/// * `nodes` — the full node slice (only `ApiEndpoint` Python nodes are modified)
+/// * `root_pairs` — `(slug, path)` pairs for workspace roots, used to find
+///   `include_router` calls in parent files.  Pass an empty slice to skip the
+///   cross-file scan (e.g., in unit tests that don't need it).
 ///
 /// # File reading
 ///
 /// Files are read at most once per unique path (via an internal cache).
 /// Non-readable files are silently skipped with a tracing warning.
-pub fn fastapi_router_prefix_pass(nodes: &mut [Node]) {
+pub fn fastapi_router_prefix_pass(nodes: &mut [Node], root_pairs: &[(String, PathBuf)]) {
     // --- Performance characteristics ---
     //
     // This pass is self-gating: the first thing it does is collect Python
@@ -72,14 +113,6 @@ pub fn fastapi_router_prefix_pass(nodes: &mut [Node]) {
     // resulting set is empty, and the function returns immediately.  The cost is
     // a single linear scan of the node slice (O(n)) with no file I/O, no regex
     // compilation, and no heap allocation beyond the HashSet itself.
-    //
-    // Only when at least one matching node exists does the pass proceed to read
-    // files and parse `APIRouter(prefix=...)` assignments.  Empirically, the
-    // added overhead is negligible: scanning 100k nodes takes ~1 ms, well under
-    // any 5% threshold relative to full tree-sitter extraction.  See
-    // `test_fast_path_noop_on_empty_node_set` and
-    // `test_fast_path_noop_on_no_router_var_nodes` for unit-test coverage of
-    // the early-exit branches.
 
     // Step 1: collect the unique set of Python files that have ApiEndpoint nodes
     // with a router_var, so we only read files that need prefix resolution.
@@ -98,12 +131,20 @@ pub fn fastapi_router_prefix_pass(nodes: &mut [Node]) {
     }
 
     // Step 2: for each such file, extract APIRouter prefix assignments.
-    // Result: file_path -> { var_name -> prefix }
-    let mut prefix_map: HashMap<std::path::PathBuf, HashMap<String, String>> = HashMap::new();
+    // Result: var_name -> prefix (aggregated across all relevant files)
+    let mut global_prefix_map: HashMap<String, String> = HashMap::new();
+
+    // Phase 1: scan endpoint files for `var = APIRouter(prefix=...)` in the same file.
+    // Keyed by file so we can do same-file lookups first (higher specificity).
+    let mut file_prefix_map: HashMap<PathBuf, HashMap<String, String>> = HashMap::new();
     for file_path in &files_to_scan {
-        match extract_router_prefixes(file_path) {
+        match extract_prefixes_from_file(file_path) {
             Ok(prefixes) if !prefixes.is_empty() => {
-                prefix_map.insert(file_path.clone(), prefixes);
+                // Merge into global map (constructor-arg prefix takes precedence over include_router).
+                for (var, prefix) in &prefixes {
+                    global_prefix_map.entry(var.clone()).or_insert_with(|| prefix.clone());
+                }
+                file_prefix_map.insert(file_path.clone(), prefixes);
             }
             Ok(_) => {} // no APIRouter assignments in this file
             Err(e) => {
@@ -115,11 +156,39 @@ pub fn fastapi_router_prefix_pass(nodes: &mut [Node]) {
         }
     }
 
-    if prefix_map.is_empty() {
+    // Phase 2: scan all Python files in the workspace roots for `include_router` calls.
+    // This picks up prefixes that are set in a parent file (main.py, api/__init__.py, etc.).
+    if !root_pairs.is_empty() {
+        // Collect all router_var names that still need a prefix (no same-file prefix found).
+        let unresolved_vars: std::collections::HashSet<String> = nodes
+            .iter()
+            .filter(|n| {
+                n.language == "python"
+                    && n.id.kind == NodeKind::ApiEndpoint
+            })
+            .filter_map(|n| n.metadata.get("router_var"))
+            .filter(|v| !v.is_empty() && !global_prefix_map.contains_key(*v))
+            .cloned()
+            .collect();
+
+        if !unresolved_vars.is_empty() {
+            // Walk Python files in all roots, skip files already scanned in phase 1.
+            for (_slug, root_path) in root_pairs {
+                scan_python_files_for_include_router(
+                    root_path,
+                    &files_to_scan,
+                    &unresolved_vars,
+                    &mut global_prefix_map,
+                );
+            }
+        }
+    }
+
+    if global_prefix_map.is_empty() && file_prefix_map.is_empty() {
         return;
     }
 
-    // Step 3: update ApiEndpoint nodes whose (file, router_var) is in the map.
+    // Step 3: update ApiEndpoint nodes whose router_var has a known prefix.
     for node in nodes.iter_mut() {
         if node.language != "python" || node.id.kind != NodeKind::ApiEndpoint {
             continue;
@@ -128,12 +197,17 @@ pub fn fastapi_router_prefix_pass(nodes: &mut [Node]) {
             Some(v) if !v.is_empty() => v.clone(),
             _ => continue,
         };
-        let file_prefixes = match prefix_map.get(&node.id.file) {
-            Some(fp) => fp,
-            None => continue,
-        };
-        let prefix = match file_prefixes.get(&router_var) {
-            Some(p) if !p.is_empty() => p.clone(),
+
+        // Prefer same-file prefix (higher specificity) over cross-file include_router prefix.
+        let prefix = if let Some(file_prefixes) = file_prefix_map.get(&node.id.file) {
+            file_prefixes.get(&router_var).cloned()
+        } else {
+            None
+        }
+        .or_else(|| global_prefix_map.get(&router_var).cloned());
+
+        let prefix = match prefix {
+            Some(p) if !p.is_empty() => p,
             _ => continue,
         };
 
@@ -143,31 +217,100 @@ pub fn fastapi_router_prefix_pass(nodes: &mut [Node]) {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-file include_router scan
+// ---------------------------------------------------------------------------
+
+/// Walk Python files under `root_path`, skipping files already in `already_scanned`,
+/// and extract `include_router(var, prefix=...)` mappings for vars in `target_vars`.
+///
+/// Results are merged into `prefix_map`. Only vars in `target_vars` are added —
+/// this avoids adding stale mappings for router vars that were already resolved
+/// via the constructor-arg pattern.
+fn scan_python_files_for_include_router(
+    root_path: &Path,
+    already_scanned: &std::collections::HashSet<PathBuf>,
+    target_vars: &std::collections::HashSet<String>,
+    prefix_map: &mut HashMap<String, String>,
+) {
+    walk_dir_for_include_router(root_path, already_scanned, target_vars, prefix_map, 0);
+}
+
+/// Recursive directory walker (depth-limited to avoid deep symlink loops).
+fn walk_dir_for_include_router(
+    dir: &Path,
+    already_scanned: &std::collections::HashSet<PathBuf>,
+    target_vars: &std::collections::HashSet<String>,
+    prefix_map: &mut HashMap<String, String>,
+    depth: usize,
+) {
+    const MAX_DEPTH: usize = 20;
+    if depth > MAX_DEPTH {
+        return;
+    }
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        // Skip hidden directories (e.g. .git, .venv, __pycache__).
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && (name.starts_with('.') || name == "__pycache__" || name == "node_modules")
+        {
+            continue;
+        }
+
+        if path.is_dir() {
+            walk_dir_for_include_router(&path, already_scanned, target_vars, prefix_map, depth + 1);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("py") {
+            if already_scanned.contains(&path) {
+                continue;
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    if content.contains("include_router") {
+                        let found = extract_include_router_prefixes_from_str(&content);
+                        for (var, prefix) in found {
+                            if target_vars.contains(&var) {
+                                prefix_map.entry(var).or_insert(prefix);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("fastapi_router_prefix: could not read {:?}: {}", path, e);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Extract `{ var_name -> prefix }` from a Python source file.
+/// Extract all prefix mappings from a Python source file.
 ///
-/// Scans for lines of the form:
-/// ```python
-/// workspace_router = APIRouter(prefix="/workspaces/{id}")
-/// workspace_router = APIRouter(prefix='/workspaces/{id}')
-/// ```
-///
-/// Uses a simple regex-like scan rather than re-parsing with tree-sitter:
-/// - We're looking for a well-known assignment pattern that is stable across
-///   FastAPI versions.
-/// - The overhead of a second tree-sitter parse per file is not justified.
+/// Combines both `APIRouter(prefix=...)` constructor args and
+/// `include_router(var, prefix=...)` call args.
 ///
 /// Returns `Err` only if the file cannot be read.
-fn extract_router_prefixes(
+fn extract_prefixes_from_file(
     path: &Path,
 ) -> Result<HashMap<String, String>, std::io::Error> {
     let content = std::fs::read_to_string(path)?;
-    Ok(extract_router_prefixes_from_str(&content))
+    let mut map = extract_router_prefixes_from_str(&content);
+    // Also pick up include_router prefixes in the same file.
+    for (var, prefix) in extract_include_router_prefixes_from_str(&content) {
+        map.entry(var).or_insert(prefix);
+    }
+    Ok(map)
 }
 
-/// Pure (testable) inner implementation that works on a string slice.
+/// Pure (testable) inner implementation for `APIRouter(prefix=...)` detection.
 ///
 /// Exported as `pub(crate)` so unit tests can call it without touching the
 /// filesystem.
@@ -229,6 +372,136 @@ pub(crate) fn extract_router_prefixes_from_str(content: &str) -> HashMap<String,
         i += 1;
     }
     map
+}
+
+/// Pure (testable) inner implementation for `include_router(router_var, prefix=...)` detection.
+///
+/// Exported as `pub(crate)` so unit tests can call it without touching the
+/// filesystem.
+///
+/// Handles patterns like:
+/// ```python
+/// # Direct call on app/router object (most common):
+/// app.include_router(expertunities_router, prefix="/workspaces/{workspace_id}/expertunities")
+/// workspace_router.include_router(comment_router, prefix="/comment")
+///
+/// # Keyword router argument:
+/// app.include_router(router=expertunities_router, prefix="/expertunities")
+///
+/// # Multi-line:
+/// app.include_router(
+///     expertunities_router,
+///     prefix="/workspaces/{workspace_id}/expertunities"
+/// )
+/// ```
+///
+/// Returns a `HashMap<var_name, prefix>` for all recognized calls.
+pub(crate) fn extract_include_router_prefixes_from_str(content: &str) -> HashMap<String, String> {
+    const MULTILINE_LOOKAHEAD: usize = 8;
+
+    let mut map = HashMap::new();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        // Fast pre-filter: line must contain "include_router".
+        if !trimmed.contains("include_router") {
+            i += 1;
+            continue;
+        }
+
+        // Try single-line parse first.
+        if trimmed.contains("prefix") && trimmed.contains(')')
+            && let Some((var, prefix)) = parse_include_router_call(trimmed)
+        {
+            map.insert(var, prefix);
+            i += 1;
+            continue;
+        }
+
+        // Multi-line: join up to MULTILINE_LOOKAHEAD continuation lines.
+        let end = (i + 1 + MULTILINE_LOOKAHEAD).min(lines.len());
+        let combined: String = lines[i..end]
+            .iter()
+            .map(|l| l.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if combined.contains("prefix")
+            && let Some((var, prefix)) = parse_include_router_call(&combined)
+        {
+            map.insert(var, prefix);
+        }
+
+        i += 1;
+    }
+    map
+}
+
+/// Parse a single line of the form `<expr>.include_router(<var>, prefix="...")`.
+///
+/// Also handles the keyword-arg form: `<expr>.include_router(router=<var>, prefix="...")`.
+///
+/// Returns `Some((router_var_name, prefix))` if the line matches, `None` otherwise.
+fn parse_include_router_call(line: &str) -> Option<(String, String)> {
+    // Must contain `.include_router(` somewhere.
+    let call_start = line.find(".include_router(")?;
+    let args_str = &line[call_start + ".include_router(".len()..];
+
+    // Extract `prefix=` keyword argument.
+    let prefix = extract_kwarg_string(args_str, "prefix")?;
+    if !prefix.starts_with('/') {
+        return None;
+    }
+
+    // Extract the router variable name — first positional arg or `router=` kwarg.
+    let router_var = extract_include_router_var(args_str)?;
+    if !is_valid_identifier(&router_var) {
+        return None;
+    }
+
+    Some((router_var, prefix))
+}
+
+/// Extract the router variable name from `include_router` arguments string.
+///
+/// Handles:
+/// - Positional: `(expertunities_router, prefix="...")` → `"expertunities_router"`
+/// - Keyword: `(router=expertunities_router, prefix="...")` → `"expertunities_router"`
+fn extract_include_router_var(args: &str) -> Option<String> {
+    // Check for keyword arg `router=<ident>` first.
+    if let Some(pos) = args.find("router=") {
+        // Make sure this is `router=` not `include_router=` or similar.
+        // The char before `router=` must be a word-boundary character.
+        let before_pos = if pos > 0 { args.as_bytes()[pos - 1] } else { b'(' };
+        if before_pos == b'(' || before_pos == b',' || before_pos == b' ' {
+            let after = args[pos + "router=".len()..].trim_start();
+            let var = take_identifier(after);
+            if !var.is_empty() {
+                return Some(var);
+            }
+        }
+    }
+
+    // Positional: first token before a `,` or `)`.
+    let first_arg = args.trim_start();
+    // Skip if the first arg starts with a quote (it's a string, not a variable).
+    if first_arg.starts_with('"') || first_arg.starts_with('\'') {
+        return None;
+    }
+    let var = take_identifier(first_arg);
+    if !var.is_empty() {
+        Some(var)
+    } else {
+        None
+    }
+}
+
+/// Take a Python identifier from the start of `s`.
+fn take_identifier(s: &str) -> String {
+    s.chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect()
 }
 
 /// Parse a single line of the form `var_name = APIRouter(prefix="...")`.
@@ -442,7 +715,7 @@ router = APIRouter(tags=["workspaces"], prefix="/workspaces")
     }
 
     #[test]
-    fn test_no_apiRouter_lines_returns_empty() {
+    fn test_no_api_router_lines_returns_empty() {
         let content = "def foo(): pass\n";
         let map = extract_router_prefixes_from_str(content);
         assert!(map.is_empty(), "no APIRouter → empty map");
@@ -466,6 +739,92 @@ items_router = APIRouter(prefix="/items")
         assert_eq!(map.len(), 2);
         assert_eq!(map.get("workspace_router").map(|s| s.as_str()), Some("/workspaces/{id}"));
         assert_eq!(map.get("items_router").map(|s| s.as_str()), Some("/items"));
+    }
+
+    // ── extract_include_router_prefixes_from_str ──────────────────────────
+
+    #[test]
+    fn test_include_router_double_quoted_prefix() {
+        let content = r#"app.include_router(expertunities_router, prefix="/workspaces/{workspace_id}/expertunities")"#;
+        let map = extract_include_router_prefixes_from_str(content);
+        assert_eq!(
+            map.get("expertunities_router").map(|s| s.as_str()),
+            Some("/workspaces/{workspace_id}/expertunities"),
+            "include_router prefix must be extracted"
+        );
+    }
+
+    #[test]
+    fn test_include_router_single_quoted_prefix() {
+        let content = r#"workspace_router.include_router(comment_router, prefix='/comment')"#;
+        let map = extract_include_router_prefixes_from_str(content);
+        assert_eq!(
+            map.get("comment_router").map(|s| s.as_str()),
+            Some("/comment"),
+        );
+    }
+
+    #[test]
+    fn test_include_router_prefix_before_router_var() {
+        // prefix kwarg before the router var in args — should still parse
+        // Note: this is unusual but we test robustness
+        let content = r#"app.include_router(items_router, tags=["items"], prefix="/items")"#;
+        let map = extract_include_router_prefixes_from_str(content);
+        assert_eq!(
+            map.get("items_router").map(|s| s.as_str()),
+            Some("/items"),
+        );
+    }
+
+    #[test]
+    fn test_include_router_multiline() {
+        let content = "app.include_router(\n    expertunities_router,\n    prefix=\"/workspaces/{workspace_id}/expertunities\"\n)";
+        let map = extract_include_router_prefixes_from_str(content);
+        assert_eq!(
+            map.get("expertunities_router").map(|s| s.as_str()),
+            Some("/workspaces/{workspace_id}/expertunities"),
+            "multi-line include_router prefix must be extracted"
+        );
+    }
+
+    #[test]
+    fn test_include_router_no_prefix_ignored() {
+        let content = r#"app.include_router(router_without_prefix)"#;
+        let map = extract_include_router_prefixes_from_str(content);
+        assert!(map.is_empty(), "include_router without prefix must produce no entry");
+    }
+
+    #[test]
+    fn test_include_router_prefix_no_leading_slash_ignored() {
+        let content = r#"app.include_router(bad_router, prefix="no-slash")"#;
+        let map = extract_include_router_prefixes_from_str(content);
+        assert!(map.is_empty(), "prefix without leading slash must be ignored");
+    }
+
+    #[test]
+    fn test_multiple_include_routers_in_main() {
+        let content = r#"
+app.include_router(workspace_router, prefix="/workspaces")
+app.include_router(user_router, prefix="/users")
+app.include_router(auth_router, prefix="/auth")
+"#;
+        let map = extract_include_router_prefixes_from_str(content);
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get("workspace_router").map(|s| s.as_str()), Some("/workspaces"));
+        assert_eq!(map.get("user_router").map(|s| s.as_str()), Some("/users"));
+        assert_eq!(map.get("auth_router").map(|s| s.as_str()), Some("/auth"));
+    }
+
+    #[test]
+    fn test_include_router_keyword_router_arg() {
+        // The router variable is passed as a keyword arg: router=my_router
+        let content = r#"app.include_router(router=my_router, prefix="/api")"#;
+        let map = extract_include_router_prefixes_from_str(content);
+        assert_eq!(
+            map.get("my_router").map(|s| s.as_str()),
+            Some("/api"),
+            "include_router with router= keyword arg must be extracted"
+        );
     }
 
     // ── join_paths ────────────────────────────────────────────────────────
@@ -537,18 +896,7 @@ items_router = APIRouter(prefix="/items")
 
     // ── fastapi_router_prefix_pass (integration) ──────────────────────────
 
-    /// Acceptance test (in-memory): APIRouter prefix is prepended to the local path.
-    ///
-    /// Simulates the scenario from issue #517:
-    /// ```python
-    /// workspace_router = APIRouter(prefix="/workspaces/{id}")
-    ///
-    /// @workspace_router.get("/expertunities")
-    /// def get_expertunities(): ...
-    /// ```
-    ///
-    /// After the pass, the ApiEndpoint node must have
-    /// `http_path = "/workspaces/{id}/expertunities"`.
+    /// Acceptance test: `APIRouter(prefix=...)` in same file.
     #[test]
     fn test_pass_prepends_prefix_to_local_path() {
         use tempfile::NamedTempFile;
@@ -568,7 +916,7 @@ items_router = APIRouter(prefix="/items")
                 Some("workspace_router"),
             ),
         ];
-        fastapi_router_prefix_pass(&mut nodes);
+        fastapi_router_prefix_pass(&mut nodes, &[]);
 
         let ep = &nodes[0];
         assert_eq!(
@@ -577,6 +925,102 @@ items_router = APIRouter(prefix="/items")
             "full path must be /workspaces/{{id}}/expertunities after prefix resolution"
         );
         assert_eq!(ep.id.name, "GET /workspaces/{id}/expertunities");
+    }
+
+    /// Acceptance test (issue #517): `include_router(router_var, prefix=...)` in a parent file.
+    ///
+    /// Simulates the IC codebase pattern:
+    /// ```python
+    /// # routers/expertunities.py
+    /// expertunities_router = APIRouter()  # no prefix here
+    /// @expertunities_router.get("/")
+    /// def list_expertunities(): ...
+    ///
+    /// # main.py
+    /// app.include_router(expertunities_router, prefix="/workspaces/{workspace_id}/expertunities")
+    /// ```
+    ///
+    /// After the pass, the ApiEndpoint node must have
+    /// `http_path = "/workspaces/{workspace_id}/expertunities/"`.
+    #[test]
+    fn test_pass_include_router_cross_file_prefix() {
+        use tempfile::{NamedTempFile, TempDir};
+        use std::io::Write;
+
+        // Create a temp dir representing the project root.
+        let tmp_dir = TempDir::new().unwrap();
+
+        // Write the endpoint file (no prefix on router constructor).
+        let mut endpoint_file = NamedTempFile::new_in(tmp_dir.path()).unwrap();
+        writeln!(endpoint_file, "expertunities_router = APIRouter()").unwrap();
+        let endpoint_path = endpoint_file.path().to_path_buf();
+
+        // Write main.py with include_router call.
+        let main_py = tmp_dir.path().join("main.py");
+        std::fs::write(
+            &main_py,
+            r#"app.include_router(expertunities_router, prefix="/workspaces/{workspace_id}/expertunities")"#,
+        ).unwrap();
+
+        let root_pairs = vec![("repo".to_string(), tmp_dir.path().to_path_buf())];
+        let mut nodes = vec![
+            make_api_endpoint(
+                endpoint_path.to_str().unwrap(),
+                "GET /",
+                "GET",
+                "/",
+                Some("expertunities_router"),
+            ),
+        ];
+        fastapi_router_prefix_pass(&mut nodes, &root_pairs);
+
+        let ep = &nodes[0];
+        assert_eq!(
+            ep.metadata.get("http_path").map(|s| s.as_str()),
+            Some("/workspaces/{workspace_id}/expertunities/"),
+            "include_router prefix must be applied to endpoint in a different file"
+        );
+    }
+
+    /// When both APIRouter(prefix=...) and include_router set a prefix for the same var,
+    /// the APIRouter constructor arg takes precedence.
+    #[test]
+    fn test_constructor_prefix_takes_precedence_over_include_router() {
+        use tempfile::{NamedTempFile, TempDir};
+        use std::io::Write;
+
+        let tmp_dir = TempDir::new().unwrap();
+
+        // Endpoint file: router has a constructor prefix.
+        let mut endpoint_file = NamedTempFile::new_in(tmp_dir.path()).unwrap();
+        writeln!(endpoint_file, r#"my_router = APIRouter(prefix="/constructor-prefix")"#).unwrap();
+        let endpoint_path = endpoint_file.path().to_path_buf();
+
+        // Parent file also has an include_router with a DIFFERENT prefix.
+        let main_py = tmp_dir.path().join("main.py");
+        std::fs::write(
+            &main_py,
+            r#"app.include_router(my_router, prefix="/include-router-prefix")"#,
+        ).unwrap();
+
+        let root_pairs = vec![("repo".to_string(), tmp_dir.path().to_path_buf())];
+        let mut nodes = vec![
+            make_api_endpoint(
+                endpoint_path.to_str().unwrap(),
+                "GET /endpoint",
+                "GET",
+                "/endpoint",
+                Some("my_router"),
+            ),
+        ];
+        fastapi_router_prefix_pass(&mut nodes, &root_pairs);
+
+        // Constructor prefix takes precedence.
+        assert_eq!(
+            nodes[0].metadata.get("http_path").map(|s| s.as_str()),
+            Some("/constructor-prefix/endpoint"),
+            "APIRouter constructor prefix must take precedence over include_router prefix"
+        );
     }
 
     /// Nodes without `router_var` metadata are untouched.
@@ -598,45 +1042,32 @@ items_router = APIRouter(prefix="/items")
                 None, // no router_var
             ),
         ];
-        fastapi_router_prefix_pass(&mut nodes);
+        fastapi_router_prefix_pass(&mut nodes, &[]);
         assert_eq!(nodes[0].metadata.get("http_path").map(|s| s.as_str()), Some("/users"));
     }
 
     // ── fast path (no matching nodes → no file I/O) ───────────────────────
 
-    /// Verifies the early-exit (fast path): an empty node slice causes the pass
-    /// to return immediately without any file I/O.  This documents that the
-    /// per-pass overhead when no FastAPI code is present is O(n) with zero I/O.
     #[test]
     fn test_fast_path_noop_on_empty_node_set() {
         let mut nodes: Vec<Node> = vec![];
-        // Should return without panicking or touching the filesystem.
-        fastapi_router_prefix_pass(&mut nodes);
+        fastapi_router_prefix_pass(&mut nodes, &[]);
         assert!(nodes.is_empty());
     }
 
-    /// When nodes exist but none have `router_var`, the pass exits after a
-    /// single linear scan — no files are read.
     #[test]
     fn test_fast_path_noop_on_no_router_var_nodes() {
         let mut nodes = vec![
             make_api_endpoint("/app/routes.py", "GET /users", "GET", "/users", None),
             make_api_endpoint("/app/routes.py", "POST /users", "POST", "/users", None),
         ];
-        fastapi_router_prefix_pass(&mut nodes);
-        // Paths must be unchanged.
+        fastapi_router_prefix_pass(&mut nodes, &[]);
         assert_eq!(nodes[0].metadata.get("http_path").map(|s| s.as_str()), Some("/users"));
         assert_eq!(nodes[1].metadata.get("http_path").map(|s| s.as_str()), Some("/users"));
     }
 
     // ── multi-line APIRouter detection ────────────────────────────────────
 
-    /// Multi-line `APIRouter(` declarations are handled:
-    /// ```python
-    /// workspace_router = APIRouter(
-    ///     prefix="/workspaces"
-    /// )
-    /// ```
     #[test]
     fn test_extracts_multiline_prefix() {
         let content = "workspace_router = APIRouter(\n    prefix=\"/workspaces\"\n)\n";
@@ -648,7 +1079,6 @@ items_router = APIRouter(prefix="/items")
         );
     }
 
-    /// Multi-line with extra kwargs before `prefix=`.
     #[test]
     fn test_extracts_multiline_prefix_with_other_kwargs() {
         let content = "items_router = APIRouter(\n    tags=[\"items\"],\n    prefix=\"/items\"\n)\n";
@@ -667,7 +1097,7 @@ items_router = APIRouter(prefix="/items")
         let mut node = make_api_endpoint("routes.ts", "GET /users", "GET", "/users", Some("router"));
         node.language = "typescript".to_string();
         let mut nodes = vec![node];
-        fastapi_router_prefix_pass(&mut nodes);
+        fastapi_router_prefix_pass(&mut nodes, &[]);
         assert_eq!(nodes[0].metadata.get("http_path").map(|s| s.as_str()), Some("/users"));
     }
 
@@ -691,7 +1121,7 @@ items_router = APIRouter(prefix="/items")
                 Some("users_router"),
             ),
         ];
-        fastapi_router_prefix_pass(&mut nodes);
+        fastapi_router_prefix_pass(&mut nodes, &[]);
         assert_eq!(nodes[0].metadata.get("http_path").map(|s| s.as_str()), Some("/users"));
     }
 
@@ -710,7 +1140,7 @@ items_router = APIRouter(prefix="/items")
             make_api_endpoint(path.to_str().unwrap(), "POST /", "POST", "/", Some("items_router")),
             make_api_endpoint(path.to_str().unwrap(), "GET /{id}", "GET", "/{id}", Some("items_router")),
         ];
-        fastapi_router_prefix_pass(&mut nodes);
+        fastapi_router_prefix_pass(&mut nodes, &[]);
 
         assert_eq!(nodes[0].metadata.get("http_path").map(|s| s.as_str()), Some("/items/"));
         assert_eq!(nodes[1].metadata.get("http_path").map(|s| s.as_str()), Some("/items/"));
