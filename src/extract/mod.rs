@@ -22,7 +22,6 @@ pub mod import_calls;
 pub mod manifest;
 pub mod naming_convention;
 pub mod nextjs_routing;
-pub mod post_extraction;
 pub mod pubsub;
 pub mod subsystem_pass;
 pub mod websocket;

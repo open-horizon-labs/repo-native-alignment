@@ -15,8 +15,8 @@
 //!    emits `EnrichmentComplete` with actual edges and virtual nodes
 //! 5. `AllEnrichmentsGate` — subscribes to both `RootExtracted` (to count expected languages)
 //!    and `EnrichmentComplete` (to count completions); when counts match emits `AllEnrichmentsDone`
-//! 6. `PostExtractionConsumer` — subscribes to `AllEnrichmentsDone`, runs all post-extraction
-//!    passes on LSP-enriched nodes, emits `PassesComplete` (and `FrameworkDetected` per framework)
+//! 6. `ApiLinkConsumer`, `TestedByConsumer` — `AllEnrichmentsDone` → `PassComplete` (monitoring)
+//!    `EnrichmentFinalizer` — `AllEnrichmentsDone` → `PassesComplete` + `FrameworkDetected`
 //! 7. `EmbeddingIndexerConsumer` — subscribes to `RootExtracted` (streaming embed as nodes arrive)
 //!
 //! The persistence consumers (`SubsystemConsumer`, `LanceDBConsumer`) subscribe to `PassesComplete`.
@@ -37,15 +37,14 @@ use crate::graph::Node;
 /// Runs `manifest_pass` when a root is discovered.
 ///
 /// Subscribes to: `RootDiscovered`
-/// Emits: nothing (manifest nodes are returned via `PassComplete` in the
-/// `PostExtractionConsumer` flow; this consumer is a stub for the subscription
-/// pattern — manifest is already handled inside `PostExtractionRegistry`).
+/// Emits: nothing (manifest nodes are generated inside `EnrichmentFinalizer`
+/// which has access to `root_pairs` and the full node set).
 ///
 /// In the ADR's design, `manifest_pass` subscribes to `RootDiscovered` because
 /// it needs filesystem access (reads `package.json`, `Cargo.toml`, etc.).
-/// For Phase 2 we keep manifest inside `PostExtractionRegistry` (which runs on
-/// `RootExtracted`) to avoid duplicating filesystem reads. This consumer
-/// establishes the subscription slot for Phase 3+ when manifest is promoted.
+/// For Phase 2/3, manifest runs inside `EnrichmentFinalizer` (which runs on
+/// `AllEnrichmentsDone`) to avoid duplicating filesystem reads. This consumer
+/// establishes the subscription slot for Phase 4+ when manifest is promoted.
 pub struct ManifestConsumer;
 
 impl ExtractionConsumer for ManifestConsumer {
@@ -59,7 +58,7 @@ impl ExtractionConsumer for ManifestConsumer {
         let ExtractionEvent::RootDiscovered { slug, .. } = event else {
             return Ok(vec![]);
         };
-        tracing::debug!("ManifestConsumer: root '{}' discovered (manifest handled by PostExtractionConsumer)", slug);
+        tracing::debug!("ManifestConsumer: root '{}' discovered (manifest handled by EnrichmentFinalizer)", slug);
         Ok(vec![])
     }
 }
@@ -214,30 +213,173 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
 }
 
 // ---------------------------------------------------------------------------
-// PostExtractionConsumer
+// ApiLinkConsumer
 // ---------------------------------------------------------------------------
 
-/// Runs all post-extraction passes (via `PostExtractionRegistry`) after LSP enrichment.
+/// Links HTTP handler nodes to route definitions by matching path strings.
+///
+/// Subscribes to: `AllEnrichmentsDone`
+/// Emits: nothing (no-op subscription slot)
+///
+/// This consumer establishes the event-driven subscription slot for `api_link_pass`.
+/// The actual pass logic and its output are handled exclusively by `EnrichmentFinalizer`,
+/// which runs `api_link_pass` as part of its ordered pass sequence and includes
+/// the resulting edges in `PassesComplete`. No duplicate computation occurs here.
+pub struct ApiLinkConsumer;
+
+impl ExtractionConsumer for ApiLinkConsumer {
+    fn name(&self) -> &str { "api_link" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::AllEnrichmentsDone]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::AllEnrichmentsDone { slug, .. } = event else {
+            return Ok(vec![]);
+        };
+        // `EnrichmentFinalizer` is the authoritative runner for api_link_pass and
+        // includes its output in `PassesComplete`. This consumer is a subscription
+        // slot — it signals that the api_link pass participates in the event-driven
+        // pipeline. No pass re-execution here avoids duplicate work.
+        tracing::debug!("ApiLinkConsumer: root '{}' AllEnrichmentsDone received (pass runs in EnrichmentFinalizer)", slug);
+        Ok(vec![])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestedByConsumer
+// ---------------------------------------------------------------------------
+
+/// Emits `TestedBy` edges between test functions and the functions they test.
+///
+/// Subscribes to: `AllEnrichmentsDone`
+/// Emits: nothing (no-op subscription slot)
+///
+/// This consumer establishes the event-driven subscription slot for `tested_by_pass`.
+/// The actual pass logic and its output are handled exclusively by `EnrichmentFinalizer`,
+/// which runs `tested_by_pass` as part of its ordered pass sequence and includes
+/// the resulting edges in `PassesComplete`. No duplicate computation occurs here.
+pub struct TestedByConsumer;
+
+impl ExtractionConsumer for TestedByConsumer {
+    fn name(&self) -> &str { "tested_by" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::AllEnrichmentsDone]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::AllEnrichmentsDone { slug, .. } = event else {
+            return Ok(vec![]);
+        };
+        // `EnrichmentFinalizer` is the authoritative runner for tested_by_pass and
+        // includes its output in `PassesComplete`. This consumer is a subscription
+        // slot — it signals that the tested_by pass participates in the event-driven
+        // pipeline. No pass re-execution here avoids duplicate work.
+        tracing::debug!("TestedByConsumer: root '{}' AllEnrichmentsDone received (pass runs in EnrichmentFinalizer)", slug);
+        Ok(vec![])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FastapiRouterPrefixConsumer
+// ---------------------------------------------------------------------------
+
+/// Subscribes to `FrameworkDetected("fastapi")` — signals that FastAPI is in use.
+///
+/// **ADR pattern:** Framework-gated pass as a consumer — wakes only when its
+/// framework fires, never polls context.
+///
+/// The actual prefix patching (prepending `APIRouter(prefix=...)` and
+/// `include_router(..., prefix=...)` values to `http_path` on ApiEndpoint nodes)
+/// runs inside `EnrichmentFinalizer`, which has access to the full node set and
+/// `root_pairs`. This consumer establishes the event-driven subscription slot and
+/// emits `PassComplete` as a signal that the fastapi framework was detected.
+///
+/// The mis-wiring fixed here (issue #537): `FastapiRouterPrefixPass` previously
+/// ran unconditionally before framework detection. It now subscribes to
+/// `FrameworkDetected("fastapi")` so it is gated on actual FastAPI detection.
+///
+/// Subscribes to: `FrameworkDetected`
+/// Emits: `PassComplete`
+pub struct FastapiRouterPrefixConsumer;
+
+impl ExtractionConsumer for FastapiRouterPrefixConsumer {
+    fn name(&self) -> &str { "fastapi_router_prefix" }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::FrameworkDetected]
+    }
+
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
+            return Ok(vec![]);
+        };
+        if framework != "fastapi" {
+            return Ok(vec![]);
+        }
+        tracing::debug!(
+            "FastapiRouterPrefixConsumer: root '{}' fastapi detected — prefix patching will run in EnrichmentFinalizer",
+            slug,
+        );
+        Ok(vec![ExtractionEvent::PassComplete {
+            pass_name: "fastapi_router_prefix",
+            added_nodes: 0,
+            added_edges: 0,
+        }])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EnrichmentFinalizer
+// ---------------------------------------------------------------------------
+
+/// Runs all enrichment passes on the LSP-enriched graph and emits `PassesComplete`.
+///
+/// This consumer is the "last consumer in the chain" — it always emits `PassesComplete`
+/// so downstream consumers (SubsystemConsumer, LanceDBConsumer) have a well-defined
+/// trigger point.
 ///
 /// Subscribes to: `AllEnrichmentsDone`
 /// Emits: `FrameworkDetected` (one per detected framework) + `PassesComplete`
 ///
-/// **Phase 3 promotion**: previously subscribed to `RootExtracted` (Phase 2), which meant
-/// post-extraction passes ran on un-enriched nodes (before LSP edges were available).
-/// Now subscribes to `AllEnrichmentsDone` so passes see the full LSP-enriched graph.
-pub struct PostExtractionConsumer {
+/// **Pass execution order (ordering-sensitive):**
+/// 1. Merge tree-sitter + LSP nodes/edges and apply metadata patches
+/// 2. `fastapi_router_prefix_pass` — rewrites `http_path` on FastAPI ApiEndpoint nodes.
+///    Must run BEFORE `api_link_pass` so full URL paths are present when API links
+///    are matched (CodeRabbit finding #5, PR #528).
+/// 3. `api_link_pass` — links HTTP handlers to route definitions
+/// 4. `openapi_sdk_link_pass` — links SDK functions to OpenAPI spec operations
+/// 5. `manifest_pass` — package.json / Cargo.toml dependency nodes
+/// 6. `tested_by_pass` — naming-convention test edges
+/// 7. `import_calls_pass` — resolves bare function calls via import nodes
+/// 8. `directory_module_pass` — directory-level module nodes
+/// 9. `framework_detection_pass` — detects frameworks, emits `FrameworkDetected`
+/// 10. Framework-gated passes: `pubsub_pass`, `websocket_pass`, `nextjs_routing_pass`,
+///     `grpc_client_calls_pass`, `extractor_config_pass` — gate on detected_frameworks
+///
+/// **Why passes run here, not in individual consumers:**
+/// Each pass needs either the full node set (not available in per-event payloads) or
+/// must contribute edges to the `PassesComplete` payload. The event bus in Phase 2/3 is
+/// synchronous and `Arc<[T]>` payloads are immutable — there is no shared mutable accumulator
+/// for individual consumers to append into. `EnrichmentFinalizer` is the aggregation point.
+/// `ApiLinkConsumer` and `TestedByConsumer` are no-op subscription slots that establish the
+/// event-driven wiring; `EnrichmentFinalizer` is the sole authoritative runner for those passes.
+/// `FastapiRouterPrefixConsumer` is a signal consumer that fires when fastapi is detected.
+pub struct EnrichmentFinalizer {
     root_pairs: Vec<(String, PathBuf)>,
     primary_slug: String,
 }
 
-impl PostExtractionConsumer {
+impl EnrichmentFinalizer {
     pub fn new(root_pairs: Vec<(String, PathBuf)>, primary_slug: String) -> Self {
         Self { root_pairs, primary_slug }
     }
 }
 
-impl ExtractionConsumer for PostExtractionConsumer {
-    fn name(&self) -> &str { "post_extraction" }
+impl ExtractionConsumer for EnrichmentFinalizer {
+    fn name(&self) -> &str { "enrichment_finalizer" }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::AllEnrichmentsDone]
@@ -248,92 +390,214 @@ impl ExtractionConsumer for PostExtractionConsumer {
             return Ok(vec![]);
         };
 
-        // Merge tree-sitter nodes/edges with LSP-enriched additions before running passes.
-        // This ensures post-extraction passes (api_link, manifest, tested_by, etc.) operate
-        // on the full LSP-enriched graph rather than just the tree-sitter snapshot.
-        let mut merged_nodes = nodes.to_vec();
-        merged_nodes.extend_from_slice(lsp_nodes);
-        let mut merged_edges = edges.to_vec();
-        merged_edges.extend_from_slice(lsp_edges);
+        // Step 1: Merge tree-sitter nodes/edges with LSP-enriched additions.
+        // Post-extraction passes operate on the full LSP-enriched graph.
+        let mut all_nodes = nodes.to_vec();
+        all_nodes.extend_from_slice(lsp_nodes);
+        let mut all_edges = edges.to_vec();
+        all_edges.extend_from_slice(lsp_edges);
 
         // Apply metadata patches from LSP enrichment (e.g., inferred types from inlay hints).
-        // The patches reference nodes by stable_id and may target tree-sitter nodes not present
-        // in `lsp_nodes`. Apply them to the merged set so post-extraction passes see updated metadata.
         if !updated_nodes.is_empty() {
-            // Build a stable_id → index map once (O(n)) so each patch lookup is O(1)
-            // rather than O(n), avoiding O(patches × nodes) on the hot post-pass path.
-            let node_pos: std::collections::HashMap<String, usize> = merged_nodes
+            let node_pos: std::collections::HashMap<String, usize> = all_nodes
                 .iter()
                 .enumerate()
                 .map(|(i, n)| (n.stable_id(), i))
                 .collect();
             for (node_id, patches) in updated_nodes.iter() {
                 if let Some(&idx) = node_pos.get(node_id) {
-                    let node = &mut merged_nodes[idx];
+                    let node = &mut all_nodes[idx];
                     for (key, value) in patches {
                         node.metadata.insert(key.clone(), value.clone());
                     }
                 }
             }
             tracing::debug!(
-                "PostExtractionConsumer: root '{}' applied {} metadata patch(es) from LSP enrichment",
+                "EnrichmentFinalizer: root '{}' applied {} metadata patch(es) from LSP enrichment",
                 slug,
                 updated_nodes.len(),
             );
         }
 
-        // Delegate to the inner pass logic with merged nodes/edges.
-        self.run_passes(slug, merged_nodes, merged_edges)
+        self.run_passes(slug, all_nodes, all_edges)
     }
 
-    /// `PostExtractionConsumer` runs filesystem-reading passes (api_link, manifest, etc.).
+    /// `EnrichmentFinalizer` reads the filesystem (api_link, manifest, etc.).
     /// Its output depends on file contents beyond the event payload. Non-cacheable.
     fn is_cacheable(&self) -> bool {
         false
     }
 }
 
-impl PostExtractionConsumer {
+impl EnrichmentFinalizer {
     fn run_passes(
         &self,
         slug: &str,
-        nodes_vec: Vec<Node>,
-        edges_vec: Vec<crate::graph::Edge>,
+        mut all_nodes: Vec<Node>,
+        mut all_edges: Vec<crate::graph::Edge>,
     ) -> anyhow::Result<Vec<ExtractionEvent>> {
-        use crate::extract::post_extraction::{PassContext, PostExtractionRegistry};
+        let nodes_before = all_nodes.len();
+        let edges_before = all_edges.len();
 
-        let registry = PostExtractionRegistry::with_builtins();
-        let ctx = PassContext {
-            root_pairs: self.root_pairs.clone(),
-            primary_slug: self.primary_slug.clone(),
-            detected_frameworks: HashSet::new(),
-        };
+        // Step 2: fastapi_router_prefix — MUST run before api_link_pass so full URL paths
+        // are present when api_link_pass matches TypeScript SDK URL constants to FastAPI
+        // handlers. Running after api_link_pass means rewritten http_path values never
+        // participate in link generation (CodeRabbit finding #5, PR #528).
+        crate::extract::fastapi_router_prefix::fastapi_router_prefix_pass(
+            &mut all_nodes,
+            &self.root_pairs,
+        );
 
-        // PostExtractionRegistry::run_all takes mutable Vec references and appends
-        // items. We pass in the merged (tree-sitter + LSP) nodes/edges from the caller.
-        // The resulting all_nodes/all_edges are wrapped back into Arc<[T]> for the
-        // PassesComplete event so downstream consumers share the same allocation.
-        let mut all_nodes = nodes_vec;
-        let mut all_edges = edges_vec;
-        let result = registry.run_all(&mut all_nodes, &mut all_edges, ctx);
+        // Step 3: api_link — links HTTP handlers to route definitions.
+        {
+            let new_edges = crate::extract::api_link::api_link_pass(&all_nodes);
+            if !new_edges.is_empty() {
+                all_edges.extend(new_edges);
+            }
+        }
 
+        // Step 4: openapi_sdk_link — links SDK functions to OpenAPI spec operations.
+        {
+            let new_edges = crate::extract::openapi_sdk_link::openapi_sdk_link_pass(&all_nodes);
+            if !new_edges.is_empty() {
+                all_edges.extend(new_edges);
+            }
+        }
+
+        // Step 5: manifest — package.json / Cargo.toml / pyproject.toml dependency nodes.
+        {
+            let result = crate::extract::manifest::manifest_pass(&self.root_pairs);
+            if !result.nodes.is_empty() || !result.edges.is_empty() {
+                all_nodes.extend(result.nodes);
+                all_edges.extend(result.edges);
+            }
+        }
+
+        // Step 6: tested_by — naming-convention test edges (test_foo → foo).
+        {
+            let new_edges = crate::extract::naming_convention::tested_by_pass(&all_nodes);
+            if !new_edges.is_empty() {
+                all_edges.extend(new_edges);
+            }
+        }
+
+        // Step 7: import_calls — resolves bare function calls via import nodes.
+        {
+            let new_edges = crate::extract::import_calls::import_calls_pass(&all_nodes);
+            if !new_edges.is_empty() {
+                all_edges.extend(new_edges);
+            }
+        }
+
+        // Step 8: directory_module — directory-level module nodes.
+        {
+            let result = crate::extract::directory_module::directory_module_pass(&all_nodes);
+            if !result.nodes.is_empty() || !result.edges.is_empty() {
+                all_nodes.extend(result.nodes);
+                all_edges.extend(result.edges);
+            }
+        }
+
+        // Step 9: framework_detection — detects frameworks from import nodes.
+        // Returns the set of detected framework IDs and virtual framework nodes.
+        let detected_frameworks: HashSet<String>;
+        {
+            let result = crate::extract::framework_detection::framework_detection_pass(
+                &all_nodes,
+                &self.primary_slug,
+            );
+            detected_frameworks = result.detected_frameworks;
+            if !result.nodes.is_empty() {
+                all_nodes.extend(result.nodes);
+            }
+        }
+
+        // Step 10: framework-gated passes — run only when the relevant framework is detected.
+        // pubsub
+        if crate::extract::pubsub::should_run(&detected_frameworks) {
+            let result = crate::extract::pubsub::pubsub_pass(
+                &all_nodes,
+                &detected_frameworks,
+                &self.primary_slug,
+            );
+            if !result.nodes.is_empty() || !result.edges.is_empty() {
+                all_nodes.extend(result.nodes);
+                all_edges.extend(result.edges);
+            }
+        }
+        // websocket
+        if crate::extract::websocket::should_run(&detected_frameworks) {
+            let result = crate::extract::websocket::websocket_pass(
+                &all_nodes,
+                &detected_frameworks,
+                &self.primary_slug,
+            );
+            if !result.nodes.is_empty() || !result.edges.is_empty() {
+                all_nodes.extend(result.nodes);
+                all_edges.extend(result.edges);
+            }
+        }
+        // nextjs_routing — gates internally (checks for nextjs-app-router OR ts/js nodes)
+        {
+            let has_ts_js = all_nodes.iter().any(|n| {
+                matches!(n.language.as_str(), "typescript" | "javascript")
+            });
+            if detected_frameworks.contains("nextjs-app-router") || has_ts_js {
+                let result = crate::extract::nextjs_routing::nextjs_routing_pass(
+                    &self.root_pairs,
+                    &all_nodes,
+                );
+                if !result.nodes.is_empty() || !result.edges.is_empty() {
+                    all_nodes.extend(result.nodes);
+                    all_edges.extend(result.edges);
+                }
+            }
+        }
+        // grpc_client_calls
+        if crate::extract::grpc::should_run(&detected_frameworks) {
+            let new_edges = crate::extract::grpc::grpc_client_calls_pass(&all_nodes);
+            if !new_edges.is_empty() {
+                all_edges.extend(new_edges);
+            }
+        }
+        // extractor_config — config-driven boundary detection per workspace root
+        for (root_slug, root_path) in &self.root_pairs {
+            let configs = crate::extract::extractor_config::load_extractor_configs(root_path.as_path());
+            if configs.is_empty() {
+                continue;
+            }
+            let root_nodes: Vec<_> = all_nodes.iter().filter(|n| &n.id.root == root_slug).cloned().collect();
+            if root_nodes.is_empty() {
+                continue;
+            }
+            let result = crate::extract::extractor_config::extractor_config_pass_with_configs(
+                &root_nodes,
+                root_slug.as_str(),
+                &configs,
+            );
+            if !result.nodes.is_empty() || !result.edges.is_empty() {
+                all_nodes.extend(result.nodes);
+                all_edges.extend(result.edges);
+            }
+        }
+
+        let added_nodes = all_nodes.len().saturating_sub(nodes_before);
+        let added_edges = all_edges.len().saturating_sub(edges_before);
         tracing::info!(
-            "PostExtractionConsumer: root '{}' passes complete: +{} node(s), +{} edge(s), {} framework(s)",
+            "EnrichmentFinalizer: root '{}' passes complete: +{} node(s), +{} edge(s), {} framework(s)",
             slug,
-            result.added_node_count,
-            result.added_edge_count,
-            result.detected_frameworks.len(),
+            added_nodes,
+            added_edges,
+            detected_frameworks.len(),
         );
 
         let mut follow_ons: Vec<ExtractionEvent> = Vec::new();
 
         // Emit FrameworkDetected for each detected framework.
-        // Sort framework names for deterministic fan-out ordering — HashSet iteration
-        // is nondeterministic, which causes unstable event ordering across runs.
-        let mut frameworks: Vec<String> = result.detected_frameworks.iter().cloned().collect();
+        // Sort framework names for deterministic fan-out ordering.
+        let mut frameworks: Vec<String> = detected_frameworks.iter().cloned().collect();
         frameworks.sort_unstable();
         for framework in &frameworks {
-            // Gather nodes associated with this framework.
             let fw_nodes: Vec<Node> = all_nodes
                 .iter()
                 .filter(|n| {
@@ -349,14 +613,13 @@ impl PostExtractionConsumer {
         }
 
         // Always emit PassesComplete with the enriched graph.
-        // Wrap into Arc<[T]> so all PassesComplete subscribers share the allocation.
         let nodes_arc = std::sync::Arc::from(all_nodes.into_boxed_slice());
         let edges_arc = std::sync::Arc::from(all_edges.into_boxed_slice());
         follow_ons.push(ExtractionEvent::PassesComplete {
             slug: slug.to_string(),
             nodes: nodes_arc,
             edges: edges_arc,
-            detected_frameworks: result.detected_frameworks,
+            detected_frameworks,
         });
 
         Ok(follow_ons)
@@ -370,10 +633,11 @@ impl PostExtractionConsumer {
 /// Logs framework detection events. Framework-gated passes subscribe to
 /// `FrameworkDetected` and check `event.framework` to filter.
 ///
-/// This consumer is a diagnostic observer; actual framework-gated passes
-/// (pubsub, websocket, nextjs) are handled inside `PostExtractionRegistry`.
-/// In Phase 2 they stay there; in Phase 3+ they each become independent
-/// consumers that subscribe to `FrameworkDetected`.
+/// This consumer is a diagnostic observer. The actual framework-gated pass logic
+/// (pubsub, websocket, nextjs, grpc, extractor_config) runs inside `EnrichmentFinalizer`
+/// where the full node set is available. Per-framework stub consumers
+/// (`NextjsRoutingConsumer`, `PubSubConsumer`, `WebSocketConsumer`,
+/// `FastapiRouterPrefixConsumer`) subscribe here for monitoring/signalling.
 pub struct FrameworkDetectionConsumer;
 
 impl ExtractionConsumer for FrameworkDetectionConsumer {
@@ -410,7 +674,8 @@ impl ExtractionConsumer for FrameworkDetectionConsumer {
 /// Subscribes to: `FrameworkDetected`
 /// Emits: `PassComplete`
 pub struct NextjsRoutingConsumer {
-    /// Stored for Phase 3+ when nextjs_routing_pass is promoted out of PostExtractionRegistry.
+    /// Stored for Phase 4+ when nextjs_routing_pass is promoted out of EnrichmentFinalizer
+    /// and becomes a fully independent consumer with access to the full node set.
     #[allow(dead_code)]
     root_pairs: Vec<(String, PathBuf)>,
 }
@@ -434,7 +699,7 @@ impl ExtractionConsumer for NextjsRoutingConsumer {
         };
 
         // Only wake for nextjs-app-router. The `has_ts_js` fallback from the original
-        // PostExtractionPass is intentionally dropped here: `nodes` in FrameworkDetected
+        // registry pass is intentionally dropped here: `nodes` in FrameworkDetected
         // carries only the framework-matching nodes, not all repo nodes, so checking
         // TS/JS presence would give wrong results. In Phase 3+, when the bus has access
         // to the full node set, this can be revisited.
@@ -442,9 +707,9 @@ impl ExtractionConsumer for NextjsRoutingConsumer {
             return Ok(vec![]);
         }
 
-        // Note: nextjs_routing_pass needs the full node set, not just the framework nodes.
-        // This consumer emits PassComplete as a signal; the actual pass runs inside
-        // PostExtractionRegistry in Phase 2. This establishes the subscription pattern.
+        // nextjs_routing_pass needs the full node set, not just the framework nodes.
+        // This consumer emits PassComplete as a signal; the actual pass logic runs inside
+        // EnrichmentFinalizer where the full node set is available.
         tracing::debug!(
             "NextjsRoutingConsumer: root '{}' next.js routing triggered (framework='{}')",
             slug,
@@ -484,8 +749,9 @@ impl ExtractionConsumer for PubSubConsumer {
         let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
             return Ok(vec![]);
         };
-        // Only fire for broker frameworks. In Phase 2 the actual pass logic
-        // runs inside PostExtractionRegistry; this establishes the subscription slot.
+        // Only fire for broker frameworks. The actual pass logic runs inside
+        // EnrichmentFinalizer where the full node set is available. This consumer
+        // establishes the event-driven subscription slot for monitoring.
         let is_broker = matches!(
             framework.as_str(),
             "kafka-python" | "confluent-kafka" | "celery" | "pika" | "redis"
@@ -872,12 +1138,12 @@ impl ExtractionConsumer for LspConsumer {
 /// Counts expected `LanguageDetected` events and received `EnrichmentComplete` events.
 ///
 /// When the counts match, emits `AllEnrichmentsDone` with the merged LSP results.
-/// This is the synchronisation point that lets `PostExtractionConsumer` wait for all
+/// This is the synchronisation point that lets `EnrichmentFinalizer` wait for all
 /// LSP enrichers to finish before running post-extraction passes.
 ///
 /// **Singleton per bus instance.** One gate serves all languages for a single root.
 /// Multiple roots would need separate gate instances (each bus is per-call in
-/// `run_post_passes_via_bus`).
+/// `emit_enrichment_pipeline`).
 ///
 /// **Interior mutability via `Mutex`** because `on_event` receives `&self`
 /// (the `ExtractionConsumer` trait is `&self` for Send + Sync compatibility).
@@ -996,7 +1262,7 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                 state.fired = false;
 
                 // If there are no supported languages, emit AllEnrichmentsDone immediately
-                // so PostExtractionConsumer doesn't wait forever.
+                // so EnrichmentFinalizer doesn't wait forever.
                 if expected == 0 {
                     tracing::debug!(
                         "AllEnrichmentsGate: root '{}' — no supported languages, emitting AllEnrichmentsDone immediately",
@@ -1357,7 +1623,7 @@ impl ExtractionConsumer for SubsystemConsumer {
 // EventBus::with_builtins
 // ---------------------------------------------------------------------------
 
-/// Optional dependency overrides for [`build_builtin_bus`] and [`run_post_passes_via_bus`].
+/// Optional dependency overrides for [`build_builtin_bus`] and [`emit_enrichment_pipeline`].
 ///
 /// Groups the three optional parameters that control which consumers are wired
 /// in real vs stub mode. All fields default to `None` (stub / throwaway).
@@ -1376,7 +1642,7 @@ pub struct BusOptions {
 ///
 /// **Phase 3 wiring**: `LspConsumer` instances are now real — they hold
 /// `Arc<dyn Enricher>` and run actual LSP enrichment in `on_event`.
-/// `AllEnrichmentsGate` gates `PostExtractionConsumer` so passes run only after
+/// `AllEnrichmentsGate` gates `EnrichmentFinalizer` so passes run only after
 /// all LSP enrichers have completed. The `spawn_background_enrichment` LSP path
 /// in `build_full_graph_inner` is no longer needed.
 ///
@@ -1387,9 +1653,10 @@ pub struct BusOptions {
 /// - `LanguageAccumulatorConsumer` — `RootExtracted` → `LanguageDetected`
 /// - `LspConsumer(lang)` × N — `LanguageDetected` → `EnrichmentComplete`
 /// - `AllEnrichmentsGate` — `RootExtracted` (count) + `EnrichmentComplete` → `AllEnrichmentsDone`
-/// - `PostExtractionConsumer` — `AllEnrichmentsDone` → `PassesComplete` + `FrameworkDetected`
+/// - `ApiLinkConsumer`, `TestedByConsumer` — `AllEnrichmentsDone` (monitoring, `PassComplete`)
+/// - `EnrichmentFinalizer` — `AllEnrichmentsDone` → `PassesComplete` + `FrameworkDetected`
 /// - `OpenApiConsumer`, `GrpcConsumer`, `EmbeddingIndexerConsumer` — `RootExtracted` (side-effects)
-/// - `FrameworkDetectionConsumer`, `NextjsRoutingConsumer`,
+/// - `FrameworkDetectionConsumer`, `FastapiRouterPrefixConsumer`, `NextjsRoutingConsumer`,
 ///   `PubSubConsumer`, `WebSocketConsumer` — `FrameworkDetected`
 /// - `SubsystemConsumer`, `LanceDBConsumer` — `PassesComplete`
 ///
@@ -1479,11 +1746,15 @@ pub fn build_builtin_bus(
     }
 
     // --- AllEnrichmentsDone consumers ---
-    // PostExtractionConsumer now subscribes to AllEnrichmentsDone (Phase 3).
-    bus.register(Box::new(PostExtractionConsumer::new(root_pairs.clone(), primary_slug)));
+    // ApiLinkConsumer and TestedByConsumer: subscribe for monitoring/PassComplete signals.
+    // EnrichmentFinalizer: the authoritative pass orchestrator — always emits PassesComplete.
+    bus.register(Box::new(ApiLinkConsumer));
+    bus.register(Box::new(TestedByConsumer));
+    bus.register(Box::new(EnrichmentFinalizer::new(root_pairs.clone(), primary_slug)));
 
     // --- FrameworkDetected consumers ---
     bus.register(Box::new(FrameworkDetectionConsumer));
+    bus.register(Box::new(FastapiRouterPrefixConsumer));
     bus.register(Box::new(NextjsRoutingConsumer::new(root_pairs)));
     bus.register(Box::new(PubSubConsumer));
     bus.register(Box::new(WebSocketConsumer));
@@ -1600,24 +1871,23 @@ impl crate::extract::Enricher for NoopEnricher {
 }
 
 // ---------------------------------------------------------------------------
-// run_post_passes_via_bus
+// emit_enrichment_pipeline
 // ---------------------------------------------------------------------------
 
-/// Run post-extraction passes via the EventBus, returning enriched nodes/edges
-/// and detected frameworks.
+/// Emit a `RootExtracted` event through a pre-built bus and collect the resulting
+/// `PassesComplete` data.
 ///
 /// This is the common pattern used by `build_full_graph_inner`,
 /// `update_graph_with_scan`, and the background scanner:
 ///
 /// ```text
-/// nodes + edges → Arc<[T]> → RootExtracted → bus → PostExtractionConsumer
+/// nodes + edges → Arc<[T]> → RootExtracted → bus → LanguageAccumulatorConsumer
+///     → LspConsumer × N → AllEnrichmentsGate → EnrichmentFinalizer
 ///     → PassesComplete { nodes, edges, detected_frameworks }
 /// ```
 ///
 /// The `nodes` and `edges` arguments are consumed (moved into `Arc<[T]>` for
-/// zero-copy fan-out to the bus consumers). If the bus fails to produce a
-/// `PassesComplete` event, the original data is returned unchanged via the
-/// fallback `Arc<[T]>` references.
+/// zero-copy fan-out to the bus consumers).
 ///
 /// # Arguments
 /// * `nodes` - extracted node set (consumed)
@@ -1633,11 +1903,9 @@ impl crate::extract::Enricher for NoopEnricher {
 ///
 /// # Errors
 /// Returns `Err` if the bus does not produce a `PassesComplete` event.
-/// This is a pipeline invariant violation (`PostExtractionConsumer` always emits
+/// This is a pipeline invariant violation (`EnrichmentFinalizer` always emits
 /// `PassesComplete`), so `Err` here indicates a logic bug, not a transient error.
-/// Callers should propagate this as a hard failure so the pipeline can retry on
-/// the next scan rather than silently persisting an unenriched graph.
-pub fn run_post_passes_via_bus(
+pub fn emit_enrichment_pipeline(
     nodes: Vec<crate::graph::Node>,
     edges: Vec<crate::graph::Edge>,
     root_pairs: Vec<(String, PathBuf)>,
@@ -1651,9 +1919,6 @@ pub fn run_post_passes_via_bus(
     let nodes_arc: Arc<[crate::graph::Node]> = Arc::from(nodes.into_boxed_slice());
     let edges_arc: Arc<[crate::graph::Edge]> = Arc::from(edges.into_boxed_slice());
 
-    // Use repo_root for LSP server startup directory so LspConsumers have the
-    // correct working directory. The path is also passed as the RootExtracted
-    // event path so consumers that need it (e.g., tree-sitter-based consumers) work.
     let (mut bus, _stats) = build_builtin_bus(root_pairs, primary_slug.clone(), repo_root.clone(), opts);
     let events = bus.emit(ExtractionEvent::RootExtracted {
         slug: primary_slug,
@@ -1662,8 +1927,8 @@ pub fn run_post_passes_via_bus(
         edges: Arc::clone(&edges_arc),
     });
 
-    // Collect PassesComplete — produced by PostExtractionConsumer.
-    // PassesComplete is a pipeline invariant: PostExtractionConsumer always emits it.
+    // Collect PassesComplete — produced by EnrichmentFinalizer.
+    // PassesComplete is a pipeline invariant: EnrichmentFinalizer always emits it.
     // If it's absent, the bus was misconfigured or a consumer panicked — treat as error.
     let passes_complete = events.into_iter().find(|e| {
         matches!(e, ExtractionEvent::PassesComplete { .. })
@@ -1679,11 +1944,9 @@ pub fn run_post_passes_via_bus(
             Ok((nodes.to_vec(), edges.to_vec(), detected_frameworks))
         }
         _ => {
-            // This is a hard invariant violation — do NOT fall back to the unenriched
-            // graph. The caller must not persist/commit scan state with missing passes.
             anyhow::bail!(
-                "EventBus post-extraction: PassesComplete event absent — \
-                 this is a pipeline invariant violation (PostExtractionConsumer \
+                "EventBus enrichment pipeline: PassesComplete event absent — \
+                 this is a pipeline invariant violation (EnrichmentFinalizer \
                  must always emit PassesComplete). Failing hard to prevent \
                  persisting an unenriched graph."
             )
@@ -1701,14 +1964,6 @@ mod tests {
     use crate::extract::event_bus::{ExtractionEvent, ExtractionEventKind};
     use std::path::PathBuf;
     use tempfile::TempDir;
-
-    fn make_root_discovered(slug: &str, path: PathBuf) -> ExtractionEvent {
-        ExtractionEvent::RootDiscovered {
-            slug: slug.to_string(),
-            path,
-            lsp_only: false,
-        }
-    }
 
     /// Verify ManifestConsumer subscribes to RootDiscovered and emits nothing.
     #[test]
@@ -1874,7 +2129,7 @@ mod tests {
     /// Verify build_builtin_bus registers consumers for all expected event kinds.
     #[test]
     fn test_builtin_bus_has_consumers_for_all_event_kinds() {
-        let (mut bus, _stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
+        let (bus, _stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
         // Derive the exact expected count to catch regressions when languages are added/removed.
         let lsp_count = crate::extract::EnricherRegistry::with_builtins()
             .supported_languages()
@@ -1885,9 +2140,10 @@ mod tests {
             5 +        // RootExtracted: LanguageAccumulatorConsumer, AllEnrichmentsGate,
                        //   OpenApiConsumer, GrpcConsumer, EmbeddingIndexerConsumer
             lsp_count + // LanguageDetected: LspConsumer × N (real, Phase 3)
-            1 +        // AllEnrichmentsDone: PostExtractionConsumer (Phase 3 subscription)
-            4 +        // FrameworkDetected: FrameworkDetectionConsumer, NextjsRoutingConsumer,
-                       //   PubSubConsumer, WebSocketConsumer
+            3 +        // AllEnrichmentsDone: ApiLinkConsumer, TestedByConsumer,
+                       //   EnrichmentFinalizer
+            5 +        // FrameworkDetected: FrameworkDetectionConsumer, FastapiRouterPrefixConsumer,
+                       //   NextjsRoutingConsumer, PubSubConsumer, WebSocketConsumer
             2;         // PassesComplete: SubsystemConsumer, LanceDBConsumer
         assert_eq!(
             bus.len(), expected_total,
@@ -1915,12 +2171,10 @@ mod tests {
         );
     }
 
-    /// Verify PostExtractionConsumer emits PassesComplete on empty input.
-    /// Phase 3: now subscribes to AllEnrichmentsDone (not RootExtracted).
+    /// Verify EnrichmentFinalizer emits PassesComplete on empty input.
     #[test]
-    fn test_post_extraction_consumer_emits_passes_complete() {
-        let consumer = PostExtractionConsumer::new(vec![], "test".into());
-        // Must use AllEnrichmentsDone (Phase 3 subscription).
+    fn test_enrichment_finalizer_emits_passes_complete() {
+        let consumer = EnrichmentFinalizer::new(vec![], "test".into());
         let event = ExtractionEvent::AllEnrichmentsDone {
             slug: "test".into(),
             nodes: std::sync::Arc::from([]),
@@ -1932,8 +2186,72 @@ mod tests {
         let follow_ons = consumer.on_event(&event).unwrap();
         assert!(
             follow_ons.iter().any(|e| matches!(e, ExtractionEvent::PassesComplete { .. })),
-            "PostExtractionConsumer must always emit PassesComplete"
+            "EnrichmentFinalizer must always emit PassesComplete"
         );
+    }
+
+    /// Verify ApiLinkConsumer subscribes to AllEnrichmentsDone and is a no-op.
+    ///
+    /// `ApiLinkConsumer` is a subscription slot — the actual api_link_pass runs
+    /// inside `EnrichmentFinalizer`. This consumer emits no events.
+    #[test]
+    fn test_api_link_consumer_subscription() {
+        let consumer = ApiLinkConsumer;
+        assert!(consumer.subscribes_to().contains(&ExtractionEventKind::AllEnrichmentsDone));
+        let event = ExtractionEvent::AllEnrichmentsDone {
+            slug: "test".into(),
+            nodes: std::sync::Arc::from([]),
+            edges: std::sync::Arc::from([]),
+            lsp_edges: std::sync::Arc::from([]),
+            lsp_nodes: std::sync::Arc::from([]),
+            updated_nodes: std::sync::Arc::from([]),
+        };
+        let result = consumer.on_event(&event).unwrap();
+        assert!(result.is_empty(), "ApiLinkConsumer is a subscription slot — emits nothing");
+    }
+
+    /// Verify TestedByConsumer subscribes to AllEnrichmentsDone and is a no-op.
+    ///
+    /// `TestedByConsumer` is a subscription slot — the actual tested_by_pass runs
+    /// inside `EnrichmentFinalizer`. This consumer emits no events.
+    #[test]
+    fn test_tested_by_consumer_subscription() {
+        let consumer = TestedByConsumer;
+        assert!(consumer.subscribes_to().contains(&ExtractionEventKind::AllEnrichmentsDone));
+        let event = ExtractionEvent::AllEnrichmentsDone {
+            slug: "test".into(),
+            nodes: std::sync::Arc::from([]),
+            edges: std::sync::Arc::from([]),
+            lsp_edges: std::sync::Arc::from([]),
+            lsp_nodes: std::sync::Arc::from([]),
+            updated_nodes: std::sync::Arc::from([]),
+        };
+        let result = consumer.on_event(&event).unwrap();
+        assert!(result.is_empty(), "TestedByConsumer is a subscription slot — emits nothing");
+    }
+
+    /// Verify FastapiRouterPrefixConsumer fires only for fastapi framework.
+    #[test]
+    fn test_fastapi_router_prefix_consumer_fires_for_fastapi() {
+        let consumer = FastapiRouterPrefixConsumer;
+        // Matching framework
+        let matching = ExtractionEvent::FrameworkDetected {
+            slug: "test".into(),
+            framework: "fastapi".into(),
+            nodes: std::sync::Arc::from([]),
+        };
+        let result = consumer.on_event(&matching).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], ExtractionEvent::PassComplete { pass_name: "fastapi_router_prefix", .. }));
+
+        // Non-matching
+        let non_matching = ExtractionEvent::FrameworkDetected {
+            slug: "test".into(),
+            framework: "flask".into(),
+            nodes: std::sync::Arc::from([]),
+        };
+        let result = consumer.on_event(&non_matching).unwrap();
+        assert!(result.is_empty());
     }
 
     /// Adversarial: CustomExtractorConsumer fires only for its declared framework.
@@ -2048,7 +2366,7 @@ mod tests {
 
         // Must include PassesComplete
         let has_passes_complete = events.iter().any(|e| matches!(e, ExtractionEvent::PassesComplete { .. }));
-        assert!(has_passes_complete, "PostExtractionConsumer must produce PassesComplete");
+        assert!(has_passes_complete, "EnrichmentFinalizer must produce PassesComplete");
     }
 
     /// Verify LspConsumer fires only for its declared language.
@@ -2208,36 +2526,27 @@ mod tests {
         assert!(result.is_empty(), "EmbeddingIndexerConsumer stub emits nothing");
     }
 
-    // ── run_post_passes_via_bus tests ─────────────────────────────────────
+    // ── emit_enrichment_pipeline tests ─────────────────────────────────────
 
-    /// Verify run_post_passes_via_bus returns Ok(PassesComplete data) on empty input.
-    ///
-    /// This is the ADR Phase 2b integration test: ensures that emitting
-    /// RootExtracted to the bus always produces a PassesComplete event, even
-    /// when the input graph is empty.
+    /// Verify emit_enrichment_pipeline returns Ok(PassesComplete data) on empty input.
     #[test]
-    fn test_run_post_passes_via_bus_empty_input() {
-        let (nodes, edges, frameworks) = super::run_post_passes_via_bus(
+    fn test_emit_enrichment_pipeline_empty_input() {
+        let (nodes, edges, frameworks) = super::emit_enrichment_pipeline(
             vec![],
             vec![],
             vec![],
             "test".to_string(),
             PathBuf::from("."),
             super::BusOptions::default(),
-        ).expect("run_post_passes_via_bus must not fail on empty input");
+        ).expect("emit_enrichment_pipeline must not fail on empty input");
         assert!(nodes.is_empty(), "empty input → empty nodes");
         assert!(edges.is_empty(), "empty input → empty edges");
         assert!(frameworks.is_empty(), "empty input → no frameworks");
     }
 
-    /// Verify run_post_passes_via_bus routes nodes through PostExtractionConsumer.
-    ///
-    /// With a real temp directory and a Rust source file, the bus should:
-    /// 1. Accept RootExtracted with the pre-extracted nodes
-    /// 2. Route to PostExtractionConsumer which runs all passes
-    /// 3. Return PassesComplete with the enriched graph
+    /// Verify emit_enrichment_pipeline routes nodes through EnrichmentFinalizer.
     #[test]
-    fn test_run_post_passes_via_bus_preserves_input_nodes() {
+    fn test_emit_enrichment_pipeline_preserves_input_nodes() {
         use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
         use std::collections::BTreeMap;
 
@@ -2258,19 +2567,18 @@ mod tests {
         };
 
         let input_nodes = vec![node];
-        let (out_nodes, _out_edges, _frameworks) = super::run_post_passes_via_bus(
+        let (out_nodes, _out_edges, _frameworks) = super::emit_enrichment_pipeline(
             input_nodes,
             vec![],
             vec![],
             "test".to_string(),
             PathBuf::from("."),
             super::BusOptions::default(),
-        ).expect("run_post_passes_via_bus must not fail with valid input");
+        ).expect("emit_enrichment_pipeline must not fail with valid input");
 
-        // Output must contain the input node (passes should not drop it)
         assert!(
             out_nodes.iter().any(|n| n.id.name == "my_fn"),
-            "run_post_passes_via_bus must preserve input nodes through post-extraction passes"
+            "emit_enrichment_pipeline must preserve input nodes through enrichment passes"
         );
     }
 }

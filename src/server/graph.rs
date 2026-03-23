@@ -106,7 +106,7 @@ impl RnaHandler {
     /// When `spawn_background` is true (default for MCP server), embedding is
     /// spawned as a background task so the graph is queryable immediately.
     /// LSP enrichment now runs synchronously via `LspConsumer` in the event bus
-    /// (`run_post_passes_via_bus`), so it completes before this function returns.
+    /// (`emit_enrichment_pipeline`), so it completes before this function returns.
     /// When false (used by `run_pipeline_foreground`), no background tasks are
     /// spawned -- the caller handles embed itself.
     pub async fn build_full_graph(&self) -> anyhow::Result<GraphState> {
@@ -388,7 +388,7 @@ impl RnaHandler {
         let registry = ExtractorRegistry::with_builtins();
         let mut all_nodes: Vec<Node> = Vec::new();
         let mut all_edges: Vec<Edge> = Vec::new();
-        // Populated by PostExtractionConsumer via EventBus (step 4b-4j).
+        // Populated by EnrichmentFinalizer via EventBus (step 4b-4j).
         let all_detected_frameworks: std::collections::HashSet<String>;
 
         // Try loading cached graph for clean-root reuse.
@@ -586,12 +586,12 @@ impl RnaHandler {
 
         // 4b-4j. Post-extraction passes via EventBus (ADR Phase 3, issue #520).
         //
-        // `run_post_passes_via_bus` routes all_nodes/all_edges through the bus:
+        // `emit_enrichment_pipeline` routes all_nodes/all_edges through the bus:
         //   - LanguageAccumulatorConsumer → emits LanguageDetected per language
         //   - LspConsumer (real, Phase 3) → runs LSP enrichment per language via
         //     block_in_place → emits EnrichmentComplete with actual edges
         //   - AllEnrichmentsGate → waits for all EnrichmentComplete → emits AllEnrichmentsDone
-        //   - PostExtractionConsumer → runs all post-extraction passes on LSP-enriched graph
+        //   - EnrichmentFinalizer → runs all post-extraction passes on LSP-enriched graph
         //     → emits PassesComplete
         //
         // LSP enrichment now runs synchronously inside this bus call.
@@ -618,7 +618,7 @@ impl RnaHandler {
                 .collect();
             let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
             let (enriched_nodes, enriched_edges, detected_frameworks) =
-                crate::extract::consumers::run_post_passes_via_bus(
+                crate::extract::consumers::emit_enrichment_pipeline(
                     all_nodes,
                     all_edges,
                     root_pairs,
@@ -858,7 +858,7 @@ impl RnaHandler {
         // `repo-map` loading from LanceDB cache would miss LSP edges (#311).
         if spawn_background {
             // Phase 3 (issue #520): LSP enrichment now runs synchronously inside
-            // `run_post_passes_via_bus` (via `LspConsumer` + `AllEnrichmentsGate`).
+            // `emit_enrichment_pipeline` (via `LspConsumer` + `AllEnrichmentsGate`).
             // The graph already contains LSP edges at this point, so we can write
             // both sentinels in one persist rather than clearing+rewriting.
             // We no longer need to clear the LSP sentinel here since LSP ran before persist.
@@ -974,14 +974,13 @@ impl RnaHandler {
     /// When `pending_scan` is `None`, this method creates its own scanner and
     /// commits state only after the graph update succeeds.
     ///
-    /// When `spawn_lsp` is true (default for MCP server), LSP enrichment for
-    /// changed nodes is spawned as a background task. When false (CLI `--full`
-    /// incremental path), no LSP is spawned -- the caller handles it.
+    /// LSP enrichment runs synchronously inside `emit_enrichment_pipeline` via `LspConsumer`.
+    /// The `_spawn_lsp` parameter is kept for API compatibility but is no longer acted on.
     pub(crate) async fn update_graph_with_scan(
         &self,
         graph: &mut GraphState,
         pending_scan: Option<ScanResult>,
-        spawn_lsp: bool,
+        _spawn_lsp: bool,
     ) -> anyhow::Result<()> {
         // If no pre-computed scan, create a fresh scanner. We hold it so we
         // can commit state after successful processing.
@@ -1138,7 +1137,7 @@ impl RnaHandler {
             .collect();
         {
             let (enriched_nodes, enriched_edges, detected_frameworks) =
-                crate::extract::consumers::run_post_passes_via_bus(
+                crate::extract::consumers::emit_enrichment_pipeline(
                     std::mem::take(&mut graph.nodes),
                     std::mem::take(&mut graph.edges),
                     root_pairs_incremental,
@@ -1207,13 +1206,10 @@ impl RnaHandler {
                 .ensure_node(&node.stable_id(), &node.id.kind.to_string());
         }
 
-        // LSP enrichment is now handled synchronously by `LspConsumer` inside
-        // `run_post_passes_via_bus` (called above, Phase 3 / issue #520).
-        // `spawn_incremental_lsp_enrichment` is NOT called here to avoid double-enrichment:
-        // the bus already ran every LspConsumer for all supported languages before this point.
-        // The `spawn_lsp` flag is retained for future use but currently has no effect on the
-        // incremental path — remove this comment when the flag is fully removed (#537).
-        let _ = spawn_lsp; // suppress unused-variable warning
+        // LSP enrichment is handled synchronously by `LspConsumer` inside
+        // `emit_enrichment_pipeline` (called above). `spawn_incremental_lsp_enrichment`
+        // is NOT called here: the bus already ran every LspConsumer for all supported
+        // languages before this point. `_spawn_lsp` is retained for API compatibility.
 
         // `changed_files` is still needed below for targeted re-embedding.
         let changed_files: std::collections::HashSet<_> = scan
@@ -1294,7 +1290,7 @@ impl RnaHandler {
             // Emit first-class subsystem nodes + BelongsTo edges.
             // Stale nodes were already removed in the pre-clean step above.
             // Note: subsystem_node_pass runs here (after community detection + PageRank)
-            // rather than inside the PostExtractionRegistry, because it depends on
+            // rather than inside EnrichmentFinalizer, because it depends on
             // subsystem community results that are only available at this point.
             let sub_result = subsystem_node_pass(&subsystems, &graph.nodes, &primary_slug);
             if !sub_result.nodes.is_empty() {

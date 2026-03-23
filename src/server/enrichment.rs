@@ -280,11 +280,11 @@ impl RnaHandler {
                         let primary_slug =
                             RootConfig::code_project(repo_root.clone()).slug();
 
-                        // Pipeline invariant: PostExtractionConsumer always emits PassesComplete.
+                        // Pipeline invariant: EnrichmentFinalizer always emits PassesComplete.
                         // If it doesn't (a logic bug), log the error and clear lance_deltas so
                         // the empty graph is not persisted. The graph remains empty until the
                         // next full rebuild (next startup or manual `scan --full`).
-                        match crate::extract::consumers::run_post_passes_via_bus(
+                        match crate::extract::consumers::emit_enrichment_pipeline(
                             std::mem::take(&mut graph_state.nodes),
                             std::mem::take(&mut graph_state.edges),
                             root_pairs,
@@ -468,7 +468,7 @@ impl RnaHandler {
     /// Spawn background embedding after a full graph build.
     ///
     /// **Phase 3**: LSP enrichment has been moved into `LspConsumer` within the event bus
-    /// (via `run_post_passes_via_bus`). This function now handles only the embedding pipeline.
+    /// (via `emit_enrichment_pipeline`). This function now handles only the embedding pipeline.
     ///
     /// The graph is queryable NOW -- embedding improves semantic search quality progressively.
     pub(crate) fn spawn_background_enrichment(&self, all_nodes: &[Node]) {
@@ -732,7 +732,7 @@ impl RnaHandler {
     /// Spawn incremental LSP enrichment for changed nodes after an incremental update.
     ///
     /// Not called from the synchronous bus path (Phase 3+, issue #520) because
-    /// `run_post_passes_via_bus` already runs LspConsumers synchronously.
+    /// `emit_enrichment_pipeline` already runs LspConsumers synchronously.
     /// Retained for future use (e.g., explicit CLI trigger or Phase 4 async path).
     #[allow(dead_code)]
     pub(crate) fn spawn_incremental_lsp_enrichment(
