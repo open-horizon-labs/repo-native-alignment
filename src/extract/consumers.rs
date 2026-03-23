@@ -147,6 +147,13 @@ impl ExtractionConsumer for TreeSitterConsumer {
             edges: std::sync::Arc::from(extraction.edges.into_boxed_slice()),
         }])
     }
+
+    /// `TreeSitterConsumer` reads the filesystem — its output depends on file contents
+    /// beyond the event payload. The bus must not cache its output; every scan must
+    /// trigger a fresh read so file edits are detected.
+    fn is_cacheable(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +284,12 @@ impl ExtractionConsumer for PostExtractionConsumer {
 
         // Delegate to the inner pass logic with merged nodes/edges.
         self.run_passes(slug, merged_nodes, merged_edges)
+    }
+
+    /// `PostExtractionConsumer` runs filesystem-reading passes (api_link, manifest, etc.).
+    /// Its output depends on file contents beyond the event payload. Non-cacheable.
+    fn is_cacheable(&self) -> bool {
+        false
     }
 }
 
@@ -632,7 +645,19 @@ impl CustomExtractorConsumer {
     /// If the file cannot be read, `config_bytes` is set to an empty `Vec` which
     /// produces a stable but generic version (`0` for the first 8 bytes of blake3(b"")`).
     pub fn from_file(framework: String, config_name: String, config_path: &std::path::Path) -> Self {
-        let config_bytes = std::fs::read(config_path).unwrap_or_default();
+        let config_bytes = match std::fs::read(config_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(
+                    "CustomExtractorConsumer '{}': could not read config file '{}': {} — \
+                     using empty config_bytes (version will be blake3(b\"\"))",
+                    config_name,
+                    config_path.display(),
+                    e,
+                );
+                Vec::new()
+            }
+        };
         Self { framework, config_name, config_bytes }
     }
 }
@@ -830,6 +855,13 @@ impl ExtractionConsumer for LspConsumer {
                 }])
             }
         }
+    }
+
+    /// `LspConsumer` runs an external LSP server process — its output depends on
+    /// runtime LSP server state beyond the event payload. The bus must not cache
+    /// its output; every enrichment must run fresh.
+    fn is_cacheable(&self) -> bool {
+        false
     }
 }
 
@@ -1052,6 +1084,13 @@ impl ExtractionConsumer for AllEnrichmentsGate {
             _ => Ok(vec![]),
         }
     }
+
+    /// `AllEnrichmentsGate` is stateful — it accumulates `EnrichmentComplete` events
+    /// across multiple `on_event` calls before emitting `AllEnrichmentsDone`.
+    /// The bus must not cache its output; every call must reach it.
+    fn is_cacheable(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,6 +1197,12 @@ impl ExtractionConsumer for EmbeddingIndexerConsumer {
 
         Ok(vec![])
     }
+
+    /// `EmbeddingIndexerConsumer` triggers external side-effects (spawns async embed tasks).
+    /// It must not be cached — the embed task must fire on every `RootExtracted` event.
+    fn is_cacheable(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,6 +1302,12 @@ impl ExtractionConsumer for LanceDBConsumer {
         }
 
         Ok(vec![])
+    }
+
+    /// `LanceDBConsumer` triggers external side-effects (spawns async LanceDB persist tasks).
+    /// It must not be cached — persistence must happen on every `PassesComplete` event.
+    fn is_cacheable(&self) -> bool {
+        false
     }
 }
 
@@ -1603,7 +1654,7 @@ pub fn run_post_passes_via_bus(
     // Use repo_root for LSP server startup directory so LspConsumers have the
     // correct working directory. The path is also passed as the RootExtracted
     // event path so consumers that need it (e.g., tree-sitter-based consumers) work.
-    let (bus, _stats) = build_builtin_bus(root_pairs, primary_slug.clone(), repo_root.clone(), opts);
+    let (mut bus, _stats) = build_builtin_bus(root_pairs, primary_slug.clone(), repo_root.clone(), opts);
     let events = bus.emit(ExtractionEvent::RootExtracted {
         slug: primary_slug,
         path: repo_root,
@@ -1823,7 +1874,7 @@ mod tests {
     /// Verify build_builtin_bus registers consumers for all expected event kinds.
     #[test]
     fn test_builtin_bus_has_consumers_for_all_event_kinds() {
-        let (bus, _stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
+        let (mut bus, _stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
         // Derive the exact expected count to catch regressions when languages are added/removed.
         let lsp_count = crate::extract::EnricherRegistry::with_builtins()
             .supported_languages()
@@ -1848,7 +1899,7 @@ mod tests {
     /// Verify build_builtin_bus returns a stats handle that shares state with the bus.
     #[test]
     fn test_builtin_bus_returns_scan_stats_handle() {
-        let (bus, stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
+        let (mut bus, stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
         // No activity yet
         assert!(!stats.read().unwrap().has_activity());
 
@@ -1979,7 +2030,7 @@ mod tests {
         // Need scan state dir
         std::fs::create_dir_all(tmp.path().join(".oh").join(".cache")).unwrap();
 
-        let (bus, _stats) = build_builtin_bus(
+        let (mut bus, _stats) = build_builtin_bus(
             vec![("test".to_string(), tmp.path().to_path_buf())],
             "test".to_string(),
             tmp.path().to_path_buf(),

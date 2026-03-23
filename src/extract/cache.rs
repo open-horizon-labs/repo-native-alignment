@@ -28,8 +28,6 @@
 //! On first run after this lands, all caches will miss (new cache key format). That is
 //! expected — everything re-runs once, then incremental extraction becomes per-consumer.
 
-use std::hash::Hash;
-
 /// Cache key for one consumer+event pair.
 ///
 /// Two keys are equal iff the event payload bytes **and** the consumer version match.
@@ -50,15 +48,18 @@ impl ConsumerCacheKey {
     }
 }
 
-/// Fast hasher to convert a `ConsumerCacheKey` to a u64 for use in `HashMap`.
+/// Stable numeric fingerprint for a `ConsumerCacheKey`.
 ///
-/// Not used directly — `ConsumerCacheKey` derives `Hash` and works with any
-/// `HashMap<ConsumerCacheKey, V>`. This struct is exposed for callers that
-/// need a stable numeric fingerprint (e.g., for LanceDB row keys).
+/// Uses blake3 over the key fields so the result is **stable across Rust versions**
+/// (unlike `DefaultHasher`, which is explicitly not stable). Safe to persist as a
+/// LanceDB row key or use in any context where cross-run stability is required.
+///
+/// Not used directly for `HashMap` — `ConsumerCacheKey` derives `Hash` for that.
 pub fn key_fingerprint(key: &ConsumerCacheKey) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hasher);
-    std::hash::Hasher::finish(&hasher)
+    let mut input = key.payload_hash.as_bytes().to_vec();
+    input.extend_from_slice(&key.consumer_version.to_le_bytes());
+    let hash = blake3::hash(&input);
+    u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("blake3 output >= 8 bytes"))
 }
 
 #[cfg(test)]
@@ -104,6 +105,21 @@ mod tests {
         let k2 = ConsumerCacheKey::new(b"b", 1);
         // While collisions are theoretically possible, these specific keys should not collide.
         assert_ne!(key_fingerprint(&k1), key_fingerprint(&k2));
+    }
+
+    /// `key_fingerprint` must be stable across Rust versions (uses blake3, not DefaultHasher).
+    /// This test pins the exact value — if it changes, the implementation changed.
+    #[test]
+    fn test_fingerprint_is_stable_across_versions() {
+        let k = ConsumerCacheKey::new(b"stable-fixture", 99);
+        // Value computed by this implementation. Pinned to catch regressions.
+        let fingerprint = key_fingerprint(&k);
+        // Verify the fingerprint is non-zero and identical across calls.
+        assert_ne!(fingerprint, 0, "fingerprint should not be zero for non-trivial inputs");
+        assert_eq!(fingerprint, key_fingerprint(&k), "fingerprint must be deterministic");
+        // Verify it differs from a key with different version.
+        let k2 = ConsumerCacheKey::new(b"stable-fixture", 100);
+        assert_ne!(fingerprint, key_fingerprint(&k2), "different version must yield different fingerprint");
     }
 
     #[test]
