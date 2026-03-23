@@ -4,6 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>RNA Graph Viewer</title>
+<!--
+  NOTE (v0 spike): Cytoscape.js is loaded from CDN. This requires network access
+  the first time. For fully offline operation a future iteration should inline or
+  serve the asset from the Axum binary.
+-->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -40,10 +45,14 @@
   .legend { display: flex; gap: 14px; align-items: center; font-size: 11px; color: #6b7499; }
   .legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 4px; }
   .loading { color: #6b7499; font-style: italic; padding: 20px 0; text-align: center; }
-  #search-input-container { position: relative; }
+  #offline-warning { display: none; background: #3d1a1a; color: #e85b5b; padding: 8px 16px;
+                     font-size: 12px; border-bottom: 1px solid #5b2020; }
 </style>
 </head>
 <body>
+<div id="offline-warning">
+  Cytoscape.js could not be loaded from CDN. Check your network connection or open the browser while connected once to cache the library.
+</div>
 <div id="header">
   <h1>RNA Graph Viewer</h1>
   <span class="repo-label" id="repo-label">Loading...</span>
@@ -78,14 +87,32 @@
 <div id="status">Initializing...</div>
 
 <script>
+// ── Guard: show warning if Cytoscape failed to load from CDN ─────────────────
+
+if (typeof cytoscape === 'undefined') {
+  document.getElementById('offline-warning').style.display = 'block';
+  document.getElementById('status').textContent = 'Error: Cytoscape.js not loaded. Check network.';
+  throw new Error('Cytoscape.js not available');
+}
+
 const MCP_URL = '/mcp';
 
-async function callTool(tool, params = {}) {
-  const r = await fetch(MCP_URL, {
+// ── Active request tracker — cancel stale requests ───────────────────────────
+// Each logical "operation" gets a token. When a new operation starts, the old
+// token is invalidated so its response is ignored even if it arrives later.
+
+let activeRepoMapController = null;
+let activeNodeController = null;
+let activeSearchController = null;
+
+async function callTool(tool, params = {}, signal = null) {
+  const opts = {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ tool, params }),
-  });
+  };
+  if (signal) opts.signal = signal;
+  const r = await fetch(MCP_URL, opts);
   if (!r.ok) {
     const e = await r.json().catch(() => ({ error: r.statusText }));
     throw new Error(e.error || r.statusText);
@@ -249,9 +276,14 @@ function runLayout(name) {
 // ── Load initial repo map ────────────────────────────────────────────────────
 
 async function loadRepoMap() {
+  // Cancel any in-flight repo map request
+  if (activeRepoMapController) activeRepoMapController.abort();
+  activeRepoMapController = new AbortController();
+  const { signal } = activeRepoMapController;
+
   setStatus('Fetching repository map...');
   try {
-    const text = await callTool('repo_map', { top_n: 20 });
+    const text = await callTool('repo_map', { top_n: 20 }, signal);
     setSidebarContent('Repository Map', '<pre>' + escapeHtml(text) + '</pre>');
 
     // Extract repo label from first line
@@ -273,20 +305,29 @@ async function loadRepoMap() {
     runLayout(document.getElementById('layout-select').value);
     setStatus(`Loaded ${nodes.length} nodes, ${edges.length} edges from repo_map.`);
   } catch (e) {
+    if (e.name === 'AbortError') return; // superseded by a newer request
     setStatus('Error: ' + e.message);
     setSidebarContent('Error', '<pre>' + escapeHtml(e.message) + '</pre>');
   }
 }
 
 function reloadRepoMap() { cy.elements().remove(); loadRepoMap(); }
-function resetView() { cy.fit(); cy.zoom({ level: 1 }); }
+
+function resetView() {
+  // cy.fit() adjusts both pan and zoom to fit all elements; don't override zoom afterward.
+  cy.fit();
+}
 
 // ── Node click: show neighbors ───────────────────────────────────────────────
 
 cy.on('tap', 'node', async function(evt) {
   const node = evt.target;
   const id = node.data('id');
-  const kind = node.data('kind');
+
+  // Cancel any in-flight neighbor request
+  if (activeNodeController) activeNodeController.abort();
+  activeNodeController = new AbortController();
+  const { signal } = activeNodeController;
 
   // Highlight tapped node and dim others
   cy.elements().addClass('dimmed').removeClass('highlighted');
@@ -294,12 +335,10 @@ cy.on('tap', 'node', async function(evt) {
   node.connectedEdges().removeClass('dimmed').addClass('highlighted');
   node.connectedEdges().connectedNodes().removeClass('dimmed').addClass('highlighted');
 
-  setSidebarTitle('Node: ' + node.data('label'));
   setSidebarContent('Node: ' + node.data('label'), '<p class="loading">Loading neighbors...</p>');
   setStatus('Fetching neighbors for: ' + id);
 
   try {
-    // Try search with node ID (graph neighbor traversal)
     const text = await callTool('search', {
       node: id,
       mode: 'neighbors',
@@ -307,14 +346,13 @@ cy.on('tap', 'node', async function(evt) {
       depth: 1,
       limit: 30,
       compact: true,
-    });
+    }, signal);
 
     setSidebarContent('Neighbors: ' + node.data('label'), '<pre>' + escapeHtml(text) + '</pre>');
-
-    // Add any new nodes/edges from the neighbor result
     expandNeighborsIntoGraph(id, text);
     setStatus('Showing neighbors of: ' + node.data('label'));
   } catch (e) {
+    if (e.name === 'AbortError') return;
     setSidebarContent('Error', '<pre>' + escapeHtml(e.message) + '</pre>');
     setStatus('Error fetching neighbors: ' + e.message);
   }
@@ -322,7 +360,6 @@ cy.on('tap', 'node', async function(evt) {
 
 cy.on('tap', function(evt) {
   if (evt.target === cy) {
-    // Tapped background — clear highlights
     cy.elements().removeClass('dimmed').removeClass('highlighted');
     setStatus('');
   }
@@ -331,19 +368,24 @@ cy.on('tap', function(evt) {
 // ── Parse neighbor search results and add new nodes to the graph ─────────────
 
 function expandNeighborsIntoGraph(parentId, text) {
-  // Each search result line looks like:
-  //   - **name** `file:line` kind [tags] edges:N
-  //   or just sections of markdown
-  // We do a simple regex to extract node IDs from the result
   const lines = text.split('\n');
   const newNodes = [];
+  // Collect all edges regardless of whether the target node is new or existing.
   const newEdges = [];
 
   for (const line of lines) {
-    // Match result node lines: typically "- **name** `path:line`" or stable IDs
     const m = line.match(/`([^`]+:[^`]+:[^`]+)`/); // stable_id pattern: root:file:name:kind
     if (m) {
       const stableId = m[1];
+      if (stableId === parentId) continue; // skip self-edges
+
+      const edgeId = parentId + '->' + stableId;
+      // Add an edge to this neighbor even if the node already existed in the graph.
+      if (!cy.getElementById(edgeId).length) {
+        newEdges.push({ data: { id: edgeId, source: parentId, target: stableId } });
+      }
+
+      // Only add the node element if it doesn't exist yet.
       if (!cy.getElementById(stableId).length) {
         const parts = stableId.split(':');
         const kind = parts.length >= 4 ? parts[parts.length - 1] : 'unknown';
@@ -358,12 +400,11 @@ function expandNeighborsIntoGraph(parentId, text) {
             color: nodeColor(kind, root),
           }
         });
-        newEdges.push({ data: { id: parentId + '->' + stableId, source: parentId, target: stableId } });
       }
     }
   }
 
-  if (newNodes.length > 0) {
+  if (newNodes.length > 0 || newEdges.length > 0) {
     cy.add([...newNodes, ...newEdges]);
     runLayout(document.getElementById('layout-select').value);
   }
@@ -376,14 +417,20 @@ document.getElementById('search-input').addEventListener('keydown', async (e) =>
   const q = e.target.value.trim();
   if (!q) return;
 
+  // Cancel any in-flight search request
+  if (activeSearchController) activeSearchController.abort();
+  activeSearchController = new AbortController();
+  const { signal } = activeSearchController;
+
   setStatus('Searching: ' + q);
   setSidebarContent('Search: ' + q, '<p class="loading">Searching...</p>');
 
   try {
-    const text = await callTool('search', { query: q, limit: 20, compact: true });
+    const text = await callTool('search', { query: q, limit: 20, compact: true }, signal);
     setSidebarContent('Search: ' + q, '<pre>' + escapeHtml(text) + '</pre>');
     setStatus('Search complete.');
   } catch (err) {
+    if (err.name === 'AbortError') return;
     setSidebarContent('Search error', '<pre>' + escapeHtml(err.message) + '</pre>');
     setStatus('Search error: ' + err.message);
   }
@@ -404,6 +451,9 @@ function toggleSidebar() {
   const sb = document.getElementById('sidebar');
   sidebarVisible = !sidebarVisible;
   sb.style.display = sidebarVisible ? 'flex' : 'none';
+  // Notify Cytoscape that container dimensions changed so it re-renders correctly.
+  cy.resize();
+  cy.fit();
 }
 
 function escapeHtml(s) {
