@@ -15,6 +15,7 @@ pub mod directory_module;
 pub mod event_bus;
 pub mod scan_stats;
 pub mod openapi_sdk_link;
+pub mod sdk_path_inference;
 pub mod extractor_config;
 pub mod framework_detection;
 pub mod grpc;

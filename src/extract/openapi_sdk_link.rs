@@ -91,6 +91,12 @@ fn is_generated_sdk_file(path: &std::path::Path) -> bool {
         || file_name.starts_with("api_client.")
 }
 
+/// Public re-export of [`is_generated_sdk_file`] for use by
+/// `sdk_path_inference_pass` in the sibling module.
+pub fn is_generated_sdk_file_pub(path: &std::path::Path) -> bool {
+    is_generated_sdk_file(path)
+}
+
 // ---------------------------------------------------------------------------
 // Pass
 // ---------------------------------------------------------------------------
