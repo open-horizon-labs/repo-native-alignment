@@ -16,7 +16,7 @@
 //! 5. `AllEnrichmentsGate` — subscribes to both `RootExtracted` (to count expected languages)
 //!    and `EnrichmentComplete` (to count completions); when counts match emits `AllEnrichmentsDone`
 //! 6. `ApiLinkConsumer`, `TestedByConsumer` — `AllEnrichmentsDone` → `PassComplete` (monitoring)
-//! 6b. `EnrichmentFinalizer` — `AllEnrichmentsDone` → `PassesComplete` + `FrameworkDetected`
+//!    `EnrichmentFinalizer` — `AllEnrichmentsDone` → `PassesComplete` + `FrameworkDetected`
 //! 7. `EmbeddingIndexerConsumer` — subscribes to `RootExtracted` (streaming embed as nodes arrive)
 //!
 //! The persistence consumers (`SubsystemConsumer`, `LanceDBConsumer`) subscribe to `PassesComplete`.
