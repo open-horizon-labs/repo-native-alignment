@@ -477,49 +477,75 @@ impl LspEnricher {
         // to build their project index. Without this wait, all reference
         // lookups return "file not found."
         //
-        // We drain notifications looking for progress/done signals.
-        // Timeout after 120 seconds to allow large workspaces to finish indexing.
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(120);
+        // Strategy (adaptive, no fixed timeout):
+        //
+        // 1. If the server sends `experimental/serverStatus`, wait indefinitely
+        //    for `quiescent=true`. This is the correct signal — pyright on a 22k-node
+        //    repo may need minutes. The old 30s hard timeout fired before pyright
+        //    finished, producing 193 errors and 0 call edges.
+        //
+        // 2. If `serverStatus` never arrives (e.g. typescript-language-server),
+        //    probe every 5s with a lightweight `workspace/symbol` request until the
+        //    server responds successfully, indicating it is ready for queries.
+        //
+        // 3. A 10-minute circuit breaker applies in both cases — not a normal
+        //    timeout, just a safety net for servers that never become ready.
+        //
+        // Progress is logged every 30s so long-running indexing is observable.
+        let circuit_breaker = tokio::time::Instant::now() + tokio::time::Duration::from_secs(600);
         let transport = state.transport.as_mut().unwrap();
-        // Wait for the server to be ready.
-        //
-        // rust-analyzer uses `experimental/serverStatus` with:
-        //   health: "ok" | "warning" | "error"
-        //   quiescent: bool (true = fully ready, no pending background work)
-        //
-        // Other LSP servers may not send this — for those, we fall back
-        // to a timeout after `$/progress` tokens complete.
         let mut server_ready = false;
         // Track whether we've seen any serverStatus notification.
-        // If the server supports serverStatus, we should keep waiting for
-        // quiescent=true rather than bailing on a per-message timeout.
+        // When true, we wait indefinitely for quiescent rather than probing.
         let mut seen_server_status = false;
         // Track the raw `quiescent` bit independently of `health`.
         // We only care about "done indexing" for the Pass 3 guard; health="warning"
         // (compile errors) does not mean RA is still indexing.
         let mut saw_quiescent = false;
+        let start = tokio::time::Instant::now();
+        let mut last_progress_log = tokio::time::Instant::now();
+        // For the probe path: track the next time we should send a probe.
+        let mut next_probe = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        // Track consecutive probe successes — require 2 in a row to confirm readiness.
+        let mut probe_success_count: u32 = 0;
 
-        while tokio::time::Instant::now() < deadline {
-            // Use a short timeout only when we haven't seen serverStatus yet.
-            // Once we know the server supports serverStatus, wait up to the
-            // full deadline for the quiescent signal.
+        while tokio::time::Instant::now() < circuit_breaker {
+            let elapsed = start.elapsed().as_secs();
+
+            // Log progress every 30s so long-running indexing is visible.
+            if last_progress_log.elapsed() >= tokio::time::Duration::from_secs(30) {
+                tracing::info!(
+                    "LSP: waiting for {} to finish indexing ({}s elapsed, seen_serverStatus={})...",
+                    self.server_command, elapsed, seen_server_status
+                );
+                last_progress_log = tokio::time::Instant::now();
+            }
+
+            // When the server uses serverStatus, wait up to 60s for the next
+            // notification — the server WILL send it eventually.
+            // When the server does not use serverStatus, use a short poll interval
+            // (until next_probe) so we can interleave probe requests with draining
+            // notifications.
+            //
+            // Cap by remaining time to the next 30s progress log and by the circuit
+            // breaker, so progress logs fire accurately and the breaker is not late.
+            let now = tokio::time::Instant::now();
+            let until_next_log = tokio::time::Duration::from_secs(30)
+                .checked_sub(last_progress_log.elapsed())
+                .unwrap_or_default();
+            let until_breaker = circuit_breaker
+                .checked_duration_since(now)
+                .unwrap_or_default();
             let msg_timeout = if seen_server_status {
-                // Wait up to remaining time in the deadline
-                let remaining = deadline.duration_since(tokio::time::Instant::now());
-                remaining.min(tokio::time::Duration::from_secs(60))
+                tokio::time::Duration::from_secs(60)
             } else {
-                // Servers that don't send serverStatus (e.g. typescript-language-server)
-                // may still be indexing the project. Wait up to 30s of silence before
-                // assuming ready — tsserver needs time to load a large project.
-                tokio::time::Duration::from_secs(30)
-            };
+                let remaining_to_probe = next_probe.saturating_duration_since(now);
+                remaining_to_probe.min(tokio::time::Duration::from_secs(5))
+            }
+            .min(until_next_log)
+            .min(until_breaker);
 
-            match tokio::time::timeout(
-                msg_timeout,
-                transport.read_message(),
-            )
-            .await
-            {
+            match tokio::time::timeout(msg_timeout, transport.read_message()).await {
                 Ok(Ok(msg)) => {
                     if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
                         match method {
@@ -551,7 +577,7 @@ impl LspEnricher {
                                     );
                                     break;
                                 }
-                                tracing::info!("{} not yet ready, continuing to wait for indexing...", self.server_command);
+                                tracing::debug!("{} not yet ready, continuing to wait for indexing...", self.server_command);
                             }
                             // Respond to progress create requests (required by protocol)
                             "window/workDoneProgress/create" => {
@@ -580,25 +606,89 @@ impl LspEnricher {
                     tracing::debug!("Error reading LSP message during init: {}", e);
                     break;
                 }
-                Err(_) => {
+                Err(_timeout) => {
                     if seen_server_status {
-                        // We know the server supports serverStatus but hit the deadline
-                        // without quiescent=true. Proceed anyway.
-                        tracing::warn!(
-                            "{} waited for quiescent but deadline reached, proceeding",
-                            self.server_command
-                        );
-                    } else {
-                        // No serverStatus received — server may not support it
-                        tracing::info!("{} no serverStatus after 30s, assuming ready", self.server_command);
+                        // We saw serverStatus but are waiting for the next update.
+                        // This is a normal 60s quiet period — keep waiting.
+                        tracing::debug!("{} waiting for next serverStatus...", self.server_command);
+                        continue;
                     }
-                    break;
+
+                    // No serverStatus — use the probe strategy.
+                    // Send a lightweight workspace/symbol request to test responsiveness.
+                    // An empty query returns quickly and is safe on all LSP servers.
+                    if tokio::time::Instant::now() >= next_probe {
+                        // Schedule next probe from probe start so cadence is ~5s regardless
+                        // of whether the probe request itself times out or succeeds quickly.
+                        next_probe = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+
+                        let probe_result = tokio::time::timeout(
+                            tokio::time::Duration::from_secs(5),
+                            transport.request("workspace/symbol", serde_json::json!({ "query": "" })),
+                        ).await;
+
+                        match probe_result {
+                            Ok(Ok(_)) => {
+                                probe_success_count += 1;
+                                if probe_success_count >= 2 {
+                                    // Two consecutive successful probes — server is responsive.
+                                    tracing::info!(
+                                        "{} ready (probe succeeded after {}s, no serverStatus)",
+                                        self.server_command, elapsed
+                                    );
+                                    server_ready = true;
+                                    // Servers without serverStatus are treated as quiescent.
+                                    saw_quiescent = true;
+                                    break;
+                                }
+                                tracing::debug!(
+                                    "{} probe {}/2 succeeded ({}s elapsed), waiting for second confirmation...",
+                                    self.server_command, probe_success_count, elapsed
+                                );
+                            }
+                            Ok(Err(e)) => {
+                                // Server responded with an error — it may not support workspace/symbol.
+                                // Treat an explicit error response as "server is alive and responsive".
+                                tracing::debug!(
+                                    "{} probe returned error (server responsive): {}",
+                                    self.server_command, e
+                                );
+                                probe_success_count += 1;
+                                if probe_success_count >= 2 {
+                                    tracing::info!(
+                                        "{} ready (probe error-response after {}s — server responsive, no serverStatus)",
+                                        self.server_command, elapsed
+                                    );
+                                    server_ready = true;
+                                    saw_quiescent = true;
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                // Probe timed out — server still indexing.
+                                probe_success_count = 0;
+                                tracing::debug!(
+                                    "{} probe timed out ({}s elapsed), server still indexing...",
+                                    self.server_command, elapsed
+                                );
+                            }
+                        }
+
+                    }
                 }
             }
         }
 
-        if !server_ready {
-            tracing::info!("{} readiness wait complete (server_ready=false, seen_status={}), proceeding", self.server_command, seen_server_status);
+        if tokio::time::Instant::now() >= circuit_breaker {
+            tracing::warn!(
+                "{} circuit breaker fired after 10 minutes — proceeding anyway (server may not be fully indexed)",
+                self.server_command
+            );
+        } else if !server_ready {
+            tracing::info!(
+                "{} readiness wait complete (server_ready=false, seen_serverStatus={}), proceeding",
+                self.server_command, seen_server_status
+            );
         }
 
         // Record whether the server became quiescent. Pass 3 (diagnostics) is
@@ -612,12 +702,13 @@ impl LspEnricher {
         // done indexing, it just has errors. Pass 3 is safe in that case.
         //
         // The guard only applies when the server supports `experimental/serverStatus`
-        // (`seen_server_status = true`) but never sent quiescent=true before the
-        // deadline. Servers that do NOT support serverStatus (pyright, marksman, etc.)
-        // never set `seen_server_status`, so we treat them as quiescent (they're
-        // assumed ready after the 5s fallback timeout and won't flood RA's queue).
-        state.was_quiescent = saw_quiescent || !seen_server_status;
-        if seen_server_status && !saw_quiescent {
+        // (`seen_server_status = true`) but never sent quiescent=true. Servers
+        // that do NOT support serverStatus use the probe path: they are quiescent
+        // only when `server_ready=true` (probe succeeded). This ensures a server
+        // that never responded to any probe (circuit breaker path) is NOT treated
+        // as quiescent — Pass 3 would flood it with diagnostic requests.
+        state.was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
+        if !state.was_quiescent {
             tracing::warn!(
                 "{} did not reach quiescent state — Pass 3 (diagnostics) will be skipped this session",
                 self.server_command
