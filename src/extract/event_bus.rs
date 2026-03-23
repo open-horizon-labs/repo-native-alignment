@@ -486,9 +486,12 @@ pub trait ExtractionConsumer: Send + Sync {
 ///
 /// # In-memory content-addressed cache
 ///
-/// `EventBus` holds an in-memory `HashMap<ConsumerCacheKey, Vec<ExtractionEvent>>`.
+/// `EventBus` holds an in-memory `HashMap<(consumer_name, ConsumerCacheKey), Vec<ExtractionEvent>>`.
 /// Before dispatching `consumer.on_event(event)`, the bus computes
-/// `key = ConsumerCacheKey::new(&event.canonical_bytes(), consumer.version())`.
+/// `key = (consumer.name(), ConsumerCacheKey::new(&event.canonical_bytes(), consumer.version()))`.
+///
+/// The consumer name is included in the outer key so two consumers with the same `version()`
+/// processing the same event do not share a cache entry.
 ///
 /// - **Cache hit**: the consumer's previous follow-on events are replayed directly
 ///   into the work queue. The consumer's `on_event` is **not** called.
