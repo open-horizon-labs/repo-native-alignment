@@ -563,4 +563,69 @@ mod tests {
     fn test_sdk_gen_ts_recognized() {
         assert!(is_generated_sdk_file_pub(&PathBuf::from("src/api/sdk.gen.ts")));
     }
+
+    // --- adversarial edge cases (dissent-seeded) ---
+
+    /// Trailing slash in SDK path does NOT match endpoint without trailing slash.
+    /// This is the "trailing slash mismatch" failure scenario from the dissent.
+    /// If the SDK stores `/workspaces/{id}/expertunities/` but the endpoint has
+    /// `/expertunities`, `ends_with` returns false and no update is made.
+    #[test]
+    fn test_trailing_slash_mismatch_no_match() {
+        let mut nodes = vec![
+            make_sdk_const("/workspaces/{id}/expertunities/"),  // trailing slash in SDK
+            make_api_endpoint("/expertunities", "GET", false),   // no trailing slash
+        ];
+
+        sdk_path_inference_pass(&mut nodes);
+
+        let ep = nodes.iter().find(|n| n.id.kind == NodeKind::ApiEndpoint).unwrap();
+        // "/workspaces/{id}/expertunities/" does not end with "/expertunities" (no trailing slash)
+        // so no match → path unchanged.
+        assert_eq!(
+            ep.metadata.get("http_path").map(|s| s.as_str()),
+            Some("/expertunities"),
+            "trailing-slash SDK path must NOT match endpoint without trailing slash"
+        );
+    }
+
+    /// SDK path with trailing slash DOES match endpoint with trailing slash.
+    #[test]
+    fn test_trailing_slash_matches_trailing_slash() {
+        let mut nodes = vec![
+            make_sdk_const("/workspaces/{id}/expertunities/"),
+            make_api_endpoint("/expertunities/", "GET", false),
+        ];
+
+        sdk_path_inference_pass(&mut nodes);
+
+        let ep = nodes.iter().find(|n| n.id.kind == NodeKind::ApiEndpoint).unwrap();
+        assert_eq!(
+            ep.metadata.get("http_path").map(|s| s.as_str()),
+            Some("/workspaces/{id}/expertunities/"),
+            "trailing-slash SDK path must match endpoint with same trailing slash"
+        );
+    }
+
+    /// Hyphenated SDK filename (e.g. "api-client.ts") is NOT detected as generated.
+    /// This is the "SDK file not detected" failure scenario from the dissent.
+    #[test]
+    fn test_hyphenated_sdk_filename_not_detected() {
+        let mut non_sdk_const = make_sdk_const("/workspaces/{id}/expertunities");
+        non_sdk_const.id.file = PathBuf::from("src/api-client.ts"); // hyphen, not matched
+
+        let mut nodes = vec![
+            non_sdk_const,
+            make_api_endpoint("/expertunities", "GET", false),
+        ];
+
+        sdk_path_inference_pass(&mut nodes);
+
+        let ep = nodes.iter().find(|n| n.id.kind == NodeKind::ApiEndpoint).unwrap();
+        assert_eq!(
+            ep.metadata.get("http_path").map(|s| s.as_str()),
+            Some("/expertunities"),
+            "hyphenated SDK filename must not be used for inference"
+        );
+    }
 }
