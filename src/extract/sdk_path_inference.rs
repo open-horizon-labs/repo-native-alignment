@@ -103,6 +103,23 @@ use crate::extract::openapi_sdk_link::is_generated_sdk_file_pub;
 ///
 /// [`fastapi_router_prefix_pass`]: super::fastapi_router_prefix::fastapi_router_prefix_pass
 pub fn sdk_path_inference_pass(nodes: &mut [Node]) {
+    // Fast-path: if no TypeScript or JavaScript Const nodes exist, there can be
+    // no generated SDK paths — return immediately without calling
+    // `is_generated_sdk_file_pub` on any node.  On Rust/Python-only repos this
+    // is O(1) (the `any` short-circuits on the first TS/JS node, or exits
+    // immediately when none exist), avoiding all filename-pattern checks.
+    //
+    // Generated SDK files are TypeScript/JavaScript by definition (e.g.,
+    // `sdk.gen.ts`, `client.generated.ts`).  Checking Python or Rust Const
+    // nodes would always return false from `is_generated_sdk_file_pub`.
+    let has_ts_js_const = nodes.iter().any(|n| {
+        n.id.kind == NodeKind::Const
+            && matches!(n.language.as_str(), "typescript" | "javascript")
+    });
+    if !has_ts_js_const {
+        return;
+    }
+
     // Phase 1: Collect all URL paths from Const nodes in generated SDK files,
     // grouped by root slug to prevent cross-service contamination.
     //
@@ -111,10 +128,14 @@ pub fn sdk_path_inference_pass(nodes: &mut [Node]) {
     // in service-A's root only matches SDK paths from service-A's root.
     //
     // The string-literal harvester stores the path as the node `name`.
+    // NOTE: we restrict to TypeScript/JavaScript nodes here because the fast-path
+    // above already confirmed at least one such Const exists; checking other
+    // languages would always return false from `is_generated_sdk_file_pub`.
     use std::collections::HashMap;
     let mut sdk_paths_by_root: HashMap<String, Vec<String>> = HashMap::new();
     for n in nodes.iter() {
         if n.id.kind == NodeKind::Const
+            && matches!(n.language.as_str(), "typescript" | "javascript")
             && is_generated_sdk_file_pub(&n.id.file)
             && n.id.name.starts_with('/')
             && n.id.name.len() > 1
