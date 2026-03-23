@@ -526,12 +526,24 @@ impl LspEnricher {
             // When the server does not use serverStatus, use a short poll interval
             // (until next_probe) so we can interleave probe requests with draining
             // notifications.
+            //
+            // Cap by remaining time to the next 30s progress log and by the circuit
+            // breaker, so progress logs fire accurately and the breaker is not late.
+            let now = tokio::time::Instant::now();
+            let until_next_log = tokio::time::Duration::from_secs(30)
+                .checked_sub(last_progress_log.elapsed())
+                .unwrap_or_default();
+            let until_breaker = circuit_breaker
+                .checked_duration_since(now)
+                .unwrap_or_default();
             let msg_timeout = if seen_server_status {
                 tokio::time::Duration::from_secs(60)
             } else {
-                let remaining_to_probe = next_probe.saturating_duration_since(tokio::time::Instant::now());
+                let remaining_to_probe = next_probe.saturating_duration_since(now);
                 remaining_to_probe.min(tokio::time::Duration::from_secs(5))
-            };
+            }
+            .min(until_next_log)
+            .min(until_breaker);
 
             match tokio::time::timeout(msg_timeout, transport.read_message()).await {
                 Ok(Ok(msg)) => {
@@ -606,6 +618,10 @@ impl LspEnricher {
                     // Send a lightweight workspace/symbol request to test responsiveness.
                     // An empty query returns quickly and is safe on all LSP servers.
                     if tokio::time::Instant::now() >= next_probe {
+                        // Schedule next probe from probe start so cadence is ~5s regardless
+                        // of whether the probe request itself times out or succeeds quickly.
+                        next_probe = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+
                         let probe_result = tokio::time::timeout(
                             tokio::time::Duration::from_secs(5),
                             transport.request("workspace/symbol", serde_json::json!({ "query": "" })),
@@ -658,7 +674,6 @@ impl LspEnricher {
                             }
                         }
 
-                        next_probe = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
                     }
                 }
             }
@@ -688,10 +703,12 @@ impl LspEnricher {
         //
         // The guard only applies when the server supports `experimental/serverStatus`
         // (`seen_server_status = true`) but never sent quiescent=true. Servers
-        // that do NOT support serverStatus use the probe path and set saw_quiescent=true
-        // when the probe succeeds, so they are always treated as quiescent.
-        state.was_quiescent = saw_quiescent || !seen_server_status;
-        if seen_server_status && !saw_quiescent {
+        // that do NOT support serverStatus use the probe path: they are quiescent
+        // only when `server_ready=true` (probe succeeded). This ensures a server
+        // that never responded to any probe (circuit breaker path) is NOT treated
+        // as quiescent — Pass 3 would flood it with diagnostic requests.
+        state.was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
+        if !state.was_quiescent {
             tracing::warn!(
                 "{} did not reach quiescent state — Pass 3 (diagnostics) will be skipped this session",
                 self.server_command
