@@ -346,9 +346,12 @@ impl ExtractionConsumer for FastapiRouterPrefixConsumer {
 ///
 /// **Pass execution order (ordering-sensitive):**
 /// 1. Merge tree-sitter + LSP nodes/edges and apply metadata patches
-/// 2. `fastapi_router_prefix_pass` — rewrites `http_path` on FastAPI ApiEndpoint nodes.
-///    Must run BEFORE `api_link_pass` so full URL paths are present when API links
-///    are matched (CodeRabbit finding #5, PR #528).
+/// 2. `fastapi_router_prefix_pass` — rewrites `http_path` on FastAPI ApiEndpoint nodes
+///    that have explicit `prefix=` args (same-file or `include_router`).
+///    Must run BEFORE `api_link_pass` (CodeRabbit finding #5, PR #528).
+/// 2b. `sdk_path_inference_pass` — infers full paths for endpoints still unresolved
+///    after step 2 (chained routers without explicit prefix= args), using URL paths
+///    from generated SDK Const nodes as the authoritative source (#517).
 /// 3. `api_link_pass` — links HTTP handlers to route definitions
 /// 4. `openapi_sdk_link_pass` — links SDK functions to OpenAPI spec operations
 /// 5. `manifest_pass` — package.json / Cargo.toml dependency nodes
@@ -447,6 +450,12 @@ impl EnrichmentFinalizer {
             &mut all_nodes,
             &self.root_pairs,
         );
+
+        // Step 2b: sdk_path_inference — infers full HTTP paths for FastAPI endpoints
+        // that remain unresolved after step 2 (chained routers without explicit prefix= args).
+        // Uses URL paths from generated SDK Const nodes as the authoritative source.
+        // Must run BEFORE api_link_pass so the full paths participate in URL-string matching.
+        crate::extract::sdk_path_inference::sdk_path_inference_pass(&mut all_nodes);
 
         // Step 3: api_link — links HTTP handlers to route definitions.
         {
