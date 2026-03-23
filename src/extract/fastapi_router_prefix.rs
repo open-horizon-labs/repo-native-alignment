@@ -346,13 +346,6 @@ fn apply_prefix(node: &mut Node, prefix: &str) {
 }
 
 /// Join a prefix path with a local path, avoiding double slashes.
-///
-/// ```
-/// assert_eq!(join_paths("/workspaces/{id}", "/expertunities"),
-///            "/workspaces/{id}/expertunities");
-/// assert_eq!(join_paths("/api", "/users"), "/api/users");
-/// assert_eq!(join_paths("/api/", "/users"), "/api/users");
-/// ```
 fn join_paths(prefix: &str, local: &str) -> String {
     let prefix = prefix.trim_end_matches('/');
     let local = local.trim_start_matches('/');
@@ -369,6 +362,14 @@ mod tests {
     use crate::graph::{ExtractionSource, NodeId, NodeKind};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    #[test]
+    fn test_join_paths() {
+        assert_eq!(join_paths("/workspaces/{id}", "/expertunities"),
+                   "/workspaces/{id}/expertunities");
+        assert_eq!(join_paths("/api", "/users"), "/api/users");
+        assert_eq!(join_paths("/api/", "/users"), "/api/users");
+    }
 
     fn make_api_endpoint(file: &str, _name: &str, method: &str, http_path: &str, router_var: Option<&str>) -> Node {
         let mut metadata = BTreeMap::new();
