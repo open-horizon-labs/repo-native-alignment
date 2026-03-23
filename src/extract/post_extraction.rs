@@ -242,6 +242,13 @@ impl PostExtractionRegistry {
     pub fn with_builtins() -> Self {
         let mut reg = Self::new();
         // Group 1: unconditional passes (no framework dependency)
+        //
+        // FastapiRouterPrefixPass MUST run before ApiLinkPass so that the full
+        // URL paths (prefix + local path) are present when api_link_pass matches
+        // TypeScript SDK URL constants to FastAPI handlers. Running it after
+        // ApiLinkPass means the rewritten http_path never participates in link
+        // generation (CodeRabbit finding #5, PR #528).
+        reg.register(Box::new(FastapiRouterPrefixPass));
         reg.register(Box::new(ApiLinkPass));
         reg.register(Box::new(OpenApiSdkLinkPass));
         reg.register(Box::new(ManifestPass));

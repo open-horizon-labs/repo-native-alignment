@@ -375,6 +375,7 @@ mod tests {
             language: "rust".into(),
             added_edges: empty_arc_edges(),
             new_nodes: empty_arc_nodes(),
+            updated_nodes: std::sync::Arc::from([]),
         }).unwrap();
         let stats = c.stats.read().unwrap();
         let in_flight = stats.languages_in_flight.get("api").map(|v| v.as_slice()).unwrap_or(&[]);
@@ -409,6 +410,7 @@ mod tests {
             language: "rust".into(),
             added_edges: std::sync::Arc::from(edges.into_boxed_slice()),
             new_nodes: empty_arc_nodes(),
+            updated_nodes: std::sync::Arc::from([]),
         }).unwrap();
 
         let stats = c.stats.read().unwrap();
@@ -436,6 +438,7 @@ mod tests {
         c.on_event(&ExtractionEvent::EnrichmentComplete {
             slug: slug("api"), language: "rust".into(),
             added_edges: empty_arc_edges(), new_nodes: empty_arc_nodes(),
+            updated_nodes: std::sync::Arc::from([]),
         }).unwrap();
         c.on_event(&ExtractionEvent::PassesComplete {
             slug: slug("api"),
@@ -485,6 +488,7 @@ mod tests {
             language: "go".into(),
             added_edges: empty_arc_edges(),
             new_nodes: empty_arc_nodes(),
+            updated_nodes: std::sync::Arc::from([]),
         });
         assert!(result.is_ok(), "should not fail even without prior LanguageDetected");
         let stats = c.stats.read().unwrap();

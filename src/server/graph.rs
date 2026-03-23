@@ -101,10 +101,12 @@ impl RnaHandler {
 
     /// Build the full graph from scratch. This is the original get_graph logic.
     ///
-    /// When `spawn_background` is true (default for MCP server), embedding and
-    /// LSP enrichment are spawned as background tasks so the graph is queryable
-    /// immediately. When false (used by `run_pipeline_foreground`), no background
-    /// tasks are spawned -- the caller handles embed+LSP itself.
+    /// When `spawn_background` is true (default for MCP server), embedding is
+    /// spawned as a background task so the graph is queryable immediately.
+    /// LSP enrichment now runs synchronously via `LspConsumer` in the event bus
+    /// (`run_post_passes_via_bus`), so it completes before this function returns.
+    /// When false (used by `run_pipeline_foreground`), no background tasks are
+    /// spawned -- the caller handles embed itself.
     pub async fn build_full_graph(&self) -> anyhow::Result<GraphState> {
         self.build_full_graph_inner(true).await
     }
@@ -580,15 +582,25 @@ impl RnaHandler {
             }
         }
 
-        // 4b-4j. Post-extraction passes via EventBus (ADR Phase 2b, issue #502).
+        // 4b-4j. Post-extraction passes via EventBus (ADR Phase 3, issue #520).
         //
-        // `run_post_passes_via_bus` routes all_nodes/all_edges through:
-        //   - PostExtractionConsumer → runs all passes → emits PassesComplete
+        // `run_post_passes_via_bus` routes all_nodes/all_edges through the bus:
         //   - LanguageAccumulatorConsumer → emits LanguageDetected per language
-        //   - LspConsumer stubs → Phase 2 no-ops, Phase 3+ async consumers
+        //   - LspConsumer (real, Phase 3) → runs LSP enrichment per language via
+        //     block_in_place → emits EnrichmentComplete with actual edges
+        //   - AllEnrichmentsGate → waits for all EnrichmentComplete → emits AllEnrichmentsDone
+        //   - PostExtractionConsumer → runs all post-extraction passes on LSP-enriched graph
+        //     → emits PassesComplete
+        //
+        // LSP enrichment now runs synchronously inside this bus call.
+        // `spawn_background_enrichment` (called below) is embedding-only.
         //
         // ADR Constraint 4: no direct pass function calls in src/server/.
         {
+            // Mark LSP as running before the bus call so status is visible immediately.
+            if spawn_background {
+                self.lsp_status.set_running();
+            }
             let root_pairs: Vec<(String, std::path::PathBuf)> = workspace
                 .resolved_roots()
                 .iter()
@@ -607,6 +619,28 @@ impl RnaHandler {
             all_nodes = enriched_nodes;
             all_edges = enriched_edges;
             all_detected_frameworks = detected_frameworks;
+
+            // Count LSP edges added by LspConsumer during bus execution.
+            // These are ExtractionSource::Lsp edges in all_edges.
+            if spawn_background {
+                let lsp_edge_count = all_edges.iter()
+                    .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
+                    .count();
+                let call_edge_count = all_edges.iter()
+                    .filter(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
+                    .count();
+                if lsp_edge_count > 0 || call_edge_count > 0 {
+                    self.lsp_status.set_complete(call_edge_count);
+                    tracing::info!(
+                        "LSP enrichment complete (via bus): {} call edges, {} total LSP edges",
+                        call_edge_count, lsp_edge_count,
+                    );
+                } else {
+                    // No LSP edges — either no server available or no enrichable nodes.
+                    // Mark as unavailable so the status shows "no server" not "running".
+                    self.lsp_status.set_unavailable();
+                }
+            }
         }
 
         // Dedup immediately after post-extraction passes so the graph index,
@@ -802,12 +836,11 @@ impl RnaHandler {
         // Persisting here would write only tree-sitter edges, and a subsequent
         // `repo-map` loading from LanceDB cache would miss LSP edges (#311).
         if spawn_background {
-            // Clear the LSP sentinel before making the new extraction-only graph durable.
-            // The previous sentinel describes the OLD graph (with old LSP edges). After this
-            // persist, LanceDB contains a fresh tree-sitter-only snapshot; if the process
-            // exits before background LSP enrichment writes a new sentinel, the next startup
-            // must not trust the old sentinel and skip re-enrichment for the new graph (#477).
-            super::sentinel::clear_lsp_sentinel(&self.repo_root);
+            // Phase 3 (issue #520): LSP enrichment now runs synchronously inside
+            // `run_post_passes_via_bus` (via `LspConsumer` + `AllEnrichmentsGate`).
+            // The graph already contains LSP edges at this point, so we can write
+            // both sentinels in one persist rather than clearing+rewriting.
+            // We no longer need to clear the LSP sentinel here since LSP ran before persist.
 
             let _lance_guard = self.lance_write_lock.lock().await;
             if let Err(e) = persist_graph_to_lance(&self.repo_root, &all_nodes, &all_edges).await {
@@ -815,9 +848,25 @@ impl RnaHandler {
                 return Err(e.context("LanceDB full persist failed during graph build"));
             }
 
-            // Write extraction sentinel inside the lock so another writer cannot race
-            // between the persist and the sentinel write (#477 CodeRabbit critical).
+            // Write both sentinels inside the lock: LSP enrichment already completed
+            // above (synchronously via bus), so the persisted graph includes LSP edges.
+            // Writing the LSP sentinel here avoids a subsequent startup re-running LSP
+            // on an already-enriched graph (#477).
             super::sentinel::write_extract_sentinel(&self.repo_root, all_nodes.len(), all_edges.len());
+            // Write or clear the LSP sentinel depending on whether LSP produced edges.
+            // If LSP ran but produced no edges (no server, no supported language, empty result),
+            // we must clear any stale sentinel left from a previous run. A stale sentinel would
+            // cause the next startup to skip LSP enrichment even though the persisted graph is
+            // tree-sitter-only, which would hide the "no server" situation.
+            let has_lsp_edges = all_edges.iter()
+                .any(|e| e.source == crate::graph::ExtractionSource::Lsp);
+            if has_lsp_edges {
+                super::sentinel::write_lsp_sentinel(&self.repo_root, all_nodes.len(), all_edges.len());
+            } else {
+                // No LSP data in this build — clear the old sentinel so the next startup
+                // knows to re-run LSP enrichment rather than trusting stale data.
+                super::sentinel::clear_lsp_sentinel(&self.repo_root);
+            }
             drop(_lance_guard);
 
             // Post-persist sanity check: if any new roots were detected, verify they
@@ -865,7 +914,8 @@ impl RnaHandler {
         }
 
         // Graph is ready -- return immediately so agents can query.
-        // Embedding and LSP enrichment run in background via the shared graph lock.
+        // LSP enrichment already ran synchronously via LspConsumer in the bus above (#520).
+        // Embedding runs in the background task below.
         let symbols_ready_at = std::time::Instant::now();
 
         // Store embed index immediately so it's available for queries.
@@ -1132,27 +1182,20 @@ impl RnaHandler {
                 .ensure_node(&node.stable_id(), &node.id.kind.to_string());
         }
 
-        // Run LSP enrichers on the updated nodes (same as cold-start, but scoped to changed files).
-        // Only enrichers matching the languages of changed files are invoked -- if only .rs
-        // changed, only rust-analyzer runs (not pyright, marksman, etc.). This scoping is
-        // handled by `enrich_all` which filters enrichers by the `languages` vec.
-        // LSP enrichment runs in a background task (matching the full-build pattern) so the
-        // write lock is released quickly and tool calls aren't blocked.
+        // LSP enrichment is now handled synchronously by `LspConsumer` inside
+        // `run_post_passes_via_bus` (called above, Phase 3 / issue #520).
+        // `spawn_incremental_lsp_enrichment` is NOT called here to avoid double-enrichment:
+        // the bus already ran every LspConsumer for all supported languages before this point.
+        // The `spawn_lsp` flag is retained for future use but currently has no effect on the
+        // incremental path — remove this comment when the flag is fully removed (#537).
+        let _ = spawn_lsp; // suppress unused-variable warning
+
+        // `changed_files` is still needed below for targeted re-embedding.
         let changed_files: std::collections::HashSet<_> = scan
             .changed_files
             .iter()
             .chain(scan.new_files.iter())
             .collect();
-        let changed_nodes: Vec<_> = graph
-            .nodes
-            .iter()
-            .filter(|n| changed_files.iter().any(|f| n.id.file == **f))
-            .cloned()
-            .collect();
-
-        if spawn_lsp && !changed_nodes.is_empty() {
-            self.spawn_incremental_lsp_enrichment(changed_nodes, graph.index.clone());
-        }
 
         // Recompute PageRank importance scores after all graph mutations
         // (extraction + LSP enrichment) are complete.
