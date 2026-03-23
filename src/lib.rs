@@ -20,4 +20,5 @@ pub mod smoke_test;
 pub mod types;
 pub mod walk;
 
+pub mod open_viewer;
 pub mod setup;
