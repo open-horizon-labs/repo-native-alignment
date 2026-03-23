@@ -18,45 +18,40 @@ pub const SCHEMA_VERSION: u32 = 18; // gRPC proto columns: parent_service, rpc_r
 
 /// Extraction version for source-level extraction logic.
 ///
-/// Bump this whenever tree-sitter extraction changes produce new or different
-/// metadata (e.g., new fields like `doc_comment`, changed parsing logic).
-/// When mismatched against the stored version, the server clears all scan-state
-/// files so every file is re-extracted from scratch on the next build.
+/// **Deprecated** — replaced by content-addressed per-consumer cache keys (#526).
 ///
-/// Unlike SCHEMA_VERSION (which invalidates LanceDB tables), EXTRACTION_VERSION
-/// invalidates the scanner's mtime/hash state — forcing full re-extraction without
-/// dropping LanceDB tables. Bumped to 1 for doc_comment metadata extraction (#401).
-/// Bumped to 3 for new C, PHP, HTML, Scala, Dart, Elixir extractors (#435).
-/// Bumped to 4 for Next.js routing pass (#440) and monorepo subdirectory roots (#442).
-/// Bumped to 5 for subsystem first-class nodes (#470): emits NodeKind::Other("subsystem")
-/// nodes and BelongsTo edges after community detection.
-/// Bumped to 6 for framework detection pass (#469): emits NodeKind::Other("framework")
-/// nodes and adds UsesFramework/Produces/Consumes EdgeKinds.
-/// Bumped to 7 for pub/sub + websocket extractors (#464/#467): Produces/Consumes edges,
-/// channel/event nodes. Gates nextjs_routing_pass on framework detection.
-/// Bumped to 8 for cross-file import-calls pass (#462).
-/// Bumped to 9 for background scanner post-extraction passes (#471): api_link,
-/// manifest, tested_by, directory_module, import_calls, framework_detection,
-/// nextjs_routing, pubsub, and websocket now run in both foreground and
-/// background paths — older caches lack these edges and must be re-extracted.
-/// Bumped to 10 for generic extractor-config pass (#467): reads *.toml from
-/// .oh/extractors/ and emits NodeKind::Other("channel") nodes + Produces/Consumes
-/// edges. Older caches lack config-driven channel nodes and must be re-extracted.
-/// Bumped to 11 for openapi_sdk_link_pass (#465): emits Implements edges from
-/// generated SDK Function nodes to ApiEndpoint nodes (matched by operation_id).
-/// Older caches lack SDK→spec links and must be re-extracted.
-/// Bumped to 12 for gRPC client calls pass (#466): detects `_pb2_grpc` / grpc-go /
-/// @grpc/ / io.grpc imports and emits Calls edges to proto RPC method nodes.
-/// Older caches lack these cross-boundary gRPC Calls edges and must be re-extracted.
-/// Bumped to 13 for FastAPI router prefix pass (#517): route-decorator extraction now
-/// stores `router_var` metadata on ApiEndpoint nodes, and the new post-extraction pass
-/// prepends `APIRouter(prefix=...)` values to `http_path`. Older caches lack the
-/// `router_var` field and unresolved paths must be re-extracted.
-/// Bumped to 14 for idempotent FastAPI prefix rewrite (#528 followup): `apply_prefix()`
-/// now stores `http_path_local` (original local path) as an idempotency guard. Older
-/// cached nodes have a prefixed `http_path` but no `http_path_local`, so the pass would
-/// double-prefix them on the next run. Re-extraction ensures all ApiEndpoint nodes have
-/// the stable local path stored before the prefix is applied.
+/// Each `ExtractionConsumer` now declares `fn version() -> u64`. The cache key for
+/// a consumer+event pair is `(blake3(event.canonical_bytes()), consumer.version())`.
+/// Changing one consumer's `version()` only invalidates that consumer's cache, not all
+/// consumers.
+///
+/// This constant is retained for backward compatibility with the sentinel system
+/// (`SentinelData::extraction_version`) and the `check_and_migrate_extraction_version`
+/// call site in the server pipeline. Both will be removed in a follow-up cleanup.
+///
+/// **Do not bump this constant.** Instead, bump the `version()` of the specific consumer
+/// whose extraction logic changed. Config-driven consumers (`CustomExtractorConsumer`)
+/// derive their version from `blake3(toml_file_contents)` automatically.
+///
+/// Historical bump log (kept for reference, not for future use):
+/// - Bumped to 1 for doc_comment metadata extraction (#401).
+/// - Bumped to 3 for new C, PHP, HTML, Scala, Dart, Elixir extractors (#435).
+/// - Bumped to 4 for Next.js routing pass (#440) and monorepo subdirectory roots (#442).
+/// - Bumped to 5 for subsystem first-class nodes (#470).
+/// - Bumped to 6 for framework detection pass (#469).
+/// - Bumped to 7 for pub/sub + websocket extractors (#464/#467).
+/// - Bumped to 8 for cross-file import-calls pass (#462).
+/// - Bumped to 9 for background scanner post-extraction passes (#471).
+/// - Bumped to 10 for generic extractor-config pass (#467).
+/// - Bumped to 11 for openapi_sdk_link_pass (#465).
+/// - Bumped to 12 for gRPC client calls pass (#466).
+/// - Bumped to 13 for FastAPI router prefix pass (#517).
+/// - Bumped to 14 for idempotent FastAPI prefix rewrite (#528 followup).
+#[deprecated(
+    since = "0.1.8",
+    note = "Use ExtractionConsumer::version() + content-addressed cache keys instead (#526). \
+            Do not bump this constant — bump the specific consumer's version() instead."
+)]
 pub const EXTRACTION_VERSION: u32 = 14;
 
 /// Arrow schema for the `symbols` table.
@@ -271,34 +266,19 @@ mod tests {
         assert!(SCHEMA_VERSION >= 17, "SCHEMA_VERSION should be >= 17");
     }
 
+    /// `EXTRACTION_VERSION` is now deprecated (#526). The global integer is replaced by
+    /// per-consumer content-addressed cache keys: `(blake3(event_payload), consumer.version())`.
+    /// This test verifies the constant still holds its historical value (14) so that the
+    /// sentinel backward-compat path continues to read old sentinel files correctly.
+    /// Do not bump this value — bump the specific consumer's `version()` instead.
     #[test]
-    fn test_extraction_version_constant() {
-        // EXTRACTION_VERSION must be at least 1 (bumped for doc_comment extraction #401)
-        assert!(EXTRACTION_VERSION >= 1, "EXTRACTION_VERSION should be >= 1");
-    }
-
-    #[test]
-    fn test_extraction_version_includes_extractor_config_pass() {
-        // EXTRACTION_VERSION was bumped to 10 for the generic extractor-config pass (#467).
-        // Caches built before version 10 lack config-driven channel nodes and must be
-        // re-extracted. Asserting >= 10 ensures this bump is never accidentally reverted.
-        assert!(
-            EXTRACTION_VERSION >= 10,
-            "EXTRACTION_VERSION must be >= 10 after extractor-config pass bump; got {}",
-            EXTRACTION_VERSION
-        );
-    }
-
-    #[test]
-    fn test_extraction_version_includes_fastapi_router_prefix_pass() {
-        // EXTRACTION_VERSION was bumped to 13 for the FastAPI router prefix pass (#517).
-        // Route-decorator extraction now stores `router_var` metadata on ApiEndpoint nodes,
-        // and the new post-extraction pass prepends APIRouter(prefix=...) to http_path.
-        // Caches built before version 13 lack `router_var` and must be re-extracted.
-        assert!(
-            EXTRACTION_VERSION >= 13,
-            "EXTRACTION_VERSION must be >= 13 after FastAPI router prefix pass bump; got {}",
-            EXTRACTION_VERSION
+    #[allow(deprecated)]
+    fn test_extraction_version_is_frozen_at_14() {
+        assert_eq!(
+            EXTRACTION_VERSION,
+            14,
+            "EXTRACTION_VERSION is frozen at 14 (#526). \
+             Do not bump — use ExtractionConsumer::version() instead."
         );
     }
 

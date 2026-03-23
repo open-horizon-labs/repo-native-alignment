@@ -261,6 +261,12 @@ impl ExtractionConsumer for ScanStatsConsumer {
 
         Ok(vec![])
     }
+
+    /// `ScanStatsConsumer` is stateful — it accumulates scan metrics across events.
+    /// The bus must not cache its output; every `on_event` call must reach it.
+    fn is_cacheable(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------

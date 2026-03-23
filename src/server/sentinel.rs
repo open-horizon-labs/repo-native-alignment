@@ -1,4 +1,6 @@
 //! Write-ahead log sentinels for scan pipeline phases.
+// EXTRACTION_VERSION is deprecated (#526) but still used for backward-compat sentinel reads.
+#![allow(deprecated)]
 //!
 //! After each major pipeline phase completes and its data is durably persisted,
 //! a sentinel file is written to `.oh/.cache/`. On startup, the server checks

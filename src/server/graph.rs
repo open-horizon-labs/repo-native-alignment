@@ -1,4 +1,6 @@
 //! Graph lifecycle: building, incremental updates, and state management.
+// EXTRACTION_VERSION is deprecated (#526) but still used for backward-compat migration.
+#![allow(deprecated)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

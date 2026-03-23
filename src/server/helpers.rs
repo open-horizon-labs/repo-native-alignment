@@ -1,4 +1,6 @@
 //! Formatting utilities, argument parsing, and display helpers.
+// EXTRACTION_VERSION is deprecated (#526) but still used in the freshness footer.
+#![allow(deprecated)]
 
 use crate::graph;
 use crate::graph::index::GraphIndex;

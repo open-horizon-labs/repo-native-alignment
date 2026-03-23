@@ -147,6 +147,13 @@ impl ExtractionConsumer for TreeSitterConsumer {
             edges: std::sync::Arc::from(extraction.edges.into_boxed_slice()),
         }])
     }
+
+    /// `TreeSitterConsumer` reads the filesystem — its output depends on file contents
+    /// beyond the event payload. The bus must not cache its output; every scan must
+    /// trigger a fresh read so file edits are detected.
+    fn is_cacheable(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +284,12 @@ impl ExtractionConsumer for PostExtractionConsumer {
 
         // Delegate to the inner pass logic with merged nodes/edges.
         self.run_passes(slug, merged_nodes, merged_edges)
+    }
+
+    /// `PostExtractionConsumer` runs filesystem-reading passes (api_link, manifest, etc.).
+    /// Its output depends on file contents beyond the event payload. Non-cacheable.
+    fn is_cacheable(&self) -> bool {
+        false
     }
 }
 
@@ -610,11 +623,43 @@ impl ExtractionConsumer for GrpcConsumer {
 ///
 /// Subscribes to: `FrameworkDetected`
 /// Emits: `PassComplete`
+///
+/// # Content-addressed versioning
+///
+/// `CustomExtractorConsumer` derives its `version()` from `blake3(config_file_contents)`.
+/// When the `.oh/extractors/*.toml` file changes, `version()` changes automatically —
+/// no manual `EXTRACTION_VERSION` bump required.
 pub struct CustomExtractorConsumer {
     /// Framework name this consumer is configured for.
     pub framework: String,
     /// Slug identifying this config (for diagnostics).
     pub config_name: String,
+    /// Raw bytes of the `.oh/extractors/*.toml` config file.
+    /// Used to derive `version()` via `blake3` so config edits auto-invalidate the cache.
+    pub config_bytes: Vec<u8>,
+}
+
+impl CustomExtractorConsumer {
+    /// Create a `CustomExtractorConsumer` by reading the config file from disk.
+    ///
+    /// If the file cannot be read, `config_bytes` is set to an empty `Vec` which
+    /// produces a stable but generic version (`0` for the first 8 bytes of blake3(b"")`).
+    pub fn from_file(framework: String, config_name: String, config_path: &std::path::Path) -> Self {
+        let config_bytes = match std::fs::read(config_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(
+                    "CustomExtractorConsumer '{}': could not read config file '{}': {} — \
+                     using empty config_bytes (version will be blake3(b\"\"))",
+                    config_name,
+                    config_path.display(),
+                    e,
+                );
+                Vec::new()
+            }
+        };
+        Self { framework, config_name, config_bytes }
+    }
 }
 
 impl ExtractionConsumer for CustomExtractorConsumer {
@@ -642,6 +687,16 @@ impl ExtractionConsumer for CustomExtractorConsumer {
             added_nodes: 0,
             added_edges: 0,
         }])
+    }
+
+    /// Version derived from blake3 of the config file bytes.
+    ///
+    /// When the `.oh/extractors/*.toml` changes, `version()` changes automatically —
+    /// no manual bump needed. Uses the first 8 bytes of the hash as a `u64`.
+    fn version(&self) -> u64 {
+        let hash = blake3::hash(&self.config_bytes);
+        let bytes = hash.as_bytes();
+        u64::from_le_bytes(bytes[..8].try_into().expect("blake3 output >= 8 bytes"))
     }
 }
 
@@ -800,6 +855,13 @@ impl ExtractionConsumer for LspConsumer {
                 }])
             }
         }
+    }
+
+    /// `LspConsumer` runs an external LSP server process — its output depends on
+    /// runtime LSP server state beyond the event payload. The bus must not cache
+    /// its output; every enrichment must run fresh.
+    fn is_cacheable(&self) -> bool {
+        false
     }
 }
 
@@ -1022,6 +1084,13 @@ impl ExtractionConsumer for AllEnrichmentsGate {
             _ => Ok(vec![]),
         }
     }
+
+    /// `AllEnrichmentsGate` is stateful — it accumulates `EnrichmentComplete` events
+    /// across multiple `on_event` calls before emitting `AllEnrichmentsDone`.
+    /// The bus must not cache its output; every call must reach it.
+    fn is_cacheable(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,6 +1197,12 @@ impl ExtractionConsumer for EmbeddingIndexerConsumer {
 
         Ok(vec![])
     }
+
+    /// `EmbeddingIndexerConsumer` triggers external side-effects (spawns async embed tasks).
+    /// It must not be cached — the embed task must fire on every `RootExtracted` event.
+    fn is_cacheable(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1227,6 +1302,12 @@ impl ExtractionConsumer for LanceDBConsumer {
         }
 
         Ok(vec![])
+    }
+
+    /// `LanceDBConsumer` triggers external side-effects (spawns async LanceDB persist tasks).
+    /// It must not be cached — persistence must happen on every `PassesComplete` event.
+    fn is_cacheable(&self) -> bool {
+        false
     }
 }
 
@@ -1573,7 +1654,7 @@ pub fn run_post_passes_via_bus(
     // Use repo_root for LSP server startup directory so LspConsumers have the
     // correct working directory. The path is also passed as the RootExtracted
     // event path so consumers that need it (e.g., tree-sitter-based consumers) work.
-    let (bus, _stats) = build_builtin_bus(root_pairs, primary_slug.clone(), repo_root.clone(), opts);
+    let (mut bus, _stats) = build_builtin_bus(root_pairs, primary_slug.clone(), repo_root.clone(), opts);
     let events = bus.emit(ExtractionEvent::RootExtracted {
         slug: primary_slug,
         path: repo_root,
@@ -1793,7 +1874,7 @@ mod tests {
     /// Verify build_builtin_bus registers consumers for all expected event kinds.
     #[test]
     fn test_builtin_bus_has_consumers_for_all_event_kinds() {
-        let (bus, _stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
+        let (mut bus, _stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
         // Derive the exact expected count to catch regressions when languages are added/removed.
         let lsp_count = crate::extract::EnricherRegistry::with_builtins()
             .supported_languages()
@@ -1818,7 +1899,7 @@ mod tests {
     /// Verify build_builtin_bus returns a stats handle that shares state with the bus.
     #[test]
     fn test_builtin_bus_returns_scan_stats_handle() {
-        let (bus, stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
+        let (mut bus, stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
         // No activity yet
         assert!(!stats.read().unwrap().has_activity());
 
@@ -1861,6 +1942,7 @@ mod tests {
         let consumer = CustomExtractorConsumer {
             framework: "fastapi".into(),
             config_name: "fastapi-routes".into(),
+            config_bytes: vec![],
         };
         // Matching framework → fires
         let matching = ExtractionEvent::FrameworkDetected {
@@ -1881,6 +1963,60 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    /// `CustomExtractorConsumer::version()` changes when config bytes change.
+    #[test]
+    fn test_custom_extractor_consumer_version_from_config_bytes() {
+        let cfg_v1 = b"[extractor]\nframework = 'nextjs'".to_vec();
+        let cfg_v2 = b"[extractor]\nframework = 'nextjs'\nnew_field = true".to_vec();
+
+        let c1 = CustomExtractorConsumer {
+            framework: "nextjs".into(),
+            config_name: "nextjs-routes".into(),
+            config_bytes: cfg_v1.clone(),
+        };
+        let c2 = CustomExtractorConsumer {
+            framework: "nextjs".into(),
+            config_name: "nextjs-routes".into(),
+            config_bytes: cfg_v1.clone(),
+        };
+        let c3 = CustomExtractorConsumer {
+            framework: "nextjs".into(),
+            config_name: "nextjs-routes".into(),
+            config_bytes: cfg_v2.clone(),
+        };
+
+        // Same config bytes → same version.
+        assert_eq!(c1.version(), c2.version(), "same config bytes must yield same version");
+        // Different config bytes → different version.
+        assert_ne!(c1.version(), c3.version(), "changed config bytes must yield different version");
+        // Empty config bytes → stable non-panic version.
+        let c_empty = CustomExtractorConsumer {
+            framework: "x".into(),
+            config_name: "x".into(),
+            config_bytes: vec![],
+        };
+        let _v = c_empty.version(); // must not panic
+    }
+
+    /// `CustomExtractorConsumer::from_file` reads the file and computes version.
+    #[test]
+    fn test_custom_extractor_consumer_from_file() {
+        let dir = TempDir::new().unwrap();
+        let cfg_path = dir.path().join("my.toml");
+        std::fs::write(&cfg_path, b"[extractor]\nframework = 'fastapi'").unwrap();
+
+        let c = CustomExtractorConsumer::from_file(
+            "fastapi".into(),
+            "fastapi-routes".into(),
+            &cfg_path,
+        );
+        assert_eq!(c.framework, "fastapi");
+        assert!(!c.config_bytes.is_empty(), "config_bytes should be populated from file");
+        // Version must be non-zero for a non-empty config file.
+        // (Could be 0 in theory but statistically impossible for real TOML.)
+        let _v = c.version(); // must not panic
+    }
+
     /// Integration: bus emit sequence starting from RootDiscovered.
     /// With a real temp directory, TreeSitterConsumer produces RootExtracted.
     #[test]
@@ -1894,7 +2030,7 @@ mod tests {
         // Need scan state dir
         std::fs::create_dir_all(tmp.path().join(".oh").join(".cache")).unwrap();
 
-        let (bus, _stats) = build_builtin_bus(
+        let (mut bus, _stats) = build_builtin_bus(
             vec![("test".to_string(), tmp.path().to_path_buf())],
             "test".to_string(),
             tmp.path().to_path_buf(),

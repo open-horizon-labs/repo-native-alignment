@@ -1,4 +1,6 @@
 //! LanceDB persistence: persist, load, schema migration, stale root pruning.
+// EXTRACTION_VERSION is deprecated (#526) but still used for backward-compat sentinel reads.
+#![allow(deprecated)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
