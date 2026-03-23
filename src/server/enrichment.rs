@@ -27,6 +27,7 @@ impl RnaHandler {
         let graph = Arc::clone(&self.graph);
         let repo_root = self.repo_root.clone();
         let lance_write_lock = Arc::clone(&self.lance_write_lock);
+        let scan_stats = Arc::clone(&self.scan_stats);
         tokio::spawn(async move {
             // Track root slugs from the previous tick to detect removed worktrees.
             // Seed from the current resolved roots so the first tick doesn't
@@ -286,6 +287,7 @@ impl RnaHandler {
                             root_pairs,
                             primary_slug.clone(),
                             repo_root.clone(),
+                            Some(Arc::clone(&scan_stats)),
                         ) {
                             Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
                                 graph_state.nodes = enriched_nodes;
@@ -522,199 +524,9 @@ impl RnaHandler {
                 }
             };
 
-            let lsp_repo_root = bg_repo_root.clone();
-            let lsp_fut = async {
-                // Snapshot graph data under lock, then release before the slow
-                // enrich_all call so write-side graph updates aren't blocked.
-                //
-                // Fallback to bg_nodes if graph state is None (race: graph may
-                // not be stored in self.graph yet when this task first runs).
-                // This matches spawn_lsp_enrichment's fallback pattern.
-                let (enrich_nodes, enrich_index, migration_fallback_nodes) = {
-                    let guard = bg_graph.read().await;
-                    if let Some(ref gs) = *guard {
-                        // MCP server path: bg_graph is set; if schema migration fires,
-                        // we'll snapshot from bg_graph after enrichment. No clone needed.
-                        (gs.nodes.clone(), gs.index.clone(), Vec::<Node>::new())
-                    } else {
-                        tracing::warn!(
-                            "[background] Graph state not yet available, using {} passed-in nodes",
-                            bg_nodes.len()
-                        );
-                        // CLI path: bg_graph is None (build_full_graph called directly).
-                        // Capture nodes for schema-migration fallback BEFORE enrichment
-                        // consumes them. If migration fires after enrichment, we need
-                        // the full set to rebuild LanceDB.
-                        let fallback = bg_nodes.clone();
-                        (bg_nodes, crate::graph::index::GraphIndex::new(), fallback)
-                    }
-                };
-
-                tracing::info!(
-                    "[background] LSP enrichment starting with {} nodes ({} languages: [{}])",
-                    enrich_nodes.len(),
-                    bg_languages.len(),
-                    bg_languages.join(", ")
-                );
-
-                let enricher_registry = EnricherRegistry::with_builtins();
-                let enrichment = enricher_registry
-                    .enrich_all(&enrich_nodes, &enrich_index, &bg_languages, &lsp_repo_root, &bg_lsp_only_roots)
-                    .await;
-
-                if !enrichment.any_enricher_ran {
-                    tracing::info!("[background] LSP enrichment: no server available");
-                    bg_lsp_status.set_unavailable();
-                    return;
-                }
-
-                if enrichment.new_nodes.is_empty()
-                    && enrichment.added_edges.is_empty()
-                    && enrichment.updated_nodes.is_empty()
-                {
-                    tracing::info!("[background] LSP enrichment: no changes");
-                    bg_lsp_status.set_complete(0);
-                    return;
-                }
-
-                tracing::info!(
-                    "[background] LSP enrichment: {} virtual nodes, {} edges, {} patches",
-                    enrichment.new_nodes.len(),
-                    enrichment.added_edges.len(),
-                    enrichment.updated_nodes.len()
-                );
-
-                // Apply enrichment to shared graph
-                let edge_count = enrichment.added_edges.len();
-
-                // Collect IDs and clone edges for persist BEFORE moving into graph.
-                let new_node_ids: std::collections::HashSet<String> = enrichment.new_nodes.iter()
-                    .map(|n| n.stable_id()).collect();
-                let enriched_node_ids: std::collections::HashSet<String> =
-                    enrichment.updated_nodes.iter().map(|(id, _)| id.clone()).collect();
-                let all_upsert_node_ids: std::collections::HashSet<String> =
-                    enriched_node_ids.into_iter().chain(new_node_ids).collect();
-                let persist_edges = enrichment.added_edges.clone();
-
-                let mut guard = bg_graph.write().await;
-                if let Some(ref mut gs) = *guard {
-                    for vnode in &enrichment.new_nodes {
-                        gs.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
-                    }
-                    gs.nodes.extend(enrichment.new_nodes);
-
-                    for edge in &enrichment.added_edges {
-                        let from_id = edge.from.to_stable_id();
-                        let to_id = edge.to.to_stable_id();
-                        gs.index.add_edge(
-                            &from_id,
-                            &edge.from.kind.to_string(),
-                            &to_id,
-                            &edge.to.kind.to_string(),
-                            edge.kind.clone(),
-                        );
-                    }
-                    gs.edges.extend(enrichment.added_edges);
-
-                    for (node_id, patches) in &enrichment.updated_nodes {
-                        if let Some(node) = gs.nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
-                            for (key, value) in patches {
-                                node.metadata.insert(key.clone(), value.clone());
-                            }
-                        }
-                    }
-
-                    // Incremental persist: upsert the new LSP nodes and edges
-                    // into the existing LanceDB tables via merge_insert.
-                    // This avoids DROP+CREATE which races with the background
-                    // scanner's own incremental persist (#344 round 2).
-                    let upsert_nodes: Vec<Node> = gs.nodes.iter()
-                        .filter(|n| all_upsert_node_ids.contains(&n.stable_id()))
-                        .cloned()
-                        .collect();
-                    tracing::info!(
-                        "[background] LSP enrichment: incremental persist with {} upsert nodes, {} edges",
-                        upsert_nodes.len(),
-                        persist_edges.len(),
-                    );
-                    drop(guard); // release graph lock before acquiring lance write lock
-                    // Serialize with other LanceDB writers via the shared mutex (#344 round 3).
-                    // The sentinel is written inside the same critical section as the persist so
-                    // another writer cannot race in between (#477 CodeRabbit critical).
-                    let persist_result = {
-                        let _lance_guard = bg_lance_write_lock.lock().await;
-                        let result = persist_graph_incremental(
-                            &lsp_repo_root, &upsert_nodes, &persist_edges, &[], &[],
-                        ).await;
-                        if matches!(result, Ok(false)) {
-                            // Incremental persist succeeded -- write sentinel while lock is held.
-                            let (total_nodes, total_edges) = {
-                                let g = bg_graph.read().await;
-                                g.as_ref().map(|gs| (gs.nodes.len(), gs.edges.len()))
-                                    .unwrap_or((0, 0))
-                            };
-                            super::sentinel::write_lsp_sentinel(&lsp_repo_root, total_nodes, total_edges);
-                        }
-                        result
-                    };
-                    match persist_result {
-                        Ok(true) => {
-                            // Schema migrated -- tables were dropped, need full persist.
-                            // Prefer the live graph snapshot (MCP server path where
-                            // bg_graph is set). Fall back to migration_fallback_nodes
-                            // (CLI path where bg_graph is None, captured before enrichment).
-                            tracing::info!("[background] LSP enrichment: schema migrated; performing full persist");
-                            let snapshot = {
-                                let g = bg_graph.read().await;
-                                if let Some(ref gs) = *g {
-                                    Some((gs.nodes.clone(), gs.edges.clone(), true))
-                                } else if !migration_fallback_nodes.is_empty() {
-                                    // CLI path: use the pre-enrichment node set.
-                                    // Edges are empty because LSP enrichment hadn't
-                                    // completed; the tree-sitter edges are already in
-                                    // migration_fallback_nodes via the initial persist.
-                                    // Do NOT write the LSP sentinel in this path -- the
-                                    // persisted graph has no LSP edges (#477 CodeRabbit major).
-                                    tracing::warn!(
-                                        "[background] LSP enrichment: bg_graph is None after migration; \
-                                         falling back to {} pre-enrichment nodes for full persist (no LSP edges)",
-                                        migration_fallback_nodes.len()
-                                    );
-                                    Some((migration_fallback_nodes, Vec::new(), false))
-                                } else {
-                                    tracing::error!(
-                                        "[background] LSP enrichment: schema migrated but no nodes \
-                                         available for full persist — LanceDB tables are now empty"
-                                    );
-                                    None
-                                }
-                            };
-                            if let Some((nodes, edges, has_lsp_edges)) = snapshot {
-                                let _lance_guard = bg_lance_write_lock.lock().await;
-                                if let Err(e) = persist_graph_to_lance(&lsp_repo_root, &nodes, &edges).await {
-                                    tracing::error!("[background] LSP enrichment: full persist after migration failed: {:#}", e);
-                                    bg_lsp_status.set_complete_persist_failed(edge_count);
-                                } else {
-                                    if has_lsp_edges {
-                                        // Only write the sentinel when real LSP edges were persisted.
-                                        super::sentinel::write_lsp_sentinel(&lsp_repo_root, nodes.len(), edges.len());
-                                    }
-                                    bg_lsp_status.set_complete(edge_count);
-                                }
-                            } else {
-                                bg_lsp_status.set_complete(edge_count);
-                            }
-                        }
-                        Ok(false) => bg_lsp_status.set_complete(edge_count),
-                        Err(e) => {
-                            tracing::error!("[background] LSP enrichment: incremental persist failed: {:#}", e);
-                            bg_lsp_status.set_complete_persist_failed(edge_count);
-                        }
-                    }
-                }
-            };
-
-            tokio::join!(embed_fut, lsp_fut);
+            // Phase 3: LSP enrichment now runs inside the event bus via LspConsumer.
+            // This function is embedding-only; no lsp_fut here.
+            embed_fut.await;
         });
     }
 

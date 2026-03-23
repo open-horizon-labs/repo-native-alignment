@@ -3,9 +3,10 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
+use crate::extract::scan_stats::ScanStats;
+
 /// Per-root stats tuple: (node_count, edge_count) and language set.
 type RootStatsMap = (HashMap<String, (usize, usize)>, HashMap<String, BTreeSet<String>>);
-
 use crate::server::state::{LspEnrichmentStatus, LspState};
 
 // ── List roots ──────────────────────────────────────────────────────
@@ -23,11 +24,14 @@ use crate::server::state::{LspEnrichmentStatus, LspState};
 ///
 /// When `graph_state` is provided, per-root symbol and edge counts are included.
 /// When `lsp_status` is provided, LSP working/missing info is included.
+/// When `scan_stats` is provided and has live activity, per-root in-progress
+/// status is shown instead of the WAL-file fallback.
 pub fn list_roots_from_slugs(
     repo_root: &Path,
     active_slugs: &std::collections::HashSet<String>,
     graph_state: Option<&crate::server::state::GraphState>,
     lsp_status: Option<&LspEnrichmentStatus>,
+    scan_stats: Option<&ScanStats>,
 ) -> String {
     let workspace = crate::roots::WorkspaceConfig::load()
         .with_primary_root(repo_root.to_path_buf())
@@ -119,8 +123,53 @@ pub fn list_roots_from_slugs(
                 r.slug, primary, r.path.display(), r.config.root_type, r.config.git_aware);
 
             // Per-root stats line.
+            // Prefer live bus stats (ScanStatsConsumer) over WAL sentinel fallback.
             let (node_count, edge_count) = root_stats.get(&r.slug).copied().unwrap_or((0, 0));
-            if graph_state.is_some() {
+            if let Some(stats) = scan_stats {
+                if stats.has_activity() {
+                    // Live data from ScanStatsConsumer — can distinguish in-progress from idle.
+                    if stats.is_root_in_progress(&r.slug) {
+                        // Root is queued but PassesComplete not yet received.
+                        let in_flight_langs: Vec<String> = stats
+                            .languages_in_flight
+                            .get(&r.slug)
+                            .cloned()
+                            .unwrap_or_default();
+                        if in_flight_langs.is_empty() {
+                            line.push_str("\n  Scan: in progress");
+                        } else {
+                            line.push_str(&format!(
+                                "\n  Scan: in progress (enriching: {})",
+                                in_flight_langs.join(", ")
+                            ));
+                        }
+                    } else if stats.is_root_complete(&r.slug) {
+                        // Root completed in this process lifetime.
+                        if let Some(complete) = stats.roots_complete.get(&r.slug) {
+                            let secs = complete.completed_at.elapsed().as_secs();
+                            let age = if secs < 60 { "just now".to_string() }
+                                else if secs < 3600 { format!("{}m ago", secs / 60) }
+                                else if secs < 86400 { format!("{}h ago", secs / 3600) }
+                                else { format!("{}d ago", secs / 86400) };
+                            line.push_str(&format!(
+                                "\n  Last scan: {} | {} symbols | {} edges",
+                                age,
+                                format_count(complete.symbol_count),
+                                format_count(complete.edge_count),
+                            ));
+                        }
+                    }
+                    // else: root not yet seen in this scan — no stats line from bus
+                } else if graph_state.is_some() {
+                    // No bus activity yet (cold start): fall back to graph state.
+                    let scan_part = last_scan_age.as_deref().unwrap_or("not yet scanned");
+                    line.push_str(&format!("\n  Last scan: {} | {} symbols | {} edges",
+                        scan_part,
+                        format_count(node_count),
+                        format_count(edge_count)));
+                }
+            } else if graph_state.is_some() {
+                // No scan_stats provided: fall back to graph state (sentinel-derived).
                 let scan_part = last_scan_age.as_deref().unwrap_or("not yet scanned");
                 line.push_str(&format!("\n  Last scan: {} | {} symbols | {} edges",
                     scan_part,
@@ -206,7 +255,7 @@ fn format_count(n: usize) -> String {
 }
 
 pub fn list_roots(repo_root: &Path) -> String {
-    list_roots_from_slugs(repo_root, &std::collections::HashSet::new(), None, None)
+    list_roots_from_slugs(repo_root, &std::collections::HashSet::new(), None, None, None)
 }
 
 #[cfg(test)]
@@ -223,7 +272,7 @@ mod tests {
     #[test]
     fn test_list_roots_from_slugs_empty_falls_back_to_config() {
         let repo = std::env::current_dir().unwrap();
-        let result = list_roots_from_slugs(&repo, &std::collections::HashSet::new(), None, None);
+        let result = list_roots_from_slugs(&repo, &std::collections::HashSet::new(), None, None, None);
         // The primary root always exists (current dir is the RNA repo).
         assert!(result.contains("## Workspace Roots"), "should produce a roots header");
         assert!(result.contains("root(s)"), "should report root count");
@@ -248,7 +297,7 @@ mod tests {
         let mut active_slugs = std::collections::HashSet::new();
         active_slugs.insert(primary_slug.clone());
 
-        let result = list_roots_from_slugs(&repo, &active_slugs, None, None);
+        let result = list_roots_from_slugs(&repo, &active_slugs, None, None, None);
         assert!(result.contains("## Workspace Roots"), "should produce header");
         assert!(result.contains("1 root(s)"), "should show exactly 1 root when only primary slug is active");
         assert!(result.contains(&primary_slug), "should contain primary slug");
@@ -261,7 +310,7 @@ mod tests {
         let mut active_slugs = std::collections::HashSet::new();
         active_slugs.insert("ghost-root".to_string());
 
-        let result = list_roots_from_slugs(&repo, &active_slugs, None, None);
+        let result = list_roots_from_slugs(&repo, &active_slugs, None, None, None);
         assert!(result.contains("ghost-root"), "orphaned slug should appear");
         assert!(result.contains("path unknown"), "orphaned slug should have placeholder text");
     }
@@ -274,7 +323,7 @@ mod tests {
         // Simulate a ghost entry: empty slug from a pruned worktree
         active_slugs.insert("".to_string());
 
-        let result = list_roots_from_slugs(&repo, &active_slugs, None, None);
+        let result = list_roots_from_slugs(&repo, &active_slugs, None, None, None);
         // Empty slug must never appear as a root line "- ****: (path unknown ...)"
         assert!(!result.contains("- ****: (path unknown"), "empty slug should be excluded from output");
     }
@@ -287,7 +336,7 @@ mod tests {
         active_slugs.insert("".to_string());
         active_slugs.insert("real-orphan-zzz".to_string());
 
-        let result = list_roots_from_slugs(&repo, &active_slugs, None, None);
+        let result = list_roots_from_slugs(&repo, &active_slugs, None, None, None);
         assert!(!result.contains("- ****: (path unknown"), "empty slug should be excluded");
         assert!(result.contains("real-orphan-zzz"), "real orphan slug should still appear");
     }
@@ -299,7 +348,7 @@ mod tests {
         let mut active_slugs = std::collections::HashSet::new();
         active_slugs.insert("external".to_string());
 
-        let result = list_roots_from_slugs(&repo, &active_slugs, None, None);
+        let result = list_roots_from_slugs(&repo, &active_slugs, None, None, None);
         // "external" is filtered out; with nothing else the result reports 0 roots
         // or the fallback fires. Either way "external" must not appear as a root.
         assert!(!result.contains("**external**"), "external pseudo-slug should be excluded");
@@ -315,7 +364,7 @@ mod tests {
         let mut active_slugs = std::collections::HashSet::new();
         active_slugs.insert("definitely-not-primary-zzz".to_string());
 
-        let result = list_roots_from_slugs(&repo, &active_slugs, None, None);
+        let result = list_roots_from_slugs(&repo, &active_slugs, None, None, None);
         // The placeholder line for the orphaned slug should appear.
         assert!(result.contains("definitely-not-primary-zzz"), "non-primary orphan slug should appear");
         // The primary root slug (repo-native-alignment or similar) should NOT appear
@@ -342,7 +391,7 @@ mod tests {
         active_slugs.insert(primary_slug.clone());
         active_slugs.insert("external".to_string());
 
-        let result = list_roots_from_slugs(&repo, &active_slugs, None, None);
+        let result = list_roots_from_slugs(&repo, &active_slugs, None, None, None);
         // external should be excluded, primary should appear
         assert!(!result.contains("**external**"), "external should be excluded");
         assert!(result.contains(&primary_slug), "primary slug should appear");
@@ -359,7 +408,7 @@ mod tests {
         active_slugs.insert("external".to_string());
         active_slugs.insert("only-real-zzz".to_string());
 
-        let result = list_roots_from_slugs(&repo, &active_slugs, None, None);
+        let result = list_roots_from_slugs(&repo, &active_slugs, None, None, None);
         assert!(!result.contains("- ****: (path unknown"), "empty slug must be excluded");
         assert!(!result.contains("**external**"), "external must be excluded");
         assert!(result.contains("only-real-zzz"), "real orphan must appear");
@@ -444,7 +493,7 @@ mod tests {
         let edges = vec![make_edge_for_root(&primary_slug)];
         let gs = make_test_graph_state(nodes, edges);
 
-        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None);
+        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None, None);
         assert!(result.contains("Last scan:"), "should show scan line, got: {}", result);
         assert!(result.contains("2 symbols"), "should show 2 symbols, got: {}", result);
         assert!(result.contains("1 edges"), "should show 1 edge, got: {}", result);
@@ -454,7 +503,7 @@ mod tests {
     #[test]
     fn test_list_roots_from_slugs_without_stats() {
         let repo = std::env::current_dir().unwrap();
-        let result = list_roots_from_slugs(&repo, &std::collections::HashSet::new(), None, None);
+        let result = list_roots_from_slugs(&repo, &std::collections::HashSet::new(), None, None, None);
         assert!(!result.contains("Last scan:"), "no stats line without graph_state, got: {}", result);
         assert!(!result.contains("symbols"), "no symbol count without graph_state, got: {}", result);
     }
@@ -477,7 +526,7 @@ mod tests {
         active_slugs.insert(primary_slug.clone());
 
         let gs = make_test_graph_state(vec![], vec![]);
-        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None);
+        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None, None);
         assert!(result.contains("not yet scanned"), "should show not yet scanned, got: {}", result);
         assert!(result.contains("0 symbols"), "should show 0 symbols, got: {}", result);
     }
@@ -506,7 +555,7 @@ mod tests {
         lsp.set_server_name("rust-analyzer");
         lsp.set_complete(8410);
 
-        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), Some(&lsp));
+        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), Some(&lsp), None);
         assert!(result.contains("LSP: rust-analyzer"), "should show LSP server, got: {}", result);
         assert!(result.contains("8,410 edges"), "should show edge count with commas, got: {}", result);
     }
@@ -553,7 +602,7 @@ mod tests {
         let ts_langs: std::collections::HashSet<String> = ["typescript".to_string()].into();
         assert!(lsp_server_relevant_for_languages("typescript-language-server", &ts_langs));
 
-        let _ = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), Some(&lsp));
+        let _ = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), Some(&lsp), None);
     }
 
     /// format_count produces comma-separated thousands.
@@ -591,7 +640,7 @@ mod tests {
         let nodes = vec![make_node_for_root("other-root-xyz", "rust")];
         let gs = make_test_graph_state(nodes, vec![]);
 
-        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None);
+        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None, None);
         assert!(result.contains("0 symbols"), "root with no nodes should show 0 symbols, got: {}", result);
         assert!(result.contains("0 edges"), "root with no edges should show 0 edges, got: {}", result);
     }
@@ -620,7 +669,7 @@ mod tests {
         let lsp = crate::server::state::LspEnrichmentStatus::default();
         lsp.set_complete(100); // Complete but no server_name set
 
-        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), Some(&lsp));
+        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), Some(&lsp), None);
         // Should not show "LSP:  (100 edges)" with empty server name.
         // The if let Some(ref name) guard prevents this.
         assert!(!result.contains("LSP:  ("), "should not show LSP line with empty server name, got: {}", result);
@@ -649,7 +698,7 @@ mod tests {
         let lsp = crate::server::state::LspEnrichmentStatus::default();
         lsp.set_unavailable(); // All servers unavailable
 
-        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), Some(&lsp));
+        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), Some(&lsp), None);
         // When LSP unavailable and no relevant missing servers: show "LSP: none detected".
         // (missing_servers is empty since we used default(), not probe_for_servers())
         assert!(result.contains("LSP: none detected"), "should show 'LSP: none detected' when unavailable, got: {}", result);
@@ -693,7 +742,7 @@ mod tests {
         };
         let gs = make_test_graph_state(nodes, vec![cross_edge]);
 
-        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None);
+        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None, None);
         // Cross-root edge counted under primary_slug (from.root == primary_slug).
         assert!(result.contains("1 edges"), "cross-root edge should be counted under from-root, got: {}", result);
     }
