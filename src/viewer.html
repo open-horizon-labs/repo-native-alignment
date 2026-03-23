@@ -62,7 +62,7 @@
     <span><span class="legend-dot" style="background:#e8a44a"></span>module/file</span>
     <span><span class="legend-dot" style="background:#5bc87e"></span>function</span>
     <span><span class="legend-dot" style="background:#c85bb8"></span>struct/type</span>
-    <span><span class="legend-dot" style="background:#e85b5b"></span>external</span>
+    <span><span class="legend-dot" style="background:#e85b5b"></span>framework/external</span>
   </div>
 </div>
 <div id="controls">
@@ -223,42 +223,147 @@ function parseRepoMap(text) {
   const seenIds = new Set();
 
   const subsysSection = text.match(/## Subsystems[\s\S]*?(?=\n## |$)/);
-  if (!subsysSection) return { nodes, edges };
+  if (subsysSection) {
+    const subsysLines = subsysSection[0].split('\n');
+    let currentSubsystem = null;
 
-  const subsysLines = subsysSection[0].split('\n');
-  let currentSubsystem = null;
-
-  for (const line of subsysLines) {
-    // Match subsystem header: "- **name** (N symbols, cohesion: X.XX)"
-    const subsysMatch = line.match(/^- \*\*(.+?)\*\* \((\d+) symbols/);
-    if (subsysMatch) {
-      const name = subsysMatch[1];
-      const symbolCount = parseInt(subsysMatch[2], 10);
-      const id = 'subsystem:' + name;
-      if (!seenIds.has(id)) {
-        seenIds.add(id);
-        nodes.push({ id, label: name, kind: 'subsystem', size: Math.max(28, Math.min(60, 20 + symbolCount / 100)), color: nodeColor('subsystem', null), symbolCount });
-      }
-      currentSubsystem = id;
-      continue;
-    }
-    // Match sub-modules line: "  Sub-modules: a (N), b (N), ..."
-    const submodMatch = line.match(/^\s+Sub-modules:\s+(.+)/);
-    if (submodMatch && currentSubsystem) {
-      const mods = submodMatch[1].split(',').map(s => s.trim());
-      for (const m of mods.slice(0, 8)) { // cap displayed sub-modules
-        const mname = m.replace(/\s*\(\d+\)$/, '').trim();
-        if (!mname) continue;
-        const mid = currentSubsystem + '/' + mname;
-        if (!seenIds.has(mid)) {
-          seenIds.add(mid);
-          nodes.push({ id: mid, label: mname, kind: 'module', size: 18, color: nodeColor('module', null), parent: currentSubsystem });
+    for (const line of subsysLines) {
+      // Match subsystem header: "- **name** (N symbols, cohesion: X.XX)"
+      const subsysMatch = line.match(/^- \*\*(.+?)\*\* \((\d+) symbols/);
+      if (subsysMatch) {
+        const name = subsysMatch[1];
+        const symbolCount = parseInt(subsysMatch[2], 10);
+        const id = 'subsystem:' + name;
+        if (!seenIds.has(id)) {
+          seenIds.add(id);
+          nodes.push({ id, label: name, kind: 'subsystem', size: Math.max(28, Math.min(60, 20 + symbolCount / 100)), color: nodeColor('subsystem', null), symbolCount });
         }
-        edges.push({ source: currentSubsystem, target: mid, label: 'contains' });
+        currentSubsystem = id;
+        continue;
+      }
+      // Match sub-modules line: "  Sub-modules: a (N), b (N), ..."
+      const submodMatch = line.match(/^\s+Sub-modules:\s+(.+)/);
+      if (submodMatch && currentSubsystem) {
+        const mods = submodMatch[1].split(',').map(s => s.trim());
+        for (const m of mods.slice(0, 8)) { // cap displayed sub-modules
+          const mname = m.replace(/\s*\(\d+\)$/, '').trim();
+          if (!mname) continue;
+          const mid = currentSubsystem + '/' + mname;
+          if (!seenIds.has(mid)) {
+            seenIds.add(mid);
+            nodes.push({ id: mid, label: mname, kind: 'module', size: 18, color: nodeColor('module', null), parent: currentSubsystem });
+          }
+          edges.push({ source: currentSubsystem, target: mid, label: 'contains' });
+        }
       }
     }
   }
+
+  // ── Fallback: parse Hotspot files and Entry points when no subsystems found ──
+  if (nodes.length === 0) {
+    // Hotspot files: "- `path/to/file.rs` -- N definitions"
+    const hotspotSection = text.match(/## Hotspot files[\s\S]*?(?=\n## |$)/i);
+    if (hotspotSection) {
+      for (const line of hotspotSection[0].split('\n')) {
+        const m = line.match(/^- `([^`]+)` -- (\d+) definitions/);
+        if (m) {
+          const filePath = m[1];
+          const defCount = parseInt(m[2], 10);
+          const id = 'file:' + filePath;
+          if (!seenIds.has(id)) {
+            seenIds.add(id);
+            // Use the last two path segments as the label to keep it readable
+            const parts = filePath.replace(/\\/g, '/').split('/');
+            const label = parts.slice(-2).join('/');
+            nodes.push({ id, label, kind: 'module', size: Math.max(18, Math.min(36, 14 + defCount / 5)), color: nodeColor('module', null) });
+          }
+        }
+      }
+    }
+
+    // Entry points: "- **name** `file`:start-end"
+    const entrySection = text.match(/## Entry points[\s\S]*?(?=\n## |$)/i);
+    if (entrySection) {
+      for (const line of entrySection[0].split('\n')) {
+        const m = line.match(/^- \*\*([^*]+)\*\* `([^`]+)`/);
+        if (m) {
+          const fnName = m[1];
+          const filePath = m[2].split(':')[0]; // strip line numbers
+          const id = 'entry:' + filePath + ':' + fnName;
+          if (!seenIds.has(id)) {
+            seenIds.add(id);
+            nodes.push({ id, label: fnName + '()', kind: 'function', size: 20, color: nodeColor('function', null) });
+          }
+          // Link entry point to its file node if present
+          const fileId = 'file:' + filePath;
+          if (seenIds.has(fileId)) {
+            edges.push({ source: fileId, target: id, label: 'defines' });
+          }
+        }
+      }
+    }
+  }
+
   return { nodes, edges };
+}
+
+// ── Load framework nodes from the graph and merge them into the view ─────────
+
+async function loadFrameworks(signal) {
+  let text;
+  try {
+    text = await callTool('search', { kind: 'framework', limit: 20, compact: true }, signal);
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      console.warn('Framework search failed (non-fatal):', e.message);
+    }
+    return 0;
+  }
+  if (!text) return 0;
+
+  const newNodes = [];
+  const newEdges = [];
+  const seenIds = new Set(cy.nodes().map(n => n.id()));
+
+  // Compact search output lines: "- **name** `stable_id` ..."
+  for (const line of text.split('\n')) {
+    const m = line.match(/`([^`]+:[^`]+:[^`]+:[^`]+)`/);
+    if (!m) continue;
+    const stableId = m[1];
+    if (seenIds.has(stableId)) continue;
+    seenIds.add(stableId);
+
+    const parts = stableId.split(':');
+    const name = parts.length >= 3 ? parts[parts.length - 2] : stableId;
+
+    newNodes.push({
+      data: {
+        id: stableId,
+        label: name,
+        kind: 'framework',
+        size: 32,
+        color: '#e85b5b',
+      }
+    });
+
+    // Draw UsesFramework edges to any file/subsystem nodes already in the graph
+    cy.nodes().forEach(existing => {
+      const existingId = existing.id();
+      // Heuristic: connect to subsystem/file nodes (not other frameworks, not entry points)
+      if (existingId.startsWith('subsystem:') || existingId.startsWith('file:')) {
+        const edgeId = existingId + '->uses->' + stableId;
+        if (!cy.getElementById(edgeId).length) {
+          newEdges.push({ data: { id: edgeId, source: existingId, target: stableId, label: 'uses' } });
+        }
+      }
+    });
+  }
+
+  if (newNodes.length > 0) {
+    cy.add([...newNodes, ...newEdges]);
+    runLayout(document.getElementById('layout-select').value);
+  }
+  return newNodes.length;
 }
 
 // ── Layout runner ────────────────────────────────────────────────────────────
@@ -291,9 +396,16 @@ async function loadRepoMap() {
     document.getElementById('repo-label').textContent = firstLine.replace(/^#+\s*/, '');
 
     const { nodes, edges } = parseRepoMap(text);
+
     if (nodes.length === 0) {
-      setStatus('No subsystem data found in repo_map output.');
-      setSidebarContent('Repository Map', '<pre>' + escapeHtml(text) + '</pre>');
+      // No subsystems and no fallback nodes either — load frameworks as last resort
+      setStatus('No structural data in repo_map; loading framework nodes...');
+      const fwCount = await loadFrameworks(signal);
+      if (fwCount === 0) {
+        setStatus('No graph data available yet. Run `rna scan` on this repo first.');
+      } else {
+        setStatus(`Loaded ${fwCount} framework nodes. Run a search to explore the graph.`);
+      }
       return;
     }
 
@@ -303,7 +415,17 @@ async function loadRepoMap() {
     cy.elements().remove();
     cy.add([...cyNodes, ...cyEdges]);
     runLayout(document.getElementById('layout-select').value);
-    setStatus(`Loaded ${nodes.length} nodes, ${edges.length} edges from repo_map.`);
+
+    // Always try to augment with framework nodes (non-blocking)
+    const subsysCount = (text.match(/## Subsystems/) ? 1 : 0);
+    if (subsysCount === 0) {
+      // Fallback path: also load frameworks to enrich the hotspot/entry-point view
+      setStatus(`Loaded ${nodes.length} nodes from hotspot/entry-point fallback. Fetching frameworks...`);
+      const fwCount = await loadFrameworks(signal);
+      setStatus(`Loaded ${nodes.length} nodes, ${edges.length} edges (fallback). ${fwCount > 0 ? fwCount + ' framework nodes added.' : ''}`);
+    } else {
+      setStatus(`Loaded ${nodes.length} nodes, ${edges.length} edges from repo_map.`);
+    }
   } catch (e) {
     if (e.name === 'AbortError') return; // superseded by a newer request
     setStatus('Error: ' + e.message);
