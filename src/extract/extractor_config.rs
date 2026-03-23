@@ -222,15 +222,35 @@ pub fn extractor_config_pass_with_configs(
     // matching (imports_contain is a substring test, not an exact match).
     // A Vec is fine here because there are rarely more than ~100 imports per
     // codebase and the configs loop is short.
+    //
+    // For Python `from X import Y` style imports the raw text is
+    // `"from google.cloud import pubsub_v1"` — the dots are broken by a space
+    // so `"google.cloud.pubsub"` would NOT be a substring of the raw text.
+    // We synthesize `X.Y` (e.g. `"google.cloud.pubsub_v1"`) and add it as an
+    // additional candidate so that prefix/substring patterns like
+    // `"google.cloud.pubsub"` match correctly.
     // -----------------------------------------------------------------------
     let import_texts: Vec<String> = all_nodes
         .iter()
         .filter(|n| n.id.kind == NodeKind::Import)
         .flat_map(|n| {
             // Collect both name and body; the caller checks if either contains the target.
-            [n.id.name.clone(), n.body.clone()]
+            let mut texts: Vec<String> = [n.id.name.as_str(), n.body.as_str()]
+                .iter()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            // Synthesize dotted module paths for `from X import Y1, Y2` style imports.
+            // This lets `imports_contain = "google.cloud.pubsub"` match
+            // `from google.cloud import pubsub_v1` by producing
+            // the candidate `"google.cloud.pubsub_v1"`.
+            let synthetics: Vec<String> = texts
+                .iter()
+                .flat_map(|t| synthesize_from_import_paths(t))
+                .collect();
+            texts.extend(synthetics);
+            texts
         })
-        .filter(|s| !s.is_empty())
         .collect();
 
     // -----------------------------------------------------------------------
@@ -602,6 +622,64 @@ fn extract_nth_arg_quoted_from_open(at_paren: &str, n: usize) -> Option<String> 
 }
 
 // ---------------------------------------------------------------------------
+// Import path synthesis
+// ---------------------------------------------------------------------------
+
+/// Synthesize dotted module paths from `from X import Y1, Y2` style import text.
+///
+/// Python's `from google.cloud import pubsub_v1` has a raw text form that does
+/// NOT contain `"google.cloud.pubsub_v1"` as a substring — the space before
+/// `import` breaks the dot-separated path. This function produces the synthetic
+/// `"google.cloud.pubsub_v1"` string so that `imports_contain = "google.cloud.pubsub"`
+/// can match via substring.
+///
+/// Also handles `from X import Y1, Y2` → `["X.Y1", "X.Y2"]`.
+///
+/// Returns an empty `Vec` for any import text that does not match the
+/// `from ... import ...` pattern (e.g., bare `import os`).
+fn synthesize_from_import_paths(import_text: &str) -> Vec<String> {
+    // Normalize whitespace so the pattern matching is robust.
+    let text = import_text.trim();
+
+    // Match `from <module> import <names>` (case-sensitive; Python only uses lowercase).
+    // We also strip a leading `from ` (with space).
+    let rest = match text.strip_prefix("from ") {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+
+    // Split on ` import ` (with spaces) to separate module from imported names.
+    let (module_part, names_part) = match rest.split_once(" import ") {
+        Some(pair) => pair,
+        None => return Vec::new(),
+    };
+
+    let module = module_part.trim();
+    if module.is_empty() {
+        return Vec::new();
+    }
+
+    // The names part may be `Y`, `Y1, Y2`, `(Y1, Y2)`, or `*`.
+    // Strip optional parentheses.
+    let names_raw = names_part.trim().trim_matches(|c| c == '(' || c == ')');
+
+    names_raw
+        .split(',')
+        .map(|name| {
+            let n = name.trim();
+            // Strip `as alias` clauses: `pubsub_v1 as ps` → `pubsub_v1`.
+            let n = n.split_whitespace().next().unwrap_or(n);
+            if n.is_empty() || n == "*" {
+                String::new()
+            } else {
+                format!("{}.{}", module, n)
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -807,6 +885,116 @@ decorator = true
         assert!(
             result.edges.is_empty(),
             "Language mismatch → no edges (got {:?})",
+            result.edges
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // synthesize_from_import_paths unit tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_synthesize_simple_from_import() {
+        let result = synthesize_from_import_paths("from google.cloud import pubsub_v1");
+        assert_eq!(result, vec!["google.cloud.pubsub_v1"]);
+    }
+
+    #[test]
+    fn test_synthesize_multiple_names() {
+        let mut result = synthesize_from_import_paths("from os.path import join, exists");
+        result.sort();
+        assert_eq!(result, vec!["os.path.exists", "os.path.join"]);
+    }
+
+    #[test]
+    fn test_synthesize_with_alias() {
+        let result = synthesize_from_import_paths("from google.cloud import pubsub_v1 as ps");
+        assert_eq!(result, vec!["google.cloud.pubsub_v1"]);
+    }
+
+    #[test]
+    fn test_synthesize_with_parens() {
+        let mut result = synthesize_from_import_paths("from os.path import (join, exists)");
+        result.sort();
+        assert_eq!(result, vec!["os.path.exists", "os.path.join"]);
+    }
+
+    #[test]
+    fn test_synthesize_star_import_skipped() {
+        let result = synthesize_from_import_paths("from os import *");
+        assert!(result.is_empty(), "star imports should produce no synthetic paths");
+    }
+
+    #[test]
+    fn test_synthesize_bare_import_returns_empty() {
+        let result = synthesize_from_import_paths("import google.cloud.pubsub_v1");
+        assert!(
+            result.is_empty(),
+            "bare import should produce no synthetic paths, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_synthesize_unrelated_text_returns_empty() {
+        assert!(synthesize_from_import_paths("def foo(): pass").is_empty());
+        assert!(synthesize_from_import_paths("").is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // applies_when gating — from X import Y style (the bug this PR fixes)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_matches_when_import_uses_from_x_import_y_style() {
+        // The real-world pattern: `from google.cloud import pubsub_v1`
+        // imports_contain = "google.cloud.pubsub" — prefix of the synthesized path.
+        let cfg = pubsub_fixture_config();
+        let import = make_import(
+            "repo",
+            "python",
+            "from google.cloud import pubsub_v1",
+            "from google.cloud import pubsub_v1",
+        );
+        let fn_node = make_fn(
+            "repo",
+            "python",
+            "src/publisher.py",
+            "publish_message",
+            r#"def publish_message(topic, data):
+    publisher.publish("orders", data.encode())"#,
+        );
+        let result = extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
+        assert_eq!(
+            result.edges.len(),
+            1,
+            "from X import Y should match via synthesized dotted path (got {:?})",
+            result.edges
+        );
+        assert_eq!(result.edges[0].kind, EdgeKind::Produces);
+    }
+
+    #[test]
+    fn test_still_skips_unrelated_from_import() {
+        // `from boto3 import client` must NOT match `imports_contain = "google.cloud.pubsub"`.
+        let cfg = pubsub_fixture_config();
+        let import = make_import(
+            "repo",
+            "python",
+            "from boto3 import client",
+            "from boto3 import client",
+        );
+        let fn_node = make_fn(
+            "repo",
+            "python",
+            "src/publisher.py",
+            "publish_message",
+            r#"publisher.publish("orders", data)"#,
+        );
+        let result = extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
+        assert!(
+            result.edges.is_empty(),
+            "unrelated from-import should not match (got {:?})",
             result.edges
         );
     }
