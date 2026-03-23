@@ -275,7 +275,8 @@ function parseRepoMap(text) {
             // Use the last two path segments as the label to keep it readable
             const parts = filePath.replace(/\\/g, '/').split('/');
             const label = parts.slice(-2).join('/');
-            nodes.push({ id, label, kind: 'module', size: Math.max(18, Math.min(36, 14 + defCount / 5)), color: nodeColor('module', null) });
+            // synthetic: true — id uses 'file:' prefix, not a real backend stable ID
+            nodes.push({ id, label, kind: 'module', size: Math.max(18, Math.min(36, 14 + defCount / 5)), color: nodeColor('module', null), synthetic: true });
           }
         }
       }
@@ -292,15 +293,18 @@ function parseRepoMap(text) {
           const id = 'entry:' + filePath + ':' + fnName;
           if (!seenIds.has(id)) {
             seenIds.add(id);
-            nodes.push({ id, label: fnName + '()', kind: 'function', size: 20, color: nodeColor('function', null) });
+            // synthetic: true — id uses 'entry:' prefix, not a real backend stable ID
+            nodes.push({ id, label: fnName + '()', kind: 'function', size: 20, color: nodeColor('function', null), synthetic: true });
           }
-          // Materialize a file node if it wasn't in the hotspot top-N
+          // Materialize a file node if it wasn't in the hotspot top-N.
+          // Mark as synthetic so the click handler uses a query search instead of
+          // a node-ID lookup (synthetic IDs don't match backend stable IDs).
           const fileId = 'file:' + filePath;
           if (!seenIds.has(fileId)) {
             const parts = filePath.replace(/\\/g, '/').split('/');
             const label = parts.slice(-2).join('/');
             seenIds.add(fileId);
-            nodes.push({ id: fileId, label, kind: 'module', size: 18, color: nodeColor('module', null) });
+            nodes.push({ id: fileId, label, kind: 'module', size: 18, color: nodeColor('module', null), synthetic: true });
           }
           edges.push({ source: fileId, target: id, label: 'defines' });
         }
@@ -402,7 +406,7 @@ async function loadRepoMap() {
       return;
     }
 
-    const cyNodes = nodes.map(n => ({ data: { id: n.id, label: n.label, kind: n.kind, size: n.size, color: n.color } }));
+    const cyNodes = nodes.map(n => ({ data: { id: n.id, label: n.label, kind: n.kind, size: n.size, color: n.color, synthetic: n.synthetic || false } }));
     const cyEdges = edges.map((e, i) => ({ data: { id: 'e' + i, source: e.source, target: e.target, label: e.label } }));
 
     cy.elements().remove();
@@ -456,18 +460,31 @@ cy.on('tap', 'node', async function(evt) {
   setStatus('Fetching neighbors for: ' + id);
 
   try {
-    const text = await callTool('search', {
-      node: id,
-      mode: 'neighbors',
-      direction: 'both',
-      depth: 1,
-      limit: 30,
-      compact: true,
-    }, signal);
-
-    setSidebarContent('Neighbors: ' + node.data('label'), '<pre>' + escapeHtml(text) + '</pre>');
-    expandNeighborsIntoGraph(id, text);
-    setStatus('Showing neighbors of: ' + node.data('label'));
+    let text;
+    if (node.data('synthetic')) {
+      // Synthetic nodes use display-only IDs that the backend doesn't know.
+      // Fall back to a keyword search on the node label so the user still gets
+      // useful results, but don't attempt graph expansion from a fake ID.
+      text = await callTool('search', {
+        query: node.data('label').replace(/\(\)$/, ''), // strip trailing () from fn names
+        limit: 20,
+        compact: true,
+      }, signal);
+      setSidebarContent('Search: ' + node.data('label'), '<pre>' + escapeHtml(text) + '</pre>');
+      setStatus('Search results for: ' + node.data('label') + ' (synthetic node — use search bar to explore)');
+    } else {
+      text = await callTool('search', {
+        node: id,
+        mode: 'neighbors',
+        direction: 'both',
+        depth: 1,
+        limit: 30,
+        compact: true,
+      }, signal);
+      setSidebarContent('Neighbors: ' + node.data('label'), '<pre>' + escapeHtml(text) + '</pre>');
+      expandNeighborsIntoGraph(id, text);
+      setStatus('Showing neighbors of: ' + node.data('label'));
+    }
   } catch (e) {
     if (e.name === 'AbortError') return;
     setSidebarContent('Error', '<pre>' + escapeHtml(e.message) + '</pre>');
