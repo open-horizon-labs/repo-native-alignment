@@ -348,7 +348,7 @@ fn derive_app_router_path(rel: &str) -> String {
     // Convert directory segments: [id] → {id}, [...slug] → {slug}
     let segments: Vec<String> = dir_part
         .split('/')
-        .map(|seg| convert_nextjs_segment(seg))
+        .map(convert_nextjs_segment)
         .collect();
 
     format!("/{}", segments.join("/"))
@@ -452,16 +452,12 @@ fn derive_pages_router_path(rel: &str) -> String {
     }
 
     // Handle "index" files: pages/api/index.ts → /api
-    let path_part = if without_ext.ends_with("/index") {
-        &without_ext[..without_ext.len() - "/index".len()]
-    } else {
-        &without_ext
-    };
+    let path_part = without_ext.strip_suffix("/index").unwrap_or(without_ext);
 
     // Convert dynamic segments
     let segments: Vec<String> = path_part
         .split('/')
-        .map(|seg| convert_nextjs_segment(seg))
+        .map(convert_nextjs_segment)
         .collect();
 
     format!("/{}", segments.join("/"))
@@ -586,8 +582,8 @@ pub fn find_exported_http_methods(content: &str) -> Vec<MethodBinding> {
                     j += 1;
                 }
                 // Extract the inner content of `{ … }`
-                if let (Some(open), Some(close)) = (block.find('{'), block.rfind('}')) {
-                    if open < close {
+                if let (Some(open), Some(close)) = (block.find('{'), block.rfind('}'))
+                    && open < close {
                         let inner = &block[open + 1..close];
                         for item in inner.split(',') {
                             let item = item.trim().trim_end_matches(',').trim();
@@ -612,7 +608,6 @@ pub fn find_exported_http_methods(content: &str) -> Vec<MethodBinding> {
                             }
                         }
                     }
-                }
             }
         }
         i += 1;

@@ -428,8 +428,8 @@ impl RnaHandler {
                     let cached_nodes = cached_nodes_by_root.remove(root_slug);
                     let cached_edges = cached_edges_by_root.remove(root_slug);
 
-                    if let Some(nodes) = cached_nodes {
-                        if !nodes.is_empty() {
+                    if let Some(nodes) = cached_nodes
+                        && !nodes.is_empty() {
                             let edges = cached_edges.unwrap_or_default();
                             tracing::info!(
                                 "Clean root '{}': loaded {} nodes, {} edges from cache (preserving LSP edges)",
@@ -441,7 +441,6 @@ impl RnaHandler {
                             all_edges.extend(edges);
                             continue;
                         }
-                    }
                     // Fall through to full extract if cache had no nodes for this root
                     tracing::info!(
                         "Clean root '{}': no cached nodes found, extracting fresh",
@@ -482,8 +481,8 @@ impl RnaHandler {
             // are produced by the background enricher and would otherwise be lost on
             // every incremental rebuild.
             let mut lsp_carry_count = 0usize;
-            if *root_changed && has_cached_graph {
-                if let Some(cached_edges) = cached_edges_by_root.remove(root_slug) {
+            if *root_changed && has_cached_graph
+                && let Some(cached_edges) = cached_edges_by_root.remove(root_slug) {
                     let node_ids: std::collections::HashSet<String> = extraction.nodes
                         .iter()
                         .map(|n| n.stable_id())
@@ -506,7 +505,6 @@ impl RnaHandler {
                         }
                     }
                 }
-            }
 
             tracing::info!(
                 "Extracted from '{}'{}: {} nodes, {} edges{}",
@@ -676,8 +674,8 @@ impl RnaHandler {
                     *name_counts.entry(s.name.clone()).or_default() += 1;
                 }
                 for s in &mut subsystems {
-                    if name_counts.get(&s.name).copied().unwrap_or(0) > 1 {
-                        if let Some(iface) = s.interfaces.first() {
+                    if name_counts.get(&s.name).copied().unwrap_or(0) > 1
+                        && let Some(iface) = s.interfaces.first() {
                             let short = iface
                                 .node_id
                                 .split(':')
@@ -686,7 +684,6 @@ impl RnaHandler {
                                 .unwrap_or(&iface.node_id);
                             s.name = format!("{}/{}", s.name, short);
                         }
-                    }
                 }
             }
             // Build node_id -> subsystem_name lookup
@@ -967,7 +964,7 @@ impl RnaHandler {
 
         graph
             .nodes
-            .retain(|n| !files_to_remove.iter().any(|f| n.id.file == *f));
+            .retain(|n| !files_to_remove.contains(&n.id.file));
         graph.edges.retain(|e| {
             !files_to_remove
                 .iter()
@@ -1182,8 +1179,8 @@ impl RnaHandler {
                     *name_counts.entry(s.name.clone()).or_default() += 1;
                 }
                 for s in &mut subsystems {
-                    if name_counts.get(&s.name).copied().unwrap_or(0) > 1 {
-                        if let Some(iface) = s.interfaces.first() {
+                    if name_counts.get(&s.name).copied().unwrap_or(0) > 1
+                        && let Some(iface) = s.interfaces.first() {
                             let short = iface
                                 .node_id
                                 .split(':')
@@ -1192,7 +1189,6 @@ impl RnaHandler {
                                 .unwrap_or(&iface.node_id);
                             s.name = format!("{}/{}", s.name, short);
                         }
-                    }
                 }
             }
             let mut node_subsystem: std::collections::HashMap<String, String> =
@@ -1372,11 +1368,10 @@ impl RnaHandler {
         // Commit fallback scanner state only after successful persist.
         // If persist failed, scanner state is left uncommitted so the next scan
         // re-detects the same changes and retries the LanceDB write.
-        if persist_succeeded {
-            if let Some(scanner) = fallback_scanner {
+        if persist_succeeded
+            && let Some(scanner) = fallback_scanner {
                 scanner.commit_state()?;
             }
-        }
 
         graph.last_scan_completed_at = Some(std::time::Instant::now());
 

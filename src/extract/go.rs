@@ -21,6 +21,12 @@ use super::{ExtractionResult, Extractor};
 /// Go tree-sitter extractor.
 pub struct GoExtractor;
 
+impl Default for GoExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GoExtractor {
     pub fn new() -> Self {
         Self
@@ -94,11 +100,10 @@ fn collect_go_specials_walk(
         "const_declaration" => {
             // Go const declarations: const X = 5 or const (X = 5; Y = "hello")
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
-                    if child.kind() == "const_spec" {
+                if let Some(child) = node.child(i as u32)
+                    && child.kind() == "const_spec" {
                         extract_go_const_spec(child, path, source, nodes);
                     }
-                }
             }
             return; // Don't recurse into children we already handled
         }
@@ -112,11 +117,10 @@ fn collect_go_specials_walk(
                         extract_go_var_spec(child, path, source, nodes);
                     } else if child.kind() == "var_spec_list" {
                         for j in 0..child.child_count() {
-                            if let Some(spec) = child.child(j as u32) {
-                                if spec.kind() == "var_spec" {
+                            if let Some(spec) = child.child(j as u32)
+                                && spec.kind() == "var_spec" {
                                     extract_go_var_spec(spec, path, source, nodes);
                                 }
-                            }
                         }
                     }
                 }
@@ -126,11 +130,10 @@ fn collect_go_specials_walk(
         "type_declaration" => {
             // type_declaration contains type_spec children
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
-                    if child.kind() == "type_spec" {
+                if let Some(child) = node.child(i as u32)
+                    && child.kind() == "type_spec" {
                         extract_type_spec(child, path, source, nodes, edges);
                     }
-                }
             }
             return; // Don't recurse into children we already handled
         }
@@ -144,12 +147,11 @@ fn collect_go_specials_walk(
                 if let Some(child) = node.child(i as u32) {
                     if child.kind() == "import_spec_list" {
                         for j in 0..child.child_count() {
-                            if let Some(spec) = child.child(j as u32) {
-                                if spec.kind() == "import_spec" {
+                            if let Some(spec) = child.child(j as u32)
+                                && spec.kind() == "import_spec" {
                                     extract_import_spec(spec, path, source, nodes, edges);
                                     found_specs = true;
                                 }
-                            }
                         }
                     } else if child.kind() == "import_spec" {
                         extract_import_spec(child, path, source, nodes, edges);
@@ -418,11 +420,10 @@ fn extract_type_spec(
         });
 
         // For interfaces, extract method_spec children as Function nodes.
-        if kind == NodeKind::Trait {
-            if let Some(type_body) = type_node {
+        if kind == NodeKind::Trait
+            && let Some(type_body) = type_node {
                 extract_interface_methods(type_body, path, source, &name_str, nodes, edges);
             }
-        }
     }
 }
 
@@ -436,8 +437,8 @@ fn extract_interface_methods(
     edges: &mut Vec<Edge>,
 ) {
     for i in 0..interface_node.child_count() {
-        if let Some(child) = interface_node.child(i as u32) {
-            if child.kind() == "method_elem" || child.kind() == "method_spec" {
+        if let Some(child) = interface_node.child(i as u32)
+            && (child.kind() == "method_elem" || child.kind() == "method_spec") {
                 let method_name = child
                     .child_by_field_name("name")
                     .and_then(|n| n.utf8_text(source).ok())
@@ -489,7 +490,6 @@ fn extract_interface_methods(
                     confidence: Confidence::Detected,
                 });
             }
-        }
     }
 }
 

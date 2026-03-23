@@ -285,13 +285,11 @@ pub(crate) fn extract_method_call_sites(body: &str) -> HashSet<&str> {
             if j < end {
                 // Only collect if preceded by '.' (method call).
                 let prev = if j > 0 { bytes[j - 1] } else { 0 };
-                if prev == b'.' {
-                    if let Ok(ident) = std::str::from_utf8(&bytes[j..end]) {
-                        if ident.len() >= 3 {
+                if prev == b'.'
+                    && let Ok(ident) = std::str::from_utf8(&bytes[j..end])
+                        && ident.len() >= 3 {
                             result.insert(ident);
                         }
-                    }
-                }
             }
         }
         i += 1;

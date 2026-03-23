@@ -22,6 +22,12 @@ use super::{ExtractionResult, Extractor};
 /// Also emits hierarchy, frontmatter reference, and cross-file link edges.
 pub struct MarkdownExtractor;
 
+impl Default for MarkdownExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MarkdownExtractor {
     pub fn new() -> Self {
         Self
@@ -106,7 +112,7 @@ impl Extractor for MarkdownExtractor {
             // or to the first non-frontmatter chunk if there's no frontmatter chunk.
             let attach_frontmatter = if chunk.is_frontmatter {
                 true
-            } else if i == 0 || (i == 1 && chunks.first().map_or(false, |c| c.is_frontmatter)) {
+            } else if i == 0 || (i == 1 && chunks.first().is_some_and(|c| c.is_frontmatter)) {
                 // First non-frontmatter chunk: attach frontmatter for backward compat
                 !frontmatter.is_empty()
             } else {
@@ -185,8 +191,8 @@ fn emit_hierarchy_edges(nodes: &[Node], edges: &mut Vec<Edge>) {
         .collect();
 
     for node in nodes {
-        if let Some(parent_text) = node.metadata.get("parent_heading") {
-            if let Some(parent_id) = heading_to_node.get(parent_text.as_str()) {
+        if let Some(parent_text) = node.metadata.get("parent_heading")
+            && let Some(parent_id) = heading_to_node.get(parent_text.as_str()) {
                 edges.push(Edge {
                     from: (*parent_id).clone(),
                     to: node.id.clone(),
@@ -195,7 +201,6 @@ fn emit_hierarchy_edges(nodes: &[Node], edges: &mut Vec<Edge>) {
                     confidence: Confidence::Detected,
                 });
             }
-        }
     }
 }
 
@@ -217,7 +222,7 @@ fn emit_frontmatter_ref_edges(
     // Find the first non-frontmatter node (the document's main section)
     let source_node = nodes
         .iter()
-        .find(|n| n.metadata.get("is_frontmatter").is_none())
+        .find(|n| !n.metadata.contains_key("is_frontmatter"))
         .or_else(|| nodes.first());
 
     let source_id = match source_node {
@@ -403,8 +408,8 @@ fn detect_oh_kind(path: &Path) -> Option<String> {
         let name = comp.as_os_str().to_string_lossy();
 
         // .oh/ artifact family
-        if name == ".oh" {
-            if let Some(next) = components.get(i + 1) {
+        if name == ".oh"
+            && let Some(next) = components.get(i + 1) {
                 let dir = next.as_os_str().to_string_lossy();
                 return match dir.as_ref() {
                     "outcomes" => Some("outcome".to_string()),
@@ -414,7 +419,6 @@ fn detect_oh_kind(path: &Path) -> Option<String> {
                     _ => None,
                 };
             }
-        }
 
         // .cursorrules — root-level file (component before this is the last)
         if name == ".cursorrules" && i == n - 1 {
@@ -432,22 +436,18 @@ fn detect_oh_kind(path: &Path) -> Option<String> {
         }
 
         // .serena/memories/ — any file under this directory
-        if name == ".serena" {
-            if let Some(next) = components.get(i + 1) {
-                if next.as_os_str() == "memories" {
+        if name == ".serena"
+            && let Some(next) = components.get(i + 1)
+                && next.as_os_str() == "memories" {
                     return Some("serena-memory".to_string());
                 }
-            }
-        }
 
         // .github/copilot-instructions.md
-        if name == ".github" {
-            if let Some(next) = components.get(i + 1) {
-                if next.as_os_str() == "copilot-instructions.md" {
+        if name == ".github"
+            && let Some(next) = components.get(i + 1)
+                && next.as_os_str() == "copilot-instructions.md" {
                     return Some("copilot-instruction".to_string());
                 }
-            }
-        }
     }
     None
 }

@@ -191,7 +191,7 @@ fn derive_module(file: &std::path::Path) -> (Option<String>, PathBuf) {
 
     let module_path = parent
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(PathBuf::new);
+        .unwrap_or_default();
 
     let module_name = if let Some(p) = parent {
         // Use the immediate parent directory name

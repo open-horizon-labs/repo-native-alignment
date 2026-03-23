@@ -14,6 +14,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct TomlExtractor;
 
+impl Default for TomlExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TomlExtractor {
     pub fn new() -> Self {
         Self
@@ -45,7 +51,7 @@ impl Extractor for TomlExtractor {
             match child.kind() {
                 "table" | "table_array_element" => {
                     // [section] or [[array_section]]
-                    if let Some(key_node) = child.child(1 as u32) {
+                    if let Some(key_node) = child.child(1_u32) {
                         let name = key_node.utf8_text(source).unwrap_or("").trim().to_string();
                         if !name.is_empty() {
                             nodes.push(Node {

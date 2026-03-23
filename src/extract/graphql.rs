@@ -25,6 +25,12 @@ use super::{ExtractionResult, Extractor};
 /// GraphQL schema extractor.
 pub struct GraphQlExtractor;
 
+impl Default for GraphQlExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GraphQlExtractor {
     pub fn new() -> Self {
         Self
@@ -526,11 +532,10 @@ fn find_child_by_kind<'tree>(
 ) -> Option<tree_sitter::Node<'tree>> {
     let child_count = node.child_count();
     for i in 0..child_count {
-        if let Some(child) = node.child(i as u32) {
-            if child.kind() == kind {
+        if let Some(child) = node.child(i as u32)
+            && child.kind() == kind {
                 return Some(child);
             }
-        }
     }
     None
 }
@@ -563,11 +568,10 @@ fn find_child_type_condition(node: tree_sitter::Node<'_>, source: &[u8]) -> Opti
 /// Checks for non_null_type, list_type, named_type, or "type" children.
 fn extract_type_text(node: tree_sitter::Node<'_>, source: &[u8]) -> String {
     for kind in &["non_null_type", "list_type", "named_type", "type"] {
-        if let Some(t) = find_child_by_kind(node, kind) {
-            if let Ok(text) = t.utf8_text(source) {
+        if let Some(t) = find_child_by_kind(node, kind)
+            && let Ok(text) = t.utf8_text(source) {
                 return text.trim().to_string();
             }
-        }
     }
     String::new()
 }

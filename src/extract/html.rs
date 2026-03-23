@@ -21,6 +21,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct HtmlExtractor;
 
+impl Default for HtmlExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HtmlExtractor {
     pub fn new() -> Self {
         Self
@@ -64,8 +70,8 @@ fn collect_html_nodes(
             // Extract <script> blocks as embedded JS nodes.
             // Find the raw_text child which contains the actual JS content.
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
-                    if child.kind() == "raw_text" {
+                if let Some(child) = node.child(i as u32)
+                    && child.kind() == "raw_text" {
                         let body = child.utf8_text(source).unwrap_or("").to_string();
                         if !body.trim().is_empty() {
                             nodes.push(Node {
@@ -91,7 +97,6 @@ fn collect_html_nodes(
                             });
                         }
                     }
-                }
             }
         }
         "element" => {
@@ -100,44 +105,40 @@ fn collect_html_nodes(
             let mut id_value = None;
 
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
-                    if child.kind() == "start_tag" {
+                if let Some(child) = node.child(i as u32)
+                    && child.kind() == "start_tag" {
                         // Get tag name
                         if let Some(tag_node) = child.child_by_field_name("name") {
                             tag_name = tag_node.utf8_text(source).ok().map(|s| s.to_string());
                         } else {
                             // Try first child of start_tag
                             for j in 0..child.child_count() {
-                                if let Some(tag_child) = child.child(j as u32) {
-                                    if tag_child.kind() == "tag_name" {
+                                if let Some(tag_child) = child.child(j as u32)
+                                    && tag_child.kind() == "tag_name" {
                                         tag_name = tag_child.utf8_text(source).ok().map(|s| s.to_string());
                                         break;
                                     }
-                                }
                             }
                         }
 
                         // Look for id attribute
                         for j in 0..child.child_count() {
-                            if let Some(attr) = child.child(j as u32) {
-                                if attr.kind() == "attribute" {
+                            if let Some(attr) = child.child(j as u32)
+                                && attr.kind() == "attribute" {
                                     let attr_text = attr.utf8_text(source).unwrap_or("");
                                     if attr_text.starts_with("id=") || attr_text.starts_with("id =") {
                                         // Extract the value
                                         for k in 0..attr.child_count() {
-                                            if let Some(val_node) = attr.child(k as u32) {
-                                                if val_node.kind() == "attribute_value" || val_node.kind() == "quoted_attribute_value" {
+                                            if let Some(val_node) = attr.child(k as u32)
+                                                && (val_node.kind() == "attribute_value" || val_node.kind() == "quoted_attribute_value") {
                                                     let raw = val_node.utf8_text(source).unwrap_or("");
                                                     id_value = Some(raw.trim_matches('"').trim_matches('\'').to_string());
                                                 }
-                                            }
                                         }
                                     }
                                 }
-                            }
                         }
                     }
-                }
             }
 
             // Emit <template> as a template node
@@ -161,8 +162,8 @@ fn collect_html_nodes(
             }
 
             // Emit id="..." as anchor node
-            if let Some(id) = id_value {
-                if !id.is_empty() {
+            if let Some(id) = id_value
+                && !id.is_empty() {
                     let mut metadata = BTreeMap::new();
                     if let Some(ref tag) = tag_name {
                         metadata.insert("tag".to_string(), tag.clone());
@@ -187,7 +188,6 @@ fn collect_html_nodes(
                         source: ExtractionSource::TreeSitter,
                     });
                 }
-            }
         }
         _ => {}
     }

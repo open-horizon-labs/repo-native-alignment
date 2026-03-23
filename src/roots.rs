@@ -19,18 +19,15 @@ use crate::walk::is_worktree_with_own_cache;
 /// The type of a workspace root, determining default exclude presets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum RootType {
+    #[default]
     CodeProject,
     Notes,
     General,
     Custom,
 }
 
-impl Default for RootType {
-    fn default() -> Self {
-        RootType::CodeProject
-    }
-}
 
 impl std::fmt::Display for RootType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -337,10 +334,10 @@ impl WorkspaceConfig {
         let mut seen_paths: HashMap<PathBuf, String> = self
             .roots
             .iter()
-            .filter_map(|r| {
+            .map(|r| {
                 let canonical = std::fs::canonicalize(r.resolved_path())
                     .unwrap_or_else(|_| r.resolved_path());
-                Some((canonical, r.slug()))
+                (canonical, r.slug())
             })
             .collect();
         let mut seen_slugs: HashSet<String> = self.roots.iter().map(|r| r.slug()).collect();
@@ -520,11 +517,10 @@ fn dirs_path(app: &str, file: &str) -> PathBuf {
 /// Expand `~` at the start of a path to the user's home directory.
 fn expand_tilde(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
-    if s.starts_with("~/") || s == "~" {
-        if let Some(home) = home_dir() {
+    if (s.starts_with("~/") || s == "~")
+        && let Some(home) = home_dir() {
             return home.join(s.strip_prefix("~/").unwrap_or(""));
         }
-    }
     path.to_path_buf()
 }
 

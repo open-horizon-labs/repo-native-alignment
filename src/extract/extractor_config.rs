@@ -347,7 +347,7 @@ pub fn extractor_config_pass_with_configs(
                 while let Some(m) = re.find(&body_lower[search_start..]) {
                     let abs_match_start = search_start + m.start();
                     let abs_paren_offset = search_start + m.end() - 1; // points to `(`
-                    search_start = search_start + m.end();
+                    search_start += m.end();
 
                     // Extract the actual matched function name from node.body (preserves casing).
                     let matched_fn_name = &node.body[abs_match_start..abs_paren_offset];
@@ -502,7 +502,7 @@ fn extract_nth_arg_quoted(body: &str, prefix: &str, n: usize) -> Option<String> 
     // Advance past `n` commas (shallow — does not handle nested parens).
     let mut remaining = after;
     for _ in 0..n {
-        remaining = remaining.splitn(2, ',').nth(1)?;
+        remaining = remaining.split_once(',')?.1;
     }
 
     // Now extract the quoted string from the current argument.
@@ -575,7 +575,7 @@ fn extract_nth_arg_quoted_from_open(at_paren: &str, n: usize) -> Option<String> 
     // Advance past `n` commas (shallow — does not handle nested parens).
     let mut remaining = after;
     for _ in 0..n {
-        remaining = remaining.splitn(2, ',').nth(1)?;
+        remaining = remaining.split_once(',')?.1;
     }
 
     let trimmed = remaining.trim_start_matches([' ', '\t', '\n', '\r']);

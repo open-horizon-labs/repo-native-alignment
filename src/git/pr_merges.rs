@@ -219,15 +219,14 @@ pub fn extract_branch_name(message: &str) -> Option<String> {
     let first_line = message.lines().next().unwrap_or("");
 
     // "Merge pull request #N from user/branch"
-    if first_line.starts_with("Merge pull request") {
-        if let Some(from_idx) = first_line.find(" from ") {
+    if first_line.starts_with("Merge pull request")
+        && let Some(from_idx) = first_line.find(" from ") {
             return Some(first_line[from_idx + 6..].trim().to_string());
         }
-    }
 
     // "Merge branch 'feature-x'" or "Merge branch 'feature-x' into main"
-    if first_line.starts_with("Merge branch '") {
-        let rest = &first_line[14..]; // after "Merge branch '"
+    if let Some(rest) = first_line.strip_prefix("Merge branch '") {
+        // after "Merge branch '"
         if let Some(end) = rest.find('\'') {
             return Some(rest[..end].to_string());
         }
@@ -329,8 +328,8 @@ fn collect_pr_commit_outcome_tags(repo: &Repository, merge_commit: &git2::Commit
     }
 
     for oid_result in revwalk {
-        if let Ok(oid) = oid_result {
-            if let Ok(commit) = repo.find_commit(oid) {
+        if let Ok(oid) = oid_result
+            && let Ok(commit) = repo.find_commit(oid) {
                 let message = commit.message().unwrap_or("");
                 for tag in extract_outcome_tags(message) {
                     if !tags.contains(&tag) {
@@ -338,7 +337,6 @@ fn collect_pr_commit_outcome_tags(repo: &Repository, merge_commit: &git2::Commit
                     }
                 }
             }
-        }
     }
 
     tags

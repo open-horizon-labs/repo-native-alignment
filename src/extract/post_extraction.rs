@@ -21,8 +21,9 @@
 //!
 //! # Adding a new pass
 //!
-//! 1. Implement `PostExtractionPass`.
-//! 2. Add it to `PostExtractionRegistry::with_builtins()`.
+//!  1. Implement `PostExtractionPass`.
+//!  2. Add it to `PostExtractionRegistry::with_builtins()`.
+//!
 //! Done — no changes to `graph.rs` or `enrichment.rs`.
 
 use std::collections::HashSet;

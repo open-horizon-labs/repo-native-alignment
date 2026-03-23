@@ -298,11 +298,10 @@ pub fn search_chunks<'a>(chunks: &'a [MarkdownChunk], query: &str) -> Vec<&'a Ma
             }
 
             // Check heading hierarchy too
-            if score == 0 {
-                if chunk.heading_hierarchy.iter().any(|h| h.to_lowercase().contains(&query_lower)) {
+            if score == 0
+                && chunk.heading_hierarchy.iter().any(|h| h.to_lowercase().contains(&query_lower)) {
                     score += 4;
                 }
-            }
 
             // Frontmatter match: low bonus (+3) because frontmatter is machine
             // metadata (YAML keys/values), not human-readable content. This ensures

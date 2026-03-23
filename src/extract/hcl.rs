@@ -14,6 +14,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct HclExtractor;
 
+impl Default for HclExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HclExtractor {
     pub fn new() -> Self {
         Self
@@ -108,8 +114,8 @@ fn collect_nodes(
         });
 
         // For `variable` blocks, emit a Const node only when a default value is present
-        if block_type == "variable" {
-            if let Some(var_name) = labels.first() {
+        if block_type == "variable"
+            && let Some(var_name) = labels.first() {
                 // Try to find `default = <value>` in the block body
                 let body_text = node.utf8_text(source).unwrap_or("").to_string();
                 let default_val = extract_hcl_attr(&body_text, "default");
@@ -134,7 +140,6 @@ fn collect_nodes(
                     });
                 }
             }
-        }
 
         // Don't recurse into block body for nested blocks (keeps graph flat)
         return;

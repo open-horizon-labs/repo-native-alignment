@@ -18,6 +18,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct KotlinExtractor;
 
+impl Default for KotlinExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KotlinExtractor {
     pub fn new() -> Self {
         Self

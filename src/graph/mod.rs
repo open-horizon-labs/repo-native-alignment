@@ -10,7 +10,7 @@ pub mod store;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use uuid::Uuid;
 
@@ -437,10 +437,10 @@ pub fn build_file_line_index<'a>(nodes: &'a [Node]) -> FileLineIndex<'a> {
 /// diagnostic) to the function or struct that "owns" it.
 pub fn find_enclosing_node(
     index: &FileLineIndex<'_>,
-    file: &PathBuf,
+    file: &Path,
     line: usize,
 ) -> Option<NodeId> {
-    index.get(&(file.clone(), line)).and_then(|nodes| {
+    index.get(&(file.to_path_buf(), line)).and_then(|nodes| {
         nodes
             .iter()
             .filter(|n| {
@@ -461,10 +461,10 @@ pub fn find_enclosing_node(
 /// (e.g., "what symbol is defined at this line?") rather than enclosure.
 pub fn find_node_at(
     index: &FileLineIndex<'_>,
-    file: &PathBuf,
+    file: &Path,
     line: usize,
 ) -> Option<NodeId> {
-    index.get(&(file.clone(), line)).and_then(|nodes| {
+    index.get(&(file.to_path_buf(), line)).and_then(|nodes| {
         nodes
             .iter()
             .filter(|n| {

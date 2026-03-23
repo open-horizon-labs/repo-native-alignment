@@ -294,21 +294,19 @@ fn install_oh_skills() -> Result<()> {
 // ─── .mcp.json merge ─────────────────────────────────────────────────────────
 
 fn installed_binary_path() -> Result<PathBuf> {
-    if let Ok(root) = std::env::var("CARGO_INSTALL_ROOT") {
-        if !root.is_empty() {
+    if let Ok(root) = std::env::var("CARGO_INSTALL_ROOT")
+        && !root.is_empty() {
             return Ok(PathBuf::from(root)
                 .join("bin")
                 .join("repo-native-alignment"));
         }
-    }
 
-    if let Ok(home) = std::env::var("CARGO_HOME") {
-        if !home.is_empty() {
+    if let Ok(home) = std::env::var("CARGO_HOME")
+        && !home.is_empty() {
             return Ok(PathBuf::from(home)
                 .join("bin")
                 .join("repo-native-alignment"));
         }
-    }
 
     let home = std::env::var("HOME").context(
         "Cannot determine installed binary path; set CARGO_INSTALL_ROOT, CARGO_HOME, or HOME",

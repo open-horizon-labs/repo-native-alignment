@@ -197,14 +197,13 @@ impl LspTransport {
             let msg = self.read_message().await?;
 
             // Check if this is our response
-            if let Some(id) = msg.get("id") {
-                if id.as_i64() == Some(expected_id) {
+            if let Some(id) = msg.get("id")
+                && id.as_i64() == Some(expected_id) {
                     if let Some(error) = msg.get("error") {
                         return Err(anyhow::anyhow!("LSP error: {}", error));
                     }
                     return Ok(msg.get("result").cloned().unwrap_or(serde_json::Value::Null));
                 }
-            }
 
             // Otherwise it's a notification or a response to a different request -- skip it
         }
@@ -378,13 +377,12 @@ impl PipelinedTransport {
                 }
                 // It has both "id" and "method" — it's a server-to-client *request*
                 // (e.g. window/workDoneProgress/create). We need to respond.
-                if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
-                    if method == "window/workDoneProgress/create" {
+                if let Some(method) = msg.get("method").and_then(|m| m.as_str())
+                    && method == "window/workDoneProgress/create" {
                         // We can't write back from the reader loop without the writer.
                         // These are non-critical during enrichment; log and skip.
                         tracing::debug!("PipelinedTransport: ignoring server request {} (id={})", method, id);
                     }
-                }
             }
 
             // Notifications: log progress, capture diagnostics, ignore the rest

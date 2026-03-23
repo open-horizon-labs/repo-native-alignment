@@ -370,7 +370,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    fn make_api_endpoint(file: &str, name: &str, method: &str, http_path: &str, router_var: Option<&str>) -> Node {
+    fn make_api_endpoint(file: &str, _name: &str, method: &str, http_path: &str, router_var: Option<&str>) -> Node {
         let mut metadata = BTreeMap::new();
         metadata.insert("http_method".to_string(), method.to_string());
         metadata.insert("http_path".to_string(), http_path.to_string());

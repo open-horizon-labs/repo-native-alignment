@@ -1266,11 +1266,10 @@ impl EmbeddingIndex {
         // longer exist in the graph. Delete them.
         // Uses current_ids captured before partitioning to avoid re-loading
         // commits/merges from git.
-        if table_exists {
-            if let Err(e) = self.delete_stale_rows_with_ids(&current_ids).await {
+        if table_exists
+            && let Err(e) = self.delete_stale_rows_with_ids(&current_ids).await {
                 tracing::warn!("EmbeddingIndex: failed to delete stale rows: {}", e);
             }
-        }
 
         // --- Compact lance to reclaim space (#298) ---
         if let Ok(table) = self.db.open_table(&self.table_name).execute().await {
@@ -1566,11 +1565,10 @@ impl EmbeddingIndex {
                 let kind = kinds.value(i).to_string();
 
                 // Filter by artifact type if specified
-                if let Some(types) = artifact_types {
-                    if !types.iter().any(|t| t == &kind) {
+                if let Some(types) = artifact_types
+                    && !types.iter().any(|t| t == &kind) {
                         continue;
                     }
-                }
 
                 let raw_score = if has_score_col {
                     // RRF / BM25 `_score` — higher is better.

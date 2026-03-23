@@ -16,6 +16,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct BashExtractor;
 
+impl Default for BashExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BashExtractor {
     pub fn new() -> Self {
         Self
