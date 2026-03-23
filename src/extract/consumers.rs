@@ -606,16 +606,36 @@ impl EnrichmentFinalizer {
                 all_edges.extend(result.edges);
             }
         }
-        // nextjs_routing — gated on nextjs-app-router framework detection only.
-        // No has_ts_js fallback: plain TS/JS repos without Next.js produce no page routes.
-        if detected_frameworks.contains("nextjs-app-router") {
-            let result = crate::extract::nextjs_routing::nextjs_routing_pass(
-                &self.root_pairs,
-                &all_nodes,
-            );
-            if !result.nodes.is_empty() || !result.edges.is_empty() {
-                all_nodes.extend(result.nodes);
-                all_edges.extend(result.edges);
+        // nextjs_routing — gated on Next.js detection.
+        //
+        // Two detection signals (either suffices):
+        // 1. Import-based: `framework_detection_pass` saw `next/*` imports.
+        // 2. Filesystem-based: any root contains `pages/`, `app/`, or
+        //    `next.config.{js,ts,mjs}` — covers repos whose API route files
+        //    import nothing from `next/` directly (e.g., plain handler functions).
+        //
+        // Pure `has_ts_js` (any TS/JS file) is NOT used — that would run on
+        // plain React, Angular, or Vue repos that have no Next.js structure.
+        {
+            let import_detected = detected_frameworks.contains("nextjs-app-router");
+            let fs_detected = !import_detected && self.root_pairs.iter().any(|(_, root_path)| {
+                root_path.join("pages").is_dir()
+                    || root_path.join("app").is_dir()
+                    || root_path.join("src/pages").is_dir()
+                    || root_path.join("src/app").is_dir()
+                    || root_path.join("next.config.js").exists()
+                    || root_path.join("next.config.ts").exists()
+                    || root_path.join("next.config.mjs").exists()
+            });
+            if import_detected || fs_detected {
+                let result = crate::extract::nextjs_routing::nextjs_routing_pass(
+                    &self.root_pairs,
+                    &all_nodes,
+                );
+                if !result.nodes.is_empty() || !result.edges.is_empty() {
+                    all_nodes.extend(result.nodes);
+                    all_edges.extend(result.edges);
+                }
             }
         }
         // grpc_client_calls
@@ -742,9 +762,11 @@ impl ExtractionConsumer for FrameworkDetectionConsumer {
 /// has access to the full node set and `root_pairs`. This consumer establishes the
 /// event-driven subscription slot and emits `PassComplete` as a monitoring signal.
 ///
-/// The `has_ts_js` fallback previously used in `EnrichmentFinalizer` has been
-/// removed: plain TS/JS repos without Next.js produce no page-route `ApiEndpoint`
-/// nodes, so gating purely on `FrameworkDetected("nextjs-app-router")` is correct.
+/// The old `has_ts_js` fallback (any TypeScript/JavaScript node) has been replaced
+/// with a filesystem-based secondary signal in `EnrichmentFinalizer`: if any root
+/// contains `pages/`, `app/`, `src/pages/`, `src/app/`, or `next.config.{js,ts,mjs}`,
+/// the routing pass runs even without `next/*` imports. This covers repos whose API
+/// route handlers don't import directly from `next/` (plain handler functions).
 ///
 /// Subscribes to: `FrameworkDetected`
 /// Emits: `PassComplete`
@@ -774,7 +796,9 @@ impl ExtractionConsumer for NextjsRoutingConsumer {
         };
 
         // Only wake for nextjs-app-router. Plain TS/JS repos without Next.js produce
-        // no page-route ApiEndpoint nodes, so the `has_ts_js` fallback is not needed.
+        // no page-route ApiEndpoint nodes. The filesystem-based fallback in
+        // EnrichmentFinalizer covers repos with Next.js directory structure but no
+        // `next/*` imports.
         if framework != "nextjs-app-router" {
             return Ok(vec![]);
         }
@@ -2806,11 +2830,11 @@ mod tests {
         }
     }
 
-    /// Adversarial: pure TS/JS repo with no `next/` imports does NOT invoke nextjs_routing.
+    /// Adversarial: plain React repo (TS but no `next/` imports, no `pages/` dir)
+    /// does NOT invoke nextjs_routing_pass and produces no ApiEndpoint nodes.
     ///
-    /// Previously, the `has_ts_js` fallback in `EnrichmentFinalizer` caused `nextjs_routing_pass`
-    /// to run on any repo with TypeScript/JavaScript nodes, even without Next.js. This test
-    /// verifies the fallback is gone: a plain React (no Next.js) repo produces no ApiEndpoint nodes.
+    /// Verifies the double gate: import-based AND filesystem-based detection are
+    /// both absent → `nextjs_routing_pass` is not invoked → no ApiEndpoint nodes.
     #[test]
     fn test_plain_ts_repo_without_nextjs_does_not_produce_api_endpoints() {
         use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
@@ -2852,6 +2876,65 @@ mod tests {
             "Plain TS/React repo without `next/` imports must produce no ApiEndpoint nodes. \
             Got: {:?}",
             api_endpoints.iter().map(|n| &n.id.name).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Adversarial: Next.js project with pages/ dir but no next/ imports still gets routing.
+    ///
+    /// Verifies the filesystem-based fallback: a repo with `pages/api/` directory
+    /// but no `next/` imports (e.g., plain TypeScript handler functions) should
+    /// still have `nextjs_routing_pass` invoked.
+    #[test]
+    fn test_nextjs_with_pages_dir_but_no_imports_gets_routing() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let pages_api = dir.path().join("pages/api");
+        std::fs::create_dir_all(&pages_api).unwrap();
+        std::fs::write(
+            pages_api.join("health.ts"),
+            "export default function handler(req: any, res: any) { res.json({ ok: true }); }\n",
+        ).unwrap();
+
+        // TypeScript import node but no `next/` import — pure handler, no next imports
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+        let fn_node = Node {
+            id: NodeId {
+                root: "client".into(),
+                file: PathBuf::from("pages/api/health.ts"),
+                name: "handler".into(),
+                kind: NodeKind::Function,
+            },
+            language: "typescript".into(),
+            line_start: 1,
+            line_end: 1,
+            signature: "function handler(req, res)".into(),
+            body: "export default function handler(req, res) { res.json({ ok: true }); }".into(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let root_path = dir.path().to_path_buf();
+        let (out_nodes, _edges, _frameworks) = super::emit_enrichment_pipeline(
+            vec![fn_node],
+            vec![],
+            vec![("client".into(), root_path)],
+            "client".to_string(),
+            PathBuf::from("."),
+            super::BusOptions::default(),
+        ).unwrap();
+
+        // Must find an ApiEndpoint node — filesystem-based gate must fire
+        let api_endpoints: Vec<_> = out_nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert!(
+            !api_endpoints.is_empty(),
+            "Next.js repo with pages/ dir but no next/ imports must produce ApiEndpoint \
+            nodes via filesystem-based detection. Got nodes: {:?}",
+            out_nodes.iter().map(|n| (&n.id.kind, &n.id.name)).collect::<Vec<_>>(),
         );
     }
 
