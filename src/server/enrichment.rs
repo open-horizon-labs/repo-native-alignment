@@ -555,6 +555,7 @@ impl RnaHandler {
         let bg_graph = self.graph.clone();
         let bg_lsp_status = self.lsp_status.clone();
         let bg_lance_write_lock = Arc::clone(&self.lance_write_lock);
+        let bg_scan_stats = Arc::clone(&self.scan_stats);
         let bg_nodes: Vec<Node> = nodes.to_vec();
         let bg_edges: Vec<Edge> = edges.to_vec();
 
@@ -583,26 +584,27 @@ impl RnaHandler {
 
             // Run the full enrichment pipeline (bus path): LanguageDetected → LspConsumer
             // → EnrichmentComplete → AllEnrichmentsGate → AllEnrichmentsDone → EnrichmentFinalizer
-            // → PassesComplete. scan_stats is passed so ScanStatsConsumer tracks LSP completion.
+            // → PassesComplete. scan_stats is wired in so ScanStatsConsumer tracks LSP completion.
             //
-            // LanceDB persist is handled below (after applying PageRank / subsystem passes are
-            // already baked into the cached nodes, so we persist the enriched result directly).
-            let result = tokio::task::block_in_place(|| {
+            // Consume bg_nodes/bg_edges via move (no redundant clone; these are the only owners).
+            // LanceDB persist is handled below after replacing the in-memory graph.
+            let bus_repo_root = bg_repo_root.clone();
+            let result = tokio::task::block_in_place(move || {
                 crate::extract::consumers::emit_enrichment_pipeline(
-                    bg_nodes.clone(),
-                    bg_edges.clone(),
+                    bg_nodes,
+                    bg_edges,
                     root_pairs,
                     primary_slug,
-                    bg_repo_root.clone(),
+                    bus_repo_root,
                     crate::extract::consumers::BusOptions {
-                        scan_stats: None, // no shared scan_stats handle available here
+                        scan_stats: Some(bg_scan_stats),
                         embed_idx: None,
                         lance_repo_root: None,
                     },
                 )
             });
 
-            let (enriched_nodes, enriched_edges, _detected_frameworks) = match result {
+            let (mut enriched_nodes, mut enriched_edges, _detected_frameworks) = match result {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!("[cache-hit bus] emit_enrichment_pipeline failed: {:#}", e);
@@ -611,22 +613,29 @@ impl RnaHandler {
                 }
             };
 
-            // Count LSP-sourced edges to decide whether enrichment produced results.
-            let lsp_edge_count = enriched_edges.iter()
-                .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
-                .count();
+            // Dedup: PassesComplete can re-emit cached entries when the cached graph already
+            // contains output from a previous pass run. Dedup avoids duplicate rows in LanceDB
+            // and inflated edge weights (same logic as the full-build path in graph.rs).
+            {
+                let mut seen_nodes = std::collections::HashSet::new();
+                enriched_nodes.reverse();
+                enriched_nodes.retain(|n| seen_nodes.insert(n.stable_id()));
+                enriched_nodes.reverse();
+
+                let mut seen_edges = std::collections::HashSet::new();
+                enriched_edges.retain(|e| seen_edges.insert(e.stable_id()));
+            }
+
+            // Count LSP-sourced edges to determine enrichment status.
             let lsp_call_edge_count = enriched_edges.iter()
                 .filter(|e| {
                     e.source == crate::graph::ExtractionSource::Lsp
                         && matches!(e.kind, crate::graph::EdgeKind::Calls)
                 })
                 .count();
-
-            if lsp_edge_count == 0 {
-                tracing::info!("[cache-hit bus] LSP enrichment: no edges produced (no server or no enrichable nodes)");
-                bg_lsp_status.set_unavailable();
-                return;
-            }
+            let lsp_edge_count = enriched_edges.iter()
+                .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
+                .count();
 
             tracing::info!(
                 "[cache-hit bus] LSP enrichment complete: {} LSP call edges, {} total LSP edges, {} total nodes",
@@ -668,6 +677,9 @@ impl RnaHandler {
                         "[cache-hit bus] LSP persist complete: {} nodes, {} edges",
                         enriched_nodes.len(), enriched_edges.len()
                     );
+                    // Mirror other LSP paths: set_complete(0) when no edges (enricher ran but found
+                    // nothing), not set_unavailable(). The sentinel is written to prevent repeated
+                    // re-enrichment on repos that legitimately produce zero LSP edges.
                     bg_lsp_status.set_complete(lsp_call_edge_count);
                 }
                 Err(e) => {
