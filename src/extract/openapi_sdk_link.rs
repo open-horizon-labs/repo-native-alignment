@@ -347,7 +347,7 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
             }
             // Deduplicate (multiple URL strings on the same line could point to the
             // same endpoint after normalisation).
-            matched_ep_ids.sort_by(|a, b| a.to_stable_id().cmp(&b.to_stable_id()));
+            matched_ep_ids.sort_by_key(|id| id.to_stable_id());
             matched_ep_ids.dedup_by(|a, b| a.to_stable_id() == b.to_stable_id());
 
             // Only emit when there is exactly one unambiguous match to avoid
