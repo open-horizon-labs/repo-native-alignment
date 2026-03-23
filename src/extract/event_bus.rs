@@ -25,9 +25,10 @@
 //!             → ApiLinkConsumer (subscription slot, no-op)
 //!             → TestedByConsumer (subscription slot, no-op)
 //!             → EnrichmentFinalizer → PassesComplete(nodes, edges)
-//!                 → SubsystemConsumer → SubsystemsDetected(...)
 //!                 → LanceDBConsumer (persist)
 //!         → EmbeddingConsumer (streaming)
+//!   CommunityDetectionComplete(slug, subsystems, nodes, edges)  [from graph.rs after PageRank]
+//!     → SubsystemConsumer → SubsystemNodesComplete(slug, nodes, edges)
 //! ```
 //!
 //! # Adding a new consumer
@@ -50,6 +51,7 @@ use std::sync::Arc;
 
 use crate::extract::cache::ConsumerCacheKey;
 use crate::graph::{Edge, Node};
+use crate::graph::index::Subsystem;
 
 // ---------------------------------------------------------------------------
 // Events
@@ -157,6 +159,39 @@ pub enum ExtractionEvent {
         /// LSP-enriched metadata (e.g., inferred types from inlay hints).
         updated_nodes: Arc<[(String, std::collections::BTreeMap<String, String>)]>,
     },
+
+    /// PageRank computation and Louvain community detection are complete.
+    ///
+    /// Fired by `graph.rs` after `detect_communities()` runs. Carries the full
+    /// node/edge set (with PageRank importance already written into node metadata)
+    /// and the detected subsystems so that `SubsystemConsumer` can run
+    /// `subsystem_node_pass` + `subsystem_framework_aggregation_pass` without
+    /// any direct coupling to `graph.rs`.
+    ///
+    /// `slug` is the primary root slug used to anchor subsystem node `stable_id`s.
+    CommunityDetectionComplete {
+        slug: String,
+        /// Detected subsystems from `GraphIndex::detect_communities()`.
+        subsystems: Arc<[Subsystem]>,
+        /// Full node set with PageRank importance written into `node.metadata`.
+        nodes: Arc<[Node]>,
+        /// Full edge set at the point community detection finished.
+        edges: Arc<[Edge]>,
+    },
+
+    /// `SubsystemConsumer` has finished running `subsystem_node_pass` and
+    /// `subsystem_framework_aggregation_pass`.
+    ///
+    /// Carries only the **newly emitted** subsystem and framework-aggregation nodes
+    /// and edges so that `graph.rs` can extend its working collections without
+    /// duplicating the full set.
+    SubsystemNodesComplete {
+        slug: String,
+        /// New `NodeKind::Other("subsystem")` nodes promoted by the pass.
+        added_nodes: Arc<[Node]>,
+        /// New `BelongsTo` + `UsesFramework` edges emitted by the passes.
+        added_edges: Arc<[Edge]>,
+    },
 }
 
 /// Discriminant for `ExtractionEvent` — used in `subscribes_to`.
@@ -170,6 +205,8 @@ pub enum ExtractionEventKind {
     PassComplete,
     PassesComplete,
     AllEnrichmentsDone,
+    CommunityDetectionComplete,
+    SubsystemNodesComplete,
 }
 
 impl ExtractionEvent {
@@ -184,6 +221,8 @@ impl ExtractionEvent {
             ExtractionEvent::PassComplete { .. }    => ExtractionEventKind::PassComplete,
             ExtractionEvent::PassesComplete { .. }  => ExtractionEventKind::PassesComplete,
             ExtractionEvent::AllEnrichmentsDone { .. } => ExtractionEventKind::AllEnrichmentsDone,
+            ExtractionEvent::CommunityDetectionComplete { .. } => ExtractionEventKind::CommunityDetectionComplete,
+            ExtractionEvent::SubsystemNodesComplete { .. } => ExtractionEventKind::SubsystemNodesComplete,
         }
     }
 
@@ -367,6 +406,43 @@ impl ExtractionEvent {
                     buf.extend_from_slice(values.as_bytes());
                 }
             }
+            ExtractionEvent::CommunityDetectionComplete { slug, subsystems, nodes, edges } => {
+                buf.extend_from_slice(slug.as_bytes());
+                // Hash subsystem names (sorted) as a proxy for the subsystem set.
+                let mut sub_names: Vec<&str> = subsystems.iter().map(|s| s.name.as_str()).collect();
+                sub_names.sort_unstable();
+                for name in &sub_names {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(name.as_bytes());
+                }
+                let mut node_ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
+                node_ids.sort_unstable();
+                for id in &node_ids {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(id.as_bytes());
+                }
+                let mut edge_keys: Vec<String> = edges.iter().map(canonical_edge_key).collect();
+                edge_keys.sort_unstable();
+                for key in &edge_keys {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(key.as_bytes());
+                }
+            }
+            ExtractionEvent::SubsystemNodesComplete { slug, added_nodes, added_edges } => {
+                buf.extend_from_slice(slug.as_bytes());
+                let mut node_ids: Vec<String> = added_nodes.iter().map(|n| n.stable_id()).collect();
+                node_ids.sort_unstable();
+                for id in &node_ids {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(id.as_bytes());
+                }
+                let mut edge_keys: Vec<String> = added_edges.iter().map(canonical_edge_key).collect();
+                edge_keys.sort_unstable();
+                for key in &edge_keys {
+                    buf.push(b'\n');
+                    buf.extend_from_slice(key.as_bytes());
+                }
+            }
         }
         buf
     }
@@ -382,6 +458,8 @@ impl ExtractionEvent {
             ExtractionEvent::PassComplete { .. }      => "pass_complete",
             ExtractionEvent::PassesComplete { .. }    => "passes_complete",
             ExtractionEvent::AllEnrichmentsDone { .. } => "all_enrichments_done",
+            ExtractionEvent::CommunityDetectionComplete { .. } => "community_detection_complete",
+            ExtractionEvent::SubsystemNodesComplete { .. } => "subsystem_nodes_complete",
         }
     }
 }

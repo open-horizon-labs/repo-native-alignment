@@ -1581,41 +1581,85 @@ impl ExtractionConsumer for LanceDBConsumer {
 // SubsystemConsumer
 // ---------------------------------------------------------------------------
 
-/// Subscribes to `PassesComplete` and handles subsystem node promotion.
+/// Subscribes to `CommunityDetectionComplete` and runs subsystem node promotion.
 ///
-/// **Phase 2 stub.** In Phase 3+, this consumer will run `subsystem_node_pass`
-/// after the graph index is built. In Phase 2, subsystem detection requires
-/// `GraphIndex::detect_communities()` which is not available in the event payload —
-/// it runs synchronously inside `build_full_graph_inner` after the graph is assembled.
+/// Reacts to the event fired by `graph.rs` after PageRank and Louvain community
+/// detection complete. Runs:
+///   1. `subsystem_node_pass` — promotes detected communities to first-class
+///      `NodeKind::Other("subsystem")` nodes with `BelongsTo` edges.
+///   2. `subsystem_framework_aggregation_pass` — emits `UsesFramework` edges from
+///      subsystem nodes to framework nodes when ≥70% of members share a framework.
 ///
-/// This stub establishes the subscription slot per the ADR consumer migration list.
-/// The issue spec maps: `subsystem_node_pass → PassesComplete`.
+/// Returns `SubsystemNodesComplete` carrying only the newly added nodes/edges so
+/// that `graph.rs` can extend its working collections without duplicating the full set.
 ///
-/// Subscribes to: `PassesComplete`
-/// Emits: nothing (Phase 2 stub)
+/// Subscribes to: `CommunityDetectionComplete`
+/// Emits: `SubsystemNodesComplete`
 pub struct SubsystemConsumer;
 
 impl ExtractionConsumer for SubsystemConsumer {
     fn name(&self) -> &str { "subsystem" }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
-        &[ExtractionEventKind::PassesComplete]
+        &[ExtractionEventKind::CommunityDetectionComplete]
     }
 
     fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::PassesComplete { slug, nodes, .. } = event else {
+        let ExtractionEvent::CommunityDetectionComplete { slug, subsystems, nodes, .. } = event else {
             return Ok(vec![]);
         };
-        // Phase 2: subsystem detection requires GraphIndex::detect_communities()
-        // which is not available in the event payload. It runs inside
-        // build_full_graph_inner after the graph is assembled. This consumer
-        // establishes the subscription slot; Phase 3+ moves the logic here.
+
+        // Run subsystem node promotion pass.
+        let sub_result = crate::extract::subsystem_pass::subsystem_node_pass(subsystems, nodes, slug);
+
+        // Build the combined node set (existing + new subsystem nodes) needed for
+        // framework aggregation, which looks for subsystem nodes by kind.
+        let combined_nodes: Vec<crate::graph::Node> = nodes.iter()
+            .cloned()
+            .chain(sub_result.nodes.iter().cloned())
+            .collect();
+
+        // Run subsystem → framework aggregation pass.
+        let fw_edges = crate::extract::framework_detection::subsystem_framework_aggregation_pass(&combined_nodes);
+
+        let added_node_count = sub_result.nodes.len();
+        let added_edge_count = sub_result.edges.len() + fw_edges.len();
+
+        if added_node_count > 0 {
+            tracing::info!(
+                "SubsystemConsumer: root '{}' — promoted {} subsystem(s) to first-class nodes",
+                slug,
+                added_node_count,
+            );
+        }
+        if !fw_edges.is_empty() {
+            tracing::info!(
+                "SubsystemConsumer: root '{}' — subsystem-framework aggregation: {} UsesFramework edge(s)",
+                slug,
+                fw_edges.len(),
+            );
+        }
         tracing::debug!(
-            "SubsystemConsumer: root '{}' — {} nodes (Phase 2 stub, subsystem detection runs in graph pipeline)",
+            "SubsystemConsumer: root '{}' — {} new nodes, {} new edges",
             slug,
-            nodes.len(),
+            added_node_count,
+            added_edge_count,
         );
-        Ok(vec![])
+
+        let mut all_added_edges = sub_result.edges;
+        all_added_edges.extend(fw_edges);
+
+        Ok(vec![ExtractionEvent::SubsystemNodesComplete {
+            slug: slug.clone(),
+            added_nodes: Arc::from(sub_result.nodes.into_boxed_slice()),
+            added_edges: Arc::from(all_added_edges.into_boxed_slice()),
+        }])
+    }
+
+    /// `SubsystemConsumer` is a pure transformation (same subsystems → same output)
+    /// so caching is appropriate.
+    fn is_cacheable(&self) -> bool {
+        true
     }
 }
 
@@ -1658,7 +1702,8 @@ pub struct BusOptions {
 /// - `OpenApiConsumer`, `GrpcConsumer`, `EmbeddingIndexerConsumer` — `RootExtracted` (side-effects)
 /// - `FrameworkDetectionConsumer`, `FastapiRouterPrefixConsumer`, `NextjsRoutingConsumer`,
 ///   `PubSubConsumer`, `WebSocketConsumer` — `FrameworkDetected`
-/// - `SubsystemConsumer`, `LanceDBConsumer` — `PassesComplete`
+/// - `LanceDBConsumer` — `PassesComplete`
+/// - `SubsystemConsumer` — `CommunityDetectionComplete` → `SubsystemNodesComplete`
 ///
 /// Note: `CustomExtractorConsumer` is not pre-registered here because the set of
 /// custom extractors is config-driven (`.oh/extractors/*.toml`) and unknown at
@@ -1760,13 +1805,19 @@ pub fn build_builtin_bus(
     bus.register(Box::new(WebSocketConsumer));
 
     // --- PassesComplete consumers ---
-    bus.register(Box::new(SubsystemConsumer));
     // LanceDBConsumer: persist graph on PassesComplete.
     // Passes None in stub/test mode; Some(repo_root) in production.
     bus.register(Box::new(match lance_repo_root {
         Some(rr) => LanceDBConsumer::new(rr),
         None => LanceDBConsumer::stub(),
     }));
+
+    // --- CommunityDetectionComplete consumers ---
+    // SubsystemConsumer: runs subsystem_node_pass + subsystem_framework_aggregation_pass
+    // after PageRank and community detection complete. Fired by graph.rs, not the
+    // extraction pipeline, so this registration slot is "always present" and the bus
+    // routes CommunityDetectionComplete → SubsystemConsumer → SubsystemNodesComplete.
+    bus.register(Box::new(SubsystemConsumer));
 
     (bus, stats_arc)
 }
@@ -1950,6 +2001,63 @@ pub fn emit_enrichment_pipeline(
                  must always emit PassesComplete). Failing hard to prevent \
                  persisting an unenriched graph."
             )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// emit_community_detection
+// ---------------------------------------------------------------------------
+
+/// Emit a `CommunityDetectionComplete` event through a slim bus (SubsystemConsumer only)
+/// and return the resulting `(added_nodes, added_edges)`.
+///
+/// This is the public API that `graph.rs` calls after PageRank and community detection
+/// complete. It fully replaces the direct `subsystem_node_pass` and
+/// `subsystem_framework_aggregation_pass` call sites in `graph.rs`.
+///
+/// Returns `(Vec<Node>, Vec<Edge>)` — the **new** subsystem nodes and edges to extend
+/// the working collections with. Returns empty vecs if no subsystems were detected.
+///
+/// # Errors
+/// Returns `Err` only if `SubsystemConsumer::on_event` itself fails, which should
+/// not happen in practice (the function is infallible for well-formed inputs).
+pub fn emit_community_detection(
+    slug: String,
+    subsystems: Vec<crate::graph::index::Subsystem>,
+    nodes: Vec<crate::graph::Node>,
+    edges: Vec<crate::graph::Edge>,
+) -> anyhow::Result<(Vec<crate::graph::Node>, Vec<crate::graph::Edge>)> {
+    use crate::extract::event_bus::{EventBus, ExtractionEvent};
+
+    let mut bus = EventBus::new();
+    bus.register(Box::new(SubsystemConsumer));
+
+    let events = bus.emit(ExtractionEvent::CommunityDetectionComplete {
+        slug,
+        subsystems: Arc::from(subsystems.into_boxed_slice()),
+        nodes: Arc::from(nodes.into_boxed_slice()),
+        edges: Arc::from(edges.into_boxed_slice()),
+    });
+
+    // Collect SubsystemNodesComplete — emitted by SubsystemConsumer.
+    let sub_complete = events.into_iter().find(|e| {
+        matches!(e, ExtractionEvent::SubsystemNodesComplete { .. })
+    });
+
+    match sub_complete {
+        Some(ExtractionEvent::SubsystemNodesComplete { added_nodes, added_edges, .. }) => {
+            Ok((added_nodes.to_vec(), added_edges.to_vec()))
+        }
+        _ => {
+            // SubsystemConsumer always emits SubsystemNodesComplete (even when empty).
+            // If it's absent, the bus was misconfigured. Return empty rather than failing
+            // hard — subsystem nodes are a non-critical enrichment.
+            tracing::warn!(
+                "emit_community_detection: SubsystemNodesComplete event absent — \
+                 subsystem promotion may have been skipped"
+            );
+            Ok((vec![], vec![]))
         }
     }
 }
@@ -2481,19 +2589,29 @@ mod tests {
         );
     }
 
-    /// Verify SubsystemConsumer subscribes to PassesComplete.
+    /// Verify SubsystemConsumer subscribes to CommunityDetectionComplete and emits
+    /// SubsystemNodesComplete (even when no subsystems are detected).
     #[test]
     fn test_subsystem_consumer_subscription() {
+        use crate::graph::index::Subsystem;
+
         let consumer = SubsystemConsumer;
-        assert!(consumer.subscribes_to().contains(&ExtractionEventKind::PassesComplete));
-        let event = ExtractionEvent::PassesComplete {
+        assert!(
+            consumer.subscribes_to().contains(&ExtractionEventKind::CommunityDetectionComplete),
+            "SubsystemConsumer must subscribe to CommunityDetectionComplete"
+        );
+        let event = ExtractionEvent::CommunityDetectionComplete {
             slug: "test".into(),
+            subsystems: std::sync::Arc::from([]),
             nodes: std::sync::Arc::from([]),
             edges: std::sync::Arc::from([]),
-            detected_frameworks: HashSet::new(),
         };
         let result = consumer.on_event(&event).unwrap();
-        assert!(result.is_empty(), "SubsystemConsumer Phase 2 stub emits nothing");
+        assert_eq!(result.len(), 1, "SubsystemConsumer must emit exactly one SubsystemNodesComplete");
+        assert!(
+            matches!(result[0], ExtractionEvent::SubsystemNodesComplete { .. }),
+            "SubsystemConsumer must emit SubsystemNodesComplete"
+        );
     }
 
     /// Verify LanceDBConsumer (stub) subscribes to PassesComplete and emits nothing.

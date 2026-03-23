@@ -11,7 +11,6 @@ pub(crate) const SUBSYSTEM_KEY: &str = "subsystem";
 
 use crate::embed::EmbeddingIndex;
 use crate::extract::ExtractorRegistry;
-use crate::extract::subsystem_pass::subsystem_node_pass;
 use crate::graph::{Edge, Node, NodeKind};
 use crate::graph::index::GraphIndex;
 use crate::graph::store::SCHEMA_VERSION;
@@ -770,32 +769,25 @@ impl RnaHandler {
                 );
             }
 
-            // 6c. Emit first-class subsystem nodes + BelongsTo edges.
-            // These go into all_nodes/all_edges so they survive the LanceDB persist.
-            // Anchored to the primary root (subsystem detection spans all roots but
-            // subsystem nodes need a root ID for stable_id uniqueness).
+            // 6c-6d. Emit first-class subsystem nodes + BelongsTo edges, then
+            // subsystem → framework aggregation (UsesFramework edges).
+            // Routed via EventBus: CommunityDetectionComplete → SubsystemConsumer
+            // → SubsystemNodesComplete. This decouples graph.rs from the pass
+            // functions and satisfies ADR Constraint 7.
             let primary_slug = crate::roots::RootConfig::code_project(self.repo_root.clone()).slug();
-            let sub_result = subsystem_node_pass(&subsystems, &all_nodes, &primary_slug);
-            if !sub_result.nodes.is_empty() {
-                tracing::info!(
-                    "Promoted {} subsystem(s) to first-class nodes",
-                    sub_result.nodes.len()
-                );
-                all_nodes.extend(sub_result.nodes);
-                all_edges.extend(sub_result.edges);
-            }
-
-            // 6d. Subsystem → framework aggregation: emit UsesFramework edges
-            // from subsystem nodes to framework nodes (when ≥70% of members share a framework).
-            // Graceful: no-op if no subsystem nodes or no framework nodes exist.
-            let subsystem_fw_edges =
-                crate::extract::framework_detection::subsystem_framework_aggregation_pass(&all_nodes);
-            if !subsystem_fw_edges.is_empty() {
-                tracing::info!(
-                    "Subsystem-framework aggregation: {} UsesFramework edge(s)",
-                    subsystem_fw_edges.len()
-                );
-                all_edges.extend(subsystem_fw_edges);
+            let (sub_added_nodes, sub_added_edges) =
+                crate::extract::consumers::emit_community_detection(
+                    primary_slug.clone(),
+                    subsystems.clone(),
+                    all_nodes.clone(),
+                    all_edges.clone(),
+                ).unwrap_or_else(|e| {
+                    tracing::warn!("Subsystem promotion via bus failed (non-fatal): {}", e);
+                    (vec![], vec![])
+                });
+            if !sub_added_nodes.is_empty() || !sub_added_edges.is_empty() {
+                all_nodes.extend(sub_added_nodes);
+                all_edges.extend(sub_added_edges);
             }
 
             // 6e. Extend petgraph index to include newly emitted virtual nodes
@@ -1287,26 +1279,23 @@ impl RnaHandler {
             let edge_ids_before_group2: std::collections::HashSet<String> =
                 graph.edges.iter().map(|e| e.stable_id()).collect();
 
-            // Emit first-class subsystem nodes + BelongsTo edges.
+            // Emit first-class subsystem nodes + BelongsTo edges, then subsystem →
+            // framework aggregation. Routed via EventBus:
+            //   CommunityDetectionComplete → SubsystemConsumer → SubsystemNodesComplete
             // Stale nodes were already removed in the pre-clean step above.
-            // Note: subsystem_node_pass runs here (after community detection + PageRank)
-            // rather than inside EnrichmentFinalizer, because it depends on
-            // subsystem community results that are only available at this point.
-            let sub_result = subsystem_node_pass(&subsystems, &graph.nodes, &primary_slug);
-            if !sub_result.nodes.is_empty() {
-                tracing::info!(
-                    "Incremental: promoted {} subsystem(s) to first-class nodes",
-                    sub_result.nodes.len()
-                );
-                graph.nodes.extend(sub_result.nodes);
-                graph.edges.extend(sub_result.edges);
-            }
-
-            // Subsystem → framework aggregation (incremental): emit UsesFramework edges.
-            let sub_fw_edges =
-                crate::extract::framework_detection::subsystem_framework_aggregation_pass(&graph.nodes);
-            if !sub_fw_edges.is_empty() {
-                graph.edges.extend(sub_fw_edges);
+            let (sub_added_nodes, sub_added_edges) =
+                crate::extract::consumers::emit_community_detection(
+                    primary_slug.clone(),
+                    subsystems.clone(),
+                    graph.nodes.clone(),
+                    graph.edges.clone(),
+                ).unwrap_or_else(|e| {
+                    tracing::warn!("Incremental subsystem promotion via bus failed (non-fatal): {}", e);
+                    (vec![], vec![])
+                });
+            if !sub_added_nodes.is_empty() || !sub_added_edges.is_empty() {
+                graph.nodes.extend(sub_added_nodes);
+                graph.edges.extend(sub_added_edges);
             }
 
             // Auto-collect post-community delta: everything added by subsystem_node and
