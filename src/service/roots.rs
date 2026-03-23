@@ -59,6 +59,7 @@ pub fn list_roots_from_slugs(
 
     // Pre-compute per-root stats in a single pass over nodes and edges.
     // This keeps list_roots_from_slugs O(nodes + edges + roots) rather than O(roots × nodes).
+    #[allow(clippy::type_complexity)]
     let (root_stats, root_langs_map): (
         std::collections::HashMap<String, (usize, usize)>,
         std::collections::HashMap<String, std::collections::BTreeSet<String>>,
@@ -128,13 +129,12 @@ pub fn list_roots_from_slugs(
             }
 
             // LSP working line.
-            if lsp_complete {
-                if let Some(ref name) = lsp_server_name {
+            if lsp_complete
+                && let Some(ref name) = lsp_server_name {
                     // edge_count() returns all LSP-enriched edges (Calls, ReferencedBy, Implements, etc.)
                     line.push_str(&format!("\n  LSP: {} ({} edges)",
                         name, format_count(lsp_edge_count)));
                 }
-            }
 
             // Languages line — show detected languages for this root.
             let empty_langs = std::collections::BTreeSet::new();
@@ -197,7 +197,7 @@ fn format_count(n: usize) -> String {
     let mut result = String::new();
     let len = chars.len();
     for (i, ch) in chars.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
+        if i > 0 && (len - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(*ch);

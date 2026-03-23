@@ -23,7 +23,6 @@ use transport::{LspTransport, PipelinedTransport, path_to_uri, find_enclosing_sy
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -391,12 +390,11 @@ impl LspEnricher {
                             }
                             p.get_mut("analysis")
                         });
-                    if let Some(analysis_val) = analysis_obj {
-                        if let Some(obj) = analysis_val.as_object_mut() {
+                    if let Some(analysis_val) = analysis_obj
+                        && let Some(obj) = analysis_val.as_object_mut() {
                             obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
                             obj.insert("venv".into(), serde_json::Value::String(venv_name.to_string()));
                         }
-                    }
                 }
                 tracing::info!(
                     "pyright: found {} at '{}', adding venvPath/venv to initializationOptions",
@@ -847,6 +845,7 @@ impl LspEnricher {
     ///
     /// Returns `true` if the prepare call succeeded, `false` if it failed (used for
     /// strike counting).
+    #[allow(clippy::too_many_arguments)]
     async fn enrich_type_hierarchy_p(
         transport: &PipelinedTransport,
         file_uri: &Uri,
@@ -960,22 +959,20 @@ impl LspEnricher {
                 "resolve_type_hierarchy_item: {} candidates for '{}' in {}, using position tiebreaker",
                 candidates.len(), name, rel_path.display()
             );
-            if range_start_line > 0 {
-                if let Some(best) = candidates.iter()
+            if range_start_line > 0
+                && let Some(best) = candidates.iter()
                     .filter(|n| n.line_start <= range_start_line && n.line_end >= range_start_line)
                     .min_by_key(|n| n.line_end - n.line_start)
                 {
                     return Some(best.id.clone());
                 }
-            }
             // If position doesn't help, pick closest by line_start
-            if range_start_line > 0 {
-                if let Some(best) = candidates.iter()
+            if range_start_line > 0
+                && let Some(best) = candidates.iter()
                     .min_by_key(|n| (n.line_start as isize - range_start_line as isize).unsigned_abs())
                 {
                     return Some(best.id.clone());
                 }
-            }
             // Last resort: take first
             return Some(candidates[0].id.clone());
         }
@@ -1086,6 +1083,7 @@ impl LspEnricher {
     ///
     /// Severity 0 is not a valid LSP value and is always filtered. Severities above
     /// `max_severity_int` are dropped.
+    #[allow(clippy::too_many_arguments)]
     fn build_diagnostic_nodes(
         file_uri: &str,
         diagnostics: &[serde_json::Value],
@@ -1252,7 +1250,7 @@ impl LspEnricher {
                 let parts: Vec<&str> = line.splitn(3, "->").collect();
                 if parts.len() >= 2 {
                     let from_id = parts[0].trim().trim_end_matches(';').to_string();
-                    let to_id = parts[1].trim().split_whitespace().next()
+                    let to_id = parts[1].split_whitespace().next()
                         .unwrap_or("").trim_end_matches(';').to_string();
                     if from_id.starts_with('_') && to_id.starts_with('_') {
                         edges.push((from_id, to_id));
@@ -1366,8 +1364,8 @@ impl LspEnricher {
 
         // rust-analyzer returns an array of LocationLinks; the first gives the
         // parent module's URI which we use as the module path.
-        if let Some(arr) = result.as_array() {
-            if let Some(first) = arr.first() {
+        if let Some(arr) = result.as_array()
+            && let Some(first) = arr.first() {
                 // The target URI gives us the parent file path; derive module name
                 // from the file name (e.g. `src/server/mod.rs` → `server`)
                 if let Some(uri_str) = first.get("targetUri").and_then(|u| u.as_str()) {
@@ -1393,7 +1391,6 @@ impl LspEnricher {
                     return Ok(module_name);
                 }
             }
-        }
 
         Ok(None)
     }
@@ -1782,11 +1779,10 @@ impl Enricher for LspEnricher {
             .filter(|n| {
                 // Skip test functions (have #[test] or #[tokio::test] decorator)
                 if n.id.kind == NodeKind::Function {
-                    if let Some(decorators) = n.metadata.get("decorators") {
-                        if decorators.contains("#[test]") || decorators.contains("#[tokio::test]") {
+                    if let Some(decorators) = n.metadata.get("decorators")
+                        && (decorators.contains("#[test]") || decorators.contains("#[tokio::test]")) {
                             return false;
                         }
-                    }
                     // Also skip functions in test files
                     if crate::ranking::is_test_file(n) {
                         return false;
@@ -1939,9 +1935,7 @@ impl Enricher for LspEnricher {
                                             }
 
                                             let caller_id = matching_refs.iter()
-                                                .filter(|n| n.id.file == caller_path)
-                                                .filter(|n| n.id.name == caller_name)
-                                                .next()
+                                                .filter(|n| n.id.file == caller_path).find(|n| n.id.name == caller_name)
                                                 .map(|n| n.id.clone())
                                                 .or_else(|| find_enclosing_symbol(&matching_refs, &caller_path, caller_line));
 
@@ -2021,9 +2015,7 @@ impl Enricher for LspEnricher {
                                             }
 
                                             let callee_id = matching_refs.iter()
-                                                .filter(|n| n.id.file == callee_path)
-                                                .filter(|n| n.id.name == callee_name)
-                                                .next()
+                                                .filter(|n| n.id.file == callee_path).find(|n| n.id.name == callee_name)
                                                 .map(|n| n.id.clone())
                                                 .or_else(|| find_enclosing_symbol(&matching_refs, &callee_path, callee_line));
 
@@ -2142,11 +2134,11 @@ impl Enricher for LspEnricher {
                         }
                     }
                     _ => {
-                        if matches!(node.id.kind, NodeKind::Other(_)) {
-                            if let Ok(links) = Self::document_links_p(&transport, &file_uri).await {
+                        if matches!(node.id.kind, NodeKind::Other(_))
+                            && let Ok(links) = Self::document_links_p(&transport, &file_uri).await {
                                 for link in &links {
-                                    if let Some(target) = link.get("target").and_then(|t| t.as_str()) {
-                                        if let Some(target_path) = target.strip_prefix("file://") {
+                                    if let Some(target) = link.get("target").and_then(|t| t.as_str())
+                                        && let Some(target_path) = target.strip_prefix("file://") {
                                             let rel_target = PathBuf::from(target_path);
                                             let rel_target = rel_target.strip_prefix(&root).unwrap_or(&rel_target).to_path_buf();
 
@@ -2172,10 +2164,8 @@ impl Enricher for LspEnricher {
                                                 confidence: Confidence::Confirmed,
                                             });
                                         }
-                                    }
                                 }
                             }
-                        }
                     }
                 }
 
@@ -2674,6 +2664,7 @@ impl Enricher for LspEnricher {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::str::FromStr;
 
     use super::*;
 

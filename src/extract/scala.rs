@@ -13,6 +13,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct ScalaExtractor;
 
+impl Default for ScalaExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScalaExtractor {
     pub fn new() -> Self {
         Self

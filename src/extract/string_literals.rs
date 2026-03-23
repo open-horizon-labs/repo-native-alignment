@@ -56,6 +56,7 @@ pub fn harvest_string_literals(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn harvest_rec(
     node: tree_sitter::Node,
     path: &Path,
@@ -73,15 +74,14 @@ fn harvest_rec(
         let value = if let Some(child_kind) = content_child {
             let mut found = String::new();
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
-                    if child.kind() == child_kind {
+                if let Some(child) = node.child(i as u32)
+                    && child.kind() == child_kind {
                         let text = child.utf8_text(source).unwrap_or("").to_string();
                         if !text.is_empty() {
                             found = text;
                             break;
                         }
                     }
-                }
             }
             found
         } else {

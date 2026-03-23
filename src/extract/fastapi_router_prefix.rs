@@ -62,7 +62,7 @@ use crate::graph::{Node, NodeKind};
 ///
 /// Files are read at most once per unique path (via an internal cache).
 /// Non-readable files are silently skipped with a tracing warning.
-pub fn fastapi_router_prefix_pass(nodes: &mut Vec<Node>) {
+pub fn fastapi_router_prefix_pass(nodes: &mut [Node]) {
     // Step 1: collect the unique set of (root, file) pairs that have ApiEndpoint nodes
     // with a router_var. Key by (root, file) rather than bare file path to avoid
     // cross-root collisions: `src/routes.py` in root-A and root-B are different files
@@ -286,11 +286,10 @@ fn apply_prefix(node: &mut Node, prefix: &str) {
 
 /// Join a prefix path with a local path, avoiding double slashes.
 ///
-/// ```
-/// assert_eq!(join_paths("/workspaces/{id}", "/expertunities"),
-///            "/workspaces/{id}/expertunities");
-/// assert_eq!(join_paths("/api", "/users"), "/api/users");
-/// assert_eq!(join_paths("/api/", "/users"), "/api/users");
+/// ```text
+/// join_paths("/workspaces/{id}", "/expertunities") == "/workspaces/{id}/expertunities"
+/// join_paths("/api", "/users") == "/api/users"
+/// join_paths("/api/", "/users") == "/api/users"
 /// ```
 fn join_paths(prefix: &str, local: &str) -> String {
     let prefix = prefix.trim_end_matches('/');

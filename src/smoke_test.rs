@@ -487,8 +487,8 @@ pub fn rna_smoke_common_fn() -> u32 { 2 }\n\
     let mut found_old = false;
     let mut found_new = false;
     for batch in &batches {
-        if let Some(names_col) = batch.column_by_name("name") {
-            if let Some(names) = names_col.as_any().downcast_ref::<StringArray>() {
+        if let Some(names_col) = batch.column_by_name("name")
+            && let Some(names) = names_col.as_any().downcast_ref::<StringArray>() {
                 for i in 0..batch.num_rows() {
                     let name = names.value(i);
                     if name.contains("rna_smoke_old_fn") {
@@ -499,7 +499,6 @@ pub fn rna_smoke_common_fn() -> u32 { 2 }\n\
                     }
                 }
             }
-        }
     }
 
     // Clean up temp dir.
@@ -803,11 +802,10 @@ async fn run_external_calls_check() -> Check {
                 found_root_external = true;
                 found_fqn = true;
                 // Check meta_virtual typed column for true
-                if let Some(col) = meta_virtual_col {
-                    if !col.is_null(i) && col.value(i) {
+                if let Some(col) = meta_virtual_col
+                    && !col.is_null(i) && col.value(i) {
                         found_virtual_true = true;
                     }
-                }
             }
         }
     }

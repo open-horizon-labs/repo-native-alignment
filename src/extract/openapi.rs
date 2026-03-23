@@ -20,6 +20,12 @@ use super::{ExtractionResult, Extractor};
 /// OpenAPI / JSON Schema extractor.
 pub struct OpenApiExtractor;
 
+impl Default for OpenApiExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OpenApiExtractor {
     pub fn new() -> Self {
         Self
@@ -63,11 +69,10 @@ impl Extractor for OpenApiExtractor {
         }
 
         // Extract component schemas (OpenAPI 3.x)
-        if let Some(components) = doc.get("components") {
-            if let Some(schemas) = components.get("schemas") {
+        if let Some(components) = doc.get("components")
+            && let Some(schemas) = components.get("schemas") {
                 extract_schemas(schemas, path, &mut nodes, &mut edges);
             }
-        }
 
         // Extract definitions (Swagger 2.x / JSON Schema)
         if let Some(definitions) = doc.get("definitions") {
@@ -252,8 +257,8 @@ fn extract_schemas(
         });
 
         // Extract enum values from the schema definition
-        if let Some(enum_values) = schema_def.get("enum") {
-            if let Some(enum_seq) = enum_values.as_sequence() {
+        if let Some(enum_values) = schema_def.get("enum")
+            && let Some(enum_seq) = enum_values.as_sequence() {
                 for enum_val in enum_seq {
                     let val_str = match enum_val {
                         Value::String(s) => s.clone(),
@@ -283,11 +288,10 @@ fn extract_schemas(
                     }
                 }
             }
-        }
 
         // Extract properties as fields
-        if let Some(properties) = schema_def.get("properties") {
-            if let Some(props_map) = properties.as_mapping() {
+        if let Some(properties) = schema_def.get("properties")
+            && let Some(props_map) = properties.as_mapping() {
                 for (prop_key, prop_def) in props_map {
                     let prop_name = match prop_key.as_str() {
                         Some(s) => s.to_string(),
@@ -352,7 +356,6 @@ fn extract_schemas(
                     }
                 }
             }
-        }
     }
 }
 

@@ -82,13 +82,11 @@ fn walk_dir_git2(
                 continue;
             }
             walk_dir_git2(repo, &path, repo_root, extensions, files)?;
-        } else if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if extensions.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+        } else if path.is_file()
+            && let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && extensions.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
                     files.push(path);
                 }
-            }
-        }
     }
     Ok(())
 }
@@ -126,13 +124,11 @@ fn walk_dir_basic(dir: &Path, extensions: &[&str], files: &mut Vec<PathBuf>) -> 
                 continue;
             }
             walk_dir_basic(&path, extensions, files)?;
-        } else if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if extensions.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+        } else if path.is_file()
+            && let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && extensions.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
                     files.push(path);
                 }
-            }
-        }
     }
     Ok(())
 }

@@ -141,8 +141,8 @@ pub fn find_pr_merges_for_outcome<'a>(
             if matched_stable_ids.contains(&stable_id) {
                 continue;
             }
-            if let Some(files_json) = node.metadata.get("files_changed") {
-                if let Ok(files) = serde_json::from_str::<Vec<String>>(files_json) {
+            if let Some(files_json) = node.metadata.get("files_changed")
+                && let Ok(files) = serde_json::from_str::<Vec<String>>(files_json) {
                     let matches = files.iter().any(|f| {
                         file_patterns
                             .iter()
@@ -152,7 +152,6 @@ pub fn find_pr_merges_for_outcome<'a>(
                         matched_stable_ids.insert(stable_id);
                     }
                 }
-            }
         }
     }
 
@@ -342,24 +341,22 @@ fn classify_risk(node: &Node, index: &GraphIndex) -> (RiskTier, String) {
     if is_entry_point {
         return (RiskTier::Critical, "entry point".to_string());
     }
-    if let Some(pr) = pagerank {
-        if pr > 0.7 {
+    if let Some(pr) = pagerank
+        && pr > 0.7 {
             return (
                 RiskTier::Critical,
                 format!("high PageRank ({:.2})", pr),
             );
         }
-    }
 
     // HIGH: high-degree hub symbols (many incoming edges) or moderate PageRank
-    if let Some(pr) = pagerank {
-        if pr > 0.4 {
+    if let Some(pr) = pagerank
+        && pr > 0.4 {
             return (
                 RiskTier::High,
                 format!("moderate PageRank ({:.2})", pr),
             );
         }
-    }
     if in_degree >= 5 {
         return (
             RiskTier::High,

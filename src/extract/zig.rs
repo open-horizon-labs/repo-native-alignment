@@ -16,6 +16,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct ZigExtractor;
 
+impl Default for ZigExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ZigExtractor {
     pub fn new() -> Self {
         Self
@@ -54,8 +60,8 @@ fn collect_const_vars(
 ) {
     if node.kind() == "variable_declaration" {
         let decl_text = node.utf8_text(source).unwrap_or("").to_string();
-        if decl_text.trim_start().starts_with("const ") {
-            if let Some(name_node) = node.child_by_field_name("variable_name") {
+        if decl_text.trim_start().starts_with("const ")
+            && let Some(name_node) = node.child_by_field_name("variable_name") {
                 let name = name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
                 if !name.is_empty() {
                     let sig = decl_text.lines().next().unwrap_or("").trim().to_string();
@@ -89,7 +95,6 @@ fn collect_const_vars(
                     });
                 }
             }
-        }
     }
 
     for i in 0..node.child_count() {

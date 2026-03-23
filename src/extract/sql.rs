@@ -25,6 +25,12 @@ use super::{ExtractionResult, Extractor};
 /// SQL migration extractor using sqlparser-rs.
 pub struct SqlExtractor;
 
+impl Default for SqlExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SqlExtractor {
     pub fn new() -> Self {
         Self

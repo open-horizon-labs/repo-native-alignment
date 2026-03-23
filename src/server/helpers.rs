@@ -240,13 +240,11 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
         if let Some(cc) = n.metadata.get("cyclomatic") {
             entry.push_str(&format!(" cc:{}", cc));
         }
-        if let Some(imp) = n.metadata.get("importance") {
-            if let Ok(score) = imp.parse::<f64>() {
-                if score > IMPORTANCE_THRESHOLD {
+        if let Some(imp) = n.metadata.get("importance")
+            && let Ok(score) = imp.parse::<f64>()
+                && score > IMPORTANCE_THRESHOLD {
                     entry.push_str(&format!(" imp:{:.3}", score));
                 }
-            }
-        }
         let edge_count = index.neighbors(&stable_id, None, Direction::Outgoing).len()
             + index.neighbors(&stable_id, None, Direction::Incoming).len();
         if edge_count > 0 {
@@ -309,13 +307,11 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
         if let Some(cc) = n.metadata.get("cyclomatic") {
             entry.push_str(&format!("\n  Complexity: {}", cc));
         }
-        if let Some(imp) = n.metadata.get("importance") {
-            if let Ok(score) = imp.parse::<f64>() {
-                if score > IMPORTANCE_THRESHOLD {
+        if let Some(imp) = n.metadata.get("importance")
+            && let Ok(score) = imp.parse::<f64>()
+                && score > IMPORTANCE_THRESHOLD {
                     entry.push_str(&format!("\n  Importance: {:.3}", score));
                 }
-            }
-        }
         // Diagnostic-specific metadata (only present on NodeKind::Other("diagnostic") nodes)
         if let Some(severity) = n.metadata.get("diagnostic_severity") {
             entry.push_str(&format!("\n  Severity: {}", severity));

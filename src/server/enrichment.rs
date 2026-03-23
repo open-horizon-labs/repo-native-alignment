@@ -52,7 +52,7 @@ impl RnaHandler {
                         Ok(repo) => match repo.head().and_then(|h| h.peel_to_commit()) {
                             Ok(commit) => {
                                 let oid = commit.id();
-                                let changed = last_head_oid.map_or(false, |prev| prev != oid);
+                                let changed = last_head_oid.is_some_and(|prev| prev != oid);
                                 last_head_oid = Some(oid);
                                 changed
                             }
@@ -67,7 +67,7 @@ impl RnaHandler {
                     match std::fs::metadata(&fetch_head_path).and_then(|m| m.modified()) {
                         Ok(mtime) => {
                             let changed =
-                                last_fetch_head_mtime.map_or(false, |prev| prev != mtime);
+                                last_fetch_head_mtime.is_some_and(|prev| prev != mtime);
                             last_fetch_head_mtime = Some(mtime);
                             changed
                         }
@@ -160,6 +160,7 @@ impl RnaHandler {
                 // Collect LanceDB persist deltas per root (outside write guard so
                 // persist_graph_incremental can run without holding the lock).
                 // Structure: (root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove)
+                #[allow(clippy::type_complexity)]
                 let mut lance_deltas: Vec<(
                     String,   // root_slug
                     PathBuf,
@@ -220,7 +221,7 @@ impl RnaHandler {
 
                         graph_state.nodes.retain(|n| {
                             n.id.root != *root_slug
-                                || !files_to_remove.iter().any(|f| n.id.file == *f)
+                                || !files_to_remove.contains(&n.id.file)
                         });
                         graph_state.edges.retain(|e| {
                             e.from.root != *root_slug
@@ -428,11 +429,10 @@ impl RnaHandler {
 
                 // Commit scanner state only for roots that persisted successfully.
                 for (root_slug, _scan, _root_path, scanner) in &per_root_scans {
-                    if persisted_slugs.contains(root_slug) {
-                        if let Err(e) = scanner.commit_state() {
+                    if persisted_slugs.contains(root_slug)
+                        && let Err(e) = scanner.commit_state() {
                             tracing::error!("Background scan: failed to commit scanner state for '{}': {}", root_slug, e);
                         }
-                    }
                 }
 
                 // Update freshness timestamp if any root persisted successfully.
@@ -602,7 +602,7 @@ impl RnaHandler {
             let enriched_node_ids: std::collections::HashSet<String> =
                 enrichment.updated_nodes.iter().map(|(id, _)| id.clone()).collect();
             let all_upsert_node_ids: std::collections::HashSet<String> =
-                enriched_node_ids.into_iter().chain(new_node_ids.into_iter()).collect();
+                enriched_node_ids.into_iter().chain(new_node_ids).collect();
             let persist_edges = enrichment.added_edges.clone();
 
             let mut guard = bg_graph.write().await;
@@ -719,6 +719,11 @@ impl RnaHandler {
     }
 
     /// Spawn incremental LSP enrichment for changed nodes after an incremental update.
+    ///
+    /// Not called from the synchronous bus path (Phase 3+, issue #520) because
+    /// `run_post_passes_via_bus` already runs LspConsumers synchronously.
+    /// Retained for future use (e.g., explicit CLI trigger or Phase 4 async path).
+    #[allow(dead_code)]
     pub(crate) fn spawn_incremental_lsp_enrichment(
         &self,
         changed_nodes: Vec<Node>,
@@ -835,7 +840,7 @@ impl RnaHandler {
                 // Collect nodes to persist/re-embed AFTER PageRank so importance is current.
                 let all_upsert_node_ids: std::collections::HashSet<String> =
                     enriched_node_ids.iter().cloned()
-                        .chain(new_node_ids.into_iter())
+                        .chain(new_node_ids)
                         .collect();
                 let all_upsert_nodes: Vec<Node> = gs.nodes.iter()
                     .filter(|n| all_upsert_node_ids.contains(&n.stable_id()))
@@ -847,11 +852,10 @@ impl RnaHandler {
 
                 // Re-embed enriched nodes.
                 let embed_guard = bg_embed_index.load();
-                if let Some(ref embed_idx) = **embed_guard {
-                    if let Err(e) = embed_idx.reindex_nodes(&all_upsert_nodes).await {
+                if let Some(ref embed_idx) = **embed_guard
+                    && let Err(e) = embed_idx.reindex_nodes(&all_upsert_nodes).await {
                         tracing::warn!("[incremental-bg] Failed to re-embed enriched nodes: {}", e);
                     }
-                }
 
                 // Persist to LanceDB (slow -- outside the lock).
                 // Acquire the write mutex to serialize with other LanceDB writers (#344 round 3).
@@ -1027,12 +1031,11 @@ impl RnaHandler {
             }
 
             // Reuse existing embedding index.
-            if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await {
-                if let Ok(true) = idx.has_table().await {
+            if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await
+                && let Ok(true) = idx.has_table().await {
                     idx.ensure_fts_index().await;
                     self.embed_index.store(Arc::new(Some(idx)));
                 }
-            }
 
             // Check if LSP enrichment has been durably persisted via the completion
             // sentinel. This replaces the `has_call_edges` heuristic, which fails

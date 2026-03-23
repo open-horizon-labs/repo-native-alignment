@@ -13,6 +13,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct YamlExtractor;
 
+impl Default for YamlExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl YamlExtractor {
     pub fn new() -> Self {
         Self
@@ -170,11 +176,10 @@ fn find_block_mapping(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
         return Some(node);
     }
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
-            if let Some(found) = find_block_mapping(child) {
+        if let Some(child) = node.child(i as u32)
+            && let Some(found) = find_block_mapping(child) {
                 return Some(found);
             }
-        }
     }
     None
 }

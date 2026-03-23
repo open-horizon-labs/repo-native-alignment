@@ -19,6 +19,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct CppExtractor;
 
+impl Default for CppExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CppExtractor {
     pub fn new() -> Self {
         Self
@@ -68,11 +74,10 @@ fn extract_cpp_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
         }
         "pointer_declarator" | "reference_declarator" => {
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
-                    if let Some(name) = extract_cpp_name(child, source) {
+                if let Some(child) = node.child(i as u32)
+                    && let Some(name) = extract_cpp_name(child, source) {
                         return Some(name);
                     }
-                }
             }
             None
         }
@@ -90,8 +95,8 @@ fn collect_cpp_specials(
 ) {
     match node.kind() {
         "function_definition" => {
-            if let Some(declarator) = node.child_by_field_name("declarator") {
-                if let Some(name) = extract_cpp_name(declarator, source) {
+            if let Some(declarator) = node.child_by_field_name("declarator")
+                && let Some(name) = extract_cpp_name(declarator, source) {
                     let qualified = match scope {
                         Some(s) => format!("{}::{}", s, name),
                         None => name.clone(),
@@ -115,7 +120,6 @@ fn collect_cpp_specials(
                         source: ExtractionSource::TreeSitter,
                     });
                 }
-            }
         }
         "namespace_definition" => {
             if let Some(name_node) = node.child_by_field_name("name") {
@@ -153,9 +157,9 @@ fn collect_cpp_specials(
             let decl_text = node.utf8_text(source).unwrap_or("").to_string();
             let is_const = decl_text.contains("constexpr")
                 || (decl_text.contains("static") && decl_text.contains("const "));
-            if is_const {
-                if let Some(declarator) = node.child_by_field_name("declarator") {
-                    if let Some(name) = extract_cpp_name(declarator, source) {
+            if is_const
+                && let Some(declarator) = node.child_by_field_name("declarator")
+                    && let Some(name) = extract_cpp_name(declarator, source) {
                         let qualified = match scope {
                             Some(s) => format!("{}::{}", s, name),
                             None => name,
@@ -190,8 +194,6 @@ fn collect_cpp_specials(
                             source: ExtractionSource::TreeSitter,
                         });
                     }
-                }
-            }
         }
         _ => {}
     }

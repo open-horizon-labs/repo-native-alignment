@@ -16,6 +16,12 @@ use super::{ExtractionResult, Extractor};
 
 pub struct LuaExtractor;
 
+impl Default for LuaExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LuaExtractor {
     pub fn new() -> Self {
         Self
@@ -52,15 +58,14 @@ fn collect_allcaps_consts(
     source: &[u8],
     nodes: &mut Vec<Node>,
 ) {
-    if node.kind() == "assignment_statement" {
-        if let Some(var_list) = node.child_by_field_name("variable_list")
+    if node.kind() == "assignment_statement"
+        && let Some(var_list) = node.child_by_field_name("variable_list")
             .or_else(|| (0..node.child_count()).find_map(|i| {
                 let c = node.child(i as u32)?;
                 if c.kind() == "variable_list" { Some(c) } else { None }
             }))
-        {
-            if let Some(name_node) = var_list.child(0_u32) {
-                if name_node.kind() == "identifier" {
+            && let Some(name_node) = var_list.child(0_u32)
+                && name_node.kind() == "identifier" {
                     let name_str = name_node.utf8_text(source).unwrap_or("").trim().to_string();
                     if !name_str.is_empty()
                         && name_str.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
@@ -104,9 +109,6 @@ fn collect_allcaps_consts(
                         });
                     }
                 }
-            }
-        }
-    }
 
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {

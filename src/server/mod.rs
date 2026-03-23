@@ -303,8 +303,8 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
         // Prepend business context preamble to first successful tool result.
         // Only mark as injected after the insert succeeds (compare_exchange
         // guards against concurrent tool calls both injecting).
-        if let (Some(preamble), Ok(tool_result)) = (preamble, &mut result) {
-            if self.context_injected.compare_exchange(
+        if let (Some(preamble), Ok(tool_result)) = (preamble, &mut result)
+            && self.context_injected.compare_exchange(
                 false, true,
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Relaxed,
@@ -314,7 +314,6 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
                     TextContent::new(preamble, None, None).into(),
                 );
             }
-        }
 
         result
     }

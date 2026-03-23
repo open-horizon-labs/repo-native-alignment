@@ -23,7 +23,7 @@
 //!
 //! 1. Implement `PostExtractionPass`.
 //! 2. Add it to `PostExtractionRegistry::with_builtins()`.
-//! Done — no changes to `graph.rs` or `enrichment.rs`.
+//!    Done — no changes to `graph.rs` or `enrichment.rs`.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
