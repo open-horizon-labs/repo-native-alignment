@@ -63,35 +63,37 @@ use crate::graph::{Node, NodeKind};
 /// Files are read at most once per unique path (via an internal cache).
 /// Non-readable files are silently skipped with a tracing warning.
 pub fn fastapi_router_prefix_pass(nodes: &mut Vec<Node>) {
-    // Step 1: collect the unique set of Python files that have ApiEndpoint nodes
-    // with a router_var, so we only read files that need prefix resolution.
-    let files_to_scan: std::collections::HashSet<std::path::PathBuf> = nodes
+    // Step 1: collect the unique set of (root, file) pairs that have ApiEndpoint nodes
+    // with a router_var. Key by (root, file) rather than bare file path to avoid
+    // cross-root collisions: `src/routes.py` in root-A and root-B are different files
+    // and may have different APIRouter assignments (CodeRabbit finding #6, PR #528).
+    let files_to_scan: std::collections::HashSet<(String, std::path::PathBuf)> = nodes
         .iter()
         .filter(|n| {
             n.language == "python"
                 && n.id.kind == NodeKind::ApiEndpoint
                 && n.metadata.get("router_var").map(|v| !v.is_empty()).unwrap_or(false)
         })
-        .map(|n| n.id.file.clone())
+        .map(|n| (n.id.root.clone(), n.id.file.clone()))
         .collect();
 
     if files_to_scan.is_empty() {
         return;
     }
 
-    // Step 2: for each such file, extract APIRouter prefix assignments.
-    // Result: file_path -> { var_name -> prefix }
-    let mut prefix_map: HashMap<std::path::PathBuf, HashMap<String, String>> = HashMap::new();
-    for file_path in &files_to_scan {
+    // Step 2: for each such (root, file) pair, extract APIRouter prefix assignments.
+    // Result: (root, file) -> { var_name -> prefix }
+    let mut prefix_map: HashMap<(String, std::path::PathBuf), HashMap<String, String>> = HashMap::new();
+    for (root, file_path) in &files_to_scan {
         match extract_router_prefixes(file_path) {
             Ok(prefixes) if !prefixes.is_empty() => {
-                prefix_map.insert(file_path.clone(), prefixes);
+                prefix_map.insert((root.clone(), file_path.clone()), prefixes);
             }
             Ok(_) => {} // no APIRouter assignments in this file
             Err(e) => {
                 tracing::warn!(
-                    "fastapi_router_prefix: could not read {:?}: {}",
-                    file_path, e
+                    "fastapi_router_prefix: could not read {:?} (root '{}'): {}",
+                    file_path, root, e
                 );
             }
         }
@@ -101,7 +103,7 @@ pub fn fastapi_router_prefix_pass(nodes: &mut Vec<Node>) {
         return;
     }
 
-    // Step 3: update ApiEndpoint nodes whose (file, router_var) is in the map.
+    // Step 3: update ApiEndpoint nodes whose (root, file, router_var) is in the map.
     for node in nodes.iter_mut() {
         if node.language != "python" || node.id.kind != NodeKind::ApiEndpoint {
             continue;
@@ -110,7 +112,7 @@ pub fn fastapi_router_prefix_pass(nodes: &mut Vec<Node>) {
             Some(v) if !v.is_empty() => v.clone(),
             _ => continue,
         };
-        let file_prefixes = match prefix_map.get(&node.id.file) {
+        let file_prefixes = match prefix_map.get(&(node.id.root.clone(), node.id.file.clone())) {
             Some(fp) => fp,
             None => continue,
         };

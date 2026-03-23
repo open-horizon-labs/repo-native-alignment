@@ -236,7 +236,7 @@ impl ExtractionConsumer for PostExtractionConsumer {
     }
 
     fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::AllEnrichmentsDone { slug, nodes, edges, lsp_edges, lsp_nodes } = event else {
+        let ExtractionEvent::AllEnrichmentsDone { slug, nodes, edges, lsp_edges, lsp_nodes, updated_nodes } = event else {
             return Ok(vec![]);
         };
 
@@ -247,6 +247,24 @@ impl ExtractionConsumer for PostExtractionConsumer {
         merged_nodes.extend_from_slice(lsp_nodes);
         let mut merged_edges = edges.to_vec();
         merged_edges.extend_from_slice(lsp_edges);
+
+        // Apply metadata patches from LSP enrichment (e.g., inferred types from inlay hints).
+        // The patches reference nodes by stable_id and may target tree-sitter nodes not present
+        // in `lsp_nodes`. Apply them to the merged set so post-extraction passes see updated metadata.
+        if !updated_nodes.is_empty() {
+            for (node_id, patches) in updated_nodes.iter() {
+                if let Some(node) = merged_nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
+                    for (key, value) in patches {
+                        node.metadata.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            tracing::debug!(
+                "PostExtractionConsumer: root '{}' applied {} metadata patch(es) from LSP enrichment",
+                slug,
+                updated_nodes.len(),
+            );
+        }
 
         // Delegate to the inner pass logic with merged nodes/edges.
         self.run_passes(slug, merged_nodes, merged_edges)
@@ -703,7 +721,15 @@ impl ExtractionConsumer for LspConsumer {
             Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
                 tokio::task::block_in_place(|| {
                     handle.block_on(async {
-                        let index = crate::graph::index::GraphIndex::new();
+                        // Build an index from the nodes visible to this enricher so that
+                        // enrichers that resolve or deduplicate through the index (e.g., future
+                        // enrichers beyond LspEnricher) see a populated graph rather than an
+                        // empty one. LspEnricher currently ignores the index (_index param),
+                        // but this keeps the contract correct for any enricher that does use it.
+                        let mut index = crate::graph::index::GraphIndex::new();
+                        for node in &nodes_vec {
+                            index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+                        }
                         enricher.enrich(&nodes_vec, &index, &repo_root).await
                     })
                 })
@@ -731,17 +757,19 @@ impl ExtractionConsumer for LspConsumer {
         match enrichment_result {
             Ok(enrichment) => {
                 tracing::info!(
-                    "LspConsumer({}): root '{}' enrichment complete: {} edges, {} virtual nodes",
+                    "LspConsumer({}): root '{}' enrichment complete: {} edges, {} virtual nodes, {} patches",
                     self.language,
                     slug,
                     enrichment.added_edges.len(),
                     enrichment.new_nodes.len(),
+                    enrichment.updated_nodes.len(),
                 );
                 Ok(vec![ExtractionEvent::EnrichmentComplete {
                     slug: slug.clone(),
                     language: language.clone(),
                     added_edges: Arc::from(enrichment.added_edges.into_boxed_slice()),
                     new_nodes: Arc::from(enrichment.new_nodes.into_boxed_slice()),
+                    updated_nodes: Arc::from(enrichment.updated_nodes.into_boxed_slice()),
                 }])
             }
             Err(e) => {
@@ -759,6 +787,7 @@ impl ExtractionConsumer for LspConsumer {
                     language: language.clone(),
                     added_edges: Arc::from([]),
                     new_nodes: Arc::from([]),
+                    updated_nodes: Arc::from([]),
                 }])
             }
         }
@@ -805,6 +834,9 @@ struct GateState {
     lsp_edges: Vec<crate::graph::Edge>,
     /// Accumulated virtual nodes from all `EnrichmentComplete` events.
     lsp_nodes: Vec<Node>,
+    /// Accumulated metadata patches from all `EnrichmentComplete` events.
+    /// Each patch is `(node_stable_id, key-value map)`.
+    updated_nodes: Vec<(String, std::collections::BTreeMap<String, String>)>,
     /// Whether `AllEnrichmentsDone` has already been emitted (guards against double-emit).
     fired: bool,
 }
@@ -820,6 +852,7 @@ impl AllEnrichmentsGate {
                 slug: None,
                 lsp_edges: Vec::new(),
                 lsp_nodes: Vec::new(),
+                updated_nodes: Vec::new(),
                 fired: false,
             }),
         }
@@ -888,6 +921,7 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                 state.slug = Some(slug.clone());
                 state.lsp_edges.clear();
                 state.lsp_nodes.clear();
+                state.updated_nodes.clear();
                 state.fired = false;
 
                 // If there are no supported languages, emit AllEnrichmentsDone immediately
@@ -904,13 +938,14 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                         edges: Arc::clone(edges),
                         lsp_edges: Arc::from([]),
                         lsp_nodes: Arc::from([]),
+                        updated_nodes: Arc::from([]),
                     }]);
                 }
 
                 Ok(vec![])
             }
 
-            ExtractionEvent::EnrichmentComplete { slug, added_edges, new_nodes, .. } => {
+            ExtractionEvent::EnrichmentComplete { slug, added_edges, new_nodes, updated_nodes, .. } => {
                 // Guard: only process if we have state initialised for this slug.
                 if state.slug.as_deref() != Some(slug.as_str()) {
                     tracing::warn!(
@@ -928,6 +963,7 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                 state.received += 1;
                 state.lsp_edges.extend_from_slice(added_edges);
                 state.lsp_nodes.extend_from_slice(new_nodes);
+                state.updated_nodes.extend_from_slice(updated_nodes);
 
                 tracing::debug!(
                     "AllEnrichmentsGate: root '{}' — {}/{} enrichments complete",
@@ -949,13 +985,17 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                     let lsp_nodes: Arc<[Node]> = Arc::from(
                         std::mem::take(&mut state.lsp_nodes).into_boxed_slice()
                     );
+                    let updated_nodes: Arc<[(String, std::collections::BTreeMap<String, String>)]> = Arc::from(
+                        std::mem::take(&mut state.updated_nodes).into_boxed_slice()
+                    );
                     tracing::info!(
                         "AllEnrichmentsGate: root '{}' — all {} enrichment(s) done, \
-                         {} LSP edges, {} LSP nodes",
+                         {} LSP edges, {} LSP nodes, {} metadata patches",
                         slug,
                         state.expected,
                         lsp_edges.len(),
                         lsp_nodes.len(),
+                        updated_nodes.len(),
                     );
                     return Ok(vec![ExtractionEvent::AllEnrichmentsDone {
                         slug: slug.clone(),
@@ -963,6 +1003,7 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                         edges: base_edges,
                         lsp_edges,
                         lsp_nodes,
+                        updated_nodes,
                     }]);
                 }
 
@@ -1625,6 +1666,7 @@ mod tests {
             edges: std::sync::Arc::from([]),
             lsp_edges: std::sync::Arc::from([]),
             lsp_nodes: std::sync::Arc::from([]),
+            updated_nodes: std::sync::Arc::from([]),
         };
         let follow_ons = consumer.on_event(&event).unwrap();
         assert!(
@@ -1793,6 +1835,7 @@ mod tests {
             language: "rust".into(),
             added_edges: std::sync::Arc::from([]),
             new_nodes: std::sync::Arc::from([]),
+            updated_nodes: std::sync::Arc::from([]),
         };
         let result = gate.on_event(&enrichment_done).unwrap();
         assert_eq!(result.len(), 1, "Gate must emit AllEnrichmentsDone after all enrichments");

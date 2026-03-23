@@ -855,10 +855,19 @@ impl RnaHandler {
             // Writing the LSP sentinel here avoids a subsequent startup re-running LSP
             // on an already-enriched graph (#477).
             super::sentinel::write_extract_sentinel(&self.repo_root, all_nodes.len(), all_edges.len());
+            // Write or clear the LSP sentinel depending on whether LSP produced edges.
+            // If LSP ran but produced no edges (no server, no supported language, empty result),
+            // we must clear any stale sentinel left from a previous run. A stale sentinel would
+            // cause the next startup to skip LSP enrichment even though the persisted graph is
+            // tree-sitter-only, which would hide the "no server" situation.
             let has_lsp_edges = all_edges.iter()
                 .any(|e| e.source == crate::graph::ExtractionSource::Lsp);
             if has_lsp_edges {
                 super::sentinel::write_lsp_sentinel(&self.repo_root, all_nodes.len(), all_edges.len());
+            } else {
+                // No LSP data in this build — clear the old sentinel so the next startup
+                // knows to re-run LSP enrichment rather than trusting stale data.
+                super::sentinel::clear_lsp_sentinel(&self.repo_root);
             }
             drop(_lance_guard);
 
@@ -1174,27 +1183,20 @@ impl RnaHandler {
                 .ensure_node(&node.stable_id(), &node.id.kind.to_string());
         }
 
-        // Run LSP enrichers on the updated nodes (same as cold-start, but scoped to changed files).
-        // Only enrichers matching the languages of changed files are invoked -- if only .rs
-        // changed, only rust-analyzer runs (not pyright, marksman, etc.). This scoping is
-        // handled by `enrich_all` which filters enrichers by the `languages` vec.
-        // LSP enrichment runs in a background task (matching the full-build pattern) so the
-        // write lock is released quickly and tool calls aren't blocked.
+        // LSP enrichment is now handled synchronously by `LspConsumer` inside
+        // `run_post_passes_via_bus` (called above, Phase 3 / issue #520).
+        // `spawn_incremental_lsp_enrichment` is NOT called here to avoid double-enrichment:
+        // the bus already ran every LspConsumer for all supported languages before this point.
+        // The `spawn_lsp` flag is retained for future use but currently has no effect on the
+        // incremental path — remove this comment when the flag is fully removed (#537).
+        let _ = spawn_lsp; // suppress unused-variable warning
+
+        // `changed_files` is still needed below for targeted re-embedding.
         let changed_files: std::collections::HashSet<_> = scan
             .changed_files
             .iter()
             .chain(scan.new_files.iter())
             .collect();
-        let changed_nodes: Vec<_> = graph
-            .nodes
-            .iter()
-            .filter(|n| changed_files.iter().any(|f| n.id.file == **f))
-            .cloned()
-            .collect();
-
-        if spawn_lsp && !changed_nodes.is_empty() {
-            self.spawn_incremental_lsp_enrichment(changed_nodes, graph.index.clone());
-        }
 
         // Recompute PageRank importance scores after all graph mutations
         // (extraction + LSP enrichment) are complete.

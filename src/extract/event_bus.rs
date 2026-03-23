@@ -96,6 +96,9 @@ pub enum ExtractionEvent {
         language: String,
         added_edges: Arc<[Edge]>,
         new_nodes: Arc<[Node]>,
+        /// Metadata patches for existing nodes: (node_stable_id, key-value patches).
+        /// Applied to base tree-sitter nodes before post-extraction passes run.
+        updated_nodes: Arc<[(String, std::collections::BTreeMap<String, String>)]>,
     },
 
     /// A framework has been detected during post-extraction passes.
@@ -144,6 +147,10 @@ pub enum ExtractionEvent {
         lsp_edges: Arc<[Edge]>,
         /// Virtual nodes added by LSP enrichment (e.g., external callee stubs).
         lsp_nodes: Arc<[Node]>,
+        /// Metadata patches for existing nodes: (node_stable_id, key-value patches).
+        /// Applied to base nodes before post-extraction passes run so passes see
+        /// LSP-enriched metadata (e.g., inferred types from inlay hints).
+        updated_nodes: Arc<[(String, std::collections::BTreeMap<String, String>)]>,
     },
 }
 
