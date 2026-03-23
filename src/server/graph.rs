@@ -594,8 +594,16 @@ impl RnaHandler {
         //
         // LSP enrichment now runs synchronously inside this bus call.
         // `spawn_background_enrichment` (called below) is embedding-only.
+        //   - EmbeddingIndexerConsumer — stub here; embed handled by spawn_background_enrichment
+        //   - LanceDBConsumer — stub here; persist handled after PageRank + subsystem passes
         //
         // ADR Constraint 4: no direct pass function calls in src/server/.
+        //
+        // Both EmbeddingIndexerConsumer and LanceDBConsumer are passed None (stub mode)
+        // in the full-build path: embedding runs via spawn_background_enrichment (which
+        // uses the embed index created just below), and LanceDB persist runs after PageRank
+        // + subsystem detection so the stored data is complete. Using real consumers here
+        // would either duplicate work (embed) or persist an incomplete graph (lance).
         {
             // Mark LSP as running before the bus call so status is visible immediately.
             if spawn_background {
@@ -614,7 +622,11 @@ impl RnaHandler {
                     root_pairs,
                     primary_slug,
                     self.repo_root.clone(),
-                    Some(Arc::clone(&self.scan_stats)),
+                    crate::extract::consumers::BusOptions {
+                        scan_stats: Some(Arc::clone(&self.scan_stats)),
+                        embed_idx: None, // embed handled by spawn_background_enrichment after graph is ready
+                        lance_repo_root: None, // LanceDB persist handled directly after PageRank/subsystem passes
+                    },
                 )?;
             all_nodes = enriched_nodes;
             all_edges = enriched_edges;
@@ -1123,7 +1135,11 @@ impl RnaHandler {
                     root_pairs_incremental,
                     primary_slug.clone(),
                     self.repo_root.clone(),
-                    Some(Arc::clone(&self.scan_stats)),
+                    crate::extract::consumers::BusOptions {
+                        scan_stats: Some(Arc::clone(&self.scan_stats)),
+                        embed_idx: None, // embed handled below via targeted reindex_nodes after PageRank
+                        lance_repo_root: None, // LanceDB persist handled below via persist_graph_incremental
+                    },
                 ).map_err(|e| {
                     // Pipeline invariant violated — abort the incremental update so the
                     // partial graph is not persisted. Scanner state is not committed on
