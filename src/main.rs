@@ -33,6 +33,15 @@ enum Commands {
     ListRoots(ListRootsCli),
     /// Show a high-level repository map
     RepoMap(RepoMapCli),
+    /// Open an interactive graph visualizer in the browser
+    Open(OpenArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct OpenArgs {
+    /// Path to the repo to visualize (must have been scanned first)
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
 }
 
 #[derive(clap::Args, Debug)] struct StatsArgs { #[arg(long, default_value = ".")] repo: PathBuf }
@@ -285,6 +294,11 @@ async fn async_main() -> anyhow::Result<()> {
             let params = RepoMapParams { top_n: args.top_n, root_filter, non_code_slugs: std::collections::HashSet::new() };
             let ctx = RepoMapContext { graph_state: &gs, repo_root: &repo_root, lsp_status: None, embed_status: None };
             println!("{}", service::repo_map(&params, &ctx)); return Ok(());
+        }
+        Some(Commands::Open(args)) => {
+            init_tracing("warn", log_path.as_deref());
+            repo_native_alignment::open_viewer::run(args.repo).await?;
+            return Ok(());
         }
         None => {}
     }

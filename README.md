@@ -186,6 +186,7 @@ CLI and MCP share the same index. Run `scan --full` from the CLI to build the co
 | `scan --repo <dir> --full` | Full pipeline including LSP enrichment. Incremental on repeat runs. |
 | `stats --repo <dir>` | Show repo stats from persisted index (no re-scan) |
 | `test --repo <dir>` | Run 29 pipeline checks end-to-end |
+| `open --repo <dir>` | Launch an interactive graph visualizer in the browser |
 | `setup --project <dir>` | Bootstrap RNA + OH MCP + skills for a project |
 
 ### Plugin Skills
@@ -290,7 +291,7 @@ RNA works standalone. These add organizational context and workflow structure:
 
 ## Status
 
-4 MCP tools, 10 CLI subcommands. Extracts symbols from 22 languages, builds a call graph via language server analysis, detects architectural subsystems and frameworks automatically.
+4 MCP tools, 11 CLI subcommands. Extracts symbols from 22 languages, builds a call graph via language server analysis, detects architectural subsystems and frameworks automatically.
 
 **v0.1.15 (current):** EventBus/consumer architecture, parallel LSP enrichment, config-driven extractors (`.oh/extractors/*.toml`), live scan stats in `list_roots`, worktree own-cache detection, FastAPI router prefix resolution.
 

@@ -74,6 +74,9 @@ fastembed = "5"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# HTTP viewer (open subcommand) — axum is already a transitive dep via rust-mcp-sdk
+axum = { version = "0.8", features = ["json"] }
+
 # SQL parsing (schema extraction from migrations)
 sqlparser = "0.61"
 

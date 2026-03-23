@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RNA Graph Viewer</title>
+<!--
+  NOTE (v0 spike): Cytoscape.js is loaded from CDN. This requires network access
+  the first time. For fully offline operation a future iteration should inline or
+  serve the asset from the Axum binary.
+-->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #0f1117; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
+  #header { padding: 10px 16px; background: #1a1d27; border-bottom: 1px solid #2d3148;
+            display: flex; align-items: center; gap: 12px; }
+  #header h1 { font-size: 16px; font-weight: 600; color: #a8b4e8; }
+  #header .repo-label { font-size: 12px; color: #6b7499; }
+  #controls { padding: 8px 16px; background: #13162b; border-bottom: 1px solid #2d3148;
+              display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  #controls input { background: #1e2235; border: 1px solid #3d4466; border-radius: 4px;
+                    color: #e0e0e0; padding: 5px 10px; font-size: 13px; width: 260px; }
+  #controls input:focus { outline: none; border-color: #6b7fe8; }
+  #controls select { background: #1e2235; border: 1px solid #3d4466; border-radius: 4px;
+                     color: #e0e0e0; padding: 5px 8px; font-size: 13px; }
+  #controls button { background: #3d4f9e; border: none; border-radius: 4px; color: #e8ecff;
+                     padding: 5px 12px; font-size: 13px; cursor: pointer; }
+  #controls button:hover { background: #4d62b8; }
+  #controls button.secondary { background: #2a2d40; }
+  #controls button.secondary:hover { background: #363a52; }
+  #main { flex: 1; display: flex; min-height: 0; }
+  #graph-container { flex: 1; position: relative; }
+  #cy { width: 100%; height: 100%; }
+  #sidebar { width: 300px; background: #13162b; border-left: 1px solid #2d3148;
+             display: flex; flex-direction: column; overflow: hidden; }
+  #sidebar h2 { padding: 10px 14px; font-size: 13px; font-weight: 600; color: #a8b4e8;
+                border-bottom: 1px solid #2d3148; }
+  #sidebar-content { flex: 1; overflow-y: auto; padding: 10px 14px; font-size: 12px;
+                     line-height: 1.6; color: #c0c8e8; }
+  #sidebar-content pre { white-space: pre-wrap; word-break: break-word; color: #9fa8d4; }
+  #status { padding: 6px 16px; background: #0d0f1a; font-size: 11px; color: #4a5070;
+            border-top: 1px solid #1e2235; }
+  .legend { display: flex; gap: 14px; align-items: center; font-size: 11px; color: #6b7499; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 4px; }
+  .loading { color: #6b7499; font-style: italic; padding: 20px 0; text-align: center; }
+  #offline-warning { display: none; background: #3d1a1a; color: #e85b5b; padding: 8px 16px;
+                     font-size: 12px; border-bottom: 1px solid #5b2020; }
+</style>
+</head>
+<body>
+<div id="offline-warning">
+  Cytoscape.js could not be loaded from CDN. Check your network connection or open the browser while connected once to cache the library.
+</div>
+<div id="header">
+  <h1>RNA Graph Viewer</h1>
+  <span class="repo-label" id="repo-label">Loading...</span>
+  <div style="flex:1"></div>
+  <div class="legend">
+    <span><span class="legend-dot" style="background:#5b7fe8"></span>subsystem</span>
+    <span><span class="legend-dot" style="background:#e8a44a"></span>module/file</span>
+    <span><span class="legend-dot" style="background:#5bc87e"></span>function</span>
+    <span><span class="legend-dot" style="background:#c85bb8"></span>struct/type</span>
+    <span><span class="legend-dot" style="background:#e85b5b"></span>external</span>
+  </div>
+</div>
+<div id="controls">
+  <input id="search-input" type="text" placeholder="Search nodes... (press Enter)" />
+  <select id="layout-select">
+    <option value="cose">Force-directed</option>
+    <option value="breadthfirst">Tree</option>
+    <option value="circle">Circle</option>
+    <option value="grid">Grid</option>
+  </select>
+  <button onclick="reloadRepoMap()">Reload map</button>
+  <button class="secondary" onclick="resetView()">Reset view</button>
+  <button class="secondary" onclick="toggleSidebar()">Toggle panel</button>
+</div>
+<div id="main">
+  <div id="graph-container"><div id="cy"></div></div>
+  <div id="sidebar">
+    <h2 id="sidebar-title">Repository Map</h2>
+    <div id="sidebar-content"><p class="loading">Loading graph...</p></div>
+  </div>
+</div>
+<div id="status">Initializing...</div>
+
+<script>
+// ── Guard: show warning if Cytoscape failed to load from CDN ─────────────────
+
+if (typeof cytoscape === 'undefined') {
+  document.getElementById('offline-warning').style.display = 'block';
+  document.getElementById('status').textContent = 'Error: Cytoscape.js not loaded. Check network.';
+  throw new Error('Cytoscape.js not available');
+}
+
+const MCP_URL = '/mcp';
+
+// ── Active request tracker — cancel stale requests ───────────────────────────
+// Each logical "operation" gets a token. When a new operation starts, the old
+// token is invalidated so its response is ignored even if it arrives later.
+
+let activeRepoMapController = null;
+let activeNodeController = null;
+let activeSearchController = null;
+
+async function callTool(tool, params = {}, signal = null) {
+  const opts = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tool, params }),
+  };
+  if (signal) opts.signal = signal;
+  const r = await fetch(MCP_URL, opts);
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({ error: r.statusText }));
+    throw new Error(e.error || r.statusText);
+  }
+  const j = await r.json();
+  return j.result;
+}
+
+function setStatus(msg) {
+  document.getElementById('status').textContent = msg;
+}
+
+// ── Cytoscape setup ─────────────────────────────────────────────────────────
+
+const cy = cytoscape({
+  container: document.getElementById('cy'),
+  style: [
+    {
+      selector: 'node',
+      style: {
+        'background-color': 'data(color)',
+        'label': 'data(label)',
+        'color': '#e0e0e0',
+        'font-size': '11px',
+        'text-valign': 'bottom',
+        'text-halign': 'center',
+        'text-margin-y': '4px',
+        'text-outline-width': '2px',
+        'text-outline-color': '#0f1117',
+        'width': 'data(size)',
+        'height': 'data(size)',
+        'border-width': 0,
+        'transition-property': 'border-width border-color',
+        'transition-duration': '0.15s',
+      }
+    },
+    {
+      selector: 'node:selected',
+      style: {
+        'border-width': 3,
+        'border-color': '#ffffff',
+      }
+    },
+    {
+      selector: 'node.dimmed',
+      style: { 'opacity': 0.25 }
+    },
+    {
+      selector: 'node.highlighted',
+      style: { 'border-width': 2, 'border-color': '#ffffff', 'opacity': 1 }
+    },
+    {
+      selector: 'edge',
+      style: {
+        'width': 1,
+        'line-color': '#2d3555',
+        'target-arrow-color': '#2d3555',
+        'target-arrow-shape': 'triangle',
+        'curve-style': 'bezier',
+        'arrow-scale': 0.8,
+        'opacity': 0.7,
+      }
+    },
+    {
+      selector: 'edge.highlighted',
+      style: {
+        'line-color': '#5b7fe8',
+        'target-arrow-color': '#5b7fe8',
+        'opacity': 1,
+        'width': 2,
+      }
+    },
+    {
+      selector: 'edge.dimmed',
+      style: { 'opacity': 0.05 }
+    },
+  ],
+  layout: { name: 'preset' },
+  minZoom: 0.1,
+  maxZoom: 4,
+});
+
+// ── Node color / size by kind ────────────────────────────────────────────────
+
+function nodeColor(kind, root) {
+  if (root === 'external') return '#e85b5b';
+  if (kind === 'subsystem') return '#5b7fe8';
+  if (kind === 'module' || kind === 'directory_module') return '#e8a44a';
+  if (kind === 'function' || kind === 'method') return '#5bc87e';
+  if (kind === 'struct' || kind === 'class' || kind === 'enum' || kind === 'interface' || kind === 'type_alias') return '#c85bb8';
+  if (kind === 'api_endpoint') return '#5bc87e';
+  if (kind === 'channel' || kind === 'topic') return '#c85bb8';
+  return '#8899bb';
+}
+
+function nodeSize(kind) {
+  if (kind === 'subsystem') return 40;
+  if (kind === 'module' || kind === 'directory_module') return 24;
+  if (kind === 'struct' || kind === 'class' || kind === 'enum') return 20;
+  return 16;
+}
+
+// ── Parse repo_map markdown to extract subsystems ───────────────────────────
+
+function parseRepoMap(text) {
+  const nodes = [];
+  const edges = [];
+  const seenIds = new Set();
+
+  const subsysSection = text.match(/## Subsystems[\s\S]*?(?=\n## |$)/);
+  if (!subsysSection) return { nodes, edges };
+
+  const subsysLines = subsysSection[0].split('\n');
+  let currentSubsystem = null;
+
+  for (const line of subsysLines) {
+    // Match subsystem header: "- **name** (N symbols, cohesion: X.XX)"
+    const subsysMatch = line.match(/^- \*\*(.+?)\*\* \((\d+) symbols/);
+    if (subsysMatch) {
+      const name = subsysMatch[1];
+      const symbolCount = parseInt(subsysMatch[2], 10);
+      const id = 'subsystem:' + name;
+      if (!seenIds.has(id)) {
+        seenIds.add(id);
+        nodes.push({ id, label: name, kind: 'subsystem', size: Math.max(28, Math.min(60, 20 + symbolCount / 100)), color: nodeColor('subsystem', null), symbolCount });
+      }
+      currentSubsystem = id;
+      continue;
+    }
+    // Match sub-modules line: "  Sub-modules: a (N), b (N), ..."
+    const submodMatch = line.match(/^\s+Sub-modules:\s+(.+)/);
+    if (submodMatch && currentSubsystem) {
+      const mods = submodMatch[1].split(',').map(s => s.trim());
+      for (const m of mods.slice(0, 8)) { // cap displayed sub-modules
+        const mname = m.replace(/\s*\(\d+\)$/, '').trim();
+        if (!mname) continue;
+        const mid = currentSubsystem + '/' + mname;
+        if (!seenIds.has(mid)) {
+          seenIds.add(mid);
+          nodes.push({ id: mid, label: mname, kind: 'module', size: 18, color: nodeColor('module', null), parent: currentSubsystem });
+        }
+        edges.push({ source: currentSubsystem, target: mid, label: 'contains' });
+      }
+    }
+  }
+  return { nodes, edges };
+}
+
+// ── Layout runner ────────────────────────────────────────────────────────────
+
+function runLayout(name) {
+  const opts = {
+    cose: { name: 'cose', animate: true, animationDuration: 600, nodeOverlap: 20, idealEdgeLength: 80, edgeElasticity: 100, gravity: 0.25, numIter: 1000 },
+    breadthfirst: { name: 'breadthfirst', directed: true, spacingFactor: 1.4, animate: true },
+    circle: { name: 'circle', animate: true },
+    grid: { name: 'grid', animate: true },
+  };
+  cy.layout(opts[name] || opts.cose).run();
+}
+
+// ── Load initial repo map ────────────────────────────────────────────────────
+
+async function loadRepoMap() {
+  // Cancel any in-flight repo map request
+  if (activeRepoMapController) activeRepoMapController.abort();
+  activeRepoMapController = new AbortController();
+  const { signal } = activeRepoMapController;
+
+  setStatus('Fetching repository map...');
+  try {
+    const text = await callTool('repo_map', { top_n: 20 }, signal);
+    setSidebarContent('Repository Map', '<pre>' + escapeHtml(text) + '</pre>');
+
+    // Extract repo label from first line
+    const firstLine = text.split('\n')[0];
+    document.getElementById('repo-label').textContent = firstLine.replace(/^#+\s*/, '');
+
+    const { nodes, edges } = parseRepoMap(text);
+    if (nodes.length === 0) {
+      setStatus('No subsystem data found in repo_map output.');
+      setSidebarContent('Repository Map', '<pre>' + escapeHtml(text) + '</pre>');
+      return;
+    }
+
+    const cyNodes = nodes.map(n => ({ data: { id: n.id, label: n.label, kind: n.kind, size: n.size, color: n.color } }));
+    const cyEdges = edges.map((e, i) => ({ data: { id: 'e' + i, source: e.source, target: e.target, label: e.label } }));
+
+    cy.elements().remove();
+    cy.add([...cyNodes, ...cyEdges]);
+    runLayout(document.getElementById('layout-select').value);
+    setStatus(`Loaded ${nodes.length} nodes, ${edges.length} edges from repo_map.`);
+  } catch (e) {
+    if (e.name === 'AbortError') return; // superseded by a newer request
+    setStatus('Error: ' + e.message);
+    setSidebarContent('Error', '<pre>' + escapeHtml(e.message) + '</pre>');
+  }
+}
+
+function reloadRepoMap() { cy.elements().remove(); loadRepoMap(); }
+
+function resetView() {
+  // cy.fit() adjusts both pan and zoom to fit all elements; don't override zoom afterward.
+  cy.fit();
+}
+
+// ── Node click: show neighbors ───────────────────────────────────────────────
+
+cy.on('tap', 'node', async function(evt) {
+  const node = evt.target;
+  const id = node.data('id');
+
+  // Cancel any in-flight neighbor request
+  if (activeNodeController) activeNodeController.abort();
+  activeNodeController = new AbortController();
+  const { signal } = activeNodeController;
+
+  // Highlight tapped node and dim others
+  cy.elements().addClass('dimmed').removeClass('highlighted');
+  node.removeClass('dimmed').addClass('highlighted');
+  node.connectedEdges().removeClass('dimmed').addClass('highlighted');
+  node.connectedEdges().connectedNodes().removeClass('dimmed').addClass('highlighted');
+
+  setSidebarContent('Node: ' + node.data('label'), '<p class="loading">Loading neighbors...</p>');
+  setStatus('Fetching neighbors for: ' + id);
+
+  try {
+    const text = await callTool('search', {
+      node: id,
+      mode: 'neighbors',
+      direction: 'both',
+      depth: 1,
+      limit: 30,
+      compact: true,
+    }, signal);
+
+    setSidebarContent('Neighbors: ' + node.data('label'), '<pre>' + escapeHtml(text) + '</pre>');
+    expandNeighborsIntoGraph(id, text);
+    setStatus('Showing neighbors of: ' + node.data('label'));
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    setSidebarContent('Error', '<pre>' + escapeHtml(e.message) + '</pre>');
+    setStatus('Error fetching neighbors: ' + e.message);
+  }
+});
+
+cy.on('tap', function(evt) {
+  if (evt.target === cy) {
+    cy.elements().removeClass('dimmed').removeClass('highlighted');
+    setStatus('');
+  }
+});
+
+// ── Parse neighbor search results and add new nodes to the graph ─────────────
+
+function expandNeighborsIntoGraph(parentId, text) {
+  const lines = text.split('\n');
+  const newNodes = [];
+  // Collect all edges regardless of whether the target node is new or existing.
+  const newEdges = [];
+
+  for (const line of lines) {
+    const m = line.match(/`([^`]+:[^`]+:[^`]+)`/); // stable_id pattern: root:file:name:kind
+    if (m) {
+      const stableId = m[1];
+      if (stableId === parentId) continue; // skip self-edges
+
+      const edgeId = parentId + '->' + stableId;
+      // Add an edge to this neighbor even if the node already existed in the graph.
+      if (!cy.getElementById(edgeId).length) {
+        newEdges.push({ data: { id: edgeId, source: parentId, target: stableId } });
+      }
+
+      // Only add the node element if it doesn't exist yet.
+      if (!cy.getElementById(stableId).length) {
+        const parts = stableId.split(':');
+        const kind = parts.length >= 4 ? parts[parts.length - 1] : 'unknown';
+        const name = parts.length >= 3 ? parts[parts.length - 2] : stableId;
+        const root = parts[0] === 'external' ? 'external' : null;
+        newNodes.push({
+          data: {
+            id: stableId,
+            label: name,
+            kind,
+            size: nodeSize(kind),
+            color: nodeColor(kind, root),
+          }
+        });
+      }
+    }
+  }
+
+  if (newNodes.length > 0 || newEdges.length > 0) {
+    cy.add([...newNodes, ...newEdges]);
+    runLayout(document.getElementById('layout-select').value);
+  }
+}
+
+// ── Search ───────────────────────────────────────────────────────────────────
+
+document.getElementById('search-input').addEventListener('keydown', async (e) => {
+  if (e.key !== 'Enter') return;
+  const q = e.target.value.trim();
+  if (!q) return;
+
+  // Cancel any in-flight search request
+  if (activeSearchController) activeSearchController.abort();
+  activeSearchController = new AbortController();
+  const { signal } = activeSearchController;
+
+  setStatus('Searching: ' + q);
+  setSidebarContent('Search: ' + q, '<p class="loading">Searching...</p>');
+
+  try {
+    const text = await callTool('search', { query: q, limit: 20, compact: true }, signal);
+    setSidebarContent('Search: ' + q, '<pre>' + escapeHtml(text) + '</pre>');
+    setStatus('Search complete.');
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    setSidebarContent('Search error', '<pre>' + escapeHtml(err.message) + '</pre>');
+    setStatus('Search error: ' + err.message);
+  }
+});
+
+// ── Sidebar helpers ──────────────────────────────────────────────────────────
+
+function setSidebarTitle(title) {
+  document.getElementById('sidebar-title').textContent = title;
+}
+function setSidebarContent(title, html) {
+  document.getElementById('sidebar-title').textContent = title;
+  document.getElementById('sidebar-content').innerHTML = html;
+}
+
+let sidebarVisible = true;
+function toggleSidebar() {
+  const sb = document.getElementById('sidebar');
+  sidebarVisible = !sidebarVisible;
+  sb.style.display = sidebarVisible ? 'flex' : 'none';
+  // Notify Cytoscape that container dimensions changed so it re-renders correctly.
+  cy.resize();
+  cy.fit();
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// ── Layout change ────────────────────────────────────────────────────────────
+
+document.getElementById('layout-select').addEventListener('change', (e) => {
+  runLayout(e.target.value);
+});
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
+
+loadRepoMap();
+</script>
+</body>
+</html>
