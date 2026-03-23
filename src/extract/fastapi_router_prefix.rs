@@ -68,6 +68,12 @@
 //! - When both patterns define a prefix for the same `router_var`, the
 //!   `APIRouter(prefix=...)` constructor arg takes precedence (it is the
 //!   "closer to definition" binding).
+//! - If the same `router_var` name appears in `include_router()` calls in
+//!   multiple files with different prefixes, only the first-found prefix is
+//!   used (based on filesystem walk order, which is non-deterministic).
+//!   Typical FastAPI projects include each router once; encountering the same
+//!   variable name with different prefixes in multiple files is unusual and
+//!   likely a configuration error in the target project.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -807,6 +813,18 @@ app.include_router(auth_router, prefix="/auth")
         assert_eq!(map.get("workspace_router").map(|s| s.as_str()), Some("/workspaces"));
         assert_eq!(map.get("user_router").map(|s| s.as_str()), Some("/users"));
         assert_eq!(map.get("auth_router").map(|s| s.as_str()), Some("/auth"));
+    }
+
+    #[test]
+    fn test_include_router_keyword_router_arg() {
+        // The router variable is passed as a keyword arg: router=my_router
+        let content = r#"app.include_router(router=my_router, prefix="/api")"#;
+        let map = extract_include_router_prefixes_from_str(content);
+        assert_eq!(
+            map.get("my_router").map(|s| s.as_str()),
+            Some("/api"),
+            "include_router with router= keyword arg must be extracted"
+        );
     }
 
     // ── join_paths ────────────────────────────────────────────────────────
