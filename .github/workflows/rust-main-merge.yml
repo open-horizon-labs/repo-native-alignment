@@ -256,7 +256,6 @@ jobs:
       - name: Strip and compress binary
         run: |
           strip target/aarch64-apple-darwin/release/repo-native-alignment
-          codesign --sign - --force target/aarch64-apple-darwin/release/repo-native-alignment
           tar czf repo-native-alignment-darwin-arm64-fast.tar.gz -C target/aarch64-apple-darwin/release repo-native-alignment
 
       - name: Upload artifact
