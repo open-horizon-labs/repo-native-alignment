@@ -251,10 +251,10 @@ fn walk_dir_for_include_router(
         let path = entry.path();
 
         // Skip hidden directories (e.g. .git, .venv, __pycache__).
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with('.') || name == "__pycache__" || name == "node_modules" {
-                continue;
-            }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && (name.starts_with('.') || name == "__pycache__" || name == "node_modules")
+        {
+            continue;
         }
 
         if path.is_dir() {
