@@ -530,6 +530,45 @@ mod tests {
         assert_eq!(ep.metadata.get("http_path").map(|s| s.as_str()), Some("/expertunities"));
     }
 
+    /// Rust-only repo fast-path: no TypeScript/JS Const nodes → return immediately.
+    ///
+    /// Validates the TS/JS pre-check added for performance: a repo with only Rust
+    /// Const nodes (e.g., string literals in `.rs` files) must exit without
+    /// touching `is_generated_sdk_file_pub`.  The endpoint path is unchanged.
+    #[test]
+    fn test_rust_only_repo_fast_path() {
+        use crate::graph::{ExtractionSource, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+        // A synthetic Rust Const (string literal from a Rust source file).
+        let rust_const = Node {
+            id: NodeId {
+                root: "repo".to_string(),
+                file: PathBuf::from("src/extract/sdk_path_inference.rs"),
+                name: "/some/path".to_string(),
+                kind: NodeKind::Const,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: "\"/some/path\"".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let mut nodes = vec![
+            rust_const,
+            make_api_endpoint("/expertunities", "GET", false),
+        ];
+        // The fast-path must trigger (no TS/JS Const nodes), endpoint unchanged.
+        sdk_path_inference_pass(&mut nodes);
+        let ep = nodes.iter().find(|n| n.id.kind == NodeKind::ApiEndpoint).unwrap();
+        assert_eq!(
+            ep.metadata.get("http_path").map(|s| s.as_str()),
+            Some("/expertunities"),
+            "Rust-only repo must exit fast-path without modifying endpoints"
+        );
+    }
+
     /// Non-Python endpoints are not modified even if a matching SDK path exists.
     #[test]
     fn test_non_python_endpoint_not_modified() {
