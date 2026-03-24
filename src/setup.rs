@@ -302,11 +302,13 @@ fn download_rna_binary(target_path: &Path) -> Result<()> {
     println!("  Downloading: {url}");
     println!("  Target: {}", target_path.display());
 
-    let status = Command::new("curl")
+    let mut curl_child = Command::new("curl")
         .args(["-fSL", &url])
         .stdout(std::process::Stdio::piped())
         .spawn()
-        .context("Failed to launch `curl`. Install curl or download the binary manually.")?
+        .context("Failed to launch `curl`. Install curl or download the binary manually.")?;
+
+    let curl_stdout = curl_child
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("Failed to capture curl stdout"))?;
@@ -321,13 +323,22 @@ fn download_rna_binary(target_path: &Path) -> Result<()> {
                 .to_str()
                 .context("Target directory path is not valid UTF-8")?,
         ])
-        .stdin(status)
+        .stdin(curl_stdout)
         .status()
         .context("Failed to launch `tar`")?;
 
+    // Reap the curl child process and check its exit status.
+    let curl_status = curl_child.wait().context("Failed to wait on `curl`")?;
+    if !curl_status.success() {
+        bail!(
+            "Download failed: curl exited with {curl_status}. URL: {url}\n  \
+             Check network connectivity and that the release exists."
+        );
+    }
+
     if !tar_status.success() {
         bail!(
-            "Download failed. URL: {url}\n  \
+            "Download failed: tar extraction failed. URL: {url}\n  \
              Your platform ({os}/{arch}) may not have a pre-built binary.\n  \
              Build from source instead: cargo install --locked --git https://github.com/open-horizon-labs/repo-native-alignment"
         );
