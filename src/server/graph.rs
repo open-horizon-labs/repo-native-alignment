@@ -78,16 +78,17 @@ impl RnaHandler {
                     tracing::info!("Waiting for pre-warm to finish...");
                     self.prewarm_notify.notified().await;
                     // Re-check: pre-warm should have populated the graph.
-                    let guard = self.graph.read().await;
-                    if guard.is_some() {
-                        *self.last_scan.lock().unwrap() = std::time::Instant::now();
-                        return Ok(guard);
-                    }
-                    // Pre-warm failed — fall through to build ourselves.
-                    drop(guard);
-                    let mut guard = self.graph.write().await;
-                    if guard.is_none() {
-                        *guard = Some(self.build_full_graph().await?);
+                    let rg = self.graph.read().await;
+                    if rg.is_some() {
+                        drop(rg);
+                        // Fall through to cooldown + background scanner below.
+                    } else {
+                        // Pre-warm failed — build ourselves.
+                        drop(rg);
+                        let mut wg = self.graph.write().await;
+                        if wg.is_none() {
+                            *wg = Some(self.build_full_graph().await?);
+                        }
                     }
                 } else {
                     // No pre-warm in progress — build from scratch.
