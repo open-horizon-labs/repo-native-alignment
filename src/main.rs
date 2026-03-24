@@ -141,10 +141,14 @@ async fn async_main() -> anyhow::Result<()> {
             if args.full { eprintln!("Full pipeline scan: {}", repo_root.display()); let handler = RnaHandler { repo_root: repo_root.clone(), lsp_only_roots: Arc::new(lsp_only_roots_scan), ..Default::default() }; handler.run_pipeline_foreground(|msg| { eprintln!("{}", msg); }).await?; return Ok(()); }
             eprintln!("Scanning: {}", repo_root.display()); let t0 = std::time::Instant::now();
             let handler = RnaHandler { repo_root: repo_root.clone(), lsp_only_roots: Arc::new(lsp_only_roots_scan), ..Default::default() }; let graph = handler.build_full_graph().await?;
-            let embed_count = match repo_native_alignment::embed::EmbeddingIndex::new(&repo_root).await {
-                Ok(idx) => { eprintln!("  Embedding {} symbols...", graph.nodes.iter().filter(|n| n.id.root != "external").count());
-                    loop { match idx.search("_probe_", None, 1).await { Ok(repo_native_alignment::embed::SearchOutcome::Results(_)) => break 1, _ => { tokio::time::sleep(std::time::Duration::from_secs(2)).await } } } }
-                Err(e) => { eprintln!("  Embedding init failed: {}", e); 0 }
+            // Await the background embedding task so it completes before the
+            // Tokio runtime shuts down. Without this, the runtime drop cancels
+            // in-flight LanceDB I/O tasks, causing JoinError::Cancelled (#560).
+            eprintln!("  Embedding {} symbols...", graph.nodes.iter().filter(|n| n.id.root != "external").count());
+            handler.await_background_embed().await;
+            let embed_count: usize = match handler.embed_status.footer_segment() {
+                Some(s) if s.contains("embedded") => 1,
+                _ => 0,
             };
             let elapsed = t0.elapsed(); eprintln!(); eprintln!("  Symbols: {} | Edges: {} | Embeddings: {} | Time: {:.2}s", graph.nodes.len(), graph.edges.len(), if embed_count > 0 { "yes" } else { "no" }, elapsed.as_secs_f64());
             return Ok(());
@@ -255,6 +259,7 @@ async fn async_main() -> anyhow::Result<()> {
             init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?; eprintln!("Scanning {}...", repo_root.display());
             let handler = RnaHandler { repo_root: repo_root.clone(), ..Default::default() }; let gs = handler.build_full_graph().await?;
+            handler.await_background_embed().await;
             let root_filter = resolve_root_filter(args.root.as_deref(), &repo_root);
             let params = OutcomeProgressParams { outcome_id: args.outcome_id.clone(), include_impact: args.include_impact, root_filter, non_code_slugs: std::collections::HashSet::new() };
             let ctx = OutcomeProgressContext { graph_state: &gs, repo_root: &repo_root };
@@ -266,6 +271,7 @@ async fn async_main() -> anyhow::Result<()> {
             eprintln!("Scanning {}...", repo_root.display());
             let handler = RnaHandler { repo_root: repo_root.clone(), ..Default::default() };
             let gs = handler.build_full_graph().await?;
+            handler.await_background_embed().await;
             let index_map = gs.node_index_map();
             // Start with graph-derived slugs (roots that have extracted nodes).
             let mut active_slugs: std::collections::HashSet<String> =
@@ -290,6 +296,7 @@ async fn async_main() -> anyhow::Result<()> {
             init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?; eprintln!("Scanning {}...", repo_root.display());
             let handler = RnaHandler { repo_root: repo_root.clone(), ..Default::default() }; let gs = handler.build_full_graph().await?;
+            handler.await_background_embed().await;
             let root_filter = resolve_root_filter(args.root.as_deref(), &repo_root);
             let params = RepoMapParams { top_n: args.top_n, root_filter, non_code_slugs: std::collections::HashSet::new() };
             let ctx = RepoMapContext { graph_state: &gs, repo_root: &repo_root, lsp_status: None, embed_status: None };

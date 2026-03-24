@@ -484,7 +484,10 @@ impl RnaHandler {
     /// (via `emit_enrichment_pipeline`). This function now handles only the embedding pipeline.
     ///
     /// The graph is queryable NOW -- embedding improves semantic search quality progressively.
-    pub(crate) fn spawn_background_enrichment(&self, all_nodes: &[Node]) {
+    pub(crate) fn spawn_background_enrichment(
+        &self,
+        all_nodes: &[Node],
+    ) -> tokio::task::JoinHandle<()> {
         let bg_repo_root = self.repo_root.clone();
         let bg_embed_index = self.embed_index.clone();
         let bg_embed_status = self.embed_status.clone();
@@ -548,7 +551,7 @@ impl RnaHandler {
             // Phase 3: LSP enrichment now runs inside the event bus via LspConsumer.
             // This function is embedding-only; no lsp_fut here.
             embed_fut.await;
-        });
+        })
     }
 
     /// Spawn background LSP enrichment for the cache-hit path, routing through the event bus.

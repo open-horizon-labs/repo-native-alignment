@@ -973,7 +973,10 @@ impl RnaHandler {
         };
 
         if spawn_background {
-            self.spawn_background_enrichment(&all_nodes);
+            let handle = self.spawn_background_enrichment(&all_nodes);
+            // Store the handle so CLI callers can await it before the runtime
+            // shuts down, preventing JoinError::Cancelled panics (#560).
+            *self.embed_handle.lock().await = Some(handle);
         }
 
         Ok(GraphState {

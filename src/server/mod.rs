@@ -88,6 +88,10 @@ pub struct RnaHandler {
     /// `list_roots` reads from this for in-progress status; falls back to sentinel files
     /// on cold start when no bus events have fired for the current process lifetime.
     pub scan_stats: Arc<std::sync::RwLock<crate::extract::scan_stats::ScanStats>>,
+    /// JoinHandle for the background embedding task spawned by `spawn_background_enrichment`.
+    /// CLI callers can await this to ensure embeddings complete before the runtime shuts down.
+    /// MCP server callers leave it as fire-and-forget (the handle is dropped on next scan).
+    pub embed_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Default for RnaHandler {
@@ -109,11 +113,37 @@ impl Default for RnaHandler {
             scan_stats: Arc::new(std::sync::RwLock::new(
                 crate::extract::scan_stats::ScanStats::default(),
             )),
+            embed_handle: tokio::sync::Mutex::new(None),
         }
     }
 }
 
 impl RnaHandler {
+    /// Await the background embedding task, if one was spawned.
+    ///
+    /// CLI callers should invoke this before returning so the Tokio runtime
+    /// does not shut down while the embedding task is still in flight (which
+    /// would cause a `JoinError::Cancelled` panic in LanceDB internals).
+    ///
+    /// MCP server callers do not need this — the runtime persists for the
+    /// lifetime of the server process.
+    pub async fn await_background_embed(&self) {
+        let handle = self.embed_handle.lock().await.take();
+        if let Some(h) = handle {
+            match h.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {
+                    tracing::warn!(
+                        "Background embedding task was cancelled (runtime shutting down)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Background embedding task failed: {}", e);
+                }
+            }
+        }
+    }
+
     /// Return the slug for the primary `--repo` root.
     pub(crate) fn primary_root_slug(&self) -> String {
         crate::roots::RootConfig::code_project(self.repo_root.clone()).slug()
