@@ -125,6 +125,8 @@ repo-native-alignment scan --repo . --full
 
 Runs the complete pipeline: scan → extract → embed → LSP enrich → graph. Without `--full`, LSP analysis is skipped — subsystem detection and "what calls this" queries won't work. Subsequent scans are incremental (~0.1s on no-change runs).
 
+**Why run this before starting the MCP server?** The MCP server pre-warms the graph automatically at startup, but building from scratch can take 10-30s on large repos. Running `scan` first populates `.oh/.cache/lance/` so the server loads the cached graph in seconds.
+
 ### 4. Verify
 
 ```bash

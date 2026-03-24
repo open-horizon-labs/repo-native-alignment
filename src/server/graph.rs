@@ -70,8 +70,30 @@ impl RnaHandler {
         {
             let mut guard = self.graph.write().await;
             if guard.is_none() {
-                // First build -- full pipeline
-                *guard = Some(self.build_full_graph().await?);
+                // If pre-warm is in progress, wait for it instead of starting
+                // a duplicate build.  Drop the write lock first so the pre-warm
+                // task can acquire it to store its result.
+                if self.prewarm_started.load(std::sync::atomic::Ordering::Relaxed) {
+                    drop(guard);
+                    tracing::info!("Waiting for pre-warm to finish...");
+                    self.prewarm_notify.notified().await;
+                    // Re-check: pre-warm should have populated the graph.
+                    let rg = self.graph.read().await;
+                    if rg.is_some() {
+                        drop(rg);
+                        // Fall through to cooldown + background scanner below.
+                    } else {
+                        // Pre-warm failed — build ourselves.
+                        drop(rg);
+                        let mut wg = self.graph.write().await;
+                        if wg.is_none() {
+                            *wg = Some(self.build_full_graph().await?);
+                        }
+                    }
+                } else {
+                    // No pre-warm in progress — build from scratch.
+                    *guard = Some(self.build_full_graph().await?);
+                }
             } else {
                 // Incremental update -- pass the already-completed scan so we
                 // don't re-scan. Scanner state is committed only after success.

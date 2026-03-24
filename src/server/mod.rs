@@ -92,6 +92,12 @@ pub struct RnaHandler {
     /// CLI callers can await this to ensure embeddings complete before the runtime shuts down.
     /// MCP server callers leave it as fire-and-forget (the handle is dropped on next scan).
     pub embed_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Notifies waiters when the pre-warm task completes (success or failure).
+    /// `get_graph()` listens on this to avoid starting a duplicate build while
+    /// pre-warm is in progress.
+    pub prewarm_notify: Arc<tokio::sync::Notify>,
+    /// Whether a pre-warm task has been started.
+    pub prewarm_started: std::sync::atomic::AtomicBool,
 }
 
 impl Default for RnaHandler {
@@ -114,11 +120,93 @@ impl Default for RnaHandler {
                 crate::extract::scan_stats::ScanStats::default(),
             )),
             embed_handle: tokio::sync::Mutex::new(None),
+            prewarm_notify: Arc::new(tokio::sync::Notify::new()),
+            prewarm_started: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
 
 impl RnaHandler {
+    /// Create a clone of this handler that shares all `Arc`-wrapped state.
+    ///
+    /// Used by `start_prewarm()` to spawn a background graph build task that
+    /// writes to the same `graph` RwLock as the MCP handler.  Non-Arc fields
+    /// (AtomicBool, Mutex) are freshly initialized because the spawned task
+    /// only needs the shared storage, not the per-request bookkeeping.
+    fn clone_shared(&self) -> Self {
+        Self {
+            repo_root: self.repo_root.clone(),
+            graph: Arc::clone(&self.graph),
+            embed_index: Arc::clone(&self.embed_index),
+            context_injected: std::sync::atomic::AtomicBool::new(false),
+            last_scan: std::sync::Mutex::new(
+                std::time::Instant::now() - std::time::Duration::from_secs(10),
+            ),
+            background_scanner_started: std::sync::atomic::AtomicBool::new(false),
+            lsp_status: Arc::clone(&self.lsp_status),
+            embed_status: Arc::clone(&self.embed_status),
+            non_code_root_slugs_cache: std::sync::Mutex::new(None),
+            lance_write_lock: Arc::clone(&self.lance_write_lock),
+            lsp_only_roots: Arc::clone(&self.lsp_only_roots),
+            scan_stats: Arc::clone(&self.scan_stats),
+            embed_handle: tokio::sync::Mutex::new(None),
+            prewarm_notify: Arc::clone(&self.prewarm_notify),
+            prewarm_started: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Spawn a background task that pre-warms the graph immediately after
+    /// MCP initialization, so the first tool call finds the graph already
+    /// built (or nearly so).  Called from `on_initialized`.
+    ///
+    /// If a LanceDB cache exists and no files changed, this completes in
+    /// seconds.  If the cache is cold, this runs the full extraction
+    /// pipeline in the background.  Either way, `get_graph()` will find
+    /// the graph populated when the first tool call arrives.
+    fn start_prewarm(&self) {
+        self.prewarm_started.store(true, std::sync::atomic::Ordering::Relaxed);
+        let handler = self.clone_shared();
+        let notify = Arc::clone(&self.prewarm_notify);
+        tokio::spawn(async move {
+            tracing::info!("Pre-warming graph index in background...");
+            let t0 = std::time::Instant::now();
+            match handler.build_full_graph().await {
+                Ok(state) => {
+                    let node_count = state.nodes.len();
+                    let edge_count = state.edges.len();
+                    // Store the built graph so get_graph() finds it already populated.
+                    {
+                        let mut guard = handler.graph.write().await;
+                        if guard.is_none() {
+                            *guard = Some(state);
+                        }
+                        // If guard.is_some(), another path (e.g. a tool call that
+                        // arrived before pre-warm finished) already built it.
+                    }
+                    // Update cooldown so the first tool call skips re-scanning.
+                    *handler.last_scan.lock().unwrap() = std::time::Instant::now();
+                    // Start the background scanner to keep the index warm.
+                    if !handler.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        handler.spawn_background_scanner();
+                    }
+                    tracing::info!(
+                        "Graph pre-warm complete: {} symbols, {} edges in {:.2}s",
+                        node_count,
+                        edge_count,
+                        t0.elapsed().as_secs_f64(),
+                    );
+                }
+                Err(e) => {
+                    // Pre-warm failure is non-fatal -- get_graph() will retry
+                    // on the first tool call.
+                    tracing::warn!("Graph pre-warm failed (will retry on first tool call): {}", e);
+                }
+            }
+            // Wake any tool calls waiting for pre-warm to finish.
+            notify.notify_waiters();
+        });
+    }
+
     /// Await the background embedding task, if one was spawned.
     ///
     /// CLI callers should invoke this before returning so the Tokio runtime
@@ -273,6 +361,13 @@ fn build_context_preamble(root: &Path) -> String {
 
 #[async_trait]
 impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
+    /// Called after the MCP client sends the `initialized` notification.
+    /// Spawns a background task to pre-warm the graph so the first tool
+    /// call doesn't block on a full extraction pipeline.
+    async fn on_initialized(&self, _runtime: Arc<dyn McpServer>) {
+        self.start_prewarm();
+    }
+
     async fn handle_list_tools_request(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -1491,5 +1586,76 @@ mod tests {
         handler.await_background_embed().await;
         // Second call -- handle was already taken, so this is a no-op.
         handler.await_background_embed().await;
+    }
+
+    /// Verify that start_prewarm populates the graph in the background
+    /// and that get_graph returns it without starting a duplicate build.
+    #[tokio::test]
+    async fn test_prewarm_populates_graph_before_first_tool_call() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn prewarm_test_fn() {}\n",
+        )
+        .unwrap();
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            ..Default::default()
+        };
+
+        // Start pre-warm (background task).
+        handler.start_prewarm();
+
+        // Wait for the prewarm_notify signal.
+        handler.prewarm_notify.notified().await;
+
+        // Graph should now be populated without calling get_graph.
+        let guard = handler.graph.read().await;
+        let gs = guard.as_ref().expect("pre-warm should have populated the graph");
+        assert!(
+            gs.nodes.iter().any(|n| n.id.name == "prewarm_test_fn"),
+            "prewarm_test_fn should be in graph after pre-warm. Nodes: {:?}",
+            gs.nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// Verify that get_graph waits for a running pre-warm instead of
+    /// starting a duplicate build.
+    #[tokio::test]
+    async fn test_get_graph_waits_for_prewarm() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn wait_test_fn() {}\n",
+        )
+        .unwrap();
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            ..Default::default()
+        };
+
+        // Start pre-warm.
+        handler.start_prewarm();
+
+        // Immediately call get_graph — it should wait for pre-warm, not build again.
+        let guard = handler.get_graph().await.unwrap();
+        let gs = guard.as_ref().expect("graph should be populated");
+        assert!(
+            gs.nodes.iter().any(|n| n.id.name == "wait_test_fn"),
+            "wait_test_fn should be in graph. Nodes: {:?}",
+            gs.nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+        );
     }
 }
