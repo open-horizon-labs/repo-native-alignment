@@ -1,3 +1,11 @@
+---
+name: release
+description: Prepare and present a release decision package. Runs test suite, sweeps PR feedback, assesses GO/NO-GO, writes outcome-oriented release notes.
+tools: Read, Write, Edit, Grep, Glob, Bash, Agent
+mcpServers:
+  - rna-mcp
+---
+
 # /release
 
 Prepare and present a release decision package. Does NOT release automatically — presents findings to the human to decide.
