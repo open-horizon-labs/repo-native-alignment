@@ -2756,6 +2756,147 @@ mod tests {
         );
     }
 
+    /// Adversarial: AllEnrichmentsGate must NOT expect enrichment for clean-root languages
+    /// when dirty_slugs is non-empty. A Rust node from a clean root should not count.
+    #[test]
+    fn test_all_enrichments_gate_ignores_clean_root_languages() {
+        use crate::graph::{ExtractionSource, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        // Create two rust nodes: one dirty, one clean.
+        let dirty_node = crate::graph::Node {
+            id: NodeId {
+                root: "dirty_root".into(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "dirty_fn".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            line_start: 1, line_end: 1,
+            signature: "dirty_fn".into(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let clean_node = crate::graph::Node {
+            id: NodeId {
+                root: "clean_root".into(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "clean_fn".into(),
+                kind: NodeKind::Function,
+            },
+            language: "python".into(), // different language so we can detect if it's counted
+            line_start: 1, line_end: 1,
+            signature: "clean_fn".into(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let gate = AllEnrichmentsGate::new();
+
+        // Only dirty_root is dirty. clean_root's python should not count.
+        let root_extracted = ExtractionEvent::RootExtracted {
+            slug: "test".into(),
+            path: PathBuf::from("."),
+            nodes: std::sync::Arc::from(vec![dirty_node, clean_node].into_boxed_slice()),
+            edges: std::sync::Arc::from([]),
+            dirty_slugs: std::collections::HashSet::from(["dirty_root".to_string()]),
+        };
+        let result = gate.on_event(&root_extracted).unwrap();
+        // expected=1 (only rust from dirty_root), not 2 (rust + python).
+        // Gate should NOT fire yet (still waiting for rust EnrichmentComplete).
+        assert!(result.is_empty(), "Gate must not fire before dirty-root enrichments arrive");
+
+        // Send EnrichmentComplete for rust only.
+        let enrichment_done = ExtractionEvent::EnrichmentComplete {
+            slug: "test".into(),
+            language: "rust".into(),
+            added_edges: std::sync::Arc::from([]),
+            new_nodes: std::sync::Arc::from([]),
+            updated_nodes: std::sync::Arc::from([]),
+        };
+        let result = gate.on_event(&enrichment_done).unwrap();
+        // Should fire now: expected=1 (rust), received=1 (rust).
+        // If python from clean_root were counted, we'd still be waiting.
+        assert_eq!(result.len(), 1, "Gate must fire after dirty-root enrichment completes (clean-root python must not block)");
+        assert!(
+            matches!(result[0], ExtractionEvent::AllEnrichmentsDone { .. }),
+            "Expected AllEnrichmentsDone"
+        );
+    }
+
+    /// Adversarial: empty dirty_slugs treats all roots as dirty (backward compatibility).
+    #[test]
+    fn test_all_enrichments_gate_empty_dirty_slugs_all_dirty() {
+        use crate::graph::{ExtractionSource, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        let node_a = crate::graph::Node {
+            id: NodeId {
+                root: "root_a".into(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "fn_a".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            line_start: 1, line_end: 1,
+            signature: "fn_a".into(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let node_b = crate::graph::Node {
+            id: NodeId {
+                root: "root_b".into(),
+                file: PathBuf::from("app.py"),
+                name: "fn_b".into(),
+                kind: NodeKind::Function,
+            },
+            language: "python".into(),
+            line_start: 1, line_end: 1,
+            signature: "fn_b".into(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let gate = AllEnrichmentsGate::new();
+
+        // Empty dirty_slugs = all dirty. Both languages should be expected.
+        let root_extracted = ExtractionEvent::RootExtracted {
+            slug: "test".into(),
+            path: PathBuf::from("."),
+            nodes: std::sync::Arc::from(vec![node_a, node_b].into_boxed_slice()),
+            edges: std::sync::Arc::from([]),
+            dirty_slugs: std::collections::HashSet::new(), // empty = all dirty
+        };
+        let result = gate.on_event(&root_extracted).unwrap();
+        assert!(result.is_empty(), "Gate must wait for both languages when all dirty");
+
+        // Complete rust -- still waiting for python.
+        let rust_done = ExtractionEvent::EnrichmentComplete {
+            slug: "test".into(),
+            language: "rust".into(),
+            added_edges: std::sync::Arc::from([]),
+            new_nodes: std::sync::Arc::from([]),
+            updated_nodes: std::sync::Arc::from([]),
+        };
+        let result = gate.on_event(&rust_done).unwrap();
+        assert!(result.is_empty(), "Gate must wait for python too when dirty_slugs is empty");
+
+        // Complete python -- now both done.
+        let python_done = ExtractionEvent::EnrichmentComplete {
+            slug: "test".into(),
+            language: "python".into(),
+            added_edges: std::sync::Arc::from([]),
+            new_nodes: std::sync::Arc::from([]),
+            updated_nodes: std::sync::Arc::from([]),
+        };
+        let result = gate.on_event(&python_done).unwrap();
+        assert_eq!(result.len(), 1, "Gate must fire after all dirty-root enrichments complete");
+    }
+
     /// Verify SubsystemConsumer subscribes to CommunityDetectionComplete and emits
     /// SubsystemNodesComplete (even when no subsystems are detected).
     #[tokio::test]
