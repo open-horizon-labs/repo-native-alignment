@@ -1432,4 +1432,64 @@ mod tests {
             supported
         );
     }
+
+    #[tokio::test]
+    async fn test_await_background_embed_no_handle() {
+        // When no background embedding was spawned, await_background_embed
+        // should return immediately without error.
+        let handler = RnaHandler::default();
+        handler.await_background_embed().await;
+        // No panic, no error -- this is the expected no-op path.
+    }
+
+    #[tokio::test]
+    async fn test_await_background_embed_completed_task() {
+        // When a background task completes normally, await should succeed.
+        let handler = RnaHandler::default();
+        let handle = tokio::spawn(async { /* no-op task completes immediately */ });
+        *handler.embed_handle.lock().await = Some(handle);
+        handler.await_background_embed().await;
+        // Handle should be taken (consumed).
+        assert!(handler.embed_handle.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_await_background_embed_cancelled_task() {
+        // When a background task is aborted, await should handle gracefully
+        // (log warning, not panic).
+        let handler = RnaHandler::default();
+        let handle = tokio::spawn(async {
+            // Task that will be cancelled before it completes.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        handle.abort();
+        *handler.embed_handle.lock().await = Some(handle);
+        // Should not panic -- the cancelled error is caught.
+        handler.await_background_embed().await;
+    }
+
+    #[tokio::test]
+    async fn test_await_background_embed_panicked_task() {
+        // When a background task panics, await should handle gracefully.
+        let handler = RnaHandler::default();
+        let handle = tokio::spawn(async {
+            panic!("simulated embedding panic");
+        });
+        // Give the task time to panic.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        *handler.embed_handle.lock().await = Some(handle);
+        // Should not panic in the caller -- the JoinError is caught.
+        handler.await_background_embed().await;
+    }
+
+    #[tokio::test]
+    async fn test_await_background_embed_idempotent() {
+        // Calling await_background_embed twice should be safe (second call is no-op).
+        let handler = RnaHandler::default();
+        let handle = tokio::spawn(async {});
+        *handler.embed_handle.lock().await = Some(handle);
+        handler.await_background_embed().await;
+        // Second call -- handle was already taken, so this is a no-op.
+        handler.await_background_embed().await;
+    }
 }
