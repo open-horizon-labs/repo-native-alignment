@@ -148,6 +148,8 @@ impl ExtractionConsumer for TreeSitterConsumer {
             path: path.clone(),
             nodes: std::sync::Arc::from(extraction.nodes.into_boxed_slice()),
             edges: std::sync::Arc::from(extraction.edges.into_boxed_slice()),
+            // Single-root extraction: this root is always dirty.
+            dirty_slugs: Some(std::collections::HashSet::from([slug.clone()])),
         }])
     }
 
@@ -178,9 +180,16 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
     }
 
     async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::RootExtracted { slug, nodes, .. } = event else {
+        let ExtractionEvent::RootExtracted { slug, nodes, dirty_slugs, .. } = event else {
             return Ok(vec![]);
         };
+
+        // Only count languages from nodes whose root is in dirty_slugs.
+        // Clean-root nodes are in the set for post-extraction passes but should NOT
+        // trigger new LSP enrichment.
+        // - `None` = all roots dirty (first-run / cache-hit LSP paths)
+        // - `Some(set)` = only roots in set are dirty; `Some(empty)` = skip all LSP
+        let dirty_set = dirty_slugs.as_ref();
 
         // Group nodes by language using BTreeMap for deterministic emission order.
         // BTreeMap ensures LanguageDetected events always fire in alphabetical language
@@ -195,16 +204,23 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
             if node.language.is_empty() {
                 continue;
             }
+            // Skip nodes from clean roots — they already have LSP edges from cache.
+            if let Some(set) = dirty_set
+                && !set.contains(&node.id.root)
+            {
+                continue;
+            }
             by_lang.entry(node.language.clone()).or_default().push(node.clone());
         }
 
         let mut events: Vec<ExtractionEvent> = Vec::with_capacity(by_lang.len());
         for (language, lang_nodes) in by_lang {
             tracing::debug!(
-                "LanguageAccumulatorConsumer: root '{}' language '{}': {} nodes",
+                "LanguageAccumulatorConsumer: root '{}' language '{}': {} nodes (dirty_slugs: {:?})",
                 slug,
                 language,
                 lang_nodes.len(),
+                dirty_slugs,
             );
             events.push(ExtractionEvent::LanguageDetected {
                 slug: slug.clone(),
@@ -1294,16 +1310,29 @@ impl ExtractionConsumer for AllEnrichmentsGate {
         let mut state = self.state.lock().expect("AllEnrichmentsGate mutex poisoned");
 
         match event {
-            ExtractionEvent::RootExtracted { slug, nodes, edges, .. } => {
+            ExtractionEvent::RootExtracted { slug, nodes, edges, dirty_slugs, .. } => {
+                // Only count languages from dirty-root nodes. This must agree with
+                // `LanguageAccumulatorConsumer` which only emits `LanguageDetected`
+                // for dirty-root nodes.
+                // - `None` = all roots dirty
+                // - `Some(set)` = only roots in set are dirty
+                let dirty_set = dirty_slugs.as_ref();
+
                 // Count distinct languages in the node set to know how many
                 // `EnrichmentComplete` events to expect. This must agree with
                 // `LanguageAccumulatorConsumer` which emits one `LanguageDetected`
-                // per distinct non-empty language.
+                // per distinct non-empty language from dirty roots.
                 let language_count: usize = {
                     let mut seen = std::collections::HashSet::new();
                     for n in nodes.iter() {
                         if !n.language.is_empty() {
-                            seen.insert(n.language.clone());
+                            let is_dirty = match dirty_set {
+                                None => true,
+                                Some(set) => set.contains(&n.id.root),
+                            };
+                            if is_dirty {
+                                seen.insert(n.language.clone());
+                            }
                         }
                     }
                     seen.len()
@@ -1318,18 +1347,25 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                     let mut seen = std::collections::HashSet::new();
                     for n in nodes.iter() {
                         if !n.language.is_empty() && supported.contains(&n.language) {
-                            seen.insert(n.language.clone());
+                            let is_dirty = match dirty_set {
+                                None => true,
+                                Some(set) => set.contains(&n.id.root),
+                            };
+                            if is_dirty {
+                                seen.insert(n.language.clone());
+                            }
                         }
                     }
                     seen.len()
                 };
 
                 tracing::debug!(
-                    "AllEnrichmentsGate: root '{}' — {} distinct language(s) in nodes, \
-                     {} supported by EnricherRegistry",
+                    "AllEnrichmentsGate: root '{}' — {} distinct language(s) in dirty-root nodes, \
+                     {} supported by EnricherRegistry (dirty_slugs: {:?})",
                     slug,
                     language_count,
                     expected,
+                    dirty_slugs,
                 );
 
                 state.expected = expected;
@@ -2048,6 +2084,7 @@ pub async fn emit_enrichment_pipeline(
     primary_slug: String,
     repo_root: PathBuf,
     opts: BusOptions,
+    dirty_slugs: Option<std::collections::HashSet<String>>,
 ) -> anyhow::Result<(Vec<crate::graph::Node>, Vec<crate::graph::Edge>, std::collections::HashSet<String>)> {
     use crate::extract::event_bus::ExtractionEvent;
 
@@ -2061,6 +2098,7 @@ pub async fn emit_enrichment_pipeline(
         path: repo_root,
         nodes: Arc::clone(&nodes_arc),
         edges: Arc::clone(&edges_arc),
+        dirty_slugs,
     }).await;
 
     // Collect PassesComplete — produced by EnrichmentFinalizer.
@@ -2203,6 +2241,7 @@ mod tests {
                 make_node("python", "baz"),
             ].into_boxed_slice()),
             edges: std::sync::Arc::from([]),
+            dirty_slugs: None,
         };
 
         let consumer = LanguageAccumulatorConsumer;
@@ -2221,6 +2260,60 @@ mod tests {
         assert!(langs.contains("python"));
     }
 
+    /// Verify LanguageAccumulatorConsumer filters out nodes from clean roots
+    /// when dirty_slugs is non-empty.
+    #[tokio::test]
+    async fn test_language_accumulator_filters_clean_roots() {
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        fn make_node_with_root(root: &str, lang: &str, name: &str) -> Node {
+            Node {
+                id: NodeId {
+                    root: root.into(),
+                    file: PathBuf::from("test.rs"),
+                    name: name.into(),
+                    kind: NodeKind::Function,
+                },
+                language: lang.into(),
+                line_start: 1,
+                line_end: 10,
+                signature: name.into(),
+                body: String::new(),
+                metadata: BTreeMap::new(),
+                source: ExtractionSource::TreeSitter,
+            }
+        }
+
+        // Two roots: "dirty_root" (dirty) and "clean_root" (not in dirty_slugs).
+        // Both have Rust nodes, but only dirty_root's nodes should trigger LanguageDetected.
+        let event = ExtractionEvent::RootExtracted {
+            slug: "test".into(),
+            path: PathBuf::from("."),
+            nodes: std::sync::Arc::from(vec![
+                make_node_with_root("dirty_root", "rust", "foo"),
+                make_node_with_root("dirty_root", "rust", "bar"),
+                make_node_with_root("clean_root", "rust", "baz"),
+                make_node_with_root("clean_root", "python", "qux"),
+            ].into_boxed_slice()),
+            edges: std::sync::Arc::from([]),
+            dirty_slugs: Some(std::collections::HashSet::from(["dirty_root".to_string()])),
+        };
+
+        let consumer = LanguageAccumulatorConsumer;
+        let follow_ons = consumer.on_event(&event).await.unwrap();
+
+        // Should only emit LanguageDetected for "rust" (from dirty_root).
+        // "python" from clean_root should be excluded.
+        assert_eq!(follow_ons.len(), 1, "Only dirty-root languages should trigger LanguageDetected");
+        if let ExtractionEvent::LanguageDetected { language, nodes, .. } = &follow_ons[0] {
+            assert_eq!(language, "rust");
+            assert_eq!(nodes.len(), 2, "Only dirty_root rust nodes should be included");
+        } else {
+            panic!("Expected LanguageDetected event");
+        }
+    }
+
     /// Verify LanguageAccumulatorConsumer skips nodes with empty language.
     #[tokio::test]
     async fn test_language_accumulator_skips_empty_language() {
@@ -2230,6 +2323,7 @@ mod tests {
         let event = ExtractionEvent::RootExtracted {
             slug: "test".into(),
             path: PathBuf::from("."),
+            dirty_slugs: None,
             nodes: std::sync::Arc::from(vec![Node {
                 id: NodeId {
                     root: "test".into(),
@@ -2612,6 +2706,7 @@ mod tests {
             path: PathBuf::from("."),
             nodes: std::sync::Arc::from([]),
             edges: std::sync::Arc::from([]),
+            dirty_slugs: None,
         };
         let result = gate.on_event(&event).await.unwrap();
         assert_eq!(result.len(), 1, "Gate must emit AllEnrichmentsDone when expected==0");
@@ -2651,6 +2746,7 @@ mod tests {
             path: PathBuf::from("."),
             nodes: std::sync::Arc::from(vec![rust_node].into_boxed_slice()),
             edges: std::sync::Arc::from([]),
+            dirty_slugs: None,
         };
         let result = gate.on_event(&root_extracted).await.unwrap();
         // expected=1, received=0 → no AllEnrichmentsDone yet.
@@ -2670,6 +2766,147 @@ mod tests {
             matches!(result[0], ExtractionEvent::AllEnrichmentsDone { .. }),
             "Expected AllEnrichmentsDone"
         );
+    }
+
+    /// Adversarial: AllEnrichmentsGate must NOT expect enrichment for clean-root languages
+    /// when dirty_slugs is non-empty. A Rust node from a clean root should not count.
+    #[tokio::test]
+    async fn test_all_enrichments_gate_ignores_clean_root_languages() {
+        use crate::graph::{ExtractionSource, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        // Create two rust nodes: one dirty, one clean.
+        let dirty_node = crate::graph::Node {
+            id: NodeId {
+                root: "dirty_root".into(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "dirty_fn".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            line_start: 1, line_end: 1,
+            signature: "dirty_fn".into(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let clean_node = crate::graph::Node {
+            id: NodeId {
+                root: "clean_root".into(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "clean_fn".into(),
+                kind: NodeKind::Function,
+            },
+            language: "python".into(), // different language so we can detect if it's counted
+            line_start: 1, line_end: 1,
+            signature: "clean_fn".into(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let gate = AllEnrichmentsGate::new();
+
+        // Only dirty_root is dirty. clean_root's python should not count.
+        let root_extracted = ExtractionEvent::RootExtracted {
+            slug: "test".into(),
+            path: PathBuf::from("."),
+            nodes: std::sync::Arc::from(vec![dirty_node, clean_node].into_boxed_slice()),
+            edges: std::sync::Arc::from([]),
+            dirty_slugs: Some(std::collections::HashSet::from(["dirty_root".to_string()])),
+        };
+        let result = gate.on_event(&root_extracted).await.unwrap();
+        // expected=1 (only rust from dirty_root), not 2 (rust + python).
+        // Gate should NOT fire yet (still waiting for rust EnrichmentComplete).
+        assert!(result.is_empty(), "Gate must not fire before dirty-root enrichments arrive");
+
+        // Send EnrichmentComplete for rust only.
+        let enrichment_done = ExtractionEvent::EnrichmentComplete {
+            slug: "test".into(),
+            language: "rust".into(),
+            added_edges: std::sync::Arc::from([]),
+            new_nodes: std::sync::Arc::from([]),
+            updated_nodes: std::sync::Arc::from([]),
+        };
+        let result = gate.on_event(&enrichment_done).await.unwrap();
+        // Should fire now: expected=1 (rust), received=1 (rust).
+        // If python from clean_root were counted, we'd still be waiting.
+        assert_eq!(result.len(), 1, "Gate must fire after dirty-root enrichment completes (clean-root python must not block)");
+        assert!(
+            matches!(result[0], ExtractionEvent::AllEnrichmentsDone { .. }),
+            "Expected AllEnrichmentsDone"
+        );
+    }
+
+    /// Adversarial: empty dirty_slugs treats all roots as dirty (backward compatibility).
+    #[tokio::test]
+    async fn test_all_enrichments_gate_empty_dirty_slugs_all_dirty() {
+        use crate::graph::{ExtractionSource, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        let node_a = crate::graph::Node {
+            id: NodeId {
+                root: "root_a".into(),
+                file: PathBuf::from("src/lib.rs"),
+                name: "fn_a".into(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".into(),
+            line_start: 1, line_end: 1,
+            signature: "fn_a".into(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+        let node_b = crate::graph::Node {
+            id: NodeId {
+                root: "root_b".into(),
+                file: PathBuf::from("app.py"),
+                name: "fn_b".into(),
+                kind: NodeKind::Function,
+            },
+            language: "python".into(),
+            line_start: 1, line_end: 1,
+            signature: "fn_b".into(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let gate = AllEnrichmentsGate::new();
+
+        // Empty dirty_slugs = all dirty. Both languages should be expected.
+        let root_extracted = ExtractionEvent::RootExtracted {
+            slug: "test".into(),
+            path: PathBuf::from("."),
+            nodes: std::sync::Arc::from(vec![node_a, node_b].into_boxed_slice()),
+            edges: std::sync::Arc::from([]),
+            dirty_slugs: None, // None = all dirty
+        };
+        let result = gate.on_event(&root_extracted).await.unwrap();
+        assert!(result.is_empty(), "Gate must wait for both languages when all dirty");
+
+        // Complete rust -- still waiting for python.
+        let rust_done = ExtractionEvent::EnrichmentComplete {
+            slug: "test".into(),
+            language: "rust".into(),
+            added_edges: std::sync::Arc::from([]),
+            new_nodes: std::sync::Arc::from([]),
+            updated_nodes: std::sync::Arc::from([]),
+        };
+        let result = gate.on_event(&rust_done).await.unwrap();
+        assert!(result.is_empty(), "Gate must wait for python too when dirty_slugs is empty");
+
+        // Complete python -- now both done.
+        let python_done = ExtractionEvent::EnrichmentComplete {
+            slug: "test".into(),
+            language: "python".into(),
+            added_edges: std::sync::Arc::from([]),
+            new_nodes: std::sync::Arc::from([]),
+            updated_nodes: std::sync::Arc::from([]),
+        };
+        let result = gate.on_event(&python_done).await.unwrap();
+        assert_eq!(result.len(), 1, "Gate must fire after all dirty-root enrichments complete");
     }
 
     /// Verify SubsystemConsumer subscribes to CommunityDetectionComplete and emits
@@ -2719,6 +2956,7 @@ mod tests {
             path: PathBuf::from("."),
             nodes: std::sync::Arc::from([]),
             edges: std::sync::Arc::from([]),
+            dirty_slugs: None,
         };
         let result = consumer.on_event(&event).await.unwrap();
         assert!(result.is_empty(), "EmbeddingIndexerConsumer stub emits nothing");
@@ -2736,6 +2974,7 @@ mod tests {
             "test".to_string(),
             PathBuf::from("."),
             super::BusOptions::default(),
+            None,
         ).await.expect("emit_enrichment_pipeline must not fail on empty input");
         assert!(nodes.is_empty(), "empty input → empty nodes");
         assert!(edges.is_empty(), "empty input → empty edges");
@@ -2772,6 +3011,7 @@ mod tests {
             "test".to_string(),
             PathBuf::from("."),
             super::BusOptions::default(),
+            None,
         ).await.expect("emit_enrichment_pipeline must not fail with valid input");
 
         assert!(
@@ -2850,6 +3090,7 @@ mod tests {
             "client".to_string(),
             PathBuf::from("."),
             super::BusOptions::default(),
+            None,
         ).await.unwrap();
 
         // Must produce no ApiEndpoint nodes — nextjs_routing_pass must NOT fire
@@ -2909,6 +3150,7 @@ mod tests {
             "client".to_string(),
             PathBuf::from("."),
             super::BusOptions::default(),
+            None,
         ).await.unwrap();
 
         // Must find an ApiEndpoint node — filesystem-based gate must fire
@@ -2963,6 +3205,7 @@ mod tests {
             "app".to_string(),
             PathBuf::from("."),
             super::BusOptions::default(),
+            None,
         ).await.unwrap();
 
         assert!(
