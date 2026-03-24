@@ -621,6 +621,22 @@ impl RnaHandler {
                 .map(|r| (r.slug.clone(), r.path.clone()))
                 .collect();
             let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
+
+            // Compute dirty_slugs: roots that actually changed and need LSP enrichment.
+            // Clean roots loaded from cache already have LSP edges and should not trigger
+            // a new rust-analyzer / LSP server spawn (#555).
+            let dirty_slugs: std::collections::HashSet<String> = scanners
+                .iter()
+                .filter(|(_, _, _, _, root_changed)| *root_changed)
+                .map(|(slug, _, _, _, _)| slug.clone())
+                .collect();
+            tracing::info!(
+                "dirty_slugs for enrichment pipeline: {:?} ({} of {} roots)",
+                dirty_slugs,
+                dirty_slugs.len(),
+                scanners.len(),
+            );
+
             let (enriched_nodes, enriched_edges, detected_frameworks) =
                 crate::extract::consumers::emit_enrichment_pipeline(
                     all_nodes,
@@ -633,6 +649,7 @@ impl RnaHandler {
                         embed_idx: None, // embed handled by spawn_background_enrichment after graph is ready
                         lance_repo_root: None, // LanceDB persist handled directly after PageRank/subsystem passes
                     },
+                    dirty_slugs,
                 ).await?;
             all_nodes = enriched_nodes;
             all_edges = enriched_edges;
@@ -1132,6 +1149,11 @@ impl RnaHandler {
             .map(|r| (r.slug.clone(), r.path.clone()))
             .collect();
         {
+            // Incremental scan: the primary root is always dirty (we only get here
+            // when there are changed/new/deleted files in the primary root).
+            let dirty_slugs: std::collections::HashSet<String> =
+                std::iter::once(primary_slug.clone()).collect();
+
             let (enriched_nodes, enriched_edges, detected_frameworks) =
                 crate::extract::consumers::emit_enrichment_pipeline(
                     std::mem::take(&mut graph.nodes),
@@ -1144,6 +1166,7 @@ impl RnaHandler {
                         embed_idx: None, // embed handled below via targeted reindex_nodes after PageRank
                         lance_repo_root: None, // LanceDB persist handled below via persist_graph_incremental
                     },
+                    dirty_slugs,
                 ).await.map_err(|e| {
                     // Pipeline invariant violated — abort the incremental update so the
                     // partial graph is not persisted. Scanner state is not committed on

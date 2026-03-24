@@ -342,6 +342,7 @@ mod tests {
             path: PathBuf::from("."),
             nodes: std::sync::Arc::from(vec![].into_boxed_slice()),
             edges: std::sync::Arc::from(vec![].into_boxed_slice()),
+            dirty_slugs: std::collections::HashSet::new(),
         }).await.unwrap();
         let stats = c.stats.read().unwrap();
         let extracted = stats.roots_extracted.get("api").expect("api should be in roots_extracted");
@@ -440,6 +441,7 @@ mod tests {
             slug: slug("api"), path: PathBuf::from("."),
             nodes: std::sync::Arc::from(vec![].into_boxed_slice()),
             edges: std::sync::Arc::from(vec![].into_boxed_slice()),
+            dirty_slugs: std::collections::HashSet::new(),
         }).await.unwrap();
         c.on_event(&ExtractionEvent::LanguageDetected {
             slug: slug("api"), language: "rust".into(), nodes: empty_arc_nodes(),

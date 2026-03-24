@@ -88,6 +88,10 @@ pub enum ExtractionEvent {
         nodes: Arc<[Node]>,
         /// Shared read-only view of all extracted edges. Use `Arc::from(vec)` to construct.
         edges: Arc<[Edge]>,
+        /// Root slugs that actually changed (dirty). Only nodes from these roots
+        /// should trigger LSP enrichment. When empty, all roots are treated as dirty
+        /// (backwards-compatible default for background enrichment paths).
+        dirty_slugs: HashSet<String>,
     },
 
     /// A language has been detected in the extracted nodes.
@@ -257,7 +261,7 @@ impl ExtractionEvent {
                 buf.push(b'\t');
                 buf.push(if *lsp_only { b'1' } else { b'0' });
             }
-            ExtractionEvent::RootExtracted { slug, path, nodes, edges } => {
+            ExtractionEvent::RootExtracted { slug, path, nodes, edges, .. } => {
                 buf.extend_from_slice(slug.as_bytes());
                 buf.push(b'\t');
                 buf.extend_from_slice(path.to_string_lossy().as_bytes());
@@ -848,6 +852,7 @@ mod tests {
             path: PathBuf::from("."),
             nodes: Arc::from(vec![].into_boxed_slice()),
             edges: Arc::from(vec![].into_boxed_slice()),
+            dirty_slugs: HashSet::new(),
         }
     }
 

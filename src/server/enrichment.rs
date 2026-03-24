@@ -280,6 +280,18 @@ impl RnaHandler {
                         let primary_slug =
                             RootConfig::code_project(repo_root.clone()).slug();
 
+                        // Compute dirty_slugs: only roots that had file changes should
+                        // trigger LSP enrichment (#555).
+                        let dirty_slugs: std::collections::HashSet<String> = per_root_scans
+                            .iter()
+                            .filter(|(_, scan, _, _)| {
+                                !scan.changed_files.is_empty()
+                                    || !scan.new_files.is_empty()
+                                    || !scan.deleted_files.is_empty()
+                            })
+                            .map(|(slug, _, _, _)| slug.clone())
+                            .collect();
+
                         // Pipeline invariant: EnrichmentFinalizer always emits PassesComplete.
                         // If it doesn't (a logic bug), log the error and clear lance_deltas so
                         // the empty graph is not persisted. The graph remains empty until the
@@ -295,6 +307,7 @@ impl RnaHandler {
                                 embed_idx: None, // embed handled by background scanner's own reindex pass
                                 lance_repo_root: None, // LanceDB persist handled by background scanner's lance_deltas
                             },
+                            dirty_slugs,
                         ).await {
                             Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
                                 graph_state.nodes = enriched_nodes;
@@ -589,6 +602,13 @@ impl RnaHandler {
             // Consume bg_nodes/bg_edges via move (no redundant clone; these are the only owners).
             // LanceDB persist is handled below after replacing the in-memory graph.
             let bus_repo_root = bg_repo_root.clone();
+            // Cache-hit LSP enrichment: all roots are "dirty" because this is
+            // the first time LSP runs on a cached graph (no prior LSP edges).
+            let all_dirty: std::collections::HashSet<String> = root_pairs
+                .iter()
+                .map(|(slug, _)| slug.clone())
+                .collect();
+
             let result = crate::extract::consumers::emit_enrichment_pipeline(
                 bg_nodes,
                 bg_edges,
@@ -600,6 +620,7 @@ impl RnaHandler {
                     embed_idx: None,
                     lance_repo_root: None,
                 },
+                all_dirty,
             ).await;
 
             let (mut enriched_nodes, mut enriched_edges, _detected_frameworks) = match result {
