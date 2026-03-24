@@ -216,7 +216,8 @@ if [ -d "$IC_REPO/.oh/.cache/lance" ]; then
   check "IC: FastAPI endpoints" \
     "repo-native-alignment search '' --repo $IC_REPO --kind api_endpoint --limit 5" "route_decorator"
   check "IC: Next.js routes (limit 500)" \
-    "repo-native-alignment search '' --repo $IC_REPO --kind api_endpoint --limit 500 2>/dev/null | grep -c nextjs_app_router" "[1-9]"
+    "repo-native-alignment search '' --repo $IC_REPO --kind api_endpoint --limit 500 2>/dev/null | grep -c nextjs_app_router" "[1-9]" \
+    "IC repo has page routes (page.tsx) but no API routes (route.ts under app/api/)"
   check "IC: framework nodes" \
     "repo-native-alignment search '' --repo $IC_REPO --kind framework --limit 5" "fastapi\|react"
   check "IC: cross-file calls Expertunities" \
@@ -230,7 +231,8 @@ if [ -d "$IC_REPO/.oh/.cache/lance" ]; then
   check "IC: BelongsTo edges" \
     "repo-native-alignment search 'get_expertunities' --repo $IC_REPO --limit 1" "result"
   check "IC: Next.js routes survive rescan" \
-    "repo-native-alignment scan --repo $IC_REPO 2>/dev/null && repo-native-alignment search '' --repo $IC_REPO --kind api_endpoint --limit 500 2>/dev/null | grep -c nextjs_app_router" "3"
+    "repo-native-alignment scan --repo $IC_REPO 2>/dev/null && repo-native-alignment search '' --repo $IC_REPO --kind api_endpoint --limit 500 2>/dev/null | grep -c nextjs_app_router" "3" \
+    "IC repo has page routes (page.tsx) but no API routes (route.ts under app/api/)"
   check "IC: WAL sentinel present after scan" \
     "test -f $IC_REPO/.oh/.cache/extract_completed.json && echo found" "found"
 else
@@ -360,16 +362,11 @@ check "ADR: FastapiRouterPrefixConsumer indexed as struct by RNA (#543)" \
 check "ADR: PostExtractionRegistry zero .rs references in src/ (#523)" \
   "grep -r 'PostExtractionRegistry' $RNA_REPO/src/ --include='*.rs' 2>/dev/null | wc -l | tr -d ' '" "^0$"
 
-# Constraint 6: subsystem_node_pass has a tracked stub (issue #542)
-# The function must be RNA-indexable (still lives in subsystem_pass.rs) AND the
-# tracking issue must be open (state: OPEN). When issue #542 is closed (stub promoted
-# to real consumer), this check will fail on the OPEN pattern — that's intentional.
-# Remove this check when SubsystemConsumer.on_event is fully implemented.
-# Note: requires 'gh' CLI; skip gracefully if not available in the environment.
+# Constraint 6: SubsystemConsumer is a real bus consumer (#542, promoted in #549)
 check "ADR: subsystem_node_pass indexed by RNA (#542)" \
   "repo-native-alignment search 'subsystem_node_pass' --repo $RNA_REPO --kind function --limit 3 2>/dev/null" "subsystem_node_pass"
-check "ADR: subsystem_node_pass bypass tracked in open issue #542" \
-  "gh issue view 542 --repo open-horizon-labs/repo-native-alignment --json state -q '.state' 2>/dev/null || echo 'SKIP_NO_GH'" "OPEN\|SKIP_NO_GH"
+check "ADR: SubsystemConsumer is a real consumer (#549)" \
+  "grep -c 'impl ExtractionConsumer for SubsystemConsumer' $RNA_REPO/src/extract/consumers.rs 2>/dev/null" "[1-9]"
 
 echo ""
 echo "=== RESULTS: $PASS passed, $FAIL failed, $SKIP skipped ==="
