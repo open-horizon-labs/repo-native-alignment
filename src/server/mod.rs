@@ -88,6 +88,10 @@ pub struct RnaHandler {
     /// `list_roots` reads from this for in-progress status; falls back to sentinel files
     /// on cold start when no bus events have fired for the current process lifetime.
     pub scan_stats: Arc<std::sync::RwLock<crate::extract::scan_stats::ScanStats>>,
+    /// JoinHandle for the background embedding task spawned by `spawn_background_enrichment`.
+    /// CLI callers can await this to ensure embeddings complete before the runtime shuts down.
+    /// MCP server callers leave it as fire-and-forget (the handle is dropped on next scan).
+    pub embed_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Default for RnaHandler {
@@ -109,11 +113,37 @@ impl Default for RnaHandler {
             scan_stats: Arc::new(std::sync::RwLock::new(
                 crate::extract::scan_stats::ScanStats::default(),
             )),
+            embed_handle: tokio::sync::Mutex::new(None),
         }
     }
 }
 
 impl RnaHandler {
+    /// Await the background embedding task, if one was spawned.
+    ///
+    /// CLI callers should invoke this before returning so the Tokio runtime
+    /// does not shut down while the embedding task is still in flight (which
+    /// would cause a `JoinError::Cancelled` panic in LanceDB internals).
+    ///
+    /// MCP server callers do not need this — the runtime persists for the
+    /// lifetime of the server process.
+    pub async fn await_background_embed(&self) {
+        let handle = self.embed_handle.lock().await.take();
+        if let Some(h) = handle {
+            match h.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {
+                    tracing::warn!(
+                        "Background embedding task was cancelled (runtime shutting down)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Background embedding task failed: {}", e);
+                }
+            }
+        }
+    }
+
     /// Return the slug for the primary `--repo` root.
     pub(crate) fn primary_root_slug(&self) -> String {
         crate::roots::RootConfig::code_project(self.repo_root.clone()).slug()
@@ -1401,5 +1431,65 @@ mod tests {
             "Expected rust in registered enricher languages: {:?}",
             supported
         );
+    }
+
+    #[tokio::test]
+    async fn test_await_background_embed_no_handle() {
+        // When no background embedding was spawned, await_background_embed
+        // should return immediately without error.
+        let handler = RnaHandler::default();
+        handler.await_background_embed().await;
+        // No panic, no error -- this is the expected no-op path.
+    }
+
+    #[tokio::test]
+    async fn test_await_background_embed_completed_task() {
+        // When a background task completes normally, await should succeed.
+        let handler = RnaHandler::default();
+        let handle = tokio::spawn(async { /* no-op task completes immediately */ });
+        *handler.embed_handle.lock().await = Some(handle);
+        handler.await_background_embed().await;
+        // Handle should be taken (consumed).
+        assert!(handler.embed_handle.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_await_background_embed_cancelled_task() {
+        // When a background task is aborted, await should handle gracefully
+        // (log warning, not panic).
+        let handler = RnaHandler::default();
+        let handle = tokio::spawn(async {
+            // Task that will be cancelled before it completes.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        handle.abort();
+        *handler.embed_handle.lock().await = Some(handle);
+        // Should not panic -- the cancelled error is caught.
+        handler.await_background_embed().await;
+    }
+
+    #[tokio::test]
+    async fn test_await_background_embed_panicked_task() {
+        // When a background task panics, await should handle gracefully.
+        let handler = RnaHandler::default();
+        let handle = tokio::spawn(async {
+            panic!("simulated embedding panic");
+        });
+        // Give the task time to panic.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        *handler.embed_handle.lock().await = Some(handle);
+        // Should not panic in the caller -- the JoinError is caught.
+        handler.await_background_embed().await;
+    }
+
+    #[tokio::test]
+    async fn test_await_background_embed_idempotent() {
+        // Calling await_background_embed twice should be safe (second call is no-op).
+        let handler = RnaHandler::default();
+        let handle = tokio::spawn(async {});
+        *handler.embed_handle.lock().await = Some(handle);
+        handler.await_background_embed().await;
+        // Second call -- handle was already taken, so this is a no-op.
+        handler.await_background_embed().await;
     }
 }
