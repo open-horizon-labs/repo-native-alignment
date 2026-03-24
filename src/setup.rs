@@ -12,6 +12,8 @@ const SOURCE_DECLARATION_KIND: &str = "code.workspace:v1";
 const SOURCE_FACT_TYPE: &str = "code.workspace.bootstrap.health";
 
 const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
+const GITHUB_RELEASE_BASE: &str =
+    "https://github.com/open-horizon-labs/repo-native-alignment/releases/latest/download";
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
@@ -80,8 +82,9 @@ pub fn run(args: &SetupArgs) -> Result<()> {
                 binary.display()
             );
         } else {
+            println!("[dry-run] Would check: curl --version");
             println!(
-                "[dry-run] Would fail without RNA source or existing binary at {}",
+                "[dry-run] Would download release binary from GitHub Releases to {}",
                 binary.display()
             );
         }
@@ -92,7 +95,8 @@ pub fn run(args: &SetupArgs) -> Result<()> {
             println!("[dry-run] Would check: npx --version\n");
         }
     } else {
-        preflight(source_available, !args.skip_skills)?;
+        let needs_download = !source_available && !binary.exists();
+        preflight(source_available, !args.skip_skills, needs_download)?;
     }
 
     // ── Step 2: install RNA binary ─────────────────────────────────────────
@@ -106,7 +110,7 @@ pub fn run(args: &SetupArgs) -> Result<()> {
             );
         } else {
             println!(
-                "[dry-run] Would fail install: source path missing and binary not found at {}",
+                "[dry-run] Would download release binary from {GITHUB_RELEASE_BASE} to {}",
                 binary.display()
             );
         }
@@ -192,13 +196,25 @@ pub fn run(args: &SetupArgs) -> Result<()> {
 
 // ─── Preflight ───────────────────────────────────────────────────────────────
 
-fn preflight(require_rna_install: bool, require_skills_install: bool) -> Result<()> {
+fn preflight(
+    require_rna_install: bool,
+    require_skills_install: bool,
+    require_download: bool,
+) -> Result<()> {
     if require_rna_install {
         check_dep("cargo", &["--version"], "Install Rust: https://rustup.rs")?;
         check_dep(
             "protoc",
             &["--version"],
             "Install protobuf:\n  macOS:  brew install protobuf\n  Linux:  https://grpc.io/docs/protoc-installation/",
+        )?;
+    }
+
+    if require_download {
+        check_dep(
+            "curl",
+            &["--version"],
+            "Install curl:\n  macOS:  (pre-installed)\n  Linux:  apt-get install curl / yum install curl",
         )?;
     }
 
@@ -210,7 +226,7 @@ fn preflight(require_rna_install: bool, require_skills_install: bool) -> Result<
         )?;
     }
 
-    if !require_rna_install && !require_skills_install {
+    if !require_rna_install && !require_skills_install && !require_download {
         println!("  No dependency checks required.\n");
     } else {
         println!("  All required dependencies present.\n");
@@ -251,11 +267,10 @@ fn install_rna_binary(installed_binary: &Path) -> Result<()> {
             return Ok(());
         }
 
-        bail!(
-            "RNA source path not found at {} and existing binary not found at {}. Re-clone repo-native-alignment or install a release binary first.",
-            source_path.display(),
-            installed_binary.display()
-        );
+        // Source not available and no binary found -- download from GitHub Releases.
+        println!("RNA source not available; downloading release binary...");
+        download_rna_binary(installed_binary)?;
+        return Ok(());
     }
 
     println!("Installing RNA binary (cargo install --locked --path {RNA_MANIFEST_DIR}) ...");
@@ -268,6 +283,128 @@ fn install_rna_binary(installed_binary: &Path) -> Result<()> {
     }
     println!("  RNA binary installed.\n");
     Ok(())
+}
+
+/// Detect the current platform and download the appropriate release binary
+/// from GitHub Releases into the directory containing `target_path`.
+fn download_rna_binary(target_path: &Path) -> Result<()> {
+    let (os, arch) = detect_platform()?;
+    let asset_name = release_asset_name(&os, &arch)?;
+    let url = format!("{GITHUB_RELEASE_BASE}/{asset_name}");
+
+    // Ensure the target directory exists (typically ~/.cargo/bin/).
+    if let Some(parent) = target_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Cannot create directory: {}", parent.display()))?;
+    }
+
+    println!("  Platform: {os}/{arch}");
+    println!("  Downloading: {url}");
+    println!("  Target: {}", target_path.display());
+
+    let mut curl_child = Command::new("curl")
+        .args(["-fSL", &url])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("Failed to launch `curl`. Install curl or download the binary manually.")?;
+
+    let curl_stdout = curl_child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to capture curl stdout"))?;
+
+    let tar_status = Command::new("tar")
+        .args([
+            "xz",
+            "-C",
+            target_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_str()
+                .context("Target directory path is not valid UTF-8")?,
+        ])
+        .stdin(curl_stdout)
+        .status()
+        .context("Failed to launch `tar`")?;
+
+    // Reap the curl child process and check its exit status.
+    let curl_status = curl_child.wait().context("Failed to wait on `curl`")?;
+    if !curl_status.success() {
+        bail!(
+            "Download failed: curl exited with {curl_status}. URL: {url}\n  \
+             Check network connectivity and that the release exists."
+        );
+    }
+
+    if !tar_status.success() {
+        bail!(
+            "Download failed: tar extraction failed. URL: {url}\n  \
+             Your platform ({os}/{arch}) may not have a pre-built binary.\n  \
+             Build from source instead: cargo install --locked --git https://github.com/open-horizon-labs/repo-native-alignment"
+        );
+    }
+
+    // Verify the binary landed.
+    if !target_path.exists() {
+        bail!(
+            "Download appeared to succeed but binary not found at {}.\n  \
+             The release archive may have a different structure than expected.",
+            target_path.display()
+        );
+    }
+
+    println!("  RNA binary downloaded.\n");
+    Ok(())
+}
+
+/// Returns (os, arch) strings matching `uname -s` / `uname -m`.
+fn detect_platform() -> Result<(String, String)> {
+    let os_out = Command::new("uname")
+        .arg("-s")
+        .output()
+        .context("Failed to run `uname -s`")?;
+    let arch_out = Command::new("uname")
+        .arg("-m")
+        .output()
+        .context("Failed to run `uname -m`")?;
+
+    let os = String::from_utf8_lossy(&os_out.stdout).trim().to_string();
+    let arch = String::from_utf8_lossy(&arch_out.stdout).trim().to_string();
+    Ok((os, arch))
+}
+
+/// Map platform to the GitHub Release asset filename.
+/// Matches the naming convention used in CI release builds.
+fn release_asset_name(os: &str, arch: &str) -> Result<String> {
+    match (os, arch) {
+        ("Darwin", "arm64") => {
+            // Check for M2+ chips which have a -fast variant.
+            if is_apple_m2_or_newer() {
+                Ok("repo-native-alignment-darwin-arm64-fast.tar.gz".to_string())
+            } else {
+                Ok("repo-native-alignment-darwin-arm64.tar.gz".to_string())
+            }
+        }
+        ("Linux", "x86_64") => Ok("repo-native-alignment-linux-x86_64.tar.gz".to_string()),
+        _ => bail!(
+            "No pre-built binary for {os}/{arch}.\n  \
+             Build from source: cargo install --locked --git https://github.com/open-horizon-labs/repo-native-alignment"
+        ),
+    }
+}
+
+/// Detect Apple M2 or newer via sysctl. Returns false on non-macOS or M1.
+fn is_apple_m2_or_newer() -> bool {
+    let Ok(output) = Command::new("sysctl")
+        .args(["-n", "machdep.cpu.brand_string"])
+        .output()
+    else {
+        return false;
+    };
+    let brand = String::from_utf8_lossy(&output.stdout);
+    let brand = brand.trim();
+    // M2, M3, M4, etc.
+    brand.contains("M2") || brand.contains("M3") || brand.contains("M4")
 }
 
 fn install_oh_skills() -> Result<()> {
@@ -878,5 +1015,43 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("expected source"), "unexpected error: {err}");
+    }
+
+    // ── release asset name mapping ──────────────────────────────────────────
+
+    #[test]
+    fn test_release_asset_name_linux_x86_64() {
+        let name = release_asset_name("Linux", "x86_64").unwrap();
+        assert_eq!(name, "repo-native-alignment-linux-x86_64.tar.gz");
+    }
+
+    #[test]
+    fn test_release_asset_name_darwin_arm64() {
+        // On non-macOS test machines, is_apple_m2_or_newer() returns false,
+        // so this should return the base arm64 variant.
+        let name = release_asset_name("Darwin", "arm64").unwrap();
+        assert!(
+            name == "repo-native-alignment-darwin-arm64.tar.gz"
+                || name == "repo-native-alignment-darwin-arm64-fast.tar.gz",
+            "unexpected asset name: {name}"
+        );
+    }
+
+    #[test]
+    fn test_release_asset_name_unsupported_platform() {
+        let err = release_asset_name("Windows", "x86_64")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("No pre-built binary"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_detect_platform_returns_nonempty() {
+        let (os, arch) = detect_platform().unwrap();
+        assert!(!os.is_empty(), "OS should not be empty");
+        assert!(!arch.is_empty(), "arch should not be empty");
     }
 }
