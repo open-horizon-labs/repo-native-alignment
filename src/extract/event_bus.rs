@@ -89,9 +89,10 @@ pub enum ExtractionEvent {
         /// Shared read-only view of all extracted edges. Use `Arc::from(vec)` to construct.
         edges: Arc<[Edge]>,
         /// Root slugs that actually changed (dirty). Only nodes from these roots
-        /// should trigger LSP enrichment. When empty, all roots are treated as dirty
-        /// (backwards-compatible default for background enrichment paths).
-        dirty_slugs: HashSet<String>,
+        /// should trigger LSP enrichment. `None` means all roots are dirty
+        /// (used for first-run / cache-hit LSP paths where no prior LSP edges exist).
+        /// `Some(empty)` means NO roots are dirty (skip LSP enrichment entirely).
+        dirty_slugs: Option<HashSet<String>>,
     },
 
     /// A language has been detected in the extracted nodes.
@@ -268,12 +269,17 @@ impl ExtractionEvent {
                 // Include dirty_slugs in cache key so consumers that filter by
                 // dirty roots (e.g. LanguageAccumulatorConsumer) don't replay
                 // stale cached results when the dirty set changes (#555).
-                let mut sorted_dirty: Vec<&String> = dirty_slugs.iter().collect();
-                sorted_dirty.sort_unstable();
                 buf.push(b'\t');
-                for ds in &sorted_dirty {
-                    buf.extend_from_slice(ds.as_bytes());
-                    buf.push(b',');
+                match dirty_slugs {
+                    None => buf.extend_from_slice(b"ALL"),
+                    Some(set) => {
+                        let mut sorted_dirty: Vec<&String> = set.iter().collect();
+                        sorted_dirty.sort_unstable();
+                        for ds in &sorted_dirty {
+                            buf.extend_from_slice(ds.as_bytes());
+                            buf.push(b',');
+                        }
+                    }
                 }
                 // Sort node stable_ids for determinism.
                 let mut node_ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
@@ -862,7 +868,7 @@ mod tests {
             path: PathBuf::from("."),
             nodes: Arc::from(vec![].into_boxed_slice()),
             edges: Arc::from(vec![].into_boxed_slice()),
-            dirty_slugs: HashSet::new(),
+            dirty_slugs: None, // None = all dirty (default)
         }
     }
 
@@ -1115,17 +1121,28 @@ mod tests {
             path: PathBuf::from("."),
             nodes: Arc::from(vec![].into_boxed_slice()),
             edges: Arc::from(vec![].into_boxed_slice()),
-            dirty_slugs: HashSet::new(),
+            dirty_slugs: None, // all dirty
         };
         let e2 = ExtractionEvent::RootExtracted {
             slug: "test".to_string(),
             path: PathBuf::from("."),
             nodes: Arc::from(vec![].into_boxed_slice()),
             edges: Arc::from(vec![].into_boxed_slice()),
-            dirty_slugs: HashSet::from(["dirty_root".to_string()]),
+            dirty_slugs: Some(HashSet::from(["dirty_root".to_string()])),
+        };
+        let e3 = ExtractionEvent::RootExtracted {
+            slug: "test".to_string(),
+            path: PathBuf::from("."),
+            nodes: Arc::from(vec![].into_boxed_slice()),
+            edges: Arc::from(vec![].into_boxed_slice()),
+            dirty_slugs: Some(HashSet::new()), // none dirty
         };
         assert_ne!(e1.canonical_bytes(), e2.canonical_bytes(),
-            "Different dirty_slugs must produce different cache keys");
+            "None vs Some(set) must produce different cache keys");
+        assert_ne!(e1.canonical_bytes(), e3.canonical_bytes(),
+            "None vs Some(empty) must produce different cache keys");
+        assert_ne!(e2.canonical_bytes(), e3.canonical_bytes(),
+            "Some(set) vs Some(empty) must produce different cache keys");
     }
 
     /// Default consumer version is 0.

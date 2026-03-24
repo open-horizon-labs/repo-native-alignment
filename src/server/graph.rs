@@ -641,7 +641,7 @@ impl RnaHandler {
                 freshly_extracted_slugs.len(),
                 scanners.len(),
             );
-            let dirty_slugs = freshly_extracted_slugs;
+            let dirty_slugs = Some(freshly_extracted_slugs);
 
             let (enriched_nodes, enriched_edges, detected_frameworks) =
                 crate::extract::consumers::emit_enrichment_pipeline(
@@ -1157,8 +1157,8 @@ impl RnaHandler {
         {
             // Incremental scan: the primary root is always dirty (we only get here
             // when there are changed/new/deleted files in the primary root).
-            let dirty_slugs: std::collections::HashSet<String> =
-                std::iter::once(primary_slug.clone()).collect();
+            let dirty_slugs: Option<std::collections::HashSet<String>> =
+                Some(std::iter::once(primary_slug.clone()).collect());
 
             let (enriched_nodes, enriched_edges, detected_frameworks) =
                 crate::extract::consumers::emit_enrichment_pipeline(

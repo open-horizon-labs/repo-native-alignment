@@ -281,8 +281,8 @@ impl RnaHandler {
                             RootConfig::code_project(repo_root.clone()).slug();
 
                         // Compute dirty_slugs: only roots that had file changes should
-                        // trigger LSP enrichment (#555).
-                        let dirty_slugs: std::collections::HashSet<String> = per_root_scans
+                        // trigger LSP enrichment (#555). `Some(set)` = only those roots.
+                        let dirty_slugs: Option<std::collections::HashSet<String>> = Some(per_root_scans
                             .iter()
                             .filter(|(_, scan, _, _)| {
                                 !scan.changed_files.is_empty()
@@ -290,7 +290,7 @@ impl RnaHandler {
                                     || !scan.deleted_files.is_empty()
                             })
                             .map(|(slug, _, _, _)| slug.clone())
-                            .collect();
+                            .collect());
 
                         // Pipeline invariant: EnrichmentFinalizer always emits PassesComplete.
                         // If it doesn't (a logic bug), log the error and clear lance_deltas so
@@ -604,11 +604,7 @@ impl RnaHandler {
             let bus_repo_root = bg_repo_root.clone();
             // Cache-hit LSP enrichment: all roots are "dirty" because this is
             // the first time LSP runs on a cached graph (no prior LSP edges).
-            let all_dirty: std::collections::HashSet<String> = root_pairs
-                .iter()
-                .map(|(slug, _)| slug.clone())
-                .collect();
-
+            // `None` = all roots dirty on first LSP run.
             let result = crate::extract::consumers::emit_enrichment_pipeline(
                 bg_nodes,
                 bg_edges,
@@ -620,7 +616,7 @@ impl RnaHandler {
                     embed_idx: None,
                     lance_repo_root: None,
                 },
-                all_dirty,
+                None,
             ).await;
 
             let (mut enriched_nodes, mut enriched_edges, _detected_frameworks) = match result {
