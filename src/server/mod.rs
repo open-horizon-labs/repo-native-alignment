@@ -50,9 +50,32 @@ use helpers::parse_args;
 pub struct PipelineResult {
     pub node_count: usize,
     pub edge_count: usize,
+    pub file_count: usize,
     pub lsp_edge_count: usize,
     pub embed_count: usize,
     pub total_time: std::time::Duration,
+    pub lsp_entries: Vec<crate::extract::scan_stats::LspEnrichmentEntry>,
+    pub encoding_stats: crate::extract::EncodingStats,
+}
+
+impl PipelineResult {
+    /// Format a structured scan summary for display.
+    pub fn format_summary(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push(format!("Scan complete: {} symbols, {} edges, {} files in {:.1}s",
+            self.node_count, self.edge_count, self.file_count, self.total_time.as_secs_f64()));
+        if !self.lsp_entries.is_empty() {
+            lines.push(String::new());
+            lines.push("LSP enrichment:".to_string());
+            for entry in &self.lsp_entries { lines.push(entry.summary_line()); }
+        }
+        if !self.encoding_stats.is_empty() {
+            lines.push(String::new());
+            lines.push(format!("Encoding: {} lossy-decoded, {} binary-skipped",
+                self.encoding_stats.lossy_decoded, self.encoding_stats.binary_skipped));
+        }
+        lines.join("\n")
+    }
 }
 
 // ── ServerHandler ───────────────────────────────────────────────────
