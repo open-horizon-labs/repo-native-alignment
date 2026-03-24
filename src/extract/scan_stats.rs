@@ -100,6 +100,10 @@ pub struct ScanStats {
 
     /// Roots that have completed all passes (`PassesComplete`).
     pub roots_complete: HashMap<String, RootCompleteStats>,
+
+    /// Per-root encoding statistics: files skipped as binary or lossy-decoded.
+    /// Populated by callers after extraction (not via the event bus).
+    pub encoding_stats: HashMap<String, crate::extract::EncodingStats>,
 }
 
 impl ScanStats {

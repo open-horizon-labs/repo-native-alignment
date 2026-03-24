@@ -76,12 +76,24 @@ impl ExtractionConsumer for ManifestConsumer {
 /// Emits: `RootExtracted` (carrying all nodes + edges for this root)
 pub struct TreeSitterConsumer {
     registry: ExtractorRegistry,
+    /// Optional handle to live scan stats — used to propagate encoding stats
+    /// (binary skipped / lossy-decoded counts) without changing the event schema.
+    scan_stats: Option<Arc<RwLock<ScanStats>>>,
 }
 
 impl TreeSitterConsumer {
     pub fn new() -> Self {
         Self {
             registry: ExtractorRegistry::with_builtins(),
+            scan_stats: None,
+        }
+    }
+
+    /// Create a consumer that also records encoding stats to shared `ScanStats`.
+    pub fn with_scan_stats(scan_stats: Arc<RwLock<ScanStats>>) -> Self {
+        Self {
+            registry: ExtractorRegistry::with_builtins(),
+            scan_stats: Some(scan_stats),
         }
     }
 }
@@ -125,7 +137,7 @@ impl ExtractionConsumer for TreeSitterConsumer {
             scan_duration: std::time::Duration::ZERO,
         };
 
-        let mut extraction = self.registry.extract_scan_result(path, &full_scan);
+        let (mut extraction, enc_stats) = self.registry.extract_scan_result_with_stats(path, &full_scan);
 
         // Stamp all nodes/edges with the root slug.
         for node in &mut extraction.nodes {
@@ -134,6 +146,15 @@ impl ExtractionConsumer for TreeSitterConsumer {
         for edge in &mut extraction.edges {
             edge.from.root = slug.clone();
             edge.to.root = slug.clone();
+        }
+
+        // Propagate encoding stats to ScanStats if we have a handle.
+        if (enc_stats.binary_skipped > 0 || enc_stats.lossy_decoded > 0)
+            && let Some(ref stats_handle) = self.scan_stats
+        {
+            if let Ok(mut stats) = stats_handle.write() {
+                stats.encoding_stats.insert(slug.clone(), enc_stats);
+            }
         }
 
         tracing::info!(
@@ -1913,7 +1934,7 @@ pub fn build_builtin_bus(
 
     // --- RootDiscovered consumers ---
     bus.register(Box::new(ManifestConsumer));
-    bus.register(Box::new(TreeSitterConsumer::new()));
+    bus.register(Box::new(TreeSitterConsumer::with_scan_stats(Arc::clone(&stats_arc))));
 
     // --- RootExtracted consumers ---
     // LanguageAccumulatorConsumer must run first (emits LanguageDetected which

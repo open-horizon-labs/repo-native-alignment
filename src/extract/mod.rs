@@ -64,12 +64,45 @@ pub mod zig;
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use rayon::prelude::*;
 
 use crate::graph::{Edge, Node};
 use crate::graph::index::GraphIndex;
+
+// ---------------------------------------------------------------------------
+// Content sniffing: distinguish binary from text-with-wrong-encoding
+// ---------------------------------------------------------------------------
+
+/// Examine the first 8 KB of a byte buffer to decide if the content is likely
+/// binary (should be skipped) or text with a non-UTF-8 encoding (should be
+/// lossy-decoded).
+///
+/// Binary heuristic:
+/// - Any null byte (`\x00`) in the sample -> binary.
+/// - More than 10% of bytes are non-text control chars (0x00-0x08, 0x0E-0x1F
+///   excluding TAB, LF, CR) -> binary.
+///
+/// Everything else is treated as (possibly wrong-encoded) text.
+fn is_binary_content(bytes: &[u8]) -> bool {
+    let sample = &bytes[..bytes.len().min(8192)];
+    if sample.is_empty() {
+        return false; // empty file is text
+    }
+    // Null bytes are a strong binary signal.
+    if sample.contains(&0x00) {
+        return true;
+    }
+    // Count non-text control bytes (exclude TAB=0x09, LF=0x0A, CR=0x0D).
+    let non_text_count = sample
+        .iter()
+        .filter(|&&b| b < 0x09 || (b > 0x0A && b < 0x0D) || (b > 0x0D && b < 0x20))
+        .count();
+    let ratio = non_text_count as f64 / sample.len() as f64;
+    ratio > 0.10
+}
 use crate::scanner::ScanResult;
 
 // ---------------------------------------------------------------------------
@@ -81,6 +114,15 @@ use crate::scanner::ScanResult;
 pub struct ExtractionResult {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
+}
+
+/// Encoding statistics from a scan, for surfacing in `list_roots`.
+#[derive(Debug, Clone, Default)]
+pub struct EncodingStats {
+    /// Files detected as binary and skipped entirely.
+    pub binary_skipped: usize,
+    /// Text files with non-UTF-8 encoding that were lossy-decoded.
+    pub lossy_decoded: usize,
 }
 
 impl ExtractionResult {
@@ -297,6 +339,12 @@ impl ExtractorRegistry {
     /// no shared mutable state — so parallelism is safe. On a 10-core machine
     /// a 500-file scan drops from ~10s to ~1s.
     ///
+    /// Files that are valid UTF-8 are extracted directly. Files that fail UTF-8
+    /// validation are content-sniffed: truly binary files (null bytes or high
+    /// control-char ratio) are skipped; text files with wrong encoding (Latin-1,
+    /// Windows-1252) are lossy-decoded with U+FFFD replacement characters so
+    /// their symbols still appear in the index.
+    ///
     /// `repo_root` is needed to construct absolute paths for reading files.
     pub fn extract_scan_result(
         &self,
@@ -316,6 +364,10 @@ impl ExtractorRegistry {
             repo_root.display()
         );
 
+        // Counters for files skipped due to encoding issues (binary or lossy-decoded).
+        let binary_skipped = AtomicUsize::new(0);
+        let lossy_decoded = AtomicUsize::new(0);
+
         // Process files in parallel. Each file is independent (no shared mutable
         // state between extractors), so rayon par_iter is safe here.
         // `filter_map` skips unreadable/binary files; `reduce` merges in parallel.
@@ -325,20 +377,41 @@ impl ExtractorRegistry {
                 let file_start = std::time::Instant::now();
                 let abs_path = repo_root.join(rel_path);
                 tracing::debug!("ExtractorRegistry: reading {}", abs_path.display());
-                let content = match std::fs::read_to_string(&abs_path) {
-                    Ok(c) => c,
+
+                // Read raw bytes instead of read_to_string so we can handle non-UTF-8.
+                let raw_bytes = match std::fs::read(&abs_path) {
+                    Ok(b) => b,
                     Err(e) => {
-                        if e.kind() == std::io::ErrorKind::InvalidData {
-                            // Binary files (invalid UTF-8) are expected to fail here.
-                            // Use debug level to avoid log spam from stale build artifacts.
-                            tracing::debug!("Skipping non-text file {}: {}", abs_path.display(), e);
-                        } else {
-                            // Real I/O errors (permission denied, etc.) deserve a warning.
-                            tracing::warn!("Failed to read {}: {}", abs_path.display(), e);
-                        }
+                        tracing::warn!("Failed to read {}: {}", abs_path.display(), e);
                         return None;
                     }
                 };
+
+                // Content-sniff first: skip truly binary files before attempting decode.
+                // This catches files with null bytes or high control-char ratios even
+                // if they happen to be valid UTF-8 byte sequences.
+                if is_binary_content(&raw_bytes) {
+                    tracing::debug!("Skipping binary file {}", abs_path.display());
+                    binary_skipped.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+
+                // Try fast-path: valid UTF-8 (vast majority of source files).
+                let content = match String::from_utf8(raw_bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // Not valid UTF-8 but not binary — lossy-decode so symbols
+                        // are still indexed (replacement char U+FFFD for bad bytes).
+                        let bytes = e.into_bytes();
+                        tracing::info!(
+                            "Lossy-decoding non-UTF-8 text file {}",
+                            abs_path.display()
+                        );
+                        lossy_decoded.fetch_add(1, Ordering::Relaxed);
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    }
+                };
+
                 let file_result = self.extract_file(rel_path, &content);
                 tracing::debug!(
                     "ExtractorRegistry: extracted {} -> {} node(s), {} edge(s) in {:?}",
@@ -354,14 +427,109 @@ impl ExtractorRegistry {
                 acc
             });
 
+        let binary_count = binary_skipped.load(Ordering::Relaxed);
+        let lossy_count = lossy_decoded.load(Ordering::Relaxed);
         tracing::info!(
-            "ExtractorRegistry: completed extraction in {:?} ({} node(s), {} edge(s))",
+            "ExtractorRegistry: completed extraction in {:?} ({} node(s), {} edge(s), {} binary skipped, {} lossy-decoded)",
             extraction_start.elapsed(),
             result.nodes.len(),
             result.edges.len(),
+            binary_count,
+            lossy_count,
         );
 
         result
+    }
+
+    /// Extract from all files in a scan result, returning both the extraction
+    /// result and encoding statistics for surfacing in `list_roots`.
+    pub fn extract_scan_result_with_stats(
+        &self,
+        repo_root: &Path,
+        scan_result: &ScanResult,
+    ) -> (ExtractionResult, EncodingStats) {
+        // Process changed + new files (not deleted ones)
+        let files_to_process: Vec<_> = scan_result
+            .changed_files
+            .iter()
+            .chain(scan_result.new_files.iter())
+            .collect();
+        let extraction_start = std::time::Instant::now();
+        tracing::info!(
+            "ExtractorRegistry: starting extraction for {} file(s) under {}",
+            files_to_process.len(),
+            repo_root.display()
+        );
+
+        let binary_skipped = AtomicUsize::new(0);
+        let lossy_decoded = AtomicUsize::new(0);
+
+        let result = files_to_process
+            .into_par_iter()
+            .filter_map(|rel_path| {
+                let file_start = std::time::Instant::now();
+                let abs_path = repo_root.join(rel_path);
+                tracing::debug!("ExtractorRegistry: reading {}", abs_path.display());
+
+                let raw_bytes = match std::fs::read(&abs_path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!("Failed to read {}: {}", abs_path.display(), e);
+                        return None;
+                    }
+                };
+
+                if is_binary_content(&raw_bytes) {
+                    tracing::debug!("Skipping binary file {}", abs_path.display());
+                    binary_skipped.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+
+                let content = match String::from_utf8(raw_bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let bytes = e.into_bytes();
+                        tracing::info!(
+                            "Lossy-decoding non-UTF-8 text file {}",
+                            abs_path.display()
+                        );
+                        lossy_decoded.fetch_add(1, Ordering::Relaxed);
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    }
+                };
+
+                let file_result = self.extract_file(rel_path, &content);
+                tracing::debug!(
+                    "ExtractorRegistry: extracted {} -> {} node(s), {} edge(s) in {:?}",
+                    rel_path.display(),
+                    file_result.nodes.len(),
+                    file_result.edges.len(),
+                    file_start.elapsed()
+                );
+                Some(file_result)
+            })
+            .reduce(ExtractionResult::default, |mut acc, r| {
+                acc.merge(r);
+                acc
+            });
+
+        let binary_count = binary_skipped.load(Ordering::Relaxed);
+        let lossy_count = lossy_decoded.load(Ordering::Relaxed);
+        tracing::info!(
+            "ExtractorRegistry: completed extraction in {:?} ({} node(s), {} edge(s), {} binary skipped, {} lossy-decoded)",
+            extraction_start.elapsed(),
+            result.nodes.len(),
+            result.edges.len(),
+            binary_count,
+            lossy_count,
+        );
+
+        let stats = EncodingStats {
+            binary_skipped: binary_count,
+            lossy_decoded: lossy_count,
+        };
+
+        (result, stats)
     }
 
     /// Number of registered extractors.
@@ -1093,5 +1261,201 @@ mod tests {
             result, client_dir.as_path(),
             "When both roots have tsconfig.json, first in list wins"
         );
+    }
+
+    // ── is_binary_content tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_is_binary_null_bytes() {
+        // Null bytes are a strong binary signal.
+        assert!(is_binary_content(b"hello\x00world"));
+        assert!(is_binary_content(b"\x00"));
+        assert!(is_binary_content(b"\xff\xfe\x00\x01"));
+    }
+
+    #[test]
+    fn test_is_binary_high_control_ratio() {
+        // >10% non-text control bytes → binary.
+        let mut data = vec![0x01u8; 200]; // all control chars
+        data.extend_from_slice(b"some text padding to make it a buffer");
+        assert!(is_binary_content(&data));
+    }
+
+    #[test]
+    fn test_is_binary_empty_is_text() {
+        assert!(!is_binary_content(b""));
+    }
+
+    #[test]
+    fn test_is_binary_valid_utf8_text() {
+        assert!(!is_binary_content(b"fn hello() {}\n"));
+        assert!(!is_binary_content("pub fn greet() -> &str { \"hello\" }\n".as_bytes()));
+    }
+
+    #[test]
+    fn test_is_binary_latin1_is_text() {
+        // Latin-1 encoded text: "caf\xe9" (cafe with accent).
+        // No null bytes, low control char ratio → should be classified as text.
+        let latin1 = b"// caf\xe9 au lait\nfn order() {}\n";
+        assert!(!is_binary_content(latin1), "Latin-1 text should not be classified as binary");
+    }
+
+    #[test]
+    fn test_is_binary_windows_1252_is_text() {
+        // Windows-1252 with smart quotes and em-dash: non-UTF-8 but clearly text.
+        let win1252 = b"// \x93smart quotes\x94 and \x97em dash\n";
+        assert!(!is_binary_content(win1252), "Windows-1252 text should not be classified as binary");
+    }
+
+    #[test]
+    fn test_is_binary_tabs_and_newlines_not_counted() {
+        // TAB (0x09), LF (0x0A), CR (0x0D) are legitimate text chars.
+        let text_with_whitespace = b"\t\tif true {\r\n\t\t\treturn\r\n\t\t}\n";
+        assert!(!is_binary_content(text_with_whitespace));
+    }
+
+    // ── Lossy decode extraction tests ──────────────────────────────────
+
+    #[test]
+    fn test_extract_lossy_decodes_latin1_file() {
+        let registry = ExtractorRegistry::with_builtins();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Write a JavaScript file with a Latin-1 encoded string (0xe9 = e-acute).
+        // This is invalid UTF-8 but valid Latin-1 text.
+        let latin1_js = b"// caf\xe9 module\nfunction greet() { return 'hello'; }\n";
+        std::fs::write(tmp.path().join("latin1.js"), latin1_js).unwrap();
+
+        let scan = ScanResult {
+            changed_files: vec![],
+            new_files: vec![PathBuf::from("latin1.js")],
+            deleted_files: vec![],
+            scan_duration: Duration::ZERO,
+        };
+
+        let result = registry.extract_scan_result(tmp.path(), &scan);
+        assert!(
+            !result.nodes.is_empty(),
+            "Latin-1 encoded file should be lossy-decoded and extracted, got 0 nodes"
+        );
+        // Verify the function was extracted
+        assert!(
+            result.nodes.iter().any(|n| n.id.name == "greet"),
+            "Should extract 'greet' function from lossy-decoded file"
+        );
+    }
+
+    #[test]
+    fn test_extract_skips_truly_binary_file() {
+        let registry = ExtractorRegistry::with_builtins();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Write a file with null bytes — should be detected as binary and skipped.
+        std::fs::write(tmp.path().join("binary.rs"), b"\xff\xfe\x00\x01\x02\x03").unwrap();
+        // Also write a valid file to ensure extraction still works.
+        std::fs::write(tmp.path().join("valid.rs"), "pub fn ok() {}\n").unwrap();
+
+        let scan = ScanResult {
+            changed_files: vec![],
+            new_files: vec![PathBuf::from("binary.rs"), PathBuf::from("valid.rs")],
+            deleted_files: vec![],
+            scan_duration: Duration::ZERO,
+        };
+
+        let result = registry.extract_scan_result(tmp.path(), &scan);
+        // Binary file should be skipped, valid file should be extracted.
+        assert!(
+            result.nodes.iter().any(|n| n.id.name == "ok"),
+            "Valid file should still be extracted alongside binary file"
+        );
+    }
+
+    #[test]
+    fn test_extract_with_stats_returns_encoding_counts() {
+        let registry = ExtractorRegistry::with_builtins();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Latin-1 file (lossy-decoded)
+        std::fs::write(
+            tmp.path().join("latin1.js"),
+            b"// caf\xe9\nfunction greet() {}\n",
+        ).unwrap();
+        // Binary file (null bytes)
+        std::fs::write(
+            tmp.path().join("binary.rs"),
+            b"\x00\x01\x02\x03",
+        ).unwrap();
+        // Valid UTF-8 file
+        std::fs::write(
+            tmp.path().join("valid.rs"),
+            "pub fn valid() {}\n",
+        ).unwrap();
+
+        let scan = ScanResult {
+            changed_files: vec![],
+            new_files: vec![
+                PathBuf::from("latin1.js"),
+                PathBuf::from("binary.rs"),
+                PathBuf::from("valid.rs"),
+            ],
+            deleted_files: vec![],
+            scan_duration: Duration::ZERO,
+        };
+
+        let (result, stats) = registry.extract_scan_result_with_stats(tmp.path(), &scan);
+        assert!(!result.nodes.is_empty(), "Should have nodes from valid + lossy files");
+        assert_eq!(stats.binary_skipped, 1, "Should skip 1 binary file");
+        assert_eq!(stats.lossy_decoded, 1, "Should lossy-decode 1 Latin-1 file");
+    }
+
+    #[test]
+    fn test_extract_utf8_bom_file() {
+        let registry = ExtractorRegistry::with_builtins();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // UTF-8 BOM prefix (EF BB BF) followed by valid UTF-8 content.
+        let bom_content = b"\xef\xbb\xbfpub fn bom_fn() {}\n";
+        std::fs::write(tmp.path().join("bom.rs"), bom_content).unwrap();
+
+        let scan = ScanResult {
+            changed_files: vec![],
+            new_files: vec![PathBuf::from("bom.rs")],
+            deleted_files: vec![],
+            scan_duration: Duration::ZERO,
+        };
+
+        let (result, stats) = registry.extract_scan_result_with_stats(tmp.path(), &scan);
+        // BOM-prefixed UTF-8 is still valid UTF-8, should be extracted normally.
+        assert!(
+            !result.nodes.is_empty(),
+            "UTF-8 BOM file should be extracted"
+        );
+        assert_eq!(stats.binary_skipped, 0);
+        assert_eq!(stats.lossy_decoded, 0, "BOM-prefixed UTF-8 is valid, should not be lossy-decoded");
+    }
+
+    #[test]
+    fn test_extract_mixed_encoding_file() {
+        let registry = ExtractorRegistry::with_builtins();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Valid UTF-8 with one 0xFF byte at end (common in Windows-1252 codebases).
+        let content = b"def valid_fn():\n    return 42\n# comment \xff\n".to_vec();
+        std::fs::write(tmp.path().join("mixed.py"), &content).unwrap();
+
+        let scan = ScanResult {
+            changed_files: vec![],
+            new_files: vec![PathBuf::from("mixed.py")],
+            deleted_files: vec![],
+            scan_duration: Duration::ZERO,
+        };
+
+        let (result, stats) = registry.extract_scan_result_with_stats(tmp.path(), &scan);
+        assert!(
+            result.nodes.iter().any(|n| n.id.name == "valid_fn"),
+            "Function should be extracted from mixed-encoding file"
+        );
+        assert_eq!(stats.lossy_decoded, 1, "Mixed encoding should be lossy-decoded");
+        assert_eq!(stats.binary_skipped, 0);
     }
 }
