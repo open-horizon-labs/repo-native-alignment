@@ -1073,9 +1073,12 @@ impl RnaHandler {
             return Ok(PipelineResult {
                 node_count: total_node_count,
                 edge_count: total_edge_count,
+                file_count: 0,
                 lsp_edge_count,
                 embed_count: 0,
                 total_time,
+                lsp_entries: vec![],
+                encoding_stats: crate::extract::EncodingStats::default(),
             });
         }
 
@@ -1170,6 +1173,7 @@ impl RnaHandler {
             .await;
         let lsp_time = t2.elapsed();
 
+        let incr_lsp_entries = enrichment.lsp_entries;
         let lsp_edge_count;
         if !enrichment.any_enricher_ran {
             if has_supported_language {
@@ -1253,23 +1257,24 @@ impl RnaHandler {
         scanner.commit_state()?;
 
         // Phase 5: Summary.
-        let (total_node_count, total_edge_count) = {
+        let (total_node_count, total_edge_count, file_count) = {
             let guard = self.graph.read().await;
             let gs = guard.as_ref().unwrap();
-            (gs.nodes.len(), gs.edges.len())
+            let fc = gs.nodes.iter().map(|n| n.id.file.to_string_lossy().to_string()).collect::<std::collections::HashSet<_>>().len();
+            (gs.nodes.len(), gs.edges.len(), fc)
         };
-
+        let encoding_stats = {
+            let ss = self.scan_stats.read().unwrap_or_else(|e| e.into_inner());
+            let mut agg = crate::extract::EncodingStats::default();
+            for es in ss.encoding_stats.values() { agg.merge(es); }
+            agg
+        };
         let total_time = pipeline_start.elapsed();
-        on_progress(&format!("Graph: {} nodes, {} edges", total_node_count, total_edge_count));
-        on_progress(&format!("Done in {:.1}s (incremental)", total_time.as_secs_f64()));
-
-        Ok(PipelineResult {
-            node_count: total_node_count,
-            edge_count: total_edge_count,
-            lsp_edge_count,
-            embed_count: 0, // re-embed handled by update_graph_with_scan
-            total_time,
-        })
+        let result = PipelineResult { node_count: total_node_count, edge_count: total_edge_count,
+            file_count, lsp_edge_count, embed_count: 0, total_time,
+            lsp_entries: incr_lsp_entries, encoding_stats };
+        on_progress(&result.format_summary());
+        Ok(result)
     }
 
     /// Full rebuild foreground pipeline (no cache available).
@@ -1383,6 +1388,7 @@ impl RnaHandler {
             embed_time.as_secs_f64(),
         ));
 
+        let full_lsp_entries = enrichment.lsp_entries;
         let lsp_edge_count;
 
         if !enrichment.any_enricher_ran {
@@ -1466,22 +1472,18 @@ impl RnaHandler {
             let guard = self.graph.read().await;
             guard.as_ref().map(|gs| gs.edges.len()).unwrap_or(graph_state.edges.len())
         };
-
+        let encoding_stats = {
+            let ss = self.scan_stats.read().unwrap_or_else(|e| e.into_inner());
+            let mut agg = crate::extract::EncodingStats::default();
+            for es in ss.encoding_stats.values() { agg.merge(es); }
+            agg
+        };
         let total_time = pipeline_start.elapsed();
-        on_progress(&format!(
-            "Graph: {} nodes, {} edges",
-            total_node_count,
-            total_edge_count,
-        ));
-        on_progress(&format!("Done in {:.1}s", total_time.as_secs_f64()));
-
-        Ok(PipelineResult {
-            node_count: total_node_count,
-            edge_count: total_edge_count,
-            lsp_edge_count,
-            embed_count,
-            total_time,
-        })
+        let result = PipelineResult { node_count: total_node_count, edge_count: total_edge_count,
+            file_count, lsp_edge_count, embed_count, total_time,
+            lsp_entries: full_lsp_entries, encoding_stats };
+        on_progress(&result.format_summary());
+        Ok(result)
     }
 
     /// Run LSP enrichment on the full graph synchronously and persist.

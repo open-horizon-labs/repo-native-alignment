@@ -41,11 +41,67 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
 use crate::extract::event_bus::{ExtractionConsumer, ExtractionEvent, ExtractionEventKind};
+
+
+// ---------------------------------------------------------------------------
+// Per-language LSP enrichment stats  (#575)
+// ---------------------------------------------------------------------------
+
+/// Status of a per-language LSP enrichment attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LspStatus { Ok, Aborted, NotFound, Failed }
+
+impl std::fmt::Display for LspStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LspStatus::Ok => write!(f, "OK"),
+            LspStatus::Aborted => write!(f, "ABORTED"),
+            LspStatus::NotFound => write!(f, "not found"),
+            LspStatus::Failed => write!(f, "FAILED"),
+        }
+    }
+}
+
+/// Per-language LSP enrichment statistics for the scan summary.
+#[derive(Debug, Clone)]
+pub struct LspEnrichmentEntry {
+    pub language: String,
+    pub server_name: String,
+    pub root_hint: Option<String>,
+    pub edge_count: usize,
+    pub node_count: usize,
+    pub error_count: usize,
+    pub duration: Duration,
+    pub status: LspStatus,
+}
+
+impl LspEnrichmentEntry {
+    /// Render a single line for the scan summary.
+    pub fn summary_line(&self) -> String {
+        let root_part = if let Some(ref root) = self.root_hint {
+            format!(" -> {}/", root)
+        } else { String::new() };
+        let label = format!("  {} ({}){}", self.language, self.server_name, root_part);
+        match self.status {
+            LspStatus::NotFound => format!("{:<50} {}", label, self.status),
+            LspStatus::Ok => {
+                let mut line = format!("{:<50} {} ({} edges, {} nodes, {:.1}s)",
+                    label, self.status, self.edge_count, self.node_count, self.duration.as_secs_f64());
+                if self.edge_count == 0 { line.push_str(" -- no edges"); }
+                line
+            }
+            LspStatus::Aborted | LspStatus::Failed => {
+                format!("{:<50} {} ({} edges, {} errors, {:.1}s)",
+                    label, self.status, self.edge_count, self.error_count, self.duration.as_secs_f64())
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -549,5 +605,24 @@ mod tests {
         assert!(stats.roots_complete.contains_key("api"));
         // has_activity is still false (roots_queued == 0)
         assert!(!stats.has_activity(), "roots_queued not incremented — no RootDiscovered fired");
+    }
+
+    #[test]
+    fn test_lsp_entry_summary_ok() {
+        let e = LspEnrichmentEntry { language: "rust".into(), server_name: "rust-analyzer".into(),
+            root_hint: None, edge_count: 150, node_count: 42, error_count: 0,
+            duration: Duration::from_secs_f64(3.5), status: LspStatus::Ok };
+        let l = e.summary_line();
+        assert!(l.contains("rust (rust-analyzer)"));
+        assert!(l.contains("OK"));
+        assert!(l.contains("150 edges"));
+    }
+
+    #[test]
+    fn test_lsp_entry_summary_not_found() {
+        let e = LspEnrichmentEntry { language: "json".into(), server_name: "vscode-json-ls".into(),
+            root_hint: None, edge_count: 0, node_count: 0, error_count: 0,
+            duration: Duration::from_millis(5), status: LspStatus::NotFound };
+        assert!(e.summary_line().contains("not found"));
     }
 }
