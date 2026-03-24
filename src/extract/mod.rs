@@ -198,6 +198,8 @@ pub struct EnrichmentResult {
     /// When false, all matching enrichers were skipped (server not on PATH, init failed, etc.).
     /// Callers use this to distinguish "no server available" from "server ran, found nothing."
     pub any_enricher_ran: bool,
+    /// Per-language LSP enrichment stats for the scan summary.
+    pub lsp_entries: Vec<scan_stats::LspEnrichmentEntry>,
 }
 
 /// Phase 2: Asynchronous enrichment after initial extraction.
@@ -724,41 +726,41 @@ impl EnricherRegistry {
                 continue; // silently skip — too many servers to log each one
             }
 
-            // Configure the LSP server startup working directory if lsp_roots are available.
-            // This is a one-time operation (OnceLock, first call wins) that sets the
-            // working directory for the language server startup (current_dir + rootUri).
-            // It must be called BEFORE the first enrich() so ensure_initialized picks it up.
-            //
-            // Only set if we found a more-specific root than the primary root.
-            if !lsp_roots.is_empty() {
-                let best = pick_lsp_root_for_nodes(
-                    nodes,
-                    repo_root,
-                    lsp_roots,
-                    enricher.config_file_hint(),
-                );
+            let lang = enricher.languages().first().copied().unwrap_or("unknown").to_string();
+            let server = enricher.name().to_string();
+            let root_hint = if !lsp_roots.is_empty() {
+                let best = pick_lsp_root_for_nodes(nodes, repo_root, lsp_roots, enricher.config_file_hint());
                 if best != repo_root {
                     enricher.set_startup_root(best.to_path_buf());
-                }
-            }
-
+                    best.strip_prefix(repo_root).ok().map(|p| p.display().to_string())
+                } else { None }
+            } else { None };
+            let t_enricher = std::time::Instant::now();
             match enricher.enrich(nodes, index, repo_root).await {
                 Ok(enrichment) => {
-                    // If enrich() returned Ok, the server was available and ran.
+                    let dur = t_enricher.elapsed();
                     result.any_enricher_ran = true;
-                    tracing::info!(
-                        "Enricher {}: {} edges, {} node patches, {} virtual nodes",
-                        enricher.name(),
-                        enrichment.added_edges.len(),
-                        enrichment.updated_nodes.len(),
-                        enrichment.new_nodes.len(),
-                    );
+                    tracing::info!("Enricher {}: {} edges, {} node patches, {} virtual nodes",
+                        enricher.name(), enrichment.added_edges.len(), enrichment.updated_nodes.len(), enrichment.new_nodes.len());
+                    let edge_count = enrichment.added_edges.len();
+                    let node_count = enrichment.new_nodes.len();
                     result.added_edges.extend(enrichment.added_edges);
                     result.updated_nodes.extend(enrichment.updated_nodes);
                     result.new_nodes.extend(enrichment.new_nodes);
+                    result.lsp_entries.push(scan_stats::LspEnrichmentEntry {
+                        language: lang, server_name: server, root_hint, edge_count, node_count,
+                        error_count: 0, duration: dur, status: scan_stats::LspStatus::Ok });
                 }
                 Err(e) => {
+                    let dur = t_enricher.elapsed();
                     tracing::warn!("Enricher {} failed: {}", enricher.name(), e);
+                    let err_msg = e.to_string();
+                    let status = if err_msg.contains("not found") || err_msg.contains("No such file") || err_msg.contains("command not found") { scan_stats::LspStatus::NotFound }
+                        else if err_msg.contains("abort") || err_msg.contains("zero-edge") { scan_stats::LspStatus::Aborted }
+                        else { scan_stats::LspStatus::Failed };
+                    result.lsp_entries.push(scan_stats::LspEnrichmentEntry {
+                        language: lang, server_name: server, root_hint, edge_count: 0, node_count: 0,
+                        error_count: 1, duration: dur, status });
                 }
             }
         }
