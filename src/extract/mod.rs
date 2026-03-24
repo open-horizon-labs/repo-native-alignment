@@ -198,7 +198,14 @@ pub struct EnrichmentResult {
     /// When false, all matching enrichers were skipped (server not on PATH, init failed, etc.).
     /// Callers use this to distinguish "no server available" from "server ran, found nothing."
     pub any_enricher_ran: bool,
+    /// Number of LSP request errors encountered during enrichment.
+    /// Set by individual enrichers; used by `LspConsumer` to propagate to `EnrichmentComplete`.
+    pub error_count: usize,
+    /// Whether enrichment was aborted early (e.g., zero-edge threshold, timeout).
+    /// Set by individual enrichers; used by `LspConsumer` to propagate to `EnrichmentComplete`.
+    pub aborted: bool,
     /// Per-language LSP enrichment stats for the scan summary.
+    /// Populated by `enrich_all()` from individual enricher results.
     pub lsp_entries: Vec<scan_stats::LspEnrichmentEntry>,
 }
 
@@ -744,12 +751,15 @@ impl EnricherRegistry {
                         enricher.name(), enrichment.added_edges.len(), enrichment.updated_nodes.len(), enrichment.new_nodes.len());
                     let edge_count = enrichment.added_edges.len();
                     let node_count = enrichment.new_nodes.len();
+                    let error_count = enrichment.error_count;
+                    let status = if enrichment.aborted { scan_stats::LspStatus::Aborted }
+                        else { scan_stats::LspStatus::Ok };
                     result.added_edges.extend(enrichment.added_edges);
                     result.updated_nodes.extend(enrichment.updated_nodes);
                     result.new_nodes.extend(enrichment.new_nodes);
                     result.lsp_entries.push(scan_stats::LspEnrichmentEntry {
                         language: lang, server_name: server, root_hint, edge_count, node_count,
-                        error_count: 0, duration: dur, status: scan_stats::LspStatus::Ok });
+                        error_count, duration: dur, status });
                 }
                 Err(e) => {
                     let dur = t_enricher.elapsed();

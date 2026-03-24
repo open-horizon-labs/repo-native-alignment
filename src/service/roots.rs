@@ -177,10 +177,38 @@ pub fn list_roots_from_slugs(
                     format_count(edge_count)));
             }
 
-            // LSP working line.
-            if lsp_complete
+            // Per-language LSP stats from ScanStats (preferred over global LspEnrichmentStatus).
+            let has_per_lang_lsp = if let Some(stats) = scan_stats
+                && let Some(root_lsp) = stats.lsp_stats.get(&r.slug)
+                && !root_lsp.is_empty()
+            {
+                // Sort by language for deterministic output.
+                let mut langs: Vec<_> = root_lsp.iter().collect();
+                langs.sort_by_key(|(lang, _)| (*lang).clone());
+                for (lang, ls) in &langs {
+                    let duration_str = format_duration(ls.duration);
+                    let mut detail_parts: Vec<String> = Vec::new();
+                    detail_parts.push(format!("{} edges", format_count(ls.edge_count)));
+                    if ls.node_count > 0 {
+                        detail_parts.push(format!("{} nodes", format_count(ls.node_count)));
+                    }
+                    detail_parts.push(duration_str);
+                    if ls.error_count > 0 {
+                        detail_parts.push(format!("{} errors", ls.error_count));
+                    }
+                    if ls.aborted {
+                        detail_parts.push("aborted".to_string());
+                    }
+                    line.push_str(&format!("\n  LSP: {} -> {} ({})",
+                        ls.server_name, lang, detail_parts.join(", ")));
+                }
+                true
+            } else {
+                false
+            };
+            // Fallback to global LSP status when per-language stats are not available.
+            if !has_per_lang_lsp && lsp_complete
                 && let Some(ref name) = lsp_server_name {
-                    // edge_count() returns all LSP-enriched edges (Calls, ReferencedBy, Implements, etc.)
                     line.push_str(&format!("\n  LSP: {} ({} edges)",
                         name, format_count(lsp_edge_count)));
                 }
@@ -253,6 +281,24 @@ fn lsp_server_relevant_for_languages(server: &str, languages: &std::collections:
         _ => &[],
     };
     relevant_langs.iter().any(|lang| languages.contains(*lang))
+}
+
+/// Format a duration as a human-readable string (e.g., "1.2s", "3m 45s").
+fn format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs == 0 {
+        format!("{:.0}ms", d.as_millis())
+    } else if secs < 60 {
+        format!("{}s", secs)
+    } else {
+        let mins = secs / 60;
+        let remaining = secs % 60;
+        if remaining == 0 {
+            format!("{}m", mins)
+        } else {
+            format!("{}m {}s", mins, remaining)
+        }
+    }
 }
 
 /// Format a count with comma thousands separators.
@@ -851,5 +897,156 @@ mod tests {
         let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None, Some(&stats));
         assert!(result.contains("2 lossy-decoded"), "should show lossy count, got: {}", result);
         assert!(!result.contains("binary skipped"), "should not show binary skipped when 0, got: {}", result);
+    }
+
+    // ── format_duration tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_format_duration_millis() {
+        assert_eq!(format_duration(std::time::Duration::from_millis(500)), "500ms");
+    }
+
+    #[test]
+    fn test_format_duration_seconds() {
+        assert_eq!(format_duration(std::time::Duration::from_secs(42)), "42s");
+    }
+
+    #[test]
+    fn test_format_duration_minutes() {
+        assert_eq!(format_duration(std::time::Duration::from_secs(125)), "2m 5s");
+    }
+
+    #[test]
+    fn test_format_duration_exact_minutes() {
+        assert_eq!(format_duration(std::time::Duration::from_secs(120)), "2m");
+    }
+
+    // ── Per-language LSP stats in list_roots tests ───────────────────
+
+    #[test]
+    fn test_list_roots_from_slugs_lsp_stats_per_language() {
+        use crate::extract::scan_stats::LspLanguageStats;
+
+        let repo = std::env::current_dir().unwrap();
+        let workspace = crate::roots::WorkspaceConfig::load()
+            .with_primary_root(repo.clone())
+            .with_worktrees(&repo)
+            .with_claude_memory(&repo)
+            .with_agent_memories(&repo)
+            .with_declared_roots(&repo);
+        let resolved = workspace.resolved_roots();
+        if resolved.is_empty() { return; }
+
+        let primary_slug = resolved[0].slug.clone();
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert(primary_slug.clone());
+
+        let nodes = vec![make_node_for_root(&primary_slug, "rust")];
+        let gs = make_test_graph_state(nodes, vec![]);
+
+        let mut stats = ScanStats::default();
+        let mut root_lsp = std::collections::HashMap::new();
+        root_lsp.insert("rust".to_string(), LspLanguageStats {
+            server_name: "rust-analyzer".to_string(),
+            edge_count: 703,
+            node_count: 150,
+            duration: std::time::Duration::from_secs(45),
+            error_count: 0,
+            aborted: false,
+        });
+        stats.lsp_stats.insert(primary_slug.clone(), root_lsp);
+
+        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None, Some(&stats));
+        assert!(result.contains("LSP: rust-analyzer -> rust"), "should show per-language LSP line, got: {}", result);
+        assert!(result.contains("703 edges"), "should show edge count, got: {}", result);
+        assert!(result.contains("150 nodes"), "should show node count, got: {}", result);
+        assert!(result.contains("45s"), "should show duration, got: {}", result);
+        assert!(!result.contains("errors"), "should not show errors when 0, got: {}", result);
+        assert!(!result.contains("aborted"), "should not show aborted when false, got: {}", result);
+    }
+
+    #[test]
+    fn test_list_roots_from_slugs_lsp_stats_aborted() {
+        use crate::extract::scan_stats::LspLanguageStats;
+
+        let repo = std::env::current_dir().unwrap();
+        let workspace = crate::roots::WorkspaceConfig::load()
+            .with_primary_root(repo.clone())
+            .with_worktrees(&repo)
+            .with_claude_memory(&repo)
+            .with_agent_memories(&repo)
+            .with_declared_roots(&repo);
+        let resolved = workspace.resolved_roots();
+        if resolved.is_empty() { return; }
+
+        let primary_slug = resolved[0].slug.clone();
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert(primary_slug.clone());
+
+        let nodes = vec![make_node_for_root(&primary_slug, "python")];
+        let gs = make_test_graph_state(nodes, vec![]);
+
+        let mut stats = ScanStats::default();
+        let mut root_lsp = std::collections::HashMap::new();
+        root_lsp.insert("python".to_string(), LspLanguageStats {
+            server_name: "pyright-langserver".to_string(),
+            edge_count: 0,
+            node_count: 0,
+            duration: std::time::Duration::from_secs(120),
+            error_count: 13,
+            aborted: true,
+        });
+        stats.lsp_stats.insert(primary_slug.clone(), root_lsp);
+
+        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None, Some(&stats));
+        assert!(result.contains("LSP: pyright-langserver -> python"), "should show server name, got: {}", result);
+        assert!(result.contains("0 edges"), "should show 0 edges, got: {}", result);
+        assert!(result.contains("13 errors"), "should show error count, got: {}", result);
+        assert!(result.contains("aborted"), "should show aborted flag, got: {}", result);
+        assert!(result.contains("2m"), "should show duration, got: {}", result);
+    }
+
+    #[test]
+    fn test_list_roots_from_slugs_lsp_stats_takes_priority_over_global() {
+        use crate::extract::scan_stats::LspLanguageStats;
+
+        let repo = std::env::current_dir().unwrap();
+        let workspace = crate::roots::WorkspaceConfig::load()
+            .with_primary_root(repo.clone())
+            .with_worktrees(&repo)
+            .with_claude_memory(&repo)
+            .with_agent_memories(&repo)
+            .with_declared_roots(&repo);
+        let resolved = workspace.resolved_roots();
+        if resolved.is_empty() { return; }
+
+        let primary_slug = resolved[0].slug.clone();
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert(primary_slug.clone());
+
+        let nodes = vec![make_node_for_root(&primary_slug, "rust")];
+        let gs = make_test_graph_state(nodes, vec![]);
+
+        // Set up both per-language stats AND global LspEnrichmentStatus.
+        let mut stats = ScanStats::default();
+        let mut root_lsp = std::collections::HashMap::new();
+        root_lsp.insert("rust".to_string(), LspLanguageStats {
+            server_name: "rust-analyzer".to_string(),
+            edge_count: 500,
+            node_count: 0,
+            duration: std::time::Duration::from_secs(10),
+            error_count: 0,
+            aborted: false,
+        });
+        stats.lsp_stats.insert(primary_slug.clone(), root_lsp);
+
+        let lsp = crate::server::state::LspEnrichmentStatus::default();
+        lsp.set_server_name("rust-analyzer");
+        lsp.set_complete(9999);
+
+        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), Some(&lsp), Some(&stats));
+        // Per-language stats should show 500 edges, NOT the global 9999.
+        assert!(result.contains("500 edges"), "per-language stats should take priority, got: {}", result);
+        assert!(!result.contains("9,999"), "global LSP should not show when per-language available, got: {}", result);
     }
 }

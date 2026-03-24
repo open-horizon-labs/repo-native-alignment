@@ -113,6 +113,12 @@ pub enum ExtractionEvent {
         /// Metadata patches for existing nodes: (node_stable_id, key-value patches).
         /// Applied to base tree-sitter nodes before post-extraction passes run.
         updated_nodes: Arc<[(String, std::collections::BTreeMap<String, String>)]>,
+        /// LSP server binary name (e.g., "rust-analyzer"). `None` for non-LSP enrichers.
+        server_name: Option<String>,
+        /// Number of errors encountered during enrichment (e.g., LSP request failures).
+        error_count: usize,
+        /// Whether enrichment was aborted early (e.g., error threshold exceeded).
+        aborted: bool,
     },
 
     /// A framework has been detected during post-extraction passes.
@@ -307,7 +313,7 @@ impl ExtractionEvent {
                     buf.extend_from_slice(id.as_bytes());
                 }
             }
-            ExtractionEvent::EnrichmentComplete { slug, language, added_edges, new_nodes, updated_nodes } => {
+            ExtractionEvent::EnrichmentComplete { slug, language, added_edges, new_nodes, updated_nodes, .. } => {
                 buf.extend_from_slice(slug.as_bytes());
                 buf.push(b'\t');
                 buf.extend_from_slice(language.as_bytes());
@@ -1198,6 +1204,9 @@ mod tests {
                 added_edges: Arc::from(vec![].into_boxed_slice()),
                 new_nodes: Arc::from(vec![].into_boxed_slice()),
                 updated_nodes: Arc::from(vec![("node::foo".to_string(), patch)].into_boxed_slice()),
+                server_name: None,
+                error_count: 0,
+                aborted: false,
             }
         };
 

@@ -2294,6 +2294,7 @@ impl Enricher for LspEnricher {
         // Collect results from all concurrent tasks
         let mut attempted = 0u32;
         let mut errors = 0u32;
+        let mut aborted = false;
         let mut seen_virtual_ids = std::collections::HashSet::new();
         let total_nodes = enrichable_nodes.len();
         let mut last_progress_log = std::time::Instant::now();
@@ -2363,6 +2364,7 @@ impl Enricher for LspEnricher {
                     "LSP: {} produced 0 edges after {}/{} nodes ({:.1}s) — aborting (likely misconfigured)",
                     self.server_command, attempted, total_nodes, pass1_start.elapsed().as_secs_f64(),
                 );
+                aborted = true;
                 join_set.abort_all();
                 break;
             }
@@ -2460,6 +2462,7 @@ impl Enricher for LspEnricher {
                         "LSP: {} type hierarchy produced 0 edges after {}/{} nodes ({:.1}s) — aborting (likely misconfigured)",
                         self.server_command, pass2_done, pass2_total, pass2_start.elapsed().as_secs_f64(),
                     );
+                    aborted = true;
                     break;
                 }
 
@@ -2756,14 +2759,17 @@ impl Enricher for LspEnricher {
             .filter(|n| matches!(&n.id.kind, NodeKind::Other(s) if s == "diagnostic"))
             .count();
         tracing::info!(
-            "LSP enrichment complete for {}: {} edges, {} diagnostic nodes ({} attempted, {} errors)",
+            "LSP enrichment complete for {}: {} edges, {} diagnostic nodes ({} attempted, {} errors{})",
             self.language,
             result.added_edges.len(),
             diag_count,
             attempted,
             errors,
+            if aborted { ", aborted" } else { "" },
         );
 
+        result.error_count = errors as usize;
+        result.aborted = aborted;
         Ok(result)
     }
 }
