@@ -198,6 +198,11 @@ pub struct EnrichmentResult {
     /// When false, all matching enrichers were skipped (server not on PATH, init failed, etc.).
     /// Callers use this to distinguish "no server available" from "server ran, found nothing."
     pub any_enricher_ran: bool,
+    /// Number of LSP request errors encountered during enrichment.
+    /// Used by `ScanStatsConsumer` to report per-language error rates in `list_roots`.
+    pub error_count: usize,
+    /// Whether enrichment was aborted early (e.g., zero-edge threshold, timeout).
+    pub aborted: bool,
 }
 
 /// Phase 2: Asynchronous enrichment after initial extraction.

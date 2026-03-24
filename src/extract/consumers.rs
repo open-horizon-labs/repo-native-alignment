@@ -1274,6 +1274,9 @@ impl ExtractionConsumer for LspConsumer {
                     added_edges: Arc::from(enrichment.added_edges.into_boxed_slice()),
                     new_nodes: Arc::from(enrichment.new_nodes.into_boxed_slice()),
                     updated_nodes: Arc::from(enrichment.updated_nodes.into_boxed_slice()),
+                    server_name: Some(self.enricher.name().to_string()),
+                    error_count: enrichment.error_count,
+                    aborted: enrichment.aborted,
                 }])
             }
             Err(e) => {
@@ -1292,6 +1295,9 @@ impl ExtractionConsumer for LspConsumer {
                     added_edges: Arc::from([]),
                     new_nodes: Arc::from([]),
                     updated_nodes: Arc::from([]),
+                    server_name: Some(self.enricher.name().to_string()),
+                    error_count: 0,
+                    aborted: false,
                 }])
             }
         }
@@ -2837,6 +2843,9 @@ mod tests {
             added_edges: std::sync::Arc::from([]),
             new_nodes: std::sync::Arc::from([]),
             updated_nodes: std::sync::Arc::from([]),
+            server_name: None,
+            error_count: 0,
+            aborted: false,
         };
         let result = gate.on_event(&enrichment_done).await.unwrap();
         assert_eq!(result.len(), 1, "Gate must emit AllEnrichmentsDone after all enrichments");
@@ -2905,6 +2914,9 @@ mod tests {
             added_edges: std::sync::Arc::from([]),
             new_nodes: std::sync::Arc::from([]),
             updated_nodes: std::sync::Arc::from([]),
+            server_name: None,
+            error_count: 0,
+            aborted: false,
         };
         let result = gate.on_event(&enrichment_done).await.unwrap();
         // Should fire now: expected=1 (rust), received=1 (rust).
@@ -2971,6 +2983,9 @@ mod tests {
             added_edges: std::sync::Arc::from([]),
             new_nodes: std::sync::Arc::from([]),
             updated_nodes: std::sync::Arc::from([]),
+            server_name: None,
+            error_count: 0,
+            aborted: false,
         };
         let result = gate.on_event(&rust_done).await.unwrap();
         assert!(result.is_empty(), "Gate must wait for python too when dirty_slugs is empty");
@@ -2982,6 +2997,9 @@ mod tests {
             added_edges: std::sync::Arc::from([]),
             new_nodes: std::sync::Arc::from([]),
             updated_nodes: std::sync::Arc::from([]),
+            server_name: None,
+            error_count: 0,
+            aborted: false,
         };
         let result = gate.on_event(&python_done).await.unwrap();
         assert_eq!(result.len(), 1, "Gate must fire after all dirty-root enrichments complete");
