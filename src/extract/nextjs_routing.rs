@@ -126,31 +126,34 @@ fn scan_root(root_slug: &str, root_path: &Path, existing_nodes: &[Node]) -> Next
         // Normalise path separators to '/' for cross-platform matching.
         let rel_forward: String = rel_str.replace('\\', "/");
 
-        // Strip optional leading "src/" for path derivation (the stripped form
-        // is used for both detection AND HTTP path derivation, but the original
-        // rel_path is used as the NodeId file path so the node matches tree-sitter
-        // extracted nodes which use the original relative path).
-        let rel_for_matching = rel_forward.strip_prefix("src/").unwrap_or(&rel_forward);
-
-        if is_app_router_route(&rel_forward) {
-            process_app_router_file(
-                root_slug,
-                root_path,
-                rel_path,
-                rel_for_matching,
-                abs_path,
-                &fn_index,
-                &mut result,
-            );
-        } else if is_pages_router_route(&rel_forward) {
-            process_pages_router_file(
-                root_slug,
-                rel_path,
-                rel_for_matching,
-                abs_path,
-                &fn_index,
-                &mut result,
-            );
+        // Try to find an App Router or Pages Router route pattern anywhere in
+        // the path. In a monorepo, the file may be at a nested prefix like
+        // `client/src/app/api/payments/route.ts`. `find_app_router_suffix`
+        // returns the portion starting at `app/` (stripping any monorepo
+        // prefix), which is then passed to the path derivation functions.
+        if let Some(app_suffix) = find_app_router_suffix(&rel_forward) {
+            if is_app_router_route_inner(app_suffix) {
+                process_app_router_file(
+                    root_slug,
+                    root_path,
+                    rel_path,
+                    app_suffix,
+                    abs_path,
+                    &fn_index,
+                    &mut result,
+                );
+            }
+        } else if let Some(pages_suffix) = find_pages_router_suffix(&rel_forward) {
+            if is_pages_router_route_inner(pages_suffix) {
+                process_pages_router_file(
+                    root_slug,
+                    rel_path,
+                    pages_suffix,
+                    abs_path,
+                    &fn_index,
+                    &mut result,
+                );
+            }
         }
     });
 
@@ -161,13 +164,58 @@ fn scan_root(root_slug: &str, root_path: &Path, existing_nodes: &[Node]) -> Next
 // Route pattern detection
 // ---------------------------------------------------------------------------
 
-/// Returns `true` if the relative path looks like a Next.js App Router API
-/// route: `app/api/**/route.{ts,tsx,js,jsx}` (or `src/app/api/…`).
-fn is_app_router_route(rel: &str) -> bool {
-    // Strip optional leading "src/" prefix (common Next.js layout)
-    let rel = rel.strip_prefix("src/").unwrap_or(rel);
+/// Find the `app/`-rooted suffix within a relative path that may have a
+/// monorepo prefix.
+///
+/// In a single-root repo the path is already `app/api/…` or `src/app/api/…`.
+/// In a monorepo it may be `client/src/app/api/…` or `packages/web/app/api/…`.
+/// This function returns the portion starting at `app/` (inclusive).
+///
+/// Returns `None` if the path does not contain an `app/` segment.
+fn find_app_router_suffix(rel: &str) -> Option<&str> {
+    // Try exact start first (no monorepo prefix)
+    if rel.starts_with("app/") {
+        return Some(rel);
+    }
+    if rel.starts_with("src/app/") {
+        return Some(&rel[4..]); // strip "src/"
+    }
+    // Look for "/app/" or "/src/app/" within the path (monorepo prefix)
+    if let Some(idx) = rel.find("/app/") {
+        return Some(&rel[idx + 1..]); // strip prefix up to and including "/"
+    }
+    if let Some(idx) = rel.find("/src/app/") {
+        return Some(&rel[idx + 5..]); // strip prefix and "src/"
+    }
+    None
+}
 
-    // Must be inside app/api/ and the filename must be route.{ts,tsx,js,jsx}
+/// Find the `pages/`-rooted suffix within a relative path that may have a
+/// monorepo prefix.
+///
+/// Analogous to `find_app_router_suffix` but for the Pages Router convention.
+fn find_pages_router_suffix(rel: &str) -> Option<&str> {
+    if rel.starts_with("pages/") {
+        return Some(rel);
+    }
+    if rel.starts_with("src/pages/") {
+        return Some(&rel[4..]); // strip "src/"
+    }
+    if let Some(idx) = rel.find("/pages/") {
+        return Some(&rel[idx + 1..]);
+    }
+    if let Some(idx) = rel.find("/src/pages/") {
+        return Some(&rel[idx + 5..]);
+    }
+    None
+}
+
+/// Returns `true` if a suffix (already starting at `app/`) looks like a
+/// Next.js App Router API route: `app/api/**/route.{ts,tsx,js,jsx}`.
+///
+/// The caller must have already stripped any monorepo prefix and optional
+/// `src/` via `find_app_router_suffix`.
+fn is_app_router_route_inner(rel: &str) -> bool {
     let Some(idx) = rel.rfind('/') else { return false; };
     let filename = &rel[idx + 1..];
     let dir = &rel[..idx];
@@ -178,21 +226,30 @@ fn is_app_router_route(rel: &str) -> bool {
     ) && (dir.starts_with("app/api/") || dir == "app/api")
 }
 
-/// Returns `true` if the relative path looks like a Next.js Pages Router API
-/// route: `pages/api/**/*.{ts,tsx,js,jsx}` (or `src/pages/api/…`), excluding
-/// `_app`, `_document`, test files, and `.d.ts` declaration files.
-fn is_pages_router_route(rel: &str) -> bool {
-    // Strip optional leading "src/" prefix
-    let rel = rel.strip_prefix("src/").unwrap_or(rel);
+/// Returns `true` if the relative path looks like a Next.js App Router API
+/// route: `app/api/**/route.{ts,tsx,js,jsx}` (or `src/app/api/…`), including
+/// paths with monorepo prefixes like `client/src/app/api/…`.
+///
+/// This is a convenience wrapper used in tests; the hot path in `scan_root`
+/// calls `find_app_router_suffix` + `is_app_router_route_inner` directly.
+#[cfg(test)]
+fn is_app_router_route(rel: &str) -> bool {
+    match find_app_router_suffix(rel) {
+        Some(suffix) => is_app_router_route_inner(suffix),
+        None => false,
+    }
+}
 
+/// Returns `true` if a suffix (already starting at `pages/`) looks like a
+/// Next.js Pages Router API route: `pages/api/**/*.{ts,tsx,js,jsx}`, excluding
+/// `_app`, `_document`, test files, and `.d.ts` declaration files.
+fn is_pages_router_route_inner(rel: &str) -> bool {
     if !rel.starts_with("pages/api/") && rel != "pages/api" {
         return false;
     }
     let Some(idx) = rel.rfind('/') else { return false; };
     let filename = &rel[idx + 1..];
 
-    // Must end in .ts, .tsx, .js, or .jsx — not test files
-    // .jsx is rare for API routes but included for consistency with App Router.
     let is_api_file = filename.ends_with(".ts")
         || filename.ends_with(".tsx")
         || filename.ends_with(".js")
@@ -204,6 +261,20 @@ fn is_pages_router_route(rel: &str) -> bool {
         || filename.ends_with(".d.ts");
 
     is_api_file && !is_noise
+}
+
+/// Returns `true` if the relative path looks like a Next.js Pages Router API
+/// route: `pages/api/**/*.{ts,tsx,js,jsx}` (or `src/pages/api/…`), including
+/// paths with monorepo prefixes like `client/src/pages/api/…`.
+///
+/// This is a convenience wrapper used in tests; the hot path in `scan_root`
+/// calls `find_pages_router_suffix` + `is_pages_router_route_inner` directly.
+#[cfg(test)]
+fn is_pages_router_route(rel: &str) -> bool {
+    match find_pages_router_suffix(rel) {
+        Some(suffix) => is_pages_router_route_inner(suffix),
+        None => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -318,8 +389,8 @@ fn process_app_router_file(
 /// | `app/api/users/[id]/route.ts` | `/api/users/{id}` |
 /// | `app/api/v2/items/[...slug]/route.ts` | `/api/v2/items/{slug}` |
 ///
-/// `rel` must already have any leading `src/` stripped by the caller
-/// (i.e. it is the path as seen from the root `app/` directory).
+/// `rel` must already have any monorepo prefix and optional `src/` stripped
+/// by the caller (via `find_app_router_suffix`), so it starts at `app/`.
 fn derive_app_router_path(rel: &str) -> String {
     // Strip only "app/" prefix — "api/" and all subdirectory segments stay as
     // part of the URL path.
@@ -835,6 +906,62 @@ mod tests {
         assert!(!is_pages_router_route("pages/api/_app.ts"));
         assert!(!is_pages_router_route("pages/api/payments.test.ts"));
         assert!(!is_pages_router_route("pages/api/types.d.ts"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Monorepo nested prefix tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_app_router_route_monorepo_prefix() {
+        // Monorepo: client/src/app/api/…
+        assert!(is_app_router_route("client/src/app/api/payments/route.ts"));
+        assert!(is_app_router_route("client/app/api/payments/route.ts"));
+        // Deeper nesting
+        assert!(is_app_router_route("packages/web/src/app/api/users/route.tsx"));
+        assert!(is_app_router_route("apps/frontend/app/api/route.js"));
+    }
+
+    #[test]
+    fn test_is_pages_router_route_monorepo_prefix() {
+        assert!(is_pages_router_route("client/src/pages/api/payments.ts"));
+        assert!(is_pages_router_route("client/pages/api/payments.ts"));
+        assert!(is_pages_router_route("packages/web/src/pages/api/users/[id].ts"));
+        // Still reject noise
+        assert!(!is_pages_router_route("client/pages/api/_app.ts"));
+        assert!(!is_pages_router_route("client/pages/api/payments.test.ts"));
+    }
+
+    #[test]
+    fn test_find_app_router_suffix() {
+        // Direct root
+        assert_eq!(find_app_router_suffix("app/api/payments/route.ts"), Some("app/api/payments/route.ts"));
+        // src/ prefix
+        assert_eq!(find_app_router_suffix("src/app/api/payments/route.ts"), Some("app/api/payments/route.ts"));
+        // Monorepo prefix
+        assert_eq!(find_app_router_suffix("client/src/app/api/payments/route.ts"), Some("app/api/payments/route.ts"));
+        assert_eq!(find_app_router_suffix("client/app/api/payments/route.ts"), Some("app/api/payments/route.ts"));
+        // No match
+        assert_eq!(find_app_router_suffix("lib/utils.ts"), None);
+    }
+
+    #[test]
+    fn test_find_pages_router_suffix() {
+        assert_eq!(find_pages_router_suffix("pages/api/payments.ts"), Some("pages/api/payments.ts"));
+        assert_eq!(find_pages_router_suffix("src/pages/api/payments.ts"), Some("pages/api/payments.ts"));
+        assert_eq!(find_pages_router_suffix("client/src/pages/api/payments.ts"), Some("pages/api/payments.ts"));
+        assert_eq!(find_pages_router_suffix("client/pages/api/payments.ts"), Some("pages/api/payments.ts"));
+        assert_eq!(find_pages_router_suffix("lib/utils.ts"), None);
+    }
+
+    #[test]
+    fn test_derive_app_router_path_from_monorepo_suffix() {
+        // After find_app_router_suffix strips the prefix, derive_app_router_path
+        // receives a path starting at `app/`.
+        assert_eq!(
+            derive_app_router_path("app/api/payments/route.ts"),
+            "/api/payments"
+        );
     }
 
     // -----------------------------------------------------------------------
