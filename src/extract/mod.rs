@@ -335,6 +335,20 @@ impl ExtractorRegistry {
 
     /// Extract from all files in a scan result.
     ///
+    /// Convenience wrapper around [`extract_scan_result_with_stats`] that
+    /// discards the encoding statistics. Prefer `_with_stats` when the caller
+    /// can propagate encoding info to `ScanStats`.
+    pub fn extract_scan_result(
+        &self,
+        repo_root: &Path,
+        scan_result: &ScanResult,
+    ) -> ExtractionResult {
+        self.extract_scan_result_with_stats(repo_root, scan_result).0
+    }
+
+    /// Extract from all files in a scan result, returning both the extraction
+    /// result and encoding statistics for surfacing in `list_roots`.
+    ///
     /// Files are processed in parallel using rayon. Each file is independent —
     /// no shared mutable state — so parallelism is safe. On a 10-core machine
     /// a 500-file scan drops from ~10s to ~1s.
@@ -344,105 +358,6 @@ impl ExtractorRegistry {
     /// control-char ratio) are skipped; text files with wrong encoding (Latin-1,
     /// Windows-1252) are lossy-decoded with U+FFFD replacement characters so
     /// their symbols still appear in the index.
-    ///
-    /// `repo_root` is needed to construct absolute paths for reading files.
-    pub fn extract_scan_result(
-        &self,
-        repo_root: &Path,
-        scan_result: &ScanResult,
-    ) -> ExtractionResult {
-        // Process changed + new files (not deleted ones)
-        let files_to_process: Vec<_> = scan_result
-            .changed_files
-            .iter()
-            .chain(scan_result.new_files.iter())
-            .collect();
-        let extraction_start = std::time::Instant::now();
-        tracing::info!(
-            "ExtractorRegistry: starting extraction for {} file(s) under {}",
-            files_to_process.len(),
-            repo_root.display()
-        );
-
-        // Counters for files skipped due to encoding issues (binary or lossy-decoded).
-        let binary_skipped = AtomicUsize::new(0);
-        let lossy_decoded = AtomicUsize::new(0);
-
-        // Process files in parallel. Each file is independent (no shared mutable
-        // state between extractors), so rayon par_iter is safe here.
-        // `filter_map` skips unreadable/binary files; `reduce` merges in parallel.
-        let result = files_to_process
-            .into_par_iter()
-            .filter_map(|rel_path| {
-                let file_start = std::time::Instant::now();
-                let abs_path = repo_root.join(rel_path);
-                tracing::debug!("ExtractorRegistry: reading {}", abs_path.display());
-
-                // Read raw bytes instead of read_to_string so we can handle non-UTF-8.
-                let raw_bytes = match std::fs::read(&abs_path) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!("Failed to read {}: {}", abs_path.display(), e);
-                        return None;
-                    }
-                };
-
-                // Content-sniff first: skip truly binary files before attempting decode.
-                // This catches files with null bytes or high control-char ratios even
-                // if they happen to be valid UTF-8 byte sequences.
-                if is_binary_content(&raw_bytes) {
-                    tracing::debug!("Skipping binary file {}", abs_path.display());
-                    binary_skipped.fetch_add(1, Ordering::Relaxed);
-                    return None;
-                }
-
-                // Try fast-path: valid UTF-8 (vast majority of source files).
-                let content = match String::from_utf8(raw_bytes) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        // Not valid UTF-8 but not binary — lossy-decode so symbols
-                        // are still indexed (replacement char U+FFFD for bad bytes).
-                        let bytes = e.into_bytes();
-                        tracing::info!(
-                            "Lossy-decoding non-UTF-8 text file {}",
-                            abs_path.display()
-                        );
-                        lossy_decoded.fetch_add(1, Ordering::Relaxed);
-                        String::from_utf8_lossy(&bytes).into_owned()
-                    }
-                };
-
-                let file_result = self.extract_file(rel_path, &content);
-                tracing::debug!(
-                    "ExtractorRegistry: extracted {} -> {} node(s), {} edge(s) in {:?}",
-                    rel_path.display(),
-                    file_result.nodes.len(),
-                    file_result.edges.len(),
-                    file_start.elapsed()
-                );
-                Some(file_result)
-            })
-            .reduce(ExtractionResult::default, |mut acc, r| {
-                acc.merge(r);
-                acc
-            });
-
-        let binary_count = binary_skipped.load(Ordering::Relaxed);
-        let lossy_count = lossy_decoded.load(Ordering::Relaxed);
-        tracing::info!(
-            "ExtractorRegistry: completed extraction in {:?} ({} node(s), {} edge(s), {} binary skipped, {} lossy-decoded)",
-            extraction_start.elapsed(),
-            result.nodes.len(),
-            result.edges.len(),
-            binary_count,
-            lossy_count,
-        );
-
-        result
-    }
-
-    /// Extract from all files in a scan result, returning both the extraction
-    /// result and encoding statistics for surfacing in `list_roots`.
     pub fn extract_scan_result_with_stats(
         &self,
         repo_root: &Path,

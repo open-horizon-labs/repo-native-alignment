@@ -493,7 +493,16 @@ impl RnaHandler {
                 deleted_files: Vec::new(),
                 scan_duration: std::time::Duration::ZERO,
             };
-            let mut extraction = registry.extract_scan_result(root_path, &full_scan);
+            let (mut extraction, enc_stats) = registry.extract_scan_result_with_stats(root_path, &full_scan);
+
+            // Record encoding stats for this root in shared ScanStats.
+            if let Ok(mut stats) = self.scan_stats.write() {
+                if enc_stats.binary_skipped > 0 || enc_stats.lossy_decoded > 0 {
+                    stats.encoding_stats.insert(root_slug.clone(), enc_stats);
+                } else {
+                    stats.encoding_stats.remove(root_slug);
+                }
+            }
 
             for node in &mut extraction.nodes {
                 node.id.root = root_slug.clone();
@@ -1087,12 +1096,21 @@ impl RnaHandler {
         });
 
         // Extract new + changed files
-        let mut extraction = registry.extract_scan_result(&self.repo_root, &scan);
+        let (mut extraction, enc_stats) = registry.extract_scan_result_with_stats(&self.repo_root, &scan);
 
         // Set root slug on extracted nodes and edges.
         // Extractors don't set root -- the caller must assign it, matching the
         // pattern in build_full_graph and the background scanner.
         let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
+
+        // Record encoding stats for this root in shared ScanStats.
+        if let Ok(mut stats) = self.scan_stats.write() {
+            if enc_stats.binary_skipped > 0 || enc_stats.lossy_decoded > 0 {
+                stats.encoding_stats.insert(primary_slug.clone(), enc_stats);
+            } else {
+                stats.encoding_stats.remove(&primary_slug);
+            }
+        }
         for node in &mut extraction.nodes {
             node.id.root = primary_slug.clone();
         }

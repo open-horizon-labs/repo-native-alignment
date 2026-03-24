@@ -149,11 +149,15 @@ impl ExtractionConsumer for TreeSitterConsumer {
         }
 
         // Propagate encoding stats to ScanStats if we have a handle.
-        if (enc_stats.binary_skipped > 0 || enc_stats.lossy_decoded > 0)
-            && let Some(ref stats_handle) = self.scan_stats
+        // Always write (even zeros) to clear stale entries from prior scans.
+        if let Some(ref stats_handle) = self.scan_stats
             && let Ok(mut stats) = stats_handle.write()
         {
-            stats.encoding_stats.insert(slug.clone(), enc_stats);
+            if enc_stats.binary_skipped > 0 || enc_stats.lossy_decoded > 0 {
+                stats.encoding_stats.insert(slug.clone(), enc_stats);
+            } else {
+                stats.encoding_stats.remove(slug);
+            }
         }
 
         tracing::info!(

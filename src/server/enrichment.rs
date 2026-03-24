@@ -228,7 +228,17 @@ impl RnaHandler {
                                 || (!files_to_remove.contains(&e.from.file)
                                     && !files_to_remove.contains(&e.to.file))
                         });
-                        let mut extraction = registry.extract_scan_result(root_path, scan);
+                        let (mut extraction, enc_stats) = registry.extract_scan_result_with_stats(root_path, scan);
+
+                        // Record encoding stats for this root in shared ScanStats.
+                        if let Ok(mut stats) = scan_stats.write() {
+                            if enc_stats.binary_skipped > 0 || enc_stats.lossy_decoded > 0 {
+                                stats.encoding_stats.insert(root_slug.clone(), enc_stats);
+                            } else {
+                                stats.encoding_stats.remove(root_slug);
+                            }
+                        }
+
                         for node in &mut extraction.nodes {
                             node.id.root = root_slug.clone();
                         }
