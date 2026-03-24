@@ -55,7 +55,19 @@ claude mcp add rna-mcp --scope project -- repo-native-alignment --repo .
 
 This adds rna-mcp to the project's `.mcp.json` so it activates when working in this repo.
 
-## Step 4: Update AGENTS.md with tool guidance
+## Step 4: Pre-build the index (recommended)
+
+Run a one-time scan to build the code index before the MCP server starts. This avoids cold-start latency on the first tool call:
+
+```bash
+repo-native-alignment scan --repo . --full
+```
+
+This builds the full pipeline (scan, extract, embed, LSP enrich, graph) and caches results in `.oh/.cache/lance/`. The MCP server reuses this cache on startup -- if no files changed, graph loads in seconds with zero re-extraction. Subsequent scans are incremental.
+
+Without this step, the MCP server pre-warms the graph automatically at startup, but the first tool call may need to wait for that to complete. Pre-building ensures instant readiness.
+
+## Step 5: Update AGENTS.md with tool guidance
 
 If AGENTS.md exists in the project root, check if it already contains `<!-- RNA MCP tool guidance -->`. If not, append this block:
 
@@ -77,7 +89,7 @@ If AGENTS.md exists in the project root, check if it already contains `<!-- RNA 
 
 If AGENTS.md doesn't exist, offer to create it with the tool guidance block as the initial content. Ask: "No AGENTS.md found. Create one with RNA tool guidance?" If accepted, write the block above as the file content.
 
-## Step 5: Inform the user
+## Step 6: Inform the user
 
 Tell the user:
 1. Setup is complete
