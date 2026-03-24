@@ -186,18 +186,18 @@ pub fn list_roots_from_slugs(
                 }
 
             // Encoding stats line — show files skipped or lossy-decoded.
-            if let Some(stats) = scan_stats {
-                if let Some(enc) = stats.encoding_stats.get(&r.slug) {
-                    let mut parts = Vec::new();
-                    if enc.lossy_decoded > 0 {
-                        parts.push(format!("{} lossy-decoded (non-UTF-8)", enc.lossy_decoded));
-                    }
-                    if enc.binary_skipped > 0 {
-                        parts.push(format!("{} binary skipped", enc.binary_skipped));
-                    }
-                    if !parts.is_empty() {
-                        line.push_str(&format!("\n  Encoding: {}", parts.join(", ")));
-                    }
+            if let Some(stats) = scan_stats
+                && let Some(enc) = stats.encoding_stats.get(&r.slug)
+            {
+                let mut parts = Vec::new();
+                if enc.lossy_decoded > 0 {
+                    parts.push(format!("{} lossy-decoded (non-UTF-8)", enc.lossy_decoded));
+                }
+                if enc.binary_skipped > 0 {
+                    parts.push(format!("{} binary skipped", enc.binary_skipped));
+                }
+                if !parts.is_empty() {
+                    line.push_str(&format!("\n  Encoding: {}", parts.join(", ")));
                 }
             }
 
