@@ -11,6 +11,7 @@ use crate::graph::index::GraphIndex;
 /// In-memory graph state: extraction results + petgraph index + embedding index.
 /// Lazily initialized on first tool call. Embeddings are built as part of the
 /// graph pipeline — not as a separate lazy init that races with graph building.
+#[derive(Clone)]
 pub struct GraphState {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
@@ -1087,5 +1088,103 @@ mod tests {
                 seg
             );
         }
+    }
+
+    // ── GraphState Clone tests (#574) ────────────────────────────────
+
+    /// Cloning a GraphState produces an independent copy: mutations to the
+    /// clone do not affect the original.
+    #[test]
+    fn test_graph_state_clone_is_independent() {
+        use crate::graph::NodeKind;
+        let node = make_test_node("root", "src/lib.rs", "my_fn", NodeKind::Function);
+        let original = make_test_graph_state(vec![node]);
+
+        let mut cloned = original.clone();
+
+        // Add a node to the clone only.
+        let extra = make_test_node("root", "src/lib.rs", "extra_fn", NodeKind::Function);
+        cloned.nodes.push(extra);
+
+        // Original must be unchanged.
+        assert_eq!(original.nodes.len(), 1, "original should still have 1 node");
+        assert_eq!(cloned.nodes.len(), 2, "clone should have 2 nodes");
+        assert!(!original.nodes.iter().any(|n| n.id.name == "extra_fn"));
+        assert!(cloned.nodes.iter().any(|n| n.id.name == "extra_fn"));
+    }
+
+    /// Clone preserves all fields that were set on the original.
+    #[test]
+    fn test_graph_state_clone_preserves_all_fields() {
+        use crate::graph::NodeKind;
+        let node = make_test_node("root", "src/lib.rs", "my_fn", NodeKind::Function);
+        let mut original = make_test_graph_state(vec![node]);
+        original.last_scan_completed_at = Some(std::time::Instant::now());
+        original.detected_frameworks.insert("fastapi".to_string());
+        original.detected_frameworks.insert("kafkajs".to_string());
+
+        let cloned = original.clone();
+
+        assert_eq!(cloned.nodes.len(), original.nodes.len());
+        assert_eq!(cloned.edges.len(), original.edges.len());
+        assert!(cloned.last_scan_completed_at.is_some());
+        assert!(cloned.detected_frameworks.contains("fastapi"));
+        assert!(cloned.detected_frameworks.contains("kafkajs"));
+        assert_eq!(cloned.detected_frameworks.len(), original.detected_frameworks.len());
+    }
+
+    /// Mutating detected_frameworks on clone does not affect original.
+    #[test]
+    fn test_graph_state_clone_frameworks_are_independent() {
+        use crate::graph::NodeKind;
+        let node = make_test_node("root", "src/lib.rs", "f", NodeKind::Function);
+        let mut original = make_test_graph_state(vec![node]);
+        original.detected_frameworks.insert("nextjs-app-router".to_string());
+
+        let mut cloned = original.clone();
+        cloned.detected_frameworks.insert("grpc".to_string());
+        cloned.detected_frameworks.remove("nextjs-app-router");
+
+        assert!(original.detected_frameworks.contains("nextjs-app-router"),
+            "original should still have nextjs-app-router");
+        assert!(!original.detected_frameworks.contains("grpc"),
+            "original should not have grpc");
+        assert_eq!(original.detected_frameworks.len(), 1);
+    }
+
+    /// Clone with no nodes or edges produces an equivalent empty state.
+    #[test]
+    fn test_graph_state_clone_empty() {
+        let original = GraphState {
+            nodes: vec![],
+            edges: vec![],
+            index: crate::graph::index::GraphIndex::new(),
+            last_scan_completed_at: None,
+            detected_frameworks: std::collections::HashSet::new(),
+        };
+        let cloned = original.clone();
+        assert!(cloned.nodes.is_empty());
+        assert!(cloned.edges.is_empty());
+        assert!(cloned.last_scan_completed_at.is_none());
+        assert!(cloned.detected_frameworks.is_empty());
+    }
+
+    /// has_framework reflects the cloned set independently.
+    #[test]
+    fn test_graph_state_clone_has_framework_reflects_clone() {
+        let mut original = GraphState {
+            nodes: vec![],
+            edges: vec![],
+            index: crate::graph::index::GraphIndex::new(),
+            last_scan_completed_at: None,
+            detected_frameworks: std::collections::HashSet::new(),
+        };
+        original.detected_frameworks.insert("kafkajs".to_string());
+
+        let mut cloned = original.clone();
+        cloned.detected_frameworks.remove("kafkajs");
+
+        assert!(original.has_framework("kafkajs"), "original should still have kafkajs");
+        assert!(!cloned.has_framework("kafkajs"), "clone removed kafkajs");
     }
 }

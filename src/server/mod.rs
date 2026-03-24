@@ -40,7 +40,6 @@ use crate::graph::NodeKind;
 use crate::types::OhArtifactKind;
 use crate::oh;
 use arc_swap::ArcSwap;
-use tokio::sync::RwLock;
 
 use helpers::parse_args;
 
@@ -59,7 +58,10 @@ pub struct PipelineResult {
 
 pub struct RnaHandler {
     pub repo_root: PathBuf,
-    pub graph: Arc<RwLock<Option<GraphState>>>,
+    /// Lock-free graph state via ArcSwap (#574).
+    /// Readers (tool calls) load an atomic snapshot — zero blocking.
+    /// Writers (pre-warm, background scanner) build a new graph and swap the pointer.
+    pub graph: Arc<ArcSwap<Option<Arc<GraphState>>>>,
     /// Double-buffered embedding index.
     pub embed_index: Arc<ArcSwap<Option<EmbeddingIndex>>>,
     /// Whether business context has been injected into a tool response.
@@ -98,13 +100,18 @@ pub struct RnaHandler {
     pub prewarm_notify: Arc<tokio::sync::Notify>,
     /// Whether a pre-warm task has been started.
     pub prewarm_started: std::sync::atomic::AtomicBool,
+    /// Serializes graph build/update operations in `get_graph()`.
+    /// With ArcSwap, reads are lock-free but concurrent builds must be serialized
+    /// to avoid duplicate work (two tool calls both detecting "no graph" and both
+    /// running the full extraction pipeline).
+    pub graph_build_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for RnaHandler {
     fn default() -> Self {
         Self {
             repo_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            graph: Arc::new(RwLock::new(None)),
+            graph: Arc::new(ArcSwap::from_pointee(None)),
             embed_index: Arc::new(ArcSwap::from_pointee(None)),
             context_injected: std::sync::atomic::AtomicBool::new(false),
             last_scan: std::sync::Mutex::new(
@@ -122,6 +129,7 @@ impl Default for RnaHandler {
             embed_handle: tokio::sync::Mutex::new(None),
             prewarm_notify: Arc::new(tokio::sync::Notify::new()),
             prewarm_started: std::sync::atomic::AtomicBool::new(false),
+            graph_build_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -130,7 +138,7 @@ impl RnaHandler {
     /// Create a clone of this handler that shares all `Arc`-wrapped state.
     ///
     /// Used by `start_prewarm()` to spawn a background graph build task that
-    /// writes to the same `graph` RwLock as the MCP handler.  Non-Arc fields
+    /// writes to the same `graph` ArcSwap as the MCP handler.  Non-Arc fields
     /// (AtomicBool, Mutex) are freshly initialized because the spawned task
     /// only needs the shared storage, not the per-request bookkeeping.
     fn clone_shared(&self) -> Self {
@@ -152,6 +160,7 @@ impl RnaHandler {
             embed_handle: tokio::sync::Mutex::new(None),
             prewarm_notify: Arc::clone(&self.prewarm_notify),
             prewarm_started: std::sync::atomic::AtomicBool::new(false),
+            graph_build_lock: Arc::clone(&self.graph_build_lock),
         }
     }
 
@@ -174,15 +183,10 @@ impl RnaHandler {
                 Ok(state) => {
                     let node_count = state.nodes.len();
                     let edge_count = state.edges.len();
-                    // Store the built graph so get_graph() finds it already populated.
-                    {
-                        let mut guard = handler.graph.write().await;
-                        if guard.is_none() {
-                            *guard = Some(state);
-                        }
-                        // If guard.is_some(), another path (e.g. a tool call that
-                        // arrived before pre-warm finished) already built it.
-                    }
+                    // Atomic swap: store the built graph so get_graph() finds it
+                    // already populated.  If another path already stored a graph,
+                    // the pre-warm result wins (it's always a complete build).
+                    handler.graph.store(Arc::new(Some(Arc::new(state))));
                     // Update cooldown so the first tool call skips re-scanning.
                     *handler.last_scan.lock().unwrap() = std::time::Instant::now();
                     // Start the background scanner to keep the index warm.
@@ -480,8 +484,7 @@ mod tests {
         };
 
         {
-            let guard = handler.get_graph().await.unwrap();
-            let gs = guard.as_ref().expect("graph should be built");
+            let gs = handler.get_graph().await.unwrap();
             assert!(
                 gs.nodes.iter().any(|n| n.id.name == "original_function"),
                 "original_function should be in graph after first build. Nodes: {:?}",
@@ -504,8 +507,7 @@ mod tests {
         }
 
         {
-            let guard = handler.get_graph().await.unwrap();
-            let gs = guard.as_ref().expect("graph should still exist");
+            let gs = handler.get_graph().await.unwrap();
 
             let has_replacement = gs.nodes.iter().any(|n| n.id.name == "replacement_function");
             let has_original = gs.nodes.iter().any(|n| n.id.name == "original_function");
@@ -543,8 +545,7 @@ mod tests {
         assert!(!expected_slug.is_empty());
 
         {
-            let guard = handler.get_graph().await.unwrap();
-            let gs = guard.as_ref().expect("graph should be built");
+            let gs = handler.get_graph().await.unwrap();
             let node = gs.nodes.iter().find(|n| n.id.name == "initial_func")
                 .expect("initial_func should be in graph");
             assert_eq!(node.id.root, expected_slug);
@@ -564,8 +565,7 @@ mod tests {
         }
 
         {
-            let guard = handler.get_graph().await.unwrap();
-            let gs = guard.as_ref().expect("graph should still exist");
+            let gs = handler.get_graph().await.unwrap();
 
             let node = gs.nodes.iter().find(|n| n.id.name == "updated_func")
                 .expect("updated_func should be in graph after edit");
@@ -615,8 +615,8 @@ mod tests {
         assert!(result.node_count > 0, "should have extracted nodes");
         // Verify alpha and beta are in the graph.
         {
-            let guard = handler.graph.read().await;
-            let gs = guard.as_ref().unwrap();
+            let snap = handler.graph.load_full();
+            let gs = snap.as_ref().as_ref().unwrap();
             assert!(gs.nodes.iter().any(|n| n.id.name == "alpha_function"));
             assert!(gs.nodes.iter().any(|n| n.id.name == "beta_function"));
         }
@@ -667,8 +667,8 @@ mod tests {
 
         // Verify gamma replaced beta.
         {
-            let guard = handler2.graph.read().await;
-            let gs = guard.as_ref().unwrap();
+            let snap = handler2.graph.load_full();
+            let gs = snap.as_ref().as_ref().unwrap();
             assert!(
                 gs.nodes.iter().any(|n| n.id.name == "alpha_function"),
                 "alpha_function should still be present"
@@ -1166,8 +1166,7 @@ mod tests {
 
         // Reset handler graph so next call triggers a fresh build_full_graph
         {
-            let mut g = handler.graph.write().await;
-            *g = None;
+            handler.graph.store(Arc::new(None));
         }
 
         // Step 4: Second build. Secondary slug is in live_slugs but not in stored
@@ -1397,8 +1396,7 @@ mod tests {
 
         // Force a second build (simulate rescan)
         {
-            let mut g = handler.graph.write().await;
-            *g = None;
+            handler.graph.store(Arc::new(None));
         }
         let gs2 = handler.build_full_graph().await.unwrap();
         let has_endpoint_second = gs2
@@ -1486,8 +1484,7 @@ mod tests {
 
         // Force a second build (simulate rescan after config change)
         {
-            let mut g = handler.graph.write().await;
-            *g = None;
+            handler.graph.store(Arc::new(None));
         }
         let gs2 = handler.build_full_graph().await.unwrap();
 
@@ -1616,8 +1613,8 @@ mod tests {
         handler.prewarm_notify.notified().await;
 
         // Graph should now be populated without calling get_graph.
-        let guard = handler.graph.read().await;
-        let gs = guard.as_ref().expect("pre-warm should have populated the graph");
+        let snap = handler.graph.load_full();
+        let gs = snap.as_ref().as_ref().expect("pre-warm should have populated the graph");
         assert!(
             gs.nodes.iter().any(|n| n.id.name == "prewarm_test_fn"),
             "prewarm_test_fn should be in graph after pre-warm. Nodes: {:?}",
@@ -1650,12 +1647,244 @@ mod tests {
         handler.start_prewarm();
 
         // Immediately call get_graph — it should wait for pre-warm, not build again.
-        let guard = handler.get_graph().await.unwrap();
-        let gs = guard.as_ref().expect("graph should be populated");
+        let gs = handler.get_graph().await.unwrap();
         assert!(
             gs.nodes.iter().any(|n| n.id.name == "wait_test_fn"),
             "wait_test_fn should be in graph. Nodes: {:?}",
             gs.nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
         );
+    }
+
+    // ── ArcSwap graph field tests (#574) ─────────────────────────────
+
+    /// Default handler: graph field starts as None (no graph built yet).
+    #[test]
+    fn test_rna_handler_default_graph_initially_none() {
+        let handler = RnaHandler::default();
+        let snap = handler.graph.load_full();
+        assert!(snap.as_ref().is_none(), "graph should be None before first build");
+    }
+
+    /// Default handler: graph_build_lock is present and unlocked.
+    #[tokio::test]
+    async fn test_rna_handler_default_graph_build_lock_unlocked() {
+        let handler = RnaHandler::default();
+        // If lock is available, try_lock succeeds immediately.
+        let result = handler.graph_build_lock.try_lock();
+        assert!(result.is_ok(), "graph_build_lock should be initially unlocked");
+    }
+
+    /// ArcSwap: storing a GraphState makes it visible via load_full.
+    #[test]
+    fn test_arcswap_store_and_load_graph_state() {
+        use crate::graph::index::GraphIndex;
+        let handler = RnaHandler::default();
+        let gs = GraphState {
+            nodes: vec![],
+            edges: vec![],
+            index: GraphIndex::new(),
+            last_scan_completed_at: None,
+            detected_frameworks: std::collections::HashSet::new(),
+        };
+        handler.graph.store(Arc::new(Some(Arc::new(gs))));
+        let snap = handler.graph.load_full();
+        assert!(snap.as_ref().is_some(), "graph should be Some after store");
+    }
+
+    /// ArcSwap: a second store replaces the first — readers see the latest version.
+    #[test]
+    fn test_arcswap_store_replaces_previous_value() {
+        use crate::graph::index::GraphIndex;
+        use std::collections::BTreeMap;
+        let handler = RnaHandler::default();
+
+        // First graph: one node named "first_fn".
+        let node1 = {
+            use crate::graph::*;
+            Node {
+                id: NodeId {
+                    root: "root".to_string(),
+                    file: std::path::PathBuf::from("src/lib.rs"),
+                    name: "first_fn".to_string(),
+                    kind: NodeKind::Function,
+                },
+                language: "rust".to_string(),
+                line_start: 1, line_end: 2,
+                signature: String::new(), body: String::new(),
+                metadata: BTreeMap::new(),
+                source: crate::graph::ExtractionSource::TreeSitter,
+            }
+        };
+        let gs1 = GraphState {
+            nodes: vec![node1],
+            edges: vec![],
+            index: GraphIndex::new(),
+            last_scan_completed_at: None,
+            detected_frameworks: std::collections::HashSet::new(),
+        };
+        handler.graph.store(Arc::new(Some(Arc::new(gs1))));
+
+        // Second graph: one node named "second_fn".
+        let node2 = {
+            use crate::graph::*;
+            Node {
+                id: NodeId {
+                    root: "root".to_string(),
+                    file: std::path::PathBuf::from("src/lib.rs"),
+                    name: "second_fn".to_string(),
+                    kind: NodeKind::Function,
+                },
+                language: "rust".to_string(),
+                line_start: 1, line_end: 2,
+                signature: String::new(), body: String::new(),
+                metadata: BTreeMap::new(),
+                source: crate::graph::ExtractionSource::TreeSitter,
+            }
+        };
+        let gs2 = GraphState {
+            nodes: vec![node2],
+            edges: vec![],
+            index: GraphIndex::new(),
+            last_scan_completed_at: None,
+            detected_frameworks: std::collections::HashSet::new(),
+        };
+        handler.graph.store(Arc::new(Some(Arc::new(gs2))));
+
+        let snap = handler.graph.load_full();
+        let gs = snap.as_ref().as_ref().unwrap();
+        assert!(!gs.nodes.iter().any(|n| n.id.name == "first_fn"),
+            "first_fn should be replaced");
+        assert!(gs.nodes.iter().any(|n| n.id.name == "second_fn"),
+            "second_fn should be visible after second store");
+    }
+
+    /// ArcSwap: concurrent loads during a store never see a torn state —
+    /// every load either returns the old value or the new value, never a
+    /// partially-written pointer.
+    #[tokio::test]
+    async fn test_arcswap_concurrent_readers_not_blocked() {
+        use crate::graph::index::GraphIndex;
+
+        let graph = Arc::new(ArcSwap::from_pointee(Some(Arc::new(GraphState {
+            nodes: vec![],
+            edges: vec![],
+            index: GraphIndex::new(),
+            last_scan_completed_at: None,
+            detected_frameworks: std::collections::HashSet::new(),
+        }))));
+
+        let g_writer = Arc::clone(&graph);
+        // Spawn a task that stores new graphs in a tight loop.
+        let writer = tokio::spawn(async move {
+            for _ in 0..200 {
+                g_writer.store(Arc::new(Some(Arc::new(GraphState {
+                    nodes: vec![],
+                    edges: vec![],
+                    index: GraphIndex::new(),
+                    last_scan_completed_at: None,
+                    detected_frameworks: std::collections::HashSet::new(),
+                }))));
+            }
+        });
+
+        // Meanwhile, load in a tight loop. Every load must return Some.
+        for _ in 0..200 {
+            let snap = graph.load_full();
+            assert!(snap.as_ref().is_some(),
+                "concurrent load should always see a valid Some (never torn)");
+        }
+
+        writer.await.unwrap();
+    }
+
+    /// clone_shared shares the same graph ArcSwap pointer.
+    /// A store from one clone is immediately visible from the other.
+    #[test]
+    fn test_clone_shared_shares_graph_arc() {
+        use crate::graph::index::GraphIndex;
+
+        let handler = RnaHandler::default();
+        let shared = handler.clone_shared();
+
+        // Store via `shared`.
+        shared.graph.store(Arc::new(Some(Arc::new(GraphState {
+            nodes: vec![],
+            edges: vec![],
+            index: GraphIndex::new(),
+            last_scan_completed_at: None,
+            detected_frameworks: std::collections::HashSet::new(),
+        }))));
+
+        // Load from `handler` — should see the stored value.
+        let snap = handler.graph.load_full();
+        assert!(snap.as_ref().is_some(),
+            "handler should see graph stored via clone_shared");
+    }
+
+    /// clone_shared shares the graph_build_lock (same Arc pointer).
+    #[tokio::test]
+    async fn test_clone_shared_shares_graph_build_lock() {
+        let handler = RnaHandler::default();
+        let shared = handler.clone_shared();
+
+        // Both should point to the same underlying Mutex.
+        assert!(Arc::ptr_eq(&handler.graph_build_lock, &shared.graph_build_lock),
+            "graph_build_lock must be the same Arc in the clone");
+    }
+
+    /// get_graph() returns an Arc<GraphState> that is usable without a lock guard.
+    /// The returned value outlives any internal synchronisation primitive.
+    #[tokio::test]
+    async fn test_get_graph_returns_owned_arc() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn arc_test_fn() {}\n").unwrap();
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            ..Default::default()
+        };
+
+        let gs: Arc<GraphState> = handler.get_graph().await.unwrap();
+        // After get_graph returns, the handler can be dropped — Arc keeps state alive.
+        drop(handler);
+        assert!(gs.nodes.iter().any(|n| n.id.name == "arc_test_fn"),
+            "returned Arc<GraphState> must be usable after handler is dropped");
+    }
+
+    /// Regression (#574): storing None resets the graph to uninitialized.
+    /// The next get_graph call must trigger a fresh build.
+    #[tokio::test]
+    async fn test_arcswap_store_none_resets_graph() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn reset_test_fn() {}\n").unwrap();
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            ..Default::default()
+        };
+
+        // Build graph.
+        let gs1 = handler.get_graph().await.unwrap();
+        assert!(gs1.nodes.iter().any(|n| n.id.name == "reset_test_fn"));
+
+        // Reset to None via ArcSwap (as done in tests throughout the codebase).
+        handler.graph.store(Arc::new(None));
+        let snap = handler.graph.load_full();
+        assert!(snap.as_ref().is_none(), "graph should be None after store(Arc::new(None))");
+
+        // get_graph must rebuild.
+        let gs2 = handler.get_graph().await.unwrap();
+        assert!(gs2.nodes.iter().any(|n| n.id.name == "reset_test_fn"),
+            "graph should be rebuilt after reset");
     }
 }
