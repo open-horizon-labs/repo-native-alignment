@@ -131,29 +131,29 @@ fn scan_root(root_slug: &str, root_path: &Path, existing_nodes: &[Node]) -> Next
         // `client/src/app/api/payments/route.ts`. `find_app_router_suffix`
         // returns the portion starting at `app/` (stripping any monorepo
         // prefix), which is then passed to the path derivation functions.
-        if let Some(app_suffix) = find_app_router_suffix(&rel_forward) {
-            if is_app_router_route_inner(app_suffix) {
-                process_app_router_file(
-                    root_slug,
-                    root_path,
-                    rel_path,
-                    app_suffix,
-                    abs_path,
-                    &fn_index,
-                    &mut result,
-                );
-            }
-        } else if let Some(pages_suffix) = find_pages_router_suffix(&rel_forward) {
-            if is_pages_router_route_inner(pages_suffix) {
-                process_pages_router_file(
-                    root_slug,
-                    rel_path,
-                    pages_suffix,
-                    abs_path,
-                    &fn_index,
-                    &mut result,
-                );
-            }
+        if let Some(app_suffix) = find_app_router_suffix(&rel_forward)
+            && is_app_router_route_inner(app_suffix)
+        {
+            process_app_router_file(
+                root_slug,
+                root_path,
+                rel_path,
+                app_suffix,
+                abs_path,
+                &fn_index,
+                &mut result,
+            );
+        } else if let Some(pages_suffix) = find_pages_router_suffix(&rel_forward)
+            && is_pages_router_route_inner(pages_suffix)
+        {
+            process_pages_router_file(
+                root_slug,
+                rel_path,
+                pages_suffix,
+                abs_path,
+                &fn_index,
+                &mut result,
+            );
         }
     });
 
