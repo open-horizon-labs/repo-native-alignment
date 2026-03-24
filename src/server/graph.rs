@@ -27,14 +27,31 @@ use super::store::{
 use super::RnaHandler;
 
 impl RnaHandler {
+    /// Maximum time a tool call will wait for a graph lock before returning
+    /// an error.  With the Phase 1-2-3 split in the background scanner (#574),
+    /// write-lock hold times are <100ms, so 30s is a generous safety net.
+    const GRAPH_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Maximum time to wait for pre-warm to finish before falling back to
+    /// building the graph ourselves.
+    const PREWARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
     /// Ensure graph is built, check for file changes since last scan.
     /// Returns a read guard to the graph.
+    ///
+    /// Tool calls that cannot acquire the lock within [`GRAPH_LOCK_TIMEOUT`]
+    /// get an error instead of hanging indefinitely (#574).
     pub(crate) async fn get_graph(&self) -> anyhow::Result<tokio::sync::RwLockReadGuard<'_, Option<GraphState>>> {
         // Fast path: graph exists and scan cooldown hasn't expired.
         // We carry both the scan result AND the scanner forward so the caller
         // can commit scanner state only after successful graph processing.
         let pending: Option<(ScanResult, Scanner)> = {
-            let guard = self.graph.read().await;
+            let guard = tokio::time::timeout(Self::GRAPH_LOCK_TIMEOUT, self.graph.read())
+                .await
+                .map_err(|_| anyhow::anyhow!(
+                    "Timed out waiting for graph read lock ({}s) — background scanner may be holding the write lock",
+                    Self::GRAPH_LOCK_TIMEOUT.as_secs()
+                ))?;
             if guard.is_some() {
                 let skip_scan = {
                     let last = self.last_scan.lock().unwrap();
@@ -68,7 +85,12 @@ impl RnaHandler {
 
         // Slow path: build or update graph
         {
-            let mut guard = self.graph.write().await;
+            let mut guard = tokio::time::timeout(Self::GRAPH_LOCK_TIMEOUT, self.graph.write())
+                .await
+                .map_err(|_| anyhow::anyhow!(
+                    "Timed out waiting for graph write lock ({}s) — background scanner may be holding the write lock",
+                    Self::GRAPH_LOCK_TIMEOUT.as_secs()
+                ))?;
             if guard.is_none() {
                 // If pre-warm is in progress, wait for it instead of starting
                 // a duplicate build.  Drop the write lock first so the pre-warm
@@ -82,6 +104,8 @@ impl RnaHandler {
                     // call .notified().await, the notification is lost and we
                     // hang forever.  Instead, check the graph periodically and
                     // also listen for the notification as a fast-path wake.
+                    // Bounded by PREWARM_TIMEOUT to avoid indefinite hangs.
+                    let prewarm_deadline = tokio::time::Instant::now() + Self::PREWARM_TIMEOUT;
                     loop {
                         let rg = self.graph.read().await;
                         if rg.is_some() {
@@ -89,6 +113,13 @@ impl RnaHandler {
                             break;
                         }
                         drop(rg);
+                        if tokio::time::Instant::now() >= prewarm_deadline {
+                            tracing::warn!(
+                                "Pre-warm did not finish within {}s — building graph ourselves",
+                                Self::PREWARM_TIMEOUT.as_secs()
+                            );
+                            break;
+                        }
                         // Wait for either the notification or a short timeout,
                         // then re-check.  The timeout ensures we never hang
                         // even if the notification was already sent.
@@ -103,7 +134,7 @@ impl RnaHandler {
                         drop(rg);
                         // Fall through to cooldown + background scanner below.
                     } else {
-                        // Pre-warm failed — build ourselves.
+                        // Pre-warm failed or timed out — build ourselves.
                         drop(rg);
                         let mut wg = self.graph.write().await;
                         if wg.is_none() {

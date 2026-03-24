@@ -168,8 +168,13 @@ impl RnaHandler {
                 // Structure: (root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove)
                 let mut lance_deltas: Vec<LanceDelta> = Vec::new();
 
-                let mut guard = graph.write().await;
-                if let Some(ref mut graph_state) = *guard {
+                // ── Phase 1: brief write lock — apply file-level mutations ──
+                // Hold the write lock only for fast, in-memory state changes
+                // (retain/extend on nodes/edges).  Tool calls block here for
+                // <100ms instead of the 10-30s they used to wait (#574).
+                let snapshot: Option<(Vec<Node>, Vec<Edge>, std::collections::HashSet<String>, std::collections::HashSet<String>)> = {
+                    let mut guard = graph.write().await;
+                    if let Some(ref mut graph_state) = *guard {
                     let registry = ExtractorRegistry::with_builtins();
 
                     // Drop in-memory nodes/edges for removed worktrees.
@@ -264,125 +269,22 @@ impl RnaHandler {
                         ));
                     }
 
-                    // Run post-extraction passes via EventBus (ADR Phase 2b, issue #502).
-                    // Both foreground and background paths now use the same bus-driven
-                    // consumer chain. Satisfies ADR Constraint 4 (no pass calls in src/server/).
-                    {
-                        // Snapshot existing stable_ids before the passes run.
-                        let before_node_ids: std::collections::HashSet<String> =
-                            graph_state.nodes.iter().map(|n| n.stable_id()).collect();
-                        let before_edge_ids: std::collections::HashSet<String> =
-                            graph_state.edges.iter().map(|e| e.stable_id()).collect();
+                    // Snapshot stable_ids before enrichment so we can detect
+                    // net-new nodes/edges from passes (for LanceDB persist).
+                    let before_node_ids: std::collections::HashSet<String> =
+                        graph_state.nodes.iter().map(|n| n.stable_id()).collect();
+                    let before_edge_ids: std::collections::HashSet<String> =
+                        graph_state.edges.iter().map(|e| e.stable_id()).collect();
 
-                        let root_pairs: Vec<(String, std::path::PathBuf)> =
-                            WorkspaceConfig::load()
-                                .with_primary_root(repo_root.clone())
-                                .with_worktrees(&repo_root)
-                                .with_declared_roots(&repo_root)
-                                .resolved_roots()
-                                .into_iter()
-                                .map(|r| (r.slug, r.path))
-                                .collect();
-                        let primary_slug =
-                            RootConfig::code_project(repo_root.clone()).slug();
+                    // Take a snapshot of nodes/edges for the enrichment pipeline.
+                    // The graph retains its current (post-file-change) state so
+                    // concurrent tool-call reads see up-to-date file extraction
+                    // while the slow enrichment runs without the lock.
+                    let snap_nodes = graph_state.nodes.clone();
+                    let snap_edges = graph_state.edges.clone();
 
-                        // Compute dirty_slugs: only roots that had file changes should
-                        // trigger LSP enrichment (#555). `Some(set)` = only those roots.
-                        let dirty_slugs: Option<std::collections::HashSet<String>> = Some(per_root_scans
-                            .iter()
-                            .filter(|(_, scan, _, _)| {
-                                !scan.changed_files.is_empty()
-                                    || !scan.new_files.is_empty()
-                                    || !scan.deleted_files.is_empty()
-                            })
-                            .map(|(slug, _, _, _)| slug.clone())
-                            .collect());
-
-                        // Pipeline invariant: EnrichmentFinalizer always emits PassesComplete.
-                        // If it doesn't (a logic bug), log the error and clear lance_deltas so
-                        // the empty graph is not persisted. The graph remains empty until the
-                        // next full rebuild (next startup or manual `scan --full`).
-                        match crate::extract::consumers::emit_enrichment_pipeline(
-                            std::mem::take(&mut graph_state.nodes),
-                            std::mem::take(&mut graph_state.edges),
-                            root_pairs,
-                            primary_slug.clone(),
-                            repo_root.clone(),
-                            crate::extract::consumers::BusOptions {
-                                scan_stats: Some(Arc::clone(&scan_stats)),
-                                embed_idx: None, // embed handled by background scanner's own reindex pass
-                                lance_repo_root: None, // LanceDB persist handled by background scanner's lance_deltas
-                            },
-                            dirty_slugs,
-                        ).await {
-                            Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
-                                graph_state.nodes = enriched_nodes;
-                                graph_state.edges = enriched_edges;
-                                graph_state.detected_frameworks = detected_frameworks;
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    "Background scanner: post-extraction passes failed \
-                                     (pipeline invariant violated) — aborting tick, \
-                                     no data will be persisted: {:#}",
-                                    e
-                                );
-                                // Clear deltas so nothing bad gets written to LanceDB.
-                                lance_deltas.clear();
-                                // graph_state.nodes/edges are now empty (taken above).
-                                // An empty graph is safe for the subsequent rebuild-index
-                                // and pagerank steps (both are no-ops on an empty set).
-                            }
-                        }
-
-                        // Deduplicate nodes and edges after post-extraction passes.
-                        // Passes re-emit edges that may already be present from cached
-                        // roots; dedup here mirrors the full-build dedup block (6z).
-                        {
-                            let mut seen_nodes = std::collections::HashSet::new();
-                            graph_state.nodes.reverse();
-                            graph_state.nodes.retain(|n| seen_nodes.insert(n.stable_id()));
-                            graph_state.nodes.reverse();
-
-                            let mut seen_edges = std::collections::HashSet::new();
-                            graph_state.edges.retain(|e| seen_edges.insert(e.stable_id()));
-                        }
-
-                        // Collect net-new nodes/edges introduced by the passes.
-                        // These must be persisted to LanceDB so they survive restarts.
-                        let new_nodes: Vec<Node> = graph_state
-                            .nodes
-                            .iter()
-                            .filter(|n| !before_node_ids.contains(&n.stable_id()))
-                            .cloned()
-                            .collect();
-                        let new_edges: Vec<Edge> = graph_state
-                            .edges
-                            .iter()
-                            .filter(|e| !before_edge_ids.contains(&e.stable_id()))
-                            .cloned()
-                            .collect();
-
-                        if !new_nodes.is_empty() || !new_edges.is_empty() {
-                            tracing::info!(
-                                "Post-extraction passes added {} node(s), {} edge(s) to persist delta",
-                                new_nodes.len(),
-                                new_edges.len()
-                            );
-                            // Use repo_root as the path for cross-cutting additions
-                            // (api_link, manifest, etc. are global, not per-root).
-                            lance_deltas.push((
-                                primary_slug,
-                                repo_root.clone(),
-                                new_nodes,
-                                new_edges,
-                                Vec::new(), // no deletions — passes only add
-                                std::collections::HashSet::new(), // no files removed
-                            ));
-                        }
-                    }
-
-                    // Rebuild petgraph index.
+                    // Rebuild index now so reads during enrichment have a
+                    // consistent petgraph index for the post-file-change state.
                     graph_state.index = GraphIndex::new();
                     graph_state.index.rebuild_from_edges(&graph_state.edges);
                     for node in &graph_state.nodes {
@@ -392,21 +294,154 @@ impl RnaHandler {
                         );
                     }
 
-                    // Recompute PageRank importance scores after graph mutation.
-                    let pagerank_scores = graph_state.index.compute_pagerank(0.85, 20);
-                    for node in &mut graph_state.nodes {
-                        if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
-                            node.metadata.insert("importance".to_string(), format!("{:.6}", score));
-                        }
+                        Some((snap_nodes, snap_edges, before_node_ids, before_edge_ids))
+                    } else {
+                        None
                     }
+                    // guard dropped here — write lock released
+                };
 
-                    tracing::info!(
-                        "Background update: {} nodes, {} edges",
-                        graph_state.nodes.len(),
-                        graph_state.edges.len()
-                    );
+                // ── Phase 2: NO lock — run enrichment pipeline ──
+                // This is the expensive part (LSP, post-extraction passes, 10-30s).
+                // Tool calls can read the graph freely during this phase.
+                if let Some((snap_nodes, snap_edges, before_node_ids, before_edge_ids)) = snapshot {
+                    let root_pairs: Vec<(String, std::path::PathBuf)> =
+                        WorkspaceConfig::load()
+                            .with_primary_root(repo_root.clone())
+                            .with_worktrees(&repo_root)
+                            .with_declared_roots(&repo_root)
+                            .resolved_roots()
+                            .into_iter()
+                            .map(|r| (r.slug, r.path))
+                            .collect();
+                    let primary_slug =
+                        RootConfig::code_project(repo_root.clone()).slug();
+
+                    // Compute dirty_slugs: only roots that had file changes should
+                    // trigger LSP enrichment (#555). `Some(set)` = only those roots.
+                    let dirty_slugs: Option<std::collections::HashSet<String>> = Some(per_root_scans
+                        .iter()
+                        .filter(|(_, scan, _, _)| {
+                            !scan.changed_files.is_empty()
+                                || !scan.new_files.is_empty()
+                                || !scan.deleted_files.is_empty()
+                        })
+                        .map(|(slug, _, _, _)| slug.clone())
+                        .collect());
+
+                    // Pipeline invariant: EnrichmentFinalizer always emits PassesComplete.
+                    // If it doesn't (a logic bug), log the error and clear lance_deltas so
+                    // the empty graph is not persisted.
+                    let pipeline_result = crate::extract::consumers::emit_enrichment_pipeline(
+                        snap_nodes,
+                        snap_edges,
+                        root_pairs,
+                        primary_slug.clone(),
+                        repo_root.clone(),
+                        crate::extract::consumers::BusOptions {
+                            scan_stats: Some(Arc::clone(&scan_stats)),
+                            embed_idx: None, // embed handled by background scanner's own reindex pass
+                            lance_repo_root: None, // LanceDB persist handled by background scanner's lance_deltas
+                        },
+                        dirty_slugs,
+                    ).await;
+
+                    // ── Phase 3: brief write lock — merge enrichment results ──
+                    {
+                        let mut guard = graph.write().await;
+                        if let Some(ref mut graph_state) = *guard {
+                            match pipeline_result {
+                                Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
+                                    graph_state.nodes = enriched_nodes;
+                                    graph_state.edges = enriched_edges;
+                                    graph_state.detected_frameworks = detected_frameworks;
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Background scanner: post-extraction passes failed \
+                                         (pipeline invariant violated) — aborting tick, \
+                                         no data will be persisted: {:#}",
+                                        e
+                                    );
+                                    // Clear deltas so nothing bad gets written to LanceDB.
+                                    lance_deltas.clear();
+                                    // graph_state still has its Phase 1 state (post-file-change),
+                                    // which is safe — tool calls can still read it.
+                                }
+                            }
+
+                            // Deduplicate nodes and edges after post-extraction passes.
+                            // Passes re-emit edges that may already be present from cached
+                            // roots; dedup here mirrors the full-build dedup block (6z).
+                            {
+                                let mut seen_nodes = std::collections::HashSet::new();
+                                graph_state.nodes.reverse();
+                                graph_state.nodes.retain(|n| seen_nodes.insert(n.stable_id()));
+                                graph_state.nodes.reverse();
+
+                                let mut seen_edges = std::collections::HashSet::new();
+                                graph_state.edges.retain(|e| seen_edges.insert(e.stable_id()));
+                            }
+
+                            // Collect net-new nodes/edges introduced by the passes.
+                            // These must be persisted to LanceDB so they survive restarts.
+                            let new_nodes: Vec<Node> = graph_state
+                                .nodes
+                                .iter()
+                                .filter(|n| !before_node_ids.contains(&n.stable_id()))
+                                .cloned()
+                                .collect();
+                            let new_edges: Vec<Edge> = graph_state
+                                .edges
+                                .iter()
+                                .filter(|e| !before_edge_ids.contains(&e.stable_id()))
+                                .cloned()
+                                .collect();
+
+                            if !new_nodes.is_empty() || !new_edges.is_empty() {
+                                tracing::info!(
+                                    "Post-extraction passes added {} node(s), {} edge(s) to persist delta",
+                                    new_nodes.len(),
+                                    new_edges.len()
+                                );
+                                // Use repo_root as the path for cross-cutting additions
+                                // (api_link, manifest, etc. are global, not per-root).
+                                lance_deltas.push((
+                                    primary_slug,
+                                    repo_root.clone(),
+                                    new_nodes,
+                                    new_edges,
+                                    Vec::new(), // no deletions — passes only add
+                                    std::collections::HashSet::new(), // no files removed
+                                ));
+                            }
+
+                            // Rebuild petgraph index.
+                            graph_state.index = GraphIndex::new();
+                            graph_state.index.rebuild_from_edges(&graph_state.edges);
+                            for node in &graph_state.nodes {
+                                graph_state.index.ensure_node(
+                                    &node.stable_id(),
+                                    &node.id.kind.to_string(),
+                                );
+                            }
+
+                            // Recompute PageRank importance scores after graph mutation.
+                            let pagerank_scores = graph_state.index.compute_pagerank(0.85, 20);
+                            for node in &mut graph_state.nodes {
+                                if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
+                                    node.metadata.insert("importance".to_string(), format!("{:.6}", score));
+                                }
+                            }
+
+                            tracing::info!(
+                                "Background update: {} nodes, {} edges",
+                                graph_state.nodes.len(),
+                                graph_state.edges.len()
+                            );
+                        }
+                    } // Phase 3 write lock dropped
                 }
-                drop(guard);
 
                 // Persist incremental deltas to LanceDB for each root (lock released above).
                 // Acquire the write mutex to serialize with other LanceDB writers (#344 round 3).
