@@ -132,37 +132,55 @@ fn scan_root(root_slug: &str, root_path: &Path) -> ManifestResult {
     ManifestResult { nodes, edges }
 }
 
-/// Return `root_path` itself plus immediate subdirectories.
+/// Return `root_path` itself plus subdirectories up to `MAX_MANIFEST_DEPTH`
+/// levels deep.
+///
 /// We limit the scan depth to avoid matching vendored/nested copies of manifests
 /// (e.g., `node_modules/foo/package.json`, `vendor/github.com/…/go.mod`).
+/// Depth 2 catches monorepo layouts like `client/package.json` and
+/// `packages/api/pyproject.toml`.
 fn candidate_manifest_dirs(root_path: &Path) -> Vec<PathBuf> {
+    const MAX_MANIFEST_DEPTH: usize = 2;
     let mut dirs = vec![root_path.to_path_buf()];
+    collect_manifest_dirs(root_path, 1, MAX_MANIFEST_DEPTH, &mut dirs);
+    dirs
+}
 
-    if let Ok(rd) = std::fs::read_dir(root_path) {
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                // Skip hidden directories and known vendor/dependency directories.
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with('.')
-                    || name_str == "node_modules"
-                    || name_str == "vendor"
-                    || name_str == "target"
-                    || name_str == "__pycache__"
-                    || name_str == ".venv"
-                    || name_str == "venv"
-                    || name_str == "dist"
-                    || name_str == "build"
-                {
-                    continue;
-                }
-                dirs.push(path);
+/// Recursively collect subdirectories for manifest scanning, up to `max_depth`.
+fn collect_manifest_dirs(dir: &Path, current_depth: usize, max_depth: usize, dirs: &mut Vec<PathBuf>) {
+    if current_depth > max_depth {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return; };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // Skip hidden directories and known vendor/dependency directories.
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if is_manifest_skip_dir(&name_str) {
+                continue;
             }
+            dirs.push(path.clone());
+            collect_manifest_dirs(&path, current_depth + 1, max_depth, dirs);
         }
     }
+}
 
-    dirs
+/// Returns `true` if this directory name should be skipped during manifest scanning.
+fn is_manifest_skip_dir(name: &str) -> bool {
+    name.starts_with('.')
+        || name == "node_modules"
+        || name == "vendor"
+        || name == "target"
+        || name == "__pycache__"
+        || name == ".venv"
+        || name == "venv"
+        || name == "dist"
+        || name == "build"
+        || name == "out"
+        || name == "coverage"
+        || name == ".next"
 }
 
 /// Compute path relative to `base`, falling back to the absolute path.

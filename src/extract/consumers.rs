@@ -644,15 +644,32 @@ impl EnrichmentFinalizer {
         // plain React, Angular, or Vue repos that have no Next.js structure.
         {
             let import_detected = detected_frameworks.contains("nextjs-app-router");
-            let fs_detected = !import_detected && self.root_pairs.iter().any(|(_, root_path)| {
-                root_path.join("pages").is_dir()
-                    || root_path.join("app").is_dir()
-                    || root_path.join("src/pages").is_dir()
-                    || root_path.join("src/app").is_dir()
-                    || root_path.join("next.config.js").exists()
-                    || root_path.join("next.config.ts").exists()
-                    || root_path.join("next.config.mjs").exists()
-            });
+            let fs_detected = !import_detected && (
+                // Check root-level paths (single-root repos)
+                self.root_pairs.iter().any(|(_, root_path)| {
+                    root_path.join("pages").is_dir()
+                        || root_path.join("app").is_dir()
+                        || root_path.join("src/pages").is_dir()
+                        || root_path.join("src/app").is_dir()
+                        || root_path.join("next.config.js").exists()
+                        || root_path.join("next.config.ts").exists()
+                        || root_path.join("next.config.mjs").exists()
+                })
+                // Check node file paths for Next.js patterns (monorepo-aware).
+                // If any extracted node has a file path containing `/app/api/`
+                // or `/pages/api/`, the project likely has a Next.js app in a
+                // subdirectory that the root-level check missed.
+                || all_nodes.iter().any(|n| {
+                    let fp = n.id.file.to_string_lossy();
+                    fp.contains("/app/api/") || fp.contains("/pages/api/")
+                        || fp.starts_with("app/api/") || fp.starts_with("pages/api/")
+                })
+                // Check immediate subdirectories for next.config or app/pages dirs.
+                // This catches monorepo layouts like `client/app/` or `web/next.config.js`.
+                || self.root_pairs.iter().any(|(_, root_path)| {
+                    has_nextjs_in_subdirs(root_path)
+                })
+            );
             if import_detected || fs_detected {
                 let result = crate::extract::nextjs_routing::nextjs_routing_pass(
                     &self.root_pairs,
@@ -735,6 +752,47 @@ impl EnrichmentFinalizer {
 
         Ok(follow_ons)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Next.js monorepo detection helper
+// ---------------------------------------------------------------------------
+
+/// Check immediate subdirectories of `root_path` for Next.js indicators.
+///
+/// In a monorepo, `app/`, `pages/`, or `next.config.*` may live under a
+/// subdirectory like `client/` or `web/` rather than at the root.
+/// This scans one level of subdirectories (skipping vendor/noise dirs).
+fn has_nextjs_in_subdirs(root_path: &std::path::Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(root_path) else { return false; };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.')
+            || name_str == "node_modules"
+            || name_str == "target"
+            || name_str == "dist"
+            || name_str == "build"
+            || name_str == "vendor"
+        {
+            continue;
+        }
+        if path.join("app").is_dir()
+            || path.join("pages").is_dir()
+            || path.join("src/app").is_dir()
+            || path.join("src/pages").is_dir()
+            || path.join("next.config.js").exists()
+            || path.join("next.config.ts").exists()
+            || path.join("next.config.mjs").exists()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
