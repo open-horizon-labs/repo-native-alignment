@@ -429,6 +429,11 @@ impl RnaHandler {
             }
         }
 
+        // Track which roots are freshly extracted (dirty OR cache-miss) and need
+        // LSP enrichment. Clean roots loaded from cache already have LSP edges.
+        let mut freshly_extracted_slugs: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         for (root_slug, scanner, _scan_result, root_path, root_changed) in &scanners {
             if !root_changed {
                 // Clean root: load from pre-indexed cache if available, otherwise extract.
@@ -449,9 +454,10 @@ impl RnaHandler {
                             all_edges.extend(edges);
                             continue;
                         }
-                    // Fall through to full extract if cache had no nodes for this root
+                    // Fall through to full extract if cache had no nodes for this root.
+                    // This root needs LSP enrichment since it has no cached LSP edges.
                     tracing::info!(
-                        "Clean root '{}': no cached nodes found, extracting fresh",
+                        "Clean root '{}': no cached nodes found, extracting fresh (will need LSP enrichment)",
                         root_slug
                     );
                 }
@@ -526,6 +532,9 @@ impl RnaHandler {
                     String::new()
                 }
             );
+
+            // Mark this root as needing LSP enrichment (dirty or cache-miss).
+            freshly_extracted_slugs.insert(root_slug.clone());
 
             all_nodes.extend(extraction.nodes);
             all_edges.extend(extraction.edges);
@@ -622,20 +631,17 @@ impl RnaHandler {
                 .collect();
             let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
 
-            // Compute dirty_slugs: roots that actually changed and need LSP enrichment.
-            // Clean roots loaded from cache already have LSP edges and should not trigger
-            // a new rust-analyzer / LSP server spawn (#555).
-            let dirty_slugs: std::collections::HashSet<String> = scanners
-                .iter()
-                .filter(|(_, _, _, _, root_changed)| *root_changed)
-                .map(|(slug, _, _, _, _)| slug.clone())
-                .collect();
+            // dirty_slugs = roots that were freshly extracted and need LSP enrichment.
+            // This includes both scanner-dirty roots AND clean roots whose cache was
+            // empty (cache-miss). Clean roots loaded from cache already have LSP edges
+            // and should not trigger a new rust-analyzer / LSP server spawn (#555).
             tracing::info!(
                 "dirty_slugs for enrichment pipeline: {:?} ({} of {} roots)",
-                dirty_slugs,
-                dirty_slugs.len(),
+                freshly_extracted_slugs,
+                freshly_extracted_slugs.len(),
                 scanners.len(),
             );
+            let dirty_slugs = freshly_extracted_slugs;
 
             let (enriched_nodes, enriched_edges, detected_frameworks) =
                 crate::extract::consumers::emit_enrichment_pipeline(

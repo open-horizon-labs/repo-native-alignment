@@ -2248,6 +2248,60 @@ mod tests {
         assert!(langs.contains("python"));
     }
 
+    /// Verify LanguageAccumulatorConsumer filters out nodes from clean roots
+    /// when dirty_slugs is non-empty.
+    #[test]
+    fn test_language_accumulator_filters_clean_roots() {
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+
+        fn make_node_with_root(root: &str, lang: &str, name: &str) -> Node {
+            Node {
+                id: NodeId {
+                    root: root.into(),
+                    file: PathBuf::from("test.rs"),
+                    name: name.into(),
+                    kind: NodeKind::Function,
+                },
+                language: lang.into(),
+                line_start: 1,
+                line_end: 10,
+                signature: name.into(),
+                body: String::new(),
+                metadata: BTreeMap::new(),
+                source: ExtractionSource::TreeSitter,
+            }
+        }
+
+        // Two roots: "dirty_root" (dirty) and "clean_root" (not in dirty_slugs).
+        // Both have Rust nodes, but only dirty_root's nodes should trigger LanguageDetected.
+        let event = ExtractionEvent::RootExtracted {
+            slug: "test".into(),
+            path: PathBuf::from("."),
+            nodes: std::sync::Arc::from(vec![
+                make_node_with_root("dirty_root", "rust", "foo"),
+                make_node_with_root("dirty_root", "rust", "bar"),
+                make_node_with_root("clean_root", "rust", "baz"),
+                make_node_with_root("clean_root", "python", "qux"),
+            ].into_boxed_slice()),
+            edges: std::sync::Arc::from([]),
+            dirty_slugs: std::collections::HashSet::from(["dirty_root".to_string()]),
+        };
+
+        let consumer = LanguageAccumulatorConsumer;
+        let follow_ons = consumer.on_event(&event).unwrap();
+
+        // Should only emit LanguageDetected for "rust" (from dirty_root).
+        // "python" from clean_root should be excluded.
+        assert_eq!(follow_ons.len(), 1, "Only dirty-root languages should trigger LanguageDetected");
+        if let ExtractionEvent::LanguageDetected { language, nodes, .. } = &follow_ons[0] {
+            assert_eq!(language, "rust");
+            assert_eq!(nodes.len(), 2, "Only dirty_root rust nodes should be included");
+        } else {
+            panic!("Expected LanguageDetected event");
+        }
+    }
+
     /// Verify LanguageAccumulatorConsumer skips nodes with empty language.
     #[tokio::test]
     async fn test_language_accumulator_skips_empty_language() {
