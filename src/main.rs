@@ -146,11 +146,8 @@ async fn async_main() -> anyhow::Result<()> {
             // in-flight LanceDB I/O tasks, causing JoinError::Cancelled (#560).
             eprintln!("  Embedding {} symbols...", graph.nodes.iter().filter(|n| n.id.root != "external").count());
             handler.await_background_embed().await;
-            let embed_count: usize = match handler.embed_status.footer_segment() {
-                Some(s) if s.contains("embedded") => 1,
-                _ => 0,
-            };
-            let elapsed = t0.elapsed(); eprintln!(); eprintln!("  Symbols: {} | Edges: {} | Embeddings: {} | Time: {:.2}s", graph.nodes.len(), graph.edges.len(), if embed_count > 0 { "yes" } else { "no" }, elapsed.as_secs_f64());
+            let embeddings_available = handler.embed_index.load().is_some();
+            let elapsed = t0.elapsed(); eprintln!(); eprintln!("  Symbols: {} | Edges: {} | Embeddings: {} | Time: {:.2}s", graph.nodes.len(), graph.edges.len(), if embeddings_available { "yes" } else { "no" }, elapsed.as_secs_f64());
             return Ok(());
         }
         Some(Commands::Search(args)) => {
