@@ -27,119 +27,122 @@ use super::store::{
 use super::RnaHandler;
 
 impl RnaHandler {
+    /// Maximum time to wait for pre-warm to finish before falling back to
+    /// building the graph ourselves.
+    const PREWARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
     /// Ensure graph is built, check for file changes since last scan.
-    /// Returns a read guard to the graph.
-    pub(crate) async fn get_graph(&self) -> anyhow::Result<tokio::sync::RwLockReadGuard<'_, Option<GraphState>>> {
+    ///
+    /// Returns an `Arc<GraphState>` loaded via atomic pointer swap (ArcSwap).
+    /// Tool calls never block on a write lock — they always see the last
+    /// complete graph snapshot (#574).
+    pub(crate) async fn get_graph(&self) -> anyhow::Result<Arc<GraphState>> {
         // Fast path: graph exists and scan cooldown hasn't expired.
-        // We carry both the scan result AND the scanner forward so the caller
-        // can commit scanner state only after successful graph processing.
-        let pending: Option<(ScanResult, Scanner)> = {
-            let guard = self.graph.read().await;
-            if guard.is_some() {
-                let skip_scan = {
-                    let last = self.last_scan.lock().unwrap();
-                    last.elapsed() < std::time::Duration::from_secs(2)
-                };
-                if skip_scan {
-                    return Ok(guard);
-                }
-
-                // Check for changes via scanner
-                let mut scanner = Scanner::new(self.repo_root.clone())?;
-                let scan = scanner.scan()?;
-                if scan.changed_files.is_empty()
-                    && scan.new_files.is_empty()
-                    && scan.deleted_files.is_empty()
-                {
-                    // No changes -- safe to commit state (records current mtimes)
-                    scanner.commit_state()?;
-                    // Update cooldown timestamp
-                    *self.last_scan.lock().unwrap() = std::time::Instant::now();
-                    return Ok(guard);
-                }
-                // Changes detected -- carry scan + scanner forward
-                drop(guard);
-                Some((scan, scanner))
-            } else {
-                drop(guard);
-                None
+        // ArcSwap load is an atomic pointer read — zero blocking.
+        let current = self.graph.load_full();
+        if let Some(ref gs) = *current {
+            let skip_scan = {
+                let last = self.last_scan.lock().unwrap();
+                last.elapsed() < std::time::Duration::from_secs(2)
+            };
+            if skip_scan {
+                return Ok(Arc::clone(gs));
             }
-        };
 
-        // Slow path: build or update graph
-        {
-            let mut guard = self.graph.write().await;
-            if guard.is_none() {
-                // If pre-warm is in progress, wait for it instead of starting
-                // a duplicate build.  Drop the write lock first so the pre-warm
-                // task can acquire it to store its result.
-                if self.prewarm_started.load(std::sync::atomic::Ordering::Relaxed) {
-                    drop(guard);
-                    tracing::info!("Waiting for pre-warm to finish...");
-                    // Poll until the graph is populated or pre-warm fails.
-                    // We cannot use Notify alone because notify_waiters() is
-                    // fire-and-forget: if the pre-warm completes before we
-                    // call .notified().await, the notification is lost and we
-                    // hang forever.  Instead, check the graph periodically and
-                    // also listen for the notification as a fast-path wake.
-                    loop {
-                        let rg = self.graph.read().await;
-                        if rg.is_some() {
-                            drop(rg);
-                            break;
-                        }
-                        drop(rg);
-                        // Wait for either the notification or a short timeout,
-                        // then re-check.  The timeout ensures we never hang
-                        // even if the notification was already sent.
-                        tokio::select! {
-                            _ = self.prewarm_notify.notified() => {}
-                            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
-                        }
-                    }
-                    // Re-check: pre-warm should have populated the graph.
-                    let rg = self.graph.read().await;
-                    if rg.is_some() {
-                        drop(rg);
-                        // Fall through to cooldown + background scanner below.
-                    } else {
-                        // Pre-warm failed — build ourselves.
-                        drop(rg);
-                        let mut wg = self.graph.write().await;
-                        if wg.is_none() {
-                            *wg = Some(self.build_full_graph().await?);
-                        }
-                    }
-                } else {
-                    // No pre-warm in progress — build from scratch.
-                    *guard = Some(self.build_full_graph().await?);
-                }
-            } else {
-                // Incremental update -- pass the already-completed scan so we
-                // don't re-scan. Scanner state is committed only after success.
-                let (scan, scanner) = match pending {
-                    Some(p) => (Some(p.0), Some(p.1)),
-                    None => (None, None),
-                };
-                let graph = guard.as_mut().unwrap();
-                self.update_graph_with_scan(graph, scan, true).await?;
-                // Graph update succeeded -- now persist scanner state
-                if let Some(scanner) = scanner {
+            // Check for changes via scanner
+            let mut scanner = Scanner::new(self.repo_root.clone())?;
+            let scan = scanner.scan()?;
+            if scan.changed_files.is_empty()
+                && scan.new_files.is_empty()
+                && scan.deleted_files.is_empty()
+            {
+                // No changes -- safe to commit state (records current mtimes)
+                scanner.commit_state()?;
+                *self.last_scan.lock().unwrap() = std::time::Instant::now();
+                return Ok(Arc::clone(gs));
+            }
+
+            // Changes detected: clone current graph, apply incremental update,
+            // then atomic-swap the new version in. Serialized by graph_build_lock
+            // to prevent duplicate concurrent updates.
+            let _build_guard = self.graph_build_lock.lock().await;
+            // Re-check after acquiring lock — another call may have already updated.
+            let current2 = self.graph.load_full();
+            if let Some(ref gs2) = *current2 {
+                if !Arc::ptr_eq(gs, gs2) {
+                    // Graph was updated while we waited for the lock.
                     scanner.commit_state()?;
+                    *self.last_scan.lock().unwrap() = std::time::Instant::now();
+                    return Ok(Arc::clone(gs2));
                 }
+            }
+            let mut new_state = (**gs).clone();
+            self.update_graph_with_scan(&mut new_state, Some(scan), true).await?;
+            scanner.commit_state()?;
+            let new_arc = Arc::new(new_state);
+            self.graph.store(Arc::new(Some(Arc::clone(&new_arc))));
+            *self.last_scan.lock().unwrap() = std::time::Instant::now();
+
+            // Start background scanner (once) to keep index warm
+            if !self.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                self.spawn_background_scanner();
+            }
+            return Ok(new_arc);
+        }
+
+        // Slow path: no graph exists yet.
+        // If pre-warm is in progress, wait for it instead of building a duplicate.
+        if self.prewarm_started.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!("Waiting for pre-warm to finish...");
+            let prewarm_deadline = tokio::time::Instant::now() + Self::PREWARM_TIMEOUT;
+            loop {
+                let snap = self.graph.load_full();
+                if snap.is_some() {
+                    break;
+                }
+                if tokio::time::Instant::now() >= prewarm_deadline {
+                    tracing::warn!(
+                        "Pre-warm did not finish within {}s — building graph ourselves",
+                        Self::PREWARM_TIMEOUT.as_secs()
+                    );
+                    break;
+                }
+                tokio::select! {
+                    _ = self.prewarm_notify.notified() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                }
+            }
+            // Re-check after waiting.
+            let snap = self.graph.load_full();
+            if let Some(ref gs) = *snap {
+                *self.last_scan.lock().unwrap() = std::time::Instant::now();
+                if !self.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    self.spawn_background_scanner();
+                }
+                return Ok(Arc::clone(gs));
             }
         }
 
-        // Update cooldown timestamp
-        *self.last_scan.lock().unwrap() = std::time::Instant::now();
+        // Build from scratch, serialized to prevent duplicate builds.
+        let _build_guard = self.graph_build_lock.lock().await;
+        // Re-check: another call may have built it while we waited.
+        let snap = self.graph.load_full();
+        if let Some(ref gs) = *snap {
+            *self.last_scan.lock().unwrap() = std::time::Instant::now();
+            if !self.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                self.spawn_background_scanner();
+            }
+            return Ok(Arc::clone(gs));
+        }
 
-        // Start background scanner (once) to keep index warm
+        let new_state = self.build_full_graph().await?;
+        let new_arc = Arc::new(new_state);
+        self.graph.store(Arc::new(Some(Arc::clone(&new_arc))));
+        *self.last_scan.lock().unwrap() = std::time::Instant::now();
         if !self.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
             self.spawn_background_scanner();
         }
-
-        // Downgrade to read lock
-        Ok(self.graph.read().await)
+        Ok(new_arc)
     }
 
     /// Build the full graph from scratch. This is the original get_graph logic.

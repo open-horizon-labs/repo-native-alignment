@@ -11,6 +11,7 @@ use crate::graph::index::GraphIndex;
 /// In-memory graph state: extraction results + petgraph index + embedding index.
 /// Lazily initialized on first tool call. Embeddings are built as part of the
 /// graph pipeline — not as a separate lazy init that races with graph building.
+#[derive(Clone)]
 pub struct GraphState {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
