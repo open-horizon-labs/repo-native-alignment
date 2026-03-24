@@ -495,13 +495,9 @@ impl RnaHandler {
             };
             let (mut extraction, enc_stats) = registry.extract_scan_result_with_stats(root_path, &full_scan);
 
-            // Record encoding stats for this root in shared ScanStats.
+            // Record encoding stats for this root (full scan: replace totals).
             if let Ok(mut stats) = self.scan_stats.write() {
-                if enc_stats.binary_skipped > 0 || enc_stats.lossy_decoded > 0 {
-                    stats.encoding_stats.insert(root_slug.clone(), enc_stats);
-                } else {
-                    stats.encoding_stats.remove(root_slug);
-                }
+                stats.set_encoding_stats(root_slug, enc_stats);
             }
 
             for node in &mut extraction.nodes {
@@ -1103,13 +1099,9 @@ impl RnaHandler {
         // pattern in build_full_graph and the background scanner.
         let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
 
-        // Record encoding stats for this root in shared ScanStats.
+        // Merge encoding stats (incremental scan: add to existing totals).
         if let Ok(mut stats) = self.scan_stats.write() {
-            if enc_stats.binary_skipped > 0 || enc_stats.lossy_decoded > 0 {
-                stats.encoding_stats.insert(primary_slug.clone(), enc_stats);
-            } else {
-                stats.encoding_stats.remove(&primary_slug);
-            }
+            stats.merge_encoding_stats(&primary_slug, &enc_stats);
         }
         for node in &mut extraction.nodes {
             node.id.root = primary_slug.clone();

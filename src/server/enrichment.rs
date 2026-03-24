@@ -230,13 +230,9 @@ impl RnaHandler {
                         });
                         let (mut extraction, enc_stats) = registry.extract_scan_result_with_stats(root_path, scan);
 
-                        // Record encoding stats for this root in shared ScanStats.
+                        // Merge encoding stats (incremental scan: add to existing totals).
                         if let Ok(mut stats) = scan_stats.write() {
-                            if enc_stats.binary_skipped > 0 || enc_stats.lossy_decoded > 0 {
-                                stats.encoding_stats.insert(root_slug.clone(), enc_stats);
-                            } else {
-                                stats.encoding_stats.remove(root_slug);
-                            }
+                            stats.merge_encoding_stats(root_slug, &enc_stats);
                         }
 
                         for node in &mut extraction.nodes {

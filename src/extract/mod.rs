@@ -86,6 +86,11 @@ use crate::graph::index::GraphIndex;
 ///   excluding TAB, LF, CR) -> binary.
 ///
 /// Everything else is treated as (possibly wrong-encoded) text.
+///
+/// **Known limitation:** UTF-16/UTF-32 encoded files contain null bytes as part
+/// of their encoding and will be classified as binary. This is acceptable because
+/// tree-sitter parsers expect UTF-8 input and cannot parse UTF-16/UTF-32 content
+/// even if decoded. UTF-16 source files are vanishingly rare in practice.
 fn is_binary_content(bytes: &[u8]) -> bool {
     let sample = &bytes[..bytes.len().min(8192)];
     if sample.is_empty() {
@@ -123,6 +128,19 @@ pub struct EncodingStats {
     pub binary_skipped: usize,
     /// Text files with non-UTF-8 encoding that were lossy-decoded.
     pub lossy_decoded: usize,
+}
+
+impl EncodingStats {
+    /// Returns true if both counts are zero (no encoding issues).
+    pub fn is_empty(&self) -> bool {
+        self.binary_skipped == 0 && self.lossy_decoded == 0
+    }
+
+    /// Merge another stats into this one (additive).
+    pub fn merge(&mut self, other: &EncodingStats) {
+        self.binary_skipped += other.binary_skipped;
+        self.lossy_decoded += other.lossy_decoded;
+    }
 }
 
 impl ExtractionResult {

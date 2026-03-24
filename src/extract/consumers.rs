@@ -149,15 +149,11 @@ impl ExtractionConsumer for TreeSitterConsumer {
         }
 
         // Propagate encoding stats to ScanStats if we have a handle.
-        // Always write (even zeros) to clear stale entries from prior scans.
+        // Full extraction: replace root totals (this scanned every file).
         if let Some(ref stats_handle) = self.scan_stats
             && let Ok(mut stats) = stats_handle.write()
         {
-            if enc_stats.binary_skipped > 0 || enc_stats.lossy_decoded > 0 {
-                stats.encoding_stats.insert(slug.clone(), enc_stats);
-            } else {
-                stats.encoding_stats.remove(slug);
-            }
+            stats.set_encoding_stats(slug, enc_stats);
         }
 
         tracing::info!(

@@ -124,6 +124,28 @@ impl ScanStats {
         self.roots_queued > 0
             && !self.roots_complete.contains_key(slug)
     }
+
+    /// Replace encoding stats for a root (used by full-scan paths that process
+    /// every file and produce a complete picture).
+    pub fn set_encoding_stats(&mut self, slug: &str, stats: crate::extract::EncodingStats) {
+        if stats.is_empty() {
+            self.encoding_stats.remove(slug);
+        } else {
+            self.encoding_stats.insert(slug.to_string(), stats);
+        }
+    }
+
+    /// Merge encoding stats from an incremental scan into the existing totals
+    /// for a root. Adds the delta counts to whatever is already stored.
+    pub fn merge_encoding_stats(&mut self, slug: &str, delta: &crate::extract::EncodingStats) {
+        if delta.is_empty() {
+            return;
+        }
+        self.encoding_stats
+            .entry(slug.to_string())
+            .or_default()
+            .merge(delta);
+    }
 }
 
 // ---------------------------------------------------------------------------
