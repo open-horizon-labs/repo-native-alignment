@@ -1,6 +1,6 @@
 # Extractor Contribution Guide
 
-RNA extracts symbols, imports, and topology edges from 22 languages via tree-sitter, then runs a set of post-extraction passes to enrich the graph with framework-aware edges (pub/sub boundaries, gRPC call chains, API links, etc.).
+RNA extracts symbols, imports, and topology edges from 30 file types (22 code languages + 4 config formats + 4 schema/doc formats) via tree-sitter, then runs a set of event-driven consumers to enrich the graph with framework-aware edges (pub/sub boundaries, gRPC call chains, API links, etc.).
 
 This document covers how to add new extraction capability — whether that is a framework-specific enrichment pass built into RNA, a repo-specific config file, or a new framework detection rule.
 
@@ -47,12 +47,12 @@ Do you just want RNA to recognise a framework from imports (no edges yet)?
 
 ### Pattern overview
 
-Every built-in enrichment step is a `PostExtractionPass` implementor registered in `PostExtractionRegistry::with_builtins()`. The registry runs all passes in order after tree-sitter extraction completes.
+Every built-in enrichment step is an `ExtractionConsumer` registered in `build_builtin_bus()` (`src/extract/consumers.rs`). The EventBus dispatches events depth-first; framework-gated consumers subscribe to `FrameworkDetected` or `PassesComplete` events.
 
 ```
 src/extract/
   your_framework.rs     ← new file: implements the pass logic
-  post_extraction.rs    ← register YourFrameworkPass in with_builtins()
+  consumers.rs          ← register YourFrameworkConsumer in build_builtin_bus()
   framework_detection.rs ← add detection rule if framework not yet detected
 ```
 
@@ -98,56 +98,53 @@ Key conventions:
 - Use `Confidence::Detected` for heuristic matches. Reserve `Confidence::Confirmed` for LSP-verified edges.
 - Return `Vec<Edge>` (or an `ExtractionResult` if you also emit nodes).
 
-**2. Add a pass struct in `post_extraction.rs`**
+**2. Add a consumer struct in `consumers.rs`**
 
-Open `src/extract/post_extraction.rs`. Add a new struct and its `PostExtractionPass` impl in the "Built-in pass implementations" section:
+Open `src/extract/consumers.rs`. Add a new struct and its `ExtractionConsumer` impl:
 
 ```rust
-// --- YourFrameworkPass ---
+// --- YourFrameworkConsumer ---
 
-struct YourFrameworkPass;
+pub struct YourFrameworkConsumer;
 
-impl PostExtractionPass for YourFrameworkPass {
+impl ExtractionConsumer for YourFrameworkConsumer {
     fn name(&self) -> &str { "your_framework" }
 
-    fn applies_when(&self, detected_frameworks: &HashSet<String>) -> bool {
-        crate::extract::your_framework::should_run(detected_frameworks)
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::PassesComplete]
     }
 
-    fn run(&self, nodes: &mut Vec<Node>, edges: &mut Vec<Edge>, _ctx: &PassContext) -> PassResult {
-        let new_edges = crate::extract::your_framework::your_framework_pass(nodes);
-        if !new_edges.is_empty() {
-            edges.extend(new_edges);
+    fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::PassesComplete { nodes, edges, detected_frameworks, .. } = event else {
+            return Ok(vec![]);
+        };
+        if !crate::extract::your_framework::should_run(detected_frameworks) {
+            return Ok(vec![]);
         }
-        PassResult::empty()
+        let new_edges = crate::extract::your_framework::your_framework_pass(nodes);
+        // Return updated PassesComplete with new edges appended
+        // ...
+        Ok(vec![])
     }
 }
 ```
 
-**3. Register in `with_builtins()`**
+**3. Register in `build_builtin_bus()`**
 
-Still in `post_extraction.rs`, add your pass to `with_builtins()` in Group 3 (framework-gated passes — after `FrameworkDetectionPass`):
+Still in `consumers.rs`, add your consumer to `build_builtin_bus()` in the framework-gated section (after `FrameworkDetectionConsumer`):
 
 ```rust
-pub fn with_builtins() -> Self {
-    let mut reg = Self::new();
-    // Group 1: unconditional passes
-    // ...
-    // Group 2: framework detection — MUST run before any framework-gated pass
-    reg.register(Box::new(FrameworkDetectionPass));
-    // Group 3: framework-gated passes
-    reg.register(Box::new(NextjsRoutingPass));
-    reg.register(Box::new(PubSubPass));
-    reg.register(Box::new(WebSocketPass));
-    reg.register(Box::new(GrpcClientCallsPass));
-    reg.register(Box::new(YourFrameworkPass));  // <-- add here
-    // Group 4: config-driven passes
-    reg.register(Box::new(ExtractorConfigPass));
-    reg
-}
+// --- FrameworkDetected consumers ---
+bus.register(Box::new(FrameworkDetectionConsumer));
+bus.register(Box::new(FastapiRouterPrefixConsumer));
+bus.register(Box::new(SdkPathInferenceConsumer));
+bus.register(Box::new(NextjsRoutingConsumer::new(root_pairs)));
+bus.register(Box::new(PubSubConsumer));
+bus.register(Box::new(WebSocketConsumer));
+bus.register(Box::new(YourFrameworkConsumer));  // <-- add here
 ```
 
-**Critical ordering invariant:** framework-gated passes MUST be registered after `FrameworkDetectionPass`. A gated pass registered before framework detection sees an empty `detected_frameworks` set and silently skips every time.
+**Critical ordering invariant:** framework-gated consumers MUST be registered after `FrameworkDetectionConsumer`. A gated consumer registered before framework detection sees an empty `detected_frameworks` set and silently skips every time.
 
 **4. Add the module to `src/extract/mod.rs`**
 
@@ -450,7 +447,7 @@ See `src/extract/extractor_config.rs` tests for the full pattern including adver
 
 ### Integration test a config extractor
 
-The test suite has filesystem-based tests in `src/extract/post_extraction.rs` that write real `.oh/extractors/` files to `TempDir` and run `ExtractorConfigPass::run()`. These verify:
+The test suite has filesystem-based tests in `src/extract/extractor_config.rs` that write real `.oh/extractors/` files to `TempDir` and run the config extractor. These verify:
 
 - Per-root isolation (configs from root A don't affect root B).
 - Missing directory is a no-op.
@@ -519,18 +516,18 @@ Config extractors (`ExtractorConfigPass`) always run regardless of `detected_fra
 
 ## Language extractor reference
 
-RNA includes 22 language extractors that run via tree-sitter to produce symbols, import graphs, and topology edges.
+RNA includes 30 extractors that run via tree-sitter to produce symbols, import graphs, and topology edges.
 
 ### Supported languages
 
-- **Code** — Rust, Python, TypeScript/TSX, JavaScript/JSX, Go, Java, Bash, Ruby, C++, C#, Kotlin, Zig, Lua, Swift
+- **Code** — Rust, Python, TypeScript/TSX, JavaScript/JSX, Go, Java, Bash, Ruby, C++, C, C#, Kotlin, Zig, Lua, Swift, Elixir, Scala, Dart, PHP, HTML, GraphQL, Dockerfile
 - **Config & infra** — HCL/Terraform, JSON, TOML, YAML (Kubernetes manifests detected automatically)
 - **Docs & schema** — Markdown (heading-aware), .proto, SQL, OpenAPI
 - **Architecture** — subprocess, network, async boundaries detected as topology edges (Rust extractor)
 
 ### Constants and literals (cross-language)
 
-All 22 extractors index constants and literal values. `search_symbols` returns the value inline:
+All 30 extractors index constants and literal values. `search_symbols` returns the value inline:
 
 ```
 - const MAX_RETRIES (rust) src/config.rs:12  Value: `5`

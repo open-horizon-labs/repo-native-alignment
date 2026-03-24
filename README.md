@@ -278,7 +278,7 @@ See the [full comparison](docs/compared-to.md) for details.
 |---|---|---|---|---|
 | **Install** | Single binary | Docker + Memgraph + API key | pip + graph DB | `pip install mcp-server-serena` |
 | **External deps** | None | Docker, Memgraph, LLM API | Graph DB (KuzuDB/Neo4j) | None (language servers auto-downloaded) |
-| **Languages** | Tree-sitter + LSP | Tree-sitter only | Tree-sitter only | 30+ via LSP |
+| **Languages** | 30 extractors + 38 LSP servers | Tree-sitter only | Tree-sitter only | 30+ via LSP |
 | **Embeddings** | MiniLM-L6-v2 on Metal GPU | UniXcoder | None | None |
 | **Business context** | Outcomes, signals, guardrails, metis | None | None | Agent memories (auto-accumulated, not curated outcomes) |
 
@@ -291,9 +291,9 @@ RNA works standalone. These add organizational context and workflow structure:
 
 ## Status
 
-4 MCP tools, 11 CLI subcommands. Extracts symbols from 22 languages, builds a call graph via language server analysis, detects architectural subsystems and frameworks automatically.
+4 MCP tools, 11 CLI subcommands. 30 tree-sitter extractors (22 code languages + 4 config + 4 schema), 38 auto-detected LSP servers, event-driven pipeline, automatic subsystem and framework detection.
 
-**v0.1.15 (current):** EventBus/consumer architecture, parallel LSP enrichment, config-driven extractors (`.oh/extractors/*.toml`), live scan stats in `list_roots`, worktree own-cache detection, FastAPI router prefix resolution.
+**v0.1.15 (current):** EventBus/consumer architecture, async bus, dirty-slugs incremental enrichment, monorepo-aware extraction (Next.js routing), content-addressed per-consumer cache, framework detection consumers, subsystem consumers, adaptive LSP wait, 8 new language extractors (C, PHP, HTML, Scala, Dart, Elixir, GraphQL, Dockerfile), config-driven extractors (`.oh/extractors/*.toml`), live scan stats in `list_roots`, worktree own-cache detection, FastAPI router prefix resolution, SDK path inference, OpenAPI SDK link pass.
 
 ### Platform Support
 
@@ -312,6 +312,6 @@ MIT — see [LICENSE](LICENSE).
 - [Compared To](docs/compared-to.md) — RNA vs Code-Graph-RAG, CodeGraphContext
 - [Extractors](docs/extractors.md) — tree-sitter language extractors, constants, synthetic literals
 - [LSP Enrichment](docs/lsp-enrichment.md) — auto-detected language servers
-- [Scanner](docs/scanner.md) — incremental, event-driven, worktree-aware scanning
+- [Scanner](docs/scanner.md) — incremental, event-driven, worktree-aware scanning, dirty-slugs optimization
 - [Graph Architecture](docs/graph.md) — edge types, persistence, in-memory index
 - [Source Compatibility](docs/rna-source-compatibility.md) — source-capability design for future Context Assembler integration

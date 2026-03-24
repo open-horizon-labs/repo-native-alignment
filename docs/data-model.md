@@ -53,7 +53,7 @@ Stores code symbols (functions, structs, traits, enums, etc.) and other node typ
 | `diagnostic_timestamp` | UTF8 | yes | Unix timestamp (seconds) when diagnostic was captured |
 | `http_method` | UTF8 | yes | HTTP verb — only for `NodeKind::ApiEndpoint` nodes (e.g., `"GET"`, `"POST"`) |
 | `http_path` | UTF8 | yes | HTTP path pattern — only for `ApiEndpoint` nodes (e.g., `"/users/{id}"`) |
-| `vector` | FixedSizeList(Float32, dim) | yes | Semantic embedding vector. Dimension depends on the model (384 for BGE-small-en-v1.5). Present only after embeddings are computed; absent in the base schema. Added by `symbols_schema_with_vector(dim)`. |
+| `vector` | FixedSizeList(Float32, dim) | yes | Semantic embedding vector. Dimension depends on the model (384 for MiniLM-L6-v2). Present only after embeddings are computed; absent in the base schema. Added by `symbols_schema_with_vector(dim)`. |
 | `updated_at` | Int64 | no | Unix timestamp (seconds) of last write |
 
 **FTS index:** An FTS (BM25) index is created on `name` after each full persist. This enables keyword search over symbol names.
@@ -274,6 +274,9 @@ The stable edge ID is `from_stable_id->kind->to_stable_id`. Edges are directiona
 | `TestedBy` | `tested_by` | test fn → production fn | Test function covers production code |
 | `BelongsTo` | `belongs_to` | symbol → module | Symbol belongs to a module |
 | `ReExports` | `re_exports` | module → symbol | Public re-export (`pub use`, `__all__`) |
+| `UsesFramework` | `uses_framework` | subsystem/symbol → framework node | A subsystem or symbol uses a detected framework |
+| `Produces` | `produces` | producer → channel | A symbol/handler produces events to a channel/topic |
+| `Consumes` | `consumes` | consumer → channel | A symbol/handler consumes events from a channel/topic |
 
 **PageRank weights by edge kind** (used for importance scoring):
 
@@ -283,7 +286,8 @@ The stable edge ID is `from_stable_id->kind->to_stable_id`. Edges are directiona
 | Implements | 0.8 |
 | DependsOn, ReferencedBy, References | 0.5 |
 | TestedBy, BelongsTo, ReExports, ConnectsTo | 0.2–0.3 |
-| Defines, HasField | 0.1 |
+| Produces, Consumes | 0.4 |
+| Defines, HasField, UsesFramework | 0.1 |
 | Evolves, TopologyBoundary, Modified, Affected, Serves | 0.05 |
 
 ### Confidence
@@ -337,46 +341,68 @@ build_full_graph_inner
 EventBus.emit_all(RootDiscovered { slug, path })
         |
         v
+ScanStatsConsumer (subscribes: all event kinds — registered first)
+  -- maintains live ScanStats for list_roots queries (no file I/O)
+
+ManifestConsumer (subscribes: RootDiscovered)
+  -- reads package.json/Cargo.toml for dependency edges
+
 TreeSitterConsumer (subscribes: RootDiscovered)
   -- rayon parallel per-file extraction --
-  -- fires: RootExtracted { slug, nodes, edges }
+  -- fires: RootExtracted { slug, nodes, edges, dirty_slugs }
         |
         v
 LanguageAccumulatorConsumer (subscribes: RootExtracted)
-  -- groups nodes by detected language --
+  -- groups nodes by detected language, filtered by dirty_slugs --
   -- fires: LanguageDetected { slug, language, nodes } (once per language)
-        |
-        v
-LspConsumer × N (subscribes: LanguageDetected)
-  -- runs real LSP enricher for each language concurrently --
-  -- fires: EnrichmentComplete { slug, language, added_edges, new_nodes, updated_nodes }
 
 AllEnrichmentsGate (subscribes: RootExtracted + EnrichmentComplete)
   -- counts expected vs received enrichments --
-  -- when counts match, fires: AllEnrichmentsDone { slug, nodes, edges, lsp_edges, lsp_nodes, updated_nodes }
+  -- registered before LspConsumers so it captures language count first
+
+OpenApiConsumer (subscribes: RootExtracted)
+  -- bidirectional endpoint → handler linking
+
+GrpcConsumer (subscribes: RootExtracted)
+  -- proto RPC → caller stub matching
+
+EmbeddingIndexerConsumer (subscribes: RootExtracted)
+  -- streams embed tasks in parallel with LSP enrichment --
+  -- re-embeds nodes whose text_hash changed
         |
         v
-PostExtractionConsumer (subscribes: AllEnrichmentsDone)
-  -- runs PostExtractionRegistry passes over full LSP-enriched graph --
+LspConsumer × N (subscribes: LanguageDetected)
+  -- one consumer per language, 38 servers auto-detected --
+  -- adaptive wait (serverStatus/quiescent or probe, 10-min circuit breaker) --
+  -- fires: EnrichmentComplete { slug, language, added_edges, new_nodes, updated_nodes }
+
+AllEnrichmentsGate fires: AllEnrichmentsDone { slug, nodes, edges, lsp_edges, lsp_nodes }
+        |
+        v
+ApiLinkConsumer (subscribes: AllEnrichmentsDone)
+TestedByConsumer (subscribes: AllEnrichmentsDone)
+EnrichmentFinalizer (subscribes: AllEnrichmentsDone)
+  -- runs post-extraction passes over full LSP-enriched graph --
   -- fires: PassesComplete { slug, nodes, edges, detected_frameworks }
-  -- may fire: FrameworkDetected { framework, nodes } (one per detected framework)
         |
         v
-SubsystemConsumer (subscribes: PassesComplete)
-  -- Louvain community detection, PageRank --
-  -- updates node.metadata["subsystem"] and node.metadata["importance"]
+FrameworkDetectionConsumer (subscribes: PassesComplete)
+  -- may fire: FrameworkDetected { framework, nodes } (one per detected framework)
+
+FastapiRouterPrefixConsumer (subscribes: PassesComplete)
+SdkPathInferenceConsumer (subscribes: PassesComplete)
+NextjsRoutingConsumer (subscribes: PassesComplete) — monorepo-aware
+PubSubConsumer (subscribes: PassesComplete)
+WebSocketConsumer (subscribes: PassesComplete)
         |
         v
 LanceDBConsumer (subscribes: PassesComplete)
   -- background persist: persist_graph_to_lance or persist_graph_incremental
 
-EmbeddingIndexerConsumer (subscribes: RootExtracted)
-  -- streams embed tasks in parallel with LSP enrichment --
-  -- re-embeds nodes whose text_hash changed
-
-ScanStatsConsumer (subscribes: all five event kinds)
-  -- maintains live ScanStats for list_roots queries (no file I/O)
-
+SubsystemConsumer (subscribes: CommunityDetectionComplete)
+  -- Louvain community detection, PageRank --
+  -- updates node.metadata["subsystem"] and node.metadata["importance"]
+        |
         v
 MCP tool call (e.g., search, repo_map, list_roots)
         |
@@ -566,3 +592,13 @@ pub struct ScanStats {
 `AllEnrichmentsGate` (defined in `src/extract/consumers.rs`) subscribes to both `RootExtracted` (to count expected languages) and `EnrichmentComplete` (to count completions). When all expected enrichments are received for a root, it emits `AllEnrichmentsDone { slug, nodes, edges, lsp_edges, lsp_nodes, updated_nodes }`.
 
 `PostExtractionConsumer` subscribes to `AllEnrichmentsDone` so post-extraction passes see the full LSP-enriched graph — not just the tree-sitter output. This replaces the former sequential pipeline where passes ran before LSP enrichment was available.
+
+### dirty_slugs on RootExtracted
+
+The `RootExtracted` event carries an `Option<HashSet<String>>` field called `dirty_slugs`:
+
+- `None` — all roots are dirty (first-run or cache-hit LSP paths where no prior LSP edges exist). All downstream consumers process all nodes.
+- `Some(set)` — only the listed root slugs have changed files. Consumers like `LanguageAccumulatorConsumer` filter nodes to only emit `LanguageDetected` events for languages with nodes in dirty roots, avoiding redundant LSP enrichment on unchanged roots.
+- `Some(empty set)` — no roots are dirty. Downstream consumers may short-circuit entirely.
+
+The `dirty_slugs` value is included in `canonical_bytes()` for cache key computation, so different dirty sets produce different cache keys and consumers are re-invoked appropriately.

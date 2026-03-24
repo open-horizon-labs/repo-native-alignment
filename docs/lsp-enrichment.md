@@ -11,7 +11,29 @@ RNA auto-discovers installed language servers and enriches the graph with cross-
 
 The result: `graph_query(mode: "impact", from: "my_fn")` shows the blast radius of a change, following call chains discovered by the language server.
 
-## 37 Auto-detected Language Servers
+## Pipeline Integration
+
+LSP enrichment runs as per-language `LspConsumer` instances in the EventBus pipeline. Each consumer subscribes to `LanguageDetected` events and fires `EnrichmentComplete` when done.
+
+### Adaptive Wait (#544)
+
+LSP servers need time after `initialized` to index the workspace. RNA uses an adaptive strategy with no fixed timeout:
+
+1. If the server sends `experimental/serverStatus`, RNA waits indefinitely for `quiescent=true`. This is the correct signal -- pyright on large repos may need minutes.
+2. If `serverStatus` never arrives (e.g., typescript-language-server), RNA probes every 5s with a lightweight `workspace/symbol` request until the server responds successfully.
+3. A 10-minute circuit breaker applies in both cases -- not a normal timeout, just a safety net for servers that never become ready.
+
+Progress is logged every 30s so long-running indexing is observable.
+
+### Cache-Hit Bus Routing (#547)
+
+When the EventBus content-addressed cache has a hit for an LSP consumer (same input event payload + same consumer version), the consumer's `on_event` is not called. Instead, the cached follow-on events are replayed directly. This means unchanged code roots skip LSP enrichment entirely on incremental scans.
+
+### Dirty-Slugs Filtering (#557)
+
+The `RootExtracted` event carries `dirty_slugs: Option<HashSet<String>>`. The `LanguageAccumulatorConsumer` uses this to emit `LanguageDetected` events only for languages with nodes in dirty roots. LSP consumers for unchanged roots are never invoked.
+
+## 38 Auto-detected Language Servers
 
 ### Common Servers (install for richer graphs)
 
@@ -24,7 +46,7 @@ The result: `graph_query(mode: "impact", from: "my_fn")` shows the blast radius 
 | C/C++ | clangd | ships with LLVM / `brew install llvm` |
 | Markdown | marksman | `brew install marksman` |
 
-Plus 31 more: Ruby (solargraph), Java (jdtls), Kotlin, Lua, Zig, Elixir, Haskell, OCaml, Scala, Dart, PHP, Swift, Nix, Terraform, TOML, YAML, and others. Full list in `src/extract/mod.rs`.
+Plus 32 more: Ruby (solargraph), Java (jdtls), C# (omnisharp), Kotlin, Lua, Zig, Elixir, Haskell, OCaml, Scala, Dart, PHP, Swift, R, Julia, CSS, HTML, JSON, Nix, Terraform, TOML, YAML, Vue, Svelte, Erlang, Gleam, Nim, Clojure, Deno, Protobuf (buf), LaTeX (texlab), Typst (tinymist). Full list in `src/extract/consumers.rs`.
 
 ## Type Hierarchy Enrichment
 
@@ -43,8 +65,11 @@ When a language server advertises `typeHierarchyProvider`, RNA queries supertype
 - Strikes reset on any successful prepare call
 - Servers that don't support type hierarchy are detected at init and skipped entirely
 
+**Concurrency:**
+
+- LSP requests within a single language server use pipelined transport with adaptive concurrency (TCP slow-start from 4 to 64 concurrent requests). Different language servers run in parallel via separate `LspConsumer` instances in the EventBus.
+
 **Limitations:**
 
-- Concurrent LSP requests are not yet supported (transport uses `&mut self`). Requests are sequential, which is acceptable at RNA's current scale (~70 requests x <10ms each)
 - Subtypes are not queried -- `find_implementations` already covers that direction for traits, and Rust structs/enums cannot have subtypes
 - Non-Rust language servers (Java, TypeScript) may benefit from subtype queries in the future

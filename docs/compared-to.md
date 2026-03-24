@@ -17,7 +17,7 @@ LSP (Language Server Protocol) is what your editor already uses. It's the null s
 
 **The practical cost:** Early testing shows agents take ~120s and ~2x the tokens to answer structural questions with raw LSP available, vs ~50s and ~half the tokens with RNA — because LSP forces many small round-trips where RNA pre-assembles the graph for single-call traversal.
 
-RNA uses LSP internally as one enrichment source (call hierarchy, type hierarchy, implements edges), fuses the results with tree-sitter, embeddings, git, and business artifacts, and exposes it all through multi-hop graph queries. For agents, RNA replaces the need for separate LSP plugins. LSP enrichment aborts early if a language server produces 0 edges after 1,000 nodes or 2 minutes, with a clear diagnostic message — so misconfigured servers fail fast instead of hanging for hours.
+RNA uses LSP internally as one enrichment source (call hierarchy, type hierarchy, implements edges), fuses the results with tree-sitter, embeddings, git, and business artifacts, and exposes it all through multi-hop graph queries. For agents, RNA replaces the need for separate LSP plugins. LSP enrichment uses adaptive wait (no fixed timeout — waits for `serverStatus/quiescent` when available, probes otherwise, 10-minute circuit breaker as safety net). Misconfigured servers abort early if they produce 0 edges after 1,000 nodes, with a clear diagnostic message.
 
 ## At a Glance
 
@@ -25,10 +25,10 @@ RNA uses LSP internally as one enrichment source (call hierarchy, type hierarchy
 |---|---|---|---|---|---|---|
 | **Install** | Editor plugin or PATH binary | `cargo install` / binary | Docker + uv + Memgraph + API key | `pip install` + (KuzuDB\|Neo4j) | `pip install mcp-server-codetree` | `pip install mcp-server-serena` |
 | **External deps** | One server per language | None | Docker, Memgraph, LLM API | Graph DB (embedded or Docker) | None | None (LSP servers auto-downloaded) |
-| **Languages parsed** | 1 per server | 22 | 11 | 14 | 10 | 30+ |
+| **Languages parsed** | 1 per server | 30 | 11 | 14 | 10 | 30+ |
 | **Graph storage** | In-memory per session | embedded graph + vector index | Memgraph (Docker) | KuzuDB/FalkorDB/Neo4j | SQLite (embedded) | None (LSP only, no persistent graph) |
 | **Embeddings** | None | MiniLM-L6-v2 on Metal GPU (local) | UniXcoder (local) | None | None | None |
-| **LSP integration** | Is LSP | 37 servers, batch enrichment | None | None | None | 44+ tools via solidlsp |
+| **LSP integration** | Is LSP | 38 servers, batch enrichment | None | None | None | 44+ tools via solidlsp |
 | **Query model** | Single-symbol, single-hop | Multi-hop, cross-language | Multi-hop | Multi-hop | Multi-hop | Single-symbol (LSP calls, not graph) |
 | **MCP tools** | N/A (protocol, not MCP) | 4 | 10 | 17 | 23 | 44+ |
 | **CLI parity** | N/A | Full (shared service layer) | N/A | N/A | N/A | N/A |
@@ -39,7 +39,7 @@ RNA uses LSP internally as one enrichment source (call hierarchy, type hierarchy
 
 | Axis | LSP | RNA | CGR | CGC | CT | Serena |
 |------|-----|-----|-----|-----|-----|--------|
-| **Cold start** | Server init (seconds) | ~5-10s scan, ~2min embed | Index + Docker startup | Index + DB setup | ~1s scan + SQLite index | LSP server init (seconds) |
+| **Cold start** | Server init (seconds) | ~5-10s scan, ~2min embed (adaptive LSP wait) | Index + Docker startup | Index + DB setup | ~1s scan + SQLite index | LSP server init (seconds) |
 | **Warm restart** | Server re-init | <1s (on-disk cache). `scan --full` is incremental — re-extracts only changed files, re-runs LSP only on changed nodes. ~0.1s on no-change runs. | Memgraph persists | DB persists | SQLite persists (mtime invalidation) | LSP server re-init |
 | **Memory** | Per-server process | in-process (no external DB) | Docker container | External or embedded DB | In-process (SQLite) | Per-server process |
 | **Query latency** | ms per hop (N round-trips) | ms total (in-process, single call) | Network hop to Memgraph | Network hop or embedded | ms (embedded SQLite) | ms per hop (N LSP round-trips) |
@@ -51,14 +51,14 @@ RNA's zero-dependency design is a deliberate architectural choice. `cargo instal
 
 | Edge source | LSP | RNA | CGR | CGC | CT | Serena |
 |-------------|-----|-----|-----|-----|-----|--------|
-| Tree-sitter (syntactic) | None | 22 languages | 11 languages | 14 languages | 10 languages | None (uses LSP not tree-sitter) |
-| LSP (semantic) | Is the source (1 lang/server) | 37 language servers, call + type hierarchy | None | None | None | Is the source (30+ servers) |
+| Tree-sitter (syntactic) | None | 30 extractors (22 code + 4 config + 4 schema) | 11 languages | 14 languages | 10 languages | None (uses LSP not tree-sitter) |
+| LSP (semantic) | Is the source (1 lang/server) | 38 language servers, call + type hierarchy | None | None | None | Is the source (30+ servers) |
 | SCIP (compiler) | None | Not needed — LSP covers the same edges | None | Pyright, tsc, scip-go, scip-rust | None | None |
 | Embedding similarity | None | MiniLM-L6-v2, cosine distance | UniXcoder | None | None | None |
 | Cross-language | No (one server per language) | Yes (unified graph) | Yes | Yes | Yes | Yes (separate servers) |
 | Multi-hop | No (agent must loop) | Yes (single call) | Yes | Yes | Yes | No (agent must loop) |
 
-LSP provides the raw semantic data — call hierarchy, type hierarchy, references — but only for one language at a time, one hop at a time. RNA consumes LSP as one enrichment source among several, fuses the results into a cross-language graph, and exposes multi-hop traversal. CGR and CGC skip LSP entirely, relying on tree-sitter (syntactic) or SCIP (compiler) for edges. RNA's two-tier approach (tree-sitter + LSP) gives the broadest coverage with the highest accuracy. 22 languages from tree-sitter, then 37 LSP servers add compiler-grade call hierarchies and type relationships that neither CGR nor CGC have.
+LSP provides the raw semantic data — call hierarchy, type hierarchy, references — but only for one language at a time, one hop at a time. RNA consumes LSP as one enrichment source among several, fuses the results into a cross-language graph, and exposes multi-hop traversal. CGR and CGC skip LSP entirely, relying on tree-sitter (syntactic) or SCIP (compiler) for edges. RNA's two-tier approach (tree-sitter + LSP) gives the broadest coverage with the highest accuracy. 30 extractors from tree-sitter (22 code languages + 8 config/schema formats), then 38 LSP servers add compiler-grade call hierarchies and type relationships that neither CGR nor CGC have.
 
 > **Why not SCIP?** RNA spiked SCIP as a third enrichment tier ([#114](https://github.com/open-horizon-labs/repo-native-alignment/pull/114)). SCIP and LSP produce the same semantic edges — call hierarchy, type hierarchy, implements — because SCIP indexers (rust-analyzer, scip-python, scip-typescript, scip-go) are often the same tools as LSP servers, run in batch mode instead of live. The difference: SCIP requires installing a separate indexer per language, running a batch index step that produces a protobuf file, and parsing that file. LSP servers are already on most developers' PATH (your editor uses them), start on demand, and return the same edges through a standard protocol. SCIP adds a build step and a dependency for no additional edge coverage. RNA salvaged the reusable patterns from the spike (process timeout, file-line index, edge deduplication — [#122](https://github.com/open-horizon-labs/repo-native-alignment/pull/122)) and closed the SCIP enricher as unnecessary. CGC's use of SCIP makes sense if you don't have LSP integration — but RNA does.
 
@@ -91,7 +91,7 @@ RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents
 
 ## What RNA Does Better
 
-1. **More accurate graph** — 22-language tree-sitter extraction + 37 LSP servers for compiler-grade call/type hierarchy and `Implements` edges. Neither CGR nor CGC has LSP enrichment. RNA's edges come from the same language servers your editor uses. Multiple language servers run concurrently (EventBus `LanguageDetected` events), so Python + TypeScript + Rust LSP enrichment all start in parallel rather than sequentially.
+1. **More accurate graph** — 30 tree-sitter extractors (22 code languages + 4 config + 4 schema) plus 38 LSP servers for compiler-grade call/type hierarchy and `Implements` edges. Neither CGR nor CGC has LSP enrichment. RNA's edges come from the same language servers your editor uses. Multiple language servers run concurrently (EventBus `LanguageDetected` events), so Python + TypeScript + Rust LSP enrichment all start in parallel rather than sequentially.
 2. **Faster queries** — In-process, embedded index. No network hop, no Docker. Microsecond graph traversal, millisecond semantic search.
 3. **Deeper semantic search** — Function bodies (not just names), all markdown (chunked by heading with hierarchy), and commits in one vector space. Results are relevance-ranked with test file demotion. CGR embeds function bodies but with raw scores. CGC doesn't embed at all.
 4. **Semantic graph entry points** — `search(query="database pool", mode="impact")` works directly. No need to look up a `node_id` first. CGR and CGC require exact node identifiers.
@@ -104,7 +104,7 @@ RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents
 1. **Outcome-to-code structural joins** — `outcome_progress` traces declared business outcomes through tagged commits to symbols. No other tool connects "why" to "what."
 2. **Cross-session learning** — `.oh/metis/` persists practical wisdom across agent sessions, searchable via the same embedding index.
 3. **Staleness awareness** — `list_roots` reads live scan stats during active scans (not just file sentinels after completion): symbols extracted, languages in-flight for LSP, edge counts per language, scan phase. Agents know exactly where in the pipeline a scan is.
-4. **Self-tuning performance** — Parallel tree-sitter extraction (rayon, all cores), parallel LSP enrichment (all language servers start concurrently via EventBus `LanguageDetected` events), lock-free double-buffered embedding index. `scan --full` is incremental when a cache exists — ~0.1s on no-change runs. Per-consumer content-addressed cache keys mean changing one consumer's logic only invalidates that consumer's results, not the entire cache.
+4. **Self-tuning performance** — Parallel tree-sitter extraction (rayon, all cores), parallel LSP enrichment (all language servers start concurrently via EventBus `LanguageDetected` events, pipelined transport with adaptive concurrency per server), lock-free double-buffered embedding index. `scan --full` is incremental when a cache exists — ~0.1s on no-change runs. Per-consumer content-addressed cache keys mean changing one consumer's logic only invalidates that consumer's results, not the entire cache. Dirty-slugs filtering skips LSP enrichment entirely for unchanged roots in multi-root workspaces.
 5. **Zero external dependencies** — Single binary, no Docker, no DB server, no API key.
 6. **Architecture-aware queries** — Subsystem detection (Louvain, phase-2 contraction) clusters symbols by actual coupling. Framework detection adds first-class `NodeKind::Other("framework")` nodes (e.g., `lancedb`, `tokio`, `fastapi`). Subsystem name, cohesion score, and interface list are available to agents on the first `repo_map` call — no tuning or config required.
 7. **Config-driven topology extraction** — Drop `.oh/extractors/*.toml` in any repo to add custom `Produces`/`Consumes` edges for any message broker, event bus, or RPC pattern. Glob patterns, optional topic-arg (function name as channel when omitted). No Rust, no build, no RNA release required.
