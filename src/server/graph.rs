@@ -76,7 +76,27 @@ impl RnaHandler {
                 if self.prewarm_started.load(std::sync::atomic::Ordering::Relaxed) {
                     drop(guard);
                     tracing::info!("Waiting for pre-warm to finish...");
-                    self.prewarm_notify.notified().await;
+                    // Poll until the graph is populated or pre-warm fails.
+                    // We cannot use Notify alone because notify_waiters() is
+                    // fire-and-forget: if the pre-warm completes before we
+                    // call .notified().await, the notification is lost and we
+                    // hang forever.  Instead, check the graph periodically and
+                    // also listen for the notification as a fast-path wake.
+                    loop {
+                        let rg = self.graph.read().await;
+                        if rg.is_some() {
+                            drop(rg);
+                            break;
+                        }
+                        drop(rg);
+                        // Wait for either the notification or a short timeout,
+                        // then re-check.  The timeout ensures we never hang
+                        // even if the notification was already sent.
+                        tokio::select! {
+                            _ = self.prewarm_notify.notified() => {}
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                        }
+                    }
                     // Re-check: pre-warm should have populated the graph.
                     let rg = self.graph.read().await;
                     if rg.is_some() {
