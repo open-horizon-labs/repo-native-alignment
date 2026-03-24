@@ -117,6 +117,8 @@ Initialize it at pipeline start:
    - Evaluate trade-offs
    - Recommend with reasoning
 
+   **Bias against Local Optimum solutions.** Band-aids are sometimes the right call (cheap, reversible). Redesigns dissolve problems. But Local Optimum / "refactor the locking" type solutions are the danger zone — they add complexity without changing the model. If your recommended solution involves intricate multi-phase coordination, new lock protocols, or careful ordering constraints, you are probably optimizing the wrong thing. Step up to Reframe or Redesign. Check: has this codebase solved a similar problem before? (`search` for prior art.)
+
 2. Create a feature branch:
    ```bash
    git checkout -b <issue-number>-<slug> main

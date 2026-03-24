@@ -625,23 +625,4 @@ mod tests {
             duration: Duration::from_millis(5), status: LspStatus::NotFound };
         assert!(e.summary_line().contains("not found"));
     }
-
-    #[test]
-    fn test_lsp_entry_summary_ok() {
-        let e = LspEnrichmentEntry { language: "rust".into(), server_name: "rust-analyzer".into(),
-            root_hint: None, edge_count: 150, node_count: 42, error_count: 0,
-            duration: Duration::from_secs_f64(3.5), status: LspStatus::Ok };
-        let l = e.summary_line();
-        assert!(l.contains("rust (rust-analyzer)"));
-        assert!(l.contains("OK"));
-        assert!(l.contains("150 edges"));
-    }
-
-    #[test]
-    fn test_lsp_entry_summary_not_found() {
-        let e = LspEnrichmentEntry { language: "json".into(), server_name: "vscode-json-ls".into(),
-            root_hint: None, edge_count: 0, node_count: 0, error_count: 0,
-            duration: Duration::from_millis(5), status: LspStatus::NotFound };
-        assert!(e.summary_line().contains("not found"));
-    }
 }
