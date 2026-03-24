@@ -185,6 +185,22 @@ pub fn list_roots_from_slugs(
                         name, format_count(lsp_edge_count)));
                 }
 
+            // Encoding stats line — show files skipped or lossy-decoded.
+            if let Some(stats) = scan_stats
+                && let Some(enc) = stats.encoding_stats.get(&r.slug)
+            {
+                let mut parts = Vec::new();
+                if enc.lossy_decoded > 0 {
+                    parts.push(format!("{} lossy-decoded (non-UTF-8)", enc.lossy_decoded));
+                }
+                if enc.binary_skipped > 0 {
+                    parts.push(format!("{} binary skipped", enc.binary_skipped));
+                }
+                if !parts.is_empty() {
+                    line.push_str(&format!("\n  Encoding: {}", parts.join(", ")));
+                }
+            }
+
             // Languages line — show detected languages for this root.
             let empty_langs = std::collections::BTreeSet::new();
             let root_lang_set = root_langs_map.get(&r.slug).unwrap_or(&empty_langs);
@@ -745,5 +761,95 @@ mod tests {
         let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None, None);
         // Cross-root edge counted under primary_slug (from.root == primary_slug).
         assert!(result.contains("1 edges"), "cross-root edge should be counted under from-root, got: {}", result);
+    }
+
+    // ── encoding stats in list_roots tests ──────────────────────────────
+
+    #[test]
+    fn test_list_roots_from_slugs_shows_encoding_stats() {
+        let repo = std::env::current_dir().unwrap();
+        let workspace = crate::roots::WorkspaceConfig::load()
+            .with_primary_root(repo.clone())
+            .with_worktrees(&repo)
+            .with_claude_memory(&repo)
+            .with_agent_memories(&repo)
+            .with_declared_roots(&repo);
+        let resolved = workspace.resolved_roots();
+        if resolved.is_empty() { return; }
+
+        let primary_slug = resolved[0].slug.clone();
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert(primary_slug.clone());
+
+        let nodes = vec![make_node_for_root(&primary_slug, "rust")];
+        let gs = make_test_graph_state(nodes, vec![]);
+
+        // Build ScanStats with encoding stats for the primary root.
+        let mut stats = ScanStats::default();
+        stats.encoding_stats.insert(primary_slug.clone(), crate::extract::EncodingStats {
+            binary_skipped: 5,
+            lossy_decoded: 3,
+        });
+
+        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None, Some(&stats));
+        assert!(result.contains("Encoding:"), "should show encoding line, got: {}", result);
+        assert!(result.contains("3 lossy-decoded"), "should show lossy-decoded count, got: {}", result);
+        assert!(result.contains("5 binary skipped"), "should show binary skipped count, got: {}", result);
+    }
+
+    #[test]
+    fn test_list_roots_from_slugs_no_encoding_line_when_zero() {
+        let repo = std::env::current_dir().unwrap();
+        let workspace = crate::roots::WorkspaceConfig::load()
+            .with_primary_root(repo.clone())
+            .with_worktrees(&repo)
+            .with_claude_memory(&repo)
+            .with_agent_memories(&repo)
+            .with_declared_roots(&repo);
+        let resolved = workspace.resolved_roots();
+        if resolved.is_empty() { return; }
+
+        let primary_slug = resolved[0].slug.clone();
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert(primary_slug.clone());
+
+        let nodes = vec![make_node_for_root(&primary_slug, "rust")];
+        let gs = make_test_graph_state(nodes, vec![]);
+
+        // ScanStats with zero encoding issues — should not show encoding line.
+        let stats = ScanStats::default();
+
+        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None, Some(&stats));
+        assert!(!result.contains("Encoding:"), "should not show encoding line when no issues, got: {}", result);
+    }
+
+    #[test]
+    fn test_list_roots_from_slugs_encoding_stats_only_lossy() {
+        let repo = std::env::current_dir().unwrap();
+        let workspace = crate::roots::WorkspaceConfig::load()
+            .with_primary_root(repo.clone())
+            .with_worktrees(&repo)
+            .with_claude_memory(&repo)
+            .with_agent_memories(&repo)
+            .with_declared_roots(&repo);
+        let resolved = workspace.resolved_roots();
+        if resolved.is_empty() { return; }
+
+        let primary_slug = resolved[0].slug.clone();
+        let mut active_slugs = std::collections::HashSet::new();
+        active_slugs.insert(primary_slug.clone());
+
+        let nodes = vec![make_node_for_root(&primary_slug, "rust")];
+        let gs = make_test_graph_state(nodes, vec![]);
+
+        let mut stats = ScanStats::default();
+        stats.encoding_stats.insert(primary_slug.clone(), crate::extract::EncodingStats {
+            binary_skipped: 0,
+            lossy_decoded: 2,
+        });
+
+        let result = list_roots_from_slugs(&repo, &active_slugs, Some(&gs), None, Some(&stats));
+        assert!(result.contains("2 lossy-decoded"), "should show lossy count, got: {}", result);
+        assert!(!result.contains("binary skipped"), "should not show binary skipped when 0, got: {}", result);
     }
 }

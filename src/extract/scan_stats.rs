@@ -100,6 +100,10 @@ pub struct ScanStats {
 
     /// Roots that have completed all passes (`PassesComplete`).
     pub roots_complete: HashMap<String, RootCompleteStats>,
+
+    /// Per-root encoding statistics: files skipped as binary or lossy-decoded.
+    /// Populated by callers after extraction (not via the event bus).
+    pub encoding_stats: HashMap<String, crate::extract::EncodingStats>,
 }
 
 impl ScanStats {
@@ -119,6 +123,28 @@ impl ScanStats {
     pub fn is_root_in_progress(&self, slug: &str) -> bool {
         self.roots_queued > 0
             && !self.roots_complete.contains_key(slug)
+    }
+
+    /// Replace encoding stats for a root (used by full-scan paths that process
+    /// every file and produce a complete picture).
+    pub fn set_encoding_stats(&mut self, slug: &str, stats: crate::extract::EncodingStats) {
+        if stats.is_empty() {
+            self.encoding_stats.remove(slug);
+        } else {
+            self.encoding_stats.insert(slug.to_string(), stats);
+        }
+    }
+
+    /// Merge encoding stats from an incremental scan into the existing totals
+    /// for a root. Adds the delta counts to whatever is already stored.
+    pub fn merge_encoding_stats(&mut self, slug: &str, delta: &crate::extract::EncodingStats) {
+        if delta.is_empty() {
+            return;
+        }
+        self.encoding_stats
+            .entry(slug.to_string())
+            .or_default()
+            .merge(delta);
     }
 }
 
