@@ -9,6 +9,7 @@ pub mod handlers;
 pub mod helpers;
 pub mod sentinel;
 mod graph;
+mod bg_scanner;
 mod enrichment;
 
 // Re-export subsystem metadata key for service layer filtering.
