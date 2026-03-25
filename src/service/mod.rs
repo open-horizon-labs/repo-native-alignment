@@ -104,7 +104,7 @@ impl SearchParams {
             kind: args.kind.clone(),
             language: args.language.clone(),
             file: args.file.clone(),
-            limit: args.top_k.map(|k| k as usize),
+            limit: args.limit.map(|k| k as usize),
             sort_by: args.sort_by.clone(),
             min_complexity: args.min_complexity,
             synthetic: args.synthetic,
