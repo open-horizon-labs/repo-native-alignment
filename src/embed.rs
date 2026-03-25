@@ -328,8 +328,9 @@ fn node_embedding_title(node: &crate::graph::Node) -> String {
 /// Scalar filter columns for a graph node.
 ///
 /// Returns `(file_path, language, subsystem, cyclomatic)`.
-/// Artifacts and other non-code nodes return `(None, None, None, None)`
-/// because they don't participate in subsystem/language/path filtering.
+/// Artifact nodes (those with `oh_kind` metadata) return `(None, None, None, None)`.
+/// Non-artifact nodes include `file_path` and `language`; `subsystem` and
+/// `cyclomatic` are populated when present in metadata.
 fn node_scalar_filters(node: &crate::graph::Node) -> (Option<String>, Option<String>, Option<String>, Option<i32>) {
     if node.metadata.contains_key("oh_kind") {
         (None, None, None, None)
