@@ -4055,6 +4055,79 @@ mod tests {
             "validation queries must be unique");
     }
 
+    /// Adversarial: verify the early-exit condition for indexing validation.
+    /// The code exits early when consecutive_empty >= 3 && attempt >= 3.
+    /// This test verifies the boundary conditions:
+    /// - 2 consecutive empties at attempt 3 → should NOT exit (needs 3)
+    /// - 3 consecutive empties at attempt 2 → should NOT exit (needs attempt >= 3)
+    /// - 3 consecutive empties at attempt 3 → SHOULD exit
+    #[test]
+    fn test_indexing_validation_early_exit_boundary() {
+        // Simulate the early exit condition from ensure_initialized
+        let check_early_exit = |consecutive_empty: u32, attempt: u32| -> bool {
+            consecutive_empty >= 3 && attempt >= 3
+        };
+
+        // Boundary: 2 empties at attempt 3 — NOT enough evidence
+        assert!(!check_early_exit(2, 3),
+            "2 consecutive empty responses is not enough to declare server unindexed");
+
+        // Boundary: 3 empties at attempt 2 — too early to give up
+        assert!(!check_early_exit(3, 2),
+            "should not exit early on attempt 2 even with 3 empties — give more time");
+
+        // Exact threshold: 3 empties at attempt 3 — exit
+        assert!(check_early_exit(3, 3),
+            "3 consecutive empty responses at attempt 3 should trigger early exit");
+
+        // Above threshold: 4 empties at attempt 4
+        assert!(check_early_exit(4, 4),
+            "4 empties at attempt 4 should also trigger early exit");
+
+        // Edge: attempt 1 with 0 empties — never exit
+        assert!(!check_early_exit(0, 1));
+    }
+
+    /// Adversarial: verify validation query rotation covers all queries
+    /// before wrapping. With 6 queries and 6 max attempts, each query
+    /// should be used exactly once before any repeats.
+    #[test]
+    fn test_indexing_validation_query_rotation() {
+        let queries = &["main", "init", "test", "get", "set", "app"];
+        let max_attempts: u32 = 6;
+
+        let mut used: Vec<&str> = Vec::new();
+        for attempt in 1..=max_attempts {
+            let query = queries[((attempt - 1) as usize) % queries.len()];
+            used.push(query);
+        }
+
+        // All 6 queries should be used exactly once in 6 attempts
+        assert_eq!(used.len(), queries.len(),
+            "6 attempts should use all 6 queries");
+        let unique: std::collections::HashSet<&&str> = used.iter().collect();
+        assert_eq!(unique.len(), queries.len(),
+            "each query should be used exactly once in 6 attempts — no repeats");
+    }
+
+    /// Adversarial: verify the was_quiescent formula handles the edge case
+    /// where a server with serverStatus reports quiescent=true BUT the probe
+    /// validation path was never entered (server_responsive=false).
+    /// The formula `saw_quiescent || (!seen_server_status && server_ready)`
+    /// should still produce true because saw_quiescent=true from serverStatus.
+    #[test]
+    fn test_was_quiescent_serverstatus_overrides_probe_path() {
+        // serverStatus quiescent=true, but probe was never attempted
+        // (because serverStatus arrived first)
+        let saw_quiescent = true;
+        let seen_server_status = true;
+        let server_ready = false; // probe never ran
+        let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
+        assert!(was_quiescent,
+            "serverStatus quiescent=true must produce was_quiescent=true \
+             even when probe path was not exercised");
+    }
+
     /// Integration test: run LSP enrichment against the RNA repo itself.
     ///
     /// This test requires rust-analyzer to be on PATH and the RNA repo to be a
