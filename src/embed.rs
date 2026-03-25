@@ -274,6 +274,75 @@ fn build_artifact_embedding_text(
     truncate_chars(&text, 500).to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Unified node → embedding helpers
+// ---------------------------------------------------------------------------
+// These functions consolidate the artifact-vs-code branching that was
+// previously scattered across reindex_nodes() and index_all_inner().
+// embed.rs still owns the text-building logic (budget, truncation) but
+// the indexing loops no longer test `oh_kind` directly.
+
+/// Build embedding text for any graph node, dispatching by node properties.
+fn node_embedding_text(node: &crate::graph::Node) -> String {
+    if node.metadata.contains_key("oh_kind") {
+        build_artifact_embedding_text(&node.id.name, &node.body, &node.metadata)
+    } else {
+        match &node.id.kind {
+            crate::graph::NodeKind::MarkdownSection => {
+                truncate_chars(&node.body, 500).to_string()
+            }
+            _ => build_code_embedding_text(&node.id.name, &node.body, &node.metadata),
+        }
+    }
+}
+
+/// Embedding index kind label for a graph node.
+fn node_embedding_kind(node: &crate::graph::Node) -> String {
+    if let Some(oh_kind) = node.metadata.get("oh_kind") {
+        oh_kind.clone()
+    } else {
+        let kind_str = match &node.id.kind {
+            crate::graph::NodeKind::Other(s) => s.clone(),
+            k => format!("{}", k),
+        };
+        format!("code:{}", kind_str)
+    }
+}
+
+/// Display title for a graph node in the embedding index.
+fn node_embedding_title(node: &crate::graph::Node) -> String {
+    let kind_str = match &node.id.kind {
+        crate::graph::NodeKind::Other(s) => s.clone(),
+        k => format!("{}", k),
+    };
+    if node.metadata.contains_key("oh_kind") {
+        node.metadata.get("frontmatter.title")
+            .or(node.metadata.get("frontmatter.statement"))
+            .cloned()
+            .unwrap_or_else(|| format!("{} {} ({})", kind_str, node.id.name, node.language))
+    } else {
+        format!("{} {} ({})", kind_str, node.id.name, node.language)
+    }
+}
+
+/// Scalar filter columns for a graph node.
+///
+/// Returns `(file_path, language, subsystem, cyclomatic)`.
+/// Artifact nodes (those with `oh_kind` metadata) return `(None, None, None, None)`.
+/// Non-artifact nodes include `file_path` and `language`; `subsystem` and
+/// `cyclomatic` are populated when present in metadata.
+fn node_scalar_filters(node: &crate::graph::Node) -> (Option<String>, Option<String>, Option<String>, Option<i32>) {
+    if node.metadata.contains_key("oh_kind") {
+        (None, None, None, None)
+    } else {
+        let fp = Some(node.id.file.to_string_lossy().to_string());
+        let lang = if node.language.is_empty() { None } else { Some(node.language.clone()) };
+        let sub = node.metadata.get(crate::server::SUBSYSTEM_KEY).cloned();
+        let cc = node.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok());
+        (fp, lang, sub, cc)
+    }
+}
+
 fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
     let start = std::time::Instant::now();
 
@@ -614,55 +683,17 @@ impl EmbeddingIndex {
         let mut candidates: Vec<Candidate> = Vec::with_capacity(nodes.len());
 
         for node in nodes {
-            let kind_str = match &node.id.kind {
-                crate::graph::NodeKind::Other(s) => s.clone(),
-                k => format!("{}", k),
-            };
+            let embed_kind = node_embedding_kind(node);
+            let text = node_embedding_text(node);
+            let (fp, lang, sub, cc) = node_scalar_filters(node);
 
-            // Use oh_kind for .oh/ artifacts, code:{kind} for everything else
-            let embed_kind = if let Some(oh_kind) = node.metadata.get("oh_kind") {
-                oh_kind.clone()
-            } else {
-                format!("code:{}", kind_str)
-            };
-
-            let text = if node.metadata.contains_key("oh_kind") {
-                build_artifact_embedding_text(&node.id.name, &node.body, &node.metadata)
-            } else {
-                match &node.id.kind {
-                    crate::graph::NodeKind::MarkdownSection => {
-                        truncate_chars(&node.body, 500).to_string()
-                    }
-                    _ => build_code_embedding_text(&node.id.name, &node.body, &node.metadata),
-                }
-            };
-
-            // Scalar filter columns: populate for code nodes, None for commits/merges/artifacts
-            let (fp, lang, sub, cc) = if node.metadata.contains_key("oh_kind") {
-                (None, None, None, None)
-            } else {
-                let fp = Some(node.id.file.to_string_lossy().to_string());
-                let lang = if node.language.is_empty() { None } else { Some(node.language.clone()) };
-                let sub = node.metadata.get(crate::server::SUBSYSTEM_KEY).cloned();
-                let cc = node.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok());
-                (fp, lang, sub, cc)
-            };
-
-            // Include scalar filter values in the hash material so that changes
             // Hash only the embedding text — scalar filter columns (file_path,
             // language, subsystem, cyclomatic) are updated separately via LanceDB
             // upsert. Including them in the hash invalidates the entire embedding
             // cache on every subsystem reassignment, causing a 4x regression (#597).
             let text_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
 
-            let title = if node.metadata.contains_key("oh_kind") {
-                node.metadata.get("frontmatter.title")
-                    .or(node.metadata.get("frontmatter.statement"))
-                    .cloned()
-                    .unwrap_or_else(|| format!("{} {} ({})", kind_str, node.id.name, node.language))
-            } else {
-                format!("{} {} ({})", kind_str, node.id.name, node.language)
-            };
+            let title = node_embedding_title(node);
             let body_display = format!(
                 "{}\n\n{}:{}",
                 node.signature,
@@ -986,51 +1017,15 @@ impl EmbeddingIndex {
 
         // Index code symbols, markdown sections, and .oh/ artifacts from the graph
         for node in &embeddable {
-            let kind_str = match &node.id.kind {
-                crate::graph::NodeKind::Other(s) => s.clone(),
-                k => format!("{}", k),
-            };
+            let embed_kind = node_embedding_kind(node);
+            let text = node_embedding_text(node);
+            let (fp, lang, sub, cc) = node_scalar_filters(node);
 
-            let embed_kind = if let Some(oh_kind) = node.metadata.get("oh_kind") {
-                oh_kind.clone()
-            } else {
-                format!("code:{}", kind_str)
-            };
-
-            let text = if node.metadata.contains_key("oh_kind") {
-                build_artifact_embedding_text(&node.id.name, &node.body, &node.metadata)
-            } else {
-                match &node.id.kind {
-                    crate::graph::NodeKind::MarkdownSection => {
-                        truncate_chars(&node.body, 500).to_string()
-                    }
-                    _ => build_code_embedding_text(&node.id.name, &node.body, &node.metadata),
-                }
-            };
-
-            // Scalar filter columns: populate for code nodes, None for oh/ artifacts.
-            // Compute before text_hash so they can be included in the hash material.
-            let (fp, lang, sub, cc) = if node.metadata.contains_key("oh_kind") {
-                (None, None, None, None)
-            } else {
-                let fp = Some(node.id.file.to_string_lossy().to_string());
-                let lang = if node.language.is_empty() { None } else { Some(node.language.clone()) };
-                let sub = node.metadata.get(crate::server::SUBSYSTEM_KEY).cloned();
-                let cc = node.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok());
-                (fp, lang, sub, cc)
-            };
-
-            // Hash only the embedding text — see comment at line 640.
+            // Hash only the embedding text — scalar filter columns are updated
+            // separately via LanceDB upsert (#597).
             let text_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
 
-            let title = if node.metadata.contains_key("oh_kind") {
-                node.metadata.get("frontmatter.title")
-                    .or(node.metadata.get("frontmatter.statement"))
-                    .cloned()
-                    .unwrap_or_else(|| format!("{} {} ({})", kind_str, node.id.name, node.language))
-            } else {
-                format!("{} {} ({})", kind_str, node.id.name, node.language)
-            };
+            let title = node_embedding_title(node);
             let body_display = format!(
                 "{}\n\n{}:{}",
                 node.signature,
@@ -1609,7 +1604,9 @@ impl EmbeddingIndex {
 #[cfg(test)]
 mod tests {
     use super::{
-        truncate_chars, build_code_embedding_text, build_artifact_embedding_text, CODE_EMBED_CHAR_BUDGET,
+        truncate_chars, build_code_embedding_text, build_artifact_embedding_text,
+        node_embedding_text, node_embedding_kind, node_embedding_title, node_scalar_filters,
+        CODE_EMBED_CHAR_BUDGET,
         BATCH_FLOOR, BATCH_CEILING, BATCH_YIELD_MS, BACKOFF_THRESHOLD,
         EmbeddingIndex, SearchFilters,
     };
@@ -2889,5 +2886,124 @@ mod tests {
             !has_score_col_first,
             "first batch does not have _score — verifying that first-only detection is wrong"
         );
+    }
+
+    // ── #599: unified node embedding helpers ──────────────────────────────
+
+    fn make_test_node(
+        name: &str,
+        kind: crate::graph::NodeKind,
+        body: &str,
+        metadata: BTreeMap<String, String>,
+    ) -> crate::graph::Node {
+        use crate::graph::{Node, NodeId, ExtractionSource};
+        use std::path::PathBuf;
+        Node {
+            id: NodeId {
+                root: "test".to_string(),
+                file: PathBuf::from("src/lib.rs"),
+                name: name.to_string(),
+                kind,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 10,
+            signature: format!("fn {}()", name),
+            body: body.to_string(),
+            metadata,
+            source: ExtractionSource::TreeSitter,
+        }
+    }
+
+    #[test]
+    fn node_embedding_kind_uses_oh_kind_when_present() {
+        let mut meta = BTreeMap::new();
+        meta.insert("oh_kind".to_string(), "outcome".to_string());
+        let node = make_test_node("my-outcome", crate::graph::NodeKind::MarkdownSection, "body", meta);
+        assert_eq!(node_embedding_kind(&node), "outcome");
+    }
+
+    #[test]
+    fn node_embedding_kind_prefixes_code_for_regular_nodes() {
+        let node = make_test_node("foo", crate::graph::NodeKind::Function, "fn foo() {}", BTreeMap::new());
+        assert_eq!(node_embedding_kind(&node), "code:function");
+    }
+
+    #[test]
+    fn node_embedding_title_uses_frontmatter_for_artifacts() {
+        let mut meta = BTreeMap::new();
+        meta.insert("oh_kind".to_string(), "outcome".to_string());
+        meta.insert("frontmatter.title".to_string(), "Context Assembly".to_string());
+        let node = make_test_node("ctx", crate::graph::NodeKind::MarkdownSection, "body", meta);
+        assert_eq!(node_embedding_title(&node), "Context Assembly");
+    }
+
+    #[test]
+    fn node_embedding_title_falls_back_for_artifacts_without_frontmatter() {
+        let mut meta = BTreeMap::new();
+        meta.insert("oh_kind".to_string(), "metis".to_string());
+        let node = make_test_node("learning", crate::graph::NodeKind::MarkdownSection, "body", meta);
+        let title = node_embedding_title(&node);
+        assert!(title.contains("learning"), "should contain name: {}", title);
+    }
+
+    #[test]
+    fn node_embedding_title_for_code_node() {
+        let node = make_test_node("process", crate::graph::NodeKind::Function, "fn process() {}", BTreeMap::new());
+        let title = node_embedding_title(&node);
+        assert_eq!(title, "function process (rust)");
+    }
+
+    #[test]
+    fn node_scalar_filters_none_for_artifacts() {
+        let mut meta = BTreeMap::new();
+        meta.insert("oh_kind".to_string(), "guardrail".to_string());
+        let node = make_test_node("gr", crate::graph::NodeKind::MarkdownSection, "body", meta);
+        let (fp, lang, sub, cc) = node_scalar_filters(&node);
+        assert!(fp.is_none(), "artifact should have no file_path filter");
+        assert!(lang.is_none(), "artifact should have no language filter");
+        assert!(sub.is_none(), "artifact should have no subsystem filter");
+        assert!(cc.is_none(), "artifact should have no cyclomatic filter");
+    }
+
+    #[test]
+    fn node_scalar_filters_populated_for_code() {
+        let mut meta = BTreeMap::new();
+        meta.insert("cyclomatic".to_string(), "5".to_string());
+        let node = make_test_node("foo", crate::graph::NodeKind::Function, "fn foo() {}", meta);
+        let (fp, lang, sub, cc) = node_scalar_filters(&node);
+        assert!(fp.is_some(), "code node should have file_path");
+        assert_eq!(lang, Some("rust".to_string()));
+        assert_eq!(cc, Some(5));
+        assert!(sub.is_none(), "no subsystem set");
+    }
+
+    #[test]
+    fn node_embedding_text_artifact_matches_direct_call() {
+        let mut meta = BTreeMap::new();
+        meta.insert("oh_kind".to_string(), "outcome".to_string());
+        meta.insert("frontmatter.id".to_string(), "ctx-assembly".to_string());
+        meta.insert("frontmatter.status".to_string(), "active".to_string());
+        let node = make_test_node("ctx", crate::graph::NodeKind::MarkdownSection, "Body text.", meta.clone());
+        let via_node = node_embedding_text(&node);
+        let via_direct = build_artifact_embedding_text("ctx", "Body text.", &meta);
+        assert_eq!(via_node, via_direct, "unified helper should match direct artifact builder");
+    }
+
+    #[test]
+    fn node_embedding_text_code_matches_direct_call() {
+        let meta = BTreeMap::new();
+        let node = make_test_node("foo", crate::graph::NodeKind::Function, "fn foo() {}", meta.clone());
+        let via_node = node_embedding_text(&node);
+        let via_direct = build_code_embedding_text("foo", "fn foo() {}", &meta);
+        assert_eq!(via_node, via_direct, "unified helper should match direct code builder");
+    }
+
+    #[test]
+    fn node_embedding_text_markdown_section_truncates() {
+        let long_body = "x".repeat(1000);
+        let node = make_test_node("section", crate::graph::NodeKind::MarkdownSection, &long_body, BTreeMap::new());
+        let text = node_embedding_text(&node);
+        assert!(text.chars().count() <= 500, "markdown section should be truncated to 500 chars");
     }
 }
