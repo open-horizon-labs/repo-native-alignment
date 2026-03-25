@@ -62,9 +62,13 @@ impl RnaHandler {
                 return Ok(Arc::clone(gs));
             }
 
-            // Changes detected: clone current graph, apply incremental update,
-            // then atomic-swap the new version in. Serialized by graph_build_lock
-            // to prevent duplicate concurrent updates.
+            // Changes detected (#574): fast tree-sitter extraction inline,
+            // then spawn full pipeline in background per ADR-001.
+            //
+            // 1. Run tree-sitter extraction (fast, <1s)
+            // 2. Apply to cloned graph, ArcSwap immediately
+            // 3. Spawn full pipeline (LSP, passes, PageRank, embed, persist) as background task
+            // 4. Return immediately with tree-sitter results
             let _build_guard = self.graph_build_lock.lock().await;
             // Re-check after acquiring lock — another call may have already updated.
             let current2 = self.graph.load_full();
@@ -76,18 +80,408 @@ impl RnaHandler {
                     return Ok(Arc::clone(gs2));
                 }
             }
-            let mut new_state = (**gs).clone();
-            self.update_graph_with_scan(&mut new_state, Some(scan), true).await?;
-            scanner.commit_state()?;
-            let new_arc = Arc::new(new_state);
-            self.graph.store(Arc::new(Some(Arc::clone(&new_arc))));
+
+            // Fast path: tree-sitter extraction only (no LSP, no passes, no persist).
+            let mut fast_state = (**gs).clone();
+            let registry = ExtractorRegistry::with_builtins();
+            let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
+
+            // Remove nodes/edges for deleted + changed files
+            let files_to_remove: Vec<PathBuf> = scan
+                .deleted_files
+                .iter()
+                .chain(scan.changed_files.iter())
+                .cloned()
+                .collect();
+            fast_state.nodes.retain(|n| !files_to_remove.contains(&n.id.file));
+            fast_state.edges.retain(|e| {
+                !files_to_remove.iter().any(|f| e.from.file == *f || e.to.file == *f)
+            });
+
+            // Extract new + changed files via tree-sitter
+            let (mut extraction, _enc_stats) = registry.extract_scan_result_with_stats(&self.repo_root, &scan);
+            for node in &mut extraction.nodes {
+                node.id.root = primary_slug.clone();
+            }
+            let file_index: std::collections::HashSet<String> = fast_state.nodes
+                .iter()
+                .chain(extraction.nodes.iter())
+                .map(|n| n.id.file.to_string_lossy().to_string())
+                .collect();
+            for edge in &mut extraction.edges {
+                edge.from.root = primary_slug.clone();
+                edge.to.root = primary_slug.clone();
+                helpers::resolve_edge_target_by_suffix(edge, &file_index);
+            }
+            fast_state.nodes.extend(extraction.nodes);
+            fast_state.edges.extend(extraction.edges);
+
+            // Rebuild petgraph index for the fast graph
+            fast_state.index = crate::graph::index::GraphIndex::new();
+            fast_state.index.rebuild_from_edges(&fast_state.edges);
+            for node in &fast_state.nodes {
+                fast_state.index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+            }
+
+            // Atomic swap: tool calls see tree-sitter results immediately
+            let fast_arc = Arc::new(fast_state);
+            self.graph.store(Arc::new(Some(Arc::clone(&fast_arc))));
             *self.last_scan.lock().unwrap() = std::time::Instant::now();
+
+            // Spawn full pipeline in background (LSP, passes, PageRank, subsystem,
+            // embedding, LanceDB persist). When it completes, it ArcSwaps the fully
+            // enriched graph in — subsequent tool calls see the enriched version.
+            // Scanner state is committed only after the full pipeline succeeds.
+            {
+                let handler_graph = Arc::clone(&self.graph);
+                let repo_root = self.repo_root.clone();
+                let fast_arc_for_check = Arc::clone(&fast_arc);
+                let scan_stats = Arc::clone(&self.scan_stats);
+                let lance_write_lock = Arc::clone(&self.lance_write_lock);
+                let embed_index = Arc::clone(&self.embed_index);
+                let lsp_status = Arc::clone(&self.lsp_status);
+                let graph_build_lock = Arc::clone(&self.graph_build_lock);
+                // Clone the pre-fast-path graph so the full pipeline starts from
+                // the same base state (with all existing LSP edges, PageRank, etc.)
+                let base_state = (**gs).clone();
+                // Release the build lock before spawning so the background task
+                // can re-acquire it. The fast graph is already swapped in.
+                drop(_build_guard);
+                tokio::spawn(async move {
+                    tracing::info!(
+                        "Spawned background incremental pipeline: {} changed, {} new, {} deleted",
+                        scan.changed_files.len(), scan.new_files.len(), scan.deleted_files.len()
+                    );
+                    // Serialize with other graph builds to prevent concurrent pipeline runs.
+                    let _build_guard = graph_build_lock.lock().await;
+                    // Re-check: if the graph was swapped since we spawned, another pipeline
+                    // may have already processed these changes. Check by comparing with the
+                    // fast_arc we stored — if they differ, someone else updated.
+                    let current_snap = handler_graph.load_full();
+                    if let Some(ref current_gs) = *current_snap {
+                        if !Arc::ptr_eq(current_gs, &fast_arc_for_check) {
+                            // Another update happened; skip this pipeline run.
+                            tracing::info!("Background incremental pipeline: graph already updated, skipping");
+                            if let Err(e) = scanner.commit_state() {
+                                tracing::error!("Failed to commit scanner state: {}", e);
+                            }
+                            return;
+                        }
+                    }
+
+                    // Run the full pipeline on the base state (which has LSP edges, etc.)
+                    let mut full_state = base_state;
+                    let primary_slug = RootConfig::code_project(repo_root.clone()).slug();
+
+                    // Remove nodes/edges for deleted + changed files (same as fast path)
+                    let files_to_remove: Vec<PathBuf> = scan
+                        .deleted_files
+                        .iter()
+                        .chain(scan.changed_files.iter())
+                        .cloned()
+                        .collect();
+                    let deleted_edge_ids: Vec<String> = full_state.edges
+                        .iter()
+                        .filter(|e| files_to_remove.iter().any(|f| e.from.file == *f || e.to.file == *f))
+                        .map(|e| e.stable_id())
+                        .collect();
+                    full_state.nodes.retain(|n| !files_to_remove.contains(&n.id.file));
+                    full_state.edges.retain(|e| {
+                        !files_to_remove.iter().any(|f| e.from.file == *f || e.to.file == *f)
+                    });
+
+                    // Extract new + changed files
+                    let registry = ExtractorRegistry::with_builtins();
+                    let (mut extraction, enc_stats) = registry.extract_scan_result_with_stats(&repo_root, &scan);
+                    if let Ok(mut stats) = scan_stats.write() {
+                        stats.merge_encoding_stats(&primary_slug, &enc_stats);
+                    }
+                    for node in &mut extraction.nodes {
+                        node.id.root = primary_slug.clone();
+                    }
+                    let file_index: std::collections::HashSet<String> = full_state.nodes
+                        .iter()
+                        .chain(extraction.nodes.iter())
+                        .map(|n| n.id.file.to_string_lossy().to_string())
+                        .collect();
+                    for edge in &mut extraction.edges {
+                        edge.from.root = primary_slug.clone();
+                        edge.to.root = primary_slug.clone();
+                        super::helpers::resolve_edge_target_by_suffix(edge, &file_index);
+                    }
+
+                    let mut upsert_node_ids: std::collections::HashSet<String> =
+                        extraction.nodes.iter().map(|n| n.stable_id()).collect();
+                    let mut upsert_edges: Vec<Edge> = extraction.edges.clone();
+                    full_state.nodes.extend(extraction.nodes);
+                    full_state.edges.extend(extraction.edges);
+
+                    // Snapshot before passes for delta tracking
+                    let node_ids_before_passes: std::collections::HashSet<String> =
+                        full_state.nodes.iter().map(|n| n.stable_id()).collect();
+                    let edge_ids_before_passes: std::collections::HashSet<String> =
+                        full_state.edges.iter().map(|e| e.stable_id()).collect();
+
+                    // Pre-clean: remove stale virtual nodes before passes
+                    let stale_virtual_files: Vec<std::path::PathBuf> = full_state.nodes
+                        .iter()
+                        .filter(|n| matches!(&n.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")))
+                        .map(|n| n.id.file.clone())
+                        .collect();
+                    full_state.nodes.retain(|n| !matches!(&n.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")));
+                    full_state.edges.retain(|e| {
+                        !matches!(&e.to.kind, NodeKind::Other(s) if s == "subsystem")
+                            && e.kind != crate::graph::EdgeKind::UsesFramework
+                            && e.kind != crate::graph::EdgeKind::Produces
+                            && e.kind != crate::graph::EdgeKind::Consumes
+                    });
+                    let mut files_to_remove_all: Vec<PathBuf> = files_to_remove;
+                    files_to_remove_all.extend(stale_virtual_files);
+
+                    // Run enrichment pipeline via EventBus (LSP, passes, framework detection)
+                    let root_pairs: Vec<(String, std::path::PathBuf)> = WorkspaceConfig::load()
+                        .with_primary_root(repo_root.clone())
+                        .with_worktrees(&repo_root)
+                        .with_declared_roots(&repo_root)
+                        .resolved_roots()
+                        .iter()
+                        .map(|r| (r.slug.clone(), r.path.clone()))
+                        .collect();
+                    {
+                        lsp_status.set_running();
+                        let dirty_slugs: Option<std::collections::HashSet<String>> =
+                            Some(std::iter::once(primary_slug.clone()).collect());
+                        match crate::extract::consumers::emit_enrichment_pipeline(
+                            std::mem::take(&mut full_state.nodes),
+                            std::mem::take(&mut full_state.edges),
+                            root_pairs,
+                            primary_slug.clone(),
+                            repo_root.clone(),
+                            crate::extract::consumers::BusOptions {
+                                scan_stats: Some(Arc::clone(&scan_stats)),
+                                embed_idx: None,
+                                lance_repo_root: None,
+                            },
+                            dirty_slugs,
+                        ).await {
+                            Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
+                                full_state.nodes = enriched_nodes;
+                                full_state.edges = enriched_edges;
+                                full_state.detected_frameworks = detected_frameworks;
+
+                                // Update LSP status
+                                let lsp_edge_count = full_state.edges.iter()
+                                    .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
+                                    .count();
+                                let lsp_call_edge_count = full_state.edges.iter()
+                                    .filter(|e| {
+                                        e.source == crate::graph::ExtractionSource::Lsp
+                                            && matches!(e.kind, crate::graph::EdgeKind::Calls)
+                                    })
+                                    .count();
+                                if lsp_edge_count > 0 {
+                                    lsp_status.set_complete(lsp_call_edge_count);
+                                } else {
+                                    lsp_status.set_unavailable();
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Background incremental pipeline: enrichment failed: {:#}", e
+                                );
+                                if let Err(e) = scanner.commit_state() {
+                                    tracing::error!("Failed to commit scanner state: {}", e);
+                                }
+                                return;
+                            }
+                        }
+                    }
+
+                    // Auto-collect delta from passes
+                    for n in &full_state.nodes {
+                        let sid = n.stable_id();
+                        if !node_ids_before_passes.contains(&sid) {
+                            upsert_node_ids.insert(sid);
+                        }
+                    }
+                    for e in &full_state.edges {
+                        let sid = e.stable_id();
+                        if !edge_ids_before_passes.contains(&sid) {
+                            upsert_edges.push(e.clone());
+                        }
+                    }
+
+                    // Dedup
+                    {
+                        let mut seen_nodes = std::collections::HashSet::new();
+                        full_state.nodes.reverse();
+                        full_state.nodes.retain(|n| seen_nodes.insert(n.stable_id()));
+                        full_state.nodes.reverse();
+                        let mut seen_edges = std::collections::HashSet::new();
+                        full_state.edges.retain(|e| seen_edges.insert(e.stable_id()));
+                    }
+
+                    // Rebuild index
+                    full_state.index = GraphIndex::new();
+                    full_state.index.rebuild_from_edges(&full_state.edges);
+                    for node in &full_state.nodes {
+                        full_state.index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+                    }
+
+                    // PageRank
+                    let pagerank_scores = full_state.index.compute_pagerank(0.85, 20);
+                    for node in &mut full_state.nodes {
+                        if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
+                            node.metadata.insert("importance".to_string(), format!("{:.6}", score));
+                        }
+                    }
+
+                    // Subsystem detection
+                    {
+                        let node_file_map: std::collections::HashMap<String, String> = full_state.nodes
+                            .iter()
+                            .filter(|n| n.id.root != "external")
+                            .map(|n| (n.stable_id(), n.id.file.display().to_string()))
+                            .collect();
+                        let mut subsystems = full_state.index.detect_communities(&pagerank_scores, &node_file_map);
+                        {
+                            let mut name_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                            for s in &subsystems { *name_counts.entry(s.name.clone()).or_default() += 1; }
+                            for s in &mut subsystems {
+                                if name_counts.get(&s.name).copied().unwrap_or(0) > 1
+                                    && let Some(iface) = s.interfaces.first() {
+                                        let short = iface.node_id.split(':').rev().nth(1).unwrap_or(&iface.node_id);
+                                        s.name = format!("{}/{}", s.name, short);
+                                    }
+                            }
+                        }
+                        let mut node_subsystem: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                        for subsystem in &subsystems {
+                            for member_id in &subsystem.member_ids {
+                                node_subsystem.insert(member_id.clone(), subsystem.name.clone());
+                            }
+                        }
+                        for node in &mut full_state.nodes {
+                            let sid = node.stable_id();
+                            let old_sub = node.metadata.get(SUBSYSTEM_KEY).cloned();
+                            let new_sub = node_subsystem.get(&sid).cloned();
+                            if old_sub != new_sub {
+                                match new_sub {
+                                    Some(name) => { node.metadata.insert(SUBSYSTEM_KEY.to_owned(), name); }
+                                    None => { node.metadata.remove(SUBSYSTEM_KEY); }
+                                }
+                                upsert_node_ids.insert(sid);
+                            }
+                        }
+
+                        // Subsystem node promotion via bus
+                        let node_ids_before_group2: std::collections::HashSet<String> =
+                            full_state.nodes.iter().map(|n| n.stable_id()).collect();
+                        let edge_ids_before_group2: std::collections::HashSet<String> =
+                            full_state.edges.iter().map(|e| e.stable_id()).collect();
+                        let (sub_added_nodes, sub_added_edges) =
+                            crate::extract::consumers::emit_community_detection(
+                                primary_slug.clone(),
+                                subsystems,
+                                full_state.nodes.clone(),
+                            ).await.unwrap_or_else(|e| {
+                                tracing::warn!("Background incremental: subsystem promotion failed (non-fatal): {}", e);
+                                (vec![], vec![])
+                            });
+                        if !sub_added_nodes.is_empty() || !sub_added_edges.is_empty() {
+                            full_state.nodes.extend(sub_added_nodes);
+                            full_state.edges.extend(sub_added_edges);
+                        }
+                        for n in &full_state.nodes {
+                            let sid = n.stable_id();
+                            if !node_ids_before_group2.contains(&sid) { upsert_node_ids.insert(sid); }
+                        }
+                        for e in &full_state.edges {
+                            let sid = e.stable_id();
+                            if !edge_ids_before_group2.contains(&sid) { upsert_edges.push(e.clone()); }
+                        }
+                    }
+
+                    // Update index for virtual nodes
+                    for node in &full_state.nodes {
+                        if matches!(&node.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+                            full_state.index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+                        }
+                    }
+                    for edge in &full_state.edges {
+                        if matches!(&edge.to.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+                            full_state.index.add_edge(
+                                &edge.from.to_stable_id(), &edge.from.kind.to_string(),
+                                &edge.to.to_stable_id(), &edge.to.kind.to_string(),
+                                edge.kind.clone(),
+                            );
+                        }
+                    }
+
+                    // Re-embed changed-file symbols
+                    let changed_files: std::collections::HashSet<_> = scan.changed_files
+                        .iter().chain(scan.new_files.iter()).collect();
+                    let embed_guard = embed_index.load();
+                    if let Some(ref embed_idx) = **embed_guard {
+                        let changed_file_nodes: Vec<_> = full_state.nodes
+                            .iter()
+                            .filter(|n| changed_files.iter().any(|f| n.id.file == **f))
+                            .cloned()
+                            .collect();
+                        if let Err(e) = embed_idx.reindex_nodes(&changed_file_nodes).await {
+                            tracing::warn!("Background incremental: re-embed failed: {}", e);
+                            if let Err(e2) = embed_idx.index_all_with_symbols(&repo_root, &full_state.nodes).await {
+                                tracing::warn!("Background incremental: full embed rebuild also failed: {}", e2);
+                            }
+                        }
+                    }
+
+                    // Build upsert data with post-PageRank importance scores
+                    let upsert_nodes: Vec<Node> = full_state.nodes
+                        .iter()
+                        .filter(|n| upsert_node_ids.contains(&n.stable_id()))
+                        .cloned()
+                        .collect();
+
+                    // Persist to LanceDB
+                    let persist_result = {
+                        let _lance_guard = lance_write_lock.lock().await;
+                        persist_graph_incremental(
+                            &repo_root, &upsert_nodes, &upsert_edges,
+                            &deleted_edge_ids, &files_to_remove_all,
+                        ).await
+                    };
+                    let persist_ok = match persist_result {
+                        Ok(true) => {
+                            let _lance_guard = lance_write_lock.lock().await;
+                            match persist_graph_to_lance(&repo_root, &full_state.nodes, &full_state.edges).await {
+                                Ok(()) => true,
+                                Err(e) => { tracing::error!("Full persist after migration failed: {:#}", e); false }
+                            }
+                        }
+                        Ok(false) => true,
+                        Err(e) => { tracing::error!("Incremental persist failed: {:#}", e); false }
+                    };
+
+                    if persist_ok {
+                        if let Err(e) = scanner.commit_state() {
+                            tracing::error!("Failed to commit scanner state: {}", e);
+                        }
+                    }
+
+                    full_state.last_scan_completed_at = Some(std::time::Instant::now());
+
+                    // Atomic swap: publish the fully enriched graph
+                    handler_graph.store(Arc::new(Some(Arc::new(full_state))));
+                    tracing::info!("Background incremental pipeline complete -- enriched graph swapped in");
+                });
+            }
 
             // Start background scanner (once) to keep index warm
             if !self.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 self.spawn_background_scanner();
             }
-            return Ok(new_arc);
+            return Ok(fast_arc);
         }
 
         // Slow path: no graph exists yet.
