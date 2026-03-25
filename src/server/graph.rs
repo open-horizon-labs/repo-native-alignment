@@ -261,6 +261,7 @@ impl RnaHandler {
                                 scan_stats: Some(Arc::clone(&scan_stats)),
                                 embed_idx: None,
                                 lance_repo_root: None,
+                                skip_lsp: false, // incremental background path: LSP runs inline
                             },
                             dirty_slugs,
                         ).await {
@@ -550,12 +551,14 @@ impl RnaHandler {
 
     /// Build the full graph from scratch. This is the original get_graph logic.
     ///
-    /// When `spawn_background` is true (default for MCP server), embedding is
-    /// spawned as a background task so the graph is queryable immediately.
-    /// LSP enrichment now runs synchronously via `LspConsumer` in the event bus
-    /// (`emit_enrichment_pipeline`), so it completes before this function returns.
-    /// When false (used by `run_pipeline_foreground`), no background tasks are
-    /// spawned -- the caller handles embed itself.
+    /// When `spawn_background` is true (default for MCP server), LSP enrichment
+    /// and embedding are spawned as background tasks so the graph is queryable
+    /// immediately with tree-sitter + non-LSP pass results (#574). The background
+    /// LSP task runs `emit_enrichment_pipeline` with LSP enabled, then ArcSwaps
+    /// the fully enriched graph when complete (restoring v0.1.14 behavior).
+    ///
+    /// When false (used by `run_pipeline_foreground`), LSP runs inline via the
+    /// event bus and no background tasks are spawned -- the caller handles embed.
     pub async fn build_full_graph(&self) -> anyhow::Result<GraphState> {
         self.build_full_graph_inner(true).await
     }
@@ -1079,6 +1082,8 @@ impl RnaHandler {
         // uses the embed index created just below), and LanceDB persist runs after PageRank
         // + subsystem detection so the stored data is complete. Using real consumers here
         // would either duplicate work (embed) or persist an incomplete graph (lance).
+        // Clone dirty slugs for the background LSP task before they're consumed by the bus.
+        let dirty_slugs_for_lsp = freshly_extracted_slugs.clone();
         {
             // Mark LSP as running before the bus call so status is visible immediately.
             if spawn_background {
@@ -1114,6 +1119,7 @@ impl RnaHandler {
                         scan_stats: Some(Arc::clone(&self.scan_stats)),
                         embed_idx: None, // embed handled by spawn_background_enrichment after graph is ready
                         lance_repo_root: None, // LanceDB persist handled directly after PageRank/subsystem passes
+                        skip_lsp: spawn_background, // #574: MCP server path skips LSP here, spawns it in background
                     },
                     dirty_slugs,
                 ).await?;
@@ -1121,13 +1127,10 @@ impl RnaHandler {
             all_edges = enriched_edges;
             all_detected_frameworks = detected_frameworks;
 
-            // Count LSP edges added by LspConsumer during bus execution.
-            // These are ExtractionSource::Lsp edges in all_edges.
-            // Use only LSP-sourced edges to drive the status: non-LSP Calls edges
-            // (e.g. from GrpcClientCallsPass) must not falsely mark LSP as complete,
-            // and a metadata-only enrichment (updated_nodes, no new edges) must not
-            // report as unavailable.
-            if spawn_background {
+            // When skip_lsp=true (spawn_background path), LSP didn't run yet.
+            // LSP status stays "running" — the background LSP task will update it.
+            // When skip_lsp=false (CLI path), check LSP edges now.
+            if !spawn_background {
                 let lsp_edge_count = all_edges.iter()
                     .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
                     .count();
@@ -1144,8 +1147,6 @@ impl RnaHandler {
                         lsp_call_edge_count, lsp_edge_count,
                     );
                 } else {
-                    // No LSP edges — either no server available or no enrichable nodes.
-                    // Mark as unavailable so the status shows "no server" not "running".
                     self.lsp_status.set_unavailable();
                 }
             }
@@ -1336,11 +1337,9 @@ impl RnaHandler {
         // Persisting here would write only tree-sitter edges, and a subsequent
         // `repo-map` loading from LanceDB cache would miss LSP edges (#311).
         if spawn_background {
-            // Phase 3 (issue #520): LSP enrichment now runs synchronously inside
-            // `emit_enrichment_pipeline` (via `LspConsumer` + `AllEnrichmentsGate`).
-            // The graph already contains LSP edges at this point, so we can write
-            // both sentinels in one persist rather than clearing+rewriting.
-            // We no longer need to clear the LSP sentinel here since LSP ran before persist.
+            // #574: LSP enrichment is deferred to background. The graph here contains
+            // tree-sitter + non-LSP passes only. Persist now so the graph is queryable,
+            // then the background LSP task will re-persist with LSP edges.
 
             let _lance_guard = self.lance_write_lock.lock().await;
             if let Err(e) = persist_graph_to_lance(&self.repo_root, &all_nodes, &all_edges).await {
@@ -1348,25 +1347,11 @@ impl RnaHandler {
                 return Err(e.context("LanceDB full persist failed during graph build"));
             }
 
-            // Write both sentinels inside the lock: LSP enrichment already completed
-            // above (synchronously via bus), so the persisted graph includes LSP edges.
-            // Writing the LSP sentinel here avoids a subsequent startup re-running LSP
-            // on an already-enriched graph (#477).
+            // Write extraction sentinel but NOT the LSP sentinel — LSP hasn't run yet.
+            // The background LSP task will write the LSP sentinel after enrichment.
             super::sentinel::write_extract_sentinel(&self.repo_root, all_nodes.len(), all_edges.len());
-            // Write or clear the LSP sentinel depending on whether LSP produced edges.
-            // If LSP ran but produced no edges (no server, no supported language, empty result),
-            // we must clear any stale sentinel left from a previous run. A stale sentinel would
-            // cause the next startup to skip LSP enrichment even though the persisted graph is
-            // tree-sitter-only, which would hide the "no server" situation.
-            let has_lsp_edges = all_edges.iter()
-                .any(|e| e.source == crate::graph::ExtractionSource::Lsp);
-            if has_lsp_edges {
-                super::sentinel::write_lsp_sentinel(&self.repo_root, all_nodes.len(), all_edges.len());
-            } else {
-                // No LSP data in this build — clear the old sentinel so the next startup
-                // knows to re-run LSP enrichment rather than trusting stale data.
-                super::sentinel::clear_lsp_sentinel(&self.repo_root);
-            }
+            // Clear any stale LSP sentinel so the next startup knows LSP is pending.
+            super::sentinel::clear_lsp_sentinel(&self.repo_root);
             drop(_lance_guard);
 
             // Post-persist sanity check: if any new roots were detected, verify they
@@ -1414,7 +1399,8 @@ impl RnaHandler {
         }
 
         // Graph is ready -- return immediately so agents can query.
-        // LSP enrichment already ran synchronously via LspConsumer in the bus above (#520).
+        // When spawn_background=true: LSP enrichment is deferred to background (#574).
+        // When spawn_background=false: LSP already ran inline via the bus.
         // Embedding runs in the background task below.
         let symbols_ready_at = std::time::Instant::now();
 
@@ -1433,6 +1419,16 @@ impl RnaHandler {
         };
 
         if spawn_background {
+            // #574: spawn background LSP enrichment (restores v0.1.14 pattern).
+            // The graph returned below has tree-sitter + non-LSP passes only.
+            // This task runs LSP, re-computes PageRank/subsystems, and ArcSwaps.
+            self.spawn_background_lsp_enrichment(
+                all_nodes.clone(),
+                all_edges.clone(),
+                dirty_slugs_for_lsp,
+                all_detected_frameworks.clone(),
+            );
+
             let handle = self.spawn_background_enrichment(&all_nodes);
             // Store the handle so CLI callers can await it before the runtime
             // shuts down, preventing JoinError::Cancelled panics (#560).
@@ -1638,6 +1634,7 @@ impl RnaHandler {
                         scan_stats: Some(Arc::clone(&self.scan_stats)),
                         embed_idx: None, // embed handled below via targeted reindex_nodes after PageRank
                         lance_repo_root: None, // LanceDB persist handled below via persist_graph_incremental
+                        skip_lsp: false, // update_graph_with_scan: LSP runs inline (already incremental)
                     },
                     dirty_slugs,
                 ).await.map_err(|e| {

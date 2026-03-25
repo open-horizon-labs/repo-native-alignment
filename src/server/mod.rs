@@ -223,7 +223,8 @@ impl RnaHandler {
                     }
                     build_status.set_ready();
                     tracing::info!(
-                        "Graph pre-warm complete: {} symbols, {} edges in {:.2}s",
+                        "Graph pre-warm complete (tree-sitter + passes): {} symbols, {} edges in {:.2}s \
+                         — LSP enrichment running in background",
                         node_count,
                         edge_count,
                         t0.elapsed().as_secs_f64(),
