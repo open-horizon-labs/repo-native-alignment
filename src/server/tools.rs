@@ -31,7 +31,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search",
-    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Add `mode` for graph traversal (neighbors/impact/reachable/tests_for/cycles/path). Use `compact: true` to save tokens. Use `rerank: true` for natural language queries. Use `subsystem` to scope to a subsystem from repo_map. Use `target_subsystem` with mode to find cross-subsystem edges. Use `depth` with mode='neighbors' to walk N levels deep (e.g., module → members → their members)."
+    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Add `mode` for graph traversal (neighbors/impact/reachable/tests_for/cycles/path) — equivalent to the `graph` CLI command. Use `compact: true` to save tokens. Use `rerank: true` for natural language queries. Use `subsystem` to scope to a subsystem from repo_map. Use `target_subsystem` with mode to find cross-subsystem edges. Use `depth` with mode='neighbors' to walk N levels deep (e.g., module → members → their members). Use `limit` to control max results (flat default: 10, traversal default: 1)."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct Search {
@@ -69,8 +69,8 @@ pub struct Search {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
     /// Max results (flat default: 10, traversal default: 1)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub top_k: Option<u32>,
+    #[serde(default, alias = "top_k", skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
     /// Sort: "relevance" (default), "complexity", "importance"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_by: Option<String>,
@@ -186,15 +186,25 @@ mod tests {
     }
 
     #[test]
-    fn test_search_traversal_with_top_k() {
+    fn test_search_traversal_with_limit() {
         let s = parse_search(json!({
             "query": "database",
             "mode": "impact",
+            "limit": 5
+        }))
+        .unwrap();
+        assert_eq!(s.limit, Some(5));
+        assert_eq!(s.mode, Some("impact".to_string()));
+    }
+
+    #[test]
+    fn test_search_top_k_alias_still_works() {
+        let s = parse_search(json!({
+            "query": "database",
             "top_k": 5
         }))
         .unwrap();
-        assert_eq!(s.top_k, Some(5));
-        assert_eq!(s.mode, Some("impact".to_string()));
+        assert_eq!(s.limit, Some(5));
     }
 
     #[test]
@@ -231,15 +241,15 @@ mod tests {
     }
 
     #[test]
-    fn test_search_flat_default_top_k_is_10() {
+    fn test_search_flat_default_limit_is_10() {
         let s = parse_search(json!({"query": "test"})).unwrap();
-        assert!(s.top_k.is_none()); // default applied by handler, not struct
+        assert!(s.limit.is_none()); // default applied by handler, not struct
     }
 
     #[test]
-    fn test_search_traversal_default_top_k_is_1() {
+    fn test_search_traversal_default_limit_is_1() {
         let s = parse_search(json!({"query": "test", "mode": "neighbors"})).unwrap();
-        assert!(s.top_k.is_none()); // default applied by handler
+        assert!(s.limit.is_none()); // default applied by handler
     }
 
     #[test]
