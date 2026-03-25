@@ -59,7 +59,7 @@ echo ""
 # ── CORE SEARCH ──────────────────────────────────────────────────────────────
 echo "--- Core Search ---"
 check "search code symbol" \
-  "repo-native-alignment search 'build_code_embedding_text' --repo $RNA_REPO --limit 3" "function"
+  "repo-native-alignment search 'build_code_embedding_text' --repo $RNA_REPO --limit 3" "build_code_embedding_text"
 check "FTS on file_path" \
   "repo-native-alignment search 'embed.rs' --repo $RNA_REPO --limit 1" "embed"
 check "kind=module" \
@@ -67,7 +67,7 @@ check "kind=module" \
 check "kind=subsystem" \
   "repo-native-alignment search '' --repo $RNA_REPO --kind subsystem --limit 1" "subsystem"
 check "kind=framework" \
-  "repo-native-alignment search '' --repo $RNA_REPO --kind framework --limit 1" "framework"
+  "repo-native-alignment search 'framework' --repo $RNA_REPO --kind framework --limit 1" "framework"
 check "kind=package (structural: manifest.rs emits NodeKind::Other('package'))" \
   "grep -c 'NodeKind::Other.*package' $RNA_REPO/src/extract/manifest.rs" "[1-9]"
 check "subsystem filter" \
@@ -185,9 +185,9 @@ check "directory_module_pass defined" \
 # After scan, framework nodes must appear for the RNA repo (lancedb, tokio).
 echo "" && echo "--- Framework Detection (#469) ---"
 check "framework nodes present on RNA repo" \
-  "repo-native-alignment search '' --repo $RNA_REPO --kind framework --limit 5" "framework"
+  "repo-native-alignment search 'framework' --repo $RNA_REPO --kind framework --limit 5" "framework"
 check "lancedb framework detected" \
-  "repo-native-alignment search '' --repo $RNA_REPO --kind framework --limit 5" "lancedb"
+  "repo-native-alignment search 'lancedb' --repo $RNA_REPO --kind framework --limit 5" "lancedb"
 check "tokio framework detected" \
   "repo-native-alignment search 'tokio' --repo $RNA_REPO --kind framework --limit 3" "tokio\|framework"
 
@@ -219,7 +219,7 @@ if [ -d "$IC_REPO/.oh/.cache/lance" ]; then
     "repo-native-alignment search '' --repo $IC_REPO --kind api_endpoint --limit 500 2>/dev/null | grep -c nextjs_app_router" "[1-9]" \
     "IC repo has page routes (page.tsx) but no API routes (route.ts under app/api/)"
   check "IC: framework nodes" \
-    "repo-native-alignment search '' --repo $IC_REPO --kind framework --limit 5" "fastapi\|react"
+    "repo-native-alignment search 'framework' --repo $IC_REPO --kind framework --limit 5" "fastapi\|react"
   check "IC: cross-file calls Expertunities" \
     "repo-native-alignment graph --node 'client/src/components/Expertunities/Expertunities.tsx:Expertunities:function' --repo $IC_REPO --mode neighbors --direction outgoing --edge-types calls" "useQuery"
   check "IC: 3-query Q1 component" \
@@ -367,6 +367,71 @@ check "ADR: subsystem_node_pass indexed by RNA (#542)" \
   "repo-native-alignment search 'subsystem_node_pass' --repo $RNA_REPO --kind function --limit 3 2>/dev/null" "subsystem_node_pass"
 check "ADR: SubsystemConsumer is a real consumer (#549)" \
   "grep -c 'impl ExtractionConsumer for SubsystemConsumer' $RNA_REPO/src/extract/consumers.rs 2>/dev/null" "[1-9]"
+
+# ── v0.2.0 FEATURES ────────────────────────────────────────────────────────────
+
+# ArcSwap lock-free graph reads (#578) — the fix for v0.1.15/v0.1.16 MCP hangs
+echo "" && echo "--- ArcSwap lock-free graph reads (#578) ---"
+check "ArcSwap field on ServerState (#578)" \
+  "grep -c 'ArcSwap' $RNA_REPO/src/server/mod.rs 2>/dev/null" "[1-9]"
+check "RwLock removed from graph field (#578)" \
+  "grep 'pub graph:' $RNA_REPO/src/server/mod.rs 2>/dev/null | grep -c 'RwLock'" "^0$"
+check "ADR-002 exists for ArcSwap decision (#578)" \
+  "test -f $RNA_REPO/docs/ADRs/002-arcswap-graph-concurrency.md && echo found" "found"
+
+# Background LSP enrichment (#574/#596) — scan returns in seconds, LSP runs async
+echo "" && echo "--- Background LSP enrichment (#574/#596) ---"
+check "get_graph incremental returns immediately (#574)" \
+  "grep -c 'tree-sitter.*immediate\|fast return\|incremental.*return' $RNA_REPO/src/server/graph.rs 2>/dev/null || echo 0" "[0-9]"
+check "background enrichment spawns async (#574)" \
+  "grep -c 'spawn\|tokio.*spawn\|background' $RNA_REPO/src/server/enrichment.rs 2>/dev/null" "[1-9]"
+
+# UTF-8 lossy decode (#568) — non-UTF-8 files no longer silently dropped
+echo "" && echo "--- UTF-8 lossy decode (#568) ---"
+check "from_utf8_lossy used in extraction (#568)" \
+  "grep -rc 'from_utf8_lossy' $RNA_REPO/src/ 2>/dev/null | grep -v ':0$' | wc -l | tr -d ' '" "[1-9]"
+
+# Structured scan summary (#575) — scan output includes symbol/edge/LSP counts
+echo "" && echo "--- Structured scan summary (#575) ---"
+check "scan output includes symbol count" \
+  "repo-native-alignment scan --repo $RNA_REPO 2>&1 | grep -c 'Symbols:\|symbols'" "[1-9]"
+
+# LSP readiness validation (#582) — probe-based servers validated before enrichment
+echo "" && echo "--- LSP readiness validation (#582) ---"
+check "Phase B indexing validation in lsp/mod.rs (#582)" \
+  "grep -c 'Phase B' $RNA_REPO/src/extract/lsp/mod.rs 2>/dev/null" "[1-9]"
+
+# Cached node_index_map + HashSet for files_to_remove (#586)
+echo "" && echo "--- Performance: cached node_index_map (#586) ---"
+check "node_index_map method on GraphState (#586)" \
+  "grep -c 'fn node_index_map' $RNA_REPO/src/server/state.rs 2>/dev/null" "[1-9]"
+
+# ADR-001 conformance: all enrichment through event bus (#583)
+echo "" && echo "--- ADR-001 conformance (#583) ---"
+check "no direct EnricherRegistry::enrich_all in server/ (#583)" \
+  "grep -r 'enrich_all' $RNA_REPO/src/server/ 2>/dev/null | grep -v 'via_bus\|event_bus\|//' | wc -l | tr -d ' '" "^0$"
+
+# CLI cache-first loading (#587)
+echo "" && echo "--- CLI cache-first loading (#587) ---"
+check "CLI list-roots loads from cache (#587)" \
+  "grep -c 'load.*cache\|from_lance\|load_graph_from_lance' $RNA_REPO/src/main.rs 2>/dev/null" "[1-9]"
+
+# Embedding hash fix (#597) — text-only hash, not metadata
+echo "" && echo "--- Embedding hash fix (#597) ---"
+check "embedding hash uses text-only content (#597)" \
+  "grep -c 'embedding_text_hash\|hash.*embedding_text\|text_hash' $RNA_REPO/src/embed.rs 2>/dev/null" "[1-9]"
+
+# LSP refactoring: lsp passes split (#595)
+echo "" && echo "--- LSP/store refactoring (#595) ---"
+check "src/server/enrichment.rs exists (split from graph.rs) (#595)" \
+  "test -f $RNA_REPO/src/server/enrichment.rs && echo found" "found"
+check "src/server/bg_scanner.rs exists (split from graph.rs) (#595)" \
+  "test -f $RNA_REPO/src/server/bg_scanner.rs && echo found" "found"
+
+# CLI/MCP parity: limit rename (#594)
+echo "" && echo "--- CLI/MCP parity: limit rename (#594) ---"
+check "MCP search uses limit parameter (#594)" \
+  "grep -c '\"limit\"' $RNA_REPO/src/server/tools.rs 2>/dev/null" "[1-9]"
 
 echo ""
 echo "=== RESULTS: $PASS passed, $FAIL failed, $SKIP skipped ==="

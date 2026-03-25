@@ -1216,6 +1216,29 @@ mod tests {
         assert_eq!(results[0].id.name, "Config");
     }
 
+    /// Empty query with kind=framework returns framework nodes (#601).
+    #[tokio::test]
+    async fn test_flat_search_empty_query_kind_framework() {
+        let func_node = make_node("main", NodeKind::Function, "src/main.rs");
+        let mut fw_node = make_node("tokio", NodeKind::Other("framework".to_string()), "frameworks/tokio");
+        fw_node.language = String::new();
+        fw_node.signature = "framework tokio".to_string();
+        let gs = make_graph_state(vec![func_node, fw_node]);
+        let repo_root = PathBuf::from("/tmp/test");
+        let ctx = make_search_context(&gs, &repo_root);
+        let params = SearchParams {
+            kind: Some("framework".into()),
+            ..Default::default()
+        };
+
+        let results = flat_code_symbol_search(
+            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
+        ).await;
+
+        assert_eq!(results.len(), 1, "Expected 1 framework node, got {}", results.len());
+        assert_eq!(results[0].id.name, "tokio");
+    }
+
     /// Language filter works with fallback path.
     #[tokio::test]
     async fn test_flat_search_fallback_language_filter() {

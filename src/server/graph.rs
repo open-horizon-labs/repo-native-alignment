@@ -769,73 +769,87 @@ impl RnaHandler {
         if !any_root_changed {
             match load_graph_from_lance(&self.repo_root).await {
                 Ok(state) => {
-                    tracing::info!(
-                        "Loaded graph from LanceDB: {} nodes, {} edges",
-                        state.nodes.len(),
-                        state.edges.len()
-                    );
-                    // No changes detected -- reuse existing embedding table if present.
-                    // Only rebuild if the table is missing (first run or cache cleared).
-                    if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await {
-                        match idx.has_table().await {
-                            Ok(true) => {
-                                // Ensure FTS indexes exist -- table may predate hybrid search.
-                                idx.ensure_fts_index().await;
-                                tracing::info!("Reusing existing embedding index (no changes detected)");
-                                self.embed_index.store(Arc::new(Some(idx)));
-                            }
-                            Ok(false) => {
-                                match idx.index_all_with_symbols(&self.repo_root, &state.nodes).await {
-                                    Ok(count) => {
-                                        tracing::info!("Built embedding index: {} items (table was missing)", count);
-                                        self.embed_index.store(Arc::new(Some(idx)));
-                                    }
-                                    Err(e) => tracing::warn!("Failed to embed cached graph: {}", e),
+                    // FIX(#601): check if the cached graph is missing enrichment output
+                    // (e.g., framework nodes). Caches built before the event bus was wired
+                    // (pre-v2-rc) lack framework nodes. When stale, skip the cache early
+                    // return and fall through to the full rebuild path which runs the
+                    // enrichment pipeline.
+                    if super::enrichment::cache_needs_enrichment(&state.nodes) {
+                        tracing::info!(
+                            "Cached graph missing enrichment output (framework nodes absent) \
+                             -- falling through to full rebuild"
+                        );
+                        // Clear sentinels so the enrichment pipeline runs fully.
+                        super::sentinel::clear_sentinels(&self.repo_root);
+                    } else {
+                        tracing::info!(
+                            "Loaded graph from LanceDB: {} nodes, {} edges",
+                            state.nodes.len(),
+                            state.edges.len()
+                        );
+                        // No changes detected -- reuse existing embedding table if present.
+                        // Only rebuild if the table is missing (first run or cache cleared).
+                        if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await {
+                            match idx.has_table().await {
+                                Ok(true) => {
+                                    // Ensure FTS indexes exist -- table may predate hybrid search.
+                                    idx.ensure_fts_index().await;
+                                    tracing::info!("Reusing existing embedding index (no changes detected)");
+                                    self.embed_index.store(Arc::new(Some(idx)));
                                 }
+                                Ok(false) => {
+                                    match idx.index_all_with_symbols(&self.repo_root, &state.nodes).await {
+                                        Ok(count) => {
+                                            tracing::info!("Built embedding index: {} items (table was missing)", count);
+                                            self.embed_index.store(Arc::new(Some(idx)));
+                                        }
+                                        Err(e) => tracing::warn!("Failed to embed cached graph: {}", e),
+                                    }
+                                }
+                                Err(e) => tracing::warn!("Failed to check embedding table: {}", e),
                             }
-                            Err(e) => tracing::warn!("Failed to check embedding table: {}", e),
                         }
-                    }
 
-                    // FIX(#215): The early return here previously skipped LSP
-                    // enrichment entirely, leaving status stuck at SERVER_FOUND.
-                    // Use the LSP completion sentinel (written after successful LSP
-                    // persist) instead of the heuristic `has_call_edges` check.
-                    // The heuristic fails when LSP ran but persist failed -- the
-                    // edges are in memory but not durable, so the next restart
-                    // would incorrectly skip re-enrichment (#477).
-                    //
-                    // FIX(bus path): When the sentinel is absent, route through the event bus
-                    // (LspConsumer → EnrichmentComplete → AllEnrichmentsGate → AllEnrichmentsDone
-                    // → EnrichmentFinalizer → PassesComplete) so ScanStatsConsumer correctly
-                    // tracks LSP completion. The old spawn_lsp_enrichment bypassed all of these.
-                    if spawn_background {
-                        let lsp_sentinel = super::sentinel::read_lsp_sentinel(&self.repo_root);
-                        if lsp_sentinel.is_none() {
-                            tracing::info!(
-                                "LSP sentinel absent -- spawning background LSP enrichment via bus"
-                            );
-                            self.spawn_lsp_enrichment_via_bus(&state.nodes, &state.edges);
-                        } else {
-                            tracing::info!(
-                                "LSP sentinel present -- LSP enrichment already persisted, skipping"
-                            );
-                            // Mark LSP as complete using the actual persisted call edge count.
-                            let call_count = state.edges.iter()
-                                .filter(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
-                                .count();
-                            self.lsp_status.set_complete(call_count);
+                        // FIX(#215): The early return here previously skipped LSP
+                        // enrichment entirely, leaving status stuck at SERVER_FOUND.
+                        // Use the LSP completion sentinel (written after successful LSP
+                        // persist) instead of the heuristic `has_call_edges` check.
+                        // The heuristic fails when LSP ran but persist failed -- the
+                        // edges are in memory but not durable, so the next restart
+                        // would incorrectly skip re-enrichment (#477).
+                        //
+                        // FIX(bus path): When the sentinel is absent, route through the event bus
+                        // (LspConsumer → EnrichmentComplete → AllEnrichmentsGate → AllEnrichmentsDone
+                        // → EnrichmentFinalizer → PassesComplete) so ScanStatsConsumer correctly
+                        // tracks LSP completion. The old spawn_lsp_enrichment bypassed all of these.
+                        if spawn_background {
+                            let lsp_sentinel = super::sentinel::read_lsp_sentinel(&self.repo_root);
+                            if lsp_sentinel.is_none() {
+                                tracing::info!(
+                                    "LSP sentinel absent -- spawning background LSP enrichment via bus"
+                                );
+                                self.spawn_lsp_enrichment_via_bus(&state.nodes, &state.edges);
+                            } else {
+                                tracing::info!(
+                                    "LSP sentinel present -- LSP enrichment already persisted, skipping"
+                                );
+                                // Mark LSP as complete using the actual persisted call edge count.
+                                let call_count = state.edges.iter()
+                                    .filter(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
+                                    .count();
+                                self.lsp_status.set_complete(call_count);
+                            }
                         }
-                    }
 
-                    for (_slug, scanner, _scan, _path, _changed) in &scanners {
-                        if let Err(e) = scanner.commit_state() {
-                            tracing::error!("Failed to commit scanner state: {}", e);
+                        for (_slug, scanner, _scan, _path, _changed) in &scanners {
+                            if let Err(e) = scanner.commit_state() {
+                                tracing::error!("Failed to commit scanner state: {}", e);
+                            }
                         }
-                    }
 
-                    self.graph_build_status.set_ready();
-                    return Ok(state);
+                        self.graph_build_status.set_ready();
+                        return Ok(state);
+                    }
                 }
                 Err(e) => {
                     tracing::debug!("Could not load persisted graph: {}", e);

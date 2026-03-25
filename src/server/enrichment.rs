@@ -23,6 +23,33 @@ use super::store::{
 };
 use super::{PipelineResult, RnaHandler};
 
+/// Check if a cached graph is missing enrichment passes output that should exist.
+///
+/// Returns `true` if the cache appears stale: it has Import nodes (so framework
+/// detection should produce results) but zero `NodeKind::Other("framework")` nodes.
+/// This catches caches built before the enrichment pipeline was wired via the event
+/// bus (pre-v2-rc) or where a persist race dropped framework nodes.
+///
+/// When this returns `true`, the caller should re-run the enrichment pipeline
+/// instead of serving the stale cache.
+pub(crate) fn cache_needs_enrichment(nodes: &[Node]) -> bool {
+    let has_imports = nodes.iter().any(|n| n.id.kind == crate::graph::NodeKind::Import);
+    if !has_imports {
+        return false; // No imports => no framework detection possible, cache is fine.
+    }
+    let has_framework_nodes = nodes.iter().any(|n| {
+        matches!(&n.id.kind, crate::graph::NodeKind::Other(s) if s == "framework")
+    });
+    // If there are imports but no framework nodes, AND the imports match at least one
+    // framework rule, the cache is missing enrichment output.
+    if has_framework_nodes {
+        return false;
+    }
+    // Quick check: do any imports match known framework patterns?
+    let result = crate::extract::framework_detection::framework_detection_pass(nodes, "check");
+    !result.detected_frameworks.is_empty()
+}
+
 impl RnaHandler {
     /// Spawn the background scanner task (event-driven + 15min heartbeat, worktree-aware).
     ///
@@ -749,7 +776,18 @@ impl RnaHandler {
         ));
 
         if change_count == 0 {
-            on_progress("No changes detected -- reusing cached graph.");
+            // FIX(#601): check if the cached graph is missing enrichment output
+            // (e.g., framework nodes). Caches built before the event bus was wired
+            // (pre-v2-rc) or by a binary that skipped post-extraction passes may lack
+            // framework nodes even though Import nodes are present. When stale, clear
+            // sentinels and re-run the full enrichment pipeline.
+            let stale_enrichment = cache_needs_enrichment(&cached_state.nodes);
+            if stale_enrichment {
+                on_progress("No file changes but cached graph missing enrichment output -- re-enriching...");
+                super::sentinel::clear_sentinels(&self.repo_root);
+            } else {
+                on_progress("No changes detected -- reusing cached graph.");
+            }
 
             // Store graph atomically and set up embedding index.
             self.graph.store(Arc::new(Some(Arc::new(cached_state))));
@@ -768,7 +806,7 @@ impl RnaHandler {
             // correctly re-runs LSP enrichment (#477).
             let lsp_sentinel = super::sentinel::read_lsp_sentinel(&self.repo_root);
 
-            let lsp_edge_count = if lsp_sentinel.is_some() {
+            let lsp_edge_count = if lsp_sentinel.is_some() && !stale_enrichment {
                 let call_count = {
                     let snap = self.graph.load_full();
                     snap.as_ref().as_ref().unwrap().edges.iter()
@@ -779,9 +817,8 @@ impl RnaHandler {
                 on_progress(&format!("LSP: {} cached call edges (sentinel present)", call_count));
                 call_count
             } else {
-                // LSP sentinel absent -- enrichment has not been durably persisted.
-                // Run it synchronously on all nodes.
-                on_progress("LSP: no sentinel -- running full enrichment...");
+                // LSP sentinel absent or stale enrichment -- run full enrichment.
+                on_progress("LSP: running full enrichment...");
                 self.run_foreground_lsp_and_persist(&on_progress).await?
             };
 
@@ -1334,5 +1371,73 @@ impl RnaHandler {
                 Ok(0)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::{NodeId, NodeKind, ExtractionSource};
+    use std::path::PathBuf;
+    use std::collections::BTreeMap;
+
+    fn make_node(name: &str, kind: NodeKind) -> Node {
+        Node {
+            id: NodeId {
+                root: "test".to_string(),
+                file: PathBuf::from("src/test.rs"),
+                name: name.to_string(),
+                kind,
+            },
+            language: "rust".to_string(),
+            line_start: 0,
+            line_end: 0,
+            signature: String::new(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        }
+    }
+
+    #[test]
+    fn test_cache_needs_enrichment_empty_graph() {
+        assert!(!cache_needs_enrichment(&[]));
+    }
+
+    #[test]
+    fn test_cache_needs_enrichment_no_imports() {
+        let nodes = vec![
+            make_node("Config", NodeKind::Function),
+        ];
+        assert!(!cache_needs_enrichment(&nodes));
+    }
+
+    #[test]
+    fn test_cache_needs_enrichment_imports_with_frameworks_but_no_framework_nodes() {
+        // Import matches a known framework pattern ("tokio") but no framework
+        // nodes exist -- cache is stale.
+        let mut import_node = make_node("use tokio::runtime::Runtime", NodeKind::Import);
+        import_node.id.file = PathBuf::from("src/main.rs");
+        let nodes = vec![import_node];
+        assert!(cache_needs_enrichment(&nodes));
+    }
+
+    #[test]
+    fn test_cache_needs_enrichment_imports_with_framework_nodes_present() {
+        // Import matches a known framework AND a framework node exists -- cache is fine.
+        let mut import_node = make_node("use tokio::runtime::Runtime", NodeKind::Import);
+        import_node.id.file = PathBuf::from("src/main.rs");
+        let mut fw_node = make_node("tokio", NodeKind::Other("framework".to_string()));
+        fw_node.id.file = PathBuf::from("frameworks/tokio");
+        let nodes = vec![import_node, fw_node];
+        assert!(!cache_needs_enrichment(&nodes));
+    }
+
+    #[test]
+    fn test_cache_needs_enrichment_imports_no_matching_framework() {
+        // Import exists but doesn't match any known framework rule -- cache is fine.
+        let import_node = make_node("use my_unknown_crate::Foo", NodeKind::Import);
+        let nodes = vec![import_node];
+        assert!(!cache_needs_enrichment(&nodes));
     }
 }
