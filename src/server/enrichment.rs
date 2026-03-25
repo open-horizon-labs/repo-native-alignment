@@ -1,37 +1,41 @@
 //! Background enrichment: LSP enrichment, embedding pipeline, and background scanner.
+//!
+//! ## Module structure
+//!
+//! The background scanner stages are extracted into `bg_scanner`:
+//! - `scan_roots()` -- resolve workspace roots, detect file changes
+//! - `update_graph()` -- apply changes, run enrichment pipeline
+//! - `persist_deltas()` -- write to LanceDB, commit scanner state
 // EXTRACTION_VERSION is deprecated (#526) but still used for backward-compat migration.
 #![allow(deprecated)]
 
 use std::path::PathBuf;
-
-/// LanceDB persist delta: (root_slug, root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove)
-type LanceDelta = (String, PathBuf, Vec<Node>, Vec<Edge>, Vec<String>, std::collections::HashSet<PathBuf>);
 use std::sync::Arc;
 
 use crate::embed::EmbeddingIndex;
-use crate::extract::ExtractorRegistry;
 use crate::graph::{Edge, Node};
-use crate::graph::index::GraphIndex;
-use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
+use crate::roots::{RootConfig, WorkspaceConfig};
 use crate::scanner::Scanner;
 
-use super::helpers;
 use super::state::GraphState;
 use super::store::{
-    check_and_migrate_extraction_version, delete_nodes_for_roots, persist_graph_incremental,
-    persist_graph_to_lance,
+    check_and_migrate_extraction_version, persist_graph_to_lance,
 };
 use super::{PipelineResult, RnaHandler};
 
 impl RnaHandler {
     /// Spawn the background scanner task (event-driven + 15min heartbeat, worktree-aware).
+    ///
+    /// The loop calls three extracted stage functions per tick:
+    /// 1. `bg_scanner::scan_roots()` -- resolve workspace roots, detect file changes
+    /// 2. `bg_scanner::update_graph()` -- apply changes, run enrichment pipeline
+    /// 3. `bg_scanner::persist_deltas()` -- write to LanceDB, commit scanner state
     pub(crate) fn spawn_background_scanner(&self) {
         let graph = Arc::clone(&self.graph);
         let repo_root = self.repo_root.clone();
         let lance_write_lock = Arc::clone(&self.lance_write_lock);
         let scan_stats = Arc::clone(&self.scan_stats);
         tokio::spawn(async move {
-            // Track root slugs from the previous tick to detect removed worktrees.
             // Seed from the current resolved roots so the first tick doesn't
             // misidentify every root as "new".
             let mut prev_root_slugs: std::collections::HashSet<String> = WorkspaceConfig::load()
@@ -51,8 +55,6 @@ impl RnaHandler {
 
             loop {
                 // Check for HEAD or FETCH_HEAD changes before waiting.
-                // If a change is detected, trigger an immediate scan rather
-                // than waiting for the full 15-min cadence.
                 let head_changed = {
                     match git2::Repository::open(&repo_root) {
                         Ok(repo) => match repo.head().and_then(|h| h.peel_to_commit()) {
@@ -88,407 +90,44 @@ impl RnaHandler {
                         "FETCH_HEAD changed -- triggering immediate background scan"
                     );
                 } else {
-                    // No git-level change detected: wait for the 15-min heartbeat.
-                    // The baselines (last_head_oid, last_fetch_head_mtime) are
-                    // updated unconditionally at the top of every iteration, so any
-                    // commit that arrives during the sleep will be visible on the
-                    // very next wake-up without a post-sleep re-read here.
                     tokio::time::sleep(tokio::time::Duration::from_secs(900)).await;
                 }
 
-                // Resolve current roots (primary + any live worktrees + claude memory + agent memories + declared roots).
-                let workspace = WorkspaceConfig::load()
-                    .with_primary_root(repo_root.clone())
-                    .with_worktrees(&repo_root)
-                    .with_claude_memory(&repo_root)
-                    .with_agent_memories(&repo_root)
-                    .with_declared_roots(&repo_root);
-                let resolved_roots = workspace.resolved_roots();
-                let current_root_slugs: std::collections::HashSet<String> =
-                    resolved_roots.iter().map(|r| r.slug.clone()).collect();
+                // Stage 1: scan roots for file changes.
+                let mut scan_result = super::bg_scanner::scan_roots(&repo_root, &prev_root_slugs);
 
-                // Slugs that disappeared -> worktree was removed.
-                let removed_slugs: Vec<String> = prev_root_slugs
-                    .difference(&current_root_slugs)
-                    .cloned()
-                    .collect();
-
-                // Scan every live root for file-level changes.
-                // We carry scanners forward so we can commit state only after
-                // the graph update + LanceDB persist succeeds.
-                let mut has_changes = false;
-                let mut per_root_scans: Vec<(String, crate::scanner::ScanResult, PathBuf, Scanner)> =
-                    Vec::new();
-                for resolved_root in &resolved_roots {
-                    // Skip lsp_only roots: their files are already covered by the primary root
-                    // scan. Running a scanner over them would produce duplicate extraction.
-                    if resolved_root.config.lsp_only {
-                        continue;
-                    }
-                    let root_slug = resolved_root.slug.clone();
-                    let root_path = resolved_root.path.clone();
-                    let excludes = resolved_root.config.effective_excludes();
-                    let is_primary = root_path == repo_root;
-                    let mut scanner = if is_primary {
-                        match Scanner::with_excludes(root_path.clone(), excludes) {
-                            Ok(s) => s,
-                            Err(_) => continue,
-                        }
-                    } else {
-                        let state_path = cache_state_path(&root_slug);
-                        match Scanner::with_excludes_and_state_path(
-                            root_path.clone(),
-                            excludes,
-                            state_path,
-                        ) {
-                            Ok(s) => s,
-                            Err(_) => continue,
-                        }
-                    };
-                    let scan = match scanner.scan() {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    if !scan.changed_files.is_empty()
-                        || !scan.new_files.is_empty()
-                        || !scan.deleted_files.is_empty()
-                    {
-                        has_changes = true;
-                    }
-                    per_root_scans.push((root_slug, scan, root_path, scanner));
-                }
-
-                if !has_changes && removed_slugs.is_empty() {
-                    prev_root_slugs = current_root_slugs;
+                if !scan_result.has_changes && scan_result.removed_slugs.is_empty() {
+                    prev_root_slugs = scan_result.current_root_slugs;
                     continue;
                 }
 
-                // ── Lock-free graph update via ArcSwap (#574) ──
-                // Load the current graph snapshot (atomic pointer load, zero blocking).
-                // Clone it into an owned mutable copy, apply all mutations + enrichment
-                // to the clone, then atomic-swap the new version in. Tool calls
-                // continue reading the previous snapshot throughout this entire process.
-                let mut lance_deltas: Vec<LanceDelta> = Vec::new();
-
+                // Stage 2: update graph (lock-free via ArcSwap).
                 let current_snap = graph.load_full();
                 if let Some(ref current_gs) = *current_snap {
                     let mut graph_state = (**current_gs).clone();
-                    let registry = ExtractorRegistry::with_builtins();
 
-                    // Drop in-memory nodes/edges for removed worktrees.
-                    for slug in &removed_slugs {
-                        tracing::info!(
-                            "Worktree removed -- dropping in-memory nodes for root '{}'",
-                            slug
-                        );
-                        graph_state.nodes.retain(|n| &n.id.root != slug);
-                        graph_state.edges.retain(|e| &e.from.root != slug);
-                    }
-
-                    // Apply file-level changes per root.
-                    for (root_slug, scan, root_path, _scanner) in &per_root_scans {
-                        if scan.changed_files.is_empty()
-                            && scan.new_files.is_empty()
-                            && scan.deleted_files.is_empty()
-                        {
-                            continue;
-                        }
-                        tracing::info!(
-                            "Background scan '{}': {} changed, {} new, {} deleted",
-                            root_slug,
-                            scan.changed_files.len(),
-                            scan.new_files.len(),
-                            scan.deleted_files.len()
-                        );
-                        // Use a HashSet for O(1) membership checks during retain/filter
-                        // instead of O(n) Vec::contains / iter().any(). With a Vec the
-                        // retain loops over nodes/edges become O(nodes * files_to_remove).
-                        let files_to_remove: std::collections::HashSet<PathBuf> = scan
-                            .deleted_files
-                            .iter()
-                            .chain(scan.changed_files.iter())
-                            .cloned()
-                            .collect();
-
-                        // Collect edge IDs to delete BEFORE retain (same pattern as foreground).
-                        let deleted_edge_ids: Vec<String> = graph_state
-                            .edges
-                            .iter()
-                            .filter(|e| {
-                                e.from.root == *root_slug
-                                    && (files_to_remove.contains(&e.from.file)
-                                        || files_to_remove.contains(&e.to.file))
-                            })
-                            .map(|e| e.stable_id())
-                            .collect();
-
-                        graph_state.nodes.retain(|n| {
-                            n.id.root != *root_slug
-                                || !files_to_remove.contains(&n.id.file)
-                        });
-                        graph_state.edges.retain(|e| {
-                            e.from.root != *root_slug
-                                || (!files_to_remove.contains(&e.from.file)
-                                    && !files_to_remove.contains(&e.to.file))
-                        });
-                        let (mut extraction, enc_stats) = registry.extract_scan_result_with_stats(root_path, scan);
-
-                        // Merge encoding stats (incremental scan: add to existing totals).
-                        if let Ok(mut stats) = scan_stats.write() {
-                            stats.merge_encoding_stats(root_slug, &enc_stats);
-                        }
-
-                        for node in &mut extraction.nodes {
-                            node.id.root = root_slug.clone();
-                        }
-                        // Build file index from existing + new nodes for suffix resolution
-                        let file_index: std::collections::HashSet<String> = graph_state.nodes
-                            .iter()
-                            .chain(extraction.nodes.iter())
-                            .map(|n| n.id.file.to_string_lossy().to_string())
-                            .collect();
-                        for edge in &mut extraction.edges {
-                            edge.from.root = root_slug.clone();
-                            edge.to.root = root_slug.clone();
-                            helpers::resolve_edge_target_by_suffix(edge, &file_index);
-                        }
-                        let upsert_nodes = extraction.nodes.clone();
-                        let upsert_edges = extraction.edges.clone();
-                        graph_state.nodes.extend(extraction.nodes);
-                        graph_state.edges.extend(extraction.edges);
-
-                        lance_deltas.push((
-                            root_slug.clone(),
-                            root_path.clone(),
-                            upsert_nodes,
-                            upsert_edges,
-                            deleted_edge_ids,
-                            files_to_remove,
-                        ));
-                    }
-
-                    // Run post-extraction passes via EventBus (ADR Phase 2b, issue #502).
-                    // Both foreground and background paths now use the same bus-driven
-                    // consumer chain. Satisfies ADR Constraint 4 (no pass calls in src/server/).
-                    {
-                        // Snapshot existing stable_ids before the passes run.
-                        let before_node_ids: std::collections::HashSet<String> =
-                            graph_state.nodes.iter().map(|n| n.stable_id()).collect();
-                        let before_edge_ids: std::collections::HashSet<String> =
-                            graph_state.edges.iter().map(|e| e.stable_id()).collect();
-
-                        let root_pairs: Vec<(String, std::path::PathBuf)> =
-                            WorkspaceConfig::load()
-                                .with_primary_root(repo_root.clone())
-                                .with_worktrees(&repo_root)
-                                .with_declared_roots(&repo_root)
-                                .resolved_roots()
-                                .into_iter()
-                                .map(|r| (r.slug, r.path))
-                                .collect();
-                        let primary_slug =
-                            RootConfig::code_project(repo_root.clone()).slug();
-
-                        // Compute dirty_slugs: only roots that had file changes should
-                        // trigger LSP enrichment (#555). `Some(set)` = only those roots.
-                        let dirty_slugs: Option<std::collections::HashSet<String>> = Some(per_root_scans
-                            .iter()
-                            .filter(|(_, scan, _, _)| {
-                                !scan.changed_files.is_empty()
-                                    || !scan.new_files.is_empty()
-                                    || !scan.deleted_files.is_empty()
-                            })
-                            .map(|(slug, _, _, _)| slug.clone())
-                            .collect());
-
-                        // Pipeline invariant: EnrichmentFinalizer always emits PassesComplete.
-                        // If it doesn't (a logic bug), log the error and clear lance_deltas so
-                        // the empty graph is not persisted. The graph remains empty until the
-                        // next full rebuild (next startup or manual `scan --full`).
-                        match crate::extract::consumers::emit_enrichment_pipeline(
-                            std::mem::take(&mut graph_state.nodes),
-                            std::mem::take(&mut graph_state.edges),
-                            root_pairs,
-                            primary_slug.clone(),
-                            repo_root.clone(),
-                            crate::extract::consumers::BusOptions {
-                                scan_stats: Some(Arc::clone(&scan_stats)),
-                                embed_idx: None, // embed handled by background scanner's own reindex pass
-                                lance_repo_root: None, // LanceDB persist handled by background scanner's lance_deltas
-                                skip_lsp: false, // background scanner: LSP runs inline
-                            },
-                            dirty_slugs,
-                        ).await {
-                            Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
-                                graph_state.nodes = enriched_nodes;
-                                graph_state.edges = enriched_edges;
-                                graph_state.detected_frameworks = detected_frameworks;
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    "Background scanner: post-extraction passes failed \
-                                     (pipeline invariant violated) — aborting tick, \
-                                     no data will be persisted: {:#}",
-                                    e
-                                );
-                                // Clear deltas so nothing bad gets written to LanceDB.
-                                lance_deltas.clear();
-                                // graph_state.nodes/edges are now empty (taken above).
-                                // An empty graph is safe for the subsequent rebuild-index
-                                // and pagerank steps (both are no-ops on an empty set).
-                            }
-                        }
-
-                        // Deduplicate nodes and edges after post-extraction passes.
-                        // Passes re-emit edges that may already be present from cached
-                        // roots; dedup here mirrors the full-build dedup block (6z).
-                        {
-                            let mut seen_nodes = std::collections::HashSet::new();
-                            graph_state.nodes.reverse();
-                            graph_state.nodes.retain(|n| seen_nodes.insert(n.stable_id()));
-                            graph_state.nodes.reverse();
-
-                            let mut seen_edges = std::collections::HashSet::new();
-                            graph_state.edges.retain(|e| seen_edges.insert(e.stable_id()));
-                        }
-
-                        // Collect net-new nodes/edges introduced by the passes.
-                        // These must be persisted to LanceDB so they survive restarts.
-                        let new_nodes: Vec<Node> = graph_state
-                            .nodes
-                            .iter()
-                            .filter(|n| !before_node_ids.contains(&n.stable_id()))
-                            .cloned()
-                            .collect();
-                        let new_edges: Vec<Edge> = graph_state
-                            .edges
-                            .iter()
-                            .filter(|e| !before_edge_ids.contains(&e.stable_id()))
-                            .cloned()
-                            .collect();
-
-                        if !new_nodes.is_empty() || !new_edges.is_empty() {
-                            tracing::info!(
-                                "Post-extraction passes added {} node(s), {} edge(s) to persist delta",
-                                new_nodes.len(),
-                                new_edges.len()
-                            );
-                            // Use repo_root as the path for cross-cutting additions
-                            // (api_link, manifest, etc. are global, not per-root).
-                            lance_deltas.push((
-                                primary_slug,
-                                repo_root.clone(),
-                                new_nodes,
-                                new_edges,
-                                Vec::new(), // no deletions — passes only add
-                                std::collections::HashSet::new(), // no files removed
-                            ));
-                        }
-                    }
-
-                    // Rebuild petgraph index.
-                    graph_state.index = GraphIndex::new();
-                    graph_state.index.rebuild_from_edges(&graph_state.edges);
-                    for node in &graph_state.nodes {
-                        graph_state.index.ensure_node(
-                            &node.stable_id(),
-                            &node.id.kind.to_string(),
-                        );
-                    }
-
-                    // Recompute PageRank importance scores after graph mutation.
-                    let pagerank_scores = graph_state.index.compute_pagerank(0.85, 20);
-                    for node in &mut graph_state.nodes {
-                        if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
-                            node.metadata.insert("importance".to_string(), format!("{:.6}", score));
-                        }
-                    }
-
-                    tracing::info!(
-                        "Background update: {} nodes, {} edges",
-                        graph_state.nodes.len(),
-                        graph_state.edges.len()
-                    );
+                    let lance_deltas = super::bg_scanner::update_graph(
+                        &mut graph_state,
+                        &mut scan_result,
+                        &repo_root,
+                        &scan_stats,
+                    ).await;
 
                     // Atomic swap: publish the new graph state.
-                    // Tool calls that were reading the old snapshot continue undisturbed;
-                    // new tool calls will see this updated version immediately.
                     graph.store(Arc::new(Some(Arc::new(graph_state))));
+
+                    // Stage 3: persist deltas to LanceDB.
+                    super::bg_scanner::persist_deltas(
+                        lance_deltas,
+                        &scan_result.per_root_scans,
+                        &scan_result.removed_slugs,
+                        &repo_root,
+                        &graph,
+                        &lance_write_lock,
+                    ).await;
                 }
 
-                // Persist incremental deltas to LanceDB for each root.
-                // Acquire the write mutex to serialize with other LanceDB writers (#344 round 3).
-                // Track which roots persisted successfully so we can commit scanner state.
-                let mut persisted_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
-                for (slug, root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove) in lance_deltas {
-                    let persist_result = {
-                        let _lance_guard = lance_write_lock.lock().await;
-                        let files_to_remove_vec: Vec<PathBuf> = files_to_remove.into_iter().collect();
-                        persist_graph_incremental(
-                            &root_path,
-                            &upsert_nodes,
-                            &upsert_edges,
-                            &deleted_edge_ids,
-                            &files_to_remove_vec,
-                        )
-                        .await
-                    };
-                    match persist_result {
-                        Ok(true) => {
-                            tracing::info!("Background scan: schema migrated; performing full persist now");
-                            let snap = graph.load_full();
-                            let snapshot = snap.as_ref().as_ref()
-                                .map(|gs| (gs.nodes.clone(), gs.edges.clone()));
-                            if let Some((nodes, edges)) = snapshot {
-                                let _lance_guard = lance_write_lock.lock().await;
-                                if let Err(e) = persist_graph_to_lance(&repo_root, &nodes, &edges).await {
-                                    tracing::error!("Background scan: full persist after migration failed: {:#}", e);
-                                    continue; // Don't commit scanner state for this root
-                                }
-                            }
-                            persisted_slugs.insert(slug);
-                        }
-                        Ok(false) => {
-                            persisted_slugs.insert(slug);
-                        }
-                        Err(e) => {
-                            tracing::error!("Background scan: failed to persist graph delta for '{}': {:#}", slug, e);
-                            // Don't commit scanner state -- next scan will re-detect changes
-                        }
-                    }
-                }
-
-                // Commit scanner state only for roots that persisted successfully.
-                for (root_slug, _scan, _root_path, scanner) in &per_root_scans {
-                    if persisted_slugs.contains(root_slug)
-                        && let Err(e) = scanner.commit_state() {
-                            tracing::error!("Background scan: failed to commit scanner state for '{}': {}", root_slug, e);
-                        }
-                }
-
-                // Update freshness timestamp if any root persisted successfully.
-                // Load → clone → mutate → store (atomic swap, no lock).
-                if !persisted_slugs.is_empty() {
-                    let snap = graph.load_full();
-                    if let Some(ref gs) = *snap {
-                        let mut updated = (**gs).clone();
-                        updated.last_scan_completed_at = Some(std::time::Instant::now());
-                        graph.store(Arc::new(Some(Arc::new(updated))));
-                    }
-                }
-
-                // Purge removed worktree slugs from LanceDB.
-                if !removed_slugs.is_empty() {
-                    let _lance_guard = lance_write_lock.lock().await;
-                    if let Err(e) = delete_nodes_for_roots(&repo_root, &removed_slugs).await {
-                        tracing::warn!(
-                            "Failed to delete LanceDB rows for removed worktrees: {}",
-                            e
-                        );
-                    }
-                }
-
-                prev_root_slugs = current_root_slugs;
+                prev_root_slugs = scan_result.current_root_slugs;
             }
         });
         tracing::info!("Background scanner started (event-driven + 15min heartbeat, worktree-aware)");
