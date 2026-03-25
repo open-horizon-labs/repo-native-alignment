@@ -737,11 +737,31 @@ impl LspEnricher {
                                     if kind == "begin" || kind == "end" {
                                         tracing::info!("{} progress {}: {}", self.server_command, kind, title);
                                     }
+                                } else if method == "experimental/serverStatus" {
+                                    // A late serverStatus notification arrived during Phase B.
+                                    // If quiescent=true, the server has finished indexing —
+                                    // skip the rest of validation and accept the authoritative signal.
+                                    let quiescent = msg.pointer("/params/quiescent")
+                                        .and_then(|q| q.as_bool())
+                                        .unwrap_or(false);
+                                    if quiescent {
+                                        tracing::info!(
+                                            "{} received experimental/serverStatus quiescent=true during Phase B validation — accepting",
+                                            self.server_command
+                                        );
+                                        server_ready = true;
+                                        saw_quiescent = true;
+                                    }
                                 }
                             }
                         }
                         _ => break, // No more pending messages
                     }
+                }
+
+                // If serverStatus arrived during drain, skip validation
+                if server_ready {
+                    break;
                 }
 
                 let validation_result = tokio::time::timeout(
@@ -781,10 +801,12 @@ impl LspEnricher {
                         );
                     }
                     Err(_) => {
-                        // Timeout — server is busy indexing.
-                        consecutive_empty += 1;
+                        // Timeout — server is busy indexing. Do NOT count toward
+                        // consecutive_empty: a timeout means the server is actively
+                        // working (not that it returned empty results). Let the
+                        // attempt counter and circuit breaker handle slow servers.
                         tracing::info!(
-                            "{} indexing validation {}/{}: workspace/symbol(\"{}\") timed out ({}s elapsed)",
+                            "{} indexing validation {}/{}: workspace/symbol(\"{}\") timed out ({}s elapsed, not counting as empty)",
                             self.server_command, attempt, MAX_INDEXING_VALIDATION_ATTEMPTS,
                             query, elapsed
                         );
@@ -4049,6 +4071,10 @@ mod tests {
         assert!(queries.len() >= 3,
             "need at least 3 validation queries to avoid false negatives \
              from projects that happen to lack a particular symbol name");
+        // Verify no empty strings — an empty query would bypass validation
+        // since workspace/symbol("") returns all symbols (or matches anything).
+        assert!(queries.iter().all(|q| !q.is_empty()),
+            "validation queries must be non-empty strings — empty query bypasses validation");
         // Verify no duplicates
         let unique: std::collections::HashSet<&&str> = queries.iter().collect();
         assert_eq!(unique.len(), queries.len(),
@@ -4057,10 +4083,8 @@ mod tests {
 
     /// Adversarial: verify the early-exit condition for indexing validation.
     /// The code exits early when consecutive_empty >= 3 && attempt >= 3.
-    /// This test verifies the boundary conditions:
-    /// - 2 consecutive empties at attempt 3 → should NOT exit (needs 3)
-    /// - 3 consecutive empties at attempt 2 → should NOT exit (needs attempt >= 3)
-    /// - 3 consecutive empties at attempt 3 → SHOULD exit
+    /// Note: only empty responses and errors count toward consecutive_empty.
+    /// Timeouts do NOT count (the server is actively working, not empty).
     #[test]
     fn test_indexing_validation_early_exit_boundary() {
         // Simulate the early exit condition from ensure_initialized
@@ -4086,6 +4110,12 @@ mod tests {
 
         // Edge: attempt 1 with 0 empties — never exit
         assert!(!check_early_exit(0, 1));
+
+        // Scenario: 3 timeouts + 0 empties at attempt 3 — should NOT exit
+        // because timeouts don't count toward consecutive_empty
+        // (server is actively indexing, not returning empty results)
+        assert!(!check_early_exit(0, 3),
+            "timeouts should not trigger early exit — only empty results and errors count");
     }
 
     /// Adversarial: verify validation query rotation covers all queries
