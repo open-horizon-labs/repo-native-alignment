@@ -522,23 +522,11 @@ impl EmbeddingIndex {
             tracing::warn!("FTS index on body failed (hybrid search degraded): {e:#}");
             return;
         }
-        // file_path index: enables path-based pre-filtering before ranking.
-        // search(file='src/embed.rs') no longer over-fetches globally — it
-        // filters within the file path before vector scoring.
-        if let Err(e) = table
-            .create_index(
-                &["file_path"],
-                lancedb::index::Index::FTS(Default::default()),
-            )
-            .replace(true)
-            .execute()
-            .await
-        {
-            tracing::warn!("FTS index on file_path failed (path-based filtering degraded): {e:#}");
-            return;
-        }
+        // file_path filtering uses LIKE predicates via .only_if(), not FTS queries.
+        // An FTS index on high-cardinality file_path adds ~60s for 14K rows with
+        // no benefit — LIKE works without it. Removed in #597.
         tracing::info!(
-            "EmbeddingIndex: FTS indexes on title+body+file_path created in {:?}",
+            "EmbeddingIndex: FTS indexes on title+body created in {:?}",
             fts_start.elapsed()
         );
     }
@@ -1272,19 +1260,26 @@ impl EmbeddingIndex {
             }
 
         // --- Compact lance to reclaim space (#298) ---
-        if let Ok(table) = self.db.open_table(&self.table_name).execute().await {
-            let compact_start = std::time::Instant::now();
-            match table.optimize(lancedb::table::OptimizeAction::All).await {
-                Ok(_stats) => {
-                    tracing::info!(
-                        "EmbeddingIndex: lance compaction completed in {:?}",
-                        compact_start.elapsed(),
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!("EmbeddingIndex: lance compaction failed: {}", e);
+        // Only compact on incremental updates where the table pre-existed.
+        // Cold builds write a small number of batches with no stale fragments,
+        // so compaction is pure overhead (~70s for 14K rows). See #597.
+        if table_exists {
+            if let Ok(table) = self.db.open_table(&self.table_name).execute().await {
+                let compact_start = std::time::Instant::now();
+                match table.optimize(lancedb::table::OptimizeAction::All).await {
+                    Ok(_stats) => {
+                        tracing::info!(
+                            "EmbeddingIndex: lance compaction completed in {:?}",
+                            compact_start.elapsed(),
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("EmbeddingIndex: lance compaction failed: {}", e);
+                    }
                 }
             }
+        } else {
+            tracing::info!("EmbeddingIndex: skipping compaction on fresh table (no stale fragments)");
         }
 
         // Build FTS index for hybrid search (BM25 on title + body).
