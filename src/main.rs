@@ -104,6 +104,26 @@ fn init_tracing(default_filter: &str, log_path: Option<&std::path::Path>) {
     tracing_subscriber::fmt().with_env_filter(env_filter).with_writer(std::io::stderr).init();
 }
 
+/// Load graph from LanceDB cache or exit with instructions to scan first.
+async fn load_cached_graph(repo_root: &std::path::Path) -> server::state::GraphState {
+    let lance_path = repo_root.join(".oh").join(".cache").join("lance");
+    if lance_path.exists() {
+        match server::load_graph_from_lance(repo_root).await {
+            Ok(state) => {
+                eprintln!("Loaded {} symbols from cache.", state.nodes.len());
+                state
+            }
+            Err(e) => {
+                eprintln!("Failed to load cached index: {}. Run `repo-native-alignment scan --path .` first.", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        eprintln!("No index found. Run `repo-native-alignment scan --path .` first.");
+        std::process::exit(1);
+    }
+}
+
 fn resolve_root_filter(root_arg: Option<&str>, repo_root: &std::path::Path) -> Option<String> {
     let root_slug = repo_native_alignment::roots::RootConfig::code_project(repo_root.to_path_buf()).slug();
     root_arg.map(|v| if v.eq_ignore_ascii_case("all") { None } else { Some(v.to_string()) }).unwrap_or_else(|| Some(root_slug))
@@ -153,24 +173,7 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::Search(args)) => {
             init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?;
-            // Load graph from LanceDB cache -- do NOT rebuild.
-            // If cache doesn't exist, tell the user to run `rna scan`.
-            let lance_path = repo_root.join(".oh").join(".cache").join("lance");
-            let gs = if lance_path.exists() {
-                match server::load_graph_from_lance(&repo_root).await {
-                    Ok(state) => {
-                        eprintln!("Loaded {} symbols from cache.", state.nodes.len());
-                        state
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to load cached index: {}. Run `repo-native-alignment scan --path .` first.", e);
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                eprintln!("No index found. Run `repo-native-alignment scan --path .` first.");
-                std::process::exit(1);
-            };
+            let gs = load_cached_graph(&repo_root).await;
             // Load existing embedding index -- do NOT rebuild.
             let embed_idx = match repo_native_alignment::embed::EmbeddingIndex::new(&repo_root).await {
                 Ok(idx) => {
@@ -219,21 +222,7 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::Graph(args)) => {
             init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?;
-            // Load graph from LanceDB cache -- do NOT rebuild.
-            // If cache doesn't exist, tell the user to run `rna scan`.
-            let lance_path = repo_root.join(".oh").join(".cache").join("lance");
-            let gs = if lance_path.exists() {
-                match server::load_graph_from_lance(&repo_root).await {
-                    Ok(state) => state,
-                    Err(e) => {
-                        eprintln!("Failed to load cached index: {}. Run `repo-native-alignment scan --path .` first.", e);
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                eprintln!("No index found. Run `repo-native-alignment scan --path .` first.");
-                std::process::exit(1);
-            };
+            let gs = load_cached_graph(&repo_root).await;
             let gp = GraphParams { node: args.node.clone(), mode: args.mode.clone(), direction: args.direction.clone(),
                 edge_types: args.edge_types.as_ref().map(|s| s.split(',').map(|t| t.trim().to_string()).collect()), max_hops: args.max_hops };
             match service::graph_query(&gp, &gs) { Ok(output) => println!("{}", output), Err(msg) => { eprintln!("Error: {}", msg); std::process::exit(1); } }
@@ -254,9 +243,8 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Commands::OutcomeProgress(args)) => {
             init_tracing("warn", log_path.as_deref());
-            let repo_root = args.repo.canonicalize()?; eprintln!("Scanning {}...", repo_root.display());
-            let handler = RnaHandler { repo_root: repo_root.clone(), ..Default::default() }; let gs = handler.build_full_graph().await?;
-            handler.await_background_embed().await;
+            let repo_root = args.repo.canonicalize()?;
+            let gs = load_cached_graph(&repo_root).await;
             let root_filter = resolve_root_filter(args.root.as_deref(), &repo_root);
             let params = OutcomeProgressParams { outcome_id: args.outcome_id.clone(), include_impact: args.include_impact, root_filter, non_code_slugs: std::collections::HashSet::new() };
             let ctx = OutcomeProgressContext { graph_state: &gs, repo_root: &repo_root };
@@ -265,10 +253,7 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::ListRoots(args)) => {
             init_tracing("warn", log_path.as_deref());
             let repo_root = args.repo.canonicalize()?;
-            eprintln!("Scanning {}...", repo_root.display());
-            let handler = RnaHandler { repo_root: repo_root.clone(), ..Default::default() };
-            let gs = handler.build_full_graph().await?;
-            handler.await_background_embed().await;
+            let gs = load_cached_graph(&repo_root).await;
             let index_map = gs.node_index_map();
             // Start with graph-derived slugs (roots that have extracted nodes).
             let mut active_slugs: std::collections::HashSet<String> =
@@ -291,9 +276,8 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Commands::RepoMap(args)) => {
             init_tracing("warn", log_path.as_deref());
-            let repo_root = args.repo.canonicalize()?; eprintln!("Scanning {}...", repo_root.display());
-            let handler = RnaHandler { repo_root: repo_root.clone(), ..Default::default() }; let gs = handler.build_full_graph().await?;
-            handler.await_background_embed().await;
+            let repo_root = args.repo.canonicalize()?;
+            let gs = load_cached_graph(&repo_root).await;
             let root_filter = resolve_root_filter(args.root.as_deref(), &repo_root);
             let params = RepoMapParams { top_n: args.top_n, root_filter, non_code_slugs: std::collections::HashSet::new() };
             let ctx = RepoMapContext { graph_state: &gs, repo_root: &repo_root, lsp_status: None, embed_status: None };
