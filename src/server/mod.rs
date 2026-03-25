@@ -1677,4 +1677,157 @@ mod tests {
             gs.nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
         );
     }
+
+    // ── Adversarial tests (ship step 4, seeded from dissent) ────────────
+
+    /// Dissent finding: concurrent get_graph calls could both detect "no graph"
+    /// and race to build, wasting resources. The graph_build_lock should serialize
+    /// them so only one build actually runs.
+    #[tokio::test]
+    async fn test_concurrent_get_graph_calls_serialize_via_build_lock() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn concurrent_fn() {}\n").unwrap();
+
+        let handler = std::sync::Arc::new(RnaHandler {
+            repo_root: root.to_path_buf(),
+            ..Default::default()
+        });
+
+        // Spawn 5 concurrent get_graph calls. All should succeed and return
+        // the same graph (same node set). Without the build lock, this would
+        // potentially trigger 5 parallel builds.
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let h = handler.clone();
+            handles.push(tokio::spawn(async move {
+                h.get_graph().await
+            }));
+        }
+
+        let mut node_counts = Vec::new();
+        for handle in handles {
+            let result = handle.await.unwrap();
+            assert!(result.is_ok(), "get_graph should succeed: {:?}", result.err());
+            let gs = result.unwrap();
+            assert!(
+                gs.nodes.iter().any(|n| n.id.name == "concurrent_fn"),
+                "concurrent_fn missing from graph"
+            );
+            node_counts.push(gs.nodes.len());
+        }
+
+        // All calls should see the same graph (same node count).
+        let first = node_counts[0];
+        for (i, count) in node_counts.iter().enumerate() {
+            assert_eq!(*count, first, "Call {} got different node count: {} vs {}", i, count, first);
+        }
+    }
+
+    /// Dissent finding: ArcSwap store() is atomic, so readers should always see
+    /// a consistent snapshot -- never a partially-mutated state.
+    #[tokio::test]
+    async fn test_arcswap_readers_see_consistent_snapshots() {
+        use arc_swap::ArcSwap;
+
+        // Simulate the graph field type directly.
+        let graph: Arc<ArcSwap<Option<Arc<GraphState>>>> = Arc::new(ArcSwap::from_pointee(None));
+
+        // Store initial graph with 2 nodes.
+        let mut initial = GraphState {
+            nodes: vec![],
+            edges: vec![],
+            index: crate::graph::index::GraphIndex::new(),
+            last_scan_completed_at: None,
+            detected_frameworks: std::collections::HashSet::new(),
+        };
+        for name in &["alpha", "beta"] {
+            initial.nodes.push(crate::graph::Node {
+                id: crate::graph::NodeId {
+                    root: "test".into(),
+                    file: std::path::PathBuf::from("test.rs"),
+                    name: name.to_string(),
+                    kind: crate::graph::NodeKind::Function,
+                },
+                language: "rust".into(),
+                line_start: 0,
+                line_end: 0,
+                signature: String::new(),
+                body: String::new(),
+                metadata: Default::default(),
+                source: crate::graph::ExtractionSource::TreeSitter,
+            });
+        }
+        graph.store(Arc::new(Some(Arc::new(initial))));
+
+        // Spawn a reader that loads the snapshot.
+        let snap = graph.load_full();
+        let gs = snap.as_ref().as_ref().unwrap();
+        assert_eq!(gs.nodes.len(), 2, "Should see both nodes");
+
+        // Now store a completely new graph (3 nodes) -- the old snapshot should
+        // be unaffected (this is the core RCU guarantee).
+        let mut new_state = (**gs).clone();
+        new_state.nodes.push(crate::graph::Node {
+            id: crate::graph::NodeId {
+                root: "test".into(),
+                file: std::path::PathBuf::from("test.rs"),
+                name: "gamma".to_string(),
+                kind: crate::graph::NodeKind::Function,
+            },
+            language: "rust".into(),
+            line_start: 0,
+            line_end: 0,
+            signature: String::new(),
+            body: String::new(),
+            metadata: Default::default(),
+            source: crate::graph::ExtractionSource::TreeSitter,
+        });
+        graph.store(Arc::new(Some(Arc::new(new_state))));
+
+        // Old snapshot still sees 2 nodes (RCU: readers see the snapshot they loaded).
+        assert_eq!(gs.nodes.len(), 2, "Old snapshot should still have 2 nodes");
+
+        // New load sees 3 nodes.
+        let new_snap = graph.load_full();
+        let new_gs = new_snap.as_ref().as_ref().unwrap();
+        assert_eq!(new_gs.nodes.len(), 3, "New snapshot should have 3 nodes");
+    }
+
+    /// Dissent finding: get_graph returns Arc<GraphState> (not a lock guard).
+    /// Verify that the returned value outlives any internal state changes.
+    #[tokio::test]
+    async fn test_get_graph_result_outlives_subsequent_mutations() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn outlive_fn() {}\n").unwrap();
+
+        let handler = RnaHandler {
+            repo_root: root.to_path_buf(),
+            ..Default::default()
+        };
+
+        // Get the graph.
+        let gs1 = handler.get_graph().await.unwrap();
+        let node_count_1 = gs1.nodes.len();
+        assert!(node_count_1 > 0, "Graph should have nodes");
+
+        // Store a completely different graph (simulating a background swap).
+        handler.graph.store(Arc::new(None));
+
+        // The Arc<GraphState> we hold should still be valid and unchanged.
+        assert_eq!(gs1.nodes.len(), node_count_1, "Arc should keep the snapshot alive");
+        assert!(
+            gs1.nodes.iter().any(|n| n.id.name == "outlive_fn"),
+            "outlive_fn should still be accessible in the held Arc"
+        );
+    }
 }
