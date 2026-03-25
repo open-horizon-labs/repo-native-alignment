@@ -104,11 +104,10 @@ impl RnaHandler {
 
         let root_filter = self.effective_root_filter(args.root.as_deref());
         let non_code_slugs = if root_filter.is_some() { self.non_code_root_slugs() } else { std::collections::HashSet::new() };
-        let graph_guard = match self.get_graph().await { Ok(g) => g, Err(e) => return Ok(text_result(format!("Graph error: {}", e))), };
-        let graph_state = graph_guard.as_ref().unwrap();
+        let graph_state = match self.get_graph().await { Ok(g) => g, Err(e) => return Ok(text_result(format!("Graph error: {}", e))), };
         let embed_guard = self.embed_index.load();
         let embed_index = embed_guard.as_ref().as_ref();
-        let ctx = SearchContext { graph_state, embed_index, repo_root: &self.repo_root, lsp_status: Some(&self.lsp_status), embed_status: Some(&self.embed_status), root_filter, non_code_slugs };
+        let ctx = SearchContext { graph_state: &graph_state, embed_index, repo_root: &self.repo_root, lsp_status: Some(&self.lsp_status), embed_status: Some(&self.embed_status), root_filter, non_code_slugs };
         let markdown = crate::service::search(&params, &ctx).await;
         Ok(text_result(markdown))
     }
@@ -133,10 +132,9 @@ impl RnaHandler {
 
         let root_filter = self.effective_root_filter(args.root.as_deref());
         let non_code_slugs = if root_filter.is_some() { self.non_code_root_slugs() } else { std::collections::HashSet::new() };
-        let graph_guard = match self.get_graph().await { Ok(g) => g, Err(e) => return Ok(text_result(format!("Graph error: {}", e))), };
-        let graph_state = graph_guard.as_ref().unwrap();
+        let graph_state = match self.get_graph().await { Ok(g) => g, Err(e) => return Ok(text_result(format!("Graph error: {}", e))), };
         let params = OutcomeProgressParams { outcome_id: args.outcome_id, include_impact: args.include_impact.unwrap_or(false), root_filter, non_code_slugs };
-        let ctx = OutcomeProgressContext { graph_state, repo_root: &self.repo_root };
+        let ctx = OutcomeProgressContext { graph_state: &graph_state, repo_root: &self.repo_root };
         let markdown = crate::service::outcome_progress(&params, &ctx);
         Ok(text_result(markdown))
     }
@@ -145,8 +143,8 @@ impl RnaHandler {
         // Derive the active root slugs from the in-memory graph so that the
         // output reflects what is actually loaded (including declared roots
         // persisted to LanceDB) rather than re-discovering roots from config.
-        let graph_guard = self.get_graph().await.ok();
-        let graph_state_ref = graph_guard.as_ref().and_then(|g| g.as_ref());
+        let graph_state = self.get_graph().await.ok();
+        let graph_state_ref = graph_state.as_deref();
 
         let active_slugs = if let Some(gs) = graph_state_ref {
             let index_map = gs.node_index_map();
@@ -197,10 +195,9 @@ impl RnaHandler {
 
         let root_filter = self.effective_root_filter(args.root.as_deref());
         let non_code_slugs = if root_filter.is_some() { self.non_code_root_slugs() } else { std::collections::HashSet::new() };
-        let graph_guard = match self.get_graph().await { Ok(g) => g, Err(e) => return Ok(text_result(format!("Graph error: {}", e))), };
-        let graph_state = graph_guard.as_ref().unwrap();
+        let graph_state = match self.get_graph().await { Ok(g) => g, Err(e) => return Ok(text_result(format!("Graph error: {}", e))), };
         let params = RepoMapParams { top_n: args.top_n.unwrap_or(15) as usize, root_filter, non_code_slugs };
-        let ctx = RepoMapContext { graph_state, repo_root: &self.repo_root, lsp_status: Some(&self.lsp_status), embed_status: Some(&self.embed_status) };
+        let ctx = RepoMapContext { graph_state: &graph_state, repo_root: &self.repo_root, lsp_status: Some(&self.lsp_status), embed_status: Some(&self.embed_status) };
         let markdown = crate::service::repo_map(&params, &ctx);
         Ok(text_result(markdown))
     }

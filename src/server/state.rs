@@ -1,6 +1,7 @@
 //! Graph state and LSP enrichment status types.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use crate::graph::{Node, Edge};
 use crate::graph::index::GraphIndex;
@@ -22,9 +23,46 @@ pub struct GraphState {
     /// Used to gate conditional extractors (pub/sub, SSE/WebSocket, gRPC, etc.) so they
     /// only run when their target framework is present. Empty until the first scan completes.
     pub detected_frameworks: HashSet<String>,
+    /// Cached stable_id -> index map, built lazily on first access.
+    /// Each GraphState snapshot is immutable once published via ArcSwap,
+    /// so the cache is valid for the lifetime of the snapshot.
+    node_index_cache: OnceLock<HashMap<String, usize>>,
+}
+
+impl Clone for GraphState {
+    fn clone(&self) -> Self {
+        Self {
+            nodes: self.nodes.clone(),
+            edges: self.edges.clone(),
+            index: self.index.clone(),
+            last_scan_completed_at: self.last_scan_completed_at,
+            detected_frameworks: self.detected_frameworks.clone(),
+            // Start with an empty cache -- the clone is typically a mutable
+            // working copy for incremental scan whose nodes will change.
+            node_index_cache: OnceLock::new(),
+        }
+    }
 }
 
 impl GraphState {
+    /// Construct a new `GraphState` with an empty node-index cache.
+    pub fn new(
+        nodes: Vec<Node>,
+        edges: Vec<Edge>,
+        index: GraphIndex,
+        last_scan_completed_at: Option<std::time::Instant>,
+        detected_frameworks: HashSet<String>,
+    ) -> Self {
+        Self {
+            nodes,
+            edges,
+            index,
+            last_scan_completed_at,
+            detected_frameworks,
+            node_index_cache: OnceLock::new(),
+        }
+    }
+
     /// Check whether a given framework was detected in this workspace.
     ///
     /// Framework IDs use kebab-case: "fastapi", "kafkajs", "nextjs-app-router", etc.
@@ -41,14 +79,17 @@ impl GraphState {
 }
 
 impl GraphState {
-    /// Build a HashMap from stable_id -> index for O(1) node lookups.
-    /// Call once per search context instead of O(N) linear scans per result.
-    pub fn node_index_map(&self) -> std::collections::HashMap<String, usize> {
-        self.nodes
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n.stable_id(), i))
-            .collect()
+    /// Return a cached HashMap from stable_id -> index for O(1) node lookups.
+    /// Built lazily on first access, then reused for the lifetime of this snapshot.
+    /// Previously rebuilt on every search call (O(N) with 87K String allocations).
+    pub fn node_index_map(&self) -> &HashMap<String, usize> {
+        self.node_index_cache.get_or_init(|| {
+            self.nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.stable_id(), i))
+                .collect()
+        })
     }
 
     /// Resolve a node ID that may be missing its root prefix.
@@ -107,6 +148,110 @@ impl GraphState {
     }
 }
 
+
+// ── Graph build status ───────────────────────────────────────────────
+
+/// Named states for the graph build lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GraphBuildState {
+    NotStarted = 0,
+    Building = 1,
+    Ready = 2,
+    Failed = 3,
+}
+
+impl GraphBuildState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::NotStarted,
+            1 => Self::Building,
+            2 => Self::Ready,
+            3 => Self::Failed,
+            _ => Self::NotStarted,
+        }
+    }
+}
+
+/// Tracks graph build progress so tool calls can report "index building"
+/// instead of blocking silently during cold start.
+pub struct GraphBuildStatus {
+    state: std::sync::atomic::AtomicU8,
+    started_at: std::sync::Mutex<Option<std::time::Instant>>,
+    file_count: std::sync::atomic::AtomicUsize,
+    last_error: std::sync::Mutex<Option<String>>,
+}
+
+impl Default for GraphBuildStatus {
+    fn default() -> Self {
+        Self {
+            state: std::sync::atomic::AtomicU8::new(GraphBuildState::NotStarted as u8),
+            started_at: std::sync::Mutex::new(None),
+            file_count: std::sync::atomic::AtomicUsize::new(0),
+            last_error: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl GraphBuildStatus {
+    pub fn current_state(&self) -> GraphBuildState {
+        GraphBuildState::from_u8(self.state.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    pub fn set_building(&self, file_count: usize) {
+        self.file_count.store(file_count, std::sync::atomic::Ordering::Release);
+        *self.started_at.lock().unwrap() = Some(std::time::Instant::now());
+        *self.last_error.lock().unwrap() = None;
+        self.state.store(GraphBuildState::Building as u8, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn set_ready(&self) {
+        self.state.store(GraphBuildState::Ready as u8, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn set_failed(&self, error: String) {
+        *self.last_error.lock().unwrap() = Some(error);
+        self.state.store(GraphBuildState::Failed as u8, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn elapsed(&self) -> Option<std::time::Duration> {
+        self.started_at.lock().unwrap().map(|t| t.elapsed())
+    }
+
+    pub fn status_message(&self) -> Option<String> {
+        match self.current_state() {
+            GraphBuildState::NotStarted | GraphBuildState::Ready => None,
+            GraphBuildState::Building => {
+                let files = self.file_count.load(std::sync::atomic::Ordering::Acquire);
+                let elapsed = self.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+                if files > 0 {
+                    Some(format!("Index building ({} files, {}s elapsed)... retry in a few seconds", files, elapsed))
+                } else {
+                    Some(format!("Index building ({}s elapsed)... retry in a few seconds", elapsed))
+                }
+            }
+            GraphBuildState::Failed => {
+                let err = self.last_error.lock().unwrap();
+                match err.as_deref() {
+                    Some(msg) => Some(format!("Index build failed: {}", msg)),
+                    None => Some("Index build failed (unknown error)".to_string()),
+                }
+            }
+        }
+    }
+
+    pub fn footer_segment(&self) -> Option<String> {
+        match self.current_state() {
+            GraphBuildState::NotStarted | GraphBuildState::Ready => None,
+            GraphBuildState::Building => {
+                let elapsed = self.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+                Some(format!("building ({}s)", elapsed))
+            }
+            GraphBuildState::Failed => Some("build failed".to_string()),
+        }
+    }
+}
+
 // ── Embedding build status ───────────────────────────────────────────
 
 /// Tracks embedding build progress so the search footer can show
@@ -120,6 +265,7 @@ pub struct EmbeddingStatus {
     total: std::sync::atomic::AtomicUsize,
     /// Final count after completion.
     completed_count: std::sync::atomic::AtomicUsize,
+    last_error: std::sync::Mutex<Option<String>>,
 }
 
 impl Default for EmbeddingStatus {
@@ -129,6 +275,7 @@ impl Default for EmbeddingStatus {
             current: std::sync::atomic::AtomicUsize::new(0),
             total: std::sync::atomic::AtomicUsize::new(0),
             completed_count: std::sync::atomic::AtomicUsize::new(0),
+            last_error: std::sync::Mutex::new(None),
         }
     }
 }
@@ -138,6 +285,7 @@ impl EmbeddingStatus {
     pub fn set_building(&self, total: usize) {
         self.total.store(total, std::sync::atomic::Ordering::Release);
         self.current.store(0, std::sync::atomic::Ordering::Release);
+        *self.last_error.lock().unwrap() = None;
         self.state.store(1, std::sync::atomic::Ordering::Release);
     }
 
@@ -152,7 +300,11 @@ impl EmbeddingStatus {
         self.state.store(2, std::sync::atomic::Ordering::Release);
     }
 
-    /// Render a footer segment for the search footer, or `None` if not started.
+    pub fn set_failed(&self, error: String) {
+        *self.last_error.lock().unwrap() = Some(error);
+        self.state.store(3, std::sync::atomic::Ordering::Release);
+    }
+
     pub fn footer_segment(&self) -> Option<String> {
         match self.state.load(std::sync::atomic::Ordering::Acquire) {
             0 => None,
@@ -164,6 +316,13 @@ impl EmbeddingStatus {
             2 => {
                 let count = self.completed_count.load(std::sync::atomic::Ordering::Acquire);
                 Some(format!("{} embedded", count))
+            }
+            3 => {
+                let err = self.last_error.lock().unwrap();
+                match err.as_deref() {
+                    Some(msg) => Some(format!("embedding failed: {}", msg)),
+                    None => Some("embedding failed".to_string()),
+                }
             }
             _ => None,
         }
@@ -183,6 +342,7 @@ pub enum LspState {
     Unavailable = 3,
     /// Server binary found on PATH but enrichment hasn't started yet.
     ServerFound = 4,
+    Failed = 5,
 }
 
 impl LspState {
@@ -193,6 +353,7 @@ impl LspState {
             2 => Self::Complete,
             3 => Self::Unavailable,
             4 => Self::ServerFound,
+            5 => Self::Failed,
             _ => Self::NotStarted,
         }
     }
@@ -204,6 +365,7 @@ impl LspState {
             Self::Complete => "COMPLETE",
             Self::Unavailable => "UNAVAILABLE",
             Self::ServerFound => "SERVER_FOUND",
+            Self::Failed => "FAILED",
         }
     }
 }
@@ -238,6 +400,7 @@ pub struct LspEnrichmentStatus {
     /// LSP server binaries that were checked but not found on PATH during probe.
     /// Used by list_roots to show "LSP available but not installed" for relevant languages.
     missing_servers: std::sync::Mutex<Vec<String>>,
+    last_error: std::sync::Mutex<Option<String>>,
 }
 
 impl Default for LspEnrichmentStatus {
@@ -252,6 +415,7 @@ impl Default for LspEnrichmentStatus {
             last_transition_at: std::sync::Mutex::new(now),
             server_name: std::sync::Mutex::new(None),
             missing_servers: std::sync::Mutex::new(Vec::new()),
+            last_error: std::sync::Mutex::new(None),
         }
     }
 }
@@ -263,6 +427,7 @@ impl LspEnrichmentStatus {
     const COMPLETE: u8 = LspState::Complete as u8;
     const UNAVAILABLE: u8 = LspState::Unavailable as u8;
     const SERVER_FOUND: u8 = LspState::ServerFound as u8;
+    const FAILED: u8 = LspState::Failed as u8;
 
     /// Log a state transition with elapsed time.
     fn log_transition(&self, from: LspState, to: LspState, detail: &str) {
@@ -346,6 +511,12 @@ impl LspEnrichmentStatus {
             self.state.swap(Self::UNAVAILABLE, std::sync::atomic::Ordering::AcqRel)
         );
         self.log_transition(prev, LspState::Unavailable, "no server detected");
+    }
+
+    pub fn set_failed(&self, error: &str) {
+        *self.last_error.lock().unwrap() = Some(error.to_string());
+        let prev = LspState::from_u8(self.state.swap(Self::FAILED, std::sync::atomic::Ordering::AcqRel));
+        self.log_transition(prev, LspState::Failed, error);
     }
 
     /// Mark that at least one LSP server binary was found on PATH.
@@ -526,9 +697,14 @@ impl LspEnrichmentStatus {
                 }
             }
             Self::UNAVAILABLE => {
-                // Always show unavailable status (no 30s auto-hide) so agents
-                // know LSP enrichment didn't run and why.
                 Some("LSP: no server detected".to_string())
+            }
+            Self::FAILED => {
+                let err = self.last_error.lock().unwrap();
+                match err.as_deref() {
+                    Some(msg) => Some(format!("LSP: enrichment failed: {}", msg)),
+                    None => Some("LSP: enrichment failed".to_string()),
+                }
             }
             _ => None,
         }
@@ -546,6 +722,7 @@ mod tests {
         assert_eq!(LspState::Complete.label(), "COMPLETE");
         assert_eq!(LspState::Unavailable.label(), "UNAVAILABLE");
         assert_eq!(LspState::ServerFound.label(), "SERVER_FOUND");
+        assert_eq!(LspState::Failed.label(), "FAILED");
     }
 
     #[test]
@@ -556,6 +733,7 @@ mod tests {
             LspState::Complete,
             LspState::Unavailable,
             LspState::ServerFound,
+            LspState::Failed,
         ] {
             assert_eq!(LspState::from_u8(state as u8), state);
         }
@@ -784,6 +962,7 @@ mod tests {
                             | LspState::Complete
                             | LspState::Unavailable
                             | LspState::ServerFound
+                            | LspState::Failed
                     ));
                     let _footer = s.footer_segment(); // must not panic
                 })
@@ -842,7 +1021,7 @@ mod tests {
     fn test_adversarial_invalid_state_u8() {
         // Values beyond the enum range should fall back to NotStarted
         assert_eq!(LspState::from_u8(255), LspState::NotStarted);
-        assert_eq!(LspState::from_u8(5), LspState::NotStarted);
+        assert_eq!(LspState::from_u8(6), LspState::NotStarted);
         assert_eq!(LspState::from_u8(100), LspState::NotStarted);
     }
 
@@ -882,7 +1061,7 @@ mod tests {
         for n in &nodes {
             index.ensure_node(&n.stable_id(), &n.id.kind.to_string());
         }
-        GraphState { nodes, edges: vec![], index, last_scan_completed_at: None, detected_frameworks: std::collections::HashSet::new() }
+        GraphState::new(nodes, vec![], index, None, std::collections::HashSet::new())
     }
 
     #[test]
@@ -1087,5 +1266,45 @@ mod tests {
                 seg
             );
         }
+    }
+
+    #[test]
+    fn test_graph_build_status_default() {
+        let status = GraphBuildStatus::default();
+        assert_eq!(status.current_state(), GraphBuildState::NotStarted);
+        assert!(status.status_message().is_none());
+    }
+
+    #[test]
+    fn test_graph_build_status_building() {
+        let status = GraphBuildStatus::default();
+        status.set_building(500);
+        let msg = status.status_message().unwrap();
+        assert!(msg.contains("500 files"), "got: {}", msg);
+        assert!(msg.contains("retry in a few seconds"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_graph_build_status_failed() {
+        let status = GraphBuildStatus::default();
+        status.set_failed("disk full".to_string());
+        let msg = status.status_message().unwrap();
+        assert!(msg.contains("disk full"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_embedding_status_failed() {
+        let status = EmbeddingStatus::default();
+        status.set_failed("model error".to_string());
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("embedding failed"), "got: {}", footer);
+    }
+
+    #[test]
+    fn test_lsp_status_failed() {
+        let status = LspEnrichmentStatus::default();
+        status.set_failed("server crashed");
+        let footer = status.footer_segment().unwrap();
+        assert!(footer.contains("enrichment failed"), "got: {}", footer);
     }
 }

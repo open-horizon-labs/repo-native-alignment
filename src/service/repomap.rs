@@ -236,7 +236,7 @@ mod tests {
 
     fn make_graph_state(nodes: Vec<Node>) -> GraphState {
         let index = GraphIndex::new();
-        GraphState { nodes, edges: vec![], index, last_scan_completed_at: None, detected_frameworks: std::collections::HashSet::new() }
+        GraphState::new(nodes, vec![], index, None, std::collections::HashSet::new())
     }
 
     // ── repo_map root prefix tests (#270) ───────────────────────────

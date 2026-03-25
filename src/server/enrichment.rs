@@ -1,37 +1,41 @@
 //! Background enrichment: LSP enrichment, embedding pipeline, and background scanner.
+//!
+//! ## Module structure
+//!
+//! The background scanner stages are extracted into `bg_scanner`:
+//! - `scan_roots()` -- resolve workspace roots, detect file changes
+//! - `update_graph()` -- apply changes, run enrichment pipeline
+//! - `persist_deltas()` -- write to LanceDB, commit scanner state
 // EXTRACTION_VERSION is deprecated (#526) but still used for backward-compat migration.
 #![allow(deprecated)]
 
 use std::path::PathBuf;
-
-/// LanceDB persist delta: (root_slug, root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove)
-type LanceDelta = (String, PathBuf, Vec<Node>, Vec<Edge>, Vec<String>, std::collections::HashSet<PathBuf>);
 use std::sync::Arc;
 
 use crate::embed::EmbeddingIndex;
-use crate::extract::{ExtractorRegistry, EnricherRegistry};
 use crate::graph::{Edge, Node};
-use crate::graph::index::GraphIndex;
-use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
+use crate::roots::{RootConfig, WorkspaceConfig};
 use crate::scanner::Scanner;
 
-use super::helpers;
 use super::state::GraphState;
 use super::store::{
-    check_and_migrate_extraction_version, delete_nodes_for_roots, persist_graph_incremental,
-    persist_graph_to_lance,
+    check_and_migrate_extraction_version, persist_graph_to_lance,
 };
 use super::{PipelineResult, RnaHandler};
 
 impl RnaHandler {
     /// Spawn the background scanner task (event-driven + 15min heartbeat, worktree-aware).
+    ///
+    /// The loop calls three extracted stage functions per tick:
+    /// 1. `bg_scanner::scan_roots()` -- resolve workspace roots, detect file changes
+    /// 2. `bg_scanner::update_graph()` -- apply changes, run enrichment pipeline
+    /// 3. `bg_scanner::persist_deltas()` -- write to LanceDB, commit scanner state
     pub(crate) fn spawn_background_scanner(&self) {
         let graph = Arc::clone(&self.graph);
         let repo_root = self.repo_root.clone();
         let lance_write_lock = Arc::clone(&self.lance_write_lock);
         let scan_stats = Arc::clone(&self.scan_stats);
         tokio::spawn(async move {
-            // Track root slugs from the previous tick to detect removed worktrees.
             // Seed from the current resolved roots so the first tick doesn't
             // misidentify every root as "new".
             let mut prev_root_slugs: std::collections::HashSet<String> = WorkspaceConfig::load()
@@ -51,8 +55,6 @@ impl RnaHandler {
 
             loop {
                 // Check for HEAD or FETCH_HEAD changes before waiting.
-                // If a change is detected, trigger an immediate scan rather
-                // than waiting for the full 15-min cadence.
                 let head_changed = {
                     match git2::Repository::open(&repo_root) {
                         Ok(repo) => match repo.head().and_then(|h| h.peel_to_commit()) {
@@ -88,400 +90,294 @@ impl RnaHandler {
                         "FETCH_HEAD changed -- triggering immediate background scan"
                     );
                 } else {
-                    // No git-level change detected: wait for the 15-min heartbeat.
-                    // The baselines (last_head_oid, last_fetch_head_mtime) are
-                    // updated unconditionally at the top of every iteration, so any
-                    // commit that arrives during the sleep will be visible on the
-                    // very next wake-up without a post-sleep re-read here.
                     tokio::time::sleep(tokio::time::Duration::from_secs(900)).await;
                 }
 
-                // Resolve current roots (primary + any live worktrees + claude memory + agent memories + declared roots).
-                let workspace = WorkspaceConfig::load()
-                    .with_primary_root(repo_root.clone())
-                    .with_worktrees(&repo_root)
-                    .with_claude_memory(&repo_root)
-                    .with_agent_memories(&repo_root)
-                    .with_declared_roots(&repo_root);
-                let resolved_roots = workspace.resolved_roots();
-                let current_root_slugs: std::collections::HashSet<String> =
-                    resolved_roots.iter().map(|r| r.slug.clone()).collect();
+                // Stage 1: scan roots for file changes.
+                let mut scan_result = super::bg_scanner::scan_roots(&repo_root, &prev_root_slugs);
 
-                // Slugs that disappeared -> worktree was removed.
-                let removed_slugs: Vec<String> = prev_root_slugs
-                    .difference(&current_root_slugs)
-                    .cloned()
-                    .collect();
-
-                // Scan every live root for file-level changes.
-                // We carry scanners forward so we can commit state only after
-                // the graph update + LanceDB persist succeeds.
-                let mut has_changes = false;
-                let mut per_root_scans: Vec<(String, crate::scanner::ScanResult, PathBuf, Scanner)> =
-                    Vec::new();
-                for resolved_root in &resolved_roots {
-                    // Skip lsp_only roots: their files are already covered by the primary root
-                    // scan. Running a scanner over them would produce duplicate extraction.
-                    if resolved_root.config.lsp_only {
-                        continue;
-                    }
-                    let root_slug = resolved_root.slug.clone();
-                    let root_path = resolved_root.path.clone();
-                    let excludes = resolved_root.config.effective_excludes();
-                    let is_primary = root_path == repo_root;
-                    let mut scanner = if is_primary {
-                        match Scanner::with_excludes(root_path.clone(), excludes) {
-                            Ok(s) => s,
-                            Err(_) => continue,
-                        }
-                    } else {
-                        let state_path = cache_state_path(&root_slug);
-                        match Scanner::with_excludes_and_state_path(
-                            root_path.clone(),
-                            excludes,
-                            state_path,
-                        ) {
-                            Ok(s) => s,
-                            Err(_) => continue,
-                        }
-                    };
-                    let scan = match scanner.scan() {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    if !scan.changed_files.is_empty()
-                        || !scan.new_files.is_empty()
-                        || !scan.deleted_files.is_empty()
-                    {
-                        has_changes = true;
-                    }
-                    per_root_scans.push((root_slug, scan, root_path, scanner));
-                }
-
-                if !has_changes && removed_slugs.is_empty() {
-                    prev_root_slugs = current_root_slugs;
+                if !scan_result.has_changes && scan_result.removed_slugs.is_empty() {
+                    prev_root_slugs = scan_result.current_root_slugs;
                     continue;
                 }
 
-                // Collect LanceDB persist deltas per root (outside write guard so
-                // persist_graph_incremental can run without holding the lock).
-                // Structure: (root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove)
-                let mut lance_deltas: Vec<LanceDelta> = Vec::new();
+                // Stage 2: update graph (lock-free via ArcSwap).
+                let current_snap = graph.load_full();
+                if let Some(ref current_gs) = *current_snap {
+                    let mut graph_state = (**current_gs).clone();
 
-                let mut guard = graph.write().await;
-                if let Some(ref mut graph_state) = *guard {
-                    let registry = ExtractorRegistry::with_builtins();
+                    let lance_deltas = super::bg_scanner::update_graph(
+                        &mut graph_state,
+                        &mut scan_result,
+                        &repo_root,
+                        &scan_stats,
+                    ).await;
 
-                    // Drop in-memory nodes/edges for removed worktrees.
-                    for slug in &removed_slugs {
+                    // Atomic swap: publish the new graph state.
+                    graph.store(Arc::new(Some(Arc::new(graph_state))));
+
+                    // Stage 3: persist deltas to LanceDB.
+                    super::bg_scanner::persist_deltas(
+                        lance_deltas,
+                        &scan_result.per_root_scans,
+                        &scan_result.removed_slugs,
+                        &repo_root,
+                        &graph,
+                        &lance_write_lock,
+                    ).await;
+                }
+
+                prev_root_slugs = scan_result.current_root_slugs;
+            }
+        });
+        tracing::info!("Background scanner started (event-driven + 15min heartbeat, worktree-aware)");
+    }
+
+    /// Spawn background LSP enrichment after the initial graph build returns (#574).
+    ///
+    /// The initial `build_full_graph_inner` runs with `skip_lsp=true` so it returns
+    /// in seconds (tree-sitter + non-LSP passes only). This method spawns LSP enrichment
+    /// in the background: when complete, it ArcSwaps the fully enriched graph and
+    /// re-persists to LanceDB with LSP edges.
+    ///
+    /// This restores the v0.1.14 behavior where `build_full_graph_inner` returned
+    /// immediately and LSP ran via `spawn_background_enrichment`.
+    pub(crate) fn spawn_background_lsp_enrichment(
+        &self,
+        nodes: Vec<crate::graph::Node>,
+        edges: Vec<crate::graph::Edge>,
+        dirty_slugs: std::collections::HashSet<String>,
+        detected_frameworks: std::collections::HashSet<String>,
+    ) {
+        let repo_root = self.repo_root.clone();
+        let graph_arc = Arc::clone(&self.graph);
+        let lsp_status = Arc::clone(&self.lsp_status);
+        let scan_stats = Arc::clone(&self.scan_stats);
+        let lance_write_lock = Arc::clone(&self.lance_write_lock);
+
+        tokio::spawn(async move {
+            let t0 = std::time::Instant::now();
+            tracing::info!(
+                "[background-lsp] Starting LSP enrichment: {} nodes, {} edges",
+                nodes.len(), edges.len()
+            );
+
+            // Build root pairs for the enrichment pipeline
+            let workspace = crate::roots::WorkspaceConfig::load()
+                .with_primary_root(repo_root.clone())
+                .with_worktrees(&repo_root)
+                .with_declared_roots(&repo_root);
+            let root_pairs: Vec<(String, std::path::PathBuf)> = workspace
+                .resolved_roots()
+                .iter()
+                .map(|r| (r.slug.clone(), r.path.clone()))
+                .collect();
+            let primary_slug = crate::roots::RootConfig::code_project(repo_root.clone()).slug();
+
+            // Run enrichment pipeline WITH LSP (skip_lsp=false)
+            let result = crate::extract::consumers::emit_enrichment_pipeline(
+                nodes,
+                edges,
+                root_pairs,
+                primary_slug.clone(),
+                repo_root.clone(),
+                crate::extract::consumers::BusOptions {
+                    scan_stats: Some(Arc::clone(&scan_stats)),
+                    embed_idx: None,
+                    lance_repo_root: None,
+                    skip_lsp: false, // this time LSP runs
+                },
+                Some(dirty_slugs),
+            ).await;
+
+            match result {
+                Ok((mut enriched_nodes, mut enriched_edges, enriched_frameworks)) => {
+                    // Update LSP status
+                    let lsp_edge_count = enriched_edges.iter()
+                        .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
+                        .count();
+                    let lsp_call_edge_count = enriched_edges.iter()
+                        .filter(|e| {
+                            e.source == crate::graph::ExtractionSource::Lsp
+                                && matches!(e.kind, crate::graph::EdgeKind::Calls)
+                        })
+                        .count();
+                    if lsp_edge_count > 0 {
+                        lsp_status.set_complete(lsp_call_edge_count);
                         tracing::info!(
-                            "Worktree removed -- dropping in-memory nodes for root '{}'",
-                            slug
+                            "[background-lsp] LSP enrichment complete: {} LSP call edges, {} total LSP edges in {:.2}s",
+                            lsp_call_edge_count, lsp_edge_count, t0.elapsed().as_secs_f64()
                         );
-                        graph_state.nodes.retain(|n| &n.id.root != slug);
-                        graph_state.edges.retain(|e| &e.from.root != slug);
+                    } else {
+                        lsp_status.set_unavailable();
+                        tracing::info!(
+                            "[background-lsp] LSP enrichment produced no edges in {:.2}s",
+                            t0.elapsed().as_secs_f64()
+                        );
                     }
 
-                    // Apply file-level changes per root.
-                    for (root_slug, scan, root_path, _scanner) in &per_root_scans {
-                        if scan.changed_files.is_empty()
-                            && scan.new_files.is_empty()
-                            && scan.deleted_files.is_empty()
-                        {
-                            continue;
-                        }
-                        tracing::info!(
-                            "Background scan '{}': {} changed, {} new, {} deleted",
-                            root_slug,
-                            scan.changed_files.len(),
-                            scan.new_files.len(),
-                            scan.deleted_files.len()
-                        );
-                        // Use a HashSet for O(1) membership checks during retain/filter
-                        // instead of O(n) Vec::contains / iter().any(). With a Vec the
-                        // retain loops over nodes/edges become O(nodes × files_to_remove).
-                        let files_to_remove: std::collections::HashSet<PathBuf> = scan
-                            .deleted_files
-                            .iter()
-                            .chain(scan.changed_files.iter())
-                            .cloned()
-                            .collect();
-
-                        // Collect edge IDs to delete BEFORE retain (same pattern as foreground).
-                        let deleted_edge_ids: Vec<String> = graph_state
-                            .edges
-                            .iter()
-                            .filter(|e| {
-                                e.from.root == *root_slug
-                                    && (files_to_remove.contains(&e.from.file)
-                                        || files_to_remove.contains(&e.to.file))
-                            })
-                            .map(|e| e.stable_id())
-                            .collect();
-
-                        graph_state.nodes.retain(|n| {
-                            n.id.root != *root_slug
-                                || !files_to_remove.contains(&n.id.file)
-                        });
-                        graph_state.edges.retain(|e| {
-                            e.from.root != *root_slug
-                                || (!files_to_remove.contains(&e.from.file)
-                                    && !files_to_remove.contains(&e.to.file))
-                        });
-                        let (mut extraction, enc_stats) = registry.extract_scan_result_with_stats(root_path, scan);
-
-                        // Merge encoding stats (incremental scan: add to existing totals).
-                        if let Ok(mut stats) = scan_stats.write() {
-                            stats.merge_encoding_stats(root_slug, &enc_stats);
-                        }
-
-                        for node in &mut extraction.nodes {
-                            node.id.root = root_slug.clone();
-                        }
-                        // Build file index from existing + new nodes for suffix resolution
-                        let file_index: std::collections::HashSet<String> = graph_state.nodes
-                            .iter()
-                            .chain(extraction.nodes.iter())
-                            .map(|n| n.id.file.to_string_lossy().to_string())
-                            .collect();
-                        for edge in &mut extraction.edges {
-                            edge.from.root = root_slug.clone();
-                            edge.to.root = root_slug.clone();
-                            helpers::resolve_edge_target_by_suffix(edge, &file_index);
-                        }
-                        let upsert_nodes = extraction.nodes.clone();
-                        let upsert_edges = extraction.edges.clone();
-                        graph_state.nodes.extend(extraction.nodes);
-                        graph_state.edges.extend(extraction.edges);
-
-                        lance_deltas.push((
-                            root_slug.clone(),
-                            root_path.clone(),
-                            upsert_nodes,
-                            upsert_edges,
-                            deleted_edge_ids,
-                            files_to_remove,
-                        ));
-                    }
-
-                    // Run post-extraction passes via EventBus (ADR Phase 2b, issue #502).
-                    // Both foreground and background paths now use the same bus-driven
-                    // consumer chain. Satisfies ADR Constraint 4 (no pass calls in src/server/).
+                    // Dedup
                     {
-                        // Snapshot existing stable_ids before the passes run.
-                        let before_node_ids: std::collections::HashSet<String> =
-                            graph_state.nodes.iter().map(|n| n.stable_id()).collect();
-                        let before_edge_ids: std::collections::HashSet<String> =
-                            graph_state.edges.iter().map(|e| e.stable_id()).collect();
-
-                        let root_pairs: Vec<(String, std::path::PathBuf)> =
-                            WorkspaceConfig::load()
-                                .with_primary_root(repo_root.clone())
-                                .with_worktrees(&repo_root)
-                                .with_declared_roots(&repo_root)
-                                .resolved_roots()
-                                .into_iter()
-                                .map(|r| (r.slug, r.path))
-                                .collect();
-                        let primary_slug =
-                            RootConfig::code_project(repo_root.clone()).slug();
-
-                        // Compute dirty_slugs: only roots that had file changes should
-                        // trigger LSP enrichment (#555). `Some(set)` = only those roots.
-                        let dirty_slugs: Option<std::collections::HashSet<String>> = Some(per_root_scans
-                            .iter()
-                            .filter(|(_, scan, _, _)| {
-                                !scan.changed_files.is_empty()
-                                    || !scan.new_files.is_empty()
-                                    || !scan.deleted_files.is_empty()
-                            })
-                            .map(|(slug, _, _, _)| slug.clone())
-                            .collect());
-
-                        // Pipeline invariant: EnrichmentFinalizer always emits PassesComplete.
-                        // If it doesn't (a logic bug), log the error and clear lance_deltas so
-                        // the empty graph is not persisted. The graph remains empty until the
-                        // next full rebuild (next startup or manual `scan --full`).
-                        match crate::extract::consumers::emit_enrichment_pipeline(
-                            std::mem::take(&mut graph_state.nodes),
-                            std::mem::take(&mut graph_state.edges),
-                            root_pairs,
-                            primary_slug.clone(),
-                            repo_root.clone(),
-                            crate::extract::consumers::BusOptions {
-                                scan_stats: Some(Arc::clone(&scan_stats)),
-                                embed_idx: None, // embed handled by background scanner's own reindex pass
-                                lance_repo_root: None, // LanceDB persist handled by background scanner's lance_deltas
-                            },
-                            dirty_slugs,
-                        ).await {
-                            Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
-                                graph_state.nodes = enriched_nodes;
-                                graph_state.edges = enriched_edges;
-                                graph_state.detected_frameworks = detected_frameworks;
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    "Background scanner: post-extraction passes failed \
-                                     (pipeline invariant violated) — aborting tick, \
-                                     no data will be persisted: {:#}",
-                                    e
-                                );
-                                // Clear deltas so nothing bad gets written to LanceDB.
-                                lance_deltas.clear();
-                                // graph_state.nodes/edges are now empty (taken above).
-                                // An empty graph is safe for the subsequent rebuild-index
-                                // and pagerank steps (both are no-ops on an empty set).
-                            }
-                        }
-
-                        // Deduplicate nodes and edges after post-extraction passes.
-                        // Passes re-emit edges that may already be present from cached
-                        // roots; dedup here mirrors the full-build dedup block (6z).
-                        {
-                            let mut seen_nodes = std::collections::HashSet::new();
-                            graph_state.nodes.reverse();
-                            graph_state.nodes.retain(|n| seen_nodes.insert(n.stable_id()));
-                            graph_state.nodes.reverse();
-
-                            let mut seen_edges = std::collections::HashSet::new();
-                            graph_state.edges.retain(|e| seen_edges.insert(e.stable_id()));
-                        }
-
-                        // Collect net-new nodes/edges introduced by the passes.
-                        // These must be persisted to LanceDB so they survive restarts.
-                        let new_nodes: Vec<Node> = graph_state
-                            .nodes
-                            .iter()
-                            .filter(|n| !before_node_ids.contains(&n.stable_id()))
-                            .cloned()
-                            .collect();
-                        let new_edges: Vec<Edge> = graph_state
-                            .edges
-                            .iter()
-                            .filter(|e| !before_edge_ids.contains(&e.stable_id()))
-                            .cloned()
-                            .collect();
-
-                        if !new_nodes.is_empty() || !new_edges.is_empty() {
-                            tracing::info!(
-                                "Post-extraction passes added {} node(s), {} edge(s) to persist delta",
-                                new_nodes.len(),
-                                new_edges.len()
-                            );
-                            // Use repo_root as the path for cross-cutting additions
-                            // (api_link, manifest, etc. are global, not per-root).
-                            lance_deltas.push((
-                                primary_slug,
-                                repo_root.clone(),
-                                new_nodes,
-                                new_edges,
-                                Vec::new(), // no deletions — passes only add
-                                std::collections::HashSet::new(), // no files removed
-                            ));
-                        }
+                        let mut seen_nodes = std::collections::HashSet::new();
+                        enriched_nodes.reverse();
+                        enriched_nodes.retain(|n| seen_nodes.insert(n.stable_id()));
+                        enriched_nodes.reverse();
+                        let mut seen_edges = std::collections::HashSet::new();
+                        enriched_edges.retain(|e| seen_edges.insert(e.stable_id()));
                     }
 
-                    // Rebuild petgraph index.
-                    graph_state.index = GraphIndex::new();
-                    graph_state.index.rebuild_from_edges(&graph_state.edges);
-                    for node in &graph_state.nodes {
-                        graph_state.index.ensure_node(
-                            &node.stable_id(),
-                            &node.id.kind.to_string(),
-                        );
+                    // Rebuild petgraph index
+                    let mut index = crate::graph::index::GraphIndex::new();
+                    index.rebuild_from_edges(&enriched_edges);
+                    for node in &enriched_nodes {
+                        index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
                     }
 
-                    // Recompute PageRank importance scores after graph mutation.
-                    let pagerank_scores = graph_state.index.compute_pagerank(0.85, 20);
-                    for node in &mut graph_state.nodes {
+                    // Recompute PageRank with LSP edges
+                    let pagerank_scores = index.compute_pagerank(0.85, 20);
+                    for node in &mut enriched_nodes {
                         if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
                             node.metadata.insert("importance".to_string(), format!("{:.6}", score));
                         }
                     }
 
+                    // Re-run subsystem detection with updated PageRank
+                    {
+                        let node_file_map: std::collections::HashMap<String, String> = enriched_nodes
+                            .iter()
+                            .filter(|n| n.id.root != "external")
+                            .map(|n| (n.stable_id(), n.id.file.display().to_string()))
+                            .collect();
+                        let mut subsystems = index.detect_communities(&pagerank_scores, &node_file_map);
+                        // Dedup subsystem names
+                        {
+                            let mut name_counts: std::collections::HashMap<String, usize> =
+                                std::collections::HashMap::new();
+                            for s in &subsystems {
+                                *name_counts.entry(s.name.clone()).or_default() += 1;
+                            }
+                            for s in &mut subsystems {
+                                if name_counts.get(&s.name).copied().unwrap_or(0) > 1
+                                    && let Some(iface) = s.interfaces.first() {
+                                        let short = iface
+                                            .node_id
+                                            .split(':')
+                                            .rev()
+                                            .nth(1)
+                                            .unwrap_or(&iface.node_id);
+                                        s.name = format!("{}/{}", s.name, short);
+                                    }
+                            }
+                        }
+                        let mut node_subsystem: std::collections::HashMap<String, String> =
+                            std::collections::HashMap::new();
+                        for subsystem in &subsystems {
+                            for member_id in &subsystem.member_ids {
+                                node_subsystem.insert(member_id.clone(), subsystem.name.clone());
+                            }
+                        }
+                        // Remove stale virtual nodes
+                        enriched_nodes.retain(|n| !matches!(&n.id.kind, crate::graph::NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")));
+                        enriched_edges.retain(|e| {
+                            !matches!(&e.to.kind, crate::graph::NodeKind::Other(s) if s == "subsystem")
+                                && e.kind != crate::graph::EdgeKind::UsesFramework
+                                && e.kind != crate::graph::EdgeKind::Produces
+                                && e.kind != crate::graph::EdgeKind::Consumes
+                        });
+                        for node in &mut enriched_nodes {
+                            if let Some(subsystem_name) = node_subsystem.get(&node.stable_id()) {
+                                node.metadata.insert(
+                                    super::graph::SUBSYSTEM_KEY.to_owned(),
+                                    subsystem_name.clone(),
+                                );
+                            } else {
+                                node.metadata.remove(super::graph::SUBSYSTEM_KEY);
+                            }
+                        }
+                        // Emit subsystem virtual nodes
+                        let (sub_added_nodes, sub_added_edges) =
+                            crate::extract::consumers::emit_community_detection(
+                                primary_slug,
+                                subsystems,
+                                enriched_nodes.clone(),
+                            ).await.unwrap_or_else(|e| {
+                                tracing::warn!("[background-lsp] Subsystem promotion failed: {}", e);
+                                (vec![], vec![])
+                            });
+                        enriched_nodes.extend(sub_added_nodes);
+                        enriched_edges.extend(sub_added_edges);
+
+                        // Re-add virtual nodes to index
+                        for node in &enriched_nodes {
+                            if matches!(&node.id.kind, crate::graph::NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+                                index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+                            }
+                        }
+                        for edge in &enriched_edges {
+                            if matches!(&edge.to.kind, crate::graph::NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+                                index.add_edge(
+                                    &edge.from.to_stable_id(),
+                                    &edge.from.kind.to_string(),
+                                    &edge.to.to_stable_id(),
+                                    &edge.to.kind.to_string(),
+                                    edge.kind.clone(),
+                                );
+                            }
+                        }
+                    }
+
+                    // Final dedup
+                    {
+                        let mut seen_edges = std::collections::HashSet::new();
+                        enriched_edges.retain(|e| seen_edges.insert(e.stable_id()));
+                    }
+
+                    // Persist to LanceDB with LSP edges
+                    {
+                        let _lance_guard = lance_write_lock.lock().await;
+                        if let Err(e) = super::store::persist_graph_to_lance(
+                            &repo_root, &enriched_nodes, &enriched_edges
+                        ).await {
+                            tracing::error!("[background-lsp] LanceDB persist failed: {}", e);
+                        } else {
+                            super::sentinel::write_extract_sentinel(
+                                &repo_root, enriched_nodes.len(), enriched_edges.len()
+                            );
+                            let has_lsp_edges = enriched_edges.iter()
+                                .any(|e| e.source == crate::graph::ExtractionSource::Lsp);
+                            if has_lsp_edges {
+                                super::sentinel::write_lsp_sentinel(
+                                    &repo_root, enriched_nodes.len(), enriched_edges.len()
+                                );
+                            }
+                            tracing::info!(
+                                "[background-lsp] LanceDB re-persisted with LSP edges: {} nodes, {} edges",
+                                enriched_nodes.len(), enriched_edges.len()
+                            );
+                        }
+                    }
+
+                    // ArcSwap the fully enriched graph
+                    let all_frameworks = detected_frameworks.union(&enriched_frameworks).cloned().collect();
+                    let new_state = super::state::GraphState::new(
+                        enriched_nodes,
+                        enriched_edges,
+                        index,
+                        Some(std::time::Instant::now()),
+                        all_frameworks,
+                    );
+                    graph_arc.store(Arc::new(Some(Arc::new(new_state))));
                     tracing::info!(
-                        "Background update: {} nodes, {} edges",
-                        graph_state.nodes.len(),
-                        graph_state.edges.len()
+                        "[background-lsp] Enriched graph swapped in after {:.2}s",
+                        t0.elapsed().as_secs_f64()
                     );
                 }
-                drop(guard);
-
-                // Persist incremental deltas to LanceDB for each root (lock released above).
-                // Acquire the write mutex to serialize with other LanceDB writers (#344 round 3).
-                // Track which roots persisted successfully so we can commit scanner state.
-                let mut persisted_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
-                for (slug, root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove) in lance_deltas {
-                    let persist_result = {
-                        let _lance_guard = lance_write_lock.lock().await;
-                        let files_to_remove_vec: Vec<PathBuf> = files_to_remove.into_iter().collect();
-                        persist_graph_incremental(
-                            &root_path,
-                            &upsert_nodes,
-                            &upsert_edges,
-                            &deleted_edge_ids,
-                            &files_to_remove_vec,
-                        )
-                        .await
-                    };
-                    match persist_result {
-                        Ok(true) => {
-                            tracing::info!("Background scan: schema migrated; performing full persist now");
-                            let snapshot = {
-                                let g = graph.read().await;
-                                g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
-                            };
-                            if let Some((nodes, edges)) = snapshot {
-                                let _lance_guard = lance_write_lock.lock().await;
-                                if let Err(e) = persist_graph_to_lance(&repo_root, &nodes, &edges).await {
-                                    tracing::error!("Background scan: full persist after migration failed: {:#}", e);
-                                    continue; // Don't commit scanner state for this root
-                                }
-                            }
-                            persisted_slugs.insert(slug);
-                        }
-                        Ok(false) => {
-                            persisted_slugs.insert(slug);
-                        }
-                        Err(e) => {
-                            tracing::error!("Background scan: failed to persist graph delta for '{}': {:#}", slug, e);
-                            // Don't commit scanner state -- next scan will re-detect changes
-                        }
-                    }
+                Err(e) => {
+                    tracing::error!("[background-lsp] LSP enrichment pipeline failed: {:#}", e);
+                    lsp_status.set_unavailable();
                 }
-
-                // Commit scanner state only for roots that persisted successfully.
-                for (root_slug, _scan, _root_path, scanner) in &per_root_scans {
-                    if persisted_slugs.contains(root_slug)
-                        && let Err(e) = scanner.commit_state() {
-                            tracing::error!("Background scan: failed to commit scanner state for '{}': {}", root_slug, e);
-                        }
-                }
-
-                // Update freshness timestamp if any root persisted successfully.
-                if !persisted_slugs.is_empty() {
-                    let mut guard = graph.write().await;
-                    if let Some(ref mut gs) = *guard {
-                        gs.last_scan_completed_at = Some(std::time::Instant::now());
-                    }
-                }
-
-                // Purge removed worktree slugs from LanceDB.
-                if !removed_slugs.is_empty() {
-                    let _lance_guard = lance_write_lock.lock().await;
-                    if let Err(e) = delete_nodes_for_roots(&repo_root, &removed_slugs).await {
-                        tracing::warn!(
-                            "Failed to delete LanceDB rows for removed worktrees: {}",
-                            e
-                        );
-                    }
-                }
-
-                prev_root_slugs = current_root_slugs;
             }
         });
-        tracing::info!("Background scanner started (event-driven + 15min heartbeat, worktree-aware)");
     }
 
     /// Spawn background embedding after a full graph build.
@@ -530,7 +426,7 @@ impl RnaHandler {
                             }
                             Err(e) => {
                                 tracing::warn!("[background] Embedding table check failed: {}", e);
-                                embed_status.set_complete(0);
+                                embed_status.set_failed(format!("{}", e));
                                 return;
                             }
                         };
@@ -543,13 +439,13 @@ impl RnaHandler {
                             }
                             Err(e) => {
                                 tracing::warn!("[background] Embedding failed: {}", e);
-                                embed_status.set_complete(0);
+                                embed_status.set_failed(format!("{}", e));
                             }
                         }
                     }
                     Err(e) => {
                         tracing::warn!("[background] EmbeddingIndex init failed: {}", e);
-                        embed_status.set_complete(0);
+                        embed_status.set_failed(format!("{}", e));
                     }
                 }
             };
@@ -624,6 +520,7 @@ impl RnaHandler {
                     scan_stats: Some(bg_scan_stats),
                     embed_idx: None,
                     lance_repo_root: None,
+                    skip_lsp: false,
                 },
                 None,
             ).await;
@@ -632,7 +529,7 @@ impl RnaHandler {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!("[cache-hit bus] emit_enrichment_pipeline failed: {:#}", e);
-                    bg_lsp_status.set_unavailable();
+                    bg_lsp_status.set_failed(&format!("{}", e));
                     return;
                 }
             };
@@ -673,15 +570,18 @@ impl RnaHandler {
                 new_index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
             }
 
-            // Replace in-memory graph state with enriched result under write lock.
+            // Atomic swap: replace the in-memory graph with the enriched version.
+            // Tool calls reading the old snapshot are undisturbed; new calls see
+            // the enriched version immediately.
             {
-                let mut guard = bg_graph.write().await;
-                if let Some(ref mut gs) = *guard {
-                    gs.nodes = enriched_nodes.clone();
-                    gs.edges = enriched_edges.clone();
-                    gs.index = new_index;
+                let snap = bg_graph.load_full();
+                if let Some(ref gs) = *snap {
+                    let mut new_gs = (**gs).clone();
+                    new_gs.nodes = enriched_nodes.clone();
+                    new_gs.edges = enriched_edges.clone();
+                    new_gs.index = new_index;
+                    bg_graph.store(Arc::new(Some(Arc::new(new_gs))));
                 }
-                // Guard drops here, releasing the write lock before LanceDB persist.
             }
 
             // Persist enriched graph to LanceDB and write sentinel under the write lock
@@ -714,193 +614,24 @@ impl RnaHandler {
         });
     }
 
-    /// Spawn incremental LSP enrichment for changed nodes after an incremental update.
+    /// Build workspace `root_pairs` and `primary_slug` for `emit_enrichment_pipeline`.
     ///
-    /// Not called from the synchronous bus path (Phase 3+, issue #520) because
-    /// `emit_enrichment_pipeline` already runs LspConsumers synchronously.
-    /// Retained for future use (e.g., explicit CLI trigger or Phase 4 async path).
-    #[allow(dead_code)]
-    pub(crate) fn spawn_incremental_lsp_enrichment(
-        &self,
-        changed_nodes: Vec<Node>,
-        index: GraphIndex,
-    ) {
-        let languages: Vec<String> = changed_nodes
+    /// Factored out to avoid duplicating `WorkspaceConfig` boilerplate across
+    /// every foreground path that now routes through the event bus (ADR-001, #583).
+    fn build_bus_root_pairs(&self) -> (Vec<(String, PathBuf)>, String) {
+        let workspace = WorkspaceConfig::load()
+            .with_primary_root(self.repo_root.clone())
+            .with_worktrees(&self.repo_root)
+            .with_claude_memory(&self.repo_root)
+            .with_agent_memories(&self.repo_root)
+            .with_declared_roots(&self.repo_root);
+        let root_pairs: Vec<(String, PathBuf)> = workspace
+            .resolved_roots()
             .iter()
-            .map(|n| n.language.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
+            .map(|r| (r.slug.clone(), r.path.clone()))
             .collect();
-
-        tracing::info!(
-            "Spawning background incremental LSP enrichment for {} nodes ({} languages: [{}])",
-            changed_nodes.len(),
-            languages.len(),
-            languages.join(", ")
-        );
-
-        // Snapshot what we need for the background task, then release the write lock.
-        let bg_graph = self.graph.clone();
-        let bg_repo_root = self.repo_root.clone();
-        let bg_lsp_status = self.lsp_status.clone();
-        let bg_embed_index = self.embed_index.clone();
-        let bg_lance_write_lock = Arc::clone(&self.lance_write_lock);
-        let bg_lsp_only_roots = Arc::clone(&self.lsp_only_roots);
-
-        self.lsp_status.set_running();
-
-        tokio::spawn(async move {
-            let enricher_registry = EnricherRegistry::with_builtins();
-
-            // Check if any registered enricher supports the delta's languages.
-            // If not, this is expected (e.g. yaml-only change with no yaml LSP) --
-            // don't mark global LSP status as unavailable since other enrichers
-            // (rust-analyzer, marksman) may still be healthy.
-            let supported = enricher_registry.supported_languages();
-            let has_supported_language = languages.iter().any(|l| supported.contains(l));
-
-            let enrichment = enricher_registry
-                .enrich_all(&changed_nodes, &index, &languages, &bg_repo_root, &bg_lsp_only_roots)
-                .await;
-
-            if !enrichment.any_enricher_ran {
-                if has_supported_language {
-                    // Enricher was expected to run but didn't -- server likely missing.
-                    bg_lsp_status.set_unavailable();
-                } else {
-                    // No enricher supports these languages -- not an error.
-                    bg_lsp_status.set_complete(0);
-                }
-                return;
-            }
-
-            if enrichment.new_nodes.is_empty()
-                && enrichment.added_edges.is_empty()
-                && enrichment.updated_nodes.is_empty()
-            {
-                tracing::info!("[incremental-bg] LSP enrichment: no changes");
-                bg_lsp_status.set_complete(0);
-                return;
-            }
-
-            tracing::info!(
-                "[incremental-bg] LSP enrichment: {} virtual nodes, {} edges, {} patches",
-                enrichment.new_nodes.len(),
-                enrichment.added_edges.len(),
-                enrichment.updated_nodes.len()
-            );
-
-            // Acquire write lock briefly for in-memory graph mutation only.
-            let mut guard = bg_graph.write().await;
-            if let Some(ref mut gs) = *guard {
-                // Collect new node IDs before moving nodes into the graph.
-                let new_node_ids: Vec<String> = enrichment.new_nodes.iter()
-                    .map(|n| n.stable_id())
-                    .collect();
-                for vnode in &enrichment.new_nodes {
-                    gs.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
-                }
-                gs.nodes.extend(enrichment.new_nodes);
-
-                // Clone edges for persist (needed after lock is dropped), then move into graph.
-                let persist_edges = enrichment.added_edges.clone();
-                for edge in &persist_edges {
-                    gs.index.add_edge(
-                        &edge.from.to_stable_id(),
-                        &edge.from.kind.to_string(),
-                        &edge.to.to_stable_id(),
-                        &edge.to.kind.to_string(),
-                        edge.kind.clone(),
-                    );
-                }
-                gs.edges.extend(enrichment.added_edges);
-
-                let enriched_node_ids: std::collections::HashSet<String> =
-                    enrichment.updated_nodes.iter().map(|(id, _)| id.clone()).collect();
-                for (node_id, patches) in &enrichment.updated_nodes {
-                    if let Some(node) = gs.nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
-                        for (key, value) in patches {
-                            node.metadata.insert(key.clone(), value.clone());
-                        }
-                    }
-                }
-
-                // Recompute PageRank after topology changes.
-                let pagerank_scores = gs.index.compute_pagerank(0.85, 20);
-                for node in &mut gs.nodes {
-                    if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
-                        node.metadata.insert("importance".to_string(), format!("{:.6}", score));
-                    }
-                }
-
-                // Collect nodes to persist/re-embed AFTER PageRank so importance is current.
-                let all_upsert_node_ids: std::collections::HashSet<String> =
-                    enriched_node_ids.iter().cloned()
-                        .chain(new_node_ids)
-                        .collect();
-                let all_upsert_nodes: Vec<Node> = gs.nodes.iter()
-                    .filter(|n| all_upsert_node_ids.contains(&n.stable_id()))
-                    .cloned()
-                    .collect();
-
-                let edge_count = persist_edges.len();
-                drop(guard); // Release lock before slow I/O.
-
-                // Re-embed enriched nodes.
-                let embed_guard = bg_embed_index.load();
-                if let Some(ref embed_idx) = **embed_guard
-                    && let Err(e) = embed_idx.reindex_nodes(&all_upsert_nodes).await {
-                        tracing::warn!("[incremental-bg] Failed to re-embed enriched nodes: {}", e);
-                    }
-
-                // Persist to LanceDB (slow -- outside the lock).
-                // Acquire the write mutex to serialize with other LanceDB writers (#344 round 3).
-                // The sentinel is written inside the same critical section as the persist so
-                // another writer cannot race in between (#477 CodeRabbit critical).
-                let persist_result = {
-                    let _lance_guard = bg_lance_write_lock.lock().await;
-                    let result = persist_graph_incremental(
-                        &bg_repo_root, &all_upsert_nodes, &persist_edges, &[], &[],
-                    ).await;
-                    if matches!(result, Ok(false)) {
-                        // Incremental persist succeeded -- write sentinel while lock is held.
-                        let (total_nodes, total_edges) = {
-                            let g = bg_graph.read().await;
-                            g.as_ref().map(|gs| (gs.nodes.len(), gs.edges.len()))
-                                .unwrap_or((0, 0))
-                        };
-                        super::sentinel::write_lsp_sentinel(&bg_repo_root, total_nodes, total_edges);
-                    }
-                    result
-                };
-                match persist_result {
-                    Ok(true) => {
-                        tracing::info!("[incremental-bg] LSP enrichment: schema migrated; performing full persist");
-                        let snapshot = {
-                            let g = bg_graph.read().await;
-                            g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
-                        };
-                        if let Some((nodes, edges)) = snapshot {
-                            let _lance_guard = bg_lance_write_lock.lock().await;
-                            if let Err(e) = persist_graph_to_lance(&bg_repo_root, &nodes, &edges).await {
-                                tracing::error!("[incremental-bg] Full persist after migration failed: {:#}", e);
-                                bg_lsp_status.set_complete_persist_failed(edge_count);
-                            } else {
-                                super::sentinel::write_lsp_sentinel(&bg_repo_root, nodes.len(), edges.len());
-                                bg_lsp_status.set_complete(edge_count);
-                            }
-                        } else {
-                            bg_lsp_status.set_complete(edge_count);
-                        }
-                    }
-                    Ok(false) => bg_lsp_status.set_complete(edge_count),
-                    Err(e) => {
-                        tracing::error!("[incremental-bg] LSP enrichment persist failed: {:#}", e);
-                        bg_lsp_status.set_complete_persist_failed(edge_count);
-                    }
-                }
-            }
-        });
+        let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
+        (root_pairs, primary_slug)
     }
 
     /// Run the full pipeline synchronously with progress reporting.
@@ -1020,11 +751,8 @@ impl RnaHandler {
         if change_count == 0 {
             on_progress("No changes detected -- reusing cached graph.");
 
-            // Store graph and set up embedding index.
-            {
-                let mut guard = self.graph.write().await;
-                *guard = Some(cached_state);
-            }
+            // Store graph atomically and set up embedding index.
+            self.graph.store(Arc::new(Some(Arc::new(cached_state))));
 
             // Reuse existing embedding index.
             if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await
@@ -1042,8 +770,8 @@ impl RnaHandler {
 
             let lsp_edge_count = if lsp_sentinel.is_some() {
                 let call_count = {
-                    let guard = self.graph.read().await;
-                    guard.as_ref().unwrap().edges.iter()
+                    let snap = self.graph.load_full();
+                    snap.as_ref().as_ref().unwrap().edges.iter()
                         .filter(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
                         .count()
                 };
@@ -1061,8 +789,8 @@ impl RnaHandler {
 
             // Read final counts (may have changed after LSP enrichment).
             let (total_node_count, total_edge_count) = {
-                let guard = self.graph.read().await;
-                let gs = guard.as_ref().unwrap();
+                let snap = self.graph.load_full();
+                let gs = snap.as_ref().as_ref().unwrap();
                 (gs.nodes.len(), gs.edges.len())
             };
 
@@ -1073,9 +801,12 @@ impl RnaHandler {
             return Ok(PipelineResult {
                 node_count: total_node_count,
                 edge_count: total_edge_count,
+                file_count: 0,
                 lsp_edge_count,
                 embed_count: 0,
                 total_time,
+                lsp_entries: vec![],
+                encoding_stats: crate::extract::EncodingStats::default(),
             });
         }
 
@@ -1095,25 +826,16 @@ impl RnaHandler {
             cached_state.index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
         }
 
-        // Store the cached graph so update_graph_with_scan can modify it in-place.
-        {
-            let mut guard = self.graph.write().await;
-            *guard = Some(cached_state);
-        }
-
-        // Run incremental update (extract only changed files, remove deleted, re-embed).
+        // Run incremental update on the local cached_state, then store atomically.
         // LSP spawning is disabled (spawn_lsp=false) -- we handle it synchronously below.
-        {
-            let mut guard = self.graph.write().await;
-            let gs = guard.as_mut().unwrap();
-            self.update_graph_with_scan(gs, Some(scan), false).await?;
-        }
+        self.update_graph_with_scan(&mut cached_state, Some(scan), false).await?;
+        self.graph.store(Arc::new(Some(Arc::new(cached_state))));
 
         let extract_time = t1.elapsed();
 
         let (node_count, file_count) = {
-            let guard = self.graph.read().await;
-            let gs = guard.as_ref().unwrap();
+            let snap = self.graph.load_full();
+            let gs = snap.as_ref().as_ref().unwrap();
             let files: std::collections::HashSet<_> = gs.nodes.iter()
                 .map(|n| n.id.file.to_string_lossy().to_string())
                 .collect();
@@ -1128,21 +850,15 @@ impl RnaHandler {
             changed_file_set.len(),
         ));
 
-        // Phase 3: LSP enrichment on changed nodes only (synchronous).
-        let changed_nodes: Vec<Node> = {
-            let guard = self.graph.read().await;
-            let gs = guard.as_ref().unwrap();
-            gs.nodes.iter()
-                .filter(|n| changed_file_set.contains(&n.id.file))
-                .cloned()
-                .collect()
+        // Phase 3: Enrichment via event bus (ADR-001, #583).
+        // Route through emit_enrichment_pipeline instead of calling
+        // EnricherRegistry::enrich_all() directly. Pass the full graph;
+        // dirty_slugs scopes LSP to only the primary root (changed files).
+        let (all_nodes, all_edges) = {
+            let snap = self.graph.load_full();
+            let gs = snap.as_ref().as_ref().unwrap();
+            (gs.nodes.clone(), gs.edges.clone())
         };
-
-        let languages: Vec<String> = changed_nodes.iter()
-            .map(|n| n.language.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
 
         let server_name = self.lsp_status.server_name();
         if let Some(ref name) = server_name {
@@ -1151,85 +867,99 @@ impl RnaHandler {
         self.lsp_status.set_running();
 
         on_progress(&format!(
-            "LSP: enriching {} changed nodes ({} languages: [{}])...",
-            changed_nodes.len(),
-            languages.len(),
-            languages.join(", "),
+            "Enrichment: running pipeline via event bus ({} changed files)...",
+            changed_file_set.len(),
         ));
 
+        let (root_pairs, primary_slug) = self.build_bus_root_pairs();
+        // Only the primary root has changes in the incremental path.
+        let dirty_slugs: Option<std::collections::HashSet<String>> =
+            Some(std::iter::once(primary_slug.clone()).collect());
+
         let t2 = std::time::Instant::now();
-        let enricher_registry = EnricherRegistry::with_builtins();
-        let supported = enricher_registry.supported_languages();
-        let has_supported_language = languages.iter().any(|l| supported.contains(l));
-        let graph_index = {
-            let guard = self.graph.read().await;
-            guard.as_ref().unwrap().index.clone()
-        };
-        let enrichment = enricher_registry
-            .enrich_all(&changed_nodes, &graph_index, &languages, &self.repo_root, &self.lsp_only_roots)
-            .await;
-        let lsp_time = t2.elapsed();
+        let bus_result = crate::extract::consumers::emit_enrichment_pipeline(
+            all_nodes,
+            all_edges,
+            root_pairs,
+            primary_slug,
+            self.repo_root.clone(),
+            crate::extract::consumers::BusOptions {
+                scan_stats: Some(Arc::clone(&self.scan_stats)),
+                embed_idx: None,
+                lance_repo_root: None,
+                skip_lsp: false,
+            },
+            dirty_slugs,
+        ).await;
+        let bus_time = t2.elapsed();
 
         let lsp_edge_count;
-        if !enrichment.any_enricher_ran {
-            if has_supported_language {
-                on_progress(&format!("LSP: no server available ({:.1}s)", lsp_time.as_secs_f64()));
-                self.lsp_status.set_unavailable();
-            } else {
-                on_progress(&format!("LSP: no supported enrichers for changed files ({:.1}s)", lsp_time.as_secs_f64()));
-                self.lsp_status.set_complete(0);
-            }
-            lsp_edge_count = 0;
-        } else {
-            lsp_edge_count = enrichment.added_edges.len();
-            on_progress(&format!(
-                "LSP: enriched {} call edges for changed files in {:.1}s",
-                lsp_edge_count,
-                lsp_time.as_secs_f64(),
-            ));
+        match bus_result {
+            Ok((mut enriched_nodes, mut enriched_edges, detected_frameworks)) => {
+                // Dedup: passes can re-emit cached entries.
+                {
+                    let mut seen_nodes = std::collections::HashSet::new();
+                    enriched_nodes.reverse();
+                    enriched_nodes.retain(|n| seen_nodes.insert(n.stable_id()));
+                    enriched_nodes.reverse();
 
-            // Apply enrichment to in-memory graph.
-            let mut guard = self.graph.write().await;
-            if let Some(ref mut gs) = *guard {
-                for vnode in &enrichment.new_nodes {
-                    gs.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
+                    let mut seen_edges = std::collections::HashSet::new();
+                    enriched_edges.retain(|e| seen_edges.insert(e.stable_id()));
                 }
-                gs.nodes.extend(enrichment.new_nodes);
 
-                for edge in &enrichment.added_edges {
-                    gs.index.add_edge(
-                        &edge.from.to_stable_id(),
-                        &edge.from.kind.to_string(),
-                        &edge.to.to_stable_id(),
-                        &edge.to.kind.to_string(),
-                        edge.kind.clone(),
-                    );
+                lsp_edge_count = enriched_edges.iter()
+                    .filter(|e| {
+                        e.source == crate::graph::ExtractionSource::Lsp
+                            && matches!(e.kind, crate::graph::EdgeKind::Calls)
+                    })
+                    .count();
+
+                on_progress(&format!(
+                    "Enrichment: {} LSP call edges via bus in {:.1}s",
+                    lsp_edge_count,
+                    bus_time.as_secs_f64(),
+                ));
+
+                // Build updated index and apply enriched graph via atomic swap.
+                let mut new_index = crate::graph::index::GraphIndex::new();
+                new_index.rebuild_from_edges(&enriched_edges);
+                for node in &enriched_nodes {
+                    new_index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
                 }
-                gs.edges.extend(enrichment.added_edges);
 
-                // Build index for O(1) lookup instead of O(N) find per patch.
-                let node_pos: std::collections::HashMap<String, usize> = gs.nodes
-                    .iter()
-                    .enumerate()
-                    .map(|(i, n)| (n.stable_id(), i))
-                    .collect();
-                for (node_id, patches) in &enrichment.updated_nodes {
-                    if let Some(&idx) = node_pos.get(node_id) {
-                        let node = &mut gs.nodes[idx];
-                        for (key, value) in patches {
-                            node.metadata.insert(key.clone(), value.clone());
-                        }
+                {
+                    let snap = self.graph.load_full();
+                    if let Some(ref current_gs) = *snap {
+                        let mut gs = (**current_gs).clone();
+                        gs.nodes = enriched_nodes;
+                        gs.edges = enriched_edges;
+                        gs.index = new_index;
+                        gs.detected_frameworks = detected_frameworks;
+                        self.graph.store(Arc::new(Some(Arc::new(gs))));
                     }
                 }
+                self.lsp_status.set_complete(lsp_edge_count);
             }
-            self.lsp_status.set_complete(lsp_edge_count);
+            Err(e) => {
+                tracing::error!(
+                    "Foreground incremental pipeline: emit_enrichment_pipeline failed: {:#}",
+                    e
+                );
+                on_progress(&format!(
+                    "Enrichment: pipeline failed in {:.1}s -- graph has tree-sitter data only",
+                    bus_time.as_secs_f64(),
+                ));
+                self.lsp_status.set_unavailable();
+                lsp_edge_count = 0;
+            }
         }
 
         // Phase 4: Full persist with LSP edges included.
         {
             let snapshot = {
-                let g = self.graph.read().await;
-                g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+                let snap = self.graph.load_full();
+                snap.as_ref().as_ref()
+                    .map(|gs| (gs.nodes.clone(), gs.edges.clone()))
             };
             if let Some((nodes, edges)) = snapshot {
                 tracing::info!(
@@ -1253,23 +983,24 @@ impl RnaHandler {
         scanner.commit_state()?;
 
         // Phase 5: Summary.
-        let (total_node_count, total_edge_count) = {
-            let guard = self.graph.read().await;
-            let gs = guard.as_ref().unwrap();
-            (gs.nodes.len(), gs.edges.len())
+        let (total_node_count, total_edge_count, file_count) = {
+            let snap = self.graph.load_full();
+            let gs = snap.as_ref().as_ref().unwrap();
+            let fc = gs.nodes.iter().map(|n| n.id.file.to_string_lossy().to_string()).collect::<std::collections::HashSet<_>>().len();
+            (gs.nodes.len(), gs.edges.len(), fc)
         };
-
+        let encoding_stats = {
+            let ss = self.scan_stats.read().unwrap_or_else(|e| e.into_inner());
+            let mut agg = crate::extract::EncodingStats::default();
+            for es in ss.encoding_stats.values() { agg.merge(es); }
+            agg
+        };
         let total_time = pipeline_start.elapsed();
-        on_progress(&format!("Graph: {} nodes, {} edges", total_node_count, total_edge_count));
-        on_progress(&format!("Done in {:.1}s (incremental)", total_time.as_secs_f64()));
-
-        Ok(PipelineResult {
-            node_count: total_node_count,
-            edge_count: total_edge_count,
-            lsp_edge_count,
-            embed_count: 0, // re-embed handled by update_graph_with_scan
-            total_time,
-        })
+        let result = PipelineResult { node_count: total_node_count, edge_count: total_edge_count,
+            file_count, lsp_edge_count, embed_count: 0, total_time,
+            lsp_entries: vec![], encoding_stats };
+        on_progress(&result.format_summary());
+        Ok(result)
     }
 
     /// Full rebuild foreground pipeline (no cache available).
@@ -1298,36 +1029,26 @@ impl RnaHandler {
             scan_extract_time.as_secs_f64(),
         ));
 
-        // Store graph state so it is available for queries during embed+LSP.
+        // Store graph state atomically so it is available for queries during embed+LSP.
         {
-            let mut guard = self.graph.write().await;
-            *guard = Some(GraphState {
-                nodes: graph_state.nodes.clone(),
-                edges: graph_state.edges.clone(),
-                index: {
-                    let mut idx = crate::graph::index::GraphIndex::new();
-                    idx.rebuild_from_edges(&graph_state.edges);
-                    for node in &graph_state.nodes {
-                        idx.ensure_node(&node.stable_id(), &node.id.kind.to_string());
-                    }
-                    idx
-                },
-                last_scan_completed_at: graph_state.last_scan_completed_at,
-                detected_frameworks: graph_state.detected_frameworks.clone(),
-            });
+            let mut idx = crate::graph::index::GraphIndex::new();
+            idx.rebuild_from_edges(&graph_state.edges);
+            for node in &graph_state.nodes {
+                idx.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+            }
+            self.graph.store(Arc::new(Some(Arc::new(GraphState::new(
+                graph_state.nodes.clone(),
+                graph_state.edges.clone(),
+                idx,
+                graph_state.last_scan_completed_at,
+                graph_state.detected_frameworks.clone(),
+            )))));
         }
 
         // Phase 2: Embed + LSP enrichment (parallel -- they use independent data stores)
         let embeddable_nodes: Vec<Node> = graph_state.nodes.iter()
             .filter(|n| n.id.root != "external")
             .cloned()
-            .collect();
-
-        let languages: Vec<String> = graph_state.nodes
-            .iter()
-            .map(|n| n.language.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
             .collect();
 
         let server_name = self.lsp_status.server_name();
@@ -1362,20 +1083,35 @@ impl RnaHandler {
             (count, elapsed)
         };
 
-        on_progress("LSP: waiting for server ready...");
+        on_progress("Enrichment: running pipeline via event bus...");
 
-        let lsp_fut = async {
+        // ADR-001 (#583): route through emit_enrichment_pipeline instead of
+        // calling EnricherRegistry::enrich_all() directly. The bus runs all
+        // post-extraction passes (LSP, subsystem detection, framework detection,
+        // import calls, tested_by, etc.) and returns the fully enriched graph.
+        let (root_pairs, primary_slug) = self.build_bus_root_pairs();
+        let bus_fut = async {
             let t2 = std::time::Instant::now();
-            let enricher_registry = EnricherRegistry::with_builtins();
-            let enrichment = enricher_registry
-                .enrich_all(&graph_state.nodes, &graph_state.index, &languages, &self.repo_root, &self.lsp_only_roots)
-                .await;
+            let result = crate::extract::consumers::emit_enrichment_pipeline(
+                graph_state.nodes.clone(),
+                graph_state.edges.clone(),
+                root_pairs,
+                primary_slug,
+                self.repo_root.clone(),
+                crate::extract::consumers::BusOptions {
+                    scan_stats: Some(Arc::clone(&self.scan_stats)),
+                    embed_idx: None,
+                    lance_repo_root: None,
+                    skip_lsp: false,
+                },
+                None, // full rebuild: all roots dirty
+            ).await;
             let elapsed = t2.elapsed();
-            (enrichment, elapsed)
+            (result, elapsed)
         };
 
-        let ((embed_count, embed_time), (enrichment, lsp_time)) =
-            tokio::join!(embed_fut, lsp_fut);
+        let ((embed_count, embed_time), (bus_result, bus_time)) =
+            tokio::join!(embed_fut, bus_fut);
 
         on_progress(&format!(
             "Embed: {} items in {:.1}s",
@@ -1385,50 +1121,64 @@ impl RnaHandler {
 
         let lsp_edge_count;
 
-        if !enrichment.any_enricher_ran {
-            on_progress(&format!("LSP: no server available ({:.1}s)", lsp_time.as_secs_f64()));
-            self.lsp_status.set_unavailable();
-            lsp_edge_count = 0;
-        } else {
-            lsp_edge_count = enrichment.added_edges.len();
-            on_progress(&format!(
-                "LSP: enriched {} call edges in {:.1}s",
-                lsp_edge_count,
-                lsp_time.as_secs_f64(),
-            ));
+        match bus_result {
+            Ok((mut enriched_nodes, mut enriched_edges, detected_frameworks)) => {
+                // Dedup: passes can re-emit cached entries.
+                {
+                    let mut seen_nodes = std::collections::HashSet::new();
+                    enriched_nodes.reverse();
+                    enriched_nodes.retain(|n| seen_nodes.insert(n.stable_id()));
+                    enriched_nodes.reverse();
 
-            // Apply enrichment to in-memory graph
-            let mut guard = self.graph.write().await;
-            if let Some(ref mut gs) = *guard {
-                for vnode in &enrichment.new_nodes {
-                    gs.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
+                    let mut seen_edges = std::collections::HashSet::new();
+                    enriched_edges.retain(|e| seen_edges.insert(e.stable_id()));
                 }
-                gs.nodes.extend(enrichment.new_nodes);
 
-                for edge in &enrichment.added_edges {
-                    let from_id = edge.from.to_stable_id();
-                    let to_id = edge.to.to_stable_id();
-                    gs.index.add_edge(
-                        &from_id,
-                        &edge.from.kind.to_string(),
-                        &to_id,
-                        &edge.to.kind.to_string(),
-                        edge.kind.clone(),
-                    );
+                lsp_edge_count = enriched_edges.iter()
+                    .filter(|e| {
+                        e.source == crate::graph::ExtractionSource::Lsp
+                            && matches!(e.kind, crate::graph::EdgeKind::Calls)
+                    })
+                    .count();
+
+                on_progress(&format!(
+                    "Enrichment: {} LSP call edges via bus in {:.1}s",
+                    lsp_edge_count,
+                    bus_time.as_secs_f64(),
+                ));
+
+                // Build updated index and apply enriched graph via atomic swap.
+                let mut new_index = crate::graph::index::GraphIndex::new();
+                new_index.rebuild_from_edges(&enriched_edges);
+                for node in &enriched_nodes {
+                    new_index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
                 }
-                gs.edges.extend(enrichment.added_edges);
 
-                for (node_id, patches) in &enrichment.updated_nodes {
-                    if let Some(node) = gs.nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
-                        for (key, value) in patches {
-                            node.metadata.insert(key.clone(), value.clone());
-                        }
+                {
+                    let snap = self.graph.load_full();
+                    if let Some(ref current_gs) = *snap {
+                        let mut gs = (**current_gs).clone();
+                        gs.nodes = enriched_nodes;
+                        gs.edges = enriched_edges;
+                        gs.index = new_index;
+                        gs.detected_frameworks = detected_frameworks;
+                        self.graph.store(Arc::new(Some(Arc::new(gs))));
                     }
                 }
-
-                drop(guard);
+                self.lsp_status.set_complete(lsp_edge_count);
             }
-            self.lsp_status.set_complete(lsp_edge_count);
+            Err(e) => {
+                tracing::error!(
+                    "Foreground full pipeline: emit_enrichment_pipeline failed: {:#}",
+                    e
+                );
+                on_progress(&format!(
+                    "Enrichment: pipeline failed in {:.1}s -- graph has tree-sitter data only",
+                    bus_time.as_secs_f64(),
+                ));
+                self.lsp_status.set_unavailable();
+                lsp_edge_count = 0;
+            }
         }
 
         // Phase 3: Full persist — write the complete graph (tree-sitter + LSP edges)
@@ -1436,8 +1186,9 @@ impl RnaHandler {
         // include LSP edges in a single atomic write (#311).
         {
             let snapshot = {
-                let g = self.graph.read().await;
-                g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+                let snap = self.graph.load_full();
+                snap.as_ref().as_ref()
+                    .map(|gs| (gs.nodes.clone(), gs.edges.clone()))
             };
             if let Some((nodes, edges)) = snapshot {
                 tracing::info!(
@@ -1458,35 +1209,31 @@ impl RnaHandler {
         }
 
         // Phase 4: Summary
-        let total_node_count = {
-            let guard = self.graph.read().await;
-            guard.as_ref().map(|gs| gs.nodes.len()).unwrap_or(graph_state.nodes.len())
+        let (total_node_count, total_edge_count) = {
+            let snap = self.graph.load_full();
+            match snap.as_ref().as_ref() {
+                Some(gs) => (gs.nodes.len(), gs.edges.len()),
+                None => (graph_state.nodes.len(), graph_state.edges.len()),
+            }
         };
-        let total_edge_count = {
-            let guard = self.graph.read().await;
-            guard.as_ref().map(|gs| gs.edges.len()).unwrap_or(graph_state.edges.len())
+        let encoding_stats = {
+            let ss = self.scan_stats.read().unwrap_or_else(|e| e.into_inner());
+            let mut agg = crate::extract::EncodingStats::default();
+            for es in ss.encoding_stats.values() { agg.merge(es); }
+            agg
         };
-
         let total_time = pipeline_start.elapsed();
-        on_progress(&format!(
-            "Graph: {} nodes, {} edges",
-            total_node_count,
-            total_edge_count,
-        ));
-        on_progress(&format!("Done in {:.1}s", total_time.as_secs_f64()));
-
-        Ok(PipelineResult {
-            node_count: total_node_count,
-            edge_count: total_edge_count,
-            lsp_edge_count,
-            embed_count,
-            total_time,
-        })
+        let result = PipelineResult { node_count: total_node_count, edge_count: total_edge_count,
+            file_count, lsp_edge_count, embed_count, total_time,
+            lsp_entries: vec![], encoding_stats };
+        on_progress(&result.format_summary());
+        Ok(result)
     }
 
-    /// Run LSP enrichment on the full graph synchronously and persist.
-    /// Used when the cached graph has no call edges and needs enrichment.
-    /// Returns the number of LSP edges added.
+    /// Run enrichment pipeline on the full graph synchronously and persist.
+    /// Used when the cached graph has no LSP sentinel and needs enrichment.
+    /// Routes through `emit_enrichment_pipeline` per ADR-001 (#583).
+    /// Returns the number of LSP call edges added.
     async fn run_foreground_lsp_and_persist<F>(
         &self,
         on_progress: &F,
@@ -1494,15 +1241,10 @@ impl RnaHandler {
     where
         F: Fn(&str) + Send + Sync,
     {
-        let (all_nodes, graph_index, languages) = {
-            let guard = self.graph.read().await;
-            let gs = guard.as_ref().unwrap();
-            let langs: Vec<String> = gs.nodes.iter()
-                .map(|n| n.language.clone())
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-            (gs.nodes.clone(), gs.index.clone(), langs)
+        let (all_nodes, all_edges) = {
+            let snap = self.graph.load_full();
+            let gs = snap.as_ref().as_ref().unwrap();
+            (gs.nodes.clone(), gs.edges.clone())
         };
 
         let server_name = self.lsp_status.server_name();
@@ -1511,73 +1253,86 @@ impl RnaHandler {
         }
         self.lsp_status.set_running();
 
-        let enricher_registry = EnricherRegistry::with_builtins();
-        let enrichment = enricher_registry
-            .enrich_all(&all_nodes, &graph_index, &languages, &self.repo_root, &self.lsp_only_roots)
-            .await;
+        on_progress("Enrichment: running pipeline via event bus (no sentinel)...");
 
-        if !enrichment.any_enricher_ran {
-            on_progress("LSP: no server available");
-            self.lsp_status.set_unavailable();
-            return Ok(0);
-        }
+        let (root_pairs, primary_slug) = self.build_bus_root_pairs();
+        let bus_result = crate::extract::consumers::emit_enrichment_pipeline(
+            all_nodes,
+            all_edges,
+            root_pairs,
+            primary_slug,
+            self.repo_root.clone(),
+            crate::extract::consumers::BusOptions {
+                scan_stats: Some(Arc::clone(&self.scan_stats)),
+                embed_idx: None,
+                lance_repo_root: None,
+                skip_lsp: false,
+            },
+            None, // no sentinel means all roots need enrichment
+        ).await;
 
-        let lsp_edge_count = enrichment.added_edges.len();
-        on_progress(&format!("LSP: enriched {} call edges", lsp_edge_count));
+        match bus_result {
+            Ok((mut enriched_nodes, mut enriched_edges, detected_frameworks)) => {
+                // Dedup: passes can re-emit cached entries.
+                {
+                    let mut seen_nodes = std::collections::HashSet::new();
+                    enriched_nodes.reverse();
+                    enriched_nodes.retain(|n| seen_nodes.insert(n.stable_id()));
+                    enriched_nodes.reverse();
 
-        // Apply enrichment to in-memory graph.
-        {
-            let mut guard = self.graph.write().await;
-            if let Some(ref mut gs) = *guard {
-                for vnode in &enrichment.new_nodes {
-                    gs.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
+                    let mut seen_edges = std::collections::HashSet::new();
+                    enriched_edges.retain(|e| seen_edges.insert(e.stable_id()));
                 }
-                gs.nodes.extend(enrichment.new_nodes);
 
-                for edge in &enrichment.added_edges {
-                    gs.index.add_edge(
-                        &edge.from.to_stable_id(),
-                        &edge.from.kind.to_string(),
-                        &edge.to.to_stable_id(),
-                        &edge.to.kind.to_string(),
-                        edge.kind.clone(),
-                    );
+                let lsp_edge_count = enriched_edges.iter()
+                    .filter(|e| {
+                        e.source == crate::graph::ExtractionSource::Lsp
+                            && matches!(e.kind, crate::graph::EdgeKind::Calls)
+                    })
+                    .count();
+
+                on_progress(&format!("Enrichment: {} LSP call edges via bus", lsp_edge_count));
+
+                // Build updated index and apply enriched graph via atomic swap.
+                let mut new_index = crate::graph::index::GraphIndex::new();
+                new_index.rebuild_from_edges(&enriched_edges);
+                for node in &enriched_nodes {
+                    new_index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
                 }
-                gs.edges.extend(enrichment.added_edges);
 
-                // Build index for O(1) lookup instead of O(N) find per patch.
-                let node_pos: std::collections::HashMap<String, usize> = gs.nodes
-                    .iter()
-                    .enumerate()
-                    .map(|(i, n)| (n.stable_id(), i))
-                    .collect();
-                for (node_id, patches) in &enrichment.updated_nodes {
-                    if let Some(&idx) = node_pos.get(node_id) {
-                        let node = &mut gs.nodes[idx];
-                        for (key, value) in patches {
-                            node.metadata.insert(key.clone(), value.clone());
-                        }
+                {
+                    let snap = self.graph.load_full();
+                    if let Some(ref current_gs) = *snap {
+                        let mut gs = (**current_gs).clone();
+                        gs.nodes = enriched_nodes.clone();
+                        gs.edges = enriched_edges.clone();
+                        gs.index = new_index;
+                        gs.detected_frameworks = detected_frameworks;
+                        self.graph.store(Arc::new(Some(Arc::new(gs))));
                     }
                 }
+                self.lsp_status.set_complete(lsp_edge_count);
+
+                // Persist with enriched edges.
+                if let Err(e) = persist_graph_to_lance(&self.repo_root, &enriched_nodes, &enriched_edges).await {
+                    tracing::error!("Foreground LSP persist failed: {}", e);
+                    return Err(e.context("LSP persist failed during foreground pipeline"));
+                }
+                // Persist succeeded -- write LSP sentinel so future startups know
+                // LSP enrichment is durable and can skip re-enrichment (#477).
+                super::sentinel::write_lsp_sentinel(&self.repo_root, enriched_nodes.len(), enriched_edges.len());
+
+                Ok(lsp_edge_count)
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Foreground LSP pipeline: emit_enrichment_pipeline failed: {:#}",
+                    e
+                );
+                on_progress("Enrichment: pipeline failed -- no LSP edges available");
+                self.lsp_status.set_unavailable();
+                Ok(0)
             }
         }
-        self.lsp_status.set_complete(lsp_edge_count);
-
-        // Persist with LSP edges.
-        let snapshot = {
-            let g = self.graph.read().await;
-            g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
-        };
-        if let Some((nodes, edges)) = snapshot {
-            if let Err(e) = persist_graph_to_lance(&self.repo_root, &nodes, &edges).await {
-                tracing::error!("Foreground LSP persist failed: {}", e);
-                return Err(e.context("LSP persist failed during foreground pipeline"));
-            }
-            // Persist succeeded -- write LSP sentinel so future startups know
-            // LSP enrichment is durable and can skip re-enrichment (#477).
-            super::sentinel::write_lsp_sentinel(&self.repo_root, nodes.len(), edges.len());
-        }
-
-        Ok(lsp_edge_count)
     }
 }

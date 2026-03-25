@@ -23,7 +23,8 @@
 //! RootExtracted              roots_extracted[slug] = RootStats
 //! LanguageDetected           languages_in_flight[slug] += [lang]
 //! EnrichmentComplete         languages_done[slug] += [lang],
-//!                            lsp_edge_counts[slug][lang] = count
+//!                            lsp_edge_counts[slug][lang] = count,
+//!                            lsp_stats[slug][lang] = LspLanguageStats
 //! PassesComplete             roots_complete[slug] = full stats
 //! ```
 //!
@@ -41,15 +42,91 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
 use crate::extract::event_bus::{ExtractionConsumer, ExtractionEvent, ExtractionEventKind};
 
+
+// ---------------------------------------------------------------------------
+// Per-language LSP enrichment stats  (#575)
+// ---------------------------------------------------------------------------
+
+/// Status of a per-language LSP enrichment attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LspStatus { Ok, Aborted, NotFound, Failed }
+
+impl std::fmt::Display for LspStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LspStatus::Ok => write!(f, "OK"),
+            LspStatus::Aborted => write!(f, "ABORTED"),
+            LspStatus::NotFound => write!(f, "not found"),
+            LspStatus::Failed => write!(f, "FAILED"),
+        }
+    }
+}
+
+/// Per-language LSP enrichment statistics for the scan summary.
+#[derive(Debug, Clone)]
+pub struct LspEnrichmentEntry {
+    pub language: String,
+    pub server_name: String,
+    pub root_hint: Option<String>,
+    pub edge_count: usize,
+    pub node_count: usize,
+    pub error_count: usize,
+    pub duration: Duration,
+    pub status: LspStatus,
+}
+
+impl LspEnrichmentEntry {
+    /// Render a single line for the scan summary.
+    pub fn summary_line(&self) -> String {
+        let root_part = if let Some(ref root) = self.root_hint {
+            format!(" -> {}/", root)
+        } else { String::new() };
+        let label = format!("  {} ({}){}", self.language, self.server_name, root_part);
+        match self.status {
+            LspStatus::NotFound => format!("{:<50} {}", label, self.status),
+            LspStatus::Ok => {
+                let mut line = format!("{:<50} {} ({} edges, {} nodes, {:.1}s)",
+                    label, self.status, self.edge_count, self.node_count, self.duration.as_secs_f64());
+                if self.edge_count == 0 { line.push_str(" -- no edges"); }
+                line
+            }
+            LspStatus::Aborted | LspStatus::Failed => {
+                format!("{:<50} {} ({} edges, {} errors, {:.1}s)",
+                    label, self.status, self.edge_count, self.error_count, self.duration.as_secs_f64())
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
+
+/// Per-language LSP enrichment statistics for a single root.
+///
+/// Populated from `EnrichmentComplete` events and the metadata they carry.
+/// Rendered by `list_roots` to show per-root LSP effectiveness at a glance.
+#[derive(Debug, Clone)]
+pub struct LspLanguageStats {
+    /// LSP server binary name (e.g., "rust-analyzer", "pyright-langserver").
+    pub server_name: String,
+    /// Number of edges produced by LSP enrichment.
+    pub edge_count: usize,
+    /// Number of virtual nodes produced by LSP enrichment (e.g., external callee stubs).
+    pub node_count: usize,
+    /// Wall-clock duration of the enrichment.
+    pub duration: Duration,
+    /// Number of errors encountered during enrichment.
+    pub error_count: usize,
+    /// Whether the enrichment was aborted (e.g., too many errors, timeout).
+    pub aborted: bool,
+}
 
 /// Per-root stats populated after `RootExtracted`.
 #[derive(Debug, Clone)]
@@ -92,6 +169,10 @@ pub struct ScanStats {
     /// `LanguageDetected` adds a language; `EnrichmentComplete` removes it.
     pub languages_in_flight: HashMap<String, Vec<String>>,
 
+    /// Start times for in-flight language enrichments, for duration tracking.
+    /// `LanguageDetected` records `Instant::now()`; `EnrichmentComplete` reads and removes.
+    pub(crate) enrichment_start_times: HashMap<String, HashMap<String, Instant>>,
+
     /// Languages for which enrichment has completed, per root.
     pub languages_done: HashMap<String, Vec<String>>,
 
@@ -100,6 +181,10 @@ pub struct ScanStats {
 
     /// Roots that have completed all passes (`PassesComplete`).
     pub roots_complete: HashMap<String, RootCompleteStats>,
+
+    /// Per-root, per-language LSP enrichment stats.
+    /// Populated on `EnrichmentComplete` when the event carries LSP metadata.
+    pub lsp_stats: HashMap<String, HashMap<String, LspLanguageStats>>,
 
     /// Per-root encoding statistics: files skipped as binary or lossy-decoded.
     /// Populated by callers after extraction (not via the event bus).
@@ -234,6 +319,11 @@ impl ExtractionConsumer for ScanStatsConsumer {
                     .entry(slug.clone())
                     .or_default()
                     .push(language.clone());
+                // Record start time for duration tracking.
+                stats.enrichment_start_times
+                    .entry(slug.clone())
+                    .or_default()
+                    .insert(language.clone(), Instant::now());
                 tracing::debug!(
                     "ScanStatsConsumer: LanguageDetected '{}' in '{}'",
                     language,
@@ -241,7 +331,7 @@ impl ExtractionConsumer for ScanStatsConsumer {
                 );
             }
 
-            ExtractionEvent::EnrichmentComplete { slug, language, added_edges, .. } => {
+            ExtractionEvent::EnrichmentComplete { slug, language, added_edges, new_nodes, server_name, error_count, aborted, .. } => {
                 // Remove from in-flight.
                 if let Some(in_flight) = stats.languages_in_flight.get_mut(slug) {
                     in_flight.retain(|l| l != language);
@@ -251,11 +341,34 @@ impl ExtractionConsumer for ScanStatsConsumer {
                     .entry(slug.clone())
                     .or_default()
                     .push(language.clone());
-                // Record LSP edge count.
+                // Record LSP edge count (backward compat).
                 stats.lsp_edge_counts
                     .entry(slug.clone())
                     .or_default()
                     .insert(language.clone(), added_edges.len());
+                // Record full LSP stats when server_name is present.
+                let duration = stats.enrichment_start_times
+                    .get(slug)
+                    .and_then(|m| m.get(language))
+                    .map(|start| start.elapsed())
+                    .unwrap_or_default();
+                // Clean up start time.
+                if let Some(starts) = stats.enrichment_start_times.get_mut(slug) {
+                    starts.remove(language);
+                }
+                if let Some(name) = server_name {
+                    stats.lsp_stats
+                        .entry(slug.clone())
+                        .or_default()
+                        .insert(language.clone(), LspLanguageStats {
+                            server_name: name.clone(),
+                            edge_count: added_edges.len(),
+                            node_count: new_nodes.len(),
+                            duration,
+                            error_count: *error_count,
+                            aborted: *aborted,
+                        });
+                }
                 tracing::debug!(
                     "ScanStatsConsumer: EnrichmentComplete '{}' for '{}': {} LSP edges",
                     language,
@@ -412,6 +525,9 @@ mod tests {
             added_edges: empty_arc_edges(),
             new_nodes: empty_arc_nodes(),
             updated_nodes: std::sync::Arc::from([]),
+            server_name: None,
+            error_count: 0,
+            aborted: false,
         }).await.unwrap();
         let stats = c.stats.read().unwrap();
         let in_flight = stats.languages_in_flight.get("api").map(|v| v.as_slice()).unwrap_or(&[]);
@@ -447,6 +563,9 @@ mod tests {
             added_edges: std::sync::Arc::from(edges.into_boxed_slice()),
             new_nodes: empty_arc_nodes(),
             updated_nodes: std::sync::Arc::from([]),
+            server_name: Some("rust-analyzer".to_string()),
+            error_count: 0,
+            aborted: false,
         }).await.unwrap();
 
         let stats = c.stats.read().unwrap();
@@ -476,6 +595,7 @@ mod tests {
             slug: slug("api"), language: "rust".into(),
             added_edges: empty_arc_edges(), new_nodes: empty_arc_nodes(),
             updated_nodes: std::sync::Arc::from([]),
+            server_name: None, error_count: 0, aborted: false,
         }).await.unwrap();
         c.on_event(&ExtractionEvent::PassesComplete {
             slug: slug("api"),
@@ -526,6 +646,9 @@ mod tests {
             added_edges: empty_arc_edges(),
             new_nodes: empty_arc_nodes(),
             updated_nodes: std::sync::Arc::from([]),
+            server_name: None,
+            error_count: 0,
+            aborted: false,
         }).await;
         assert!(result.is_ok(), "should not fail even without prior LanguageDetected");
         let stats = c.stats.read().unwrap();
@@ -549,5 +672,80 @@ mod tests {
         assert!(stats.roots_complete.contains_key("api"));
         // has_activity is still false (roots_queued == 0)
         assert!(!stats.has_activity(), "roots_queued not incremented — no RootDiscovered fired");
+    }
+
+    /// EnrichmentComplete with server_name populates lsp_stats.
+    #[tokio::test]
+    async fn test_enrichment_complete_records_lsp_stats() {
+        let c = make_consumer();
+        // Start enrichment (records start time)
+        c.on_event(&ExtractionEvent::LanguageDetected {
+            slug: slug("api"),
+            language: "rust".into(),
+            nodes: empty_arc_nodes(),
+        }).await.unwrap();
+        // Complete enrichment with server_name
+        c.on_event(&ExtractionEvent::EnrichmentComplete {
+            slug: slug("api"),
+            language: "rust".into(),
+            added_edges: empty_arc_edges(),
+            new_nodes: empty_arc_nodes(),
+            updated_nodes: std::sync::Arc::from([]),
+            server_name: Some("rust-analyzer".to_string()),
+            error_count: 5,
+            aborted: true,
+        }).await.unwrap();
+
+        let stats = c.stats.read().unwrap();
+        let lsp = stats.lsp_stats.get("api")
+            .expect("api should have lsp_stats")
+            .get("rust")
+            .expect("rust should have LspLanguageStats");
+        assert_eq!(lsp.server_name, "rust-analyzer");
+        assert_eq!(lsp.edge_count, 0);
+        assert_eq!(lsp.node_count, 0);
+        assert_eq!(lsp.error_count, 5);
+        assert!(lsp.aborted);
+        // Duration is non-zero because LanguageDetected fires before EnrichmentComplete.
+        // (In practice the test runs so fast this may be 0, so just assert it parsed.)
+        let _ = lsp.duration;
+    }
+
+    /// EnrichmentComplete without server_name does NOT populate lsp_stats.
+    #[tokio::test]
+    async fn test_enrichment_complete_without_server_name_no_lsp_stats() {
+        let c = make_consumer();
+        c.on_event(&ExtractionEvent::EnrichmentComplete {
+            slug: slug("api"),
+            language: "rust".into(),
+            added_edges: empty_arc_edges(),
+            new_nodes: empty_arc_nodes(),
+            updated_nodes: std::sync::Arc::from([]),
+            server_name: None,
+            error_count: 0,
+            aborted: false,
+        }).await.unwrap();
+
+        let stats = c.stats.read().unwrap();
+        assert!(stats.lsp_stats.get("api").is_none(), "no lsp_stats when server_name is None");
+    }
+
+    #[test]
+    fn test_lsp_entry_summary_ok() {
+        let e = LspEnrichmentEntry { language: "rust".into(), server_name: "rust-analyzer".into(),
+            root_hint: None, edge_count: 150, node_count: 42, error_count: 0,
+            duration: Duration::from_secs_f64(3.5), status: LspStatus::Ok };
+        let l = e.summary_line();
+        assert!(l.contains("rust (rust-analyzer)"));
+        assert!(l.contains("OK"));
+        assert!(l.contains("150 edges"));
+    }
+
+    #[test]
+    fn test_lsp_entry_summary_not_found() {
+        let e = LspEnrichmentEntry { language: "json".into(), server_name: "vscode-json-ls".into(),
+            root_hint: None, edge_count: 0, node_count: 0, error_count: 0,
+            duration: Duration::from_millis(5), status: LspStatus::NotFound };
+        assert!(e.summary_line().contains("not found"));
     }
 }

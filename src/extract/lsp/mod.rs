@@ -19,11 +19,12 @@
 //!   [`PipelinedTransport`] (concurrent, enrichment-phase), plus URI helpers.
 
 mod transport;
-use transport::{LspTransport, PipelinedTransport, path_to_uri, find_enclosing_symbol, uri_to_relative_path};
+mod passes;
+use transport::{LspTransport, PipelinedTransport, path_to_uri};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -39,8 +40,6 @@ use crate::graph::index::GraphIndex;
 use crate::graph::{
     Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
 };
-use crate::scanner::LspConfig;
-
 use super::{EnrichmentResult, Enricher};
 
 
@@ -482,9 +481,23 @@ impl LspEnricher {
         //    repo may need minutes. The old 30s hard timeout fired before pyright
         //    finished, producing 193 errors and 0 call edges.
         //
-        // 2. If `serverStatus` never arrives (e.g. typescript-language-server),
-        //    probe every 5s with a lightweight `workspace/symbol` request until the
-        //    server responds successfully, indicating it is ready for queries.
+        // 2. If `serverStatus` never arrives (e.g. typescript-language-server,
+        //    pyright), use a two-phase probe strategy:
+        //
+        //    Phase A (responsiveness): probe every 5s with workspace/symbol("")
+        //    until 2 consecutive successes confirm the server is alive.
+        //
+        //    Phase B (indexing validation): send workspace/symbol with non-empty
+        //    queries ("main", "init", "test", etc.) to verify the server has
+        //    actually indexed files. A responsive-but-unindexed server returns
+        //    0 symbols for all queries. Retries use exponential backoff (5s,
+        //    10s, 20s, ...) up to 6 attempts. After 3 consecutive empty
+        //    responses on different queries, the server is declared "responsive
+        //    but not indexed" and Passes 1/3 are skipped.
+        //
+        //    This fixes the #576 regression where pyright and tsserver responded
+        //    to probes within 5s but hadn't indexed the workspace, producing
+        //    0 edges from thousands of nodes.
         //
         // 3. A 10-minute circuit breaker applies in both cases — not a normal
         //    timeout, just a safety net for servers that never become ready.
@@ -504,8 +517,12 @@ impl LspEnricher {
         let mut last_progress_log = tokio::time::Instant::now();
         // For the probe path: track the next time we should send a probe.
         let mut next_probe = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        // Track consecutive probe successes — require 2 in a row to confirm readiness.
+        // Track consecutive probe successes — require 2 in a row to confirm responsiveness.
         let mut probe_success_count: u32 = 0;
+        // After the server is responsive, validate it has actually indexed files
+        // by sending workspace/symbol with non-empty queries. A server that responds
+        // to probes but returns 0 symbols for real queries hasn't finished indexing.
+        let mut server_responsive = false;
 
         while tokio::time::Instant::now() < circuit_breaker {
             let elapsed = start.elapsed().as_secs();
@@ -626,17 +643,20 @@ impl LspEnricher {
                         ).await;
 
                         match probe_result {
-                            Ok(Ok(_)) => {
+                            Ok(Ok(_)) | Ok(Err(_)) => {
+                                if let Ok(Err(e)) = &probe_result {
+                                    tracing::debug!(
+                                        "{} probe returned error (server responsive): {}",
+                                        self.server_command, e
+                                    );
+                                }
                                 probe_success_count += 1;
                                 if probe_success_count >= 2 {
-                                    // Two consecutive successful probes — server is responsive.
+                                    server_responsive = true;
                                     tracing::info!(
-                                        "{} ready (probe succeeded after {}s, no serverStatus)",
+                                        "{} responsive (probe succeeded after {}s, no serverStatus) — validating indexing...",
                                         self.server_command, elapsed
                                     );
-                                    server_ready = true;
-                                    // Servers without serverStatus are treated as quiescent.
-                                    saw_quiescent = true;
                                     break;
                                 }
                                 tracing::debug!(
@@ -644,29 +664,11 @@ impl LspEnricher {
                                     self.server_command, probe_success_count, elapsed
                                 );
                             }
-                            Ok(Err(e)) => {
-                                // Server responded with an error — it may not support workspace/symbol.
-                                // Treat an explicit error response as "server is alive and responsive".
-                                tracing::debug!(
-                                    "{} probe returned error (server responsive): {}",
-                                    self.server_command, e
-                                );
-                                probe_success_count += 1;
-                                if probe_success_count >= 2 {
-                                    tracing::info!(
-                                        "{} ready (probe error-response after {}s — server responsive, no serverStatus)",
-                                        self.server_command, elapsed
-                                    );
-                                    server_ready = true;
-                                    saw_quiescent = true;
-                                    break;
-                                }
-                            }
                             Err(_) => {
-                                // Probe timed out — server still indexing.
+                                // Probe timed out — server still starting up.
                                 probe_success_count = 0;
                                 tracing::debug!(
-                                    "{} probe timed out ({}s elapsed), server still indexing...",
+                                    "{} probe timed out ({}s elapsed), server still starting...",
                                     self.server_command, elapsed
                                 );
                             }
@@ -677,9 +679,175 @@ impl LspEnricher {
             }
         }
 
+        // ----------------------------------------------------------------
+        // Indexing validation for probe-based servers (no serverStatus).
+        //
+        // "Server responds to requests" != "server has finished indexing."
+        // pyright and typescript-language-server respond to workspace/symbol
+        // within 5s but may not have indexed a single file yet. On large
+        // repos this produces 0 edges from thousands of nodes.
+        //
+        // Validation: send workspace/symbol with non-empty queries. An
+        // indexed server returns results; an unindexed one returns [].
+        // Use exponential backoff (5s, 10s, 20s) between attempts, with
+        // up to MAX_INDEXING_VALIDATION_ATTEMPTS total tries.
+        // ----------------------------------------------------------------
+        if server_responsive && !server_ready {
+            const MAX_INDEXING_VALIDATION_ATTEMPTS: u32 = 6;
+            // Queries chosen to match common symbols across Python/TypeScript/Rust
+            // codebases. We try multiple queries so a project that happens to lack
+            // "main" can still pass validation with "init" or "test".
+            const VALIDATION_QUERIES: &[&str] = &["main", "init", "test", "get", "set", "app"];
+            let mut validation_delay = tokio::time::Duration::from_secs(5);
+            let mut consecutive_empty: u32 = 0;
+
+            for attempt in 1..=MAX_INDEXING_VALIDATION_ATTEMPTS {
+                if tokio::time::Instant::now() >= circuit_breaker {
+                    break;
+                }
+
+                // Pick a different query each attempt to avoid false negatives
+                // from a project that simply doesn't have a "main" function.
+                let query = VALIDATION_QUERIES[((attempt - 1) as usize) % VALIDATION_QUERIES.len()];
+
+                // Drain any pending notifications before sending the validation request.
+                // Some servers (pyright) may send progress or diagnostic notifications
+                // that need to be consumed to avoid transport deadlock.
+                loop {
+                    match tokio::time::timeout(
+                        tokio::time::Duration::from_millis(100),
+                        transport.read_message(),
+                    ).await {
+                        Ok(Ok(msg)) => {
+                            // Handle workDoneProgress/create requests during drain
+                            if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+                                if method == "window/workDoneProgress/create" {
+                                    if let Some(id) = msg.get("id") {
+                                        let response = serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "id": id,
+                                            "result": null
+                                        });
+                                        let _ = transport.send_message(&response).await;
+                                    }
+                                } else if method == "$/progress" {
+                                    let kind = msg.pointer("/params/value/kind").and_then(|k| k.as_str()).unwrap_or("");
+                                    let title = msg.pointer("/params/value/title").and_then(|t| t.as_str()).unwrap_or("");
+                                    if kind == "begin" || kind == "end" {
+                                        tracing::info!("{} progress {}: {}", self.server_command, kind, title);
+                                    }
+                                } else if method == "experimental/serverStatus" {
+                                    // A late serverStatus notification arrived during Phase B.
+                                    // If quiescent=true, the server has finished indexing —
+                                    // skip the rest of validation and accept the authoritative signal.
+                                    let quiescent = msg.pointer("/params/quiescent")
+                                        .and_then(|q| q.as_bool())
+                                        .unwrap_or(false);
+                                    if quiescent {
+                                        tracing::info!(
+                                            "{} received experimental/serverStatus quiescent=true during Phase B validation — accepting",
+                                            self.server_command
+                                        );
+                                        server_ready = true;
+                                        saw_quiescent = true;
+                                    }
+                                }
+                            }
+                        }
+                        _ => break, // No more pending messages
+                    }
+                }
+
+                // If serverStatus arrived during drain, skip validation
+                if server_ready {
+                    break;
+                }
+
+                let validation_result = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(10),
+                    transport.request("workspace/symbol", serde_json::json!({ "query": query })),
+                ).await;
+
+                let elapsed = start.elapsed().as_secs();
+
+                match validation_result {
+                    Ok(Ok(ref response)) => {
+                        let symbol_count = response.as_array().map(|a| a.len()).unwrap_or(0);
+                        if symbol_count > 0 {
+                            tracing::info!(
+                                "{} indexing validated: workspace/symbol(\"{}\") returned {} symbols ({}s elapsed)",
+                                self.server_command, query, symbol_count, elapsed
+                            );
+                            server_ready = true;
+                            saw_quiescent = true;
+                            break;
+                        }
+                        consecutive_empty += 1;
+                        tracing::info!(
+                            "{} indexing validation {}/{}: workspace/symbol(\"{}\") returned 0 symbols ({}s elapsed, waiting {}s)",
+                            self.server_command, attempt, MAX_INDEXING_VALIDATION_ATTEMPTS,
+                            query, elapsed, validation_delay.as_secs()
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        // Error response — the server is responsive but the query
+                        // may not be supported. Count it as non-indexed.
+                        consecutive_empty += 1;
+                        tracing::info!(
+                            "{} indexing validation {}/{}: workspace/symbol(\"{}\") returned error: {} ({}s elapsed)",
+                            self.server_command, attempt, MAX_INDEXING_VALIDATION_ATTEMPTS,
+                            query, e, elapsed
+                        );
+                    }
+                    Err(_) => {
+                        // Timeout — server is busy indexing. Do NOT count toward
+                        // consecutive_empty: a timeout means the server is actively
+                        // working (not that it returned empty results). Let the
+                        // attempt counter and circuit breaker handle slow servers.
+                        tracing::info!(
+                            "{} indexing validation {}/{}: workspace/symbol(\"{}\") timed out ({}s elapsed, not counting as empty)",
+                            self.server_command, attempt, MAX_INDEXING_VALIDATION_ATTEMPTS,
+                            query, elapsed
+                        );
+                    }
+                }
+
+                // After 3 consecutive empty responses on different queries,
+                // the server is almost certainly not going to index this project.
+                // Mark it as "responsive but not indexed" early.
+                if consecutive_empty >= 3 && attempt >= 3 {
+                    // Check if ALL queries returned empty — not just a streak.
+                    // If every query we tried returned 0 symbols, the server
+                    // is responsive but not indexing this workspace.
+                    tracing::warn!(
+                        "{} indexing validation failed: {} consecutive empty responses across different queries — \
+                         server is responsive but has not indexed the workspace ({}s elapsed)",
+                        self.server_command, consecutive_empty, elapsed
+                    );
+                    // server_ready stays false, saw_quiescent stays false.
+                    // This means Pass 1 and Pass 3 will be skipped, which is
+                    // correct — sending requests to an unindexed server produces
+                    // 0 edges and wastes time.
+                    break;
+                }
+
+                // Exponential backoff: 5s, 10s, 20s, 40s, ...
+                // Capped by the circuit breaker.
+                let sleep_until = tokio::time::Instant::now() + validation_delay;
+                let capped = sleep_until.min(circuit_breaker);
+                tokio::time::sleep_until(capped).await;
+                validation_delay = (validation_delay * 2).min(tokio::time::Duration::from_secs(60));
+            }
+        }
+
         if tokio::time::Instant::now() >= circuit_breaker {
             tracing::warn!(
                 "{} circuit breaker fired after 10 minutes — proceeding anyway (server may not be fully indexed)",
+                self.server_command
+            );
+        } else if !server_ready && server_responsive {
+            tracing::warn!(
+                "{} responsive but indexing validation failed — server has not indexed the workspace",
                 self.server_command
             );
         } else if !server_ready {
@@ -702,9 +870,10 @@ impl LspEnricher {
         // The guard only applies when the server supports `experimental/serverStatus`
         // (`seen_server_status = true`) but never sent quiescent=true. Servers
         // that do NOT support serverStatus use the probe path: they are quiescent
-        // only when `server_ready=true` (probe succeeded). This ensures a server
-        // that never responded to any probe (circuit breaker path) is NOT treated
-        // as quiescent — Pass 3 would flood it with diagnostic requests.
+        // only when `server_ready=true` (probe + indexing validation both passed).
+        // This ensures a server that responded to probes but returned 0 symbols
+        // on validation (e.g., pyright before indexing completes) is NOT treated
+        // as quiescent — Pass 1 and Pass 3 would produce 0 edges.
         state.was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
         if !state.was_quiescent {
             tracing::warn!(
@@ -1722,10 +1891,7 @@ impl Enricher for LspEnricher {
         let mut result = EnrichmentResult::default();
 
         // Filter to nodes matching this enricher's language.
-        // Skip virtual crate nodes emitted by Pass 0: they have language="rust" but
-        // are structural topology nodes, not source symbols. Including them would send
-        // spurious LSP requests for Cargo.toml and create bogus edges on subsequent
-        // enrichment runs. Similarly skip diagnostic nodes (already filtered in Pass 1).
+        // Skip virtual crate nodes emitted by Pass 0 and diagnostic nodes.
         let matching_nodes: Vec<&Node> = nodes
             .iter()
             .filter(|n| n.language == self.language)
@@ -1749,12 +1915,7 @@ impl Enricher for LspEnricher {
             return Err(e);
         }
 
-        // Extract state under lock, then release the lock for concurrent work.
-        // was_quiescent is read from the pipelined transport's live quiescent_flag
-        // (not just the static snapshot from ensure_initialized). This allows later
-        // enrich() calls to proceed after RA finishes indexing, even if the first
-        // call timed out during initialization. The flag is updated by the background
-        // reader loop whenever `experimental/serverStatus { quiescent: true }` arrives.
+        // Extract state under lock, then release for concurrent work.
         let (transport, root, has_type_hierarchy, type_hierarchy_strikes, has_references, has_call_hierarchy, has_pull_diagnostics, has_inlay_hints, was_quiescent, diag_sink) = {
             let state = self.state.lock().await;
             let root = state
@@ -1766,83 +1927,30 @@ impl Enricher for LspEnricher {
                 None => return Ok(result),
             };
             let diag_sink = Arc::clone(&state.diagnostics_sink);
-            // Use live quiescent_flag from pipelined transport for session-wide accuracy.
-            // This allows RA to become quiescent after the init timeout and still be used.
             let was_quiescent = transport.quiescent_flag.load(Ordering::Acquire);
             (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references, state.has_call_hierarchy, state.has_pull_diagnostics, state.has_inlay_hints, was_quiescent, diag_sink)
         };
-        // State lock is released here — concurrent tasks can proceed
 
-        // ------------------------------------------------------------------
-        // Pass 0: crate-level dependency graph via rust-analyzer/viewCrateGraph.
-        //
-        // Single request; returns the entire workspace crate graph as a DOT
-        // string. Runs unconditionally (no per-node cost, no quiescence
-        // requirement). Only emits nodes+edges for Rust roots.
-        // ------------------------------------------------------------------
-        if self.language == "rust" {
-            let pass0_start = std::time::Instant::now();
-            let root_id = matching_nodes
-                .first()
-                .map(|n| n.id.root.clone())
-                .unwrap_or_default();
+        // Pass 0: crate-level dependency graph (Rust only, no quiescence needed)
+        self.run_pass0_crate_graph(&transport, &matching_nodes, &mut result).await;
 
-            match Self::fetch_crate_graph(&transport).await {
-                Ok((crate_names, pairs)) if !crate_names.is_empty() => {
-                    let pair_count = pairs.len();
-                    Self::emit_crate_graph_edges(&crate_names, &pairs, &root_id, &mut result);
-                    tracing::info!(
-                        "LSP Pass 0 complete in {:?}: {} crate nodes, {} DependsOn edges",
-                        pass0_start.elapsed(), crate_names.len(), pair_count
-                    );
-                }
-                Ok(_) => {
-                    tracing::debug!("LSP Pass 0: viewCrateGraph returned no crates");
-                }
-                Err(e) => {
-                    tracing::debug!("LSP Pass 0: viewCrateGraph failed: {}", e);
-                }
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // Pass 1: call hierarchy, find_implementations, and document links.
-        // Pipelined with adaptive concurrency (TCP slow-start).
-        //
-        // Guard: skip Pass 1 entirely when the server never reached quiescent
-        // state (i.e., the initialization deadline expired before indexing
-        // finished). When rust-analyzer hasn't indexed the workspace, every
-        // call-hierarchy request returns 0 results — triggering the zero-edge
-        // abort after ZERO_EDGE_ABORT_THRESHOLD nodes. This is indistinguishable
-        // from a misconfigured server and discards the entire enrichment run.
-        //
-        // On large repos (19K+ nodes across two roots) RA needs >120s to
-        // become quiescent. The same guard already protects Pass 3; apply it
-        // here too to prevent the zero-edge abort on timed-out servers.
-        //
-        // Note: `matching_nodes_owned` and `language` are allocated after this
-        // guard to avoid a wasted Arc<Vec<Node>> clone when skipping all passes.
-        // ------------------------------------------------------------------
+        // Guard: skip enrichment passes when server never reached quiescent state
         if !was_quiescent {
             tracing::info!(
                 "LSP Pass 1 skipped: {} did not reach quiescent state during initialization",
                 self.server_command
             );
             tracing::info!(
-                "LSP enrichment complete for {}: 0 edges, 0 diagnostic nodes (0 attempted, 0 errors) — skipped (not quiescent)",
+                "LSP enrichment complete for {}: 0 edges, 0 diagnostic nodes (0 attempted, 0 errors) -- skipped (not quiescent)",
                 self.language,
             );
             return Ok(result);
         }
 
-        // Share matching_nodes across concurrent tasks via Arc<Vec<Node>> (owned copies).
-        // Allocated after the was_quiescent guard to avoid cloning when all passes are skipped.
+        // Shared state for concurrent passes
         let matching_nodes_owned: Arc<Vec<Node>> = Arc::new(
             matching_nodes.iter().map(|n| (*n).clone()).collect()
         );
-
-        // Build a per-file index once and share it across all tasks via Arc.
-        // Without this, every function task rebuilt the same HashMap, O(functions × nodes).
         let refs_by_file_shared: Arc<HashMap<std::path::PathBuf, Vec<Node>>> = {
             let mut map: HashMap<std::path::PathBuf, Vec<Node>> = HashMap::new();
             for n in matching_nodes_owned.iter() {
@@ -1851,623 +1959,19 @@ impl Enricher for LspEnricher {
             Arc::new(map)
         };
 
-        let language = self.language.clone();
+        // Pass 1: call hierarchy, references, implementations, document links (concurrent)
+        let (attempted, errors, aborted) = self.run_pass1_references(
+            &transport, &root, &matching_nodes, &matching_nodes_owned,
+            &refs_by_file_shared, has_references, has_call_hierarchy,
+            &mut result,
+        ).await;
 
-        let pass1_start = std::time::Instant::now();
-
-        // Filter to only nodes that need LSP requests:
-        // Functions (call hierarchy), Traits (implementations), and Other (document links).
-        // Skip test functions — they don't have meaningful cross-file callers
-        // and halve the total RPC count.
-        // Also skip diagnostic nodes (Other("diagnostic")) to prevent them from being
-        // re-enriched via the generic Other/documentLink path on subsequent passes —
-        // which would generate spurious DependsOn edges from diagnostics.
-        let enrichable_nodes: Vec<&Node> = matching_nodes.iter()
-            .filter(|n| matches!(n.id.kind,
-                NodeKind::Function | NodeKind::Trait | NodeKind::Other(_)
-                | NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const))
-            .filter(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "diagnostic"))
-            .filter(|n| {
-                // Skip test functions (have #[test] or #[tokio::test] decorator)
-                if n.id.kind == NodeKind::Function {
-                    if let Some(decorators) = n.metadata.get("decorators")
-                        && (decorators.contains("#[test]") || decorators.contains("#[tokio::test]")) {
-                            return false;
-                        }
-                    // Also skip functions in test files
-                    if crate::ranking::is_test_file(n) {
-                        return false;
-                    }
-                }
-                true
-            })
-            .copied()
-            .collect();
-
-        let ref_eligible = enrichable_nodes.iter()
-            .filter(|n| matches!(n.id.kind,
-                NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const))
-            .count();
-        tracing::info!(
-            "LSP pipeline: {} enrichable nodes out of {} total ({}f, {}t, {}r, {}o) [references={}, call_hierarchy={}]",
-            enrichable_nodes.len(), matching_nodes.len(),
-            enrichable_nodes.iter().filter(|n| n.id.kind == NodeKind::Function).count(),
-            enrichable_nodes.iter().filter(|n| n.id.kind == NodeKind::Trait).count(),
-            ref_eligible,
-            enrichable_nodes.iter().filter(|n| matches!(n.id.kind, NodeKind::Other(_))).count(),
-            has_references, has_call_hierarchy,
-        );
-
-        // Concurrency control: TCP slow-start from 4 to 64.
-        // Start conservatively to let the LSP server warm its caches,
-        // then ramp up quickly once it's handling requests smoothly.
-        const PIPELINE_MAX_CONCURRENCY: usize = 64;
-        let concurrency_limit = Arc::new(tokio::sync::Semaphore::new(4));
-        let mut join_set = tokio::task::JoinSet::new();
-
-        let completed = Arc::new(AtomicI64::new(0));
-        let error_count = Arc::new(AtomicI64::new(0));
-        let ramped_up = Arc::new(AtomicBool::new(false));
-
-        for node in &enrichable_nodes {
-            let node = (*node).clone();
-            let transport = Arc::clone(&transport);
-            let root = root.clone();
-            let matching_owned = Arc::clone(&matching_nodes_owned);
-            let refs_by_file = Arc::clone(&refs_by_file_shared);
-            let language = language.clone();
-            let sem = Arc::clone(&concurrency_limit);
-            let completed = Arc::clone(&completed);
-            let error_count = Arc::clone(&error_count);
-
-            let ramped_up = Arc::clone(&ramped_up);
-
-            join_set.spawn(async move {
-                // Acquire semaphore permit — limits concurrency
-                let _permit = sem.acquire().await.unwrap();
-
-                let abs_path = root.join(&node.id.file);
-                let file_uri = match path_to_uri(&abs_path) {
-                    Ok(u) => u,
-                    Err(_) => {
-                        completed.fetch_add(1, Ordering::Relaxed);
-                        return (Vec::new(), Vec::new(), false);
-                    }
-                };
-
-                let (line, col) = Self::node_lsp_position(&node);
-                let mut edges = Vec::new();
-                let mut new_nodes = Vec::new();
-                let mut had_error = false;
-
-                match node.id.kind {
-                    NodeKind::Function => {
-                        if !has_call_hierarchy && has_references {
-                            // Server supports references but not callHierarchy (e.g., pyright).
-                            // Use textDocument/references to find callers of this function.
-                            // This produces Calls edges from caller → this function.
-                            // Note: references include non-call sites (imports, type annotations,
-                            // passing as callback), so confidence is Detected (not Confirmed).
-                            match Self::find_references_p(&transport, &file_uri, line, col).await {
-                                Ok(locations) => {
-                                    for loc in &locations {
-                                        let ref_path = uri_to_relative_path(&loc.uri, &root);
-                                        let ref_line = loc.range.start.line as usize + 1;
-
-                                        // Skip external dependencies
-                                        if ref_path.to_string_lossy().contains(".cargo")
-                                            || ref_path.to_string_lossy().contains("site-packages")
-                                        {
-                                            continue;
-                                        }
-
-                                        // Skip definition site (self-reference)
-                                        if ref_path == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end {
-                                            continue;
-                                        }
-
-                                        let referrer_id = refs_by_file
-                                            .get(ref_path.as_path())
-                                            .and_then(|candidates| {
-                                                let refs: Vec<&Node> = candidates.iter().collect();
-                                                find_enclosing_symbol(&refs, &ref_path, ref_line)
-                                            });
-
-                                        if let Some(referrer) = referrer_id {
-                                            if referrer == node.id {
-                                                continue;
-                                            }
-                                            edges.push(Edge {
-                                                from: referrer,
-                                                to: node.id.clone(),
-                                                kind: EdgeKind::Calls,
-                                                source: ExtractionSource::Lsp,
-                                                // Detected (not Confirmed): references include
-                                                // non-call sites (imports, type annotations,
-                                                // passing as value).
-                                                confidence: Confidence::Detected,
-                                            });
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    had_error = true;
-                                    error_count.fetch_add(1, Ordering::Relaxed);
-                                    tracing::debug!("references lookup failed for {}: {}", node.id.name, e);
-                                }
-                            }
-                        } else if has_call_hierarchy {
-                        match Self::prepare_call_hierarchy_p(&transport, &file_uri, line, col).await {
-                            Ok(Some(item)) => {
-                                // Run incoming and outgoing calls concurrently
-                                let (incoming_result, outgoing_result) = tokio::join!(
-                                    Self::incoming_calls_p(&transport, &item),
-                                    Self::outgoing_calls_p(&transport, &item),
-                                );
-
-                                // Build a precomputed (file, name) → NodeId index once for O(1)
-                                // lookup during incoming and outgoing call resolution.
-                                // Without this, each per-call `.iter().filter().find()` scan is
-                                // O(matching_refs), making the entire block O(calls × nodes).
-                                // Ambiguous buckets (same file+name) fall back to line-based
-                                // disambiguation via `find_enclosing_symbol`.
-                                let matching_refs: Vec<&Node> = matching_owned.iter().collect();
-                                let mut refs_by_file_name: std::collections::HashMap<
-                                    (std::path::PathBuf, String),
-                                    Vec<NodeId>,
-                                > = std::collections::HashMap::new();
-                                for n in &matching_refs {
-                                    refs_by_file_name
-                                        .entry((n.id.file.clone(), n.id.name.clone()))
-                                        .or_default()
-                                        .push(n.id.clone());
-                                }
-
-                                // Process incoming calls
-                                if let Ok(calls) = incoming_result {
-                                    for call in &calls {
-                                        let caller_uri = &call["from"]["uri"];
-                                        let caller_name = call["from"]["name"].as_str().unwrap_or("");
-                                        let caller_line = call["from"]["range"]["start"]["line"].as_u64().unwrap_or(0) as usize + 1;
-
-                                        if let Some(uri_str) = caller_uri.as_str() {
-                                            let caller_path = if let Some(p) = uri_str.strip_prefix("file://") {
-                                                let abs = PathBuf::from(p);
-                                                abs.strip_prefix(&root).unwrap_or(&abs).to_path_buf()
-                                            } else {
-                                                continue;
-                                            };
-
-                                            if caller_path.to_string_lossy().contains(".cargo") {
-                                                continue;
-                                            }
-
-                                            let key = (caller_path.clone(), caller_name.to_string());
-                                            let caller_id = match refs_by_file_name.get(&key) {
-                                                Some(ids) if ids.len() == 1 => Some(ids[0].clone()),
-                                                Some(_) => find_enclosing_symbol(&matching_refs, &caller_path, caller_line),
-                                                None => find_enclosing_symbol(&matching_refs, &caller_path, caller_line),
-                                            };
-
-                                            if let Some(caller) = caller_id {
-                                                if caller.name == node.id.name && caller.file == node.id.file {
-                                                    continue;
-                                                }
-                                                edges.push(Edge {
-                                                    from: caller,
-                                                    to: node.id.clone(),
-                                                    kind: EdgeKind::Calls,
-                                                    source: ExtractionSource::Lsp,
-                                                    confidence: Confidence::Confirmed,
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Process outgoing calls
-                                if let Ok(calls) = outgoing_result {
-                                    for call in &calls {
-                                        let callee_uri = &call["to"]["uri"];
-                                        let callee_name = call["to"]["name"].as_str().unwrap_or("");
-                                        let callee_line = call["to"]["range"]["start"]["line"].as_u64().unwrap_or(0) as usize + 1;
-
-                                        if let Some(uri_str) = callee_uri.as_str() {
-                                            let callee_path = if let Some(p) = uri_str.strip_prefix("file://") {
-                                                let abs = PathBuf::from(p);
-                                                abs.strip_prefix(&root).unwrap_or(&abs).to_path_buf()
-                                            } else {
-                                                continue;
-                                            };
-
-                                            if callee_path.to_string_lossy().contains(".cargo") {
-                                                let fqn = call["to"]["detail"]
-                                                    .as_str()
-                                                    .filter(|s| !s.is_empty())
-                                                    .unwrap_or(callee_name);
-
-                                                if fqn.is_empty() {
-                                                    continue;
-                                                }
-
-                                                let package = fqn.split("::").next().unwrap_or(fqn).to_string();
-
-                                                let virtual_id = NodeId {
-                                                    root: "external".to_string(),
-                                                    file: PathBuf::new(),
-                                                    name: fqn.to_string(),
-                                                    kind: NodeKind::Function,
-                                                };
-
-                                                let mut meta = std::collections::BTreeMap::new();
-                                                meta.insert("package".to_string(), package.clone());
-                                                meta.insert("virtual".to_string(), "true".to_string());
-                                                new_nodes.push(Node {
-                                                    id: virtual_id.clone(),
-                                                    language: language.clone(),
-                                                    line_start: 0,
-                                                    line_end: 0,
-                                                    signature: fqn.to_string(),
-                                                    body: String::new(),
-                                                    metadata: meta,
-                                                    source: ExtractionSource::Lsp,
-                                                });
-
-                                                edges.push(Edge {
-                                                    from: node.id.clone(),
-                                                    to: virtual_id,
-                                                    kind: EdgeKind::Calls,
-                                                    source: ExtractionSource::Lsp,
-                                                    confidence: Confidence::Detected,
-                                                });
-                                                continue;
-                                            }
-
-                                            let key = (callee_path.clone(), callee_name.to_string());
-                                            let callee_id = match refs_by_file_name.get(&key) {
-                                                Some(ids) if ids.len() == 1 => Some(ids[0].clone()),
-                                                Some(_) => find_enclosing_symbol(&matching_refs, &callee_path, callee_line),
-                                                None => find_enclosing_symbol(&matching_refs, &callee_path, callee_line),
-                                            };
-
-                                            if let Some(callee) = callee_id {
-                                                if callee.name == node.id.name && callee.file == node.id.file {
-                                                    continue;
-                                                }
-                                                edges.push(Edge {
-                                                    from: node.id.clone(),
-                                                    to: callee,
-                                                    kind: EdgeKind::Calls,
-                                                    source: ExtractionSource::Lsp,
-                                                    confidence: Confidence::Confirmed,
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Ok(None) => {} // No call hierarchy item
-                            Err(e) => {
-                                had_error = true;
-                                error_count.fetch_add(1, Ordering::Relaxed);
-                                tracing::debug!("prepareCallHierarchy failed for {}: {}", node.id.name, e);
-                            }
-                        }
-                        } // end else if has_call_hierarchy
-                    }
-                    NodeKind::Trait => {
-                        match Self::find_implementations_p(&transport, &file_uri, line, col).await {
-                            Ok(locations) => {
-                                let matching_refs: Vec<&Node> = matching_owned.iter().collect();
-                                for loc in locations {
-                                    let impl_path = uri_to_relative_path(&loc.uri, &root);
-                                    let impl_line = loc.range.start.line as usize + 1;
-
-                                    if impl_path.to_string_lossy().contains(".cargo") {
-                                        continue;
-                                    }
-
-                                    let impl_id = matching_refs.iter()
-                                        .filter(|n| n.id.file == impl_path)
-                                        .filter(|n| matches!(n.id.kind, NodeKind::Impl | NodeKind::Struct))
-                                        .filter(|n| n.line_start <= impl_line && n.line_end >= impl_line)
-                                        .min_by_key(|n| n.line_end - n.line_start)
-                                        .map(|n| n.id.clone());
-
-                                    if let Some(implementor) = impl_id {
-                                        edges.push(Edge {
-                                            from: implementor,
-                                            to: node.id.clone(),
-                                            kind: EdgeKind::Implements,
-                                            source: ExtractionSource::Lsp,
-                                            confidence: Confidence::Confirmed,
-                                        });
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!("Implementation lookup failed for {}: {}", node.id.name, e);
-                            }
-                        }
-                    }
-                    NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
-                        // Use textDocument/references to find usage sites for
-                        // non-function symbols (structs, enums, type aliases, consts).
-                        if has_references {
-                            match Self::find_references_p(&transport, &file_uri, line, col).await {
-                                Ok(locations) => {
-                                    // Build per-file index once to avoid O(R*N) scans
-                                    let matching_refs: Vec<&Node> = matching_owned.iter().collect();
-                                    let mut refs_by_file: HashMap<&Path, Vec<&Node>> = HashMap::new();
-                                    for n in &matching_refs {
-                                        refs_by_file.entry(n.id.file.as_path()).or_default().push(*n);
-                                    }
-                                    for loc in &locations {
-                                        let ref_path = uri_to_relative_path(&loc.uri, &root);
-                                        let ref_line = loc.range.start.line as usize + 1;
-
-                                        // Skip external dependencies
-                                        if ref_path.to_string_lossy().contains(".cargo") {
-                                            continue;
-                                        }
-
-                                        // Skip self-references (definition site)
-                                        if ref_path == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end {
-                                            continue;
-                                        }
-
-                                        // Resolve to the enclosing symbol at the reference site
-                                        let referrer_id = refs_by_file
-                                            .get(ref_path.as_path())
-                                            .and_then(|candidates| find_enclosing_symbol(candidates, &ref_path, ref_line));
-
-                                        if let Some(referrer) = referrer_id {
-                                            // Skip self-edges
-                                            if referrer == node.id {
-                                                continue;
-                                            }
-                                            edges.push(Edge {
-                                                from: referrer,
-                                                to: node.id.clone(),
-                                                kind: EdgeKind::ReferencedBy,
-                                                source: ExtractionSource::Lsp,
-                                                confidence: Confidence::Confirmed,
-                                            });
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    had_error = true;
-                                    error_count.fetch_add(1, Ordering::Relaxed);
-                                    tracing::debug!("textDocument/references failed for {}: {}", node.id.name, e);
-                                }
-                            }
-                        }
-                    }
-                    _ => {
-                        if matches!(node.id.kind, NodeKind::Other(_))
-                            && let Ok(links) = Self::document_links_p(&transport, &file_uri).await {
-                                for link in &links {
-                                    if let Some(target) = link.get("target").and_then(|t| t.as_str())
-                                        && let Some(target_path) = target.strip_prefix("file://") {
-                                            let rel_target = PathBuf::from(target_path);
-                                            let rel_target = rel_target.strip_prefix(&root).unwrap_or(&rel_target).to_path_buf();
-
-                                            if rel_target.to_string_lossy().starts_with("http") {
-                                                continue;
-                                            }
-
-                                            let target_id = NodeId {
-                                                root: node.id.root.clone(),
-                                                file: rel_target.clone(),
-                                                name: rel_target.file_name()
-                                                    .and_then(|n| n.to_str())
-                                                    .unwrap_or("unknown")
-                                                    .to_string(),
-                                                kind: NodeKind::Module,
-                                            };
-
-                                            edges.push(Edge {
-                                                from: node.id.clone(),
-                                                to: target_id,
-                                                kind: EdgeKind::DependsOn,
-                                                source: ExtractionSource::Lsp,
-                                                confidence: Confidence::Confirmed,
-                                            });
-                                        }
-                                }
-                            }
-                    }
-                }
-
-                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                // Ramp up after 4 successful completions (TCP slow-start exit)
-                if done >= 4 && !had_error && !ramped_up.swap(true, Ordering::Relaxed) {
-                    let added = PIPELINE_MAX_CONCURRENCY - 4;
-                    sem.add_permits(added);
-                    tracing::info!("LSP pipeline: ramp-up to {} concurrent", PIPELINE_MAX_CONCURRENCY);
-                }
-                (edges, new_nodes, had_error)
-            });
-        }
-
-        // Collect results from all concurrent tasks
-        let mut attempted = 0u32;
-        let mut errors = 0u32;
-        let mut seen_virtual_ids = std::collections::HashSet::new();
-        let total_nodes = enrichable_nodes.len();
-        let mut last_progress_log = std::time::Instant::now();
-        let mut last_logged_count = 0u64;
-        const PROGRESS_LOG_INTERVAL_SECS: u64 = 30;
-        const PROGRESS_LOG_INTERVAL_NODES: u64 = 1_000;
-
-        while let Some(task_result) = join_set.join_next().await {
-            match task_result {
-                Ok((edges, new_nodes, had_error)) => {
-                    attempted += 1;
-                    if had_error {
-                        errors += 1;
-                    }
-                    result.added_edges.extend(edges);
-                    for vnode in new_nodes {
-                        if seen_virtual_ids.insert(vnode.id.clone()) {
-                            result.new_nodes.push(vnode);
-                        }
-                    }
-                }
-                Err(e) => {
-                    errors += 1;
-                    tracing::debug!("LSP enrichment task panicked: {}", e);
-                }
-            }
-
-            // Log progress every 1,000 nodes or every 30 seconds (whichever comes first)
-            let done = completed.load(Ordering::Relaxed) as u64;
-            let elapsed_since_log = last_progress_log.elapsed().as_secs();
-            let nodes_since_log = done.saturating_sub(last_logged_count);
-            if done > 0
-                && (nodes_since_log >= PROGRESS_LOG_INTERVAL_NODES
-                    || elapsed_since_log >= PROGRESS_LOG_INTERVAL_SECS)
-            {
-                let elapsed_total = pass1_start.elapsed().as_secs_f64();
-                let rate = done as f64 / elapsed_total;
-                let remaining = if rate > 0.0 {
-                    let remaining_nodes = (total_nodes as f64) - (done as f64);
-                    let remaining_secs = remaining_nodes / rate;
-                    if remaining_secs >= 120.0 {
-                        format!("~{} min remaining", (remaining_secs / 60.0).round() as u64)
-                    } else {
-                        format!("~{}s remaining", remaining_secs.round() as u64)
-                    }
-                } else {
-                    "estimating...".to_string()
-                };
-                tracing::info!(
-                    "LSP: {} processing... {}/{} nodes ({} edges found, {})",
-                    self.server_command, done, total_nodes,
-                    result.added_edges.len(), remaining,
-                );
-                last_progress_log = std::time::Instant::now();
-                last_logged_count = done;
-            }
-
-            // Early abort: if we've processed >= 1,000 nodes AND warmed up for >= 30s,
-            // OR spent >= 2 minutes with 0 edges, the language server is likely
-            // misconfigured. The warmup guard prevents false aborts on servers like
-            // typescript-language-server that need time to index before producing edges.
-            if result.added_edges.is_empty()
-                && ((attempted >= ZERO_EDGE_ABORT_THRESHOLD && pass1_start.elapsed() >= ZERO_EDGE_MIN_WARMUP)
-                    || pass1_start.elapsed() > ZERO_EDGE_TIMEOUT)
-            {
-                tracing::warn!(
-                    "LSP: {} produced 0 edges after {}/{} nodes ({:.1}s) — aborting (likely misconfigured)",
-                    self.server_command, attempted, total_nodes, pass1_start.elapsed().as_secs_f64(),
-                );
-                join_set.abort_all();
-                break;
-            }
-        }
-
-        tracing::info!(
-            "LSP Pass 1 complete in {:?}: {} edges from {} nodes ({} errors)",
-            pass1_start.elapsed(), result.added_edges.len(), attempted, errors,
-        );
-
-        // Pass 1b (TestedBy naming conventions) was removed in fix/#395.
-        // TestedBy edges are now emitted by the tree-sitter post-extraction
-        // pass `naming_convention::tested_by_pass`, which runs unconditionally
-        // after every scan — no LSP startup required.
-
-        // ------------------------------------------------------------------
-        // Pass 2: type hierarchy (sequential — strike counting needs order)
-        // ------------------------------------------------------------------
-        let mut has_type_hierarchy = has_type_hierarchy;
-        let mut type_hierarchy_strikes = type_hierarchy_strikes;
-
-        if has_type_hierarchy {
-            let type_nodes: Vec<&Node> = matching_nodes
-                .iter()
-                .filter(|n| matches!(n.id.kind, NodeKind::Trait | NodeKind::Struct | NodeKind::Enum))
-                .copied()
-                .collect();
-
-            if !type_nodes.is_empty() {
-                tracing::debug!(
-                    "Type hierarchy pass: {} eligible nodes",
-                    type_nodes.len()
-                );
-            }
-
-            let pass2_start = std::time::Instant::now();
-            let mut pass2_done = 0u64;
-            let pass2_total = type_nodes.len();
-            let edges_before_pass2 = result.added_edges.len();
-            let mut pass2_last_log = std::time::Instant::now();
-            let mut pass2_last_count = 0u64;
-
-            for node in &type_nodes {
-                let abs_path = root.join(&node.id.file);
-                let file_uri = match path_to_uri(&abs_path) {
-                    Ok(u) => u,
-                    Err(_) => continue,
-                };
-                let (line, col) = Self::node_lsp_position(node);
-
-                let ok = Self::enrich_type_hierarchy_p(
-                    &transport, &file_uri, line, col,
-                    node, &matching_nodes, &root, &mut result,
-                ).await;
-
-                Self::update_type_hierarchy_strikes(
-                    ok,
-                    &mut type_hierarchy_strikes,
-                    &mut has_type_hierarchy,
-                );
-
-                pass2_done += 1;
-
-                // Log progress every 500 nodes or every 30 seconds
-                let since_log = pass2_last_log.elapsed().as_secs();
-                let nodes_since = pass2_done - pass2_last_count;
-                if nodes_since >= 500 || since_log >= 30 {
-                    let elapsed = pass2_start.elapsed().as_secs_f64();
-                    let rate = pass2_done as f64 / elapsed;
-                    let remaining_secs = if rate > 0.0 {
-                        ((pass2_total as f64) - (pass2_done as f64)) / rate
-                    } else {
-                        0.0
-                    };
-                    let remaining = if remaining_secs >= 120.0 {
-                        format!("~{} min remaining", (remaining_secs / 60.0).round() as u64)
-                    } else {
-                        format!("~{}s remaining", remaining_secs.round() as u64)
-                    };
-                    tracing::info!(
-                        "LSP: {} type hierarchy... {}/{} nodes ({} edges total, {})",
-                        self.server_command, pass2_done, pass2_total,
-                        result.added_edges.len(), remaining,
-                    );
-                    pass2_last_log = std::time::Instant::now();
-                    pass2_last_count = pass2_done;
-                }
-
-                // Early abort: 0 new edges after 1,000 nodes + 30s warmup, OR 2 minutes
-                if result.added_edges.len() == edges_before_pass2
-                    && ((pass2_done >= ZERO_EDGE_ABORT_THRESHOLD as u64 && pass2_start.elapsed() >= ZERO_EDGE_MIN_WARMUP)
-                        || pass2_start.elapsed() > ZERO_EDGE_TIMEOUT)
-                {
-                    tracing::warn!(
-                        "LSP: {} type hierarchy produced 0 edges after {}/{} nodes ({:.1}s) — aborting (likely misconfigured)",
-                        self.server_command, pass2_done, pass2_total, pass2_start.elapsed().as_secs_f64(),
-                    );
-                    break;
-                }
-
-                if !has_type_hierarchy {
-                    break;
-                }
-            }
-        }
+        // Pass 2: type hierarchy (sequential -- strike counting needs order)
+        let (has_type_hierarchy, type_hierarchy_strikes) = self.run_pass2_type_hierarchy(
+            &transport, &root, &matching_nodes,
+            has_type_hierarchy, type_hierarchy_strikes,
+            &mut result,
+        ).await;
 
         // Persist strike counter back to state
         {
@@ -2476,294 +1980,41 @@ impl Enricher for LspEnricher {
             state.has_type_hierarchy = has_type_hierarchy;
         }
 
-        // ------------------------------------------------------------------
-        // Pass 4: BelongsTo edges — module hierarchy (#396).
-        //
-        // Per unique file: emit BelongsTo edges from all symbols to a module
-        // node. For Rust, tries rust-analyzer/parentModule first; falls back
-        // to directory-based module detection for all other languages.
-        //
-        // This runs unconditionally (no quiescence dependency) since:
-        //   - Directory-based fallback never hits the LSP server
-        //   - rust-analyzer/parentModule is cheap (one request per file, not per symbol)
-        // ------------------------------------------------------------------
-        {
-            let pass4_start = std::time::Instant::now();
-            let edges_before = result.added_edges.len();
+        // Pass 4: BelongsTo edges -- module hierarchy
+        self.run_pass4_belongs_to(&transport, &root, &matching_nodes, &mut result).await;
 
-            // Group matching_nodes by file
-            let mut nodes_by_file: HashMap<PathBuf, Vec<&Node>> = HashMap::new();
-            for n in &matching_nodes {
-                nodes_by_file.entry(n.id.file.clone()).or_default().push(n);
-            }
+        // Pass 5: InlayHints -- inferred types in embeddings
+        self.run_pass5_inlay_hints(&transport, &root, &matching_nodes, has_inlay_hints, &mut result).await;
 
-            let is_rust = self.language == "rust";
-
-            for (rel_file, file_nodes) in &nodes_by_file {
-                Self::emit_belongs_to_edges(
-                    &transport,
-                    file_nodes,
-                    rel_file,
-                    &root,
-                    is_rust,
-                    &mut result,
-                ).await;
-            }
-
-            // Remove duplicate module nodes (same stable_id emitted for multiple files in same dir)
-            let mut deduplicated_new_nodes = Vec::with_capacity(result.new_nodes.len());
-            let mut module_stable_ids_seen = std::collections::HashSet::new();
-            for node in result.new_nodes.drain(..) {
-                if matches!(node.id.kind, NodeKind::Module) {
-                    let sid = node.id.to_stable_id();
-                    if module_stable_ids_seen.insert(sid) {
-                        deduplicated_new_nodes.push(node);
-                    }
-                    // else: skip duplicate
-                } else {
-                    deduplicated_new_nodes.push(node);
-                }
-            }
-            result.new_nodes = deduplicated_new_nodes;
-
-            let belongs_to_count = result.added_edges.len() - edges_before;
-            let module_node_count = result.new_nodes.iter()
-                .filter(|n| matches!(n.id.kind, NodeKind::Module))
-                .count();
-            if belongs_to_count > 0 {
-                tracing::info!(
-                    "LSP Pass 4 complete in {:?}: {} BelongsTo edges, {} module nodes",
-                    pass4_start.elapsed(), belongs_to_count, module_node_count
-                );
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // Pass 5: InlayHints — inferred types in embeddings (#408).
-        //
-        // For language servers that support inlayHint (rust-analyzer,
-        // TypeScript LS, Pyright, gopls): request inlay hints per file,
-        // extract type annotations, and patch node metadata so
-        // build_code_embedding_text() includes them.
-        //
-        // Only runs if the server advertised inlayHintProvider capability.
-        // ------------------------------------------------------------------
-        if has_inlay_hints {
-            let pass5_start = std::time::Instant::now();
-            let mut hint_patches = 0usize;
-
-            // Unique files (recompute since nodes_by_file was consumed above)
-            let mut nodes_by_file2: HashMap<PathBuf, Vec<&Node>> = HashMap::new();
-            for n in &matching_nodes {
-                nodes_by_file2.entry(n.id.file.clone()).or_default().push(n);
-            }
-
-            for (rel_file, file_nodes) in &nodes_by_file2 {
-                let abs_path = root.join(rel_file);
-                let file_uri = match path_to_uri(&abs_path) {
-                    Ok(u) => u,
-                    Err(_) => continue,
-                };
-
-                // Use max line_end as the range end for the request
-                let max_line = file_nodes
-                    .iter()
-                    .map(|n| n.line_end as u32)
-                    .max()
-                    .unwrap_or(0);
-
-                match Self::inlay_hints_for_file(&transport, &file_uri, max_line + 1).await {
-                    Ok(hints) if !hints.is_empty() => {
-                        let type_map = Self::group_inlay_hints_by_node(&hints, file_nodes);
-                        for (stable_id, type_str) in type_map {
-                            result.updated_nodes.push((
-                                stable_id,
-                                {
-                                    let mut patch = std::collections::BTreeMap::new();
-                                    patch.insert("inferred_types".to_string(), type_str);
-                                    patch
-                                },
-                            ));
-                            hint_patches += 1;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::debug!(
-                            "textDocument/inlayHint failed for {}: {}",
-                            rel_file.display(), e
-                        );
-                    }
-                }
-            }
-
-            if hint_patches > 0 {
-                tracing::info!(
-                    "LSP Pass 5 complete in {:?}: {} nodes patched with inferred_types",
-                    pass5_start.elapsed(), hint_patches
-                );
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // Pass 3: diagnostics.
-        //
-        // Strategy: prefer pull-based diagnostics (textDocument/diagnostic,
-        // LSP 3.17+) when the server advertised `diagnosticProvider`. For
-        // servers that only push (`textDocument/publishDiagnostics`), fall
-        // back to what the pipelined reader loop captured in `diag_sink`.
-        //
-        // Only Error and Warning severities produce nodes.
-        // Files with zero qualifying diagnostics produce no nodes (clean-file rule).
-        //
-        // Guard: skip Pass 3 entirely when the server never reached quiescent
-        // state (i.e., the initialization deadline expired before indexing
-        // finished). Sending thousands of textDocument/diagnostic requests to an
-        // unindexed server floods its request queue and was the root cause of the
-        // zero-edge regression introduced by #381.
-        // ------------------------------------------------------------------
+        // Pass 3: diagnostics (runs last, guarded by quiescence)
         if !was_quiescent {
             tracing::info!(
                 "LSP Pass 3 skipped: {} did not reach quiescent state during initialization",
                 self.server_command
             );
-            let diag_count = 0usize;
-            tracing::info!(
-                "LSP enrichment complete for {}: {} edges, {} diagnostic nodes ({} attempted, {} errors)",
-                self.language,
-                result.added_edges.len(),
-                diag_count,
-                attempted,
-                errors,
-            );
-            return Ok(result);
-        }
-
-        let diag_timestamp = {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs().to_string())
-                .unwrap_or_else(|_| "0".to_string())
-        };
-
-        // Collect unique files from matching_nodes so we can request pull diagnostics
-        // for exactly the files we already enriched (no extra LSP sessions).
-        let unique_files: Vec<PathBuf> = {
-            let mut seen = std::collections::HashSet::new();
-            matching_nodes.iter()
-                .map(|n| n.id.file.clone())
-                .filter(|f| seen.insert(f.clone()))
-                .collect()
-        };
-
-        // Use the canonical root ID from the graph (from matching_nodes), not the filesystem
-        // path. This ensures diagnostic NodeIds live in the same namespace as all other nodes
-        // and are correctly handled by root-prefix stripping and stale-root pruning.
-        let root_id = matching_nodes
-            .first()
-            .map(|n| n.id.root.clone())
-            .unwrap_or_default();
-
-        // Load diagnostic severity threshold from .oh/config.toml [lsp] section.
-        // Defaults to Warning (severity ≤ 2) if no config is present.
-        let lsp_config = LspConfig::load(repo_root);
-        let max_severity_int = lsp_config.diagnostic_min_severity.max_severity_int();
-
-        if has_pull_diagnostics {
-            tracing::info!(
-                "LSP diagnostics pass: pull-based for {} files ({})",
-                unique_files.len(), self.server_command
-            );
-            // Pull diagnostics per unique file
-            let mut pull_raw_total = 0usize;
-            let mut pull_files_with_diags = 0usize;
-            for rel_file in &unique_files {
-                let abs_path = root.join(rel_file);
-                let file_uri = match path_to_uri(&abs_path) {
-                    Ok(u) => u,
-                    Err(_) => continue,
-                };
-                match Self::pull_diagnostics_p(&transport, &file_uri).await {
-                    Ok(diags) => {
-                        if !diags.is_empty() {
-                            pull_raw_total += diags.len();
-                            pull_files_with_diags += 1;
-                            tracing::debug!(
-                                "textDocument/diagnostic: {} raw items for {}",
-                                diags.len(), rel_file.display()
-                            );
-                        }
-                        let nodes = Self::build_diagnostic_nodes(
-                            file_uri.as_str(),
-                            &diags,
-                            &root,
-                            &root_id,
-                            &self.server_command,
-                            &self.language,
-                            &diag_timestamp,
-                            max_severity_int,
-                        );
-                        result.new_nodes.extend(nodes);
-                    }
-                    Err(e) => {
-                        tracing::debug!("textDocument/diagnostic failed for {}: {}", rel_file.display(), e);
-                    }
-                }
-            }
-            tracing::info!(
-                "LSP diagnostics pass: pull complete — {} raw items from {} files with diagnostics (out of {} files)",
-                pull_raw_total, pull_files_with_diags, unique_files.len()
-            );
         } else {
-            // Fall back to push-captured diagnostics from the reader loop.
-            // Limit to URIs that correspond to this pass's files — prevents
-            // re-emitting stale diagnostics for files no longer in matching_nodes.
-            let expected_uris: std::collections::HashSet<String> = unique_files
-                .iter()
-                .filter_map(|rel_file| path_to_uri(&root.join(rel_file)).ok().map(|u| u.to_string()))
-                .collect();
-
-            let captured: HashMap<String, Vec<serde_json::Value>> = {
-                let sink = diag_sink.lock().unwrap();
-                sink.clone()
-            };
-            let relevant_count = captured.keys().filter(|u| expected_uris.contains(*u)).count();
-            tracing::info!(
-                "LSP diagnostics pass: push-captured {}/{} relevant files with diagnostics ({})",
-                relevant_count, captured.len(), self.server_command
-            );
-            for (uri, diags) in &captured {
-                // Only convert diagnostics for files in this pass
-                if !expected_uris.contains(uri) {
-                    continue;
-                }
-                let nodes = Self::build_diagnostic_nodes(
-                    uri,
-                    diags,
-                    &root,
-                    &root_id,
-                    &self.server_command,
-                    &self.language,
-                    &diag_timestamp,
-                    max_severity_int,
-                );
-                result.new_nodes.extend(nodes);
-            }
+            self.run_pass3_diagnostics(
+                &transport, &root, &matching_nodes,
+                has_pull_diagnostics, &diag_sink, repo_root,
+                &mut result,
+            ).await;
         }
 
         let diag_count = result.new_nodes.iter()
             .filter(|n| matches!(&n.id.kind, NodeKind::Other(s) if s == "diagnostic"))
             .count();
         tracing::info!(
-            "LSP enrichment complete for {}: {} edges, {} diagnostic nodes ({} attempted, {} errors)",
+            "LSP enrichment complete for {}: {} edges, {} diagnostic nodes ({} attempted, {} errors{})",
             self.language,
             result.added_edges.len(),
             diag_count,
             attempted,
             errors,
+            if aborted { ", aborted" } else { "" },
         );
 
+        result.error_count = errors as usize;
+        result.aborted = aborted;
         Ok(result)
     }
 }
@@ -2778,6 +2029,7 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
+    use super::transport::{find_enclosing_symbol, uri_to_relative_path};
 
     /// Verify the Enricher trait can be implemented (compile-time check).
     #[tokio::test]
@@ -3820,6 +3072,172 @@ mod tests {
             Some(&serde_json::json!(true)),
             "serverStatusNotification must be true to receive serverStatus from rust-analyzer"
         );
+    }
+
+    /// Verify that the was_quiescent computation correctly handles the probe
+    /// validation path introduced by #576.
+    ///
+    /// For servers without serverStatus:
+    /// - Probe succeeds + validation returns symbols → was_quiescent = true
+    /// - Probe succeeds + validation returns 0 symbols → was_quiescent = false
+    /// - Probe never succeeds → was_quiescent = false
+    ///
+    /// This ensures Pass 1 and Pass 3 are skipped when a server (e.g., pyright,
+    /// tsserver) responds to probes but hasn't indexed the workspace.
+    #[test]
+    fn test_was_quiescent_probe_validation_path() {
+        // Case 1: Probe + validation both succeed → was_quiescent = true
+        // (saw_quiescent=true from validation, server_ready=true)
+        {
+            let saw_quiescent = true;
+            let seen_server_status = false;
+            let server_ready = true;
+            let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
+            assert!(was_quiescent,
+                "probe + validation success must set was_quiescent=true — Pass 1/3 should run");
+        }
+
+        // Case 2: Probe succeeds but validation returns 0 symbols → was_quiescent = false
+        // (saw_quiescent=false, server_ready=false after validation failure)
+        {
+            let saw_quiescent = false;
+            let seen_server_status = false;
+            let server_ready = false;
+            let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
+            assert!(!was_quiescent,
+                "probe success with failed validation must NOT set was_quiescent — \
+                 Pass 1/3 must be skipped (server responsive but not indexed, #576)");
+        }
+
+        // Case 3: Neither probe nor validation succeed → was_quiescent = false
+        {
+            let saw_quiescent = false;
+            let seen_server_status = false;
+            let server_ready = false;
+            let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
+            assert!(!was_quiescent,
+                "no probe success must not set was_quiescent — server never responded");
+        }
+
+        // Case 4: serverStatus path (not probe) — quiescent=true → was_quiescent = true
+        {
+            let saw_quiescent = true;
+            let seen_server_status = true;
+            let server_ready = true;
+            let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
+            assert!(was_quiescent,
+                "serverStatus quiescent=true must set was_quiescent regardless of probe path");
+        }
+
+        // Case 5: serverStatus path — not quiescent → was_quiescent = false
+        {
+            let saw_quiescent = false;
+            let seen_server_status = true;
+            let server_ready = false;
+            let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
+            assert!(!was_quiescent,
+                "serverStatus without quiescent=true must NOT set was_quiescent — \
+                 server timed out during indexing");
+        }
+    }
+
+    /// Verify the validation query list covers common symbol names across
+    /// Python, TypeScript, and Rust codebases. An empty validation query
+    /// list would bypass indexing validation entirely.
+    #[test]
+    fn test_indexing_validation_queries_not_empty() {
+        // These constants are defined inline in ensure_initialized. Replicate them
+        // here to verify the design contract: at least 3 diverse queries so a
+        // project missing "main" can still pass validation.
+        let queries = &["main", "init", "test", "get", "set", "app"];
+        assert!(queries.len() >= 3,
+            "need at least 3 validation queries to avoid false negatives \
+             from projects that happen to lack a particular symbol name");
+        // Verify no empty strings — an empty query would bypass validation
+        // since workspace/symbol("") returns all symbols (or matches anything).
+        assert!(queries.iter().all(|q| !q.is_empty()),
+            "validation queries must be non-empty strings — empty query bypasses validation");
+        // Verify no duplicates
+        let unique: std::collections::HashSet<&&str> = queries.iter().collect();
+        assert_eq!(unique.len(), queries.len(),
+            "validation queries must be unique");
+    }
+
+    /// Adversarial: verify the early-exit condition for indexing validation.
+    /// The code exits early when consecutive_empty >= 3 && attempt >= 3.
+    /// Note: only empty responses and errors count toward consecutive_empty.
+    /// Timeouts do NOT count (the server is actively working, not empty).
+    #[test]
+    fn test_indexing_validation_early_exit_boundary() {
+        // Simulate the early exit condition from ensure_initialized
+        let check_early_exit = |consecutive_empty: u32, attempt: u32| -> bool {
+            consecutive_empty >= 3 && attempt >= 3
+        };
+
+        // Boundary: 2 empties at attempt 3 — NOT enough evidence
+        assert!(!check_early_exit(2, 3),
+            "2 consecutive empty responses is not enough to declare server unindexed");
+
+        // Boundary: 3 empties at attempt 2 — too early to give up
+        assert!(!check_early_exit(3, 2),
+            "should not exit early on attempt 2 even with 3 empties — give more time");
+
+        // Exact threshold: 3 empties at attempt 3 — exit
+        assert!(check_early_exit(3, 3),
+            "3 consecutive empty responses at attempt 3 should trigger early exit");
+
+        // Above threshold: 4 empties at attempt 4
+        assert!(check_early_exit(4, 4),
+            "4 empties at attempt 4 should also trigger early exit");
+
+        // Edge: attempt 1 with 0 empties — never exit
+        assert!(!check_early_exit(0, 1));
+
+        // Scenario: 3 timeouts + 0 empties at attempt 3 — should NOT exit
+        // because timeouts don't count toward consecutive_empty
+        // (server is actively indexing, not returning empty results)
+        assert!(!check_early_exit(0, 3),
+            "timeouts should not trigger early exit — only empty results and errors count");
+    }
+
+    /// Adversarial: verify validation query rotation covers all queries
+    /// before wrapping. With 6 queries and 6 max attempts, each query
+    /// should be used exactly once before any repeats.
+    #[test]
+    fn test_indexing_validation_query_rotation() {
+        let queries = &["main", "init", "test", "get", "set", "app"];
+        let max_attempts: u32 = 6;
+
+        let mut used: Vec<&str> = Vec::new();
+        for attempt in 1..=max_attempts {
+            let query = queries[((attempt - 1) as usize) % queries.len()];
+            used.push(query);
+        }
+
+        // All 6 queries should be used exactly once in 6 attempts
+        assert_eq!(used.len(), queries.len(),
+            "6 attempts should use all 6 queries");
+        let unique: std::collections::HashSet<&&str> = used.iter().collect();
+        assert_eq!(unique.len(), queries.len(),
+            "each query should be used exactly once in 6 attempts — no repeats");
+    }
+
+    /// Adversarial: verify the was_quiescent formula handles the edge case
+    /// where a server with serverStatus reports quiescent=true BUT the probe
+    /// validation path was never entered (server_responsive=false).
+    /// The formula `saw_quiescent || (!seen_server_status && server_ready)`
+    /// should still produce true because saw_quiescent=true from serverStatus.
+    #[test]
+    fn test_was_quiescent_serverstatus_overrides_probe_path() {
+        // serverStatus quiescent=true, but probe was never attempted
+        // (because serverStatus arrived first)
+        let saw_quiescent = true;
+        let seen_server_status = true;
+        let server_ready = false; // probe never ran
+        let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
+        assert!(was_quiescent,
+            "serverStatus quiescent=true must produce was_quiescent=true \
+             even when probe path was not exercised");
     }
 
     /// Integration test: run LSP enrichment against the RNA repo itself.

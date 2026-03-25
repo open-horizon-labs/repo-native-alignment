@@ -27,129 +27,538 @@ use super::store::{
 use super::RnaHandler;
 
 impl RnaHandler {
+    /// Maximum time to wait for pre-warm to finish before falling back to
+    /// building the graph ourselves.
+    const PREWARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
     /// Ensure graph is built, check for file changes since last scan.
-    /// Returns a read guard to the graph.
-    pub(crate) async fn get_graph(&self) -> anyhow::Result<tokio::sync::RwLockReadGuard<'_, Option<GraphState>>> {
+    ///
+    /// Returns an `Arc<GraphState>` loaded via atomic pointer swap (ArcSwap).
+    /// Tool calls never block on a write lock — they always see the last
+    /// complete graph snapshot (#574).
+    pub(crate) async fn get_graph(&self) -> anyhow::Result<Arc<GraphState>> {
         // Fast path: graph exists and scan cooldown hasn't expired.
-        // We carry both the scan result AND the scanner forward so the caller
-        // can commit scanner state only after successful graph processing.
-        let pending: Option<(ScanResult, Scanner)> = {
-            let guard = self.graph.read().await;
-            if guard.is_some() {
-                let skip_scan = {
-                    let last = self.last_scan.lock().unwrap();
-                    last.elapsed() < std::time::Duration::from_secs(2)
-                };
-                if skip_scan {
-                    return Ok(guard);
-                }
+        // ArcSwap load is an atomic pointer read — zero blocking.
+        let current = self.graph.load_full();
+        if let Some(ref gs) = *current {
+            let skip_scan = {
+                let last = self.last_scan.lock().unwrap();
+                last.elapsed() < std::time::Duration::from_secs(2)
+            };
+            if skip_scan {
+                return Ok(Arc::clone(gs));
+            }
 
-                // Check for changes via scanner
-                let mut scanner = Scanner::new(self.repo_root.clone())?;
-                let scan = scanner.scan()?;
-                if scan.changed_files.is_empty()
-                    && scan.new_files.is_empty()
-                    && scan.deleted_files.is_empty()
-                {
-                    // No changes -- safe to commit state (records current mtimes)
+            // Check for changes via scanner
+            let mut scanner = Scanner::new(self.repo_root.clone())?;
+            let scan = scanner.scan()?;
+            if scan.changed_files.is_empty()
+                && scan.new_files.is_empty()
+                && scan.deleted_files.is_empty()
+            {
+                // No changes -- safe to commit state (records current mtimes)
+                scanner.commit_state()?;
+                *self.last_scan.lock().unwrap() = std::time::Instant::now();
+                return Ok(Arc::clone(gs));
+            }
+
+            // Changes detected (#574): fast tree-sitter extraction inline,
+            // then spawn full pipeline in background per ADR-001.
+            //
+            // 1. Run tree-sitter extraction (fast, <1s)
+            // 2. Apply to cloned graph, ArcSwap immediately
+            // 3. Spawn full pipeline (LSP, passes, PageRank, embed, persist) as background task
+            // 4. Return immediately with tree-sitter results
+            let _build_guard = self.graph_build_lock.lock().await;
+            // Re-check after acquiring lock — another call may have already updated.
+            let current2 = self.graph.load_full();
+            if let Some(ref gs2) = *current2 {
+                if !Arc::ptr_eq(gs, gs2) {
+                    // Graph was updated while we waited for the lock.
                     scanner.commit_state()?;
-                    // Update cooldown timestamp
                     *self.last_scan.lock().unwrap() = std::time::Instant::now();
-                    return Ok(guard);
+                    return Ok(Arc::clone(gs2));
                 }
-                // Changes detected -- carry scan + scanner forward
-                drop(guard);
-                Some((scan, scanner))
-            } else {
-                drop(guard);
-                None
             }
-        };
 
-        // Slow path: build or update graph
-        {
-            let mut guard = self.graph.write().await;
-            if guard.is_none() {
-                // If pre-warm is in progress, wait for it instead of starting
-                // a duplicate build.  Drop the write lock first so the pre-warm
-                // task can acquire it to store its result.
-                if self.prewarm_started.load(std::sync::atomic::Ordering::Relaxed) {
-                    drop(guard);
-                    tracing::info!("Waiting for pre-warm to finish...");
-                    // Poll until the graph is populated or pre-warm fails.
-                    // We cannot use Notify alone because notify_waiters() is
-                    // fire-and-forget: if the pre-warm completes before we
-                    // call .notified().await, the notification is lost and we
-                    // hang forever.  Instead, check the graph periodically and
-                    // also listen for the notification as a fast-path wake.
-                    loop {
-                        let rg = self.graph.read().await;
-                        if rg.is_some() {
-                            drop(rg);
-                            break;
-                        }
-                        drop(rg);
-                        // Wait for either the notification or a short timeout,
-                        // then re-check.  The timeout ensures we never hang
-                        // even if the notification was already sent.
-                        tokio::select! {
-                            _ = self.prewarm_notify.notified() => {}
-                            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+            // Fast path: tree-sitter extraction only (no LSP, no passes, no persist).
+            let mut fast_state = (**gs).clone();
+            let registry = ExtractorRegistry::with_builtins();
+            let primary_slug = RootConfig::code_project(self.repo_root.clone()).slug();
+
+            // Remove nodes/edges for deleted + changed files
+            let files_to_remove: Vec<PathBuf> = scan
+                .deleted_files
+                .iter()
+                .chain(scan.changed_files.iter())
+                .cloned()
+                .collect();
+            fast_state.nodes.retain(|n| !files_to_remove.contains(&n.id.file));
+            fast_state.edges.retain(|e| {
+                !files_to_remove.iter().any(|f| e.from.file == *f || e.to.file == *f)
+            });
+
+            // Extract new + changed files via tree-sitter
+            let (mut extraction, _enc_stats) = registry.extract_scan_result_with_stats(&self.repo_root, &scan);
+            for node in &mut extraction.nodes {
+                node.id.root = primary_slug.clone();
+            }
+            let file_index: std::collections::HashSet<String> = fast_state.nodes
+                .iter()
+                .chain(extraction.nodes.iter())
+                .map(|n| n.id.file.to_string_lossy().to_string())
+                .collect();
+            for edge in &mut extraction.edges {
+                edge.from.root = primary_slug.clone();
+                edge.to.root = primary_slug.clone();
+                helpers::resolve_edge_target_by_suffix(edge, &file_index);
+            }
+            fast_state.nodes.extend(extraction.nodes);
+            fast_state.edges.extend(extraction.edges);
+
+            // Rebuild petgraph index for the fast graph
+            fast_state.index = crate::graph::index::GraphIndex::new();
+            fast_state.index.rebuild_from_edges(&fast_state.edges);
+            for node in &fast_state.nodes {
+                fast_state.index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+            }
+
+            // Atomic swap: tool calls see tree-sitter results immediately
+            let fast_arc = Arc::new(fast_state);
+            self.graph.store(Arc::new(Some(Arc::clone(&fast_arc))));
+            *self.last_scan.lock().unwrap() = std::time::Instant::now();
+
+            // Spawn full pipeline in background (LSP, passes, PageRank, subsystem,
+            // embedding, LanceDB persist). When it completes, it ArcSwaps the fully
+            // enriched graph in — subsequent tool calls see the enriched version.
+            // Scanner state is committed only after the full pipeline succeeds.
+            {
+                let handler_graph = Arc::clone(&self.graph);
+                let repo_root = self.repo_root.clone();
+                let fast_arc_for_check = Arc::clone(&fast_arc);
+                let scan_stats = Arc::clone(&self.scan_stats);
+                let lance_write_lock = Arc::clone(&self.lance_write_lock);
+                let embed_index = Arc::clone(&self.embed_index);
+                let lsp_status = Arc::clone(&self.lsp_status);
+                let graph_build_lock = Arc::clone(&self.graph_build_lock);
+                // Clone the pre-fast-path graph so the full pipeline starts from
+                // the same base state (with all existing LSP edges, PageRank, etc.)
+                let base_state = (**gs).clone();
+                // Release the build lock before spawning so the background task
+                // can re-acquire it. The fast graph is already swapped in.
+                drop(_build_guard);
+                tokio::spawn(async move {
+                    tracing::info!(
+                        "Spawned background incremental pipeline: {} changed, {} new, {} deleted",
+                        scan.changed_files.len(), scan.new_files.len(), scan.deleted_files.len()
+                    );
+                    // Serialize with other graph builds to prevent concurrent pipeline runs.
+                    let _build_guard = graph_build_lock.lock().await;
+                    // Re-check: if the graph was swapped since we spawned, another pipeline
+                    // may have already processed these changes. Check by comparing with the
+                    // fast_arc we stored — if they differ, someone else updated.
+                    let current_snap = handler_graph.load_full();
+                    if let Some(ref current_gs) = *current_snap {
+                        if !Arc::ptr_eq(current_gs, &fast_arc_for_check) {
+                            // Another update happened; skip this pipeline run.
+                            tracing::info!("Background incremental pipeline: graph already updated, skipping");
+                            if let Err(e) = scanner.commit_state() {
+                                tracing::error!("Failed to commit scanner state: {}", e);
+                            }
+                            return;
                         }
                     }
-                    // Re-check: pre-warm should have populated the graph.
-                    let rg = self.graph.read().await;
-                    if rg.is_some() {
-                        drop(rg);
-                        // Fall through to cooldown + background scanner below.
-                    } else {
-                        // Pre-warm failed — build ourselves.
-                        drop(rg);
-                        let mut wg = self.graph.write().await;
-                        if wg.is_none() {
-                            *wg = Some(self.build_full_graph().await?);
+
+                    // Run the full pipeline on the base state (which has LSP edges, etc.)
+                    let mut full_state = base_state;
+                    let primary_slug = RootConfig::code_project(repo_root.clone()).slug();
+
+                    // Remove nodes/edges for deleted + changed files (same as fast path)
+                    let files_to_remove: Vec<PathBuf> = scan
+                        .deleted_files
+                        .iter()
+                        .chain(scan.changed_files.iter())
+                        .cloned()
+                        .collect();
+                    let deleted_edge_ids: Vec<String> = full_state.edges
+                        .iter()
+                        .filter(|e| files_to_remove.iter().any(|f| e.from.file == *f || e.to.file == *f))
+                        .map(|e| e.stable_id())
+                        .collect();
+                    full_state.nodes.retain(|n| !files_to_remove.contains(&n.id.file));
+                    full_state.edges.retain(|e| {
+                        !files_to_remove.iter().any(|f| e.from.file == *f || e.to.file == *f)
+                    });
+
+                    // Extract new + changed files
+                    let registry = ExtractorRegistry::with_builtins();
+                    let (mut extraction, enc_stats) = registry.extract_scan_result_with_stats(&repo_root, &scan);
+                    if let Ok(mut stats) = scan_stats.write() {
+                        stats.merge_encoding_stats(&primary_slug, &enc_stats);
+                    }
+                    for node in &mut extraction.nodes {
+                        node.id.root = primary_slug.clone();
+                    }
+                    let file_index: std::collections::HashSet<String> = full_state.nodes
+                        .iter()
+                        .chain(extraction.nodes.iter())
+                        .map(|n| n.id.file.to_string_lossy().to_string())
+                        .collect();
+                    for edge in &mut extraction.edges {
+                        edge.from.root = primary_slug.clone();
+                        edge.to.root = primary_slug.clone();
+                        super::helpers::resolve_edge_target_by_suffix(edge, &file_index);
+                    }
+
+                    let mut upsert_node_ids: std::collections::HashSet<String> =
+                        extraction.nodes.iter().map(|n| n.stable_id()).collect();
+                    let mut upsert_edges: Vec<Edge> = extraction.edges.clone();
+                    full_state.nodes.extend(extraction.nodes);
+                    full_state.edges.extend(extraction.edges);
+
+                    // Snapshot before passes for delta tracking
+                    let node_ids_before_passes: std::collections::HashSet<String> =
+                        full_state.nodes.iter().map(|n| n.stable_id()).collect();
+                    let edge_ids_before_passes: std::collections::HashSet<String> =
+                        full_state.edges.iter().map(|e| e.stable_id()).collect();
+
+                    // Pre-clean: remove stale virtual nodes before passes
+                    let stale_virtual_files: Vec<std::path::PathBuf> = full_state.nodes
+                        .iter()
+                        .filter(|n| matches!(&n.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")))
+                        .map(|n| n.id.file.clone())
+                        .collect();
+                    full_state.nodes.retain(|n| !matches!(&n.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")));
+                    full_state.edges.retain(|e| {
+                        !matches!(&e.to.kind, NodeKind::Other(s) if s == "subsystem")
+                            && e.kind != crate::graph::EdgeKind::UsesFramework
+                            && e.kind != crate::graph::EdgeKind::Produces
+                            && e.kind != crate::graph::EdgeKind::Consumes
+                    });
+                    let mut files_to_remove_all: Vec<PathBuf> = files_to_remove;
+                    files_to_remove_all.extend(stale_virtual_files);
+
+                    // Run enrichment pipeline via EventBus (LSP, passes, framework detection)
+                    let root_pairs: Vec<(String, std::path::PathBuf)> = WorkspaceConfig::load()
+                        .with_primary_root(repo_root.clone())
+                        .with_worktrees(&repo_root)
+                        .with_declared_roots(&repo_root)
+                        .resolved_roots()
+                        .iter()
+                        .map(|r| (r.slug.clone(), r.path.clone()))
+                        .collect();
+                    {
+                        lsp_status.set_running();
+                        let dirty_slugs: Option<std::collections::HashSet<String>> =
+                            Some(std::iter::once(primary_slug.clone()).collect());
+                        match crate::extract::consumers::emit_enrichment_pipeline(
+                            std::mem::take(&mut full_state.nodes),
+                            std::mem::take(&mut full_state.edges),
+                            root_pairs,
+                            primary_slug.clone(),
+                            repo_root.clone(),
+                            crate::extract::consumers::BusOptions {
+                                scan_stats: Some(Arc::clone(&scan_stats)),
+                                embed_idx: None,
+                                lance_repo_root: None,
+                                skip_lsp: false, // incremental background path: LSP runs inline
+                            },
+                            dirty_slugs,
+                        ).await {
+                            Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
+                                full_state.nodes = enriched_nodes;
+                                full_state.edges = enriched_edges;
+                                full_state.detected_frameworks = detected_frameworks;
+
+                                // Update LSP status
+                                let lsp_edge_count = full_state.edges.iter()
+                                    .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
+                                    .count();
+                                let lsp_call_edge_count = full_state.edges.iter()
+                                    .filter(|e| {
+                                        e.source == crate::graph::ExtractionSource::Lsp
+                                            && matches!(e.kind, crate::graph::EdgeKind::Calls)
+                                    })
+                                    .count();
+                                if lsp_edge_count > 0 {
+                                    lsp_status.set_complete(lsp_call_edge_count);
+                                } else {
+                                    lsp_status.set_unavailable();
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Background incremental pipeline: enrichment failed: {:#}", e
+                                );
+                                if let Err(e) = scanner.commit_state() {
+                                    tracing::error!("Failed to commit scanner state: {}", e);
+                                }
+                                return;
+                            }
                         }
                     }
-                } else {
-                    // No pre-warm in progress — build from scratch.
-                    *guard = Some(self.build_full_graph().await?);
+
+                    // Auto-collect delta from passes
+                    for n in &full_state.nodes {
+                        let sid = n.stable_id();
+                        if !node_ids_before_passes.contains(&sid) {
+                            upsert_node_ids.insert(sid);
+                        }
+                    }
+                    for e in &full_state.edges {
+                        let sid = e.stable_id();
+                        if !edge_ids_before_passes.contains(&sid) {
+                            upsert_edges.push(e.clone());
+                        }
+                    }
+
+                    // Dedup
+                    {
+                        let mut seen_nodes = std::collections::HashSet::new();
+                        full_state.nodes.reverse();
+                        full_state.nodes.retain(|n| seen_nodes.insert(n.stable_id()));
+                        full_state.nodes.reverse();
+                        let mut seen_edges = std::collections::HashSet::new();
+                        full_state.edges.retain(|e| seen_edges.insert(e.stable_id()));
+                    }
+
+                    // Rebuild index
+                    full_state.index = GraphIndex::new();
+                    full_state.index.rebuild_from_edges(&full_state.edges);
+                    for node in &full_state.nodes {
+                        full_state.index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+                    }
+
+                    // PageRank
+                    let pagerank_scores = full_state.index.compute_pagerank(0.85, 20);
+                    for node in &mut full_state.nodes {
+                        if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
+                            node.metadata.insert("importance".to_string(), format!("{:.6}", score));
+                        }
+                    }
+
+                    // Subsystem detection
+                    {
+                        let node_file_map: std::collections::HashMap<String, String> = full_state.nodes
+                            .iter()
+                            .filter(|n| n.id.root != "external")
+                            .map(|n| (n.stable_id(), n.id.file.display().to_string()))
+                            .collect();
+                        let mut subsystems = full_state.index.detect_communities(&pagerank_scores, &node_file_map);
+                        {
+                            let mut name_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                            for s in &subsystems { *name_counts.entry(s.name.clone()).or_default() += 1; }
+                            for s in &mut subsystems {
+                                if name_counts.get(&s.name).copied().unwrap_or(0) > 1
+                                    && let Some(iface) = s.interfaces.first() {
+                                        let short = iface.node_id.split(':').rev().nth(1).unwrap_or(&iface.node_id);
+                                        s.name = format!("{}/{}", s.name, short);
+                                    }
+                            }
+                        }
+                        let mut node_subsystem: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                        for subsystem in &subsystems {
+                            for member_id in &subsystem.member_ids {
+                                node_subsystem.insert(member_id.clone(), subsystem.name.clone());
+                            }
+                        }
+                        for node in &mut full_state.nodes {
+                            let sid = node.stable_id();
+                            let old_sub = node.metadata.get(SUBSYSTEM_KEY).cloned();
+                            let new_sub = node_subsystem.get(&sid).cloned();
+                            if old_sub != new_sub {
+                                match new_sub {
+                                    Some(name) => { node.metadata.insert(SUBSYSTEM_KEY.to_owned(), name); }
+                                    None => { node.metadata.remove(SUBSYSTEM_KEY); }
+                                }
+                                upsert_node_ids.insert(sid);
+                            }
+                        }
+
+                        // Subsystem node promotion via bus
+                        let node_ids_before_group2: std::collections::HashSet<String> =
+                            full_state.nodes.iter().map(|n| n.stable_id()).collect();
+                        let edge_ids_before_group2: std::collections::HashSet<String> =
+                            full_state.edges.iter().map(|e| e.stable_id()).collect();
+                        let (sub_added_nodes, sub_added_edges) =
+                            crate::extract::consumers::emit_community_detection(
+                                primary_slug.clone(),
+                                subsystems,
+                                full_state.nodes.clone(),
+                            ).await.unwrap_or_else(|e| {
+                                tracing::warn!("Background incremental: subsystem promotion failed (non-fatal): {}", e);
+                                (vec![], vec![])
+                            });
+                        if !sub_added_nodes.is_empty() || !sub_added_edges.is_empty() {
+                            full_state.nodes.extend(sub_added_nodes);
+                            full_state.edges.extend(sub_added_edges);
+                        }
+                        for n in &full_state.nodes {
+                            let sid = n.stable_id();
+                            if !node_ids_before_group2.contains(&sid) { upsert_node_ids.insert(sid); }
+                        }
+                        for e in &full_state.edges {
+                            let sid = e.stable_id();
+                            if !edge_ids_before_group2.contains(&sid) { upsert_edges.push(e.clone()); }
+                        }
+                    }
+
+                    // Update index for virtual nodes
+                    for node in &full_state.nodes {
+                        if matches!(&node.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+                            full_state.index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+                        }
+                    }
+                    for edge in &full_state.edges {
+                        if matches!(&edge.to.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+                            full_state.index.add_edge(
+                                &edge.from.to_stable_id(), &edge.from.kind.to_string(),
+                                &edge.to.to_stable_id(), &edge.to.kind.to_string(),
+                                edge.kind.clone(),
+                            );
+                        }
+                    }
+
+                    // Re-embed changed-file symbols
+                    let changed_files: std::collections::HashSet<_> = scan.changed_files
+                        .iter().chain(scan.new_files.iter()).collect();
+                    let embed_guard = embed_index.load();
+                    if let Some(ref embed_idx) = **embed_guard {
+                        let changed_file_nodes: Vec<_> = full_state.nodes
+                            .iter()
+                            .filter(|n| changed_files.iter().any(|f| n.id.file == **f))
+                            .cloned()
+                            .collect();
+                        if let Err(e) = embed_idx.reindex_nodes(&changed_file_nodes).await {
+                            tracing::warn!("Background incremental: re-embed failed: {}", e);
+                            if let Err(e2) = embed_idx.index_all_with_symbols(&repo_root, &full_state.nodes).await {
+                                tracing::warn!("Background incremental: full embed rebuild also failed: {}", e2);
+                            }
+                        }
+                    }
+
+                    // Build upsert data with post-PageRank importance scores
+                    let upsert_nodes: Vec<Node> = full_state.nodes
+                        .iter()
+                        .filter(|n| upsert_node_ids.contains(&n.stable_id()))
+                        .cloned()
+                        .collect();
+
+                    // Persist to LanceDB
+                    let persist_result = {
+                        let _lance_guard = lance_write_lock.lock().await;
+                        persist_graph_incremental(
+                            &repo_root, &upsert_nodes, &upsert_edges,
+                            &deleted_edge_ids, &files_to_remove_all,
+                        ).await
+                    };
+                    let persist_ok = match persist_result {
+                        Ok(true) => {
+                            let _lance_guard = lance_write_lock.lock().await;
+                            match persist_graph_to_lance(&repo_root, &full_state.nodes, &full_state.edges).await {
+                                Ok(()) => true,
+                                Err(e) => { tracing::error!("Full persist after migration failed: {:#}", e); false }
+                            }
+                        }
+                        Ok(false) => true,
+                        Err(e) => { tracing::error!("Incremental persist failed: {:#}", e); false }
+                    };
+
+                    if persist_ok {
+                        if let Err(e) = scanner.commit_state() {
+                            tracing::error!("Failed to commit scanner state: {}", e);
+                        }
+                    }
+
+                    full_state.last_scan_completed_at = Some(std::time::Instant::now());
+
+                    // Atomic swap: publish the fully enriched graph
+                    handler_graph.store(Arc::new(Some(Arc::new(full_state))));
+                    tracing::info!("Background incremental pipeline complete -- enriched graph swapped in");
+                });
+            }
+
+            // Start background scanner (once) to keep index warm
+            if !self.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                self.spawn_background_scanner();
+            }
+            return Ok(fast_arc);
+        }
+
+        // Slow path: no graph exists yet.
+        // If pre-warm is in progress, wait for it instead of building a duplicate.
+        if self.prewarm_started.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!("Waiting for pre-warm to finish...");
+            let prewarm_deadline = tokio::time::Instant::now() + Self::PREWARM_TIMEOUT;
+            loop {
+                let snap = self.graph.load_full();
+                if snap.is_some() {
+                    break;
                 }
-            } else {
-                // Incremental update -- pass the already-completed scan so we
-                // don't re-scan. Scanner state is committed only after success.
-                let (scan, scanner) = match pending {
-                    Some(p) => (Some(p.0), Some(p.1)),
-                    None => (None, None),
-                };
-                let graph = guard.as_mut().unwrap();
-                self.update_graph_with_scan(graph, scan, true).await?;
-                // Graph update succeeded -- now persist scanner state
-                if let Some(scanner) = scanner {
-                    scanner.commit_state()?;
+                if tokio::time::Instant::now() >= prewarm_deadline {
+                    tracing::warn!(
+                        "Pre-warm did not finish within {}s — building graph ourselves",
+                        Self::PREWARM_TIMEOUT.as_secs()
+                    );
+                    break;
                 }
+                tokio::select! {
+                    _ = self.prewarm_notify.notified() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                }
+            }
+            // Re-check after waiting.
+            let snap = self.graph.load_full();
+            if let Some(ref gs) = *snap {
+                *self.last_scan.lock().unwrap() = std::time::Instant::now();
+                if !self.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    self.spawn_background_scanner();
+                }
+                return Ok(Arc::clone(gs));
             }
         }
 
-        // Update cooldown timestamp
-        *self.last_scan.lock().unwrap() = std::time::Instant::now();
-
-        // Start background scanner (once) to keep index warm
-        if !self.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            self.spawn_background_scanner();
+        // Build from scratch, serialized to prevent duplicate builds.
+        let _build_guard = self.graph_build_lock.lock().await;
+        // Re-check: another call may have built it while we waited.
+        let snap = self.graph.load_full();
+        if let Some(ref gs) = *snap {
+            *self.last_scan.lock().unwrap() = std::time::Instant::now();
+            if !self.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                self.spawn_background_scanner();
+            }
+            return Ok(Arc::clone(gs));
         }
 
-        // Downgrade to read lock
-        Ok(self.graph.read().await)
+        self.graph_build_status.set_building(0);
+        match self.build_full_graph().await {
+            Ok(new_state) => {
+                let new_arc = Arc::new(new_state);
+                self.graph.store(Arc::new(Some(Arc::clone(&new_arc))));
+                *self.last_scan.lock().unwrap() = std::time::Instant::now();
+                self.graph_build_status.set_ready();
+                if !self.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    self.spawn_background_scanner();
+                }
+                Ok(new_arc)
+            }
+            Err(e) => {
+                self.graph_build_status.set_failed(format!("{}", e));
+                Err(e)
+            }
+        }
     }
 
     /// Build the full graph from scratch. This is the original get_graph logic.
     ///
-    /// When `spawn_background` is true (default for MCP server), embedding is
-    /// spawned as a background task so the graph is queryable immediately.
-    /// LSP enrichment now runs synchronously via `LspConsumer` in the event bus
-    /// (`emit_enrichment_pipeline`), so it completes before this function returns.
-    /// When false (used by `run_pipeline_foreground`), no background tasks are
-    /// spawned -- the caller handles embed itself.
+    /// When `spawn_background` is true (default for MCP server), LSP enrichment
+    /// and embedding are spawned as background tasks so the graph is queryable
+    /// immediately with tree-sitter + non-LSP pass results (#574). The background
+    /// LSP task runs `emit_enrichment_pipeline` with LSP enabled, then ArcSwaps
+    /// the fully enriched graph when complete (restoring v0.1.14 behavior).
+    ///
+    /// When false (used by `run_pipeline_foreground`), LSP runs inline via the
+    /// event bus and no background tasks are spawned -- the caller handles embed.
     pub async fn build_full_graph(&self) -> anyhow::Result<GraphState> {
         self.build_full_graph_inner(true).await
     }
@@ -349,6 +758,13 @@ impl RnaHandler {
             scanners.push((root_slug.clone(), scanner, scan_result, root_path.clone(), root_has_changes));
         }
 
+        {
+            let total_files: usize = scanners.iter()
+                .map(|(_, _, scan, _, _)| scan.new_files.len() + scan.changed_files.len())
+                .sum();
+            self.graph_build_status.set_building(total_files);
+        }
+
         // 2. If no changes anywhere, try loading full graph from LanceDB
         if !any_root_changed {
             match load_graph_from_lance(&self.repo_root).await {
@@ -412,13 +828,13 @@ impl RnaHandler {
                         }
                     }
 
-                    // No changes detected -- safe to commit scanner state
                     for (_slug, scanner, _scan, _path, _changed) in &scanners {
                         if let Err(e) = scanner.commit_state() {
                             tracing::error!("Failed to commit scanner state: {}", e);
                         }
                     }
 
+                    self.graph_build_status.set_ready();
                     return Ok(state);
                 }
                 Err(e) => {
@@ -666,6 +1082,8 @@ impl RnaHandler {
         // uses the embed index created just below), and LanceDB persist runs after PageRank
         // + subsystem detection so the stored data is complete. Using real consumers here
         // would either duplicate work (embed) or persist an incomplete graph (lance).
+        // Clone dirty slugs for the background LSP task before they're consumed by the bus.
+        let dirty_slugs_for_lsp = freshly_extracted_slugs.clone();
         {
             // Mark LSP as running before the bus call so status is visible immediately.
             if spawn_background {
@@ -701,6 +1119,7 @@ impl RnaHandler {
                         scan_stats: Some(Arc::clone(&self.scan_stats)),
                         embed_idx: None, // embed handled by spawn_background_enrichment after graph is ready
                         lance_repo_root: None, // LanceDB persist handled directly after PageRank/subsystem passes
+                        skip_lsp: spawn_background, // #574: MCP server path skips LSP here, spawns it in background
                     },
                     dirty_slugs,
                 ).await?;
@@ -708,13 +1127,10 @@ impl RnaHandler {
             all_edges = enriched_edges;
             all_detected_frameworks = detected_frameworks;
 
-            // Count LSP edges added by LspConsumer during bus execution.
-            // These are ExtractionSource::Lsp edges in all_edges.
-            // Use only LSP-sourced edges to drive the status: non-LSP Calls edges
-            // (e.g. from GrpcClientCallsPass) must not falsely mark LSP as complete,
-            // and a metadata-only enrichment (updated_nodes, no new edges) must not
-            // report as unavailable.
-            if spawn_background {
+            // When skip_lsp=true (spawn_background path), LSP didn't run yet.
+            // LSP status stays "running" — the background LSP task will update it.
+            // When skip_lsp=false (CLI path), check LSP edges now.
+            if !spawn_background {
                 let lsp_edge_count = all_edges.iter()
                     .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
                     .count();
@@ -731,8 +1147,6 @@ impl RnaHandler {
                         lsp_call_edge_count, lsp_edge_count,
                     );
                 } else {
-                    // No LSP edges — either no server available or no enrichable nodes.
-                    // Mark as unavailable so the status shows "no server" not "running".
                     self.lsp_status.set_unavailable();
                 }
             }
@@ -923,11 +1337,9 @@ impl RnaHandler {
         // Persisting here would write only tree-sitter edges, and a subsequent
         // `repo-map` loading from LanceDB cache would miss LSP edges (#311).
         if spawn_background {
-            // Phase 3 (issue #520): LSP enrichment now runs synchronously inside
-            // `emit_enrichment_pipeline` (via `LspConsumer` + `AllEnrichmentsGate`).
-            // The graph already contains LSP edges at this point, so we can write
-            // both sentinels in one persist rather than clearing+rewriting.
-            // We no longer need to clear the LSP sentinel here since LSP ran before persist.
+            // #574: LSP enrichment is deferred to background. The graph here contains
+            // tree-sitter + non-LSP passes only. Persist now so the graph is queryable,
+            // then the background LSP task will re-persist with LSP edges.
 
             let _lance_guard = self.lance_write_lock.lock().await;
             if let Err(e) = persist_graph_to_lance(&self.repo_root, &all_nodes, &all_edges).await {
@@ -935,25 +1347,11 @@ impl RnaHandler {
                 return Err(e.context("LanceDB full persist failed during graph build"));
             }
 
-            // Write both sentinels inside the lock: LSP enrichment already completed
-            // above (synchronously via bus), so the persisted graph includes LSP edges.
-            // Writing the LSP sentinel here avoids a subsequent startup re-running LSP
-            // on an already-enriched graph (#477).
+            // Write extraction sentinel but NOT the LSP sentinel — LSP hasn't run yet.
+            // The background LSP task will write the LSP sentinel after enrichment.
             super::sentinel::write_extract_sentinel(&self.repo_root, all_nodes.len(), all_edges.len());
-            // Write or clear the LSP sentinel depending on whether LSP produced edges.
-            // If LSP ran but produced no edges (no server, no supported language, empty result),
-            // we must clear any stale sentinel left from a previous run. A stale sentinel would
-            // cause the next startup to skip LSP enrichment even though the persisted graph is
-            // tree-sitter-only, which would hide the "no server" situation.
-            let has_lsp_edges = all_edges.iter()
-                .any(|e| e.source == crate::graph::ExtractionSource::Lsp);
-            if has_lsp_edges {
-                super::sentinel::write_lsp_sentinel(&self.repo_root, all_nodes.len(), all_edges.len());
-            } else {
-                // No LSP data in this build — clear the old sentinel so the next startup
-                // knows to re-run LSP enrichment rather than trusting stale data.
-                super::sentinel::clear_lsp_sentinel(&self.repo_root);
-            }
+            // Clear any stale LSP sentinel so the next startup knows LSP is pending.
+            super::sentinel::clear_lsp_sentinel(&self.repo_root);
             drop(_lance_guard);
 
             // Post-persist sanity check: if any new roots were detected, verify they
@@ -1001,7 +1399,8 @@ impl RnaHandler {
         }
 
         // Graph is ready -- return immediately so agents can query.
-        // LSP enrichment already ran synchronously via LspConsumer in the bus above (#520).
+        // When spawn_background=true: LSP enrichment is deferred to background (#574).
+        // When spawn_background=false: LSP already ran inline via the bus.
         // Embedding runs in the background task below.
         let symbols_ready_at = std::time::Instant::now();
 
@@ -1020,19 +1419,29 @@ impl RnaHandler {
         };
 
         if spawn_background {
+            // #574: spawn background LSP enrichment (restores v0.1.14 pattern).
+            // The graph returned below has tree-sitter + non-LSP passes only.
+            // This task runs LSP, re-computes PageRank/subsystems, and ArcSwaps.
+            self.spawn_background_lsp_enrichment(
+                all_nodes.clone(),
+                all_edges.clone(),
+                dirty_slugs_for_lsp,
+                all_detected_frameworks.clone(),
+            );
+
             let handle = self.spawn_background_enrichment(&all_nodes);
             // Store the handle so CLI callers can await it before the runtime
             // shuts down, preventing JoinError::Cancelled panics (#560).
             *self.embed_handle.lock().await = Some(handle);
         }
 
-        Ok(GraphState {
-            nodes: all_nodes,
-            edges: all_edges,
+        Ok(GraphState::new(
+            all_nodes,
+            all_edges,
             index,
-            last_scan_completed_at: Some(symbols_ready_at),
-            detected_frameworks: all_detected_frameworks,
-        })
+            Some(symbols_ready_at),
+            all_detected_frameworks,
+        ))
     }
 
     /// Incrementally update the graph, accepting an optional pre-computed scan.
@@ -1081,8 +1490,9 @@ impl RnaHandler {
 
         let registry = ExtractorRegistry::with_builtins();
 
-        // Remove nodes/edges for deleted + changed files
-        let mut files_to_remove: Vec<PathBuf> = scan
+        // Remove nodes/edges for deleted + changed files.
+        // HashSet for O(1) lookup instead of O(F) Vec scan per edge (#586).
+        let mut files_to_remove: std::collections::HashSet<PathBuf> = scan
             .deleted_files
             .iter()
             .chain(scan.changed_files.iter())
@@ -1095,9 +1505,8 @@ impl RnaHandler {
             .edges
             .iter()
             .filter(|e| {
-                files_to_remove
-                    .iter()
-                    .any(|f| e.from.file == *f || e.to.file == *f)
+                files_to_remove.contains(&e.from.file)
+                    || files_to_remove.contains(&e.to.file)
             })
             .map(|e| e.stable_id())
             .collect();
@@ -1106,9 +1515,8 @@ impl RnaHandler {
             .nodes
             .retain(|n| !files_to_remove.contains(&n.id.file));
         graph.edges.retain(|e| {
-            !files_to_remove
-                .iter()
-                .any(|f| e.from.file == *f || e.to.file == *f)
+            !files_to_remove.contains(&e.from.file)
+                && !files_to_remove.contains(&e.to.file)
         });
 
         // Extract new + changed files
@@ -1226,6 +1634,7 @@ impl RnaHandler {
                         scan_stats: Some(Arc::clone(&self.scan_stats)),
                         embed_idx: None, // embed handled below via targeted reindex_nodes after PageRank
                         lance_repo_root: None, // LanceDB persist handled below via persist_graph_incremental
+                        skip_lsp: false, // update_graph_with_scan: LSP runs inline (already incremental)
                     },
                     dirty_slugs,
                 ).await.map_err(|e| {
@@ -1475,12 +1884,13 @@ impl RnaHandler {
         // failure, so the next scan re-detects and retries the persist.
         let persist_result = {
             let _lance_guard = self.lance_write_lock.lock().await;
+            let files_to_remove_vec: Vec<PathBuf> = files_to_remove.into_iter().collect();
             persist_graph_incremental(
                 &self.repo_root,
                 &upsert_nodes,
                 &upsert_edges,
                 &deleted_edge_ids,
-                &files_to_remove,
+                &files_to_remove_vec,
             )
             .await
         };
