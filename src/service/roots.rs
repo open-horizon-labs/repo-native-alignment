@@ -522,13 +522,7 @@ mod tests {
     fn make_test_graph_state(nodes: Vec<Node>, edges: Vec<Edge>) -> crate::server::state::GraphState {
         use crate::graph::index::GraphIndex;
         let index = GraphIndex::new();
-        crate::server::state::GraphState {
-            nodes,
-            edges,
-            index,
-            last_scan_completed_at: None,
-            detected_frameworks: std::collections::HashSet::new(),
-        }
+        crate::server::state::GraphState::new(nodes, edges, index, None, std::collections::HashSet::new())
     }
 
     /// With graph_state provided, per-root symbol and edge counts appear.

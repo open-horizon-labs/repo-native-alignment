@@ -1314,20 +1314,20 @@ impl RnaHandler {
         ));
 
         // Store graph state atomically so it is available for queries during embed+LSP.
-        self.graph.store(Arc::new(Some(Arc::new(GraphState {
-            nodes: graph_state.nodes.clone(),
-            edges: graph_state.edges.clone(),
-            index: {
-                let mut idx = crate::graph::index::GraphIndex::new();
-                idx.rebuild_from_edges(&graph_state.edges);
-                for node in &graph_state.nodes {
-                    idx.ensure_node(&node.stable_id(), &node.id.kind.to_string());
-                }
-                idx
-            },
-            last_scan_completed_at: graph_state.last_scan_completed_at,
-            detected_frameworks: graph_state.detected_frameworks.clone(),
-        }))));
+        {
+            let mut idx = crate::graph::index::GraphIndex::new();
+            idx.rebuild_from_edges(&graph_state.edges);
+            for node in &graph_state.nodes {
+                idx.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+            }
+            self.graph.store(Arc::new(Some(Arc::new(GraphState::new(
+                graph_state.nodes.clone(),
+                graph_state.edges.clone(),
+                idx,
+                graph_state.last_scan_completed_at,
+                graph_state.detected_frameworks.clone(),
+            )))));
+        }
 
         // Phase 2: Embed + LSP enrichment (parallel -- they use independent data stores)
         let embeddable_nodes: Vec<Node> = graph_state.nodes.iter()

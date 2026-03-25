@@ -1738,13 +1738,13 @@ mod tests {
         let graph: Arc<ArcSwap<Option<Arc<GraphState>>>> = Arc::new(ArcSwap::from_pointee(None));
 
         // Store initial graph with 2 nodes.
-        let mut initial = GraphState {
-            nodes: vec![],
-            edges: vec![],
-            index: crate::graph::index::GraphIndex::new(),
-            last_scan_completed_at: None,
-            detected_frameworks: std::collections::HashSet::new(),
-        };
+        let mut initial = GraphState::new(
+            vec![],
+            vec![],
+            crate::graph::index::GraphIndex::new(),
+            None,
+            std::collections::HashSet::new(),
+        );
         for name in &["alpha", "beta"] {
             initial.nodes.push(crate::graph::Node {
                 id: crate::graph::NodeId {
