@@ -135,14 +135,23 @@ impl RnaHandler {
             return Ok(Arc::clone(gs));
         }
 
-        let new_state = self.build_full_graph().await?;
-        let new_arc = Arc::new(new_state);
-        self.graph.store(Arc::new(Some(Arc::clone(&new_arc))));
-        *self.last_scan.lock().unwrap() = std::time::Instant::now();
-        if !self.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            self.spawn_background_scanner();
+        self.graph_build_status.set_building(0);
+        match self.build_full_graph().await {
+            Ok(new_state) => {
+                let new_arc = Arc::new(new_state);
+                self.graph.store(Arc::new(Some(Arc::clone(&new_arc))));
+                *self.last_scan.lock().unwrap() = std::time::Instant::now();
+                self.graph_build_status.set_ready();
+                if !self.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    self.spawn_background_scanner();
+                }
+                Ok(new_arc)
+            }
+            Err(e) => {
+                self.graph_build_status.set_failed(format!("{}", e));
+                Err(e)
+            }
         }
-        Ok(new_arc)
     }
 
     /// Build the full graph from scratch. This is the original get_graph logic.
@@ -352,6 +361,13 @@ impl RnaHandler {
             scanners.push((root_slug.clone(), scanner, scan_result, root_path.clone(), root_has_changes));
         }
 
+        {
+            let total_files: usize = scanners.iter()
+                .map(|(_, _, scan, _, _)| scan.new_files.len() + scan.changed_files.len())
+                .sum();
+            self.graph_build_status.set_building(total_files);
+        }
+
         // 2. If no changes anywhere, try loading full graph from LanceDB
         if !any_root_changed {
             match load_graph_from_lance(&self.repo_root).await {
@@ -415,13 +431,13 @@ impl RnaHandler {
                         }
                     }
 
-                    // No changes detected -- safe to commit scanner state
                     for (_slug, scanner, _scan, _path, _changed) in &scanners {
                         if let Err(e) = scanner.commit_state() {
                             tracing::error!("Failed to commit scanner state: {}", e);
                         }
                     }
 
+                    self.graph_build_status.set_ready();
                     return Ok(state);
                 }
                 Err(e) => {
