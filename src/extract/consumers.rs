@@ -1334,6 +1334,9 @@ impl ExtractionConsumer for LspConsumer {
 pub struct AllEnrichmentsGate {
     /// Shared state protected by a Mutex — on_event is &self but needs mutation.
     state: Mutex<GateState>,
+    /// When true, LSP consumers are skipped (#574) — force expected=0 so the gate
+    /// emits AllEnrichmentsDone immediately on RootExtracted.
+    skip_lsp: bool,
 }
 
 struct GateState {
@@ -1372,6 +1375,26 @@ impl AllEnrichmentsGate {
                 updated_nodes: Vec::new(),
                 fired: false,
             }),
+            skip_lsp: false,
+        }
+    }
+
+    /// Create a gate that skips LSP — forces expected=0 so AllEnrichmentsDone
+    /// fires immediately. Used when LSP is deferred to background (#574).
+    pub fn with_skip_lsp() -> Self {
+        Self {
+            state: Mutex::new(GateState {
+                expected: 0,
+                received: 0,
+                base_nodes: None,
+                base_edges: None,
+                slug: None,
+                lsp_edges: Vec::new(),
+                lsp_nodes: Vec::new(),
+                updated_nodes: Vec::new(),
+                fired: false,
+            }),
+            skip_lsp: true,
         }
     }
 }
@@ -1427,7 +1450,12 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                 // never produce EnrichmentComplete, so we must not count them.
                 let supported = crate::extract::EnricherRegistry::with_builtins()
                     .supported_languages();
-                let expected = {
+                let expected = if self.skip_lsp {
+                    // #574: LSP consumers are not registered — no EnrichmentComplete
+                    // events will arrive. Force expected=0 so we emit AllEnrichmentsDone
+                    // immediately, allowing non-LSP passes to run without waiting.
+                    0
+                } else {
                     let mut seen = std::collections::HashSet::new();
                     for n in nodes.iter() {
                         if !n.language.is_empty() && supported.contains(&n.language) {
@@ -1884,6 +1912,10 @@ pub struct BusOptions {
     pub embed_idx: Option<Arc<crate::embed::EmbeddingIndex>>,
     /// When `Some`, `LanceDBConsumer` fires a background persist on `PassesComplete`.
     pub lance_repo_root: Option<Arc<PathBuf>>,
+    /// When `true`, `LspConsumer` instances are NOT registered in the bus.
+    /// This allows the enrichment pipeline to run non-LSP passes only (fast path),
+    /// with LSP enrichment deferred to a background task (#574).
+    pub skip_lsp: bool,
 }
 
 /// Build an `EventBus` pre-loaded with all built-in consumers.
@@ -1927,7 +1959,7 @@ pub fn build_builtin_bus(
     repo_root: PathBuf,
     opts: BusOptions,
 ) -> (crate::extract::event_bus::EventBus, Arc<RwLock<ScanStats>>) {
-    let BusOptions { scan_stats, embed_idx, lance_repo_root } = opts;
+    let BusOptions { scan_stats, embed_idx, lance_repo_root, skip_lsp } = opts;
     use crate::extract::event_bus::EventBus;
 
     let mut bus = EventBus::new();
@@ -1949,7 +1981,13 @@ pub fn build_builtin_bus(
     // AllEnrichmentsGate: must subscribe to RootExtracted BEFORE LspConsumers
     // fire so it captures the language count before any EnrichmentComplete arrives.
     // Registration order matches subscription order in the sync bus.
-    bus.register(Box::new(AllEnrichmentsGate::new()));
+    // When skip_lsp=true (#574), the gate forces expected=0 so AllEnrichmentsDone
+    // fires immediately without waiting for EnrichmentComplete events.
+    bus.register(Box::new(if skip_lsp {
+        AllEnrichmentsGate::with_skip_lsp()
+    } else {
+        AllEnrichmentsGate::new()
+    }));
 
     // OpenApi, gRPC, Embedding — subscribe to RootExtracted independently.
     bus.register(Box::new(OpenApiConsumer));
@@ -1965,33 +2003,40 @@ pub fn build_builtin_bus(
     // Per the ADR: "ALL fire concurrently, one per language."
     // Currently sequential in the sync bus; Phase 4 promotes to async parallel.
     //
-    // Build the enricher registry once and extract individual enrichers per language.
-    // Each `LspConsumer` owns an `Arc<dyn Enricher>` so it doesn't re-instantiate.
-    let enricher_registry = crate::extract::EnricherRegistry::with_builtins();
-    let lsp_roots: Arc<Vec<(String, PathBuf)>> = Arc::new(root_pairs.clone());
+    // When `skip_lsp=true` (#574), LspConsumers are omitted entirely so the bus
+    // completes without waiting for LSP servers. The caller spawns LSP enrichment
+    // in background and ArcSwaps the enriched graph when it finishes.
+    if !skip_lsp {
+        // Build the enricher registry once and extract individual enrichers per language.
+        // Each `LspConsumer` owns an `Arc<dyn Enricher>` so it doesn't re-instantiate.
+        let enricher_registry = crate::extract::EnricherRegistry::with_builtins();
+        let lsp_roots: Arc<Vec<(String, PathBuf)>> = Arc::new(root_pairs.clone());
 
-    // Build enrichers indexed by language for O(1) lookup.
-    // EnricherRegistry does not expose individual enrichers, so we rebuild
-    // per-language enrichers via LspEnricher::new (same as EnricherRegistry internals).
-    // This avoids exposing registry internals and keeps consumers self-contained.
-    let mut supported_languages: Vec<String> = enricher_registry
-        .supported_languages()
-        .into_iter()
-        .collect();
-    supported_languages.sort(); // deterministic registration order
+        // Build enrichers indexed by language for O(1) lookup.
+        // EnricherRegistry does not expose individual enrichers, so we rebuild
+        // per-language enrichers via LspEnricher::new (same as EnricherRegistry internals).
+        // This avoids exposing registry internals and keeps consumers self-contained.
+        let mut supported_languages: Vec<String> = enricher_registry
+            .supported_languages()
+            .into_iter()
+            .collect();
+        supported_languages.sort(); // deterministic registration order
 
-    for lang in &supported_languages {
-        // Build a single-language enricher for this consumer.
-        // The enricher is the same type as what EnricherRegistry uses internally.
-        // We use `EnricherRegistry::with_builtins()` filtered to this language
-        // rather than duplicating the language-server config table.
-        let single_lang_enricher = build_single_language_enricher(lang);
-        bus.register(Box::new(LspConsumer {
-            language: lang.clone(),
-            enricher: single_lang_enricher,
-            repo_root: repo_root.clone(),
-            lsp_roots: Arc::clone(&lsp_roots),
-        }));
+        for lang in &supported_languages {
+            // Build a single-language enricher for this consumer.
+            // The enricher is the same type as what EnricherRegistry uses internally.
+            // We use `EnricherRegistry::with_builtins()` filtered to this language
+            // rather than duplicating the language-server config table.
+            let single_lang_enricher = build_single_language_enricher(lang);
+            bus.register(Box::new(LspConsumer {
+                language: lang.clone(),
+                enricher: single_lang_enricher,
+                repo_root: repo_root.clone(),
+                lsp_roots: Arc::clone(&lsp_roots),
+            }));
+        }
+    } else {
+        tracing::info!("skip_lsp=true: LspConsumers omitted from bus — LSP will run in background");
     }
 
     // --- AllEnrichmentsDone consumers ---
