@@ -21,7 +21,7 @@ pub(crate) use store::{
     check_and_migrate_schema, graph_lance_path,
     persist_graph_incremental, persist_graph_to_lance,
 };
-pub use state::{EmbeddingStatus, GraphState, LspEnrichmentStatus, LspState};
+pub use state::{EmbeddingStatus, GraphBuildState, GraphBuildStatus, GraphState, LspEnrichmentStatus, LspState};
 pub use helpers::format_freshness;
 
 use std::path::{Path, PathBuf};
@@ -128,6 +128,7 @@ pub struct RnaHandler {
     /// to avoid duplicate work (two tool calls both detecting "no graph" and both
     /// running the full extraction pipeline).
     pub graph_build_lock: Arc<tokio::sync::Mutex<()>>,
+    pub graph_build_status: Arc<GraphBuildStatus>,
 }
 
 impl Default for RnaHandler {
@@ -153,6 +154,7 @@ impl Default for RnaHandler {
             prewarm_notify: Arc::new(tokio::sync::Notify::new()),
             prewarm_started: std::sync::atomic::AtomicBool::new(false),
             graph_build_lock: Arc::new(tokio::sync::Mutex::new(())),
+            graph_build_status: Arc::new(GraphBuildStatus::default()),
         }
     }
 }
@@ -184,6 +186,7 @@ impl RnaHandler {
             prewarm_notify: Arc::clone(&self.prewarm_notify),
             prewarm_started: std::sync::atomic::AtomicBool::new(false),
             graph_build_lock: Arc::clone(&self.graph_build_lock),
+            graph_build_status: Arc::clone(&self.graph_build_status),
         }
     }
 
@@ -197,8 +200,10 @@ impl RnaHandler {
     /// the graph populated when the first tool call arrives.
     fn start_prewarm(&self) {
         self.prewarm_started.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.graph_build_status.set_building(0);
         let handler = self.clone_shared();
         let notify = Arc::clone(&self.prewarm_notify);
+        let build_status = Arc::clone(&self.graph_build_status);
         tokio::spawn(async move {
             tracing::info!("Pre-warming graph index in background...");
             let t0 = std::time::Instant::now();
@@ -216,6 +221,7 @@ impl RnaHandler {
                     if !handler.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
                         handler.spawn_background_scanner();
                     }
+                    build_status.set_ready();
                     tracing::info!(
                         "Graph pre-warm complete: {} symbols, {} edges in {:.2}s",
                         node_count,
@@ -224,8 +230,7 @@ impl RnaHandler {
                     );
                 }
                 Err(e) => {
-                    // Pre-warm failure is non-fatal -- get_graph() will retry
-                    // on the first tool call.
+                    build_status.set_failed(format!("{}", e));
                     tracing::warn!("Graph pre-warm failed (will retry on first tool call): {}", e);
                 }
             }
@@ -277,6 +282,12 @@ impl RnaHandler {
             Some(slug) => Some(slug.to_string()),
             None => Some(self.primary_root_slug()),
         }
+    }
+
+    pub(crate) fn cold_start_building_message(&self) -> Option<String> {
+        let current = self.graph.load_full();
+        if current.is_some() { return None; }
+        self.graph_build_status.status_message()
     }
 
     /// Return the set of root slugs that correspond to non-code roots
@@ -437,6 +448,12 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
         } else {
             None
         };
+
+        if params.name != "list_roots" {
+            if let Some(building_msg) = self.cold_start_building_message() {
+                return Ok(helpers::text_result(building_msg));
+            }
+        }
 
         let mut result = match params.name.as_str() {
             "outcome_progress" => {

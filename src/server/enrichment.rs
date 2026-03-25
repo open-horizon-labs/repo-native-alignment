@@ -539,7 +539,7 @@ impl RnaHandler {
                             }
                             Err(e) => {
                                 tracing::warn!("[background] Embedding table check failed: {}", e);
-                                embed_status.set_complete(0);
+                                embed_status.set_failed(format!("{}", e));
                                 return;
                             }
                         };
@@ -552,13 +552,13 @@ impl RnaHandler {
                             }
                             Err(e) => {
                                 tracing::warn!("[background] Embedding failed: {}", e);
-                                embed_status.set_complete(0);
+                                embed_status.set_failed(format!("{}", e));
                             }
                         }
                     }
                     Err(e) => {
                         tracing::warn!("[background] EmbeddingIndex init failed: {}", e);
-                        embed_status.set_complete(0);
+                        embed_status.set_failed(format!("{}", e));
                     }
                 }
             };
@@ -641,7 +641,7 @@ impl RnaHandler {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!("[cache-hit bus] emit_enrichment_pipeline failed: {:#}", e);
-                    bg_lsp_status.set_unavailable();
+                    bg_lsp_status.set_failed(&format!("{}", e));
                     return;
                 }
             };
