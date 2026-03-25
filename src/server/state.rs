@@ -1,6 +1,7 @@
 //! Graph state and LSP enrichment status types.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use crate::graph::{Node, Edge};
 use crate::graph::index::GraphIndex;
@@ -11,7 +12,6 @@ use crate::graph::index::GraphIndex;
 /// In-memory graph state: extraction results + petgraph index + embedding index.
 /// Lazily initialized on first tool call. Embeddings are built as part of the
 /// graph pipeline — not as a separate lazy init that races with graph building.
-#[derive(Clone)]
 pub struct GraphState {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
@@ -23,9 +23,46 @@ pub struct GraphState {
     /// Used to gate conditional extractors (pub/sub, SSE/WebSocket, gRPC, etc.) so they
     /// only run when their target framework is present. Empty until the first scan completes.
     pub detected_frameworks: HashSet<String>,
+    /// Cached stable_id -> index map, built lazily on first access.
+    /// Each GraphState snapshot is immutable once published via ArcSwap,
+    /// so the cache is valid for the lifetime of the snapshot.
+    node_index_cache: OnceLock<HashMap<String, usize>>,
+}
+
+impl Clone for GraphState {
+    fn clone(&self) -> Self {
+        Self {
+            nodes: self.nodes.clone(),
+            edges: self.edges.clone(),
+            index: self.index.clone(),
+            last_scan_completed_at: self.last_scan_completed_at,
+            detected_frameworks: self.detected_frameworks.clone(),
+            // Start with an empty cache -- the clone is typically a mutable
+            // working copy for incremental scan whose nodes will change.
+            node_index_cache: OnceLock::new(),
+        }
+    }
 }
 
 impl GraphState {
+    /// Construct a new `GraphState` with an empty node-index cache.
+    pub fn new(
+        nodes: Vec<Node>,
+        edges: Vec<Edge>,
+        index: GraphIndex,
+        last_scan_completed_at: Option<std::time::Instant>,
+        detected_frameworks: HashSet<String>,
+    ) -> Self {
+        Self {
+            nodes,
+            edges,
+            index,
+            last_scan_completed_at,
+            detected_frameworks,
+            node_index_cache: OnceLock::new(),
+        }
+    }
+
     /// Check whether a given framework was detected in this workspace.
     ///
     /// Framework IDs use kebab-case: "fastapi", "kafkajs", "nextjs-app-router", etc.
@@ -42,14 +79,17 @@ impl GraphState {
 }
 
 impl GraphState {
-    /// Build a HashMap from stable_id -> index for O(1) node lookups.
-    /// Call once per search context instead of O(N) linear scans per result.
-    pub fn node_index_map(&self) -> std::collections::HashMap<String, usize> {
-        self.nodes
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n.stable_id(), i))
-            .collect()
+    /// Return a cached HashMap from stable_id -> index for O(1) node lookups.
+    /// Built lazily on first access, then reused for the lifetime of this snapshot.
+    /// Previously rebuilt on every search call (O(N) with 87K String allocations).
+    pub fn node_index_map(&self) -> &HashMap<String, usize> {
+        self.node_index_cache.get_or_init(|| {
+            self.nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.stable_id(), i))
+                .collect()
+        })
     }
 
     /// Resolve a node ID that may be missing its root prefix.
@@ -883,7 +923,7 @@ mod tests {
         for n in &nodes {
             index.ensure_node(&n.stable_id(), &n.id.kind.to_string());
         }
-        GraphState { nodes, edges: vec![], index, last_scan_completed_at: None, detected_frameworks: std::collections::HashSet::new() }
+        GraphState::new(nodes, vec![], index, None, std::collections::HashSet::new())
     }
 
     #[test]

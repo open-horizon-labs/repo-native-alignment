@@ -1578,13 +1578,13 @@ async fn run_impact_output_size_check(index: &GraphIndex, nodes: &[Node]) -> Che
     let node_id = best_node.stable_id();
 
     // Build a GraphState using the caller's index (which has real edges)
-    let graph_state = GraphState {
-        nodes: nodes.to_vec(),
-        edges: Vec::new(),
-        index: index.clone(),
-        last_scan_completed_at: None,
-        detected_frameworks: std::collections::HashSet::new(),
-    };
+    let graph_state = GraphState::new(
+        nodes.to_vec(),
+        Vec::new(),
+        index.clone(),
+        None,
+        std::collections::HashSet::new(),
+    );
 
     let ctx = crate::service::SearchContext {
         graph_state: &graph_state,
@@ -1685,13 +1685,13 @@ fn run_short_id_resolution_check(_index: &GraphIndex, _nodes: &[Node]) -> Check 
     let mut index = GraphIndex::new();
     index.ensure_node(&full_id, &kind.to_string());
 
-    let graph_state = GraphState {
-        nodes: vec![node],
-        edges: Vec::new(),
+    let graph_state = GraphState::new(
+        vec![node],
+        Vec::new(),
         index,
-        last_scan_completed_at: None,
-        detected_frameworks: std::collections::HashSet::new(),
-    };
+        None,
+        std::collections::HashSet::new(),
+    );
 
     // Strip the root prefix to get the short ID
     let short_id = match full_id.split_once(':') {

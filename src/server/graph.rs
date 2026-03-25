@@ -1423,13 +1423,13 @@ impl RnaHandler {
             *self.embed_handle.lock().await = Some(handle);
         }
 
-        Ok(GraphState {
-            nodes: all_nodes,
-            edges: all_edges,
+        Ok(GraphState::new(
+            all_nodes,
+            all_edges,
             index,
-            last_scan_completed_at: Some(symbols_ready_at),
-            detected_frameworks: all_detected_frameworks,
-        })
+            Some(symbols_ready_at),
+            all_detected_frameworks,
+        ))
     }
 
     /// Incrementally update the graph, accepting an optional pre-computed scan.
@@ -1478,8 +1478,9 @@ impl RnaHandler {
 
         let registry = ExtractorRegistry::with_builtins();
 
-        // Remove nodes/edges for deleted + changed files
-        let mut files_to_remove: Vec<PathBuf> = scan
+        // Remove nodes/edges for deleted + changed files.
+        // HashSet for O(1) lookup instead of O(F) Vec scan per edge (#586).
+        let mut files_to_remove: std::collections::HashSet<PathBuf> = scan
             .deleted_files
             .iter()
             .chain(scan.changed_files.iter())
@@ -1492,9 +1493,8 @@ impl RnaHandler {
             .edges
             .iter()
             .filter(|e| {
-                files_to_remove
-                    .iter()
-                    .any(|f| e.from.file == *f || e.to.file == *f)
+                files_to_remove.contains(&e.from.file)
+                    || files_to_remove.contains(&e.to.file)
             })
             .map(|e| e.stable_id())
             .collect();
@@ -1503,9 +1503,8 @@ impl RnaHandler {
             .nodes
             .retain(|n| !files_to_remove.contains(&n.id.file));
         graph.edges.retain(|e| {
-            !files_to_remove
-                .iter()
-                .any(|f| e.from.file == *f || e.to.file == *f)
+            !files_to_remove.contains(&e.from.file)
+                && !files_to_remove.contains(&e.to.file)
         });
 
         // Extract new + changed files
@@ -1872,12 +1871,13 @@ impl RnaHandler {
         // failure, so the next scan re-detects and retries the persist.
         let persist_result = {
             let _lance_guard = self.lance_write_lock.lock().await;
+            let files_to_remove_vec: Vec<PathBuf> = files_to_remove.into_iter().collect();
             persist_graph_incremental(
                 &self.repo_root,
                 &upsert_nodes,
                 &upsert_edges,
                 &deleted_edge_ids,
-                &files_to_remove,
+                &files_to_remove_vec,
             )
             .await
         };
