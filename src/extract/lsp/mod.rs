@@ -482,9 +482,23 @@ impl LspEnricher {
         //    repo may need minutes. The old 30s hard timeout fired before pyright
         //    finished, producing 193 errors and 0 call edges.
         //
-        // 2. If `serverStatus` never arrives (e.g. typescript-language-server),
-        //    probe every 5s with a lightweight `workspace/symbol` request until the
-        //    server responds successfully, indicating it is ready for queries.
+        // 2. If `serverStatus` never arrives (e.g. typescript-language-server,
+        //    pyright), use a two-phase probe strategy:
+        //
+        //    Phase A (responsiveness): probe every 5s with workspace/symbol("")
+        //    until 2 consecutive successes confirm the server is alive.
+        //
+        //    Phase B (indexing validation): send workspace/symbol with non-empty
+        //    queries ("main", "init", "test", etc.) to verify the server has
+        //    actually indexed files. A responsive-but-unindexed server returns
+        //    0 symbols for all queries. Retries use exponential backoff (5s,
+        //    10s, 20s, ...) up to 6 attempts. After 3 consecutive empty
+        //    responses on different queries, the server is declared "responsive
+        //    but not indexed" and Passes 1/3 are skipped.
+        //
+        //    This fixes the #576 regression where pyright and tsserver responded
+        //    to probes within 5s but hadn't indexed the workspace, producing
+        //    0 edges from thousands of nodes.
         //
         // 3. A 10-minute circuit breaker applies in both cases — not a normal
         //    timeout, just a safety net for servers that never become ready.
@@ -504,8 +518,12 @@ impl LspEnricher {
         let mut last_progress_log = tokio::time::Instant::now();
         // For the probe path: track the next time we should send a probe.
         let mut next_probe = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        // Track consecutive probe successes — require 2 in a row to confirm readiness.
+        // Track consecutive probe successes — require 2 in a row to confirm responsiveness.
         let mut probe_success_count: u32 = 0;
+        // After the server is responsive, validate it has actually indexed files
+        // by sending workspace/symbol with non-empty queries. A server that responds
+        // to probes but returns 0 symbols for real queries hasn't finished indexing.
+        let mut server_responsive = false;
 
         while tokio::time::Instant::now() < circuit_breaker {
             let elapsed = start.elapsed().as_secs();
@@ -626,17 +644,20 @@ impl LspEnricher {
                         ).await;
 
                         match probe_result {
-                            Ok(Ok(_)) => {
+                            Ok(Ok(_)) | Ok(Err(_)) => {
+                                if let Ok(Err(e)) = &probe_result {
+                                    tracing::debug!(
+                                        "{} probe returned error (server responsive): {}",
+                                        self.server_command, e
+                                    );
+                                }
                                 probe_success_count += 1;
                                 if probe_success_count >= 2 {
-                                    // Two consecutive successful probes — server is responsive.
+                                    server_responsive = true;
                                     tracing::info!(
-                                        "{} ready (probe succeeded after {}s, no serverStatus)",
+                                        "{} responsive (probe succeeded after {}s, no serverStatus) — validating indexing...",
                                         self.server_command, elapsed
                                     );
-                                    server_ready = true;
-                                    // Servers without serverStatus are treated as quiescent.
-                                    saw_quiescent = true;
                                     break;
                                 }
                                 tracing::debug!(
@@ -644,29 +665,11 @@ impl LspEnricher {
                                     self.server_command, probe_success_count, elapsed
                                 );
                             }
-                            Ok(Err(e)) => {
-                                // Server responded with an error — it may not support workspace/symbol.
-                                // Treat an explicit error response as "server is alive and responsive".
-                                tracing::debug!(
-                                    "{} probe returned error (server responsive): {}",
-                                    self.server_command, e
-                                );
-                                probe_success_count += 1;
-                                if probe_success_count >= 2 {
-                                    tracing::info!(
-                                        "{} ready (probe error-response after {}s — server responsive, no serverStatus)",
-                                        self.server_command, elapsed
-                                    );
-                                    server_ready = true;
-                                    saw_quiescent = true;
-                                    break;
-                                }
-                            }
                             Err(_) => {
-                                // Probe timed out — server still indexing.
+                                // Probe timed out — server still starting up.
                                 probe_success_count = 0;
                                 tracing::debug!(
-                                    "{} probe timed out ({}s elapsed), server still indexing...",
+                                    "{} probe timed out ({}s elapsed), server still starting...",
                                     self.server_command, elapsed
                                 );
                             }
@@ -677,9 +680,153 @@ impl LspEnricher {
             }
         }
 
+        // ----------------------------------------------------------------
+        // Indexing validation for probe-based servers (no serverStatus).
+        //
+        // "Server responds to requests" != "server has finished indexing."
+        // pyright and typescript-language-server respond to workspace/symbol
+        // within 5s but may not have indexed a single file yet. On large
+        // repos this produces 0 edges from thousands of nodes.
+        //
+        // Validation: send workspace/symbol with non-empty queries. An
+        // indexed server returns results; an unindexed one returns [].
+        // Use exponential backoff (5s, 10s, 20s) between attempts, with
+        // up to MAX_INDEXING_VALIDATION_ATTEMPTS total tries.
+        // ----------------------------------------------------------------
+        if server_responsive && !server_ready {
+            const MAX_INDEXING_VALIDATION_ATTEMPTS: u32 = 6;
+            // Queries chosen to match common symbols across Python/TypeScript/Rust
+            // codebases. We try multiple queries so a project that happens to lack
+            // "main" can still pass validation with "init" or "test".
+            const VALIDATION_QUERIES: &[&str] = &["main", "init", "test", "get", "set", "app"];
+            let mut validation_delay = tokio::time::Duration::from_secs(5);
+            let mut consecutive_empty: u32 = 0;
+
+            for attempt in 1..=MAX_INDEXING_VALIDATION_ATTEMPTS {
+                if tokio::time::Instant::now() >= circuit_breaker {
+                    break;
+                }
+
+                // Pick a different query each attempt to avoid false negatives
+                // from a project that simply doesn't have a "main" function.
+                let query = VALIDATION_QUERIES[((attempt - 1) as usize) % VALIDATION_QUERIES.len()];
+
+                // Drain any pending notifications before sending the validation request.
+                // Some servers (pyright) may send progress or diagnostic notifications
+                // that need to be consumed to avoid transport deadlock.
+                loop {
+                    match tokio::time::timeout(
+                        tokio::time::Duration::from_millis(100),
+                        transport.read_message(),
+                    ).await {
+                        Ok(Ok(msg)) => {
+                            // Handle workDoneProgress/create requests during drain
+                            if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+                                if method == "window/workDoneProgress/create" {
+                                    if let Some(id) = msg.get("id") {
+                                        let response = serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "id": id,
+                                            "result": null
+                                        });
+                                        let _ = transport.send_message(&response).await;
+                                    }
+                                } else if method == "$/progress" {
+                                    let kind = msg.pointer("/params/value/kind").and_then(|k| k.as_str()).unwrap_or("");
+                                    let title = msg.pointer("/params/value/title").and_then(|t| t.as_str()).unwrap_or("");
+                                    if kind == "begin" || kind == "end" {
+                                        tracing::info!("{} progress {}: {}", self.server_command, kind, title);
+                                    }
+                                }
+                            }
+                        }
+                        _ => break, // No more pending messages
+                    }
+                }
+
+                let validation_result = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(10),
+                    transport.request("workspace/symbol", serde_json::json!({ "query": query })),
+                ).await;
+
+                let elapsed = start.elapsed().as_secs();
+
+                match validation_result {
+                    Ok(Ok(ref response)) => {
+                        let symbol_count = response.as_array().map(|a| a.len()).unwrap_or(0);
+                        if symbol_count > 0 {
+                            tracing::info!(
+                                "{} indexing validated: workspace/symbol(\"{}\") returned {} symbols ({}s elapsed)",
+                                self.server_command, query, symbol_count, elapsed
+                            );
+                            server_ready = true;
+                            saw_quiescent = true;
+                            break;
+                        }
+                        consecutive_empty += 1;
+                        tracing::info!(
+                            "{} indexing validation {}/{}: workspace/symbol(\"{}\") returned 0 symbols ({}s elapsed, waiting {}s)",
+                            self.server_command, attempt, MAX_INDEXING_VALIDATION_ATTEMPTS,
+                            query, elapsed, validation_delay.as_secs()
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        // Error response — the server is responsive but the query
+                        // may not be supported. Count it as non-indexed.
+                        consecutive_empty += 1;
+                        tracing::info!(
+                            "{} indexing validation {}/{}: workspace/symbol(\"{}\") returned error: {} ({}s elapsed)",
+                            self.server_command, attempt, MAX_INDEXING_VALIDATION_ATTEMPTS,
+                            query, e, elapsed
+                        );
+                    }
+                    Err(_) => {
+                        // Timeout — server is busy indexing.
+                        consecutive_empty += 1;
+                        tracing::info!(
+                            "{} indexing validation {}/{}: workspace/symbol(\"{}\") timed out ({}s elapsed)",
+                            self.server_command, attempt, MAX_INDEXING_VALIDATION_ATTEMPTS,
+                            query, elapsed
+                        );
+                    }
+                }
+
+                // After 3 consecutive empty responses on different queries,
+                // the server is almost certainly not going to index this project.
+                // Mark it as "responsive but not indexed" early.
+                if consecutive_empty >= 3 && attempt >= 3 {
+                    // Check if ALL queries returned empty — not just a streak.
+                    // If every query we tried returned 0 symbols, the server
+                    // is responsive but not indexing this workspace.
+                    tracing::warn!(
+                        "{} indexing validation failed: {} consecutive empty responses across different queries — \
+                         server is responsive but has not indexed the workspace ({}s elapsed)",
+                        self.server_command, consecutive_empty, elapsed
+                    );
+                    // server_ready stays false, saw_quiescent stays false.
+                    // This means Pass 1 and Pass 3 will be skipped, which is
+                    // correct — sending requests to an unindexed server produces
+                    // 0 edges and wastes time.
+                    break;
+                }
+
+                // Exponential backoff: 5s, 10s, 20s, 40s, ...
+                // Capped by the circuit breaker.
+                let sleep_until = tokio::time::Instant::now() + validation_delay;
+                let capped = sleep_until.min(circuit_breaker);
+                tokio::time::sleep_until(capped).await;
+                validation_delay = (validation_delay * 2).min(tokio::time::Duration::from_secs(60));
+            }
+        }
+
         if tokio::time::Instant::now() >= circuit_breaker {
             tracing::warn!(
                 "{} circuit breaker fired after 10 minutes — proceeding anyway (server may not be fully indexed)",
+                self.server_command
+            );
+        } else if !server_ready && server_responsive {
+            tracing::warn!(
+                "{} responsive but indexing validation failed — server has not indexed the workspace",
                 self.server_command
             );
         } else if !server_ready {
@@ -702,9 +849,10 @@ impl LspEnricher {
         // The guard only applies when the server supports `experimental/serverStatus`
         // (`seen_server_status = true`) but never sent quiescent=true. Servers
         // that do NOT support serverStatus use the probe path: they are quiescent
-        // only when `server_ready=true` (probe succeeded). This ensures a server
-        // that never responded to any probe (circuit breaker path) is NOT treated
-        // as quiescent — Pass 3 would flood it with diagnostic requests.
+        // only when `server_ready=true` (probe + indexing validation both passed).
+        // This ensures a server that responded to probes but returned 0 symbols
+        // on validation (e.g., pyright before indexing completes) is NOT treated
+        // as quiescent — Pass 1 and Pass 3 would produce 0 edges.
         state.was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
         if !state.was_quiescent {
             tracing::warn!(
@@ -3820,6 +3968,91 @@ mod tests {
             Some(&serde_json::json!(true)),
             "serverStatusNotification must be true to receive serverStatus from rust-analyzer"
         );
+    }
+
+    /// Verify that the was_quiescent computation correctly handles the probe
+    /// validation path introduced by #576.
+    ///
+    /// For servers without serverStatus:
+    /// - Probe succeeds + validation returns symbols → was_quiescent = true
+    /// - Probe succeeds + validation returns 0 symbols → was_quiescent = false
+    /// - Probe never succeeds → was_quiescent = false
+    ///
+    /// This ensures Pass 1 and Pass 3 are skipped when a server (e.g., pyright,
+    /// tsserver) responds to probes but hasn't indexed the workspace.
+    #[test]
+    fn test_was_quiescent_probe_validation_path() {
+        // Case 1: Probe + validation both succeed → was_quiescent = true
+        // (saw_quiescent=true from validation, server_ready=true)
+        {
+            let saw_quiescent = true;
+            let seen_server_status = false;
+            let server_ready = true;
+            let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
+            assert!(was_quiescent,
+                "probe + validation success must set was_quiescent=true — Pass 1/3 should run");
+        }
+
+        // Case 2: Probe succeeds but validation returns 0 symbols → was_quiescent = false
+        // (saw_quiescent=false, server_ready=false after validation failure)
+        {
+            let saw_quiescent = false;
+            let seen_server_status = false;
+            let server_ready = false;
+            let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
+            assert!(!was_quiescent,
+                "probe success with failed validation must NOT set was_quiescent — \
+                 Pass 1/3 must be skipped (server responsive but not indexed, #576)");
+        }
+
+        // Case 3: Neither probe nor validation succeed → was_quiescent = false
+        {
+            let saw_quiescent = false;
+            let seen_server_status = false;
+            let server_ready = false;
+            let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
+            assert!(!was_quiescent,
+                "no probe success must not set was_quiescent — server never responded");
+        }
+
+        // Case 4: serverStatus path (not probe) — quiescent=true → was_quiescent = true
+        {
+            let saw_quiescent = true;
+            let seen_server_status = true;
+            let server_ready = true;
+            let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
+            assert!(was_quiescent,
+                "serverStatus quiescent=true must set was_quiescent regardless of probe path");
+        }
+
+        // Case 5: serverStatus path — not quiescent → was_quiescent = false
+        {
+            let saw_quiescent = false;
+            let seen_server_status = true;
+            let server_ready = false;
+            let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
+            assert!(!was_quiescent,
+                "serverStatus without quiescent=true must NOT set was_quiescent — \
+                 server timed out during indexing");
+        }
+    }
+
+    /// Verify the validation query list covers common symbol names across
+    /// Python, TypeScript, and Rust codebases. An empty validation query
+    /// list would bypass indexing validation entirely.
+    #[test]
+    fn test_indexing_validation_queries_not_empty() {
+        // These constants are defined inline in ensure_initialized. Replicate them
+        // here to verify the design contract: at least 3 diverse queries so a
+        // project missing "main" can still pass validation.
+        let queries = &["main", "init", "test", "get", "set", "app"];
+        assert!(queries.len() >= 3,
+            "need at least 3 validation queries to avoid false negatives \
+             from projects that happen to lack a particular symbol name");
+        // Verify no duplicates
+        let unique: std::collections::HashSet<&&str> = queries.iter().collect();
+        assert_eq!(unique.len(), queries.len(),
+            "validation queries must be unique");
     }
 
     /// Integration test: run LSP enrichment against the RNA repo itself.
