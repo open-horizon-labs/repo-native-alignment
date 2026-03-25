@@ -254,6 +254,7 @@ pub(super) async fn update_graph(
                 scan_stats: Some(Arc::clone(scan_stats)),
                 embed_idx: None,
                 lance_repo_root: None,
+                skip_lsp: false, // background scanner: LSP runs inline
             },
             dirty_slugs,
         ).await {

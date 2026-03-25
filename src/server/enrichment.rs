@@ -133,6 +133,253 @@ impl RnaHandler {
         tracing::info!("Background scanner started (event-driven + 15min heartbeat, worktree-aware)");
     }
 
+    /// Spawn background LSP enrichment after the initial graph build returns (#574).
+    ///
+    /// The initial `build_full_graph_inner` runs with `skip_lsp=true` so it returns
+    /// in seconds (tree-sitter + non-LSP passes only). This method spawns LSP enrichment
+    /// in the background: when complete, it ArcSwaps the fully enriched graph and
+    /// re-persists to LanceDB with LSP edges.
+    ///
+    /// This restores the v0.1.14 behavior where `build_full_graph_inner` returned
+    /// immediately and LSP ran via `spawn_background_enrichment`.
+    pub(crate) fn spawn_background_lsp_enrichment(
+        &self,
+        nodes: Vec<crate::graph::Node>,
+        edges: Vec<crate::graph::Edge>,
+        dirty_slugs: std::collections::HashSet<String>,
+        detected_frameworks: std::collections::HashSet<String>,
+    ) {
+        let repo_root = self.repo_root.clone();
+        let graph_arc = Arc::clone(&self.graph);
+        let lsp_status = Arc::clone(&self.lsp_status);
+        let scan_stats = Arc::clone(&self.scan_stats);
+        let lance_write_lock = Arc::clone(&self.lance_write_lock);
+
+        tokio::spawn(async move {
+            let t0 = std::time::Instant::now();
+            tracing::info!(
+                "[background-lsp] Starting LSP enrichment: {} nodes, {} edges",
+                nodes.len(), edges.len()
+            );
+
+            // Build root pairs for the enrichment pipeline
+            let workspace = crate::roots::WorkspaceConfig::load()
+                .with_primary_root(repo_root.clone())
+                .with_worktrees(&repo_root)
+                .with_declared_roots(&repo_root);
+            let root_pairs: Vec<(String, std::path::PathBuf)> = workspace
+                .resolved_roots()
+                .iter()
+                .map(|r| (r.slug.clone(), r.path.clone()))
+                .collect();
+            let primary_slug = crate::roots::RootConfig::code_project(repo_root.clone()).slug();
+
+            // Run enrichment pipeline WITH LSP (skip_lsp=false)
+            let result = crate::extract::consumers::emit_enrichment_pipeline(
+                nodes,
+                edges,
+                root_pairs,
+                primary_slug.clone(),
+                repo_root.clone(),
+                crate::extract::consumers::BusOptions {
+                    scan_stats: Some(Arc::clone(&scan_stats)),
+                    embed_idx: None,
+                    lance_repo_root: None,
+                    skip_lsp: false, // this time LSP runs
+                },
+                Some(dirty_slugs),
+            ).await;
+
+            match result {
+                Ok((mut enriched_nodes, mut enriched_edges, enriched_frameworks)) => {
+                    // Update LSP status
+                    let lsp_edge_count = enriched_edges.iter()
+                        .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
+                        .count();
+                    let lsp_call_edge_count = enriched_edges.iter()
+                        .filter(|e| {
+                            e.source == crate::graph::ExtractionSource::Lsp
+                                && matches!(e.kind, crate::graph::EdgeKind::Calls)
+                        })
+                        .count();
+                    if lsp_edge_count > 0 {
+                        lsp_status.set_complete(lsp_call_edge_count);
+                        tracing::info!(
+                            "[background-lsp] LSP enrichment complete: {} LSP call edges, {} total LSP edges in {:.2}s",
+                            lsp_call_edge_count, lsp_edge_count, t0.elapsed().as_secs_f64()
+                        );
+                    } else {
+                        lsp_status.set_unavailable();
+                        tracing::info!(
+                            "[background-lsp] LSP enrichment produced no edges in {:.2}s",
+                            t0.elapsed().as_secs_f64()
+                        );
+                    }
+
+                    // Dedup
+                    {
+                        let mut seen_nodes = std::collections::HashSet::new();
+                        enriched_nodes.reverse();
+                        enriched_nodes.retain(|n| seen_nodes.insert(n.stable_id()));
+                        enriched_nodes.reverse();
+                        let mut seen_edges = std::collections::HashSet::new();
+                        enriched_edges.retain(|e| seen_edges.insert(e.stable_id()));
+                    }
+
+                    // Rebuild petgraph index
+                    let mut index = crate::graph::index::GraphIndex::new();
+                    index.rebuild_from_edges(&enriched_edges);
+                    for node in &enriched_nodes {
+                        index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+                    }
+
+                    // Recompute PageRank with LSP edges
+                    let pagerank_scores = index.compute_pagerank(0.85, 20);
+                    for node in &mut enriched_nodes {
+                        if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
+                            node.metadata.insert("importance".to_string(), format!("{:.6}", score));
+                        }
+                    }
+
+                    // Re-run subsystem detection with updated PageRank
+                    {
+                        let node_file_map: std::collections::HashMap<String, String> = enriched_nodes
+                            .iter()
+                            .filter(|n| n.id.root != "external")
+                            .map(|n| (n.stable_id(), n.id.file.display().to_string()))
+                            .collect();
+                        let mut subsystems = index.detect_communities(&pagerank_scores, &node_file_map);
+                        // Dedup subsystem names
+                        {
+                            let mut name_counts: std::collections::HashMap<String, usize> =
+                                std::collections::HashMap::new();
+                            for s in &subsystems {
+                                *name_counts.entry(s.name.clone()).or_default() += 1;
+                            }
+                            for s in &mut subsystems {
+                                if name_counts.get(&s.name).copied().unwrap_or(0) > 1
+                                    && let Some(iface) = s.interfaces.first() {
+                                        let short = iface
+                                            .node_id
+                                            .split(':')
+                                            .rev()
+                                            .nth(1)
+                                            .unwrap_or(&iface.node_id);
+                                        s.name = format!("{}/{}", s.name, short);
+                                    }
+                            }
+                        }
+                        let mut node_subsystem: std::collections::HashMap<String, String> =
+                            std::collections::HashMap::new();
+                        for subsystem in &subsystems {
+                            for member_id in &subsystem.member_ids {
+                                node_subsystem.insert(member_id.clone(), subsystem.name.clone());
+                            }
+                        }
+                        // Remove stale virtual nodes
+                        enriched_nodes.retain(|n| !matches!(&n.id.kind, crate::graph::NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")));
+                        enriched_edges.retain(|e| {
+                            !matches!(&e.to.kind, crate::graph::NodeKind::Other(s) if s == "subsystem")
+                                && e.kind != crate::graph::EdgeKind::UsesFramework
+                                && e.kind != crate::graph::EdgeKind::Produces
+                                && e.kind != crate::graph::EdgeKind::Consumes
+                        });
+                        for node in &mut enriched_nodes {
+                            if let Some(subsystem_name) = node_subsystem.get(&node.stable_id()) {
+                                node.metadata.insert(
+                                    super::graph::SUBSYSTEM_KEY.to_owned(),
+                                    subsystem_name.clone(),
+                                );
+                            } else {
+                                node.metadata.remove(super::graph::SUBSYSTEM_KEY);
+                            }
+                        }
+                        // Emit subsystem virtual nodes
+                        let (sub_added_nodes, sub_added_edges) =
+                            crate::extract::consumers::emit_community_detection(
+                                primary_slug,
+                                subsystems,
+                                enriched_nodes.clone(),
+                            ).await.unwrap_or_else(|e| {
+                                tracing::warn!("[background-lsp] Subsystem promotion failed: {}", e);
+                                (vec![], vec![])
+                            });
+                        enriched_nodes.extend(sub_added_nodes);
+                        enriched_edges.extend(sub_added_edges);
+
+                        // Re-add virtual nodes to index
+                        for node in &enriched_nodes {
+                            if matches!(&node.id.kind, crate::graph::NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+                                index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+                            }
+                        }
+                        for edge in &enriched_edges {
+                            if matches!(&edge.to.kind, crate::graph::NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+                                index.add_edge(
+                                    &edge.from.to_stable_id(),
+                                    &edge.from.kind.to_string(),
+                                    &edge.to.to_stable_id(),
+                                    &edge.to.kind.to_string(),
+                                    edge.kind.clone(),
+                                );
+                            }
+                        }
+                    }
+
+                    // Final dedup
+                    {
+                        let mut seen_edges = std::collections::HashSet::new();
+                        enriched_edges.retain(|e| seen_edges.insert(e.stable_id()));
+                    }
+
+                    // Persist to LanceDB with LSP edges
+                    {
+                        let _lance_guard = lance_write_lock.lock().await;
+                        if let Err(e) = super::store::persist_graph_to_lance(
+                            &repo_root, &enriched_nodes, &enriched_edges
+                        ).await {
+                            tracing::error!("[background-lsp] LanceDB persist failed: {}", e);
+                        } else {
+                            super::sentinel::write_extract_sentinel(
+                                &repo_root, enriched_nodes.len(), enriched_edges.len()
+                            );
+                            let has_lsp_edges = enriched_edges.iter()
+                                .any(|e| e.source == crate::graph::ExtractionSource::Lsp);
+                            if has_lsp_edges {
+                                super::sentinel::write_lsp_sentinel(
+                                    &repo_root, enriched_nodes.len(), enriched_edges.len()
+                                );
+                            }
+                            tracing::info!(
+                                "[background-lsp] LanceDB re-persisted with LSP edges: {} nodes, {} edges",
+                                enriched_nodes.len(), enriched_edges.len()
+                            );
+                        }
+                    }
+
+                    // ArcSwap the fully enriched graph
+                    let all_frameworks = detected_frameworks.union(&enriched_frameworks).cloned().collect();
+                    let new_state = super::state::GraphState::new(
+                        enriched_nodes,
+                        enriched_edges,
+                        index,
+                        Some(std::time::Instant::now()),
+                        all_frameworks,
+                    );
+                    graph_arc.store(Arc::new(Some(Arc::new(new_state))));
+                    tracing::info!(
+                        "[background-lsp] Enriched graph swapped in after {:.2}s",
+                        t0.elapsed().as_secs_f64()
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("[background-lsp] LSP enrichment pipeline failed: {:#}", e);
+                    lsp_status.set_unavailable();
+                }
+            }
+        });
+    }
+
     /// Spawn background embedding after a full graph build.
     ///
     /// **Phase 3**: LSP enrichment has been moved into `LspConsumer` within the event bus
@@ -273,6 +520,7 @@ impl RnaHandler {
                     scan_stats: Some(bg_scan_stats),
                     embed_idx: None,
                     lance_repo_root: None,
+                    skip_lsp: false,
                 },
                 None,
             ).await;
@@ -639,6 +887,7 @@ impl RnaHandler {
                 scan_stats: Some(Arc::clone(&self.scan_stats)),
                 embed_idx: None,
                 lance_repo_root: None,
+                skip_lsp: false,
             },
             dirty_slugs,
         ).await;
@@ -853,6 +1102,7 @@ impl RnaHandler {
                     scan_stats: Some(Arc::clone(&self.scan_stats)),
                     embed_idx: None,
                     lance_repo_root: None,
+                    skip_lsp: false,
                 },
                 None, // full rebuild: all roots dirty
             ).await;
@@ -1016,6 +1266,7 @@ impl RnaHandler {
                 scan_stats: Some(Arc::clone(&self.scan_stats)),
                 embed_idx: None,
                 lance_repo_root: None,
+                skip_lsp: false,
             },
             None, // no sentinel means all roots need enrichment
         ).await;

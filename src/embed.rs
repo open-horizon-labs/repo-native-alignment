@@ -649,19 +649,11 @@ impl EmbeddingIndex {
             };
 
             // Include scalar filter values in the hash material so that changes
-            // to file_path/language/subsystem/cyclomatic invalidate the hash and
-            // force a re-embed. Without this, a subsystem reassignment would leave
-            // stale values in the LanceDB scalar filter columns, making .only_if()
-            // return incorrect results.
-            let hash_material = format!(
-                "{}\x00{}\x00{}\x00{}\x00{}",
-                text,
-                fp.as_deref().unwrap_or(""),
-                lang.as_deref().unwrap_or(""),
-                sub.as_deref().unwrap_or(""),
-                cc.unwrap_or(0),
-            );
-            let text_hash = blake3::hash(hash_material.as_bytes()).to_hex().to_string();
+            // Hash only the embedding text — scalar filter columns (file_path,
+            // language, subsystem, cyclomatic) are updated separately via LanceDB
+            // upsert. Including them in the hash invalidates the entire embedding
+            // cache on every subsystem reassignment, causing a 4x regression (#597).
+            let text_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
 
             let title = if node.metadata.contains_key("oh_kind") {
                 node.metadata.get("frontmatter.title")
@@ -1028,17 +1020,8 @@ impl EmbeddingIndex {
                 (fp, lang, sub, cc)
             };
 
-            // Include scalar filter values in the hash so changes to
-            // file_path/language/subsystem/cyclomatic invalidate the hash.
-            let hash_material = format!(
-                "{}\x00{}\x00{}\x00{}\x00{}",
-                text,
-                fp.as_deref().unwrap_or(""),
-                lang.as_deref().unwrap_or(""),
-                sub.as_deref().unwrap_or(""),
-                cc.unwrap_or(0),
-            );
-            let text_hash = blake3::hash(hash_material.as_bytes()).to_hex().to_string();
+            // Hash only the embedding text — see comment at line 640.
+            let text_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
 
             let title = if node.metadata.contains_key("oh_kind") {
                 node.metadata.get("frontmatter.title")
