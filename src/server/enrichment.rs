@@ -163,13 +163,16 @@ impl RnaHandler {
                     continue;
                 }
 
-                // Collect LanceDB persist deltas per root (outside write guard so
-                // persist_graph_incremental can run without holding the lock).
-                // Structure: (root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove)
+                // ── Lock-free graph update via ArcSwap (#574) ──
+                // Load the current graph snapshot (atomic pointer load, zero blocking).
+                // Clone it into an owned mutable copy, apply all mutations + enrichment
+                // to the clone, then atomic-swap the new version in. Tool calls
+                // continue reading the previous snapshot throughout this entire process.
                 let mut lance_deltas: Vec<LanceDelta> = Vec::new();
 
-                let mut guard = graph.write().await;
-                if let Some(ref mut graph_state) = *guard {
+                let current_snap = graph.load_full();
+                if let Some(ref current_gs) = *current_snap {
+                    let mut graph_state = (**current_gs).clone();
                     let registry = ExtractorRegistry::with_builtins();
 
                     // Drop in-memory nodes/edges for removed worktrees.
@@ -199,7 +202,7 @@ impl RnaHandler {
                         );
                         // Use a HashSet for O(1) membership checks during retain/filter
                         // instead of O(n) Vec::contains / iter().any(). With a Vec the
-                        // retain loops over nodes/edges become O(nodes × files_to_remove).
+                        // retain loops over nodes/edges become O(nodes * files_to_remove).
                         let files_to_remove: std::collections::HashSet<PathBuf> = scan
                             .deleted_files
                             .iter()
@@ -405,10 +408,14 @@ impl RnaHandler {
                         graph_state.nodes.len(),
                         graph_state.edges.len()
                     );
-                }
-                drop(guard);
 
-                // Persist incremental deltas to LanceDB for each root (lock released above).
+                    // Atomic swap: publish the new graph state.
+                    // Tool calls that were reading the old snapshot continue undisturbed;
+                    // new tool calls will see this updated version immediately.
+                    graph.store(Arc::new(Some(Arc::new(graph_state))));
+                }
+
+                // Persist incremental deltas to LanceDB for each root.
                 // Acquire the write mutex to serialize with other LanceDB writers (#344 round 3).
                 // Track which roots persisted successfully so we can commit scanner state.
                 let mut persisted_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -428,10 +435,9 @@ impl RnaHandler {
                     match persist_result {
                         Ok(true) => {
                             tracing::info!("Background scan: schema migrated; performing full persist now");
-                            let snapshot = {
-                                let g = graph.read().await;
-                                g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
-                            };
+                            let snap = graph.load_full();
+                            let snapshot = snap.as_ref().as_ref()
+                                .map(|gs| (gs.nodes.clone(), gs.edges.clone()));
                             if let Some((nodes, edges)) = snapshot {
                                 let _lance_guard = lance_write_lock.lock().await;
                                 if let Err(e) = persist_graph_to_lance(&repo_root, &nodes, &edges).await {
@@ -460,10 +466,13 @@ impl RnaHandler {
                 }
 
                 // Update freshness timestamp if any root persisted successfully.
+                // Load → clone → mutate → store (atomic swap, no lock).
                 if !persisted_slugs.is_empty() {
-                    let mut guard = graph.write().await;
-                    if let Some(ref mut gs) = *guard {
-                        gs.last_scan_completed_at = Some(std::time::Instant::now());
+                    let snap = graph.load_full();
+                    if let Some(ref gs) = *snap {
+                        let mut updated = (**gs).clone();
+                        updated.last_scan_completed_at = Some(std::time::Instant::now());
+                        graph.store(Arc::new(Some(Arc::new(updated))));
                     }
                 }
 
@@ -673,15 +682,18 @@ impl RnaHandler {
                 new_index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
             }
 
-            // Replace in-memory graph state with enriched result under write lock.
+            // Atomic swap: replace the in-memory graph with the enriched version.
+            // Tool calls reading the old snapshot are undisturbed; new calls see
+            // the enriched version immediately.
             {
-                let mut guard = bg_graph.write().await;
-                if let Some(ref mut gs) = *guard {
-                    gs.nodes = enriched_nodes.clone();
-                    gs.edges = enriched_edges.clone();
-                    gs.index = new_index;
+                let snap = bg_graph.load_full();
+                if let Some(ref gs) = *snap {
+                    let mut new_gs = (**gs).clone();
+                    new_gs.nodes = enriched_nodes.clone();
+                    new_gs.edges = enriched_edges.clone();
+                    new_gs.index = new_index;
+                    bg_graph.store(Arc::new(Some(Arc::new(new_gs))));
                 }
-                // Guard drops here, releasing the write lock before LanceDB persist.
             }
 
             // Persist enriched graph to LanceDB and write sentinel under the write lock
@@ -790,9 +802,10 @@ impl RnaHandler {
                 enrichment.updated_nodes.len()
             );
 
-            // Acquire write lock briefly for in-memory graph mutation only.
-            let mut guard = bg_graph.write().await;
-            if let Some(ref mut gs) = *guard {
+            // Atomic swap: apply enrichment results to a clone, then store.
+            let snap = bg_graph.load_full();
+            if let Some(ref current_gs) = *snap {
+                let mut gs = (**current_gs).clone();
                 // Collect new node IDs before moving nodes into the graph.
                 let new_node_ids: Vec<String> = enrichment.new_nodes.iter()
                     .map(|n| n.stable_id())
@@ -802,7 +815,7 @@ impl RnaHandler {
                 }
                 gs.nodes.extend(enrichment.new_nodes);
 
-                // Clone edges for persist (needed after lock is dropped), then move into graph.
+                // Clone edges for persist (needed after store), then move into graph.
                 let persist_edges = enrichment.added_edges.clone();
                 for edge in &persist_edges {
                     gs.index.add_edge(
@@ -844,7 +857,9 @@ impl RnaHandler {
                     .collect();
 
                 let edge_count = persist_edges.len();
-                drop(guard); // Release lock before slow I/O.
+
+                // Atomic swap before slow I/O.
+                bg_graph.store(Arc::new(Some(Arc::new(gs))));
 
                 // Re-embed enriched nodes.
                 let embed_guard = bg_embed_index.load();
@@ -865,8 +880,9 @@ impl RnaHandler {
                     if matches!(result, Ok(false)) {
                         // Incremental persist succeeded -- write sentinel while lock is held.
                         let (total_nodes, total_edges) = {
-                            let g = bg_graph.read().await;
-                            g.as_ref().map(|gs| (gs.nodes.len(), gs.edges.len()))
+                            let snap = bg_graph.load_full();
+                            snap.as_ref().as_ref()
+                                .map(|gs| (gs.nodes.len(), gs.edges.len()))
                                 .unwrap_or((0, 0))
                         };
                         super::sentinel::write_lsp_sentinel(&bg_repo_root, total_nodes, total_edges);
@@ -877,8 +893,9 @@ impl RnaHandler {
                     Ok(true) => {
                         tracing::info!("[incremental-bg] LSP enrichment: schema migrated; performing full persist");
                         let snapshot = {
-                            let g = bg_graph.read().await;
-                            g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+                            let snap = bg_graph.load_full();
+                            snap.as_ref().as_ref()
+                                .map(|gs| (gs.nodes.clone(), gs.edges.clone()))
                         };
                         if let Some((nodes, edges)) = snapshot {
                             let _lance_guard = bg_lance_write_lock.lock().await;
@@ -1020,11 +1037,8 @@ impl RnaHandler {
         if change_count == 0 {
             on_progress("No changes detected -- reusing cached graph.");
 
-            // Store graph and set up embedding index.
-            {
-                let mut guard = self.graph.write().await;
-                *guard = Some(cached_state);
-            }
+            // Store graph atomically and set up embedding index.
+            self.graph.store(Arc::new(Some(Arc::new(cached_state))));
 
             // Reuse existing embedding index.
             if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await
@@ -1042,8 +1056,8 @@ impl RnaHandler {
 
             let lsp_edge_count = if lsp_sentinel.is_some() {
                 let call_count = {
-                    let guard = self.graph.read().await;
-                    guard.as_ref().unwrap().edges.iter()
+                    let snap = self.graph.load_full();
+                    snap.as_ref().as_ref().unwrap().edges.iter()
                         .filter(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
                         .count()
                 };
@@ -1061,8 +1075,8 @@ impl RnaHandler {
 
             // Read final counts (may have changed after LSP enrichment).
             let (total_node_count, total_edge_count) = {
-                let guard = self.graph.read().await;
-                let gs = guard.as_ref().unwrap();
+                let snap = self.graph.load_full();
+                let gs = snap.as_ref().as_ref().unwrap();
                 (gs.nodes.len(), gs.edges.len())
             };
 
@@ -1098,25 +1112,16 @@ impl RnaHandler {
             cached_state.index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
         }
 
-        // Store the cached graph so update_graph_with_scan can modify it in-place.
-        {
-            let mut guard = self.graph.write().await;
-            *guard = Some(cached_state);
-        }
-
-        // Run incremental update (extract only changed files, remove deleted, re-embed).
+        // Run incremental update on the local cached_state, then store atomically.
         // LSP spawning is disabled (spawn_lsp=false) -- we handle it synchronously below.
-        {
-            let mut guard = self.graph.write().await;
-            let gs = guard.as_mut().unwrap();
-            self.update_graph_with_scan(gs, Some(scan), false).await?;
-        }
+        self.update_graph_with_scan(&mut cached_state, Some(scan), false).await?;
+        self.graph.store(Arc::new(Some(Arc::new(cached_state))));
 
         let extract_time = t1.elapsed();
 
         let (node_count, file_count) = {
-            let guard = self.graph.read().await;
-            let gs = guard.as_ref().unwrap();
+            let snap = self.graph.load_full();
+            let gs = snap.as_ref().as_ref().unwrap();
             let files: std::collections::HashSet<_> = gs.nodes.iter()
                 .map(|n| n.id.file.to_string_lossy().to_string())
                 .collect();
@@ -1133,8 +1138,8 @@ impl RnaHandler {
 
         // Phase 3: LSP enrichment on changed nodes only (synchronous).
         let changed_nodes: Vec<Node> = {
-            let guard = self.graph.read().await;
-            let gs = guard.as_ref().unwrap();
+            let snap = self.graph.load_full();
+            let gs = snap.as_ref().as_ref().unwrap();
             gs.nodes.iter()
                 .filter(|n| changed_file_set.contains(&n.id.file))
                 .cloned()
@@ -1165,8 +1170,8 @@ impl RnaHandler {
         let supported = enricher_registry.supported_languages();
         let has_supported_language = languages.iter().any(|l| supported.contains(l));
         let graph_index = {
-            let guard = self.graph.read().await;
-            guard.as_ref().unwrap().index.clone()
+            let snap = self.graph.load_full();
+            snap.as_ref().as_ref().unwrap().index.clone()
         };
         let enrichment = enricher_registry
             .enrich_all(&changed_nodes, &graph_index, &languages, &self.repo_root, &self.lsp_only_roots)
@@ -1192,38 +1197,42 @@ impl RnaHandler {
                 lsp_time.as_secs_f64(),
             ));
 
-            // Apply enrichment to in-memory graph.
-            let mut guard = self.graph.write().await;
-            if let Some(ref mut gs) = *guard {
-                for vnode in &enrichment.new_nodes {
-                    gs.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
-                }
-                gs.nodes.extend(enrichment.new_nodes);
+            // Apply enrichment to in-memory graph via load-clone-modify-store.
+            {
+                let snap = self.graph.load_full();
+                if let Some(ref current_gs) = *snap {
+                    let mut gs = (**current_gs).clone();
+                    for vnode in &enrichment.new_nodes {
+                        gs.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
+                    }
+                    gs.nodes.extend(enrichment.new_nodes);
 
-                for edge in &enrichment.added_edges {
-                    gs.index.add_edge(
-                        &edge.from.to_stable_id(),
-                        &edge.from.kind.to_string(),
-                        &edge.to.to_stable_id(),
-                        &edge.to.kind.to_string(),
-                        edge.kind.clone(),
-                    );
-                }
-                gs.edges.extend(enrichment.added_edges);
+                    for edge in &enrichment.added_edges {
+                        gs.index.add_edge(
+                            &edge.from.to_stable_id(),
+                            &edge.from.kind.to_string(),
+                            &edge.to.to_stable_id(),
+                            &edge.to.kind.to_string(),
+                            edge.kind.clone(),
+                        );
+                    }
+                    gs.edges.extend(enrichment.added_edges);
 
-                // Build index for O(1) lookup instead of O(N) find per patch.
-                let node_pos: std::collections::HashMap<String, usize> = gs.nodes
-                    .iter()
-                    .enumerate()
-                    .map(|(i, n)| (n.stable_id(), i))
-                    .collect();
-                for (node_id, patches) in &enrichment.updated_nodes {
-                    if let Some(&idx) = node_pos.get(node_id) {
-                        let node = &mut gs.nodes[idx];
-                        for (key, value) in patches {
-                            node.metadata.insert(key.clone(), value.clone());
+                    // Build index for O(1) lookup instead of O(N) find per patch.
+                    let node_pos: std::collections::HashMap<String, usize> = gs.nodes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| (n.stable_id(), i))
+                        .collect();
+                    for (node_id, patches) in &enrichment.updated_nodes {
+                        if let Some(&idx) = node_pos.get(node_id) {
+                            let node = &mut gs.nodes[idx];
+                            for (key, value) in patches {
+                                node.metadata.insert(key.clone(), value.clone());
+                            }
                         }
                     }
+                    self.graph.store(Arc::new(Some(Arc::new(gs))));
                 }
             }
             self.lsp_status.set_complete(lsp_edge_count);
@@ -1232,8 +1241,9 @@ impl RnaHandler {
         // Phase 4: Full persist with LSP edges included.
         {
             let snapshot = {
-                let g = self.graph.read().await;
-                g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+                let snap = self.graph.load_full();
+                snap.as_ref().as_ref()
+                    .map(|gs| (gs.nodes.clone(), gs.edges.clone()))
             };
             if let Some((nodes, edges)) = snapshot {
                 tracing::info!(
@@ -1258,8 +1268,8 @@ impl RnaHandler {
 
         // Phase 5: Summary.
         let (total_node_count, total_edge_count, file_count) = {
-            let guard = self.graph.read().await;
-            let gs = guard.as_ref().unwrap();
+            let snap = self.graph.load_full();
+            let gs = snap.as_ref().as_ref().unwrap();
             let fc = gs.nodes.iter().map(|n| n.id.file.to_string_lossy().to_string()).collect::<std::collections::HashSet<_>>().len();
             (gs.nodes.len(), gs.edges.len(), fc)
         };
@@ -1303,24 +1313,21 @@ impl RnaHandler {
             scan_extract_time.as_secs_f64(),
         ));
 
-        // Store graph state so it is available for queries during embed+LSP.
-        {
-            let mut guard = self.graph.write().await;
-            *guard = Some(GraphState {
-                nodes: graph_state.nodes.clone(),
-                edges: graph_state.edges.clone(),
-                index: {
-                    let mut idx = crate::graph::index::GraphIndex::new();
-                    idx.rebuild_from_edges(&graph_state.edges);
-                    for node in &graph_state.nodes {
-                        idx.ensure_node(&node.stable_id(), &node.id.kind.to_string());
-                    }
-                    idx
-                },
-                last_scan_completed_at: graph_state.last_scan_completed_at,
-                detected_frameworks: graph_state.detected_frameworks.clone(),
-            });
-        }
+        // Store graph state atomically so it is available for queries during embed+LSP.
+        self.graph.store(Arc::new(Some(Arc::new(GraphState {
+            nodes: graph_state.nodes.clone(),
+            edges: graph_state.edges.clone(),
+            index: {
+                let mut idx = crate::graph::index::GraphIndex::new();
+                idx.rebuild_from_edges(&graph_state.edges);
+                for node in &graph_state.nodes {
+                    idx.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+                }
+                idx
+            },
+            last_scan_completed_at: graph_state.last_scan_completed_at,
+            detected_frameworks: graph_state.detected_frameworks.clone(),
+        }))));
 
         // Phase 2: Embed + LSP enrichment (parallel -- they use independent data stores)
         let embeddable_nodes: Vec<Node> = graph_state.nodes.iter()
@@ -1403,36 +1410,38 @@ impl RnaHandler {
                 lsp_time.as_secs_f64(),
             ));
 
-            // Apply enrichment to in-memory graph
-            let mut guard = self.graph.write().await;
-            if let Some(ref mut gs) = *guard {
-                for vnode in &enrichment.new_nodes {
-                    gs.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
-                }
-                gs.nodes.extend(enrichment.new_nodes);
+            // Apply enrichment to in-memory graph via load-clone-modify-store.
+            {
+                let snap = self.graph.load_full();
+                if let Some(ref current_gs) = *snap {
+                    let mut gs = (**current_gs).clone();
+                    for vnode in &enrichment.new_nodes {
+                        gs.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
+                    }
+                    gs.nodes.extend(enrichment.new_nodes);
 
-                for edge in &enrichment.added_edges {
-                    let from_id = edge.from.to_stable_id();
-                    let to_id = edge.to.to_stable_id();
-                    gs.index.add_edge(
-                        &from_id,
-                        &edge.from.kind.to_string(),
-                        &to_id,
-                        &edge.to.kind.to_string(),
-                        edge.kind.clone(),
-                    );
-                }
-                gs.edges.extend(enrichment.added_edges);
+                    for edge in &enrichment.added_edges {
+                        let from_id = edge.from.to_stable_id();
+                        let to_id = edge.to.to_stable_id();
+                        gs.index.add_edge(
+                            &from_id,
+                            &edge.from.kind.to_string(),
+                            &to_id,
+                            &edge.to.kind.to_string(),
+                            edge.kind.clone(),
+                        );
+                    }
+                    gs.edges.extend(enrichment.added_edges);
 
-                for (node_id, patches) in &enrichment.updated_nodes {
-                    if let Some(node) = gs.nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
-                        for (key, value) in patches {
-                            node.metadata.insert(key.clone(), value.clone());
+                    for (node_id, patches) in &enrichment.updated_nodes {
+                        if let Some(node) = gs.nodes.iter_mut().find(|n| n.stable_id() == *node_id) {
+                            for (key, value) in patches {
+                                node.metadata.insert(key.clone(), value.clone());
+                            }
                         }
                     }
+                    self.graph.store(Arc::new(Some(Arc::new(gs))));
                 }
-
-                drop(guard);
             }
             self.lsp_status.set_complete(lsp_edge_count);
         }
@@ -1442,8 +1451,9 @@ impl RnaHandler {
         // include LSP edges in a single atomic write (#311).
         {
             let snapshot = {
-                let g = self.graph.read().await;
-                g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+                let snap = self.graph.load_full();
+                snap.as_ref().as_ref()
+                    .map(|gs| (gs.nodes.clone(), gs.edges.clone()))
             };
             if let Some((nodes, edges)) = snapshot {
                 tracing::info!(
@@ -1464,13 +1474,12 @@ impl RnaHandler {
         }
 
         // Phase 4: Summary
-        let total_node_count = {
-            let guard = self.graph.read().await;
-            guard.as_ref().map(|gs| gs.nodes.len()).unwrap_or(graph_state.nodes.len())
-        };
-        let total_edge_count = {
-            let guard = self.graph.read().await;
-            guard.as_ref().map(|gs| gs.edges.len()).unwrap_or(graph_state.edges.len())
+        let (total_node_count, total_edge_count) = {
+            let snap = self.graph.load_full();
+            match snap.as_ref().as_ref() {
+                Some(gs) => (gs.nodes.len(), gs.edges.len()),
+                None => (graph_state.nodes.len(), graph_state.edges.len()),
+            }
         };
         let encoding_stats = {
             let ss = self.scan_stats.read().unwrap_or_else(|e| e.into_inner());
@@ -1497,8 +1506,8 @@ impl RnaHandler {
         F: Fn(&str) + Send + Sync,
     {
         let (all_nodes, graph_index, languages) = {
-            let guard = self.graph.read().await;
-            let gs = guard.as_ref().unwrap();
+            let snap = self.graph.load_full();
+            let gs = snap.as_ref().as_ref().unwrap();
             let langs: Vec<String> = gs.nodes.iter()
                 .map(|n| n.language.clone())
                 .collect::<std::collections::HashSet<_>>()
@@ -1527,10 +1536,11 @@ impl RnaHandler {
         let lsp_edge_count = enrichment.added_edges.len();
         on_progress(&format!("LSP: enriched {} call edges", lsp_edge_count));
 
-        // Apply enrichment to in-memory graph.
+        // Apply enrichment via load-clone-modify-store.
         {
-            let mut guard = self.graph.write().await;
-            if let Some(ref mut gs) = *guard {
+            let snap = self.graph.load_full();
+            if let Some(ref current_gs) = *snap {
+                let mut gs = (**current_gs).clone();
                 for vnode in &enrichment.new_nodes {
                     gs.index.ensure_node(&vnode.stable_id(), &vnode.id.kind.to_string());
                 }
@@ -1561,14 +1571,16 @@ impl RnaHandler {
                         }
                     }
                 }
+                self.graph.store(Arc::new(Some(Arc::new(gs))));
             }
         }
         self.lsp_status.set_complete(lsp_edge_count);
 
         // Persist with LSP edges.
         let snapshot = {
-            let g = self.graph.read().await;
-            g.as_ref().map(|gs| (gs.nodes.clone(), gs.edges.clone()))
+            let snap = self.graph.load_full();
+            snap.as_ref().as_ref()
+                .map(|gs| (gs.nodes.clone(), gs.edges.clone()))
         };
         if let Some((nodes, edges)) = snapshot {
             if let Err(e) = persist_graph_to_lance(&self.repo_root, &nodes, &edges).await {
