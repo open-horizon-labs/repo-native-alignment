@@ -55,6 +55,8 @@ pub struct SearchParams {
     pub artifact_types: Option<Vec<String>>,
     pub subsystem: Option<String>,
     pub target_subsystem: Option<String>,
+    pub include_body: bool,
+    pub minify_body: bool,
 }
 
 impl Default for SearchParams {
@@ -86,6 +88,8 @@ impl Default for SearchParams {
             artifact_types: None,
             subsystem: None,
             target_subsystem: None,
+            include_body: false,
+            minify_body: false,
         }
     }
 }
@@ -117,6 +121,8 @@ impl SearchParams {
             artifact_types: args.artifact_types.clone(),
             subsystem: args.subsystem.clone(),
             target_subsystem: args.target_subsystem.clone(),
+            include_body: args.include_body.unwrap_or(false),
+            minify_body: args.minify_body.unwrap_or(false),
         }
     }
 }

@@ -86,7 +86,7 @@ async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchCon
 
     if !matches.is_empty() {
         let strip = ctx.root_filter.as_deref();
-        let md: String = matches.iter().map(|n| format_node_entry_with_root(n, &graph_state.index, params.compact, strip)).collect::<Vec<_>>().join("\n\n");
+        let md: String = matches.iter().map(|n| format_node_entry_with_root(n, &graph_state.index, params.compact, strip, false, false)).collect::<Vec<_>>().join("\n\n");
         sections.push(format!("### Code symbols ({} result(s))\n\n{}", matches.len(), md));
     }
 
@@ -807,7 +807,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
                 _ => String::new(),
             };
 
-            let md = format_neighbors_grouped_with_root(&gs.nodes, &merged_groups, &gs.index, params.compact, strip);
+            let md = format_neighbors_grouped_with_root(&gs.nodes, &merged_groups, &gs.index, params.compact, strip, false, false);
 
             // For impact mode, append a subsystem breakdown showing which subsystems
             // are affected and through which interface function the impact propagates.
@@ -958,7 +958,7 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
                         }).count()
                     }).sum();
                     if total == 0 { sections.push(format!("### `{}`\n\nNo {} results.", display_nid, mode)); }
-                    else { let md = format_neighbors_grouped_with_root(&gs.nodes, &groups, &gs.index, params.compact, strip); sections.push(format!("### `{}`\n\n{} result(s)\n\n{}", display_nid, total, md)); }
+                    else { let md = format_neighbors_grouped_with_root(&gs.nodes, &groups, &gs.index, params.compact, strip, false, false); sections.push(format!("### `{}`\n\n{} result(s)\n\n{}", display_nid, total, md)); }
                 }
                 Err(msg) => sections.push(format!("### `{}`\n\n{}", display_nid, msg)),
             }
@@ -973,7 +973,7 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
         }
         let strip = ctx.root_filter.as_deref();
         if found.is_empty() { return format!("No nodes found for {}. Try search to find valid node IDs.{}", node_ids.iter().map(|id| format!("`{}`", strip_root_prefix(id, strip))).collect::<Vec<_>>().join(", "), freshness); }
-        let md: String = found.iter().map(|n| format_node_entry_with_root(n, &gs.index, params.compact, strip)).collect::<Vec<_>>().join("\n\n");
+        let md: String = found.iter().map(|n| format_node_entry_with_root(n, &gs.index, params.compact, strip, params.include_body, params.minify_body)).collect::<Vec<_>>().join("\n\n");
         let mut result = format!("## Batch retrieve: {} found\n\n{}", found.len(), md);
         if !missing.is_empty() { result.push_str(&format!("\n\n**Missing:** {}", missing.iter().map(|id| format!("`{}`", strip_root_prefix(id, strip))).collect::<Vec<_>>().join(", "))); }
         result.push_str(&freshness);

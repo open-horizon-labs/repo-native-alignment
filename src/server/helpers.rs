@@ -184,14 +184,14 @@ fn format_inline_code(s: &str) -> String {
 }
 
 pub(crate) fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> String {
-    format_node_entry_with_root(n, index, compact, None)
+    format_node_entry_with_root(n, index, compact, None, false, false)
 }
 
 /// Format a single node, optionally stripping the root slug prefix from
 /// displayed stable IDs. When `strip_root` is `Some(slug)`, the `slug:`
 /// prefix is removed from the ID display -- used in single-root mode
 /// where the prefix is noise.
-pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, compact: bool, strip_root: Option<&str>) -> String {
+pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, compact: bool, strip_root: Option<&str>, include_body: bool, minify_body: bool) -> String {
     let stable_id = n.stable_id();
     let display_id = strip_root_prefix(&stable_id, strip_root);
 
@@ -253,6 +253,21 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
             entry.push_str(&format!(" edges:{}", edge_count));
         }
         entry.push_str(&format!("\n  `{}`", display_id));
+        if include_body && !n.body.is_empty() {
+            let body_text = if minify_body {
+                crate::code::minify::minify_body(&n.body, &n.language)
+            } else {
+                n.body.clone()
+            };
+            let lang_hint = match n.language.as_str() {
+                "typescript" => "typescript",
+                "rust" => "rust",
+                "python" => "python",
+                "go" => "go",
+                _ => "",
+            };
+            entry.push_str(&format!("\n  ```{}\n{}\n  ```", lang_hint, body_text));
+        }
         entry
     } else {
         // Full detail (existing format)
@@ -343,6 +358,21 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
         if !incoming.is_empty() {
             entry.push_str(&format!("\n  In: {} edge(s)", incoming.len()));
         }
+        if include_body && !n.body.is_empty() {
+            let body_text = if minify_body {
+                crate::code::minify::minify_body(&n.body, &n.language)
+            } else {
+                n.body.clone()
+            };
+            let lang_hint = match n.language.as_str() {
+                "typescript" => "typescript",
+                "rust" => "rust",
+                "python" => "python",
+                "go" => "go",
+                _ => "",
+            };
+            entry.push_str(&format!("\n  ```{}\n{}\n  ```", lang_hint, body_text));
+        }
         entry
     }
 }
@@ -366,7 +396,7 @@ pub(crate) fn format_neighbors_grouped(
     index: &GraphIndex,
     compact: bool,
 ) -> String {
-    format_neighbors_grouped_with_root(nodes, groups, index, compact, None)
+    format_neighbors_grouped_with_root(nodes, groups, index, compact, None, false, false)
 }
 
 /// Format traversal results grouped by edge type, with optional root slug stripping.
@@ -380,6 +410,8 @@ pub(crate) fn format_neighbors_grouped_with_root(
     index: &GraphIndex,
     compact: bool,
     strip_root: Option<&str>,
+    include_body: bool,
+    minify_body: bool,
 ) -> String {
     // Build O(1) lookup map: stable_id -> index into nodes vec.
     let node_map: std::collections::HashMap<String, usize> = nodes
@@ -409,7 +441,7 @@ pub(crate) fn format_neighbors_grouped_with_root(
             .iter()
             .map(|id| {
                 if let Some(&i) = node_map.get(id.as_str()) {
-                    format_node_entry_with_root(&nodes[i], index, compact, strip_root)
+                    format_node_entry_with_root(&nodes[i], index, compact, strip_root, include_body, minify_body)
                 } else {
                     format_unresolved_id(id, strip_root)
                 }
@@ -789,7 +821,7 @@ mod tests {
     fn test_format_node_entry_with_root_strips_prefix() {
         let node = make_test_node("my_func");
         let index = GraphIndex::new();
-        let full = format_node_entry_with_root(&node, &index, false, Some("test"));
+        let full = format_node_entry_with_root(&node, &index, false, Some("test"), false, false);
         // The stable ID should NOT start with "test:" in the display
         assert!(full.contains("ID: `src/test.rs:my_func:function`"), "got: {}", full);
     }
@@ -798,7 +830,7 @@ mod tests {
     fn test_format_node_entry_with_root_compact_strips_prefix() {
         let node = make_test_node("my_func");
         let index = GraphIndex::new();
-        let compact = format_node_entry_with_root(&node, &index, true, Some("test"));
+        let compact = format_node_entry_with_root(&node, &index, true, Some("test"), false, false);
         // The trailing stable ID line should not have the root prefix
         assert!(compact.contains("`src/test.rs:my_func:function`"), "got: {}", compact);
         assert!(!compact.contains("`test:src/"), "root prefix should be stripped, got: {}", compact);

@@ -1,3 +1,5 @@
+pub mod minify;
+
 use std::path::Path;
 
 use anyhow::Result;

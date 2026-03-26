@@ -31,7 +31,7 @@ pub struct OutcomeProgress {
 
 #[macros::mcp_tool(
     name = "search",
-    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Add `mode` for graph traversal (neighbors/impact/reachable/tests_for/cycles/path) — equivalent to the `graph` CLI command. Use `compact: true` to save tokens. Use `rerank: true` for natural language queries. Use `subsystem` to scope to a subsystem from repo_map. Use `target_subsystem` with mode to find cross-subsystem edges. Use `depth` with mode='neighbors' to walk N levels deep (e.g., module → members → their members). Use `limit` to control max results (flat default: 10, traversal default: 1)."
+    description = "USE THIS INSTEAD OF Grep/Read for code understanding. Searches code symbols, docs, business artifacts, and commits in one call. Add `mode` for graph traversal (neighbors/impact/reachable/tests_for/cycles/path) — equivalent to the `graph` CLI command. Use `compact: true` to save tokens. Use `rerank: true` for natural language queries. Use `subsystem` to scope to a subsystem from repo_map. Use `target_subsystem` with mode to find cross-subsystem edges. Use `depth` with mode='neighbors' to walk N levels deep (e.g., module → members → their members). Use `limit` to control max results (flat default: 10, traversal default: 1). Use `include_body: true` to return function bodies; add `minify_body: true` to strip comments and shorten locals."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct Search {
@@ -110,6 +110,12 @@ pub struct Search {
     /// Repo path to query (e.g. worktree path); defaults to server repo
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    /// Include function body in results (default: false)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_body: Option<bool>,
+    /// Minify body: strip comments, shorten locals (default: false). Only applies when include_body=true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minify_body: Option<bool>,
 }
 
 fn default_true() -> Option<bool> {

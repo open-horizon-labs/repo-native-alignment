@@ -80,6 +80,9 @@ impl RnaHandler {
 
     pub(crate) async fn handle_search(&self, args: Search) -> Result<CallToolResult, CallToolError> {
         let params = SearchParams::from_mcp_search(&args);
+        if params.include_body && args.node.is_none() && args.nodes.is_none() {
+            return Ok(text_result("include_body requires `node` or `nodes` parameter".into()));
+        }
 
         // When `repo` is provided, load an external graph from that path.
         // Semantic search is skipped (no embed_index for external repos).
