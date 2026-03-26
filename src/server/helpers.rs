@@ -183,6 +183,23 @@ fn format_inline_code(s: &str) -> String {
     format!("{fence}{s}{fence}")
 }
 
+/// Wrap content in a CommonMark fenced code block using a fence long enough
+/// to safely contain any backticks in the content (e.g. template literals).
+fn format_fenced_code_block(content: &str, lang_hint: &str) -> String {
+    let mut max_run = 0usize;
+    let mut run = 0usize;
+    for ch in content.chars() {
+        if ch == '`' {
+            run += 1;
+            max_run = max_run.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let fence = "`".repeat(max_run.max(2) + 1); // at least 3 backticks
+    format!("\n  {}{}\n{}\n  {}", fence, lang_hint, content, fence)
+}
+
 pub(crate) fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> String {
     format_node_entry_with_root(n, index, compact, None, false, false)
 }
@@ -266,7 +283,7 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
                 "go" => "go",
                 _ => "",
             };
-            entry.push_str(&format!("\n  ```{}\n{}\n  ```", lang_hint, body_text));
+            entry.push_str(&format_fenced_code_block(&body_text, lang_hint));
         }
         entry
     } else {
@@ -371,7 +388,7 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
                 "go" => "go",
                 _ => "",
             };
-            entry.push_str(&format!("\n  ```{}\n{}\n  ```", lang_hint, body_text));
+            entry.push_str(&format_fenced_code_block(&body_text, lang_hint));
         }
         entry
     }
