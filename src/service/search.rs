@@ -122,7 +122,7 @@ async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchCon
             }
         }
 
-    let freshness = format_freshness_full(graph_state.nodes.len(), graph_state.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
+    let freshness = if params.verbose { format_freshness_full(graph_state.nodes.len(), graph_state.last_scan_completed_at, ctx.lsp_status, ctx.embed_status) } else { String::new() };
     if sections.is_empty() { format!("No results matching \"{}\".{}", query_str, freshness) }
     else { format!("## Search: \"{}\"\n\n{}{}", query_str, sections.join("\n\n"), freshness) }
 }
@@ -412,7 +412,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
             types.iter().filter_map(|t| parse_edge_kind(t)).collect::<Vec<_>>()
         });
         let edge_filter_slice = edge_filter.as_deref();
-        let freshness = format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
+        let freshness = if params.verbose { format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status) } else { String::new() };
         let strip = ctx.root_filter.as_deref();
 
         if let Some(node_id) = node {
@@ -482,7 +482,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
             types.iter().filter_map(|t| parse_edge_kind(t)).collect::<Vec<_>>()
         });
         let edge_filter_slice = edge_filter.as_deref();
-        let freshness = format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
+        let freshness = if params.verbose { format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status) } else { String::new() };
         let strip = ctx.root_filter.as_deref();
 
         if gs.index.get_node(&from_id).is_none() {
@@ -738,7 +738,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
     let strip = ctx.root_filter.as_deref();
     let entry_label = if valid_entry_ids.len() == 1 { format!("`{}`", strip_root_prefix(valid_entry_ids[0], strip)) } else { format!("{} entry nodes", valid_entry_ids.len()) };
     let direction = params.direction.as_deref().unwrap_or("outgoing");
-    let freshness = format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
+    let freshness = if params.verbose { format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status) } else { String::new() };
 
     if total_count == 0 {
         let mode_desc = match mode {
@@ -923,7 +923,7 @@ fn count_affected_subsystems(
 fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_>) -> String {
     use crate::server::handlers::run_traversal_grouped;
     let gs = ctx.graph_state;
-    let freshness = format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
+    let freshness = if params.verbose { format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status) } else { String::new() };
     // Build O(1) lookup map and root slugs once for the entire batch.
     let node_index_map = gs.node_index_map();
     let roots = GraphState::root_slugs_from_index_map(&node_index_map);

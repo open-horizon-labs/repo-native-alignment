@@ -59,6 +59,8 @@ struct SearchArgs {
     #[arg(long)] rerank: bool, #[arg(long)] subsystem: Option<String>,
     #[arg(long)] target_subsystem: Option<String>,
     #[arg(long)] include_body: bool, #[arg(long)] minify_body: bool,
+    /// Show index stats (default: true for CLI, false for MCP)
+    #[arg(long, default_value_t = true)] verbose: bool,
 }
 #[derive(clap::Args, Debug)]
 struct GraphArgs {
@@ -206,7 +208,7 @@ async fn async_main() -> anyhow::Result<()> {
                 artifact_types: args.artifact_types.as_ref().map(|s| s.split(',').map(|t| t.trim().to_string()).collect()),
                 subsystem: args.subsystem.clone(),
                 target_subsystem: args.target_subsystem.clone(),
-                include_body: args.include_body, minify_body: args.minify_body,
+                include_body: args.include_body, minify_body: args.minify_body, verbose: args.verbose,
             };
             let root_filter = resolve_root_filter(args.root.as_deref(), &repo_root);
             // Include lsp_only subdirectory root slugs in non_code_slugs so they're not

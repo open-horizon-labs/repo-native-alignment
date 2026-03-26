@@ -57,6 +57,7 @@ pub struct SearchParams {
     pub target_subsystem: Option<String>,
     pub include_body: bool,
     pub minify_body: bool,
+    pub verbose: bool,
 }
 
 impl Default for SearchParams {
@@ -90,6 +91,7 @@ impl Default for SearchParams {
             target_subsystem: None,
             include_body: false,
             minify_body: false,
+            verbose: false,
         }
     }
 }
@@ -123,6 +125,7 @@ impl SearchParams {
             target_subsystem: args.target_subsystem.clone(),
             include_body: args.include_body.unwrap_or(false),
             minify_body: args.minify_body.unwrap_or(false),
+            verbose: args.verbose.unwrap_or(false),
         }
     }
 }

@@ -116,6 +116,9 @@ pub struct Search {
     /// Minify body: strip comments, shorten locals (default: false). Only applies when include_body=true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minify_body: Option<bool>,
+    /// Show index stats footer (default: false for MCP, true for CLI)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbose: Option<bool>,
 }
 
 fn default_true() -> Option<bool> {
