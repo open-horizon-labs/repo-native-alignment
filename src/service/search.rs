@@ -807,7 +807,15 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
                 _ => String::new(),
             };
 
-            let md = format_neighbors_grouped_with_root(&gs.nodes, &merged_groups, &gs.index, params.compact, strip, false, false);
+            let md = format_neighbors_grouped_with_root(
+                &gs.nodes,
+                &merged_groups,
+                &gs.index,
+                params.compact,
+                strip,
+                params.include_body,
+                params.minify_body,
+            );
 
             // For impact mode, append a subsystem breakdown showing which subsystems
             // are affected and through which interface function the impact propagates.
@@ -958,7 +966,18 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
                         }).count()
                     }).sum();
                     if total == 0 { sections.push(format!("### `{}`\n\nNo {} results.", display_nid, mode)); }
-                    else { let md = format_neighbors_grouped_with_root(&gs.nodes, &groups, &gs.index, params.compact, strip, false, false); sections.push(format!("### `{}`\n\n{} result(s)\n\n{}", display_nid, total, md)); }
+                    else {
+                        let md = format_neighbors_grouped_with_root(
+                            &gs.nodes,
+                            &groups,
+                            &gs.index,
+                            params.compact,
+                            strip,
+                            params.include_body,
+                            params.minify_body,
+                        );
+                        sections.push(format!("### `{}`\n\n{} result(s)\n\n{}", display_nid, total, md));
+                    }
                 }
                 Err(msg) => sections.push(format!("### `{}`\n\n{}", display_nid, msg)),
             }

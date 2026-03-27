@@ -354,6 +354,31 @@ mod tests {
     }
 
     #[test]
+    fn test_search_include_body_default_is_none() {
+        let s = parse_search(json!({"query": "test"})).unwrap();
+        assert!(s.include_body.is_none());
+    }
+
+    #[test]
+    fn test_search_include_body_true() {
+        let s = parse_search(json!({"query": "test", "node": "x", "include_body": true})).unwrap();
+        assert_eq!(s.include_body, Some(true));
+    }
+
+    #[test]
+    fn test_search_minify_body_default_is_none() {
+        let s = parse_search(json!({"query": "test"})).unwrap();
+        assert!(s.minify_body.is_none());
+    }
+
+    #[test]
+    fn test_search_minify_body_with_include_body() {
+        let s = parse_search(json!({"node": "x", "include_body": true, "minify_body": true})).unwrap();
+        assert_eq!(s.include_body, Some(true));
+        assert_eq!(s.minify_body, Some(true));
+    }
+
+    #[test]
     fn test_search_nodes_param() {
         let s = parse_search(json!({
             "nodes": ["root:file:name:kind", "root:file2:name2:kind"]

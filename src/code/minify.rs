@@ -16,7 +16,8 @@ pub fn minify_body(body: &str, language: &str) -> String {
     }
 
     match language {
-        "typescript" | "tsx" | "javascript" | "jsx" => minify_ts(body),
+        "typescript" | "tsx" => minify_ts(body),
+        "javascript" | "jsx" => minify_javascript(body),
         "rust" => minify_rust(body),
         "python" => minify_python(body),
         "go" => minify_go(body),
@@ -36,7 +37,17 @@ fn minify_ts(body: &str) -> String {
     minify_with_ast(&mut parser, body, "typescript", collect_ts_locals)
 }
 
-/// Collect local variable declarations from tree-sitter AST.
+fn minify_javascript(body: &str) -> String {
+    // Use the dedicated JavaScript parser for JS/JSX to avoid
+    // subtle TSX-versus-JS ambiguity in edge cases.
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&tree_sitter_javascript::LANGUAGE.into()).is_err() {
+        return minify_text(body, "javascript");
+    }
+    minify_with_ast(&mut parser, body, "javascript", collect_ts_locals)
+}
+
+// Collect local variable declarations from tree-sitter AST.
 fn collect_ts_locals(
     node: tree_sitter::Node,
     source: &[u8],
@@ -159,7 +170,7 @@ fn make_short_name(original: &str, used: &mut std::collections::HashSet<String>)
     use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
 
-    const ALPHA: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789"; // base-36: 46,656 slots
+    const ALPHA: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789"; // base-36 with letter-only first char: 26 * 36 * 36 = 33,696 slots
 
     let mut hasher = DefaultHasher::new();
     original.hash(&mut hasher);
@@ -807,11 +818,17 @@ fn minify_text(body: &str, language: &str) -> String {
         result.push(trimmed);
     }
 
-    while result.first().map(|s| s.is_empty()).unwrap_or(false) {
-        result.remove(0);
-    }
-    while result.last().map(|s| s.is_empty()).unwrap_or(false) {
-        result.pop();
+    let start = result.iter().position(|s| !s.is_empty()).unwrap_or(result.len());
+    let end = result
+        .iter()
+        .rposition(|s| !s.is_empty())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    if start >= end {
+        result.clear();
+    } else {
+        result.drain(0..start);
+        result.truncate(end - start);
     }
 
     result.join("\n")

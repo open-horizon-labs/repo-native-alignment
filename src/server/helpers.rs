@@ -853,6 +853,19 @@ mod tests {
         assert!(!compact.contains("`test:src/"), "root prefix should be stripped, got: {}", compact);
     }
 
+    #[test]
+    fn test_format_node_entry_with_root_includes_body_with_safe_fence() {
+        let mut node = make_test_node("template_fn");
+        node.language = "typescript".to_string();
+        node.body = "const fenced = \"```\";\nconst inline = `value`;".to_string();
+        let index = GraphIndex::new();
+        let full = format_node_entry_with_root(&node, &index, false, Some("test"), true, false);
+
+        assert!(full.contains("````typescript"));
+        assert!(full.contains("const fenced = \"```\";"));
+        assert!(full.contains("const inline = `value`;"));
+    }
+
     // ── format_freshness_full with embedding status ─────────────────
 
     #[test]
