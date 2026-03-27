@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result};
 use arrow_array::{
@@ -363,6 +363,10 @@ fn node_scalar_filters(
     }
 }
 
+// Serialize embedding model initialization within this process to avoid
+// HuggingFace cache lock contention when tests call `new_model()` in parallel.
+static MODEL_LOAD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
     let start = std::time::Instant::now();
 
@@ -382,6 +386,7 @@ fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
     };
     #[cfg(not(feature = "metal"))]
     let device_name = "CPU";
+    let _model_load_guard = MODEL_LOAD_LOCK.lock().expect("model load lock poisoned");
 
     let model = metal_candle::embeddings::EmbeddingModel::from_pretrained(
         metal_candle::embeddings::EmbeddingModelType::AllMiniLmL6V2,
