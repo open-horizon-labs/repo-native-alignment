@@ -16,9 +16,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::graph::{
-    Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
-};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 use super::{ExtractionResult, Extractor};
 
@@ -189,12 +187,12 @@ fn extract_operation(
     edges: &mut Vec<Edge>,
 ) {
     // Operation type: query | mutation | subscription (absent for shorthand query)
-    let op_type = find_child_kind_text(node, "operation_type", source)
-        .unwrap_or_else(|| "query".to_string());
+    let op_type =
+        find_child_kind_text(node, "operation_type", source).unwrap_or_else(|| "query".to_string());
 
     // Name is optional for anonymous operations
-    let name = find_child_text(node, "name", source)
-        .unwrap_or_else(|| format!("<anonymous {}>", op_type));
+    let name =
+        find_child_text(node, "name", source).unwrap_or_else(|| format!("<anonymous {}>", op_type));
 
     let line_start = node.start_position().row + 1;
     let line_end = node.end_position().row + 1;
@@ -533,9 +531,10 @@ fn find_child_by_kind<'tree>(
     let child_count = node.child_count();
     for i in 0..child_count {
         if let Some(child) = node.child(i as u32)
-            && child.kind() == kind {
-                return Some(child);
-            }
+            && child.kind() == kind
+        {
+            return Some(child);
+        }
     }
     None
 }
@@ -549,11 +548,7 @@ fn find_child_text(node: tree_sitter::Node<'_>, kind: &str, source: &[u8]) -> Op
 }
 
 /// Alias for find_child_text (for non-named node kinds like operation_type).
-fn find_child_kind_text(
-    node: tree_sitter::Node<'_>,
-    kind: &str,
-    source: &[u8],
-) -> Option<String> {
+fn find_child_kind_text(node: tree_sitter::Node<'_>, kind: &str, source: &[u8]) -> Option<String> {
     find_child_text(node, kind, source)
 }
 
@@ -569,9 +564,10 @@ fn find_child_type_condition(node: tree_sitter::Node<'_>, source: &[u8]) -> Opti
 fn extract_type_text(node: tree_sitter::Node<'_>, source: &[u8]) -> String {
     for kind in &["non_null_type", "list_type", "named_type", "type"] {
         if let Some(t) = find_child_by_kind(node, kind)
-            && let Ok(text) = t.utf8_text(source) {
-                return text.trim().to_string();
-            }
+            && let Ok(text) = t.utf8_text(source)
+        {
+            return text.trim().to_string();
+        }
     }
     String::new()
 }
@@ -818,7 +814,10 @@ mutation CreateUser($name: String!) {
 
         let create_user = ops.iter().find(|n| n.id.name == "CreateUser").unwrap();
         assert_eq!(
-            create_user.metadata.get("operation_type").map(|s| s.as_str()),
+            create_user
+                .metadata
+                .get("operation_type")
+                .map(|s| s.as_str()),
             Some("mutation")
         );
     }
@@ -856,7 +855,10 @@ input CreateUserInput {
             Some("scalar")
         );
 
-        let input = types.iter().find(|n| n.id.name == "CreateUserInput").unwrap();
+        let input = types
+            .iter()
+            .find(|n| n.id.name == "CreateUserInput")
+            .unwrap();
         assert_eq!(
             input.metadata.get("graphql_kind").map(|s| s.as_str()),
             Some("input")

@@ -52,8 +52,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::extract::cache::ConsumerCacheKey;
-use crate::graph::{Edge, Node};
 use crate::graph::index::Subsystem;
+use crate::graph::{Edge, Node};
 
 // ---------------------------------------------------------------------------
 // Events
@@ -228,16 +228,20 @@ impl ExtractionEvent {
     /// Return the kind discriminant for this event.
     pub fn kind(&self) -> ExtractionEventKind {
         match self {
-            ExtractionEvent::RootDiscovered { .. }  => ExtractionEventKind::RootDiscovered,
-            ExtractionEvent::RootExtracted { .. }   => ExtractionEventKind::RootExtracted,
-            ExtractionEvent::LanguageDetected { .. }  => ExtractionEventKind::LanguageDetected,
+            ExtractionEvent::RootDiscovered { .. } => ExtractionEventKind::RootDiscovered,
+            ExtractionEvent::RootExtracted { .. } => ExtractionEventKind::RootExtracted,
+            ExtractionEvent::LanguageDetected { .. } => ExtractionEventKind::LanguageDetected,
             ExtractionEvent::EnrichmentComplete { .. } => ExtractionEventKind::EnrichmentComplete,
             ExtractionEvent::FrameworkDetected { .. } => ExtractionEventKind::FrameworkDetected,
-            ExtractionEvent::PassComplete { .. }    => ExtractionEventKind::PassComplete,
-            ExtractionEvent::PassesComplete { .. }  => ExtractionEventKind::PassesComplete,
+            ExtractionEvent::PassComplete { .. } => ExtractionEventKind::PassComplete,
+            ExtractionEvent::PassesComplete { .. } => ExtractionEventKind::PassesComplete,
             ExtractionEvent::AllEnrichmentsDone { .. } => ExtractionEventKind::AllEnrichmentsDone,
-            ExtractionEvent::CommunityDetectionComplete { .. } => ExtractionEventKind::CommunityDetectionComplete,
-            ExtractionEvent::SubsystemNodesComplete { .. } => ExtractionEventKind::SubsystemNodesComplete,
+            ExtractionEvent::CommunityDetectionComplete { .. } => {
+                ExtractionEventKind::CommunityDetectionComplete
+            }
+            ExtractionEvent::SubsystemNodesComplete { .. } => {
+                ExtractionEventKind::SubsystemNodesComplete
+            }
         }
     }
 
@@ -261,14 +265,24 @@ impl ExtractionEvent {
         buf.push(b'\n');
 
         match self {
-            ExtractionEvent::RootDiscovered { slug, path, lsp_only } => {
+            ExtractionEvent::RootDiscovered {
+                slug,
+                path,
+                lsp_only,
+            } => {
                 buf.extend_from_slice(slug.as_bytes());
                 buf.push(b'\t');
                 buf.extend_from_slice(path.to_string_lossy().as_bytes());
                 buf.push(b'\t');
                 buf.push(if *lsp_only { b'1' } else { b'0' });
             }
-            ExtractionEvent::RootExtracted { slug, path, nodes, edges, dirty_slugs } => {
+            ExtractionEvent::RootExtracted {
+                slug,
+                path,
+                nodes,
+                edges,
+                dirty_slugs,
+            } => {
                 buf.extend_from_slice(slug.as_bytes());
                 buf.push(b'\t');
                 buf.extend_from_slice(path.to_string_lossy().as_bytes());
@@ -302,7 +316,11 @@ impl ExtractionEvent {
                     buf.extend_from_slice(key.as_bytes());
                 }
             }
-            ExtractionEvent::LanguageDetected { slug, language, nodes } => {
+            ExtractionEvent::LanguageDetected {
+                slug,
+                language,
+                nodes,
+            } => {
                 buf.extend_from_slice(slug.as_bytes());
                 buf.push(b'\t');
                 buf.extend_from_slice(language.as_bytes());
@@ -313,7 +331,14 @@ impl ExtractionEvent {
                     buf.extend_from_slice(id.as_bytes());
                 }
             }
-            ExtractionEvent::EnrichmentComplete { slug, language, added_edges, new_nodes, updated_nodes, .. } => {
+            ExtractionEvent::EnrichmentComplete {
+                slug,
+                language,
+                added_edges,
+                new_nodes,
+                updated_nodes,
+                ..
+            } => {
                 buf.extend_from_slice(slug.as_bytes());
                 buf.push(b'\t');
                 buf.extend_from_slice(language.as_bytes());
@@ -323,7 +348,8 @@ impl ExtractionEvent {
                     buf.push(b'\n');
                     buf.extend_from_slice(id.as_bytes());
                 }
-                let mut edge_keys: Vec<String> = added_edges.iter().map(canonical_edge_key).collect();
+                let mut edge_keys: Vec<String> =
+                    added_edges.iter().map(canonical_edge_key).collect();
                 edge_keys.sort_unstable();
                 for key in &edge_keys {
                     buf.push(b'\n');
@@ -336,7 +362,8 @@ impl ExtractionEvent {
                     .iter()
                     .map(|(id, map)| {
                         // Serialize the BTreeMap deterministically (already sorted by key).
-                        let values: String = map.iter()
+                        let values: String = map
+                            .iter()
                             .map(|(k, v)| format!("{}={}", k, v))
                             .collect::<Vec<_>>()
                             .join(",");
@@ -351,7 +378,11 @@ impl ExtractionEvent {
                     buf.extend_from_slice(values.as_bytes());
                 }
             }
-            ExtractionEvent::FrameworkDetected { slug, framework, nodes } => {
+            ExtractionEvent::FrameworkDetected {
+                slug,
+                framework,
+                nodes,
+            } => {
                 buf.extend_from_slice(slug.as_bytes());
                 buf.push(b'\t');
                 buf.extend_from_slice(framework.as_bytes());
@@ -362,14 +393,23 @@ impl ExtractionEvent {
                     buf.extend_from_slice(id.as_bytes());
                 }
             }
-            ExtractionEvent::PassComplete { pass_name, added_nodes, added_edges } => {
+            ExtractionEvent::PassComplete {
+                pass_name,
+                added_nodes,
+                added_edges,
+            } => {
                 buf.extend_from_slice(pass_name.as_bytes());
                 buf.push(b'\t');
                 buf.extend_from_slice(added_nodes.to_string().as_bytes());
                 buf.push(b'\t');
                 buf.extend_from_slice(added_edges.to_string().as_bytes());
             }
-            ExtractionEvent::PassesComplete { slug, nodes, edges, detected_frameworks } => {
+            ExtractionEvent::PassesComplete {
+                slug,
+                nodes,
+                edges,
+                detected_frameworks,
+            } => {
                 buf.extend_from_slice(slug.as_bytes());
                 let mut node_ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
                 node_ids.sort_unstable();
@@ -383,14 +423,22 @@ impl ExtractionEvent {
                     buf.push(b'\n');
                     buf.extend_from_slice(key.as_bytes());
                 }
-                let mut frameworks: Vec<&str> = detected_frameworks.iter().map(|s| s.as_str()).collect();
+                let mut frameworks: Vec<&str> =
+                    detected_frameworks.iter().map(|s| s.as_str()).collect();
                 frameworks.sort_unstable();
                 for f in &frameworks {
                     buf.push(b'\t');
                     buf.extend_from_slice(f.as_bytes());
                 }
             }
-            ExtractionEvent::AllEnrichmentsDone { slug, nodes, edges, lsp_edges, lsp_nodes, updated_nodes } => {
+            ExtractionEvent::AllEnrichmentsDone {
+                slug,
+                nodes,
+                edges,
+                lsp_edges,
+                lsp_nodes,
+                updated_nodes,
+            } => {
                 buf.extend_from_slice(slug.as_bytes());
                 let mut node_ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
                 node_ids.sort_unstable();
@@ -398,7 +446,8 @@ impl ExtractionEvent {
                     buf.push(b'\n');
                     buf.extend_from_slice(id.as_bytes());
                 }
-                let mut lsp_node_ids: Vec<String> = lsp_nodes.iter().map(|n| n.stable_id()).collect();
+                let mut lsp_node_ids: Vec<String> =
+                    lsp_nodes.iter().map(|n| n.stable_id()).collect();
                 lsp_node_ids.sort_unstable();
                 for id in &lsp_node_ids {
                     buf.push(b'\n');
@@ -410,7 +459,8 @@ impl ExtractionEvent {
                     buf.push(b'\n');
                     buf.extend_from_slice(key.as_bytes());
                 }
-                let mut lsp_edge_keys: Vec<String> = lsp_edges.iter().map(canonical_edge_key).collect();
+                let mut lsp_edge_keys: Vec<String> =
+                    lsp_edges.iter().map(canonical_edge_key).collect();
                 lsp_edge_keys.sort_unstable();
                 for key in &lsp_edge_keys {
                     buf.push(b'\n');
@@ -421,7 +471,8 @@ impl ExtractionEvent {
                 let mut patches: Vec<(&str, String)> = updated_nodes
                     .iter()
                     .map(|(id, map)| {
-                        let values: String = map.iter()
+                        let values: String = map
+                            .iter()
                             .map(|(k, v)| format!("{}={}", k, v))
                             .collect::<Vec<_>>()
                             .join(",");
@@ -436,7 +487,11 @@ impl ExtractionEvent {
                     buf.extend_from_slice(values.as_bytes());
                 }
             }
-            ExtractionEvent::CommunityDetectionComplete { slug, subsystems, nodes } => {
+            ExtractionEvent::CommunityDetectionComplete {
+                slug,
+                subsystems,
+                nodes,
+            } => {
                 buf.extend_from_slice(slug.as_bytes());
                 // Hash each subsystem's name AND sorted member_ids so that membership
                 // changes (nodes moving between clusters) invalidate the cache even when
@@ -444,7 +499,8 @@ impl ExtractionEvent {
                 let mut subs: Vec<(&str, Vec<&str>)> = subsystems
                     .iter()
                     .map(|s| {
-                        let mut members: Vec<&str> = s.member_ids.iter().map(|m| m.as_str()).collect();
+                        let mut members: Vec<&str> =
+                            s.member_ids.iter().map(|m| m.as_str()).collect();
                         members.sort_unstable();
                         (s.name.as_str(), members)
                     })
@@ -466,7 +522,11 @@ impl ExtractionEvent {
                     buf.extend_from_slice(id.as_bytes());
                 }
             }
-            ExtractionEvent::SubsystemNodesComplete { slug, added_nodes, added_edges } => {
+            ExtractionEvent::SubsystemNodesComplete {
+                slug,
+                added_nodes,
+                added_edges,
+            } => {
                 buf.extend_from_slice(slug.as_bytes());
                 let mut node_ids: Vec<String> = added_nodes.iter().map(|n| n.stable_id()).collect();
                 node_ids.sort_unstable();
@@ -474,7 +534,8 @@ impl ExtractionEvent {
                     buf.push(b'\n');
                     buf.extend_from_slice(id.as_bytes());
                 }
-                let mut edge_keys: Vec<String> = added_edges.iter().map(canonical_edge_key).collect();
+                let mut edge_keys: Vec<String> =
+                    added_edges.iter().map(canonical_edge_key).collect();
                 edge_keys.sort_unstable();
                 for key in &edge_keys {
                     buf.push(b'\n');
@@ -488,13 +549,13 @@ impl ExtractionEvent {
     /// Short lowercase tag for the event kind — used as a prefix in `canonical_bytes`.
     fn kind_tag(&self) -> &'static str {
         match self {
-            ExtractionEvent::RootDiscovered { .. }    => "root_discovered",
-            ExtractionEvent::RootExtracted { .. }     => "root_extracted",
-            ExtractionEvent::LanguageDetected { .. }  => "language_detected",
+            ExtractionEvent::RootDiscovered { .. } => "root_discovered",
+            ExtractionEvent::RootExtracted { .. } => "root_extracted",
+            ExtractionEvent::LanguageDetected { .. } => "language_detected",
             ExtractionEvent::EnrichmentComplete { .. } => "enrichment_complete",
             ExtractionEvent::FrameworkDetected { .. } => "framework_detected",
-            ExtractionEvent::PassComplete { .. }      => "pass_complete",
-            ExtractionEvent::PassesComplete { .. }    => "passes_complete",
+            ExtractionEvent::PassComplete { .. } => "pass_complete",
+            ExtractionEvent::PassesComplete { .. } => "passes_complete",
             ExtractionEvent::AllEnrichmentsDone { .. } => "all_enrichments_done",
             ExtractionEvent::CommunityDetectionComplete { .. } => "community_detection_complete",
             ExtractionEvent::SubsystemNodesComplete { .. } => "subsystem_nodes_complete",
@@ -782,7 +843,10 @@ impl EventBus {
     }
 
     /// Emit multiple seed events (one per discovered root), process all follow-ons.
-    pub async fn emit_all(&mut self, seeds: impl IntoIterator<Item = ExtractionEvent>) -> Vec<ExtractionEvent> {
+    pub async fn emit_all(
+        &mut self,
+        seeds: impl IntoIterator<Item = ExtractionEvent>,
+    ) -> Vec<ExtractionEvent> {
         let mut all: Vec<ExtractionEvent> = Vec::new();
         for seed in seeds {
             all.extend(self.emit(seed).await);
@@ -827,7 +891,10 @@ impl Default for EventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     struct CountingConsumer {
         name: &'static str,
@@ -837,8 +904,12 @@ mod tests {
 
     #[async_trait]
     impl ExtractionConsumer for CountingConsumer {
-        fn name(&self) -> &str { self.name }
-        fn subscribes_to(&self) -> &[ExtractionEventKind] { &self.kinds }
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn subscribes_to(&self) -> &[ExtractionEventKind] {
+            &self.kinds
+        }
         async fn on_event(&self, _event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
             self.count.fetch_add(1, Ordering::Relaxed);
             Ok(vec![])
@@ -853,8 +924,12 @@ mod tests {
 
     #[async_trait]
     impl ExtractionConsumer for EmittingConsumer {
-        fn name(&self) -> &str { self.name }
-        fn subscribes_to(&self) -> &[ExtractionEventKind] { std::slice::from_ref(&self.listens) }
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn subscribes_to(&self) -> &[ExtractionEventKind] {
+            std::slice::from_ref(&self.listens)
+        }
         async fn on_event(&self, _event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
             Ok(self.emits.clone())
         }
@@ -911,7 +986,11 @@ mod tests {
         }));
 
         bus.emit(make_root_discovered()).await;
-        assert_eq!(count.load(Ordering::Relaxed), 0, "counter must not fire for non-matching event");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "counter must not fire for non-matching event"
+        );
     }
 
     #[tokio::test]
@@ -934,8 +1013,16 @@ mod tests {
         }));
 
         let emitted = bus.emit(make_root_discovered()).await;
-        assert_eq!(count.load(Ordering::Relaxed), 1, "follow-on event must be routed");
-        assert_eq!(emitted.len(), 2, "emitted list must contain seed + follow-on");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "follow-on event must be routed"
+        );
+        assert_eq!(
+            emitted.len(),
+            2,
+            "emitted list must contain seed + follow-on"
+        );
     }
 
     #[tokio::test]
@@ -977,11 +1064,16 @@ mod tests {
         struct FailingConsumer;
         #[async_trait]
         impl ExtractionConsumer for FailingConsumer {
-            fn name(&self) -> &str { "failing" }
+            fn name(&self) -> &str {
+                "failing"
+            }
             fn subscribes_to(&self) -> &[ExtractionEventKind] {
                 &[ExtractionEventKind::RootDiscovered]
             }
-            async fn on_event(&self, _event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+            async fn on_event(
+                &self,
+                _event: &ExtractionEvent,
+            ) -> anyhow::Result<Vec<ExtractionEvent>> {
                 Err(anyhow::anyhow!("test error"))
             }
         }
@@ -996,7 +1088,11 @@ mod tests {
         }));
 
         bus.emit(make_root_discovered()).await;
-        assert_eq!(count.load(Ordering::Relaxed), 1, "second consumer must still run after first fails");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "second consumer must still run after first fails"
+        );
     }
 
     #[tokio::test]
@@ -1013,9 +1109,21 @@ mod tests {
         // and does not hit the in-memory cache. The test validates that emit_all
         // processes every seed; caching is tested separately in test_cache_*.
         let seeds = vec![
-            ExtractionEvent::RootDiscovered { slug: "a".into(), path: PathBuf::from("."), lsp_only: false },
-            ExtractionEvent::RootDiscovered { slug: "b".into(), path: PathBuf::from("."), lsp_only: false },
-            ExtractionEvent::RootDiscovered { slug: "c".into(), path: PathBuf::from("."), lsp_only: false },
+            ExtractionEvent::RootDiscovered {
+                slug: "a".into(),
+                path: PathBuf::from("."),
+                lsp_only: false,
+            },
+            ExtractionEvent::RootDiscovered {
+                slug: "b".into(),
+                path: PathBuf::from("."),
+                lsp_only: false,
+            },
+            ExtractionEvent::RootDiscovered {
+                slug: "c".into(),
+                path: PathBuf::from("."),
+                lsp_only: false,
+            },
         ];
         bus.emit_all(seeds).await;
         assert_eq!(count.load(Ordering::Relaxed), 3);
@@ -1063,8 +1171,11 @@ mod tests {
         }));
 
         bus.emit(make_root_discovered()).await;
-        assert_eq!(count.load(Ordering::Relaxed), 1,
-            "counter registered before emitter must still receive follow-on event");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "counter registered before emitter must still receive follow-on event"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1143,12 +1254,21 @@ mod tests {
             edges: Arc::from(vec![].into_boxed_slice()),
             dirty_slugs: Some(HashSet::new()), // none dirty
         };
-        assert_ne!(e1.canonical_bytes(), e2.canonical_bytes(),
-            "None vs Some(set) must produce different cache keys");
-        assert_ne!(e1.canonical_bytes(), e3.canonical_bytes(),
-            "None vs Some(empty) must produce different cache keys");
-        assert_ne!(e2.canonical_bytes(), e3.canonical_bytes(),
-            "Some(set) vs Some(empty) must produce different cache keys");
+        assert_ne!(
+            e1.canonical_bytes(),
+            e2.canonical_bytes(),
+            "None vs Some(set) must produce different cache keys"
+        );
+        assert_ne!(
+            e1.canonical_bytes(),
+            e3.canonical_bytes(),
+            "None vs Some(empty) must produce different cache keys"
+        );
+        assert_ne!(
+            e2.canonical_bytes(),
+            e3.canonical_bytes(),
+            "Some(set) vs Some(empty) must produce different cache keys"
+        );
     }
 
     /// Default consumer version is 0.
@@ -1157,9 +1277,15 @@ mod tests {
         struct ZeroConsumer;
         #[async_trait]
         impl ExtractionConsumer for ZeroConsumer {
-            fn name(&self) -> &str { "zero" }
-            fn subscribes_to(&self) -> &[ExtractionEventKind] { &[] }
-            async fn on_event(&self, _: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> { Ok(vec![]) }
+            fn name(&self) -> &str {
+                "zero"
+            }
+            fn subscribes_to(&self) -> &[ExtractionEventKind] {
+                &[]
+            }
+            async fn on_event(&self, _: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+                Ok(vec![])
+            }
         }
         assert_eq!(ZeroConsumer.version(), 0);
     }
@@ -1170,10 +1296,18 @@ mod tests {
         struct VersionedConsumer;
         #[async_trait]
         impl ExtractionConsumer for VersionedConsumer {
-            fn name(&self) -> &str { "versioned" }
-            fn subscribes_to(&self) -> &[ExtractionEventKind] { &[] }
-            async fn on_event(&self, _: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> { Ok(vec![]) }
-            fn version(&self) -> u64 { 42 }
+            fn name(&self) -> &str {
+                "versioned"
+            }
+            fn subscribes_to(&self) -> &[ExtractionEventKind] {
+                &[]
+            }
+            async fn on_event(&self, _: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+                Ok(vec![])
+            }
+            fn version(&self) -> u64 {
+                42
+            }
         }
         assert_eq!(VersionedConsumer.version(), 42);
     }
@@ -1266,11 +1400,19 @@ mod tests {
 
         // First emit: cache miss → on_event is called.
         bus.emit(make_root_discovered()).await;
-        assert_eq!(count.load(Ordering::Relaxed), 1, "first emit must call on_event");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "first emit must call on_event"
+        );
 
         // Second emit with same event: cache hit → on_event must NOT be called again.
         bus.emit(make_root_discovered()).await;
-        assert_eq!(count.load(Ordering::Relaxed), 1, "second identical emit must not call on_event (cache hit)");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "second identical emit must not call on_event (cache hit)"
+        );
     }
 
     /// Cache miss: different payloads must each call on_event.
@@ -1296,10 +1438,18 @@ mod tests {
         };
 
         bus.emit(event_a).await;
-        assert_eq!(count.load(Ordering::Relaxed), 1, "first payload must call on_event");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "first payload must call on_event"
+        );
 
         bus.emit(event_b).await;
-        assert_eq!(count.load(Ordering::Relaxed), 2, "different payload must call on_event again (cache miss)");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            2,
+            "different payload must call on_event again (cache miss)"
+        );
     }
 
     /// Cache hit replays follow-on events: even when on_event is skipped,
@@ -1324,7 +1474,11 @@ mod tests {
 
         // First emit: emitter runs, produces follow-on, counter fires for it.
         bus.emit(make_root_discovered()).await;
-        assert_eq!(follow_count.load(Ordering::Relaxed), 1, "first emit: follow-on must fire");
+        assert_eq!(
+            follow_count.load(Ordering::Relaxed),
+            1,
+            "first emit: follow-on must fire"
+        );
 
         // Second emit with same event: emitter is cached (skips on_event) but
         // its cached follow-on (RootExtracted) must still be replayed and routed.
@@ -1332,7 +1486,8 @@ mod tests {
         // (second RootExtracted has same payload → cache hit on counter too).
         bus.emit(make_root_discovered()).await;
         assert_eq!(
-            follow_count.load(Ordering::Relaxed), 1,
+            follow_count.load(Ordering::Relaxed),
+            1,
             "second identical emit: both emitter (cached) and counter (cached) must not double-fire"
         );
     }
@@ -1349,7 +1504,11 @@ mod tests {
 
         assert_eq!(bus.cache_len(), 0, "cache starts empty");
         bus.emit(make_root_discovered()).await;
-        assert_eq!(bus.cache_len(), 1, "one consumer × one event → one cache entry");
+        assert_eq!(
+            bus.cache_len(),
+            1,
+            "one consumer × one event → one cache entry"
+        );
 
         // Same event again: hit, no new entry.
         bus.emit(make_root_discovered()).await;
@@ -1374,6 +1533,10 @@ mod tests {
 
         // After clearing, same event must re-run on_event.
         bus.emit(make_root_discovered()).await;
-        assert_eq!(count.load(Ordering::Relaxed), 2, "after clear_cache, on_event must run again");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            2,
+            "after clear_cache, on_event must run again"
+        );
     }
 }

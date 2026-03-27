@@ -8,9 +8,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::graph::{
-    Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
-};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 use super::configs::CSHARP_CONFIG;
 use super::generic::GenericExtractor;
@@ -87,40 +85,50 @@ fn collect_csharp_specials(
                             for j in 0..child.child_count() {
                                 if let Some(decl) = child.child(j as u32)
                                     && decl.kind() == "variable_declarator"
-                                        && let Some(name_node) = decl.child_by_field_name("name") {
-                                            let name = name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
-                                            let sig = decl_text.lines().next().unwrap_or("").trim().to_string();
-                                            // Value may be in equals_value_clause
-                                            let value_str = decl.child_by_field_name("initializer")
-                                                .and_then(|v| v.utf8_text(source).ok())
-                                                .map(|s| s.trim_start_matches('=').trim().to_string());
-                                            let mut metadata = BTreeMap::new();
-                                            if let Some(ref v) = value_str {
-                                                let is_scalar = v.starts_with('"') || v.starts_with('\'')
-                                                    || v.parse::<f64>().is_ok()
-                                                    || v == "true" || v == "false";
-                                                if is_scalar {
-                                                    let stripped = v.trim_matches('"').trim_matches('\'');
-                                                    metadata.insert("value".to_string(), stripped.to_string());
-                                                }
-                                            }
-                                            metadata.insert("synthetic".to_string(), "false".to_string());
-                                            nodes.push(Node {
-                                                id: NodeId {
-                                                    root: String::new(),
-                                                    file: path.to_path_buf(),
-                                                    name,
-                                                    kind: NodeKind::Const,
-                                                },
-                                                language: "csharp".to_string(),
-                                                line_start: node.start_position().row + 1,
-                                                line_end: node.end_position().row + 1,
-                                                signature: sig,
-                                                body: decl_text.clone(),
-                                                metadata,
-                                                source: ExtractionSource::TreeSitter,
-                                            });
+                                    && let Some(name_node) = decl.child_by_field_name("name")
+                                {
+                                    let name = name_node
+                                        .utf8_text(source)
+                                        .unwrap_or("unknown")
+                                        .trim()
+                                        .to_string();
+                                    let sig =
+                                        decl_text.lines().next().unwrap_or("").trim().to_string();
+                                    // Value may be in equals_value_clause
+                                    let value_str = decl
+                                        .child_by_field_name("initializer")
+                                        .and_then(|v| v.utf8_text(source).ok())
+                                        .map(|s| s.trim_start_matches('=').trim().to_string());
+                                    let mut metadata = BTreeMap::new();
+                                    if let Some(ref v) = value_str {
+                                        let is_scalar = v.starts_with('"')
+                                            || v.starts_with('\'')
+                                            || v.parse::<f64>().is_ok()
+                                            || v == "true"
+                                            || v == "false";
+                                        if is_scalar {
+                                            let stripped = v.trim_matches('"').trim_matches('\'');
+                                            metadata
+                                                .insert("value".to_string(), stripped.to_string());
                                         }
+                                    }
+                                    metadata.insert("synthetic".to_string(), "false".to_string());
+                                    nodes.push(Node {
+                                        id: NodeId {
+                                            root: String::new(),
+                                            file: path.to_path_buf(),
+                                            name,
+                                            kind: NodeKind::Const,
+                                        },
+                                        language: "csharp".to_string(),
+                                        line_start: node.start_position().row + 1,
+                                        line_end: node.end_position().row + 1,
+                                        signature: sig,
+                                        body: decl_text.clone(),
+                                        metadata,
+                                        source: ExtractionSource::TreeSitter,
+                                    });
+                                }
                             }
                         }
                     }
@@ -203,14 +211,38 @@ public class MyService {
 "#;
         let result = extractor.extract(Path::new("MyService.cs"), code).unwrap();
 
-        let create = result.nodes.iter().find(|n| n.id.name == "Create" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(create.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "static Create() should be static");
+        let create = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Create" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            create.metadata.get("is_static").map(|s| s.as_str()),
+            Some("true"),
+            "static Create() should be static"
+        );
 
-        let serve = result.nodes.iter().find(|n| n.id.name == "Serve" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(serve.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "Serve() should be instance");
+        let serve = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Serve" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            serve.metadata.get("is_static").map(|s| s.as_str()),
+            Some("false"),
+            "Serve() should be instance"
+        );
 
-        let count = result.nodes.iter().find(|n| n.id.name == "Count" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(count.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "static Count() should be static");
+        let count = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Count" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            count.metadata.get("is_static").map(|s| s.as_str()),
+            Some("true"),
+            "static Count() should be static"
+        );
     }
 
     #[test]
@@ -224,7 +256,15 @@ public class Foo {
 "#;
         let result = extractor.extract(Path::new("Foo.cs"), code).unwrap();
 
-        let ctor = result.nodes.iter().find(|n| n.id.name == "Foo" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(ctor.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "Constructor should be instance");
+        let ctor = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Foo" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            ctor.metadata.get("is_static").map(|s| s.as_str()),
+            Some("false"),
+            "Constructor should be instance"
+        );
     }
 }

@@ -12,9 +12,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::graph::{
-    Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
-};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 use super::{ExtractionResult, Extractor};
 
@@ -153,16 +151,25 @@ impl Extractor for ProtoExtractor {
                     let block_start = i;
                     let block_end = find_block_end(&lines, i);
                     // Emit each enum value as a Const
-                    for (offset, ev_line_raw) in lines[(block_start + 1)..block_end].iter().enumerate() {
+                    for (offset, ev_line_raw) in
+                        lines[(block_start + 1)..block_end].iter().enumerate()
+                    {
                         let j = block_start + 1 + offset;
                         let ev_line = ev_line_raw.trim();
-                        if ev_line.is_empty() || ev_line.starts_with("//") || ev_line.starts_with("option ") {
+                        if ev_line.is_empty()
+                            || ev_line.starts_with("//")
+                            || ev_line.starts_with("option ")
+                        {
                             continue;
                         }
                         // Enum values: `FIELD_NAME = number;`
                         if let Some(eq_pos) = ev_line.find('=') {
                             let ev_name = ev_line[..eq_pos].trim().to_string();
-                            let ev_val = ev_line[eq_pos+1..].trim().trim_end_matches(';').trim().to_string();
+                            let ev_val = ev_line[eq_pos + 1..]
+                                .trim()
+                                .trim_end_matches(';')
+                                .trim()
+                                .to_string();
                             if !ev_name.is_empty() && !ev_name.contains(' ') {
                                 let mut metadata = BTreeMap::new();
                                 if !ev_val.is_empty() {
@@ -197,7 +204,7 @@ impl Extractor for ProtoExtractor {
                 let opt_line = line.trim_end_matches(';').trim();
                 if let Some(eq_pos) = opt_line.find('=') {
                     let opt_name = opt_line[7..eq_pos].trim().to_string(); // strip "option "
-                    let opt_val = opt_line[eq_pos+1..].trim().trim_matches('"').to_string();
+                    let opt_val = opt_line[eq_pos + 1..].trim().trim_matches('"').to_string();
                     if !opt_name.is_empty() {
                         let mut metadata = BTreeMap::new();
                         if !opt_val.is_empty() {
@@ -582,8 +589,7 @@ service SearchService {
             .nodes
             .iter()
             .filter(|n| {
-                n.id.kind == NodeKind::Function
-                    && n.metadata.get("parent_service").is_some()
+                n.id.kind == NodeKind::Function && n.metadata.get("parent_service").is_some()
             })
             .collect();
         assert_eq!(rpcs.len(), 2, "Should find 2 RPC methods");
@@ -592,10 +598,7 @@ service SearchService {
         let rpc_deps: Vec<_> = result
             .edges
             .iter()
-            .filter(|e| {
-                e.kind == EdgeKind::DependsOn
-                    && e.to.kind == NodeKind::ProtoMessage
-            })
+            .filter(|e| e.kind == EdgeKind::DependsOn && e.to.kind == NodeKind::ProtoMessage)
             .collect();
         assert_eq!(rpc_deps.len(), 4, "2 RPCs * 2 message refs = 4 edges");
     }
@@ -643,9 +646,7 @@ message Event {
     fn test_proto_language_is_protobuf() {
         let extractor = ProtoExtractor::new();
         let content = "message Foo {\n  string bar = 1;\n}\n";
-        let result = extractor
-            .extract(Path::new("test.proto"), content)
-            .unwrap();
+        let result = extractor.extract(Path::new("test.proto"), content).unwrap();
         assert_eq!(result.nodes[0].language, "protobuf");
     }
 }

@@ -10,9 +10,9 @@
 #![allow(deprecated)]
 
 mod batch;
+pub(crate) mod load;
 pub(crate) mod migrate;
 pub(crate) mod persist;
-pub(crate) mod load;
 
 use std::path::{Path, PathBuf};
 
@@ -21,12 +21,11 @@ use crate::graph::{Confidence, EdgeKind, ExtractionSource, NodeId, NodeKind};
 // ── Re-exports for backward compatibility ────────────────────────────
 
 // From migrate
-pub(crate) use migrate::{check_and_migrate_schema, check_and_migrate_extraction_version};
+pub(crate) use migrate::{check_and_migrate_extraction_version, check_and_migrate_schema};
 
 // From persist
 pub(crate) use persist::{
-    persist_graph_to_lance, persist_graph_incremental,
-    get_stored_root_ids, delete_nodes_for_roots,
+    delete_nodes_for_roots, get_stored_root_ids, persist_graph_incremental, persist_graph_to_lance,
 };
 
 // From load
@@ -120,7 +119,11 @@ pub(crate) fn parse_confidence(s: &str) -> Confidence {
 
 /// Parse a NodeId from its stable_id string (format: "root:file:name:kind").
 /// Falls back to using the type hint and root if parsing is ambiguous.
-pub(crate) fn parse_node_id_from_stable(stable_id: &str, kind_hint: &str, root_hint: &str) -> NodeId {
+pub(crate) fn parse_node_id_from_stable(
+    stable_id: &str,
+    kind_hint: &str,
+    root_hint: &str,
+) -> NodeId {
     // stable_id format: "root:file:name:kind"
     // We need to handle the case where file or name might contain ':'
     // Strategy: split from the end to get kind, then from the start to get root,
@@ -178,7 +181,8 @@ pub(crate) fn infer_language_from_path(path: &Path) -> String {
         Some("js") | Some("jsx") => "javascript".to_string(),
         Some("go") => "go".to_string(),
         Some("java") => "java".to_string(),
-        Some("c") | Some("h") | Some("cpp") | Some("cc") | Some("cxx") | Some("hpp") | Some("hh") | Some("hxx") => "cpp".to_string(),
+        Some("c") | Some("h") | Some("cpp") | Some("cc") | Some("cxx") | Some("hpp")
+        | Some("hh") | Some("hxx") => "cpp".to_string(),
         Some("cs") => "csharp".to_string(),
         Some("rb") => "ruby".to_string(),
         Some("kt") | Some("kts") => "kotlin".to_string(),

@@ -45,9 +45,9 @@
 //! cross-file test/production pairs are linked even when only one side was
 //! touched in an incremental scan.
 
-use aho_corasick::{AhoCorasick, MatchKind};
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeKind};
 use crate::ranking::is_test_function;
+use aho_corasick::{AhoCorasick, MatchKind};
 
 /// Post-extraction pass: emit `TestedBy` edges from test functions to the
 /// production functions they cover, using naming-convention heuristics.
@@ -225,21 +225,18 @@ mod tests {
     #[test]
     fn test_short_name_skipped() {
         // "get" < 4 chars — must not produce an edge
-        let nodes = vec![
-            make_fn("get", false),
-            make_fn("test_get_all", true),
-        ];
+        let nodes = vec![make_fn("get", false), make_fn("test_get_all", true)];
         let edges = tested_by_pass(&nodes);
-        assert!(edges.is_empty(), "names shorter than 4 chars must be skipped");
+        assert!(
+            edges.is_empty(),
+            "names shorter than 4 chars must be skipped"
+        );
     }
 
     #[test]
     fn test_four_char_name_included() {
         // "send" is exactly 4 chars — must produce an edge
-        let nodes = vec![
-            make_fn("send", false),
-            make_fn("test_send_message", true),
-        ];
+        let nodes = vec![make_fn("send", false), make_fn("test_send_message", true)];
         let edges = tested_by_pass(&nodes);
         assert_eq!(edges.len(), 1, "4-char production names should be matched");
     }
@@ -256,9 +253,7 @@ mod tests {
 
     #[test]
     fn test_no_production_functions_returns_empty() {
-        let nodes = vec![
-            make_fn("test_process_payment", true),
-        ];
+        let nodes = vec![make_fn("test_process_payment", true)];
         let edges = tested_by_pass(&nodes);
         assert!(edges.is_empty());
     }
@@ -285,8 +280,8 @@ mod tests {
     fn test_multiple_matches_for_one_test() {
         // One test whose name contains two production names
         let nodes = vec![
-            make_fn("build", false),         // < 5 chars but == 5 actually, "build" is 5 — included
-            make_fn("parse", false),         // 5 chars — included
+            make_fn("build", false), // < 5 chars but == 5 actually, "build" is 5 — included
+            make_fn("parse", false), // 5 chars — included
             make_fn("test_build_and_parse", true),
         ];
         let edges = tested_by_pass(&nodes);
@@ -315,8 +310,11 @@ mod tests {
             make_fn("test_process_payment", true),
         ];
         let edges = tested_by_pass(&nodes);
-        assert_eq!(edges[0].source, ExtractionSource::TreeSitter,
-            "source must be TreeSitter (not LSP) for the tree-sitter pass");
+        assert_eq!(
+            edges[0].source,
+            ExtractionSource::TreeSitter,
+            "source must be TreeSitter (not LSP) for the tree-sitter pass"
+        );
     }
 
     /// Integration test: extract a real Rust file and verify tested_by_pass
@@ -356,7 +354,8 @@ mod tests {
         // Run the naming-convention pass over the extracted nodes
         let edges = tested_by_pass(&result.nodes);
 
-        let tested_by: Vec<_> = edges.iter()
+        let tested_by: Vec<_> = edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::TestedBy)
             .collect();
 
@@ -364,13 +363,17 @@ mod tests {
             !tested_by.is_empty(),
             "expected TestedBy edges from naming convention pass on real Rust code; \
              got 0. Nodes extracted: {:?}",
-            result.nodes.iter().map(|n| (&n.id.name, &n.id.kind)).collect::<Vec<_>>()
+            result
+                .nodes
+                .iter()
+                .map(|n| (&n.id.name, &n.id.kind))
+                .collect::<Vec<_>>()
         );
 
         // Verify at least one expected edge
-        let has_payment_edge = tested_by.iter().any(|e|
-            e.from.name.contains("process_payment") && e.to.name == "process_payment"
-        );
+        let has_payment_edge = tested_by
+            .iter()
+            .any(|e| e.from.name.contains("process_payment") && e.to.name == "process_payment");
         assert!(
             has_payment_edge,
             "expected test_process_payment_valid → process_payment TestedBy edge"
@@ -417,7 +420,9 @@ mod tests {
             assert!(
                 edges.is_empty(),
                 "production name '{}' (len={}) should be excluded — got {} edges",
-                name, name.len(), edges.len()
+                name,
+                name.len(),
+                edges.len()
             );
         }
     }
@@ -445,10 +450,7 @@ mod tests {
         // fire — they ARE different nodes. This is correct behavior.
         // Verify: if an edge is emitted the from != to.
         for edge in &edges {
-            assert_ne!(
-                edge.from, edge.to,
-                "self-edge must never be emitted"
-            );
+            assert_ne!(edge.from, edge.to, "self-edge must never be emitted");
         }
     }
 
@@ -478,7 +480,8 @@ mod tests {
             let to_name = &edge.to.name;
             assert!(
                 to_name == "parse" || to_name == "parse_config",
-                "edge.to.name '{}' must be one of the prod functions", to_name
+                "edge.to.name '{}' must be one of the prod functions",
+                to_name
             );
         }
     }
@@ -490,12 +493,11 @@ mod tests {
         let mut struct_node = make_fn("test_process_payment_helper", false);
         struct_node.id.kind = NodeKind::Struct;
         // Mark it as "test" even so it would be classified as test if it were a function
-        struct_node.metadata.insert("is_test".to_string(), "true".to_string());
+        struct_node
+            .metadata
+            .insert("is_test".to_string(), "true".to_string());
 
-        let nodes = vec![
-            struct_node,
-            make_fn("process_payment", false),
-        ];
+        let nodes = vec![struct_node, make_fn("process_payment", false)];
         let edges = tested_by_pass(&nodes);
         assert!(
             edges.is_empty(),
@@ -515,7 +517,8 @@ mod tests {
         ];
         let edges = tested_by_pass(&nodes);
         assert_eq!(
-            edges.len(), 1,
+            edges.len(),
+            1,
             "test name containing the same production name twice must yield exactly 1 edge"
         );
         assert_eq!(edges[0].to.name, "parse");
@@ -538,7 +541,10 @@ mod tests {
         }
         // 500 test functions that each contain one production name
         for i in 0..500 {
-            nodes.push(make_fn(&format!("test_process_event_{}_happy_path", i), true));
+            nodes.push(make_fn(
+                &format!("test_process_event_{}_happy_path", i),
+                true,
+            ));
         }
 
         let start = Instant::now();
@@ -547,7 +553,10 @@ mod tests {
 
         // Each test fn matches exactly one prod fn → 500 edges
         assert_eq!(edges.len(), 500, "expected 500 edges in 500×500 case");
-        println!("tested_by_pass 500×500: {:?} (250_000 comparisons with O(T×P) would be ~same)", elapsed);
+        println!(
+            "tested_by_pass 500×500: {:?} (250_000 comparisons with O(T×P) would be ~same)",
+            elapsed
+        );
         // Generous upper bound: must complete in under 1 second even in debug mode
         assert!(
             elapsed.as_secs() < 1,

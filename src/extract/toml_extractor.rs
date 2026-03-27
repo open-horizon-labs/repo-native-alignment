@@ -47,7 +47,9 @@ impl Extractor for TomlExtractor {
         let root = tree.root_node();
 
         for i in 0..root.child_count() {
-            let Some(child) = root.child(i as u32) else { continue };
+            let Some(child) = root.child(i as u32) else {
+                continue;
+            };
             match child.kind() {
                 "table" | "table_array_element" => {
                     // [section] or [[array_section]]
@@ -84,13 +86,16 @@ impl Extractor for TomlExtractor {
                                 .to_string();
 
                             // Check if value is a scalar (not array or inline table)
-                            let is_scalar = val_node.map(|v| {
-                                !matches!(v.kind(), "array" | "inline_table")
-                            }).unwrap_or(false);
+                            let is_scalar = val_node
+                                .map(|v| !matches!(v.kind(), "array" | "inline_table"))
+                                .unwrap_or(false);
 
                             let (kind, metadata) = if is_scalar && !val.trim().is_empty() {
                                 let mut m = BTreeMap::new();
-                                m.insert("value".to_string(), val.trim().trim_matches('"').trim_matches('\'').to_string());
+                                m.insert(
+                                    "value".to_string(),
+                                    val.trim().trim_matches('"').trim_matches('\'').to_string(),
+                                );
                                 m.insert("synthetic".to_string(), "true".to_string());
                                 (NodeKind::Const, m)
                             } else {
@@ -119,6 +124,9 @@ impl Extractor for TomlExtractor {
             }
         }
 
-        Ok(ExtractionResult { nodes, edges: Vec::new() })
+        Ok(ExtractionResult {
+            nodes,
+            edges: Vec::new(),
+        })
     }
 }

@@ -44,7 +44,10 @@ impl ConsumerCacheKey {
     /// Build a cache key from raw bytes and a consumer version.
     pub fn new(payload_bytes: &[u8], consumer_version: u64) -> Self {
         let payload_hash = blake3::hash(payload_bytes).to_hex().to_string();
-        Self { payload_hash, consumer_version }
+        Self {
+            payload_hash,
+            consumer_version,
+        }
     }
 }
 
@@ -59,7 +62,11 @@ pub fn key_fingerprint(key: &ConsumerCacheKey) -> u64 {
     let mut input = key.payload_hash.as_bytes().to_vec();
     input.extend_from_slice(&key.consumer_version.to_le_bytes());
     let hash = blake3::hash(&input);
-    u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("blake3 output >= 8 bytes"))
+    u64::from_le_bytes(
+        hash.as_bytes()[..8]
+            .try_into()
+            .expect("blake3 output >= 8 bytes"),
+    )
 }
 
 #[cfg(test)]
@@ -115,11 +122,22 @@ mod tests {
         // Value computed by this implementation. Pinned to catch regressions.
         let fingerprint = key_fingerprint(&k);
         // Verify the fingerprint is non-zero and identical across calls.
-        assert_ne!(fingerprint, 0, "fingerprint should not be zero for non-trivial inputs");
-        assert_eq!(fingerprint, key_fingerprint(&k), "fingerprint must be deterministic");
+        assert_ne!(
+            fingerprint, 0,
+            "fingerprint should not be zero for non-trivial inputs"
+        );
+        assert_eq!(
+            fingerprint,
+            key_fingerprint(&k),
+            "fingerprint must be deterministic"
+        );
         // Verify it differs from a key with different version.
         let k2 = ConsumerCacheKey::new(b"stable-fixture", 100);
-        assert_ne!(fingerprint, key_fingerprint(&k2), "different version must yield different fingerprint");
+        assert_ne!(
+            fingerprint,
+            key_fingerprint(&k2),
+            "different version must yield different fingerprint"
+        );
     }
 
     #[test]
@@ -129,18 +147,21 @@ mod tests {
         let config_v2 = b"[extractor]\nframework = 'nextjs'\nsome_new_field = true";
 
         // Same file bytes → same version.
-        let version_a = u64::from_le_bytes(
-            blake3::hash(config_v1).as_bytes()[..8].try_into().unwrap()
+        let version_a =
+            u64::from_le_bytes(blake3::hash(config_v1).as_bytes()[..8].try_into().unwrap());
+        let version_b =
+            u64::from_le_bytes(blake3::hash(config_v1).as_bytes()[..8].try_into().unwrap());
+        assert_eq!(
+            version_a, version_b,
+            "same config bytes must yield same version"
         );
-        let version_b = u64::from_le_bytes(
-            blake3::hash(config_v1).as_bytes()[..8].try_into().unwrap()
-        );
-        assert_eq!(version_a, version_b, "same config bytes must yield same version");
 
         // Different file bytes → different version.
-        let version_c = u64::from_le_bytes(
-            blake3::hash(config_v2).as_bytes()[..8].try_into().unwrap()
+        let version_c =
+            u64::from_le_bytes(blake3::hash(config_v2).as_bytes()[..8].try_into().unwrap());
+        assert_ne!(
+            version_a, version_c,
+            "changed config bytes must yield different version"
         );
-        assert_ne!(version_a, version_c, "changed config bytes must yield different version");
     }
 }

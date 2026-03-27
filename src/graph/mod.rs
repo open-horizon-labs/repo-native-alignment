@@ -435,11 +435,7 @@ pub fn build_file_line_index<'a>(nodes: &'a [Node]) -> FileLineIndex<'a> {
 ///
 /// Use case: mapping an external reference (LSP location, SCIP occurrence,
 /// diagnostic) to the function or struct that "owns" it.
-pub fn find_enclosing_node(
-    index: &FileLineIndex<'_>,
-    file: &Path,
-    line: usize,
-) -> Option<NodeId> {
+pub fn find_enclosing_node(index: &FileLineIndex<'_>, file: &Path, line: usize) -> Option<NodeId> {
     index.get(&(file.to_path_buf(), line)).and_then(|nodes| {
         nodes
             .iter()
@@ -459,11 +455,7 @@ pub fn find_enclosing_node(
 ///
 /// Unlike `find_enclosing_node`, this is used for exact-match lookups
 /// (e.g., "what symbol is defined at this line?") rather than enclosure.
-pub fn find_node_at(
-    index: &FileLineIndex<'_>,
-    file: &Path,
-    line: usize,
-) -> Option<NodeId> {
+pub fn find_node_at(index: &FileLineIndex<'_>, file: &Path, line: usize) -> Option<NodeId> {
     index.get(&(file.to_path_buf(), line)).and_then(|nodes| {
         nodes
             .iter()
@@ -541,7 +533,10 @@ mod tests {
 
     #[test]
     fn test_macro_is_embeddable() {
-        assert!(NodeKind::Macro.is_embeddable(), "Macro should be embeddable");
+        assert!(
+            NodeKind::Macro.is_embeddable(),
+            "Macro should be embeddable"
+        );
     }
 
     #[test]
@@ -551,13 +546,7 @@ mod tests {
 
     #[test]
     fn test_find_node_at_finds_macro() {
-        let nodes = vec![make_node(
-            "src/lib.rs",
-            "my_macro",
-            NodeKind::Macro,
-            5,
-            10,
-        )];
+        let nodes = vec![make_node("src/lib.rs", "my_macro", NodeKind::Macro, 5, 10)];
         let index = build_file_line_index(&nodes);
 
         let result = find_node_at(&index, &PathBuf::from("src/lib.rs"), 7);
@@ -569,7 +558,10 @@ mod tests {
 
     #[test]
     fn test_type_alias_is_embeddable() {
-        assert!(NodeKind::TypeAlias.is_embeddable(), "TypeAlias should be embeddable");
+        assert!(
+            NodeKind::TypeAlias.is_embeddable(),
+            "TypeAlias should be embeddable"
+        );
     }
 
     #[test]
@@ -579,13 +571,7 @@ mod tests {
 
     #[test]
     fn test_find_node_at_finds_type_alias() {
-        let nodes = vec![make_node(
-            "src/lib.rs",
-            "Result",
-            NodeKind::TypeAlias,
-            5,
-            5,
-        )];
+        let nodes = vec![make_node("src/lib.rs", "Result", NodeKind::TypeAlias, 5, 5)];
         let index = build_file_line_index(&nodes);
 
         let result = find_node_at(&index, &PathBuf::from("src/lib.rs"), 5);
@@ -605,7 +591,10 @@ mod tests {
         let index = build_file_line_index(&nodes);
 
         let result = find_node_at(&index, &PathBuf::from("src/lib.rs"), 10);
-        assert!(result.is_some(), "find_node_at should find EnumVariant nodes");
+        assert!(
+            result.is_some(),
+            "find_node_at should find EnumVariant nodes"
+        );
         assert_eq!(result.unwrap().name, "Active");
     }
 
@@ -622,14 +611,20 @@ mod tests {
         // On line 7 (variant line), should find the variant (narrower span)
         let result = find_node_at(&index, &PathBuf::from("src/lib.rs"), 7);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().name, "Active",
-            "Should prefer EnumVariant (span 1) over Enum (span 5) on variant line");
+        assert_eq!(
+            result.unwrap().name,
+            "Active",
+            "Should prefer EnumVariant (span 1) over Enum (span 5) on variant line"
+        );
 
         // On line 5 (enum declaration line, no variant), should find the enum
         let result = find_node_at(&index, &PathBuf::from("src/lib.rs"), 5);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().name, "Status",
-            "Should find Enum on enum declaration line");
+        assert_eq!(
+            result.unwrap().name,
+            "Status",
+            "Should find Enum on enum declaration line"
+        );
     }
 
     // -- edge_id_set tests --
@@ -739,13 +734,7 @@ mod tests {
 
     #[test]
     fn test_find_enclosing_node_skips_import() {
-        let nodes = vec![make_node(
-            "src/lib.rs",
-            "use_std",
-            NodeKind::Import,
-            1,
-            1,
-        )];
+        let nodes = vec![make_node("src/lib.rs", "use_std", NodeKind::Import, 1, 1)];
         let index = build_file_line_index(&nodes);
 
         let result = find_enclosing_node(&index, &PathBuf::from("src/lib.rs"), 1);

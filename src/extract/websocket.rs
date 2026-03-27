@@ -167,8 +167,7 @@ pub fn websocket_pass(
     }
 
     let mut result_edges: Vec<Edge> = Vec::new();
-    let mut event_nodes: std::collections::HashMap<String, Node> =
-        std::collections::HashMap::new();
+    let mut event_nodes: std::collections::HashMap<String, Node> = std::collections::HashMap::new();
     // Deduplicate edges: (from_stable_id, event_name, direction_str) → seen
     let mut seen_edges: HashSet<(String, String, String)> = HashSet::new();
 
@@ -238,11 +237,7 @@ pub fn websocket_pass(
 
                 // Deduplicate: skip if we already emitted an edge for this
                 // (from_node, event_name, direction) combination.
-                let dedup_key = (
-                    node.stable_id(),
-                    event_name.clone(),
-                    edge_kind.to_string(),
-                );
+                let dedup_key = (node.stable_id(), event_name.clone(), edge_kind.to_string());
                 if !seen_edges.insert(dedup_key) {
                     continue;
                 }
@@ -430,7 +425,10 @@ mod tests {
             "def broadcast(msg):\n    socketio.emit('update', {'data': msg})",
         );
         let result = websocket_pass(&[node], &fw(&["socketio"]), "repo");
-        assert!(!result.edges.is_empty(), "Should detect Python socketio.emit");
+        assert!(
+            !result.edges.is_empty(),
+            "Should detect Python socketio.emit"
+        );
         assert_eq!(result.edges[0].kind, EdgeKind::Produces);
     }
 
@@ -443,7 +441,10 @@ mod tests {
             "@socketio.on('chat_message')\ndef handle_message(data):\n    pass",
         );
         let result = websocket_pass(&[node], &fw(&["socketio"]), "repo");
-        assert!(!result.edges.is_empty(), "Should detect @socketio.on decorator");
+        assert!(
+            !result.edges.is_empty(),
+            "Should detect @socketio.on decorator"
+        );
         assert_eq!(result.edges[0].kind, EdgeKind::Consumes);
         assert!(result.nodes.iter().any(|n| n.id.name == "chat_message"));
     }
@@ -464,7 +465,11 @@ mod tests {
             "socket.emit(\"update\", data_b)",
         );
         let result = websocket_pass(&[node_a, node_b], &fw(&["socketio"]), "repo");
-        let update_nodes: Vec<_> = result.nodes.iter().filter(|n| n.id.name == "update").collect();
+        let update_nodes: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.name == "update")
+            .collect();
         assert_eq!(update_nodes.len(), 1, "Same event → one node");
         assert_eq!(result.edges.len(), 2, "Two functions → two edges");
     }
@@ -472,14 +477,12 @@ mod tests {
     #[test]
     fn test_dynamic_event_name_skipped() {
         // Variable event name — should not produce an edge.
-        let node = make_fn(
-            "repo",
-            "typescript",
-            "fn",
-            "socket.emit(eventName, data)",
-        );
+        let node = make_fn("repo", "typescript", "fn", "socket.emit(eventName, data)");
         let result = websocket_pass(&[node], &fw(&["socketio"]), "repo");
-        assert!(result.edges.is_empty(), "Dynamic event names must not produce edges");
+        assert!(
+            result.edges.is_empty(),
+            "Dynamic event names must not produce edges"
+        );
     }
 
     #[test]

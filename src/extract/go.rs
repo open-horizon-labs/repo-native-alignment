@@ -10,9 +10,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::graph::{
-    Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
-};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 use super::configs::GO_CONFIG;
 use super::generic::GenericExtractor;
@@ -101,9 +99,10 @@ fn collect_go_specials_walk(
             // Go const declarations: const X = 5 or const (X = 5; Y = "hello")
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i as u32)
-                    && child.kind() == "const_spec" {
-                        extract_go_const_spec(child, path, source, nodes);
-                    }
+                    && child.kind() == "const_spec"
+                {
+                    extract_go_const_spec(child, path, source, nodes);
+                }
             }
             return; // Don't recurse into children we already handled
         }
@@ -118,9 +117,10 @@ fn collect_go_specials_walk(
                     } else if child.kind() == "var_spec_list" {
                         for j in 0..child.child_count() {
                             if let Some(spec) = child.child(j as u32)
-                                && spec.kind() == "var_spec" {
-                                    extract_go_var_spec(spec, path, source, nodes);
-                                }
+                                && spec.kind() == "var_spec"
+                            {
+                                extract_go_var_spec(spec, path, source, nodes);
+                            }
                         }
                     }
                 }
@@ -131,9 +131,10 @@ fn collect_go_specials_walk(
             // type_declaration contains type_spec children
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i as u32)
-                    && child.kind() == "type_spec" {
-                        extract_type_spec(child, path, source, nodes, edges);
-                    }
+                    && child.kind() == "type_spec"
+                {
+                    extract_type_spec(child, path, source, nodes, edges);
+                }
             }
             return; // Don't recurse into children we already handled
         }
@@ -148,10 +149,11 @@ fn collect_go_specials_walk(
                     if child.kind() == "import_spec_list" {
                         for j in 0..child.child_count() {
                             if let Some(spec) = child.child(j as u32)
-                                && spec.kind() == "import_spec" {
-                                    extract_import_spec(spec, path, source, nodes, edges);
-                                    found_specs = true;
-                                }
+                                && spec.kind() == "import_spec"
+                            {
+                                extract_import_spec(spec, path, source, nodes, edges);
+                                found_specs = true;
+                            }
                         }
                     } else if child.kind() == "import_spec" {
                         extract_import_spec(child, path, source, nodes, edges);
@@ -190,8 +192,12 @@ fn collect_go_specials_walk(
                     let line = node.start_position().row + 1;
                     // Find the matching node via HashMap lookup
                     if let Some(&idx) = node_index.get(&(name_str.to_string(), line)) {
-                        nodes[idx].metadata.insert("receiver".to_string(), recv_text);
-                        nodes[idx].metadata.insert("is_static".to_string(), "false".to_string());
+                        nodes[idx]
+                            .metadata
+                            .insert("receiver".to_string(), recv_text);
+                        nodes[idx]
+                            .metadata
+                            .insert("is_static".to_string(), "false".to_string());
                     }
                 }
             }
@@ -244,38 +250,45 @@ fn extract_go_const_spec(
     // Build a per-name value list.
     // If the value child is an expression_list, extract each child expression
     // and pair by index. If counts don't match (e.g. `iota`), use None for all.
-    let per_name_values: Vec<Option<String>> = if let Some(value_node) = node.child_by_field_name("value") {
-        if value_node.kind() == "expression_list" {
-            // Collect the non-punctuation children of the expression_list
-            let exprs: Vec<String> = (0..value_node.child_count())
-                .filter_map(|i| value_node.child(i as u32))
-                .filter(|c| c.kind() != "," && c.is_named())
-                .map(|c| c.utf8_text(source).unwrap_or("").trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+    let per_name_values: Vec<Option<String>> =
+        if let Some(value_node) = node.child_by_field_name("value") {
+            if value_node.kind() == "expression_list" {
+                // Collect the non-punctuation children of the expression_list
+                let exprs: Vec<String> = (0..value_node.child_count())
+                    .filter_map(|i| value_node.child(i as u32))
+                    .filter(|c| c.kind() != "," && c.is_named())
+                    .map(|c| c.utf8_text(source).unwrap_or("").trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
 
-            if exprs.len() == names.len() {
-                exprs.into_iter().map(Some).collect()
+                if exprs.len() == names.len() {
+                    exprs.into_iter().map(Some).collect()
+                } else {
+                    // Count mismatch (e.g. iota): don't guess values
+                    vec![None; names.len()]
+                }
             } else {
-                // Count mismatch (e.g. iota): don't guess values
-                vec![None; names.len()]
+                // Single value node -- use it for every name (only one name expected)
+                let v = value_node
+                    .utf8_text(source)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                vec![Some(v); names.len()]
             }
         } else {
-            // Single value node -- use it for every name (only one name expected)
-            let v = value_node.utf8_text(source).unwrap_or("").trim().to_string();
-            vec![Some(v); names.len()]
-        }
-    } else {
-        vec![None; names.len()]
-    };
+            vec![None; names.len()]
+        };
 
     for (name_str, value_opt) in names.into_iter().zip(per_name_values.into_iter()) {
         let signature = format!("const {}", body.trim());
         let mut metadata = BTreeMap::new();
         if let Some(v) = value_opt {
-            let is_scalar = v.starts_with('"') || v.starts_with('`')
+            let is_scalar = v.starts_with('"')
+                || v.starts_with('`')
                 || v.parse::<f64>().is_ok()
-                || v == "true" || v == "false";
+                || v == "true"
+                || v == "false";
             if is_scalar {
                 let stripped = v.trim_matches('"').trim_matches('`');
                 metadata.insert("value".to_string(), stripped.to_string());
@@ -305,12 +318,7 @@ fn extract_go_const_spec(
 /// Mirrors `extract_go_const_spec` but emits `Const` nodes with
 /// `metadata["storage"] = "var"` to distinguish package-level variables
 /// from compile-time constants.
-fn extract_go_var_spec(
-    node: tree_sitter::Node,
-    path: &Path,
-    source: &[u8],
-    nodes: &mut Vec<Node>,
-) {
+fn extract_go_var_spec(node: tree_sitter::Node, path: &Path, source: &[u8], nodes: &mut Vec<Node>) {
     let body = node.utf8_text(source).unwrap_or("").to_string();
 
     // Collect all name children (handles both single and multi-name specs).
@@ -323,36 +331,43 @@ fn extract_go_var_spec(
         .collect();
 
     // Build a per-name value list (same logic as const_spec).
-    let per_name_values: Vec<Option<String>> = if let Some(value_node) = node.child_by_field_name("value") {
-        if value_node.kind() == "expression_list" {
-            let exprs: Vec<String> = (0..value_node.child_count())
-                .filter_map(|i| value_node.child(i as u32))
-                .filter(|c| c.kind() != "," && c.is_named())
-                .map(|c| c.utf8_text(source).unwrap_or("").trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+    let per_name_values: Vec<Option<String>> =
+        if let Some(value_node) = node.child_by_field_name("value") {
+            if value_node.kind() == "expression_list" {
+                let exprs: Vec<String> = (0..value_node.child_count())
+                    .filter_map(|i| value_node.child(i as u32))
+                    .filter(|c| c.kind() != "," && c.is_named())
+                    .map(|c| c.utf8_text(source).unwrap_or("").trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
 
-            if exprs.len() == names.len() {
-                exprs.into_iter().map(Some).collect()
+                if exprs.len() == names.len() {
+                    exprs.into_iter().map(Some).collect()
+                } else {
+                    vec![None; names.len()]
+                }
             } else {
-                vec![None; names.len()]
+                let v = value_node
+                    .utf8_text(source)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                vec![Some(v); names.len()]
             }
         } else {
-            let v = value_node.utf8_text(source).unwrap_or("").trim().to_string();
-            vec![Some(v); names.len()]
-        }
-    } else {
-        vec![None; names.len()]
-    };
+            vec![None; names.len()]
+        };
 
     for (name_str, value_opt) in names.into_iter().zip(per_name_values.into_iter()) {
         let signature = format!("var {}", body.trim());
         let mut metadata = BTreeMap::new();
         metadata.insert("storage".to_string(), "var".to_string());
         if let Some(v) = value_opt {
-            let is_scalar = v.starts_with('"') || v.starts_with('`')
+            let is_scalar = v.starts_with('"')
+                || v.starts_with('`')
                 || v.parse::<f64>().is_ok()
-                || v == "true" || v == "false";
+                || v == "true"
+                || v == "false";
             if is_scalar {
                 let stripped = v.trim_matches('"').trim_matches('`');
                 metadata.insert("value".to_string(), stripped.to_string());
@@ -421,9 +436,10 @@ fn extract_type_spec(
 
         // For interfaces, extract method_spec children as Function nodes.
         if kind == NodeKind::Trait
-            && let Some(type_body) = type_node {
-                extract_interface_methods(type_body, path, source, &name_str, nodes, edges);
-            }
+            && let Some(type_body) = type_node
+        {
+            extract_interface_methods(type_body, path, source, &name_str, nodes, edges);
+        }
     }
 }
 
@@ -438,58 +454,59 @@ fn extract_interface_methods(
 ) {
     for i in 0..interface_node.child_count() {
         if let Some(child) = interface_node.child(i as u32)
-            && (child.kind() == "method_elem" || child.kind() == "method_spec") {
-                let method_name = child
-                    .child_by_field_name("name")
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .unwrap_or("unknown")
-                    .to_string();
+            && (child.kind() == "method_elem" || child.kind() == "method_spec")
+        {
+            let method_name = child
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("unknown")
+                .to_string();
 
-                if method_name == "unknown" {
-                    continue;
-                }
-
-                let method_body = child.utf8_text(source).unwrap_or("").to_string();
-                let signature = method_body.lines().next().unwrap_or("").to_string();
-
-                let mut metadata = BTreeMap::new();
-                metadata.insert("parent_scope".to_string(), interface_name.to_string());
-
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: method_name.clone(),
-                        kind: NodeKind::Function,
-                    },
-                    language: "go".to_string(),
-                    line_start: child.start_position().row + 1,
-                    line_end: child.end_position().row + 1,
-                    signature,
-                    body: method_body,
-                    metadata,
-                    source: ExtractionSource::TreeSitter,
-                });
-
-                // Emit structural edge from interface to method.
-                edges.push(Edge {
-                    from: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: interface_name.to_string(),
-                        kind: NodeKind::Trait,
-                    },
-                    to: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: method_name,
-                        kind: NodeKind::Function,
-                    },
-                    kind: EdgeKind::Defines,
-                    source: ExtractionSource::TreeSitter,
-                    confidence: Confidence::Detected,
-                });
+            if method_name == "unknown" {
+                continue;
             }
+
+            let method_body = child.utf8_text(source).unwrap_or("").to_string();
+            let signature = method_body.lines().next().unwrap_or("").to_string();
+
+            let mut metadata = BTreeMap::new();
+            metadata.insert("parent_scope".to_string(), interface_name.to_string());
+
+            nodes.push(Node {
+                id: NodeId {
+                    root: String::new(),
+                    file: path.to_path_buf(),
+                    name: method_name.clone(),
+                    kind: NodeKind::Function,
+                },
+                language: "go".to_string(),
+                line_start: child.start_position().row + 1,
+                line_end: child.end_position().row + 1,
+                signature,
+                body: method_body,
+                metadata,
+                source: ExtractionSource::TreeSitter,
+            });
+
+            // Emit structural edge from interface to method.
+            edges.push(Edge {
+                from: NodeId {
+                    root: String::new(),
+                    file: path.to_path_buf(),
+                    name: interface_name.to_string(),
+                    kind: NodeKind::Trait,
+                },
+                to: NodeId {
+                    root: String::new(),
+                    file: path.to_path_buf(),
+                    name: method_name,
+                    kind: NodeKind::Function,
+                },
+                kind: EdgeKind::Defines,
+                source: ExtractionSource::TreeSitter,
+                confidence: Confidence::Detected,
+            });
+        }
     }
 }
 
@@ -609,14 +626,21 @@ func main() {}
             .iter()
             .filter(|n| n.id.kind == NodeKind::Import)
             .collect();
-        assert!(imports.len() >= 3, "Should find at least 3 imports, found {}", imports.len());
+        assert!(
+            imports.len() >= 3,
+            "Should find at least 3 imports, found {}",
+            imports.len()
+        );
 
         let dep_edges: Vec<_> = result
             .edges
             .iter()
             .filter(|e| e.kind == EdgeKind::DependsOn)
             .collect();
-        assert!(dep_edges.len() >= 3, "Should produce at least 3 DependsOn edges");
+        assert!(
+            dep_edges.len() >= 3,
+            "Should produce at least 3 DependsOn edges"
+        );
     }
 
     #[test]
@@ -635,7 +659,8 @@ func main() {}
     #[test]
     fn test_go_interface_is_trait_kind() {
         let extractor = GoExtractor::new();
-        let code = "package main\n\ntype Reader interface {\n\tRead(p []byte) (n int, err error)\n}\n";
+        let code =
+            "package main\n\ntype Reader interface {\n\tRead(p []byte) (n int, err error)\n}\n";
         let result = extractor.extract(Path::new("main.go"), code).unwrap();
         let reader = result
             .nodes
@@ -691,11 +716,18 @@ func hello() {}
 
         // Method with receiver should be is_static = false
         let bar = result.nodes.iter().find(|n| n.id.name == "Bar").unwrap();
-        assert_eq!(bar.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "Method with receiver should not be static");
+        assert_eq!(
+            bar.metadata.get("is_static").map(|s| s.as_str()),
+            Some("false"),
+            "Method with receiver should not be static"
+        );
 
         // Top-level function should NOT have is_static
         let hello = result.nodes.iter().find(|n| n.id.name == "hello").unwrap();
-        assert!(hello.metadata.get("is_static").is_none(), "Top-level Go function should NOT have is_static");
+        assert!(
+            hello.metadata.get("is_static").is_none(),
+            "Top-level Go function should NOT have is_static"
+        );
     }
 
     #[test]
@@ -710,9 +742,16 @@ const (
 )
 "#;
         let result = extractor.extract(Path::new("main.go"), code).unwrap();
-        let consts: Vec<_> = result.nodes.iter().filter(|n| n.id.kind == NodeKind::Const).collect();
+        let consts: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Const)
+            .collect();
         assert!(!consts.is_empty(), "Should find const nodes");
-        assert_eq!(consts[0].metadata.get("synthetic").map(|s| s.as_str()), Some("false"));
+        assert_eq!(
+            consts[0].metadata.get("synthetic").map(|s| s.as_str()),
+            Some("false")
+        );
     }
 
     #[test]
@@ -723,14 +762,32 @@ const (
 const A, B = 1, 2
 "#;
         let result = extractor.extract(Path::new("main.go"), code).unwrap();
-        let consts: Vec<_> = result.nodes.iter().filter(|n| n.id.kind == NodeKind::Const).collect();
+        let consts: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Const)
+            .collect();
         let names: Vec<&str> = consts.iter().map(|n| n.id.name.as_str()).collect();
-        assert!(names.contains(&"A"), "Should find const A, got: {:?}", names);
-        assert!(names.contains(&"B"), "Should find const B, got: {:?}", names);
+        assert!(
+            names.contains(&"A"),
+            "Should find const A, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"B"),
+            "Should find const B, got: {:?}",
+            names
+        );
 
         // Each name should have its own paired value
-        let a = consts.iter().find(|n| n.id.name == "A").expect("Should find A");
-        let b = consts.iter().find(|n| n.id.name == "B").expect("Should find B");
+        let a = consts
+            .iter()
+            .find(|n| n.id.name == "A")
+            .expect("Should find A");
+        let b = consts
+            .iter()
+            .find(|n| n.id.name == "B")
+            .expect("Should find B");
         assert_eq!(
             a.metadata.get("value").map(|s| s.as_str()),
             Some("1"),
@@ -759,21 +816,33 @@ type Pair [2]string
             .iter()
             .find(|n| n.id.name == "Handler")
             .expect("Should find Handler");
-        assert_eq!(handler.id.kind, NodeKind::TypeAlias, "Function type alias should be TypeAlias");
+        assert_eq!(
+            handler.id.kind,
+            NodeKind::TypeAlias,
+            "Function type alias should be TypeAlias"
+        );
 
         let duration = result
             .nodes
             .iter()
             .find(|n| n.id.name == "Duration")
             .expect("Should find Duration");
-        assert_eq!(duration.id.kind, NodeKind::TypeAlias, "Primitive type alias should be TypeAlias");
+        assert_eq!(
+            duration.id.kind,
+            NodeKind::TypeAlias,
+            "Primitive type alias should be TypeAlias"
+        );
 
         let pair = result
             .nodes
             .iter()
             .find(|n| n.id.name == "Pair")
             .expect("Should find Pair");
-        assert_eq!(pair.id.kind, NodeKind::TypeAlias, "Array type alias should be TypeAlias");
+        assert_eq!(
+            pair.id.kind,
+            NodeKind::TypeAlias,
+            "Array type alias should be TypeAlias"
+        );
     }
 
     #[test]
@@ -792,11 +861,27 @@ type Service interface {
 "#;
         let result = extractor.extract(Path::new("main.go"), code).unwrap();
 
-        let config = result.nodes.iter().find(|n| n.id.name == "Config").expect("Should find Config");
-        assert_eq!(config.id.kind, NodeKind::Struct, "Struct type should still be Struct");
+        let config = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Config")
+            .expect("Should find Config");
+        assert_eq!(
+            config.id.kind,
+            NodeKind::Struct,
+            "Struct type should still be Struct"
+        );
 
-        let service = result.nodes.iter().find(|n| n.id.name == "Service").expect("Should find Service");
-        assert_eq!(service.id.kind, NodeKind::Trait, "Interface type should still be Trait");
+        let service = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Service")
+            .expect("Should find Service");
+        assert_eq!(
+            service.id.kind,
+            NodeKind::Trait,
+            "Interface type should still be Trait"
+        );
     }
 
     #[test]
@@ -811,11 +896,18 @@ const (
 )
 "#;
         let result = extractor.extract(Path::new("main.go"), code).unwrap();
-        let consts: Vec<_> = result.nodes.iter().filter(|n| n.id.kind == NodeKind::Const).collect();
+        let consts: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Const)
+            .collect();
         let names: Vec<&str> = consts.iter().map(|n| n.id.name.as_str()).collect();
         assert!(names.contains(&"A"), "Should find const A");
         // iota is not a scalar, so value should not be set for A
-        let a = consts.iter().find(|n| n.id.name == "A").expect("Should find A");
+        let a = consts
+            .iter()
+            .find(|n| n.id.name == "A")
+            .expect("Should find A");
         assert!(
             a.metadata.get("value").is_none(),
             "A with iota should not have a scalar value, got: {:?}",
@@ -836,11 +928,22 @@ var Version string = "1.0.0"
         let vars: Vec<_> = result
             .nodes
             .iter()
-            .filter(|n| n.id.kind == NodeKind::Const && n.metadata.get("storage").map(|s| s.as_str()) == Some("var"))
+            .filter(|n| {
+                n.id.kind == NodeKind::Const
+                    && n.metadata.get("storage").map(|s| s.as_str()) == Some("var")
+            })
             .collect();
         let names: Vec<&str> = vars.iter().map(|n| n.id.name.as_str()).collect();
-        assert!(names.contains(&"Debug"), "Should find var Debug, got: {:?}", names);
-        assert!(names.contains(&"Version"), "Should find var Version, got: {:?}", names);
+        assert!(
+            names.contains(&"Debug"),
+            "Should find var Debug, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Version"),
+            "Should find var Version, got: {:?}",
+            names
+        );
 
         let debug = vars.iter().find(|n| n.id.name == "Debug").unwrap();
         assert_eq!(
@@ -877,11 +980,22 @@ var (
         let vars: Vec<_> = result
             .nodes
             .iter()
-            .filter(|n| n.id.kind == NodeKind::Const && n.metadata.get("storage").map(|s| s.as_str()) == Some("var"))
+            .filter(|n| {
+                n.id.kind == NodeKind::Const
+                    && n.metadata.get("storage").map(|s| s.as_str()) == Some("var")
+            })
             .collect();
         let names: Vec<&str> = vars.iter().map(|n| n.id.name.as_str()).collect();
-        assert!(names.contains(&"Logger"), "Should find var Logger, got: {:?}", names);
-        assert!(names.contains(&"Verbose"), "Should find var Verbose, got: {:?}", names);
+        assert!(
+            names.contains(&"Logger"),
+            "Should find var Logger, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Verbose"),
+            "Should find var Verbose, got: {:?}",
+            names
+        );
 
         let verbose = vars.iter().find(|n| n.id.name == "Verbose").unwrap();
         assert_eq!(
@@ -903,7 +1017,10 @@ var X, Y = 1, 2
         let vars: Vec<_> = result
             .nodes
             .iter()
-            .filter(|n| n.id.kind == NodeKind::Const && n.metadata.get("storage").map(|s| s.as_str()) == Some("var"))
+            .filter(|n| {
+                n.id.kind == NodeKind::Const
+                    && n.metadata.get("storage").map(|s| s.as_str()) == Some("var")
+            })
             .collect();
         let names: Vec<&str> = vars.iter().map(|n| n.id.name.as_str()).collect();
         assert!(names.contains(&"X"), "Should find var X, got: {:?}", names);
@@ -925,13 +1042,21 @@ var CurrentRetries = 0
 "#;
         let result = extractor.extract(Path::new("main.go"), code).unwrap();
 
-        let max = result.nodes.iter().find(|n| n.id.name == "MaxRetries").expect("Should find MaxRetries");
+        let max = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "MaxRetries")
+            .expect("Should find MaxRetries");
         assert!(
             max.metadata.get("storage").is_none(),
             "const should not have storage metadata"
         );
 
-        let current = result.nodes.iter().find(|n| n.id.name == "CurrentRetries").expect("Should find CurrentRetries");
+        let current = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "CurrentRetries")
+            .expect("Should find CurrentRetries");
         assert_eq!(
             current.metadata.get("storage").map(|s| s.as_str()),
             Some("var"),
@@ -970,14 +1095,28 @@ var Name string
         let vars: Vec<_> = result
             .nodes
             .iter()
-            .filter(|n| n.id.kind == NodeKind::Const && n.metadata.get("storage").map(|s| s.as_str()) == Some("var"))
+            .filter(|n| {
+                n.id.kind == NodeKind::Const
+                    && n.metadata.get("storage").map(|s| s.as_str()) == Some("var")
+            })
             .collect();
         let names: Vec<&str> = vars.iter().map(|n| n.id.name.as_str()).collect();
-        assert!(names.contains(&"Counter"), "Should find var Counter, got: {:?}", names);
-        assert!(names.contains(&"Name"), "Should find var Name, got: {:?}", names);
+        assert!(
+            names.contains(&"Counter"),
+            "Should find var Counter, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Name"),
+            "Should find var Name, got: {:?}",
+            names
+        );
         // No value should be extracted for type-only declarations
         let counter = vars.iter().find(|n| n.id.name == "Counter").unwrap();
-        assert!(counter.metadata.get("value").is_none(), "Type-only var should have no value");
+        assert!(
+            counter.metadata.get("value").is_none(),
+            "Type-only var should have no value"
+        );
     }
 
     /// Adversarial: function-local var declarations are also captured
@@ -998,12 +1137,18 @@ func main() {
         let vars: Vec<_> = result
             .nodes
             .iter()
-            .filter(|n| n.id.kind == NodeKind::Const && n.metadata.get("storage").map(|s| s.as_str()) == Some("var"))
+            .filter(|n| {
+                n.id.kind == NodeKind::Const
+                    && n.metadata.get("storage").map(|s| s.as_str()) == Some("var")
+            })
             .collect();
         let names: Vec<&str> = vars.iter().map(|n| n.id.name.as_str()).collect();
         // Both should be captured (known limitation: we don't filter by scope)
         assert!(names.contains(&"GlobalVar"), "Should find global var");
-        assert!(names.contains(&"localVar"), "Function-local var also captured (known behavior)");
+        assert!(
+            names.contains(&"localVar"),
+            "Function-local var also captured (known behavior)"
+        );
     }
 
     #[test]
@@ -1019,14 +1164,23 @@ type Reader interface {
         let result = extractor.extract(Path::new("main.go"), code).unwrap();
 
         // Interface itself should be found as Trait
-        let reader = result.nodes.iter().find(|n| n.id.name == "Reader" && n.id.kind == NodeKind::Trait);
+        let reader = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Reader" && n.id.kind == NodeKind::Trait);
         assert!(reader.is_some(), "Should find interface Reader");
 
         // Method specs should be indexed as Function nodes
-        let read = result.nodes.iter().find(|n| n.id.name == "Read" && n.id.kind == NodeKind::Function);
+        let read = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Read" && n.id.kind == NodeKind::Function);
         assert!(read.is_some(), "Should find interface method Read");
 
-        let close = result.nodes.iter().find(|n| n.id.name == "Close" && n.id.kind == NodeKind::Function);
+        let close = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Close" && n.id.kind == NodeKind::Function);
         assert!(close.is_some(), "Should find interface method Close");
 
         // Methods should have parent_scope pointing to the interface

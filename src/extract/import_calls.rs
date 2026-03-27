@@ -81,7 +81,10 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
     let mut fn_by_name: HashMap<&str, Vec<&Node>> = HashMap::new();
     for node in all_nodes {
         if node.id.kind == NodeKind::Function {
-            fn_by_name.entry(node.id.name.as_str()).or_default().push(node);
+            fn_by_name
+                .entry(node.id.name.as_str())
+                .or_default()
+                .push(node);
         }
     }
 
@@ -332,17 +335,23 @@ pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
             .trim_end_matches(';');
         // Brace group: `{A, B}`
         if let Some(brace_start) = after.rfind('{')
-            && let Some(brace_end) = after.rfind('}') {
-                let inner = &after[brace_start + 1..brace_end];
-                return inner
-                    .split(',')
-                    .map(|s| {
-                        // Handle `A as _` style
-                        s.trim().split(" as ").next().unwrap_or("").trim().to_string()
-                    })
-                    .filter(|s| !s.is_empty() && s != "*" && s != "self")
-                    .collect();
-            }
+            && let Some(brace_end) = after.rfind('}')
+        {
+            let inner = &after[brace_start + 1..brace_end];
+            return inner
+                .split(',')
+                .map(|s| {
+                    // Handle `A as _` style
+                    s.trim()
+                        .split(" as ")
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                })
+                .filter(|s| !s.is_empty() && s != "*" && s != "self")
+                .collect();
+        }
         // Bare path: `use crate::foo::Bar`
         if let Some(last_segment) = after.split("::").last() {
             let name = last_segment.trim();
@@ -373,14 +382,8 @@ pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
 /// list; they are not yet supported.
 fn parse_es6_import_names(text: &str) -> Vec<String> {
     // Strip `import ` prefix and optional `type ` keyword.
-    let body = text
-        .strip_prefix("import ")
-        .unwrap_or(text)
-        .trim();
-    let body = body
-        .strip_prefix("type ")
-        .unwrap_or(body)
-        .trim();
+    let body = text.strip_prefix("import ").unwrap_or(text).trim();
+    let body = body.strip_prefix("type ").unwrap_or(body).trim();
 
     // Everything before ` from '…'`
     let specifier = if let Some(from_idx) = body.find(" from ") {
@@ -402,7 +405,10 @@ fn parse_es6_import_names(text: &str) -> Vec<String> {
     // Split named `{ … }` block from default import prefix.
     let (default_part, named_part) = if let Some(brace_start) = specifier.find('{') {
         let before = specifier[..brace_start].trim().trim_end_matches(',').trim();
-        let end = specifier.rfind('}').map(|i| i + 1).unwrap_or(specifier.len());
+        let end = specifier
+            .rfind('}')
+            .map(|i| i + 1)
+            .unwrap_or(specifier.len());
         let inner = &specifier[brace_start + 1..end - 1];
         (before, Some(inner))
     } else {
@@ -418,12 +424,7 @@ fn parse_es6_import_names(text: &str) -> Vec<String> {
     if let Some(inner) = named_part {
         for part in inner.split(',') {
             // `B as C` → take `B` (the original name in the module)
-            let original = part
-                .trim()
-                .split(" as ")
-                .next()
-                .unwrap_or("")
-                .trim();
+            let original = part.trim().split(" as ").next().unwrap_or("").trim();
             if !original.is_empty() {
                 names.push(original.to_string());
             }
@@ -455,10 +456,16 @@ pub(crate) fn extract_call_sites(body: &str) -> HashSet<&str> {
             // Walk backwards to find the identifier
             let mut j = i.saturating_sub(1);
             // Skip whitespace
-            while j > 0 && bytes[j] == b' ' { j -= 1; }
+            while j > 0 && bytes[j] == b' ' {
+                j -= 1;
+            }
             let end = j + 1;
             // Walk back through identifier chars
-            while j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || bytes[j - 1] == b'_' || bytes[j - 1] == b'$') {
+            while j > 0
+                && (bytes[j - 1].is_ascii_alphanumeric()
+                    || bytes[j - 1] == b'_'
+                    || bytes[j - 1] == b'$')
+            {
                 j -= 1;
             }
             if j < end {
@@ -497,11 +504,12 @@ pub(crate) fn body_contains_call(body: &str, name: &str) -> bool {
         // Compute the number of bytes to advance past the first character at `idx`.
         // `find()` returns byte offsets; `&search[idx + 1..]` panics if the character
         // at `idx` is a multi-byte Unicode sequence.  Use the actual char width instead.
-        let advance = idx + search[idx..]
-            .chars()
-            .next()
-            .map(|ch| ch.len_utf8())
-            .unwrap_or(1);
+        let advance = idx
+            + search[idx..]
+                .chars()
+                .next()
+                .map(|ch| ch.len_utf8())
+                .unwrap_or(1);
 
         // Check that what follows is `(`.
         let next_char = search[after_idx..].chars().next();
@@ -518,25 +526,36 @@ pub(crate) fn body_contains_call(body: &str, name: &str) -> bool {
         //         `:` (scoped path).
         if idx > 0
             && let Some(prev_char) = search[..idx].chars().last()
-                && (prev_char == '.'
-                    || prev_char == ':'
-                    || prev_char == '_'
-                    || prev_char == '$'
-                    || prev_char.is_ascii_alphanumeric())
-                {
-                    search = &search[advance..];
-                    continue;
-                }
+            && (prev_char == '.'
+                || prev_char == ':'
+                || prev_char == '_'
+                || prev_char == '$'
+                || prev_char.is_ascii_alphanumeric())
+        {
+            search = &search[advance..];
+            continue;
+        }
 
         // Reject declaration contexts: `function name(`, `def name(`, `fn name(`,
         // `const name(`, `class name(` — these define the symbol, not call it.
         // Check if the text immediately before `name` ends with a declaration keyword.
         let before = search[..idx].trim_end();
-        let is_declaration = ["function", "def", "fn", "const", "let", "var",
-                               "class", "async function", "async def",
-                               "async fn", "pub fn", "pub async fn"]
-            .iter()
-            .any(|kw| before.ends_with(kw));
+        let is_declaration = [
+            "function",
+            "def",
+            "fn",
+            "const",
+            "let",
+            "var",
+            "class",
+            "async function",
+            "async def",
+            "async fn",
+            "pub fn",
+            "pub async fn",
+        ]
+        .iter()
+        .any(|kw| before.ends_with(kw));
         if is_declaration {
             search = &search[advance..];
             continue;
@@ -635,14 +654,22 @@ mod tests {
         // The alias is used as `ns.foo()` (method call) which body_contains_call
         // rejects. We return empty so no spurious edges are emitted.
         let names = parse_imported_names("import * as api from './api'");
-        assert!(names.is_empty(), "namespace imports should return empty, got {:?}", names);
+        assert!(
+            names.is_empty(),
+            "namespace imports should return empty, got {:?}",
+            names
+        );
     }
 
     #[test]
     fn test_parse_es6_type_only_import_returns_empty() {
         // `import type { Foo }` is erased at runtime — no callable value created.
         let names = parse_imported_names("import type { MyType } from './types'");
-        assert!(names.is_empty(), "type-only import should return empty, got {:?}", names);
+        assert!(
+            names.is_empty(),
+            "type-only import should return empty, got {:?}",
+            names
+        );
     }
 
     #[test]
@@ -657,7 +684,11 @@ mod tests {
         // `os()` would raise TypeError; module members need `os.method()` which
         // body_contains_call correctly rejects.
         let names = parse_imported_names("import os");
-        assert!(names.is_empty(), "bare Python import should return empty, got {:?}", names);
+        assert!(
+            names.is_empty(),
+            "bare Python import should return empty, got {:?}",
+            names
+        );
     }
 
     #[test]
@@ -727,11 +758,20 @@ mod tests {
     #[test]
     fn test_body_does_not_match_declaration_context() {
         // `function helper(` defines the symbol, not calls it — must NOT match
-        assert!(!body_contains_call("function helper(x) { return x; }", "helper"));
+        assert!(!body_contains_call(
+            "function helper(x) { return x; }",
+            "helper"
+        ));
         // `def helper(` — Python declaration
-        assert!(!body_contains_call("def helper(x):\n    return x", "helper"));
+        assert!(!body_contains_call(
+            "def helper(x):\n    return x",
+            "helper"
+        ));
         // `fn helper(` — Rust declaration
-        assert!(!body_contains_call("fn helper(x: i32) -> i32 { x }", "helper"));
+        assert!(!body_contains_call(
+            "fn helper(x: i32) -> i32 { x }",
+            "helper"
+        ));
         // Actual call SHOULD match
         assert!(body_contains_call("let result = helper(42);", "helper"));
     }
@@ -743,16 +783,9 @@ mod tests {
     #[test]
     fn test_cross_file_call_emitted() {
         // Caller in file A imports `helper` from file B, calls it.
-        let caller = make_fn(
-            "a.ts",
-            "main",
-            "function main() { return helper(42); }",
-        );
+        let caller = make_fn("a.ts", "main", "function main() { return helper(42); }");
         let callee = make_fn("b.ts", "helper", "function helper(x) { return x; }");
-        let import = make_import(
-            "a.ts",
-            "import { helper } from './b'",
-        );
+        let import = make_import("a.ts", "import { helper } from './b'");
 
         let nodes = vec![caller.clone(), callee.clone(), import];
         let edges = import_calls_pass(&nodes);
@@ -772,11 +805,7 @@ mod tests {
         let nodes = vec![caller, callee];
         let edges = import_calls_pass(&nodes);
 
-        assert!(
-            edges.is_empty(),
-            "no import → no edge, got {:?}",
-            edges
-        );
+        assert!(edges.is_empty(), "no import → no edge, got {:?}", edges);
     }
 
     #[test]
@@ -866,7 +895,12 @@ mod tests {
         let nodes = vec![caller, callee, import_node];
         let edges = import_calls_pass(&nodes);
 
-        assert_eq!(edges.len(), 1, "expected 1 Python Calls edge, got {:?}", edges);
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected 1 Python Calls edge, got {:?}",
+            edges
+        );
         assert_eq!(edges[0].from.name, "get_workspace");
         assert_eq!(edges[0].to.name, "fetch_data");
         assert_eq!(edges[0].kind, EdgeKind::Calls);
@@ -875,7 +909,11 @@ mod tests {
     #[test]
     fn test_no_self_edge() {
         // A function that imports itself (unusual, but guard defensively).
-        let node = make_fn("a.ts", "processData", "function processData() { return processData(); }");
+        let node = make_fn(
+            "a.ts",
+            "processData",
+            "function processData() { return processData(); }",
+        );
         let import = make_import("a.ts", "import { processData } from './b'");
         // No other file defines processData — so no edge anyway.
 
@@ -907,11 +945,7 @@ mod tests {
     #[test]
     fn test_method_call_not_confused_with_bare_call() {
         // `obj.helper()` must not emit a Calls edge for `helper`.
-        let caller = make_fn(
-            "a.ts",
-            "main",
-            "function main() { return obj.helper(42); }",
-        );
+        let caller = make_fn("a.ts", "main", "function main() { return obj.helper(42); }");
         let callee = make_fn("b.ts", "helper", "function helper(x) { return x; }");
         let import = make_import("a.ts", "import { helper } from './b'");
 
@@ -935,8 +969,11 @@ mod tests {
         let edges = import_calls_pass(&nodes);
 
         assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].confidence, Confidence::Detected,
-            "relative import should produce Detected confidence");
+        assert_eq!(
+            edges[0].confidence,
+            Confidence::Detected,
+            "relative import should produce Detected confidence"
+        );
     }
 
     #[test]
@@ -950,11 +987,18 @@ mod tests {
         let edges = import_calls_pass(&nodes);
 
         // Edge is emitted when a local function with matching name exists.
-        assert_eq!(edges.len(), 1, "expected 1 Calls edge for the non-relative import");
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected 1 Calls edge for the non-relative import"
+        );
         // All edges use Detected confidence.
         for e in &edges {
-            assert_eq!(e.confidence, Confidence::Detected,
-                "all import-calls edges use Detected confidence");
+            assert_eq!(
+                e.confidence,
+                Confidence::Detected,
+                "all import-calls edges use Detected confidence"
+            );
         }
     }
 
@@ -971,7 +1015,8 @@ mod tests {
                 kind: NodeKind::Function,
             },
             language: "typescript".into(),
-            line_start: 1, line_end: 3,
+            line_start: 1,
+            line_end: 3,
             signature: "function main()".into(),
             body: "function main() { return fetch_data(id); }".into(),
             metadata: BTreeMap::new(),
@@ -985,7 +1030,8 @@ mod tests {
                 kind: NodeKind::Function,
             },
             language: "python".into(),
-            line_start: 1, line_end: 3,
+            line_start: 1,
+            line_end: 3,
             signature: "def fetch_data(id):".into(),
             body: "def fetch_data(id):\n    return db.get(id)".into(),
             metadata: BTreeMap::new(),
@@ -1052,7 +1098,8 @@ mod tests {
                 kind: NodeKind::Function,
             },
             language: "typescript".into(),
-            line_start: 1, line_end: 5,
+            line_start: 1,
+            line_end: 5,
             signature: "function mainA()".into(),
             body: "function mainA() { return helperA(1); }".into(),
             metadata: BTreeMap::new(),
@@ -1066,7 +1113,8 @@ mod tests {
                 kind: NodeKind::Function,
             },
             language: "typescript".into(),
-            line_start: 1, line_end: 3,
+            line_start: 1,
+            line_end: 3,
             signature: "function helperA(x)".into(),
             body: "function helperA(x) { return x; }".into(),
             metadata: BTreeMap::new(),
@@ -1080,7 +1128,8 @@ mod tests {
                 kind: NodeKind::Import,
             },
             language: "typescript".into(),
-            line_start: 1, line_end: 1,
+            line_start: 1,
+            line_end: 1,
             signature: "import { helperA } from './helpers'".into(),
             body: String::new(),
             metadata: BTreeMap::new(),
@@ -1097,7 +1146,8 @@ mod tests {
                 kind: NodeKind::Function,
             },
             language: "typescript".into(),
-            line_start: 1, line_end: 5,
+            line_start: 1,
+            line_end: 5,
             signature: "function mainB()".into(),
             body: "function mainB() { return helperB(1); }".into(),
             metadata: BTreeMap::new(),
@@ -1111,7 +1161,8 @@ mod tests {
                 kind: NodeKind::Function,
             },
             language: "typescript".into(),
-            line_start: 1, line_end: 3,
+            line_start: 1,
+            line_end: 3,
             signature: "function helperB(x)".into(),
             body: "function helperB(x) { return x; }".into(),
             metadata: BTreeMap::new(),
@@ -1125,22 +1176,36 @@ mod tests {
                 kind: NodeKind::Import,
             },
             language: "typescript".into(),
-            line_start: 1, line_end: 1,
+            line_start: 1,
+            line_end: 1,
             signature: "import { helperB } from './helpers'".into(),
             body: String::new(),
             metadata: BTreeMap::new(),
             source: ExtractionSource::TreeSitter,
         };
 
-        let nodes = vec![caller_a, callee_a.clone(), import_a,
-                         caller_b, callee_b.clone(), import_b];
+        let nodes = vec![
+            caller_a,
+            callee_a.clone(),
+            import_a,
+            caller_b,
+            callee_b.clone(),
+            import_b,
+        ];
         let edges = import_calls_pass(&nodes);
 
         // Expected: 2 edges — mainA→helperA (root-a) and mainB→helperB (root-b).
         // Without (root, file) keying: root-b's `helperB` import could leak into
         // root-a, and vice versa, causing different counts.
-        assert_eq!(edges.len(), 2, "expected 2 isolated cross-file edges, got {:?}",
-                   edges.iter().map(|e| format!("{}->{}", e.from.name, e.to.name)).collect::<Vec<_>>());
+        assert_eq!(
+            edges.len(),
+            2,
+            "expected 2 isolated cross-file edges, got {:?}",
+            edges
+                .iter()
+                .map(|e| format!("{}->{}", e.from.name, e.to.name))
+                .collect::<Vec<_>>()
+        );
 
         let edge_a = edges.iter().find(|e| e.from.root == "root-a");
         assert!(edge_a.is_some(), "missing root-a edge");

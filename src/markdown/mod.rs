@@ -4,7 +4,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use gray_matter::{engine::YAML, Matter, ParsedEntity};
+use gray_matter::{Matter, ParsedEntity, engine::YAML};
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 
 use crate::types::MarkdownChunk;
@@ -299,9 +299,13 @@ pub fn search_chunks<'a>(chunks: &'a [MarkdownChunk], query: &str) -> Vec<&'a Ma
 
             // Check heading hierarchy too
             if score == 0
-                && chunk.heading_hierarchy.iter().any(|h| h.to_lowercase().contains(&query_lower)) {
-                    score += 4;
-                }
+                && chunk
+                    .heading_hierarchy
+                    .iter()
+                    .any(|h| h.to_lowercase().contains(&query_lower))
+            {
+                score += 4;
+            }
 
             // Frontmatter match: low bonus (+3) because frontmatter is machine
             // metadata (YAML keys/values), not human-readable content. This ensures
@@ -385,7 +389,10 @@ pub struct ScoredMarkdownChunk<'a> {
 /// that merely contains the term in a deep subsection.
 ///
 /// Returns results sorted by descending score.
-pub fn search_chunks_ranked<'a>(chunks: &'a [MarkdownChunk], query: &str) -> Vec<ScoredMarkdownChunk<'a>> {
+pub fn search_chunks_ranked<'a>(
+    chunks: &'a [MarkdownChunk],
+    query: &str,
+) -> Vec<ScoredMarkdownChunk<'a>> {
     let query_lower = query.to_lowercase();
 
     let mut scored: Vec<ScoredMarkdownChunk<'a>> = chunks
@@ -394,13 +401,10 @@ pub fn search_chunks_ranked<'a>(chunks: &'a [MarkdownChunk], query: &str) -> Vec
             let content_lower = chunk.content.to_lowercase();
             // Strip `#` prefix before matching so queries like "#" don't
             // spuriously match every heading (review finding #6).
-            let heading_match = chunk
-                .heading_hierarchy
-                .iter()
-                .any(|h| {
-                    let text = h.trim_start_matches('#').trim().to_lowercase();
-                    text.contains(&query_lower)
-                });
+            let heading_match = chunk.heading_hierarchy.iter().any(|h| {
+                let text = h.trim_start_matches('#').trim().to_lowercase();
+                text.contains(&query_lower)
+            });
             let content_match = content_lower.contains(&query_lower);
 
             if !heading_match && !content_match {
@@ -434,7 +438,11 @@ pub fn search_chunks_ranked<'a>(chunks: &'a [MarkdownChunk], query: &str) -> Vec
             }
 
             // Tier 3: Code span match -- cross-reference to a code symbol
-            if chunk.code_spans.iter().any(|s| s.to_lowercase().contains(&query_lower)) {
+            if chunk
+                .code_spans
+                .iter()
+                .any(|s| s.to_lowercase().contains(&query_lower))
+            {
                 score += 0.15; // strong signal for developer queries
             }
 
@@ -447,7 +455,11 @@ pub fn search_chunks_ranked<'a>(chunks: &'a [MarkdownChunk], query: &str) -> Vec
         })
         .collect();
 
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     scored
 }
 
@@ -503,7 +515,13 @@ mod tests {
 
         let chunks = parse_markdown_file(&md_path).unwrap();
 
-        assert_eq!(chunks.len(), 4, "Expected 4 chunks, got {}: {:#?}", chunks.len(), chunks);
+        assert_eq!(
+            chunks.len(),
+            4,
+            "Expected 4 chunks, got {}: {:#?}",
+            chunks.len(),
+            chunks
+        );
 
         // Title
         assert_eq!(chunks[0].heading_hierarchy, vec!["# Title"]);
@@ -535,7 +553,10 @@ mod tests {
         );
         assert_eq!(chunks[3].heading_level, 3);
         assert_eq!(chunks[3].heading_text, "Subsection B1");
-        assert_eq!(chunks[3].section_path(), "Title > Section B > Subsection B1");
+        assert_eq!(
+            chunks[3].section_path(),
+            "Title > Section B > Subsection B1"
+        );
         assert_eq!(chunks[3].parent_heading, Some("Section B".to_string()));
         assert!(chunks[3].code_spans.contains(&"baz".to_string()));
     }
@@ -642,7 +663,13 @@ mod tests {
         let source = "---\nid: test-outcome\nstatus: active\n---\n\n# Title\n\nBody text.\n";
         let chunks = parse_markdown_source(source, Path::new("test.md"));
 
-        assert_eq!(chunks.len(), 2, "Expected frontmatter + heading chunk, got {}: {:#?}", chunks.len(), chunks);
+        assert_eq!(
+            chunks.len(),
+            2,
+            "Expected frontmatter + heading chunk, got {}: {:#?}",
+            chunks.len(),
+            chunks
+        );
         assert!(chunks[0].is_frontmatter);
         assert!(chunks[0].content.contains("id: test-outcome"));
         assert_eq!(chunks[0].heading_level, 0);
@@ -722,7 +749,10 @@ mod tests {
         assert_eq!(chunks[0].byte_offset, 0);
         // Second chunk content should match the source slice
         let c1 = &chunks[1];
-        assert_eq!(&source[c1.byte_offset..c1.byte_offset + c1.byte_len], c1.content);
+        assert_eq!(
+            &source[c1.byte_offset..c1.byte_offset + c1.byte_len],
+            c1.content
+        );
     }
 
     #[test]
@@ -862,21 +892,19 @@ mod tests {
 
     #[test]
     fn test_search_chunks_ranked_no_match() {
-        let chunks = vec![
-            MarkdownChunk {
-                file_path: PathBuf::from("a.md"),
-                heading_hierarchy: vec!["# Alpha".to_string()],
-                heading_level: 1,
-                heading_text: String::new(),
-                parent_heading: None,
-                is_frontmatter: false,
-                content: "Hello world".to_string(),
-                byte_offset: 0,
-                byte_len: 11,
-                code_spans: vec![],
-                links: vec![],
-            },
-        ];
+        let chunks = vec![MarkdownChunk {
+            file_path: PathBuf::from("a.md"),
+            heading_hierarchy: vec!["# Alpha".to_string()],
+            heading_level: 1,
+            heading_text: String::new(),
+            parent_heading: None,
+            is_frontmatter: false,
+            content: "Hello world".to_string(),
+            byte_offset: 0,
+            byte_len: 11,
+            code_spans: vec![],
+            links: vec![],
+        }];
 
         let results = search_chunks_ranked(&chunks, "nonexistent");
         assert!(results.is_empty());
@@ -1035,21 +1063,19 @@ mod tests {
     /// byte position. Verify density doesn't overflow or produce absurd scores.
     #[test]
     fn test_ranked_empty_query_density_bounded() {
-        let chunks = vec![
-            MarkdownChunk {
-                file_path: PathBuf::from("a.md"),
-                heading_hierarchy: vec!["# Test".to_string()],
-                heading_level: 1,
-                heading_text: String::new(),
-                parent_heading: None,
-                is_frontmatter: false,
-                content: "A normal sentence with some words in it.".to_string(),
-                byte_offset: 0,
-                byte_len: 40,
-                code_spans: vec![],
-                links: vec![],
-            },
-        ];
+        let chunks = vec![MarkdownChunk {
+            file_path: PathBuf::from("a.md"),
+            heading_hierarchy: vec!["# Test".to_string()],
+            heading_level: 1,
+            heading_text: String::new(),
+            parent_heading: None,
+            is_frontmatter: false,
+            content: "A normal sentence with some words in it.".to_string(),
+            byte_offset: 0,
+            byte_len: 40,
+            code_spans: vec![],
+            links: vec![],
+        }];
 
         let results = search_chunks_ranked(&chunks, "");
         // If empty query matches, the density bonus must still be capped at 0.10
@@ -1101,14 +1127,20 @@ mod tests {
         assert_eq!(results.len(), 1, "Should match only the Spanish chunk");
         assert_eq!(results[0].chunk.file_path, PathBuf::from("i18n.md"));
         // Gets exact heading match (1.0) + h1 bonus (0.10) + density
-        assert!(results[0].score >= 1.0, "Exact heading match for accented text");
+        assert!(
+            results[0].score >= 1.0,
+            "Exact heading match for accented text"
+        );
 
         // CJK search
         let results = search_chunks_ranked(&chunks, "設定");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk.file_path, PathBuf::from("cjk.md"));
         // Should get exact heading match score (1.0 + heading bonus)
-        assert!(results[0].score >= 1.0, "Exact CJK heading match should score >= 1.0");
+        assert!(
+            results[0].score >= 1.0,
+            "Exact CJK heading match should score >= 1.0"
+        );
     }
 
     /// Hash character as query: after the review fix, searching for "#" should
@@ -1178,21 +1210,19 @@ mod tests {
     /// Verify scoring doesn't panic and applies the preamble bonus (0.02).
     #[test]
     fn test_ranked_preamble_no_headings() {
-        let chunks = vec![
-            MarkdownChunk {
-                file_path: PathBuf::from("plain.md"),
-                heading_hierarchy: vec![],
-                heading_level: 0,
-                heading_text: String::new(),
-                parent_heading: None,
-                is_frontmatter: false,
-                content: "Just plain text mentioning config here.".to_string(),
-                byte_offset: 0,
-                byte_len: 39,
-                code_spans: vec![],
-                links: vec![],
-            },
-        ];
+        let chunks = vec![MarkdownChunk {
+            file_path: PathBuf::from("plain.md"),
+            heading_hierarchy: vec![],
+            heading_level: 0,
+            heading_text: String::new(),
+            parent_heading: None,
+            is_frontmatter: false,
+            content: "Just plain text mentioning config here.".to_string(),
+            byte_offset: 0,
+            byte_len: 39,
+            code_spans: vec![],
+            links: vec![],
+        }];
 
         let results = search_chunks_ranked(&chunks, "config");
         assert_eq!(results.len(), 1);
@@ -1281,25 +1311,23 @@ mod tests {
     /// Verify it still gets heading-match credit.
     #[test]
     fn test_ranked_ancestor_heading_match() {
-        let chunks = vec![
-            MarkdownChunk {
-                file_path: PathBuf::from("deep.md"),
-                heading_hierarchy: vec![
-                    "# Config".to_string(),
-                    "## Advanced".to_string(),
-                    "### Timeouts".to_string(),
-                ],
-                heading_level: 3,
-                heading_text: String::new(),
-                parent_heading: None,
-                is_frontmatter: false,
-                content: "Set the timeout to 30s.".to_string(),
-                byte_offset: 0,
-                byte_len: 23,
-                code_spans: vec![],
-                links: vec![],
-            },
-        ];
+        let chunks = vec![MarkdownChunk {
+            file_path: PathBuf::from("deep.md"),
+            heading_hierarchy: vec![
+                "# Config".to_string(),
+                "## Advanced".to_string(),
+                "### Timeouts".to_string(),
+            ],
+            heading_level: 3,
+            heading_text: String::new(),
+            parent_heading: None,
+            is_frontmatter: false,
+            content: "Set the timeout to 30s.".to_string(),
+            byte_offset: 0,
+            byte_len: 23,
+            code_spans: vec![],
+            links: vec![],
+        }];
 
         let results = search_chunks_ranked(&chunks, "config");
         assert_eq!(results.len(), 1);
@@ -1316,21 +1344,19 @@ mod tests {
     /// content, and code spans.
     #[test]
     fn test_ranked_case_insensitive_all_components() {
-        let chunks = vec![
-            MarkdownChunk {
-                file_path: PathBuf::from("a.md"),
-                heading_hierarchy: vec!["# ParseConfig".to_string()],
-                heading_level: 1,
-                heading_text: String::new(),
-                parent_heading: None,
-                is_frontmatter: false,
-                content: "The PARSECONFIG function.".to_string(),
-                byte_offset: 0,
-                byte_len: 25,
-                code_spans: vec!["ParseConfig".to_string()],
-                links: vec![],
-            },
-        ];
+        let chunks = vec![MarkdownChunk {
+            file_path: PathBuf::from("a.md"),
+            heading_hierarchy: vec!["# ParseConfig".to_string()],
+            heading_level: 1,
+            heading_text: String::new(),
+            parent_heading: None,
+            is_frontmatter: false,
+            content: "The PARSECONFIG function.".to_string(),
+            byte_offset: 0,
+            byte_len: 25,
+            code_spans: vec!["ParseConfig".to_string()],
+            links: vec![],
+        }];
 
         let results = search_chunks_ranked(&chunks, "parseconfig");
         assert_eq!(results.len(), 1);
@@ -1449,7 +1475,11 @@ mod tests {
         let source = "---\nid: x\nstatus: draft\n---\n";
         let chunks = parse_markdown_source(source, Path::new("fm-only.md"));
 
-        assert_eq!(chunks.len(), 1, "Frontmatter-only doc should produce exactly one chunk");
+        assert_eq!(
+            chunks.len(),
+            1,
+            "Frontmatter-only doc should produce exactly one chunk"
+        );
         assert!(chunks[0].is_frontmatter);
         assert!(chunks[0].content.contains("id: x"));
     }
@@ -1470,7 +1500,11 @@ mod tests {
         let source = "# Title\n\n## Empty\n\n## Next\n\nContent.\n";
         let chunks = parse_markdown_source(source, Path::new("sparse.md"));
 
-        assert_eq!(chunks.len(), 3, "Each heading gets its own chunk even without body");
+        assert_eq!(
+            chunks.len(),
+            3,
+            "Each heading gets its own chunk even without body"
+        );
         assert_eq!(chunks[0].heading_text, "Title");
         assert_eq!(chunks[1].heading_text, "Empty");
         assert_eq!(chunks[2].heading_text, "Next");
@@ -1514,8 +1548,10 @@ mod tests {
         let results = search_chunks(&chunks, "active");
         assert_eq!(results.len(), 2);
         // The h1 with exact heading match must rank above frontmatter body-only match
-        assert_eq!(results[0].heading_text, "Active",
-            "Exact h1 heading match should rank above frontmatter body match");
+        assert_eq!(
+            results[0].heading_text, "Active",
+            "Exact h1 heading match should rank above frontmatter body match"
+        );
     }
 
     #[test]
@@ -1556,10 +1592,11 @@ mod tests {
         let results = search_chunks(&chunks, "active");
         assert_eq!(results.len(), 2);
         // h1 body-only (score 8) must outrank frontmatter body-only (score 5)
-        assert_eq!(results[0].heading_text, "Overview",
-            "h1 body-only match (score 8) should rank above frontmatter body-only match (score 5)");
-        assert!(results[1].is_frontmatter,
-            "frontmatter should be second");
+        assert_eq!(
+            results[0].heading_text, "Overview",
+            "h1 body-only match (score 8) should rank above frontmatter body-only match (score 5)"
+        );
+        assert!(results[1].is_frontmatter, "frontmatter should be second");
     }
 
     // ========================================================================
@@ -1578,11 +1615,22 @@ mod tests {
 Deepest content.\n";
         let chunks = parse_markdown_source(source, Path::new("deep.md"));
 
-        assert_eq!(chunks.len(), 6, "Should produce one chunk per heading level");
+        assert_eq!(
+            chunks.len(),
+            6,
+            "Should produce one chunk per heading level"
+        );
         assert_eq!(chunks[5].heading_level, 6);
         assert_eq!(
             chunks[5].heading_hierarchy,
-            vec!["# L1", "## L2", "### L3", "#### L4", "##### L5", "###### L6"]
+            vec![
+                "# L1",
+                "## L2",
+                "### L3",
+                "#### L4",
+                "##### L5",
+                "###### L6"
+            ]
         );
         assert_eq!(chunks[5].section_path(), "L1 > L2 > L3 > L4 > L5 > L6");
         assert_eq!(chunks[5].parent_heading, Some("L5".to_string()));
@@ -1666,13 +1714,18 @@ Deepest content.\n";
         let chunks = parse_markdown_source(source, Path::new("empty-fm.md"));
 
         let fm_chunks: Vec<_> = chunks.iter().filter(|c| c.is_frontmatter).collect();
-        assert_eq!(fm_chunks.len(), 1,
-            "Empty frontmatter should produce a frontmatter chunk");
+        assert_eq!(
+            fm_chunks.len(),
+            1,
+            "Empty frontmatter should produce a frontmatter chunk"
+        );
 
         // The heading should still be parsed correctly
         let heading_chunks: Vec<_> = chunks.iter().filter(|c| !c.is_frontmatter).collect();
-        assert!(heading_chunks.iter().any(|c| c.heading_text == "Title"),
-            "Heading should still be parsed after empty frontmatter");
+        assert!(
+            heading_chunks.iter().any(|c| c.heading_text == "Title"),
+            "Heading should still be parsed after empty frontmatter"
+        );
     }
 
     #[test]
@@ -1722,7 +1775,12 @@ Deepest content.\n";
         let chunks = parse_markdown_source(source, Path::new("empty-body.md"));
 
         // Each heading should produce a chunk (via saw_any_heading flag)
-        assert!(chunks.len() >= 3, "Got {} chunks: {:#?}", chunks.len(), chunks);
+        assert!(
+            chunks.len() >= 3,
+            "Got {} chunks: {:#?}",
+            chunks.len(),
+            chunks
+        );
         // Verify hierarchy is correct
         let d_chunk = chunks.iter().find(|c| c.heading_text == "D").unwrap();
         assert_eq!(d_chunk.heading_hierarchy, vec!["# A", "## C", "### D"]);
@@ -1736,7 +1794,10 @@ Deepest content.\n";
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].heading_text.len(), 2000);
-        assert_eq!(chunks[0].heading_hierarchy[0], format!("# {}", long_heading));
+        assert_eq!(
+            chunks[0].heading_hierarchy[0],
+            format!("# {}", long_heading)
+        );
     }
 
     #[test]
@@ -1759,7 +1820,11 @@ Deepest content.\n";
         let text = chunk.embedding_text();
         // Default limit is 500 chars for body. Single-level heading skips
         // breadcrumb prefix, so the text IS the truncated body.
-        assert!(text.len() <= 500, "embedding_text should truncate body, got len={}", text.len());
+        assert!(
+            text.len() <= 500,
+            "embedding_text should truncate body, got len={}",
+            text.len()
+        );
     }
 
     #[test]
@@ -1789,7 +1854,8 @@ Deepest content.\n";
 
     #[test]
     fn test_unicode_headings_and_body() {
-        let source = "# Ψηφιακή Εποχή\n\n日本語のテキスト。\n\n## Ñoño 🎉\n\nEmoji content: 🦀🔥💯\n";
+        let source =
+            "# Ψηφιακή Εποχή\n\n日本語のテキスト。\n\n## Ñoño 🎉\n\nEmoji content: 🦀🔥💯\n";
         let chunks = parse_markdown_source(source, Path::new("unicode.md"));
 
         assert_eq!(chunks.len(), 2);
@@ -1821,7 +1887,11 @@ Deepest content.\n";
         // Must not panic on multibyte boundary
         let text = chunk.embedding_text();
         // Single-level heading: no breadcrumb prefix, body starts directly
-        assert!(text.starts_with("日"), "Single-level heading should have no prefix, got: {}", &text[..20.min(text.len())]);
+        assert!(
+            text.starts_with("日"),
+            "Single-level heading should have no prefix, got: {}",
+            &text[..20.min(text.len())]
+        );
         // Verify it's valid UTF-8 (implicit — if we got here, it is)
     }
 
@@ -1832,7 +1902,10 @@ Deepest content.\n";
         let chunks = parse_markdown_source(source, Path::new("no-trail.md"));
 
         // Should produce at least the frontmatter chunk, and not panic
-        assert!(!chunks.is_empty(), "Should handle frontmatter without trailing newline");
+        assert!(
+            !chunks.is_empty(),
+            "Should handle frontmatter without trailing newline"
+        );
         assert!(chunks[0].is_frontmatter);
     }
 
@@ -1854,7 +1927,11 @@ Deepest content.\n";
         let source = "   \n\n  \t  \n";
         let chunks = parse_markdown_source(source, Path::new("ws.md"));
 
-        assert_eq!(chunks.len(), 0, "Whitespace-only document should produce no chunks");
+        assert_eq!(
+            chunks.len(),
+            0,
+            "Whitespace-only document should produce no chunks"
+        );
     }
 
     #[test]
@@ -1875,7 +1952,8 @@ Deepest content.\n";
             chunks[0].byte_len
         );
         // Verify content matches source at the offset
-        let actual = &source[heading_chunk.byte_offset..heading_chunk.byte_offset + heading_chunk.byte_len];
+        let actual =
+            &source[heading_chunk.byte_offset..heading_chunk.byte_offset + heading_chunk.byte_len];
         assert_eq!(actual, heading_chunk.content);
     }
 
@@ -1939,7 +2017,11 @@ Deepest content.\n";
 
         // Empty string is contained in everything — should match all chunks
         let results = search_chunks(&chunks, "");
-        assert_eq!(results.len(), 1, "Empty query matches everything via contains");
+        assert_eq!(
+            results.len(),
+            1,
+            "Empty query matches everything via contains"
+        );
     }
 
     #[test]
@@ -1988,7 +2070,11 @@ Deepest content.\n";
         let chunks = parse_markdown_source(source, Path::new("pre.md"));
 
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].section_path(), "", "Preamble should have empty section_path");
+        assert_eq!(
+            chunks[0].section_path(),
+            "",
+            "Preamble should have empty section_path"
+        );
         assert!(chunks[0].heading_hierarchy.is_empty());
     }
 
@@ -2062,10 +2148,14 @@ Deepest content.\n";
     #[test]
     fn test_heading_after_deep_nesting_resets_properly() {
         // h1 > h2 > h3 > h4, then back to h2 — stack should unwind properly
-        let source = "# Root\n\n## L2\n\n### L3\n\n#### L4\n\nDeep.\n\n## Back to L2\n\nShallow again.\n";
+        let source =
+            "# Root\n\n## L2\n\n### L3\n\n#### L4\n\nDeep.\n\n## Back to L2\n\nShallow again.\n";
         let chunks = parse_markdown_source(source, Path::new("unwind.md"));
 
-        let back = chunks.iter().find(|c| c.heading_text == "Back to L2").unwrap();
+        let back = chunks
+            .iter()
+            .find(|c| c.heading_text == "Back to L2")
+            .unwrap();
         assert_eq!(
             back.heading_hierarchy,
             vec!["# Root", "## Back to L2"],

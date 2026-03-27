@@ -147,8 +147,19 @@ pub struct SearchContext<'a> {
 /// the slug (case-insensitive), OR be the synthetic "external" root (so that
 /// external dependencies always appear in traversal results), OR be a
 /// non-code slug (e.g., a memory root that stores markdown rather than code).
-pub fn node_passes_root_filter(node_root: &str, root_filter: &Option<String>, non_code_slugs: &HashSet<String>) -> bool {
-    match root_filter { None => true, Some(slug) => node_root.eq_ignore_ascii_case(slug) || node_root == "external" || non_code_slugs.contains(node_root) }
+pub fn node_passes_root_filter(
+    node_root: &str,
+    root_filter: &Option<String>,
+    non_code_slugs: &HashSet<String>,
+) -> bool {
+    match root_filter {
+        None => true,
+        Some(slug) => {
+            node_root.eq_ignore_ascii_case(slug)
+                || node_root == "external"
+                || non_code_slugs.contains(node_root)
+        }
+    }
 }
 
 /// Returns true when an embedding search result passes the active root filter.
@@ -156,8 +167,20 @@ pub fn node_passes_root_filter(node_root: &str, root_filter: &Option<String>, no
 /// Non-code results (artifacts, markdown) always pass — they are not root-
 /// scoped the same way code symbols are. Code results delegate to
 /// `node_passes_root_filter` using the root prefix of the result ID.
-pub fn search_result_passes_root_filter(result: &crate::embed::SearchResult, root_filter: &Option<String>, non_code_slugs: &HashSet<String>) -> bool {
-    if root_filter.is_none() { return true; }
-    if !result.kind.starts_with("code:") { return true; }
-    node_passes_root_filter(result.id.split(':').next().unwrap_or(""), root_filter, non_code_slugs)
+pub fn search_result_passes_root_filter(
+    result: &crate::embed::SearchResult,
+    root_filter: &Option<String>,
+    non_code_slugs: &HashSet<String>,
+) -> bool {
+    if root_filter.is_none() {
+        return true;
+    }
+    if !result.kind.starts_with("code:") {
+        return true;
+    }
+    node_passes_root_filter(
+        result.id.split(':').next().unwrap_or(""),
+        root_filter,
+        non_code_slugs,
+    )
 }

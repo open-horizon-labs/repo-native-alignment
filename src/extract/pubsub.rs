@@ -276,9 +276,7 @@ pub fn pubsub_pass(
 
             // Extract channel name.
             let channel_name = match &rule.extraction {
-                Extraction::QuotedAfter(prefix) => {
-                    extract_quoted_after(&node.body, prefix)
-                }
+                Extraction::QuotedAfter(prefix) => extract_quoted_after(&node.body, prefix),
                 Extraction::FixedName(name) => Some(name.to_string()),
             };
 
@@ -297,7 +295,10 @@ pub fn pubsub_pass(
                     Node {
                         id: NodeId {
                             root: root_id.to_string(),
-                            file: PathBuf::from(format!("channels/{}", channel_name.replace(':', "/"))),
+                            file: PathBuf::from(format!(
+                                "channels/{}",
+                                channel_name.replace(':', "/")
+                            )),
                             name: channel_name.clone(),
                             kind: NodeKind::Other("channel".to_string()),
                         },
@@ -571,8 +572,16 @@ mod tests {
             "def fn_b(): producer.send(\"orders\", value=y)",
         );
         let result = pubsub_pass(&[node_a, node_b], &fw(&["kafka-python"]), "repo");
-        let order_nodes: Vec<_> = result.nodes.iter().filter(|n| n.id.name == "orders").collect();
-        assert_eq!(order_nodes.len(), 1, "Same topic must produce one channel node");
+        let order_nodes: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.name == "orders")
+            .collect();
+        assert_eq!(
+            order_nodes.len(),
+            1,
+            "Same topic must produce one channel node"
+        );
         assert_eq!(result.edges.len(), 2, "Two functions → two edges");
     }
 
@@ -587,7 +596,10 @@ mod tests {
     #[test]
     fn test_extract_quoted_after_single_quote() {
         assert_eq!(
-            extract_quoted_after("channel.basic_publish(routing_key='orders')", "routing_key="),
+            extract_quoted_after(
+                "channel.basic_publish(routing_key='orders')",
+                "routing_key="
+            ),
             Some("orders".to_string())
         );
     }
@@ -606,6 +618,9 @@ mod tests {
         let mut node = make_fn("external", "python", "fn", "producer.send(\"topic\")");
         node.id.root = "external".into();
         let result = pubsub_pass(&[node], &fw(&["kafka-python"]), "repo");
-        assert!(result.edges.is_empty(), "External root nodes must be skipped");
+        assert!(
+            result.edges.is_empty(),
+            "External root nodes must be skipped"
+        );
     }
 }

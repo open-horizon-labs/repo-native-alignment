@@ -51,7 +51,9 @@ pub struct ManifestConsumer;
 
 #[async_trait]
 impl ExtractionConsumer for ManifestConsumer {
-    fn name(&self) -> &str { "manifest" }
+    fn name(&self) -> &str {
+        "manifest"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::RootDiscovered]
@@ -61,7 +63,10 @@ impl ExtractionConsumer for ManifestConsumer {
         let ExtractionEvent::RootDiscovered { slug, .. } = event else {
             return Ok(vec![]);
         };
-        tracing::debug!("ManifestConsumer: root '{}' discovered (manifest handled by EnrichmentFinalizer)", slug);
+        tracing::debug!(
+            "ManifestConsumer: root '{}' discovered (manifest handled by EnrichmentFinalizer)",
+            slug
+        );
         Ok(vec![])
     }
 }
@@ -106,14 +111,21 @@ impl Default for TreeSitterConsumer {
 
 #[async_trait]
 impl ExtractionConsumer for TreeSitterConsumer {
-    fn name(&self) -> &str { "tree_sitter" }
+    fn name(&self) -> &str {
+        "tree_sitter"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::RootDiscovered]
     }
 
     async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::RootDiscovered { slug, path, lsp_only } = event else {
+        let ExtractionEvent::RootDiscovered {
+            slug,
+            path,
+            lsp_only,
+        } = event
+        else {
             return Ok(vec![]);
         };
 
@@ -137,7 +149,9 @@ impl ExtractionConsumer for TreeSitterConsumer {
             scan_duration: std::time::Duration::ZERO,
         };
 
-        let (mut extraction, enc_stats) = self.registry.extract_scan_result_with_stats(path, &full_scan);
+        let (mut extraction, enc_stats) = self
+            .registry
+            .extract_scan_result_with_stats(path, &full_scan);
 
         // Stamp all nodes/edges with the root slug.
         for node in &mut extraction.nodes {
@@ -193,14 +207,22 @@ pub struct LanguageAccumulatorConsumer;
 
 #[async_trait]
 impl ExtractionConsumer for LanguageAccumulatorConsumer {
-    fn name(&self) -> &str { "language_accumulator" }
+    fn name(&self) -> &str {
+        "language_accumulator"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::RootExtracted]
     }
 
     async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::RootExtracted { slug, nodes, dirty_slugs, .. } = event else {
+        let ExtractionEvent::RootExtracted {
+            slug,
+            nodes,
+            dirty_slugs,
+            ..
+        } = event
+        else {
             return Ok(vec![]);
         };
 
@@ -230,7 +252,10 @@ impl ExtractionConsumer for LanguageAccumulatorConsumer {
             {
                 continue;
             }
-            by_lang.entry(node.language.clone()).or_default().push(node.clone());
+            by_lang
+                .entry(node.language.clone())
+                .or_default()
+                .push(node.clone());
         }
 
         let mut events: Vec<ExtractionEvent> = Vec::with_capacity(by_lang.len());
@@ -270,7 +295,9 @@ pub struct ApiLinkConsumer;
 
 #[async_trait]
 impl ExtractionConsumer for ApiLinkConsumer {
-    fn name(&self) -> &str { "api_link" }
+    fn name(&self) -> &str {
+        "api_link"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::AllEnrichmentsDone]
@@ -284,7 +311,10 @@ impl ExtractionConsumer for ApiLinkConsumer {
         // includes its output in `PassesComplete`. This consumer is a subscription
         // slot — it signals that the api_link pass participates in the event-driven
         // pipeline. No pass re-execution here avoids duplicate work.
-        tracing::debug!("ApiLinkConsumer: root '{}' AllEnrichmentsDone received (pass runs in EnrichmentFinalizer)", slug);
+        tracing::debug!(
+            "ApiLinkConsumer: root '{}' AllEnrichmentsDone received (pass runs in EnrichmentFinalizer)",
+            slug
+        );
         Ok(vec![])
     }
 }
@@ -306,7 +336,9 @@ pub struct TestedByConsumer;
 
 #[async_trait]
 impl ExtractionConsumer for TestedByConsumer {
-    fn name(&self) -> &str { "tested_by" }
+    fn name(&self) -> &str {
+        "tested_by"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::AllEnrichmentsDone]
@@ -320,7 +352,10 @@ impl ExtractionConsumer for TestedByConsumer {
         // includes its output in `PassesComplete`. This consumer is a subscription
         // slot — it signals that the tested_by pass participates in the event-driven
         // pipeline. No pass re-execution here avoids duplicate work.
-        tracing::debug!("TestedByConsumer: root '{}' AllEnrichmentsDone received (pass runs in EnrichmentFinalizer)", slug);
+        tracing::debug!(
+            "TestedByConsumer: root '{}' AllEnrichmentsDone received (pass runs in EnrichmentFinalizer)",
+            slug
+        );
         Ok(vec![])
     }
 }
@@ -350,14 +385,19 @@ pub struct FastapiRouterPrefixConsumer;
 
 #[async_trait]
 impl ExtractionConsumer for FastapiRouterPrefixConsumer {
-    fn name(&self) -> &str { "fastapi_router_prefix" }
+    fn name(&self) -> &str {
+        "fastapi_router_prefix"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::FrameworkDetected]
     }
 
     async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
+        let ExtractionEvent::FrameworkDetected {
+            slug, framework, ..
+        } = event
+        else {
             return Ok(vec![]);
         };
         if framework != "fastapi" {
@@ -401,14 +441,19 @@ pub struct SdkPathInferenceConsumer;
 
 #[async_trait]
 impl ExtractionConsumer for SdkPathInferenceConsumer {
-    fn name(&self) -> &str { "sdk_path_inference" }
+    fn name(&self) -> &str {
+        "sdk_path_inference"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::FrameworkDetected]
     }
 
     async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
+        let ExtractionEvent::FrameworkDetected {
+            slug, framework, ..
+        } = event
+        else {
             return Ok(vec![]);
         };
         if framework != "fastapi" {
@@ -475,20 +520,33 @@ pub struct EnrichmentFinalizer {
 
 impl EnrichmentFinalizer {
     pub fn new(root_pairs: Vec<(String, PathBuf)>, primary_slug: String) -> Self {
-        Self { root_pairs, primary_slug }
+        Self {
+            root_pairs,
+            primary_slug,
+        }
     }
 }
 
 #[async_trait]
 impl ExtractionConsumer for EnrichmentFinalizer {
-    fn name(&self) -> &str { "enrichment_finalizer" }
+    fn name(&self) -> &str {
+        "enrichment_finalizer"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::AllEnrichmentsDone]
     }
 
     async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::AllEnrichmentsDone { slug, nodes, edges, lsp_edges, lsp_nodes, updated_nodes } = event else {
+        let ExtractionEvent::AllEnrichmentsDone {
+            slug,
+            nodes,
+            edges,
+            lsp_edges,
+            lsp_nodes,
+            updated_nodes,
+        } = event
+        else {
             return Ok(vec![]);
         };
 
@@ -664,9 +722,10 @@ impl EnrichmentFinalizer {
         // plain React, Angular, or Vue repos that have no Next.js structure.
         {
             let import_detected = detected_frameworks.contains("nextjs-app-router");
-            let fs_detected = !import_detected && (
-                // Check root-level paths (single-root repos)
-                self.root_pairs.iter().any(|(_, root_path)| {
+            let fs_detected = !import_detected
+                && (
+                    // Check root-level paths (single-root repos)
+                    self.root_pairs.iter().any(|(_, root_path)| {
                     root_path.join("pages").is_dir()
                         || root_path.join("app").is_dir()
                         || root_path.join("src/pages").is_dir()
@@ -689,7 +748,7 @@ impl EnrichmentFinalizer {
                 || self.root_pairs.iter().any(|(_, root_path)| {
                     has_nextjs_in_subdirs(root_path)
                 })
-            );
+                );
             if import_detected || fs_detected {
                 let result = crate::extract::nextjs_routing::nextjs_routing_pass(
                     &self.root_pairs,
@@ -710,11 +769,16 @@ impl EnrichmentFinalizer {
         }
         // extractor_config — config-driven boundary detection per workspace root
         for (root_slug, root_path) in &self.root_pairs {
-            let configs = crate::extract::extractor_config::load_extractor_configs(root_path.as_path());
+            let configs =
+                crate::extract::extractor_config::load_extractor_configs(root_path.as_path());
             if configs.is_empty() {
                 continue;
             }
-            let root_nodes: Vec<_> = all_nodes.iter().filter(|n| &n.id.root == root_slug).cloned().collect();
+            let root_nodes: Vec<_> = all_nodes
+                .iter()
+                .filter(|n| &n.id.root == root_slug)
+                .cloned()
+                .collect();
             if root_nodes.is_empty() {
                 continue;
             }
@@ -749,7 +813,10 @@ impl EnrichmentFinalizer {
             let fw_nodes: Vec<Node> = all_nodes
                 .iter()
                 .filter(|n| {
-                    n.metadata.get("framework").map(|f| f == framework).unwrap_or(false)
+                    n.metadata
+                        .get("framework")
+                        .map(|f| f == framework)
+                        .unwrap_or(false)
                 })
                 .cloned()
                 .collect();
@@ -784,7 +851,9 @@ impl EnrichmentFinalizer {
 /// subdirectory like `client/` or `web/` rather than at the root.
 /// This scans one level of subdirectories (skipping vendor/noise dirs).
 fn has_nextjs_in_subdirs(root_path: &std::path::Path) -> bool {
-    let Ok(rd) = std::fs::read_dir(root_path) else { return false; };
+    let Ok(rd) = std::fs::read_dir(root_path) else {
+        return false;
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -832,14 +901,21 @@ pub struct FrameworkDetectionConsumer;
 
 #[async_trait]
 impl ExtractionConsumer for FrameworkDetectionConsumer {
-    fn name(&self) -> &str { "framework_detection" }
+    fn name(&self) -> &str {
+        "framework_detection"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::FrameworkDetected]
     }
 
     async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::FrameworkDetected { slug, framework, nodes } = event else {
+        let ExtractionEvent::FrameworkDetected {
+            slug,
+            framework,
+            nodes,
+        } = event
+        else {
             return Ok(vec![]);
         };
         tracing::info!(
@@ -890,14 +966,19 @@ impl NextjsRoutingConsumer {
 
 #[async_trait]
 impl ExtractionConsumer for NextjsRoutingConsumer {
-    fn name(&self) -> &str { "nextjs_routing" }
+    fn name(&self) -> &str {
+        "nextjs_routing"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::FrameworkDetected]
     }
 
     async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
+        let ExtractionEvent::FrameworkDetected {
+            slug, framework, ..
+        } = event
+        else {
             return Ok(vec![]);
         };
 
@@ -942,14 +1023,19 @@ pub struct PubSubConsumer;
 
 #[async_trait]
 impl ExtractionConsumer for PubSubConsumer {
-    fn name(&self) -> &str { "pubsub" }
+    fn name(&self) -> &str {
+        "pubsub"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::FrameworkDetected]
     }
 
     async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
+        let ExtractionEvent::FrameworkDetected {
+            slug, framework, ..
+        } = event
+        else {
             return Ok(vec![]);
         };
         // Only fire for broker frameworks. The actual pass logic runs inside
@@ -962,7 +1048,11 @@ impl ExtractionConsumer for PubSubConsumer {
         if !is_broker {
             return Ok(vec![]);
         }
-        tracing::debug!("PubSubConsumer: root '{}' broker '{}' detected", slug, framework);
+        tracing::debug!(
+            "PubSubConsumer: root '{}' broker '{}' detected",
+            slug,
+            framework
+        );
         Ok(vec![ExtractionEvent::PassComplete {
             pass_name: "pubsub",
             added_nodes: 0,
@@ -983,14 +1073,19 @@ pub struct WebSocketConsumer;
 
 #[async_trait]
 impl ExtractionConsumer for WebSocketConsumer {
-    fn name(&self) -> &str { "websocket" }
+    fn name(&self) -> &str {
+        "websocket"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::FrameworkDetected]
     }
 
     async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
+        let ExtractionEvent::FrameworkDetected {
+            slug, framework, ..
+        } = event
+        else {
             return Ok(vec![]);
         };
         if framework != "socketio" {
@@ -1021,7 +1116,9 @@ pub struct OpenApiConsumer;
 
 #[async_trait]
 impl ExtractionConsumer for OpenApiConsumer {
-    fn name(&self) -> &str { "openapi_bidirectional" }
+    fn name(&self) -> &str {
+        "openapi_bidirectional"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::RootExtracted]
@@ -1061,7 +1158,9 @@ pub struct GrpcConsumer;
 
 #[async_trait]
 impl ExtractionConsumer for GrpcConsumer {
-    fn name(&self) -> &str { "grpc_proto" }
+    fn name(&self) -> &str {
+        "grpc_proto"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::RootExtracted]
@@ -1116,7 +1215,11 @@ impl CustomExtractorConsumer {
     ///
     /// If the file cannot be read, `config_bytes` is set to an empty `Vec` which
     /// produces a stable but generic version (`0` for the first 8 bytes of blake3(b"")`).
-    pub fn from_file(framework: String, config_name: String, config_path: &std::path::Path) -> Self {
+    pub fn from_file(
+        framework: String,
+        config_name: String,
+        config_path: &std::path::Path,
+    ) -> Self {
         let config_bytes = match std::fs::read(config_path) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1130,20 +1233,29 @@ impl CustomExtractorConsumer {
                 Vec::new()
             }
         };
-        Self { framework, config_name, config_bytes }
+        Self {
+            framework,
+            config_name,
+            config_bytes,
+        }
     }
 }
 
 #[async_trait]
 impl ExtractionConsumer for CustomExtractorConsumer {
-    fn name(&self) -> &str { "custom_extractor" }
+    fn name(&self) -> &str {
+        "custom_extractor"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::FrameworkDetected]
     }
 
     async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::FrameworkDetected { slug, framework, .. } = event else {
+        let ExtractionEvent::FrameworkDetected {
+            slug, framework, ..
+        } = event
+        else {
             return Ok(vec![]);
         };
         if framework != &self.framework {
@@ -1203,14 +1315,21 @@ pub struct LspConsumer {
 
 #[async_trait]
 impl ExtractionConsumer for LspConsumer {
-    fn name(&self) -> &str { "lsp" }
+    fn name(&self) -> &str {
+        "lsp"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::LanguageDetected]
     }
 
     async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::LanguageDetected { slug, language, nodes } = event else {
+        let ExtractionEvent::LanguageDetected {
+            slug,
+            language,
+            nodes,
+        } = event
+        else {
             return Ok(vec![]);
         };
         if language != &self.language {
@@ -1407,17 +1526,31 @@ impl Default for AllEnrichmentsGate {
 
 #[async_trait]
 impl ExtractionConsumer for AllEnrichmentsGate {
-    fn name(&self) -> &str { "all_enrichments_gate" }
+    fn name(&self) -> &str {
+        "all_enrichments_gate"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
-        &[ExtractionEventKind::RootExtracted, ExtractionEventKind::EnrichmentComplete]
+        &[
+            ExtractionEventKind::RootExtracted,
+            ExtractionEventKind::EnrichmentComplete,
+        ]
     }
 
     async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let mut state = self.state.lock().expect("AllEnrichmentsGate mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("AllEnrichmentsGate mutex poisoned");
 
         match event {
-            ExtractionEvent::RootExtracted { slug, nodes, edges, dirty_slugs, .. } => {
+            ExtractionEvent::RootExtracted {
+                slug,
+                nodes,
+                edges,
+                dirty_slugs,
+                ..
+            } => {
                 // Only count languages from dirty-root nodes. This must agree with
                 // `LanguageAccumulatorConsumer` which only emits `LanguageDetected`
                 // for dirty-root nodes.
@@ -1448,8 +1581,8 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                 // Filter to languages that have a registered LspConsumer (i.e., are
                 // supported by EnricherRegistry). Languages without an enricher will
                 // never produce EnrichmentComplete, so we must not count them.
-                let supported = crate::extract::EnricherRegistry::with_builtins()
-                    .supported_languages();
+                let supported =
+                    crate::extract::EnricherRegistry::with_builtins().supported_languages();
                 let expected = if self.skip_lsp {
                     // #574: LSP consumers are not registered — no EnrichmentComplete
                     // events will arrive. Force expected=0 so we emit AllEnrichmentsDone
@@ -1511,7 +1644,13 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                 Ok(vec![])
             }
 
-            ExtractionEvent::EnrichmentComplete { slug, added_edges, new_nodes, updated_nodes, .. } => {
+            ExtractionEvent::EnrichmentComplete {
+                slug,
+                added_edges,
+                new_nodes,
+                updated_nodes,
+                ..
+            } => {
                 // Guard: only process if we have state initialised for this slug.
                 if state.slug.as_deref() != Some(slug.as_str()) {
                     tracing::warn!(
@@ -1541,19 +1680,14 @@ impl ExtractionConsumer for AllEnrichmentsGate {
                 if state.received >= state.expected {
                     // All enrichments received — emit AllEnrichmentsDone.
                     state.fired = true;
-                    let base_nodes = state.base_nodes.clone()
-                        .unwrap_or_else(|| Arc::from([]));
-                    let base_edges = state.base_edges.clone()
-                        .unwrap_or_else(|| Arc::from([]));
-                    let lsp_edges: Arc<[crate::graph::Edge]> = Arc::from(
-                        std::mem::take(&mut state.lsp_edges).into_boxed_slice()
-                    );
-                    let lsp_nodes: Arc<[Node]> = Arc::from(
-                        std::mem::take(&mut state.lsp_nodes).into_boxed_slice()
-                    );
-                    let updated_nodes: Arc<[(String, std::collections::BTreeMap<String, String>)]> = Arc::from(
-                        std::mem::take(&mut state.updated_nodes).into_boxed_slice()
-                    );
+                    let base_nodes = state.base_nodes.clone().unwrap_or_else(|| Arc::from([]));
+                    let base_edges = state.base_edges.clone().unwrap_or_else(|| Arc::from([]));
+                    let lsp_edges: Arc<[crate::graph::Edge]> =
+                        Arc::from(std::mem::take(&mut state.lsp_edges).into_boxed_slice());
+                    let lsp_nodes: Arc<[Node]> =
+                        Arc::from(std::mem::take(&mut state.lsp_nodes).into_boxed_slice());
+                    let updated_nodes: Arc<[(String, std::collections::BTreeMap<String, String>)]> =
+                        Arc::from(std::mem::take(&mut state.updated_nodes).into_boxed_slice());
                     tracing::info!(
                         "AllEnrichmentsGate: root '{}' — all {} enrichment(s) done, \
                          {} LSP edges, {} LSP nodes, {} metadata patches",
@@ -1626,7 +1760,9 @@ impl EmbeddingIndexerConsumer {
 
 #[async_trait]
 impl ExtractionConsumer for EmbeddingIndexerConsumer {
-    fn name(&self) -> &str { "embedding_indexer" }
+    fn name(&self) -> &str {
+        "embedding_indexer"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::RootExtracted]
@@ -1647,7 +1783,8 @@ impl ExtractionConsumer for EmbeddingIndexerConsumer {
         };
 
         // Filter external/virtual nodes — they have no source text to embed.
-        let embeddable: Vec<Node> = nodes.iter()
+        let embeddable: Vec<Node> = nodes
+            .iter()
             .filter(|n| n.id.root != "external")
             .cloned()
             .collect();
@@ -1673,11 +1810,14 @@ impl ExtractionConsumer for EmbeddingIndexerConsumer {
                     match idx_clone.reindex_nodes(&embeddable).await {
                         Ok(n) => tracing::info!(
                             "EmbeddingIndexerConsumer: root '{}' — embedded {} / {} nodes",
-                            slug_clone, n, count,
+                            slug_clone,
+                            n,
+                            count,
                         ),
                         Err(e) => tracing::warn!(
                             "EmbeddingIndexerConsumer: root '{}' — embed failed: {}",
-                            slug_clone, e,
+                            slug_clone,
+                            e,
                         ),
                     }
                 });
@@ -1686,7 +1826,8 @@ impl ExtractionConsumer for EmbeddingIndexerConsumer {
                 // No async runtime available (e.g., purely sync test). Log and skip.
                 tracing::debug!(
                     "EmbeddingIndexerConsumer: root '{}' — no async runtime, skipping embed of {} nodes",
-                    slug, count,
+                    slug,
+                    count,
                 );
             }
         }
@@ -1732,7 +1873,9 @@ pub struct LanceDBConsumer {
 impl LanceDBConsumer {
     /// Create a real consumer that will persist the graph on `PassesComplete`.
     pub fn new(repo_root: Arc<PathBuf>) -> Self {
-        Self { repo_root: Some(repo_root) }
+        Self {
+            repo_root: Some(repo_root),
+        }
     }
 
     /// Create a stub consumer that does nothing (for tests and Phase 2 callers).
@@ -1743,14 +1886,19 @@ impl LanceDBConsumer {
 
 #[async_trait]
 impl ExtractionConsumer for LanceDBConsumer {
-    fn name(&self) -> &str { "lancedb_persist" }
+    fn name(&self) -> &str {
+        "lancedb_persist"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::PassesComplete]
     }
 
     async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::PassesComplete { slug, nodes, edges, .. } = event else {
+        let ExtractionEvent::PassesComplete {
+            slug, nodes, edges, ..
+        } = event
+        else {
             return Ok(vec![]);
         };
 
@@ -1776,14 +1924,19 @@ impl ExtractionConsumer for LanceDBConsumer {
                         &repo_root_clone,
                         &nodes_vec,
                         &edges_vec,
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(()) => tracing::info!(
                             "LanceDBConsumer: root '{}' — persisted {} nodes, {} edges",
-                            slug_clone, nodes_vec.len(), edges_vec.len(),
+                            slug_clone,
+                            nodes_vec.len(),
+                            edges_vec.len(),
                         ),
                         Err(e) => tracing::warn!(
                             "LanceDBConsumer: root '{}' — persist failed: {}",
-                            slug_clone, e,
+                            slug_clone,
+                            e,
                         ),
                     }
                 });
@@ -1830,29 +1983,40 @@ pub struct SubsystemConsumer;
 
 #[async_trait]
 impl ExtractionConsumer for SubsystemConsumer {
-    fn name(&self) -> &str { "subsystem" }
+    fn name(&self) -> &str {
+        "subsystem"
+    }
 
     fn subscribes_to(&self) -> &[ExtractionEventKind] {
         &[ExtractionEventKind::CommunityDetectionComplete]
     }
 
     async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
-        let ExtractionEvent::CommunityDetectionComplete { slug, subsystems, nodes } = event else {
+        let ExtractionEvent::CommunityDetectionComplete {
+            slug,
+            subsystems,
+            nodes,
+        } = event
+        else {
             return Ok(vec![]);
         };
 
         // Run subsystem node promotion pass.
-        let sub_result = crate::extract::subsystem_pass::subsystem_node_pass(subsystems, nodes, slug);
+        let sub_result =
+            crate::extract::subsystem_pass::subsystem_node_pass(subsystems, nodes, slug);
 
         // Build the combined node set (existing + new subsystem nodes) needed for
         // framework aggregation, which looks for subsystem nodes by kind.
-        let combined_nodes: Vec<crate::graph::Node> = nodes.iter()
+        let combined_nodes: Vec<crate::graph::Node> = nodes
+            .iter()
             .cloned()
             .chain(sub_result.nodes.iter().cloned())
             .collect();
 
         // Run subsystem → framework aggregation pass.
-        let fw_edges = crate::extract::framework_detection::subsystem_framework_aggregation_pass(&combined_nodes);
+        let fw_edges = crate::extract::framework_detection::subsystem_framework_aggregation_pass(
+            &combined_nodes,
+        );
 
         let added_node_count = sub_result.nodes.len();
         let added_edge_count = sub_result.edges.len() + fw_edges.len();
@@ -1959,19 +2123,28 @@ pub fn build_builtin_bus(
     repo_root: PathBuf,
     opts: BusOptions,
 ) -> (crate::extract::event_bus::EventBus, Arc<RwLock<ScanStats>>) {
-    let BusOptions { scan_stats, embed_idx, lance_repo_root, skip_lsp } = opts;
+    let BusOptions {
+        scan_stats,
+        embed_idx,
+        lance_repo_root,
+        skip_lsp,
+    } = opts;
     use crate::extract::event_bus::EventBus;
 
     let mut bus = EventBus::new();
 
     // --- ScanStatsConsumer (singleton — registered first so it sees every event) ---
     let stats_arc = scan_stats.unwrap_or_else(|| Arc::new(RwLock::new(ScanStats::default())));
-    let scan_stats_consumer = ScanStatsConsumer { stats: Arc::clone(&stats_arc) };
+    let scan_stats_consumer = ScanStatsConsumer {
+        stats: Arc::clone(&stats_arc),
+    };
     bus.register(Box::new(scan_stats_consumer));
 
     // --- RootDiscovered consumers ---
     bus.register(Box::new(ManifestConsumer));
-    bus.register(Box::new(TreeSitterConsumer::with_scan_stats(Arc::clone(&stats_arc))));
+    bus.register(Box::new(TreeSitterConsumer::with_scan_stats(Arc::clone(
+        &stats_arc,
+    ))));
 
     // --- RootExtracted consumers ---
     // LanguageAccumulatorConsumer must run first (emits LanguageDetected which
@@ -2044,7 +2217,10 @@ pub fn build_builtin_bus(
     // EnrichmentFinalizer: the authoritative pass orchestrator — always emits PassesComplete.
     bus.register(Box::new(ApiLinkConsumer));
     bus.register(Box::new(TestedByConsumer));
-    bus.register(Box::new(EnrichmentFinalizer::new(root_pairs.clone(), primary_slug)));
+    bus.register(Box::new(EnrichmentFinalizer::new(
+        root_pairs.clone(),
+        primary_slug,
+    )));
 
     // --- FrameworkDetected consumers ---
     bus.register(Box::new(FrameworkDetectionConsumer));
@@ -2082,44 +2258,88 @@ fn build_single_language_enricher(language: &str) -> Arc<dyn crate::extract::Enr
     // Mirror the server table from EnricherRegistry::with_builtins().
     // Keep this in sync with that table — a test in consumers::tests verifies parity.
     let servers: &[(&str, &str, &[&str], &[&str])] = &[
-        ("rust",         "rust-analyzer",              &[],         &["rs"]),
-        ("python",       "pyright-langserver",         &["--stdio"], &["py"]),
-        ("typescript",   "typescript-language-server",  &["--stdio"], &["ts", "tsx", "js", "jsx"]),
-        ("go",           "gopls",                      &["serve"],  &["go"]),
-        ("markdown",     "marksman",                   &["server"], &["md"]),
-        ("c-cpp",        "clangd",                     &[],         &["c", "cc", "cpp", "cxx", "h", "hpp"]),
-        ("java",         "jdtls",                      &[],         &["java"]),
-        ("ruby",         "solargraph",                 &["stdio"],  &["rb"]),
-        ("csharp",       "omnisharp",                  &["-lsp"],   &["cs"]),
-        ("swift",        "sourcekit-lsp",              &[],         &["swift"]),
-        ("kotlin",       "kotlin-language-server",     &[],         &["kt", "kts"]),
-        ("lua",          "lua-language-server",        &[],         &["lua"]),
-        ("zig",          "zls",                        &[],         &["zig"]),
-        ("elixir",       "elixir-ls",                  &[],         &["ex", "exs"]),
-        ("haskell",      "haskell-language-server",    &["--lsp"],  &["hs"]),
-        ("ocaml",        "ocamllsp",                   &[],         &["ml", "mli"]),
-        ("scala",        "metals",                     &[],         &["scala", "sc"]),
-        ("dart",         "dart",                       &["language-server"], &["dart"]),
-        ("r",            "R",                          &["--no-echo", "-e", "languageserver::run()"], &["r", "R"]),
-        ("julia",        "julia",                      &["--startup-file=no", "-e", "using LanguageServer; runserver()"], &["jl"]),
-        ("php",          "intelephense",               &["--stdio"], &["php"]),
-        ("css",          "vscode-css-languageserver",  &["--stdio"], &["css", "scss", "less"]),
-        ("html",         "vscode-html-languageserver", &["--stdio"], &["html", "htm"]),
-        ("yaml",         "yaml-language-server",       &["--stdio"], &["yaml", "yml"]),
-        ("json",         "vscode-json-languageserver", &["--stdio"], &["json"]),
-        ("toml",         "taplo",                      &["lsp", "stdio"], &["toml"]),
-        ("terraform",    "terraform-ls",               &["serve"],  &["tf", "tfvars"]),
-        ("nix",          "nil",                        &[],         &["nix"]),
-        ("vue",          "vue-language-server",        &["--stdio"], &["vue"]),
-        ("svelte",       "svelteserver",               &["--stdio"], &["svelte"]),
-        ("erlang",       "erlang_ls",                  &[],         &["erl", "hrl"]),
-        ("gleam",        "gleam",                      &["lsp"],    &["gleam"]),
-        ("nim",          "nimlsp",                     &[],         &["nim"]),
-        ("clojure",      "clojure-lsp",               &[],         &["clj", "cljs", "cljc"]),
-        ("deno",         "deno",                       &["lsp"],    &["ts", "tsx", "js", "jsx"]),
-        ("protobuf",     "buf",                        &["lsp"],    &["proto"]),
-        ("latex",        "texlab",                     &[],         &["tex", "bib"]),
-        ("typst",        "tinymist",                   &[],         &["typ"]),
+        ("rust", "rust-analyzer", &[], &["rs"]),
+        ("python", "pyright-langserver", &["--stdio"], &["py"]),
+        (
+            "typescript",
+            "typescript-language-server",
+            &["--stdio"],
+            &["ts", "tsx", "js", "jsx"],
+        ),
+        ("go", "gopls", &["serve"], &["go"]),
+        ("markdown", "marksman", &["server"], &["md"]),
+        (
+            "c-cpp",
+            "clangd",
+            &[],
+            &["c", "cc", "cpp", "cxx", "h", "hpp"],
+        ),
+        ("java", "jdtls", &[], &["java"]),
+        ("ruby", "solargraph", &["stdio"], &["rb"]),
+        ("csharp", "omnisharp", &["-lsp"], &["cs"]),
+        ("swift", "sourcekit-lsp", &[], &["swift"]),
+        ("kotlin", "kotlin-language-server", &[], &["kt", "kts"]),
+        ("lua", "lua-language-server", &[], &["lua"]),
+        ("zig", "zls", &[], &["zig"]),
+        ("elixir", "elixir-ls", &[], &["ex", "exs"]),
+        ("haskell", "haskell-language-server", &["--lsp"], &["hs"]),
+        ("ocaml", "ocamllsp", &[], &["ml", "mli"]),
+        ("scala", "metals", &[], &["scala", "sc"]),
+        ("dart", "dart", &["language-server"], &["dart"]),
+        (
+            "r",
+            "R",
+            &["--no-echo", "-e", "languageserver::run()"],
+            &["r", "R"],
+        ),
+        (
+            "julia",
+            "julia",
+            &[
+                "--startup-file=no",
+                "-e",
+                "using LanguageServer; runserver()",
+            ],
+            &["jl"],
+        ),
+        ("php", "intelephense", &["--stdio"], &["php"]),
+        (
+            "css",
+            "vscode-css-languageserver",
+            &["--stdio"],
+            &["css", "scss", "less"],
+        ),
+        (
+            "html",
+            "vscode-html-languageserver",
+            &["--stdio"],
+            &["html", "htm"],
+        ),
+        (
+            "yaml",
+            "yaml-language-server",
+            &["--stdio"],
+            &["yaml", "yml"],
+        ),
+        (
+            "json",
+            "vscode-json-languageserver",
+            &["--stdio"],
+            &["json"],
+        ),
+        ("toml", "taplo", &["lsp", "stdio"], &["toml"]),
+        ("terraform", "terraform-ls", &["serve"], &["tf", "tfvars"]),
+        ("nix", "nil", &[], &["nix"]),
+        ("vue", "vue-language-server", &["--stdio"], &["vue"]),
+        ("svelte", "svelteserver", &["--stdio"], &["svelte"]),
+        ("erlang", "erlang_ls", &[], &["erl", "hrl"]),
+        ("gleam", "gleam", &["lsp"], &["gleam"]),
+        ("nim", "nimlsp", &[], &["nim"]),
+        ("clojure", "clojure-lsp", &[], &["clj", "cljs", "cljc"]),
+        ("deno", "deno", &["lsp"], &["ts", "tsx", "js", "jsx"]),
+        ("protobuf", "buf", &["lsp"], &["proto"]),
+        ("latex", "texlab", &[], &["tex", "bib"]),
+        ("typst", "tinymist", &[], &["typ"]),
     ];
 
     for &(lang, cmd, args, exts) in servers {
@@ -2134,12 +2354,12 @@ fn build_single_language_enricher(language: &str) -> Arc<dyn crate::extract::Enr
             };
             let enricher = match lang {
                 "typescript" | "deno" => enricher.with_config_file("tsconfig.json"),
-                "python"              => enricher.with_config_file("pyproject.toml"),
-                "go"                  => enricher.with_config_file("go.mod"),
-                "rust"                => enricher.with_config_file("Cargo.toml"),
-                "java"                => enricher.with_config_file("pom.xml"),
-                "kotlin"              => enricher.with_config_file("build.gradle.kts"),
-                _                     => enricher,
+                "python" => enricher.with_config_file("pyproject.toml"),
+                "go" => enricher.with_config_file("go.mod"),
+                "rust" => enricher.with_config_file("Cargo.toml"),
+                "java" => enricher.with_config_file("pom.xml"),
+                "kotlin" => enricher.with_config_file("build.gradle.kts"),
+                _ => enricher,
             };
             return Arc::new(enricher);
         }
@@ -2147,8 +2367,13 @@ fn build_single_language_enricher(language: &str) -> Arc<dyn crate::extract::Enr
 
     // Fallback: no-op enricher for unrecognised languages.
     // This should never happen if `supported_languages` is derived from the same table.
-    tracing::warn!("build_single_language_enricher: unrecognised language '{}' — using no-op", language);
-    Arc::new(NoopEnricher { language: language.to_string() })
+    tracing::warn!(
+        "build_single_language_enricher: unrecognised language '{}' — using no-op",
+        language
+    );
+    Arc::new(NoopEnricher {
+        language: language.to_string(),
+    })
 }
 
 /// No-op enricher used as a fallback when a language is not in the server table.
@@ -2158,8 +2383,12 @@ struct NoopEnricher {
 
 #[async_trait::async_trait]
 impl crate::extract::Enricher for NoopEnricher {
-    fn languages(&self) -> &[&str] { &[] }
-    fn is_ready(&self) -> bool { false }
+    fn languages(&self) -> &[&str] {
+        &[]
+    }
+    fn is_ready(&self) -> bool {
+        false
+    }
     async fn enrich(
         &self,
         _nodes: &[Node],
@@ -2168,7 +2397,9 @@ impl crate::extract::Enricher for NoopEnricher {
     ) -> anyhow::Result<crate::extract::EnrichmentResult> {
         Ok(crate::extract::EnrichmentResult::default())
     }
-    fn name(&self) -> &str { &self.language }
+    fn name(&self) -> &str {
+        &self.language
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2214,28 +2445,35 @@ pub async fn emit_enrichment_pipeline(
     repo_root: PathBuf,
     opts: BusOptions,
     dirty_slugs: Option<std::collections::HashSet<String>>,
-) -> anyhow::Result<(Vec<crate::graph::Node>, Vec<crate::graph::Edge>, std::collections::HashSet<String>)> {
+) -> anyhow::Result<(
+    Vec<crate::graph::Node>,
+    Vec<crate::graph::Edge>,
+    std::collections::HashSet<String>,
+)> {
     use crate::extract::event_bus::ExtractionEvent;
 
     // Wrap into Arc<[T]> for zero-copy bus fan-out.
     let nodes_arc: Arc<[crate::graph::Node]> = Arc::from(nodes.into_boxed_slice());
     let edges_arc: Arc<[crate::graph::Edge]> = Arc::from(edges.into_boxed_slice());
 
-    let (mut bus, _stats) = build_builtin_bus(root_pairs, primary_slug.clone(), repo_root.clone(), opts);
-    let events = bus.emit(ExtractionEvent::RootExtracted {
-        slug: primary_slug,
-        path: repo_root,
-        nodes: Arc::clone(&nodes_arc),
-        edges: Arc::clone(&edges_arc),
-        dirty_slugs,
-    }).await;
+    let (mut bus, _stats) =
+        build_builtin_bus(root_pairs, primary_slug.clone(), repo_root.clone(), opts);
+    let events = bus
+        .emit(ExtractionEvent::RootExtracted {
+            slug: primary_slug,
+            path: repo_root,
+            nodes: Arc::clone(&nodes_arc),
+            edges: Arc::clone(&edges_arc),
+            dirty_slugs,
+        })
+        .await;
 
     // Collect PassesComplete — produced by EnrichmentFinalizer.
     // PassesComplete is a pipeline invariant: EnrichmentFinalizer always emits it.
     // If it's absent, the bus was misconfigured or a consumer panicked — treat as error.
-    let passes_complete = events.into_iter().find(|e| {
-        matches!(e, ExtractionEvent::PassesComplete { .. })
-    });
+    let passes_complete = events
+        .into_iter()
+        .find(|e| matches!(e, ExtractionEvent::PassesComplete { .. }));
 
     match passes_complete {
         Some(ExtractionEvent::PassesComplete {
@@ -2243,9 +2481,7 @@ pub async fn emit_enrichment_pipeline(
             edges,
             detected_frameworks,
             ..
-        }) => {
-            Ok((nodes.to_vec(), edges.to_vec(), detected_frameworks))
-        }
+        }) => Ok((nodes.to_vec(), edges.to_vec(), detected_frameworks)),
         _ => {
             anyhow::bail!(
                 "EventBus enrichment pipeline: PassesComplete event absent — \
@@ -2284,21 +2520,25 @@ pub async fn emit_community_detection(
     let mut bus = EventBus::new();
     bus.register(Box::new(SubsystemConsumer));
 
-    let events = bus.emit(ExtractionEvent::CommunityDetectionComplete {
-        slug,
-        subsystems: Arc::from(subsystems.into_boxed_slice()),
-        nodes: Arc::from(nodes.into_boxed_slice()),
-    }).await;
+    let events = bus
+        .emit(ExtractionEvent::CommunityDetectionComplete {
+            slug,
+            subsystems: Arc::from(subsystems.into_boxed_slice()),
+            nodes: Arc::from(nodes.into_boxed_slice()),
+        })
+        .await;
 
     // Collect SubsystemNodesComplete — emitted by SubsystemConsumer.
-    let sub_complete = events.into_iter().find(|e| {
-        matches!(e, ExtractionEvent::SubsystemNodesComplete { .. })
-    });
+    let sub_complete = events
+        .into_iter()
+        .find(|e| matches!(e, ExtractionEvent::SubsystemNodesComplete { .. }));
 
     match sub_complete {
-        Some(ExtractionEvent::SubsystemNodesComplete { added_nodes, added_edges, .. }) => {
-            Ok((added_nodes.to_vec(), added_edges.to_vec()))
-        }
+        Some(ExtractionEvent::SubsystemNodesComplete {
+            added_nodes,
+            added_edges,
+            ..
+        }) => Ok((added_nodes.to_vec(), added_edges.to_vec())),
         _ => {
             // SubsystemConsumer always emits SubsystemNodesComplete (even when empty).
             // If it's absent, the bus was misconfigured. Return empty rather than failing
@@ -2327,14 +2567,21 @@ mod tests {
     #[tokio::test]
     async fn test_manifest_consumer_subscription() {
         let consumer = ManifestConsumer;
-        assert!(consumer.subscribes_to().contains(&ExtractionEventKind::RootDiscovered));
+        assert!(
+            consumer
+                .subscribes_to()
+                .contains(&ExtractionEventKind::RootDiscovered)
+        );
         let event = ExtractionEvent::RootDiscovered {
             slug: "test".into(),
             path: PathBuf::from("."),
             lsp_only: false,
         };
         let result = consumer.on_event(&event).await.unwrap();
-        assert!(result.is_empty(), "ManifestConsumer emits no follow-on events in Phase 2");
+        assert!(
+            result.is_empty(),
+            "ManifestConsumer emits no follow-on events in Phase 2"
+        );
     }
 
     /// Verify LanguageAccumulatorConsumer groups nodes by language.
@@ -2364,11 +2611,14 @@ mod tests {
         let event = ExtractionEvent::RootExtracted {
             slug: "test".into(),
             path: PathBuf::from("."),
-            nodes: std::sync::Arc::from(vec![
-                make_node("rust", "foo"),
-                make_node("rust", "bar"),
-                make_node("python", "baz"),
-            ].into_boxed_slice()),
+            nodes: std::sync::Arc::from(
+                vec![
+                    make_node("rust", "foo"),
+                    make_node("rust", "bar"),
+                    make_node("python", "baz"),
+                ]
+                .into_boxed_slice(),
+            ),
             edges: std::sync::Arc::from([]),
             dirty_slugs: None,
         };
@@ -2377,14 +2627,21 @@ mod tests {
         let follow_ons = consumer.on_event(&event).await.unwrap();
 
         // Should emit LanguageDetected for "rust" and "python"
-        assert_eq!(follow_ons.len(), 2, "Should emit one LanguageDetected per language");
-        let langs: HashSet<String> = follow_ons.iter().filter_map(|e| {
-            if let ExtractionEvent::LanguageDetected { language, .. } = e {
-                Some(language.clone())
-            } else {
-                None
-            }
-        }).collect();
+        assert_eq!(
+            follow_ons.len(),
+            2,
+            "Should emit one LanguageDetected per language"
+        );
+        let langs: HashSet<String> = follow_ons
+            .iter()
+            .filter_map(|e| {
+                if let ExtractionEvent::LanguageDetected { language, .. } = e {
+                    Some(language.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert!(langs.contains("rust"));
         assert!(langs.contains("python"));
     }
@@ -2419,12 +2676,15 @@ mod tests {
         let event = ExtractionEvent::RootExtracted {
             slug: "test".into(),
             path: PathBuf::from("."),
-            nodes: std::sync::Arc::from(vec![
-                make_node_with_root("dirty_root", "rust", "foo"),
-                make_node_with_root("dirty_root", "rust", "bar"),
-                make_node_with_root("clean_root", "rust", "baz"),
-                make_node_with_root("clean_root", "python", "qux"),
-            ].into_boxed_slice()),
+            nodes: std::sync::Arc::from(
+                vec![
+                    make_node_with_root("dirty_root", "rust", "foo"),
+                    make_node_with_root("dirty_root", "rust", "bar"),
+                    make_node_with_root("clean_root", "rust", "baz"),
+                    make_node_with_root("clean_root", "python", "qux"),
+                ]
+                .into_boxed_slice(),
+            ),
             edges: std::sync::Arc::from([]),
             dirty_slugs: Some(std::collections::HashSet::from(["dirty_root".to_string()])),
         };
@@ -2434,10 +2694,21 @@ mod tests {
 
         // Should only emit LanguageDetected for "rust" (from dirty_root).
         // "python" from clean_root should be excluded.
-        assert_eq!(follow_ons.len(), 1, "Only dirty-root languages should trigger LanguageDetected");
-        if let ExtractionEvent::LanguageDetected { language, nodes, .. } = &follow_ons[0] {
+        assert_eq!(
+            follow_ons.len(),
+            1,
+            "Only dirty-root languages should trigger LanguageDetected"
+        );
+        if let ExtractionEvent::LanguageDetected {
+            language, nodes, ..
+        } = &follow_ons[0]
+        {
             assert_eq!(language, "rust");
-            assert_eq!(nodes.len(), 2, "Only dirty_root rust nodes should be included");
+            assert_eq!(
+                nodes.len(),
+                2,
+                "Only dirty_root rust nodes should be included"
+            );
         } else {
             panic!("Expected LanguageDetected event");
         }
@@ -2453,26 +2724,32 @@ mod tests {
             slug: "test".into(),
             path: PathBuf::from("."),
             dirty_slugs: None,
-            nodes: std::sync::Arc::from(vec![Node {
-                id: NodeId {
-                    root: "test".into(),
-                    file: PathBuf::from("unknown"),
-                    name: "x".into(),
-                    kind: NodeKind::Other("unknown".into()),
-                },
-                language: "".into(), // empty language
-                line_start: 1,
-                line_end: 1,
-                signature: "x".into(),
-                body: String::new(),
-                metadata: BTreeMap::new(),
-                source: ExtractionSource::TreeSitter,
-            }].into_boxed_slice()),
+            nodes: std::sync::Arc::from(
+                vec![Node {
+                    id: NodeId {
+                        root: "test".into(),
+                        file: PathBuf::from("unknown"),
+                        name: "x".into(),
+                        kind: NodeKind::Other("unknown".into()),
+                    },
+                    language: "".into(), // empty language
+                    line_start: 1,
+                    line_end: 1,
+                    signature: "x".into(),
+                    body: String::new(),
+                    metadata: BTreeMap::new(),
+                    source: ExtractionSource::TreeSitter,
+                }]
+                .into_boxed_slice(),
+            ),
             edges: std::sync::Arc::from([]),
         };
         let consumer = LanguageAccumulatorConsumer;
         let follow_ons = consumer.on_event(&event).await.unwrap();
-        assert!(follow_ons.is_empty(), "Empty language nodes must be skipped");
+        assert!(
+            follow_ons.is_empty(),
+            "Empty language nodes must be skipped"
+        );
     }
 
     /// Verify TreeSitterConsumer skips lsp_only roots.
@@ -2485,7 +2762,10 @@ mod tests {
             lsp_only: true,
         };
         let result = consumer.on_event(&event).await.unwrap();
-        assert!(result.is_empty(), "lsp_only roots must produce no RootExtracted event");
+        assert!(
+            result.is_empty(),
+            "lsp_only roots must produce no RootExtracted event"
+        );
     }
 
     /// Verify PubSubConsumer only fires for broker frameworks.
@@ -2499,7 +2779,13 @@ mod tests {
         };
         let result = consumer.on_event(&event).await.unwrap();
         assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], ExtractionEvent::PassComplete { pass_name: "pubsub", .. }));
+        assert!(matches!(
+            result[0],
+            ExtractionEvent::PassComplete {
+                pass_name: "pubsub",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -2525,7 +2811,13 @@ mod tests {
         };
         let result = consumer.on_event(&event).await.unwrap();
         assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], ExtractionEvent::PassComplete { pass_name: "websocket", .. }));
+        assert!(matches!(
+            result[0],
+            ExtractionEvent::PassComplete {
+                pass_name: "websocket",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -2543,13 +2835,17 @@ mod tests {
     /// Verify build_builtin_bus registers consumers for all expected event kinds.
     #[tokio::test]
     async fn test_builtin_bus_has_consumers_for_all_event_kinds() {
-        let (bus, _stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
+        let (bus, _stats) = build_builtin_bus(
+            vec![],
+            "test".into(),
+            PathBuf::from("."),
+            BusOptions::default(),
+        );
         // Derive the exact expected count to catch regressions when languages are added/removed.
         let lsp_count = crate::extract::EnricherRegistry::with_builtins()
             .supported_languages()
             .len();
-        let expected_total =
-            1 +        // ScanStatsConsumer (singleton, registered first)
+        let expected_total = 1 +        // ScanStatsConsumer (singleton, registered first)
             2 +        // RootDiscovered: ManifestConsumer, TreeSitterConsumer
             5 +        // RootExtracted: LanguageAccumulatorConsumer, AllEnrichmentsGate,
                        //   OpenApiConsumer, GrpcConsumer, EmbeddingIndexerConsumer
@@ -2558,18 +2854,26 @@ mod tests {
                        //   EnrichmentFinalizer
             6 +        // FrameworkDetected: FrameworkDetectionConsumer, FastapiRouterPrefixConsumer,
                        //   SdkPathInferenceConsumer, NextjsRoutingConsumer, PubSubConsumer, WebSocketConsumer
-            2;         // PassesComplete: SubsystemConsumer, LanceDBConsumer
+            2; // PassesComplete: SubsystemConsumer, LanceDBConsumer
         assert_eq!(
-            bus.len(), expected_total,
+            bus.len(),
+            expected_total,
             "Unexpected built-in consumer count: got {}, expected {} (lsp_count={})",
-            bus.len(), expected_total, lsp_count
+            bus.len(),
+            expected_total,
+            lsp_count
         );
     }
 
     /// Verify build_builtin_bus returns a stats handle that shares state with the bus.
     #[tokio::test]
     async fn test_builtin_bus_returns_scan_stats_handle() {
-        let (mut bus, stats) = build_builtin_bus(vec![], "test".into(), PathBuf::from("."), BusOptions::default());
+        let (mut bus, stats) = build_builtin_bus(
+            vec![],
+            "test".into(),
+            PathBuf::from("."),
+            BusOptions::default(),
+        );
         // No activity yet
         assert!(!stats.read().unwrap().has_activity());
 
@@ -2578,7 +2882,8 @@ mod tests {
             slug: "test".into(),
             path: PathBuf::from("."),
             lsp_only: false,
-        }).await;
+        })
+        .await;
         assert!(
             stats.read().unwrap().has_activity(),
             "stats handle must reflect events fired through the bus"
@@ -2599,7 +2904,9 @@ mod tests {
         };
         let follow_ons = consumer.on_event(&event).await.unwrap();
         assert!(
-            follow_ons.iter().any(|e| matches!(e, ExtractionEvent::PassesComplete { .. })),
+            follow_ons
+                .iter()
+                .any(|e| matches!(e, ExtractionEvent::PassesComplete { .. })),
             "EnrichmentFinalizer must always emit PassesComplete"
         );
     }
@@ -2611,7 +2918,11 @@ mod tests {
     #[tokio::test]
     async fn test_api_link_consumer_subscription() {
         let consumer = ApiLinkConsumer;
-        assert!(consumer.subscribes_to().contains(&ExtractionEventKind::AllEnrichmentsDone));
+        assert!(
+            consumer
+                .subscribes_to()
+                .contains(&ExtractionEventKind::AllEnrichmentsDone)
+        );
         let event = ExtractionEvent::AllEnrichmentsDone {
             slug: "test".into(),
             nodes: std::sync::Arc::from([]),
@@ -2621,7 +2932,10 @@ mod tests {
             updated_nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&event).await.unwrap();
-        assert!(result.is_empty(), "ApiLinkConsumer is a subscription slot — emits nothing");
+        assert!(
+            result.is_empty(),
+            "ApiLinkConsumer is a subscription slot — emits nothing"
+        );
     }
 
     /// Verify TestedByConsumer subscribes to AllEnrichmentsDone and is a no-op.
@@ -2631,7 +2945,11 @@ mod tests {
     #[tokio::test]
     async fn test_tested_by_consumer_subscription() {
         let consumer = TestedByConsumer;
-        assert!(consumer.subscribes_to().contains(&ExtractionEventKind::AllEnrichmentsDone));
+        assert!(
+            consumer
+                .subscribes_to()
+                .contains(&ExtractionEventKind::AllEnrichmentsDone)
+        );
         let event = ExtractionEvent::AllEnrichmentsDone {
             slug: "test".into(),
             nodes: std::sync::Arc::from([]),
@@ -2641,7 +2959,10 @@ mod tests {
             updated_nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&event).await.unwrap();
-        assert!(result.is_empty(), "TestedByConsumer is a subscription slot — emits nothing");
+        assert!(
+            result.is_empty(),
+            "TestedByConsumer is a subscription slot — emits nothing"
+        );
     }
 
     /// Verify FastapiRouterPrefixConsumer fires only for fastapi framework.
@@ -2656,7 +2977,13 @@ mod tests {
         };
         let result = consumer.on_event(&matching).await.unwrap();
         assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], ExtractionEvent::PassComplete { pass_name: "fastapi_router_prefix", .. }));
+        assert!(matches!(
+            result[0],
+            ExtractionEvent::PassComplete {
+                pass_name: "fastapi_router_prefix",
+                ..
+            }
+        ));
 
         // Non-matching
         let non_matching = ExtractionEvent::FrameworkDetected {
@@ -2718,9 +3045,17 @@ mod tests {
         };
 
         // Same config bytes → same version.
-        assert_eq!(c1.version(), c2.version(), "same config bytes must yield same version");
+        assert_eq!(
+            c1.version(),
+            c2.version(),
+            "same config bytes must yield same version"
+        );
         // Different config bytes → different version.
-        assert_ne!(c1.version(), c3.version(), "changed config bytes must yield different version");
+        assert_ne!(
+            c1.version(),
+            c3.version(),
+            "changed config bytes must yield different version"
+        );
         // Empty config bytes → stable non-panic version.
         let c_empty = CustomExtractorConsumer {
             framework: "x".into(),
@@ -2743,7 +3078,10 @@ mod tests {
             &cfg_path,
         );
         assert_eq!(c.framework, "fastapi");
-        assert!(!c.config_bytes.is_empty(), "config_bytes should be populated from file");
+        assert!(
+            !c.config_bytes.is_empty(),
+            "config_bytes should be populated from file"
+        );
         // Version must be non-zero for a non-empty config file.
         // (Could be 0 in theory but statistically impossible for real TOML.)
         let _v = c.version(); // must not panic
@@ -2755,10 +3093,7 @@ mod tests {
     async fn test_bus_emit_root_discovered_produces_root_extracted() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-        std::fs::write(
-            tmp.path().join("src/lib.rs"),
-            "pub fn hello() {}\n",
-        ).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
         // Need scan state dir
         std::fs::create_dir_all(tmp.path().join(".oh").join(".cache")).unwrap();
 
@@ -2768,19 +3103,31 @@ mod tests {
             tmp.path().to_path_buf(),
             BusOptions::default(),
         );
-        let events = bus.emit(ExtractionEvent::RootDiscovered {
-            slug: "test".to_string(),
-            path: tmp.path().to_path_buf(),
-            lsp_only: false,
-        }).await;
+        let events = bus
+            .emit(ExtractionEvent::RootDiscovered {
+                slug: "test".to_string(),
+                path: tmp.path().to_path_buf(),
+                lsp_only: false,
+            })
+            .await;
 
         // Must include RootExtracted somewhere in the emitted events
-        let has_root_extracted = events.iter().any(|e| matches!(e, ExtractionEvent::RootExtracted { .. }));
-        assert!(has_root_extracted, "TreeSitterConsumer must produce RootExtracted from RootDiscovered");
+        let has_root_extracted = events
+            .iter()
+            .any(|e| matches!(e, ExtractionEvent::RootExtracted { .. }));
+        assert!(
+            has_root_extracted,
+            "TreeSitterConsumer must produce RootExtracted from RootDiscovered"
+        );
 
         // Must include PassesComplete
-        let has_passes_complete = events.iter().any(|e| matches!(e, ExtractionEvent::PassesComplete { .. }));
-        assert!(has_passes_complete, "EnrichmentFinalizer must produce PassesComplete");
+        let has_passes_complete = events
+            .iter()
+            .any(|e| matches!(e, ExtractionEvent::PassesComplete { .. }));
+        assert!(
+            has_passes_complete,
+            "EnrichmentFinalizer must produce PassesComplete"
+        );
     }
 
     /// Verify LspConsumer fires only for its declared language.
@@ -2789,7 +3136,9 @@ mod tests {
     async fn test_lsp_consumer_fires_for_declared_language() {
         let consumer = LspConsumer {
             language: "rust".into(),
-            enricher: Arc::new(NoopEnricher { language: "rust".into() }),
+            enricher: Arc::new(NoopEnricher {
+                language: "rust".into(),
+            }),
             repo_root: PathBuf::from("."),
             lsp_roots: Arc::new(vec![]),
         };
@@ -2801,7 +3150,11 @@ mod tests {
         let result = consumer.on_event(&matching).await.unwrap();
         // No tokio runtime in sync test context: the consumer falls back to the no-op path
         // and still emits EnrichmentComplete (with empty edges).
-        assert_eq!(result.len(), 1, "LspConsumer must emit EnrichmentComplete for its language");
+        assert_eq!(
+            result.len(),
+            1,
+            "LspConsumer must emit EnrichmentComplete for its language"
+        );
         assert!(
             matches!(result[0], ExtractionEvent::EnrichmentComplete { .. }),
             "LspConsumer must emit EnrichmentComplete"
@@ -2812,7 +3165,9 @@ mod tests {
     async fn test_lsp_consumer_ignores_other_language() {
         let consumer = LspConsumer {
             language: "rust".into(),
-            enricher: Arc::new(NoopEnricher { language: "rust".into() }),
+            enricher: Arc::new(NoopEnricher {
+                language: "rust".into(),
+            }),
             repo_root: PathBuf::from("."),
             lsp_roots: Arc::new(vec![]),
         };
@@ -2822,7 +3177,10 @@ mod tests {
             nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&other_lang).await.unwrap();
-        assert!(result.is_empty(), "LspConsumer must ignore events for other languages");
+        assert!(
+            result.is_empty(),
+            "LspConsumer must ignore events for other languages"
+        );
     }
 
     /// Verify AllEnrichmentsGate emits AllEnrichmentsDone immediately when no supported languages.
@@ -2838,7 +3196,11 @@ mod tests {
             dirty_slugs: None,
         };
         let result = gate.on_event(&event).await.unwrap();
-        assert_eq!(result.len(), 1, "Gate must emit AllEnrichmentsDone when expected==0");
+        assert_eq!(
+            result.len(),
+            1,
+            "Gate must emit AllEnrichmentsDone when expected==0"
+        );
         assert!(
             matches!(result[0], ExtractionEvent::AllEnrichmentsDone { .. }),
             "Expected AllEnrichmentsDone"
@@ -2860,7 +3222,8 @@ mod tests {
                 kind: NodeKind::Function,
             },
             language: "rust".into(),
-            line_start: 1, line_end: 1,
+            line_start: 1,
+            line_end: 1,
             signature: "foo".into(),
             body: String::new(),
             metadata: BTreeMap::new(),
@@ -2879,7 +3242,10 @@ mod tests {
         };
         let result = gate.on_event(&root_extracted).await.unwrap();
         // expected=1, received=0 → no AllEnrichmentsDone yet.
-        assert!(result.is_empty(), "Gate must not fire before all enrichments arrive");
+        assert!(
+            result.is_empty(),
+            "Gate must not fire before all enrichments arrive"
+        );
 
         // Send EnrichmentComplete for rust.
         let enrichment_done = ExtractionEvent::EnrichmentComplete {
@@ -2893,7 +3259,11 @@ mod tests {
             aborted: false,
         };
         let result = gate.on_event(&enrichment_done).await.unwrap();
-        assert_eq!(result.len(), 1, "Gate must emit AllEnrichmentsDone after all enrichments");
+        assert_eq!(
+            result.len(),
+            1,
+            "Gate must emit AllEnrichmentsDone after all enrichments"
+        );
         assert!(
             matches!(result[0], ExtractionEvent::AllEnrichmentsDone { .. }),
             "Expected AllEnrichmentsDone"
@@ -2916,7 +3286,8 @@ mod tests {
                 kind: NodeKind::Function,
             },
             language: "rust".into(),
-            line_start: 1, line_end: 1,
+            line_start: 1,
+            line_end: 1,
             signature: "dirty_fn".into(),
             body: String::new(),
             metadata: BTreeMap::new(),
@@ -2930,7 +3301,8 @@ mod tests {
                 kind: NodeKind::Function,
             },
             language: "python".into(), // different language so we can detect if it's counted
-            line_start: 1, line_end: 1,
+            line_start: 1,
+            line_end: 1,
             signature: "clean_fn".into(),
             body: String::new(),
             metadata: BTreeMap::new(),
@@ -2950,7 +3322,10 @@ mod tests {
         let result = gate.on_event(&root_extracted).await.unwrap();
         // expected=1 (only rust from dirty_root), not 2 (rust + python).
         // Gate should NOT fire yet (still waiting for rust EnrichmentComplete).
-        assert!(result.is_empty(), "Gate must not fire before dirty-root enrichments arrive");
+        assert!(
+            result.is_empty(),
+            "Gate must not fire before dirty-root enrichments arrive"
+        );
 
         // Send EnrichmentComplete for rust only.
         let enrichment_done = ExtractionEvent::EnrichmentComplete {
@@ -2966,7 +3341,11 @@ mod tests {
         let result = gate.on_event(&enrichment_done).await.unwrap();
         // Should fire now: expected=1 (rust), received=1 (rust).
         // If python from clean_root were counted, we'd still be waiting.
-        assert_eq!(result.len(), 1, "Gate must fire after dirty-root enrichment completes (clean-root python must not block)");
+        assert_eq!(
+            result.len(),
+            1,
+            "Gate must fire after dirty-root enrichment completes (clean-root python must not block)"
+        );
         assert!(
             matches!(result[0], ExtractionEvent::AllEnrichmentsDone { .. }),
             "Expected AllEnrichmentsDone"
@@ -2987,7 +3366,8 @@ mod tests {
                 kind: NodeKind::Function,
             },
             language: "rust".into(),
-            line_start: 1, line_end: 1,
+            line_start: 1,
+            line_end: 1,
             signature: "fn_a".into(),
             body: String::new(),
             metadata: BTreeMap::new(),
@@ -3001,7 +3381,8 @@ mod tests {
                 kind: NodeKind::Function,
             },
             language: "python".into(),
-            line_start: 1, line_end: 1,
+            line_start: 1,
+            line_end: 1,
             signature: "fn_b".into(),
             body: String::new(),
             metadata: BTreeMap::new(),
@@ -3019,7 +3400,10 @@ mod tests {
             dirty_slugs: None, // None = all dirty
         };
         let result = gate.on_event(&root_extracted).await.unwrap();
-        assert!(result.is_empty(), "Gate must wait for both languages when all dirty");
+        assert!(
+            result.is_empty(),
+            "Gate must wait for both languages when all dirty"
+        );
 
         // Complete rust -- still waiting for python.
         let rust_done = ExtractionEvent::EnrichmentComplete {
@@ -3033,7 +3417,10 @@ mod tests {
             aborted: false,
         };
         let result = gate.on_event(&rust_done).await.unwrap();
-        assert!(result.is_empty(), "Gate must wait for python too when dirty_slugs is empty");
+        assert!(
+            result.is_empty(),
+            "Gate must wait for python too when dirty_slugs is empty"
+        );
 
         // Complete python -- now both done.
         let python_done = ExtractionEvent::EnrichmentComplete {
@@ -3047,7 +3434,11 @@ mod tests {
             aborted: false,
         };
         let result = gate.on_event(&python_done).await.unwrap();
-        assert_eq!(result.len(), 1, "Gate must fire after all dirty-root enrichments complete");
+        assert_eq!(
+            result.len(),
+            1,
+            "Gate must fire after all dirty-root enrichments complete"
+        );
     }
 
     /// Verify SubsystemConsumer subscribes to CommunityDetectionComplete and emits
@@ -3056,7 +3447,9 @@ mod tests {
     async fn test_subsystem_consumer_subscription() {
         let consumer = SubsystemConsumer;
         assert!(
-            consumer.subscribes_to().contains(&ExtractionEventKind::CommunityDetectionComplete),
+            consumer
+                .subscribes_to()
+                .contains(&ExtractionEventKind::CommunityDetectionComplete),
             "SubsystemConsumer must subscribe to CommunityDetectionComplete"
         );
         let event = ExtractionEvent::CommunityDetectionComplete {
@@ -3065,7 +3458,11 @@ mod tests {
             nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&event).await.unwrap();
-        assert_eq!(result.len(), 1, "SubsystemConsumer must emit exactly one SubsystemNodesComplete");
+        assert_eq!(
+            result.len(),
+            1,
+            "SubsystemConsumer must emit exactly one SubsystemNodesComplete"
+        );
         assert!(
             matches!(result[0], ExtractionEvent::SubsystemNodesComplete { .. }),
             "SubsystemConsumer must emit SubsystemNodesComplete"
@@ -3076,7 +3473,11 @@ mod tests {
     #[tokio::test]
     async fn test_lancedb_consumer_subscription() {
         let consumer = LanceDBConsumer::stub();
-        assert!(consumer.subscribes_to().contains(&ExtractionEventKind::PassesComplete));
+        assert!(
+            consumer
+                .subscribes_to()
+                .contains(&ExtractionEventKind::PassesComplete)
+        );
         let event = ExtractionEvent::PassesComplete {
             slug: "test".into(),
             nodes: std::sync::Arc::from([]),
@@ -3091,7 +3492,11 @@ mod tests {
     #[tokio::test]
     async fn test_embedding_indexer_consumer_subscription() {
         let consumer = EmbeddingIndexerConsumer::stub();
-        assert!(consumer.subscribes_to().contains(&ExtractionEventKind::RootExtracted));
+        assert!(
+            consumer
+                .subscribes_to()
+                .contains(&ExtractionEventKind::RootExtracted)
+        );
         let event = ExtractionEvent::RootExtracted {
             slug: "test".into(),
             path: PathBuf::from("."),
@@ -3100,7 +3505,10 @@ mod tests {
             dirty_slugs: None,
         };
         let result = consumer.on_event(&event).await.unwrap();
-        assert!(result.is_empty(), "EmbeddingIndexerConsumer stub emits nothing");
+        assert!(
+            result.is_empty(),
+            "EmbeddingIndexerConsumer stub emits nothing"
+        );
     }
 
     // ── emit_enrichment_pipeline tests ─────────────────────────────────────
@@ -3116,7 +3524,9 @@ mod tests {
             PathBuf::from("."),
             super::BusOptions::default(),
             None,
-        ).await.expect("emit_enrichment_pipeline must not fail on empty input");
+        )
+        .await
+        .expect("emit_enrichment_pipeline must not fail on empty input");
         assert!(nodes.is_empty(), "empty input → empty nodes");
         assert!(edges.is_empty(), "empty input → empty edges");
         assert!(frameworks.is_empty(), "empty input → no frameworks");
@@ -3153,7 +3563,9 @@ mod tests {
             PathBuf::from("."),
             super::BusOptions::default(),
             None,
-        ).await.expect("emit_enrichment_pipeline must not fail with valid input");
+        )
+        .await
+        .expect("emit_enrichment_pipeline must not fail with valid input");
 
         assert!(
             out_nodes.iter().any(|n| n.id.name == "my_fn"),
@@ -3169,7 +3581,11 @@ mod tests {
     #[tokio::test]
     async fn test_sdk_path_inference_consumer_fires_only_for_fastapi() {
         let consumer = SdkPathInferenceConsumer;
-        assert!(consumer.subscribes_to().contains(&ExtractionEventKind::FrameworkDetected));
+        assert!(
+            consumer
+                .subscribes_to()
+                .contains(&ExtractionEventKind::FrameworkDetected)
+        );
 
         // Must fire for fastapi
         let fastapi_event = ExtractionEvent::FrameworkDetected {
@@ -3178,8 +3594,18 @@ mod tests {
             nodes: std::sync::Arc::from([]),
         };
         let result = consumer.on_event(&fastapi_event).await.unwrap();
-        assert_eq!(result.len(), 1, "SdkPathInferenceConsumer must fire for fastapi");
-        assert!(matches!(result[0], ExtractionEvent::PassComplete { pass_name: "sdk_path_inference", .. }));
+        assert_eq!(
+            result.len(),
+            1,
+            "SdkPathInferenceConsumer must fire for fastapi"
+        );
+        assert!(matches!(
+            result[0],
+            ExtractionEvent::PassComplete {
+                pass_name: "sdk_path_inference",
+                ..
+            }
+        ));
 
         // Must be silent for unrelated frameworks
         for framework in &["flask", "django", "nextjs-app-router", "react", "socketio"] {
@@ -3192,7 +3618,8 @@ mod tests {
             assert!(
                 result.is_empty(),
                 "SdkPathInferenceConsumer must be silent for framework '{}', got {:?}",
-                framework, result,
+                framework,
+                result,
             );
         }
     }
@@ -3232,7 +3659,9 @@ mod tests {
             PathBuf::from("."),
             super::BusOptions::default(),
             None,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         // Must produce no ApiEndpoint nodes — nextjs_routing_pass must NOT fire
         let api_endpoints: Vec<_> = out_nodes
@@ -3262,7 +3691,8 @@ mod tests {
         std::fs::write(
             pages_api.join("health.ts"),
             "export default function handler(req: any, res: any) { res.json({ ok: true }); }\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         // TypeScript import node but no `next/` import — pure handler, no next imports
         use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
@@ -3292,7 +3722,9 @@ mod tests {
             PathBuf::from("."),
             super::BusOptions::default(),
             None,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         // Must find an ApiEndpoint node — filesystem-based gate must fire
         let api_endpoints: Vec<_> = out_nodes
@@ -3303,7 +3735,10 @@ mod tests {
             !api_endpoints.is_empty(),
             "Next.js repo with pages/ dir but no next/ imports must produce ApiEndpoint \
             nodes via filesystem-based detection. Got nodes: {:?}",
-            out_nodes.iter().map(|n| (&n.id.kind, &n.id.name)).collect::<Vec<_>>(),
+            out_nodes
+                .iter()
+                .map(|n| (&n.id.kind, &n.id.name))
+                .collect::<Vec<_>>(),
         );
     }
 
@@ -3347,7 +3782,9 @@ mod tests {
             PathBuf::from("."),
             super::BusOptions::default(),
             None,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert!(
             !frameworks.contains("fastapi"),

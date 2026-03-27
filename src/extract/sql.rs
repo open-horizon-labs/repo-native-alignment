@@ -10,15 +10,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
-use sqlparser::ast::{
-    AlterTableOperation, ColumnOption, DataType, Statement,
-};
+use sqlparser::ast::{AlterTableOperation, ColumnOption, DataType, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::graph::{
-    Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
-};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 use super::{ExtractionResult, Extractor};
 
@@ -231,10 +227,15 @@ impl Extractor for SqlExtractor {
                     }
                 }
 
-                Statement::CreateType { name, representation } => {
+                Statement::CreateType {
+                    name,
+                    representation,
+                } => {
                     // PostgreSQL: CREATE TYPE status AS ENUM ('active', 'inactive');
                     let type_name = name.to_string();
-                    if let Some(sqlparser::ast::UserDefinedTypeRepresentation::Enum { labels }) = representation {
+                    if let Some(sqlparser::ast::UserDefinedTypeRepresentation::Enum { labels }) =
+                        representation
+                    {
                         for label in labels {
                             let label_str = label.value.clone();
                             if !label_str.is_empty() {
@@ -422,9 +423,7 @@ CREATE TABLE posts (
     fn test_sql_handles_parse_errors_gracefully() {
         let extractor = SqlExtractor::new();
         let content = "THIS IS NOT VALID SQL AT ALL ;;;;";
-        let result = extractor
-            .extract(Path::new("bad.sql"), content)
-            .unwrap();
+        let result = extractor.extract(Path::new("bad.sql"), content).unwrap();
         // Should return empty result, not error
         assert!(result.nodes.is_empty());
     }

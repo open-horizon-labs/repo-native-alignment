@@ -34,8 +34,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
-use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 use crate::graph::index::Subsystem;
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 // ---------------------------------------------------------------------------
 // Public return type
@@ -102,8 +102,14 @@ pub fn subsystem_node_pass(
         };
 
         let mut metadata = BTreeMap::new();
-        metadata.insert(META_SYMBOL_COUNT.to_owned(), subsystem.symbol_count.to_string());
-        metadata.insert(META_COHESION.to_owned(), format!("{:.4}", subsystem.cohesion));
+        metadata.insert(
+            META_SYMBOL_COUNT.to_owned(),
+            subsystem.symbol_count.to_string(),
+        );
+        metadata.insert(
+            META_COHESION.to_owned(),
+            format!("{:.4}", subsystem.cohesion),
+        );
         // Store interface names for display (comma-separated, top 3).
         let iface_names: Vec<String> = subsystem
             .interfaces
@@ -176,8 +182,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
     use crate::graph::index::{Subsystem, SubsystemInterface};
+    use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
 
     fn make_node(root: &str, file: &str, name: &str) -> Node {
         Node {
@@ -313,7 +319,11 @@ mod tests {
         let result = subsystem_node_pass(&[subsystem], &all_nodes, "repo");
 
         // Only the real member should get an edge, not the subsystem node.
-        assert_eq!(result.edges.len(), 1, "subsystem node must not get BelongsTo edge");
+        assert_eq!(
+            result.edges.len(),
+            1,
+            "subsystem node must not get BelongsTo edge"
+        );
         assert_ne!(result.edges[0].from.name, "embed");
     }
 }

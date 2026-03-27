@@ -91,31 +91,31 @@ pub fn symbols_schema() -> Schema {
         Field::new("meta_virtual", DataType::Boolean, true),
         Field::new("meta_package", DataType::Utf8, true),
         Field::new("meta_name_col", DataType::Int32, true),
-        Field::new("value", DataType::Utf8, true),      // metadata["value"]
+        Field::new("value", DataType::Utf8, true), // metadata["value"]
         Field::new("synthetic", DataType::Boolean, true), // metadata["synthetic"] == "true"
-        Field::new("cyclomatic", DataType::Int32, true),   // metadata["cyclomatic"] — complexity score
-        Field::new("importance", DataType::Float64, true),   // PageRank importance score (0.0-1.0)
-        Field::new("storage", DataType::Utf8, true),         // metadata["storage"] — "static" (Rust) or "var" (Go)
-        Field::new("mutable", DataType::Boolean, true),      // metadata["mutable"] — true for `static mut`
-        Field::new("decorators", DataType::Utf8, true),        // metadata["decorators"] — comma-separated decorator/attribute text
-        Field::new("type_params", DataType::Utf8, true),       // metadata["type_params"] — generic type parameters (e.g. "<T: Clone + Send>")
-        Field::new("pattern_hint", DataType::Utf8, true),        // metadata["pattern_hint"] — design pattern from naming conventions (e.g. "factory", "observer")
-        Field::new("is_static", DataType::Boolean, true),           // metadata["is_static"] — true for static/associated methods, false for instance methods
-        Field::new("is_async", DataType::Boolean, true),             // metadata["is_async"] — true for async functions (#390)
-        Field::new("is_test", DataType::Boolean, true),              // metadata["is_test"] — true for test functions (#390)
-        Field::new("visibility", DataType::Utf8, true),              // metadata["visibility"] — "pub" for public re-exports (#409)
-        Field::new("exported", DataType::Boolean, true),             // metadata["exported"] — true for Python __all__ exports (#409)
+        Field::new("cyclomatic", DataType::Int32, true), // metadata["cyclomatic"] — complexity score
+        Field::new("importance", DataType::Float64, true), // PageRank importance score (0.0-1.0)
+        Field::new("storage", DataType::Utf8, true), // metadata["storage"] — "static" (Rust) or "var" (Go)
+        Field::new("mutable", DataType::Boolean, true), // metadata["mutable"] — true for `static mut`
+        Field::new("decorators", DataType::Utf8, true), // metadata["decorators"] — comma-separated decorator/attribute text
+        Field::new("type_params", DataType::Utf8, true), // metadata["type_params"] — generic type parameters (e.g. "<T: Clone + Send>")
+        Field::new("pattern_hint", DataType::Utf8, true), // metadata["pattern_hint"] — design pattern from naming conventions (e.g. "factory", "observer")
+        Field::new("is_static", DataType::Boolean, true), // metadata["is_static"] — true for static/associated methods, false for instance methods
+        Field::new("is_async", DataType::Boolean, true), // metadata["is_async"] — true for async functions (#390)
+        Field::new("is_test", DataType::Boolean, true), // metadata["is_test"] — true for test functions (#390)
+        Field::new("visibility", DataType::Utf8, true), // metadata["visibility"] — "pub" for public re-exports (#409)
+        Field::new("exported", DataType::Boolean, true), // metadata["exported"] — true for Python __all__ exports (#409)
         // Diagnostic columns — populated for NodeKind::Other("diagnostic") nodes
-        Field::new("diagnostic_severity", DataType::Utf8, true),    // "error" | "warning"
-        Field::new("diagnostic_source", DataType::Utf8, true),      // LSP server name
-        Field::new("diagnostic_message", DataType::Utf8, true),     // full diagnostic text
-        Field::new("diagnostic_range", DataType::Utf8, true),       // "line:col-end_line:end_col"
-        Field::new("diagnostic_timestamp", DataType::Utf8, true),   // unix timestamp string
+        Field::new("diagnostic_severity", DataType::Utf8, true), // "error" | "warning"
+        Field::new("diagnostic_source", DataType::Utf8, true),   // LSP server name
+        Field::new("diagnostic_message", DataType::Utf8, true),  // full diagnostic text
+        Field::new("diagnostic_range", DataType::Utf8, true),    // "line:col-end_line:end_col"
+        Field::new("diagnostic_timestamp", DataType::Utf8, true), // unix timestamp string
         // ApiEndpoint columns — populated for NodeKind::ApiEndpoint nodes
-        Field::new("http_method", DataType::Utf8, true),    // "GET" | "POST" | "PUT" | etc.
-        Field::new("http_path", DataType::Utf8, true),      // "/users" | "/items/{id}" | etc.
+        Field::new("http_method", DataType::Utf8, true), // "GET" | "POST" | "PUT" | etc.
+        Field::new("http_path", DataType::Utf8, true),   // "/users" | "/items/{id}" | etc.
         // Doc comment column — survives LSP reindex round-trip (#416)
-        Field::new("doc_comment", DataType::Utf8, true),    // metadata["doc_comment"] — documentation comment
+        Field::new("doc_comment", DataType::Utf8, true), // metadata["doc_comment"] — documentation comment
         // gRPC / proto columns — populated for proto RPC Function nodes (#466)
         // These must survive LanceDB round-trip so GrpcClientCallsPass works on incremental scans.
         Field::new("parent_service", DataType::Utf8, true), // metadata["parent_service"] — owning service name
@@ -179,10 +179,7 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("rpc_response_type", DataType::Utf8, true),
         Field::new(
             "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                dim,
-            ),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
             true, // nullable: not all symbols need embeddings immediately
         ),
         Field::new("updated_at", DataType::Int64, false),
@@ -225,16 +222,16 @@ pub fn edges_schema() -> Schema {
 /// bump SCHEMA_VERSION in store.rs when changing this
 pub fn pr_merges_schema() -> Schema {
     Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),           // root:merge_commit_sha
+        Field::new("id", DataType::Utf8, false), // root:merge_commit_sha
         Field::new("root_id", DataType::Utf8, false),
-        Field::new("merge_sha", DataType::Utf8, false),     // the merge commit
-        Field::new("branch_name", DataType::Utf8, true),    // from commit message
-        Field::new("title", DataType::Utf8, false),         // first line of merge commit message
-        Field::new("description", DataType::Utf8, true),    // rest of merge commit message
+        Field::new("merge_sha", DataType::Utf8, false), // the merge commit
+        Field::new("branch_name", DataType::Utf8, true), // from commit message
+        Field::new("title", DataType::Utf8, false),     // first line of merge commit message
+        Field::new("description", DataType::Utf8, true), // rest of merge commit message
         Field::new("author", DataType::Utf8, false),
-        Field::new("merged_at", DataType::Int64, false),    // unix timestamp
+        Field::new("merged_at", DataType::Int64, false), // unix timestamp
         Field::new("commit_count", DataType::UInt32, false), // commits in the PR
-        Field::new("files_changed", DataType::Utf8, false),  // JSON array of file paths
+        Field::new("files_changed", DataType::Utf8, false), // JSON array of file paths
         Field::new("updated_at", DataType::Int64, false),
     ])
 }
@@ -275,8 +272,7 @@ mod tests {
     #[allow(deprecated)]
     fn test_extraction_version_is_frozen_at_14() {
         assert_eq!(
-            EXTRACTION_VERSION,
-            14,
+            EXTRACTION_VERSION, 14,
             "EXTRACTION_VERSION is frozen at 14 (#526). \
              Do not bump — use ExtractionConsumer::version() instead."
         );
@@ -337,14 +333,32 @@ mod tests {
     fn test_is_static_column_type_and_nullability() {
         // Adversarial: verify is_static is Boolean and nullable in both schemas
         let schema = symbols_schema();
-        let field = schema.field_with_name("is_static").expect("is_static missing from symbols_schema");
-        assert_eq!(*field.data_type(), DataType::Boolean, "is_static should be Boolean");
-        assert!(field.is_nullable(), "is_static should be nullable (top-level functions have no is_static)");
+        let field = schema
+            .field_with_name("is_static")
+            .expect("is_static missing from symbols_schema");
+        assert_eq!(
+            *field.data_type(),
+            DataType::Boolean,
+            "is_static should be Boolean"
+        );
+        assert!(
+            field.is_nullable(),
+            "is_static should be nullable (top-level functions have no is_static)"
+        );
 
         let vec_schema = symbols_schema_with_vector(384);
-        let vec_field = vec_schema.field_with_name("is_static").expect("is_static missing from symbols_schema_with_vector");
-        assert_eq!(*vec_field.data_type(), DataType::Boolean, "is_static should be Boolean in vector schema");
-        assert!(vec_field.is_nullable(), "is_static should be nullable in vector schema");
+        let vec_field = vec_schema
+            .field_with_name("is_static")
+            .expect("is_static missing from symbols_schema_with_vector");
+        assert_eq!(
+            *vec_field.data_type(),
+            DataType::Boolean,
+            "is_static should be Boolean in vector schema"
+        );
+        assert!(
+            vec_field.is_nullable(),
+            "is_static should be nullable in vector schema"
+        );
     }
 
     #[test]

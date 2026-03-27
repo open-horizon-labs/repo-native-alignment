@@ -60,7 +60,9 @@ function add(int $a, int $b): int {
     return $a + $b;
 }
 "#;
-        let result = extractor.extract(Path::new("src/helpers.php"), code).unwrap();
+        let result = extractor
+            .extract(Path::new("src/helpers.php"), code)
+            .unwrap();
         let funcs: Vec<_> = result
             .nodes
             .iter()
@@ -111,7 +113,10 @@ trait Loggable {
             .iter()
             .filter(|n| n.id.kind == NodeKind::Trait)
             .collect();
-        assert!(!traits.is_empty(), "Should extract PHP interfaces or traits as Trait");
+        assert!(
+            !traits.is_empty(),
+            "Should extract PHP interfaces or traits as Trait"
+        );
     }
 
     #[test]
@@ -135,7 +140,9 @@ class Calculator {
     }
 }
 "#;
-        let result = extractor.extract(Path::new("src/Calculator.php"), code).unwrap();
+        let result = extractor
+            .extract(Path::new("src/Calculator.php"), code)
+            .unwrap();
         let funcs: Vec<_> = result
             .nodes
             .iter()

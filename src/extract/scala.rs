@@ -63,7 +63,9 @@ object UserRepository {
   def apply(db: Database): UserRepository = new UserRepository(db)
 }
 "#;
-        let result = extractor.extract(Path::new("src/UserRepository.scala"), code).unwrap();
+        let result = extractor
+            .extract(Path::new("src/UserRepository.scala"), code)
+            .unwrap();
         let structs: Vec<_> = result
             .nodes
             .iter()
@@ -81,7 +83,9 @@ trait Repository[T] {
   def save(entity: T): Unit
 }
 "#;
-        let result = extractor.extract(Path::new("src/Repository.scala"), code).unwrap();
+        let result = extractor
+            .extract(Path::new("src/Repository.scala"), code)
+            .unwrap();
         let traits: Vec<_> = result
             .nodes
             .iter()
@@ -99,7 +103,9 @@ object MathUtils {
   def multiply(a: Int, b: Int): Int = a * b
 }
 "#;
-        let result = extractor.extract(Path::new("src/MathUtils.scala"), code).unwrap();
+        let result = extractor
+            .extract(Path::new("src/MathUtils.scala"), code)
+            .unwrap();
         let funcs: Vec<_> = result
             .nodes
             .iter()

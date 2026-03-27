@@ -112,10 +112,12 @@ fn collect_symbols(
 fn extract_name(node: &tree_sitter::Node, kind: &SymbolKind, source: &[u8]) -> String {
     match kind {
         SymbolKind::Impl => {
-            let trait_name = node.child_by_field_name("trait")
+            let trait_name = node
+                .child_by_field_name("trait")
                 .and_then(|n| n.utf8_text(source).ok())
                 .map(|s| s.to_string());
-            let type_name = node.child_by_field_name("type")
+            let type_name = node
+                .child_by_field_name("type")
                 .and_then(|n| n.utf8_text(source).ok())
                 .unwrap_or("unknown")
                 .to_string();
@@ -135,10 +137,7 @@ fn extract_name(node: &tree_sitter::Node, kind: &SymbolKind, source: &[u8]) -> S
         _ => {
             // Most items (function, struct, trait, enum, const, mod) have a "name" field
             if let Some(name_node) = node.child_by_field_name("name") {
-                name_node
-                    .utf8_text(source)
-                    .unwrap_or("unknown")
-                    .to_string()
+                name_node.utf8_text(source).unwrap_or("unknown").to_string()
             } else {
                 "unknown".to_string()
             }
@@ -156,11 +155,7 @@ fn extract_signature(body: &str) -> String {
         }
     }
     // Fallback: first line
-    body.lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string()
+    body.lines().next().unwrap_or("").trim().to_string()
 }
 
 /// Case-insensitive substring search across symbol name and signature.

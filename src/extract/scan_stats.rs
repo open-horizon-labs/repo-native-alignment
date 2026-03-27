@@ -48,14 +48,18 @@ use async_trait::async_trait;
 
 use crate::extract::event_bus::{ExtractionConsumer, ExtractionEvent, ExtractionEventKind};
 
-
 // ---------------------------------------------------------------------------
 // Per-language LSP enrichment stats  (#575)
 // ---------------------------------------------------------------------------
 
 /// Status of a per-language LSP enrichment attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LspStatus { Ok, Aborted, NotFound, Failed }
+pub enum LspStatus {
+    Ok,
+    Aborted,
+    NotFound,
+    Failed,
+}
 
 impl std::fmt::Display for LspStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -86,19 +90,35 @@ impl LspEnrichmentEntry {
     pub fn summary_line(&self) -> String {
         let root_part = if let Some(ref root) = self.root_hint {
             format!(" -> {}/", root)
-        } else { String::new() };
+        } else {
+            String::new()
+        };
         let label = format!("  {} ({}){}", self.language, self.server_name, root_part);
         match self.status {
             LspStatus::NotFound => format!("{:<50} {}", label, self.status),
             LspStatus::Ok => {
-                let mut line = format!("{:<50} {} ({} edges, {} nodes, {:.1}s)",
-                    label, self.status, self.edge_count, self.node_count, self.duration.as_secs_f64());
-                if self.edge_count == 0 { line.push_str(" -- no edges"); }
+                let mut line = format!(
+                    "{:<50} {} ({} edges, {} nodes, {:.1}s)",
+                    label,
+                    self.status,
+                    self.edge_count,
+                    self.node_count,
+                    self.duration.as_secs_f64()
+                );
+                if self.edge_count == 0 {
+                    line.push_str(" -- no edges");
+                }
                 line
             }
             LspStatus::Aborted | LspStatus::Failed => {
-                format!("{:<50} {} ({} edges, {} errors, {:.1}s)",
-                    label, self.status, self.edge_count, self.error_count, self.duration.as_secs_f64())
+                format!(
+                    "{:<50} {} ({} edges, {} errors, {:.1}s)",
+                    label,
+                    self.status,
+                    self.edge_count,
+                    self.error_count,
+                    self.duration.as_secs_f64()
+                )
             }
         }
     }
@@ -206,8 +226,7 @@ impl ScanStats {
     /// Returns `true` if the given root is currently being extracted or enriched
     /// (seen via `RootDiscovered` but `PassesComplete` not yet received).
     pub fn is_root_in_progress(&self, slug: &str) -> bool {
-        self.roots_queued > 0
-            && !self.roots_complete.contains_key(slug)
+        self.roots_queued > 0 && !self.roots_complete.contains_key(slug)
     }
 
     /// Replace encoding stats for a root (used by full-scan paths that process
@@ -288,7 +307,10 @@ impl ExtractionConsumer for ScanStatsConsumer {
     async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
         // Acquire an exclusive write lock. The lock is short-lived (a few HashMap ops)
         // and uncontested in normal operation — the extraction thread is the only writer.
-        let mut stats = self.stats.write().map_err(|e| anyhow::anyhow!("ScanStatsConsumer lock poisoned: {}", e))?;
+        let mut stats = self
+            .stats
+            .write()
+            .map_err(|e| anyhow::anyhow!("ScanStatsConsumer lock poisoned: {}", e))?;
 
         match event {
             ExtractionEvent::RootDiscovered { slug, .. } => {
@@ -300,12 +322,17 @@ impl ExtractionConsumer for ScanStatsConsumer {
                 );
             }
 
-            ExtractionEvent::RootExtracted { slug, nodes, edges, .. } => {
-                stats.roots_extracted.insert(slug.clone(), RootExtractedStats {
-                    symbol_count: nodes.len(),
-                    edge_count: edges.len(),
-                    completed_at: Instant::now(),
-                });
+            ExtractionEvent::RootExtracted {
+                slug, nodes, edges, ..
+            } => {
+                stats.roots_extracted.insert(
+                    slug.clone(),
+                    RootExtractedStats {
+                        symbol_count: nodes.len(),
+                        edge_count: edges.len(),
+                        completed_at: Instant::now(),
+                    },
+                );
                 tracing::debug!(
                     "ScanStatsConsumer: RootExtracted '{}': {} symbols, {} edges",
                     slug,
@@ -315,12 +342,14 @@ impl ExtractionConsumer for ScanStatsConsumer {
             }
 
             ExtractionEvent::LanguageDetected { slug, language, .. } => {
-                stats.languages_in_flight
+                stats
+                    .languages_in_flight
                     .entry(slug.clone())
                     .or_default()
                     .push(language.clone());
                 // Record start time for duration tracking.
-                stats.enrichment_start_times
+                stats
+                    .enrichment_start_times
                     .entry(slug.clone())
                     .or_default()
                     .insert(language.clone(), Instant::now());
@@ -331,23 +360,35 @@ impl ExtractionConsumer for ScanStatsConsumer {
                 );
             }
 
-            ExtractionEvent::EnrichmentComplete { slug, language, added_edges, new_nodes, server_name, error_count, aborted, .. } => {
+            ExtractionEvent::EnrichmentComplete {
+                slug,
+                language,
+                added_edges,
+                new_nodes,
+                server_name,
+                error_count,
+                aborted,
+                ..
+            } => {
                 // Remove from in-flight.
                 if let Some(in_flight) = stats.languages_in_flight.get_mut(slug) {
                     in_flight.retain(|l| l != language);
                 }
                 // Add to done.
-                stats.languages_done
+                stats
+                    .languages_done
                     .entry(slug.clone())
                     .or_default()
                     .push(language.clone());
                 // Record LSP edge count (backward compat).
-                stats.lsp_edge_counts
+                stats
+                    .lsp_edge_counts
                     .entry(slug.clone())
                     .or_default()
                     .insert(language.clone(), added_edges.len());
                 // Record full LSP stats when server_name is present.
-                let duration = stats.enrichment_start_times
+                let duration = stats
+                    .enrichment_start_times
                     .get(slug)
                     .and_then(|m| m.get(language))
                     .map(|start| start.elapsed())
@@ -357,17 +398,17 @@ impl ExtractionConsumer for ScanStatsConsumer {
                     starts.remove(language);
                 }
                 if let Some(name) = server_name {
-                    stats.lsp_stats
-                        .entry(slug.clone())
-                        .or_default()
-                        .insert(language.clone(), LspLanguageStats {
+                    stats.lsp_stats.entry(slug.clone()).or_default().insert(
+                        language.clone(),
+                        LspLanguageStats {
                             server_name: name.clone(),
                             edge_count: added_edges.len(),
                             node_count: new_nodes.len(),
                             duration,
                             error_count: *error_count,
                             aborted: *aborted,
-                        });
+                        },
+                    );
                 }
                 tracing::debug!(
                     "ScanStatsConsumer: EnrichmentComplete '{}' for '{}': {} LSP edges",
@@ -377,13 +418,22 @@ impl ExtractionConsumer for ScanStatsConsumer {
                 );
             }
 
-            ExtractionEvent::PassesComplete { slug, nodes, edges, detected_frameworks, .. } => {
-                stats.roots_complete.insert(slug.clone(), RootCompleteStats {
-                    symbol_count: nodes.len(),
-                    edge_count: edges.len(),
-                    detected_frameworks: detected_frameworks.clone(),
-                    completed_at: Instant::now(),
-                });
+            ExtractionEvent::PassesComplete {
+                slug,
+                nodes,
+                edges,
+                detected_frameworks,
+                ..
+            } => {
+                stats.roots_complete.insert(
+                    slug.clone(),
+                    RootCompleteStats {
+                        symbol_count: nodes.len(),
+                        edge_count: edges.len(),
+                        detected_frameworks: detected_frameworks.clone(),
+                        completed_at: Instant::now(),
+                    },
+                );
                 // Clean up intermediate state now that this root is complete.
                 stats.roots_extracted.remove(slug);
                 stats.languages_in_flight.remove(slug);
@@ -460,7 +510,9 @@ mod tests {
                 slug: slug(name),
                 path: PathBuf::from("."),
                 lsp_only: false,
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
         }
         let stats = c.stats.read().unwrap();
         assert_eq!(stats.roots_queued, 3);
@@ -474,7 +526,9 @@ mod tests {
             slug: slug("api"),
             path: PathBuf::from("."),
             lsp_only: false,
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         // Then RootExtracted
         c.on_event(&ExtractionEvent::RootExtracted {
             slug: slug("api"),
@@ -482,12 +536,20 @@ mod tests {
             nodes: std::sync::Arc::from(vec![].into_boxed_slice()),
             edges: std::sync::Arc::from(vec![].into_boxed_slice()),
             dirty_slugs: None,
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         let stats = c.stats.read().unwrap();
-        let extracted = stats.roots_extracted.get("api").expect("api should be in roots_extracted");
+        let extracted = stats
+            .roots_extracted
+            .get("api")
+            .expect("api should be in roots_extracted");
         assert_eq!(extracted.symbol_count, 0);
         assert_eq!(extracted.edge_count, 0);
-        assert!(stats.is_root_in_progress("api"), "root should be in-progress after RootExtracted");
+        assert!(
+            stats.is_root_in_progress("api"),
+            "root should be in-progress after RootExtracted"
+        );
     }
 
     #[tokio::test]
@@ -497,14 +559,21 @@ mod tests {
             slug: slug("api"),
             language: "rust".into(),
             nodes: empty_arc_nodes(),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         c.on_event(&ExtractionEvent::LanguageDetected {
             slug: slug("api"),
             language: "python".into(),
             nodes: empty_arc_nodes(),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         let stats = c.stats.read().unwrap();
-        let in_flight = stats.languages_in_flight.get("api").expect("api should have in-flight langs");
+        let in_flight = stats
+            .languages_in_flight
+            .get("api")
+            .expect("api should have in-flight langs");
         assert!(in_flight.contains(&"rust".to_string()));
         assert!(in_flight.contains(&"python".to_string()));
     }
@@ -517,7 +586,9 @@ mod tests {
             slug: slug("api"),
             language: "rust".into(),
             nodes: empty_arc_nodes(),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         // Complete enrichment for rust
         c.on_event(&ExtractionEvent::EnrichmentComplete {
             slug: slug("api"),
@@ -528,24 +599,49 @@ mod tests {
             server_name: None,
             error_count: 0,
             aborted: false,
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         let stats = c.stats.read().unwrap();
-        let in_flight = stats.languages_in_flight.get("api").map(|v| v.as_slice()).unwrap_or(&[]);
-        assert!(!in_flight.contains(&"rust".to_string()), "rust should no longer be in-flight");
-        let done = stats.languages_done.get("api").expect("api should have done langs");
-        assert!(done.contains(&"rust".to_string()), "rust should be in done langs");
+        let in_flight = stats
+            .languages_in_flight
+            .get("api")
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        assert!(
+            !in_flight.contains(&"rust".to_string()),
+            "rust should no longer be in-flight"
+        );
+        let done = stats
+            .languages_done
+            .get("api")
+            .expect("api should have done langs");
+        assert!(
+            done.contains(&"rust".to_string()),
+            "rust should be in done langs"
+        );
     }
 
     #[tokio::test]
     async fn test_enrichment_complete_records_lsp_edge_count() {
-        use crate::graph::{Edge, EdgeKind, ExtractionSource, Confidence, NodeId, NodeKind};
+        use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, NodeId, NodeKind};
         use std::path::PathBuf as Pb;
         let c = make_consumer();
 
         // Build 3 fake edges
         let make_edge = |n: &str| Edge {
-            from: NodeId { root: "api".into(), file: Pb::from("a.rs"), name: n.into(), kind: NodeKind::Function },
-            to: NodeId { root: "api".into(), file: Pb::from("b.rs"), name: "b".into(), kind: NodeKind::Function },
+            from: NodeId {
+                root: "api".into(),
+                file: Pb::from("a.rs"),
+                name: n.into(),
+                kind: NodeKind::Function,
+            },
+            to: NodeId {
+                root: "api".into(),
+                file: Pb::from("b.rs"),
+                name: "b".into(),
+                kind: NodeKind::Function,
+            },
             kind: EdgeKind::Calls,
             source: ExtractionSource::TreeSitter,
             confidence: Confidence::Confirmed,
@@ -556,7 +652,9 @@ mod tests {
             slug: slug("api"),
             language: "rust".into(),
             nodes: empty_arc_nodes(),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         c.on_event(&ExtractionEvent::EnrichmentComplete {
             slug: slug("api"),
             language: "rust".into(),
@@ -566,12 +664,18 @@ mod tests {
             server_name: Some("rust-analyzer".to_string()),
             error_count: 0,
             aborted: false,
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         let stats = c.stats.read().unwrap();
-        let count = stats.lsp_edge_counts
-            .get("api").expect("api")
-            .get("rust").copied().unwrap_or(0);
+        let count = stats
+            .lsp_edge_counts
+            .get("api")
+            .expect("api")
+            .get("rust")
+            .copied()
+            .unwrap_or(0);
         assert_eq!(count, 3, "lsp_edge_count should reflect added_edges length");
     }
 
@@ -580,35 +684,66 @@ mod tests {
         let c = make_consumer();
         // Simulate full pipeline for "api"
         c.on_event(&ExtractionEvent::RootDiscovered {
-            slug: slug("api"), path: PathBuf::from("."), lsp_only: false,
-        }).await.unwrap();
+            slug: slug("api"),
+            path: PathBuf::from("."),
+            lsp_only: false,
+        })
+        .await
+        .unwrap();
         c.on_event(&ExtractionEvent::RootExtracted {
-            slug: slug("api"), path: PathBuf::from("."),
+            slug: slug("api"),
+            path: PathBuf::from("."),
             nodes: std::sync::Arc::from(vec![].into_boxed_slice()),
             edges: std::sync::Arc::from(vec![].into_boxed_slice()),
             dirty_slugs: None,
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         c.on_event(&ExtractionEvent::LanguageDetected {
-            slug: slug("api"), language: "rust".into(), nodes: empty_arc_nodes(),
-        }).await.unwrap();
+            slug: slug("api"),
+            language: "rust".into(),
+            nodes: empty_arc_nodes(),
+        })
+        .await
+        .unwrap();
         c.on_event(&ExtractionEvent::EnrichmentComplete {
-            slug: slug("api"), language: "rust".into(),
-            added_edges: empty_arc_edges(), new_nodes: empty_arc_nodes(),
+            slug: slug("api"),
+            language: "rust".into(),
+            added_edges: empty_arc_edges(),
+            new_nodes: empty_arc_nodes(),
             updated_nodes: std::sync::Arc::from([]),
-            server_name: None, error_count: 0, aborted: false,
-        }).await.unwrap();
+            server_name: None,
+            error_count: 0,
+            aborted: false,
+        })
+        .await
+        .unwrap();
         c.on_event(&ExtractionEvent::PassesComplete {
             slug: slug("api"),
             nodes: std::sync::Arc::from(vec![].into_boxed_slice()),
             edges: std::sync::Arc::from(vec![].into_boxed_slice()),
             detected_frameworks: std::collections::HashSet::new(),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         let stats = c.stats.read().unwrap();
-        assert!(stats.is_root_complete("api"), "root should be complete after PassesComplete");
-        assert!(!stats.is_root_in_progress("api"), "root should not be in-progress after PassesComplete");
-        assert!(!stats.roots_extracted.contains_key("api"), "intermediate extracted state should be removed");
-        assert!(!stats.languages_in_flight.contains_key("api"), "in-flight languages should be cleared");
+        assert!(
+            stats.is_root_complete("api"),
+            "root should be complete after PassesComplete"
+        );
+        assert!(
+            !stats.is_root_in_progress("api"),
+            "root should not be in-progress after PassesComplete"
+        );
+        assert!(
+            !stats.roots_extracted.contains_key("api"),
+            "intermediate extracted state should be removed"
+        );
+        assert!(
+            !stats.languages_in_flight.contains_key("api"),
+            "in-flight languages should be cleared"
+        );
     }
 
     #[tokio::test]
@@ -627,11 +762,18 @@ mod tests {
         let handle = c.stats_handle();
         // Mutate through the consumer's internal Arc
         c.on_event(&ExtractionEvent::RootDiscovered {
-            slug: slug("test"), path: PathBuf::from("."), lsp_only: false,
-        }).await.unwrap();
+            slug: slug("test"),
+            path: PathBuf::from("."),
+            lsp_only: false,
+        })
+        .await
+        .unwrap();
         // Read through the handle — must see the mutation
         let stats = handle.read().unwrap();
-        assert_eq!(stats.roots_queued, 1, "stats_handle must share the same Arc as the consumer");
+        assert_eq!(
+            stats.roots_queued, 1,
+            "stats_handle must share the same Arc as the consumer"
+        );
     }
 
     /// Adversarial: EnrichmentComplete for a language that was never in-flight
@@ -640,19 +782,27 @@ mod tests {
     async fn test_enrichment_complete_without_prior_language_detected() {
         let c = make_consumer();
         // No LanguageDetected fired before this
-        let result = c.on_event(&ExtractionEvent::EnrichmentComplete {
-            slug: slug("api"),
-            language: "go".into(),
-            added_edges: empty_arc_edges(),
-            new_nodes: empty_arc_nodes(),
-            updated_nodes: std::sync::Arc::from([]),
-            server_name: None,
-            error_count: 0,
-            aborted: false,
-        }).await;
-        assert!(result.is_ok(), "should not fail even without prior LanguageDetected");
+        let result = c
+            .on_event(&ExtractionEvent::EnrichmentComplete {
+                slug: slug("api"),
+                language: "go".into(),
+                added_edges: empty_arc_edges(),
+                new_nodes: empty_arc_nodes(),
+                updated_nodes: std::sync::Arc::from([]),
+                server_name: None,
+                error_count: 0,
+                aborted: false,
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "should not fail even without prior LanguageDetected"
+        );
         let stats = c.stats.read().unwrap();
-        let done = stats.languages_done.get("api").expect("api should be in done");
+        let done = stats
+            .languages_done
+            .get("api")
+            .expect("api should be in done");
         assert!(done.contains(&"go".to_string()));
     }
 
@@ -660,18 +810,26 @@ mod tests {
     #[tokio::test]
     async fn test_passes_complete_without_prior_discovered() {
         let c = make_consumer();
-        let result = c.on_event(&ExtractionEvent::PassesComplete {
-            slug: slug("api"),
-            nodes: std::sync::Arc::from(vec![].into_boxed_slice()),
-            edges: std::sync::Arc::from(vec![].into_boxed_slice()),
-            detected_frameworks: std::collections::HashSet::new(),
-        }).await;
-        assert!(result.is_ok(), "PassesComplete without prior events must not panic");
+        let result = c
+            .on_event(&ExtractionEvent::PassesComplete {
+                slug: slug("api"),
+                nodes: std::sync::Arc::from(vec![].into_boxed_slice()),
+                edges: std::sync::Arc::from(vec![].into_boxed_slice()),
+                detected_frameworks: std::collections::HashSet::new(),
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "PassesComplete without prior events must not panic"
+        );
         // Root is complete despite no prior events
         let stats = c.stats.read().unwrap();
         assert!(stats.roots_complete.contains_key("api"));
         // has_activity is still false (roots_queued == 0)
-        assert!(!stats.has_activity(), "roots_queued not incremented — no RootDiscovered fired");
+        assert!(
+            !stats.has_activity(),
+            "roots_queued not incremented — no RootDiscovered fired"
+        );
     }
 
     /// EnrichmentComplete with server_name populates lsp_stats.
@@ -683,7 +841,9 @@ mod tests {
             slug: slug("api"),
             language: "rust".into(),
             nodes: empty_arc_nodes(),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         // Complete enrichment with server_name
         c.on_event(&ExtractionEvent::EnrichmentComplete {
             slug: slug("api"),
@@ -694,10 +854,14 @@ mod tests {
             server_name: Some("rust-analyzer".to_string()),
             error_count: 5,
             aborted: true,
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         let stats = c.stats.read().unwrap();
-        let lsp = stats.lsp_stats.get("api")
+        let lsp = stats
+            .lsp_stats
+            .get("api")
             .expect("api should have lsp_stats")
             .get("rust")
             .expect("rust should have LspLanguageStats");
@@ -724,17 +888,29 @@ mod tests {
             server_name: None,
             error_count: 0,
             aborted: false,
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         let stats = c.stats.read().unwrap();
-        assert!(stats.lsp_stats.get("api").is_none(), "no lsp_stats when server_name is None");
+        assert!(
+            stats.lsp_stats.get("api").is_none(),
+            "no lsp_stats when server_name is None"
+        );
     }
 
     #[test]
     fn test_lsp_entry_summary_ok() {
-        let e = LspEnrichmentEntry { language: "rust".into(), server_name: "rust-analyzer".into(),
-            root_hint: None, edge_count: 150, node_count: 42, error_count: 0,
-            duration: Duration::from_secs_f64(3.5), status: LspStatus::Ok };
+        let e = LspEnrichmentEntry {
+            language: "rust".into(),
+            server_name: "rust-analyzer".into(),
+            root_hint: None,
+            edge_count: 150,
+            node_count: 42,
+            error_count: 0,
+            duration: Duration::from_secs_f64(3.5),
+            status: LspStatus::Ok,
+        };
         let l = e.summary_line();
         assert!(l.contains("rust (rust-analyzer)"));
         assert!(l.contains("OK"));
@@ -743,9 +919,16 @@ mod tests {
 
     #[test]
     fn test_lsp_entry_summary_not_found() {
-        let e = LspEnrichmentEntry { language: "json".into(), server_name: "vscode-json-ls".into(),
-            root_hint: None, edge_count: 0, node_count: 0, error_count: 0,
-            duration: Duration::from_millis(5), status: LspStatus::NotFound };
+        let e = LspEnrichmentEntry {
+            language: "json".into(),
+            server_name: "vscode-json-ls".into(),
+            root_hint: None,
+            edge_count: 0,
+            node_count: 0,
+            error_count: 0,
+            duration: Duration::from_millis(5),
+            status: LspStatus::NotFound,
+        };
         assert!(e.summary_line().contains("not found"));
     }
 }

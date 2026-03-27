@@ -185,7 +185,11 @@ pub fn grpc_client_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
                     "grpc_client_calls: {} ({}) -> {}.{} ({}.proto)",
                     node.id.name,
                     node.id.file.display(),
-                    rpc_node.metadata.get("parent_service").map(|s| s.as_str()).unwrap_or("?"),
+                    rpc_node
+                        .metadata
+                        .get("parent_service")
+                        .map(|s| s.as_str())
+                        .unwrap_or("?"),
                     rpc_node.id.name,
                     rpc_node.id.file.display(),
                 );
@@ -275,10 +279,7 @@ pub(crate) fn extract_method_call_sites(body: &str) -> HashSet<&str> {
             }
             let end = j + 1;
             // Walk back through identifier chars.
-            while j > 0
-                && (bytes[j - 1].is_ascii_alphanumeric()
-                    || bytes[j - 1] == b'_')
-            {
+            while j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || bytes[j - 1] == b'_') {
                 j -= 1;
             }
             if j < end {
@@ -286,9 +287,10 @@ pub(crate) fn extract_method_call_sites(body: &str) -> HashSet<&str> {
                 let prev = if j > 0 { bytes[j - 1] } else { 0 };
                 if prev == b'.'
                     && let Ok(ident) = std::str::from_utf8(&bytes[j..end])
-                        && ident.len() >= 3 {
-                            result.insert(ident);
-                        }
+                    && ident.len() >= 3
+                {
+                    result.insert(ident);
+                }
             }
         }
         i += 1;
@@ -332,8 +334,14 @@ mod tests {
     fn make_proto_rpc(file: &str, method_name: &str, service_name: &str) -> Node {
         let mut metadata = BTreeMap::new();
         metadata.insert("parent_service".to_string(), service_name.to_string());
-        metadata.insert("request_type".to_string(), format!("{}Request", method_name));
-        metadata.insert("response_type".to_string(), format!("{}Response", method_name));
+        metadata.insert(
+            "request_type".to_string(),
+            format!("{}Request", method_name),
+        );
+        metadata.insert(
+            "response_type".to_string(),
+            format!("{}Response", method_name),
+        );
         Node {
             id: NodeId {
                 root: "r".into(),
@@ -344,8 +352,14 @@ mod tests {
             language: "protobuf".into(),
             line_start: 5,
             line_end: 5,
-            signature: format!("rpc {} ({}Request) returns ({}Response);", method_name, method_name, method_name),
-            body: format!("rpc {} ({}Request) returns ({}Response);", method_name, method_name, method_name),
+            signature: format!(
+                "rpc {} ({}Request) returns ({}Response);",
+                method_name, method_name, method_name
+            ),
+            body: format!(
+                "rpc {} ({}Request) returns ({}Response);",
+                method_name, method_name, method_name
+            ),
             metadata,
             source: ExtractionSource::Schema,
         }
@@ -395,7 +409,11 @@ mod tests {
     fn test_extract_method_call_finds_dot_call() {
         let body = "resp = stub.GetUser(req)";
         let sites = extract_method_call_sites(body);
-        assert!(sites.contains("GetUser"), "should find GetUser method call, got {:?}", sites);
+        assert!(
+            sites.contains("GetUser"),
+            "should find GetUser method call, got {:?}",
+            sites
+        );
     }
 
     #[test]
@@ -403,7 +421,10 @@ mod tests {
         // Bare function calls (no dot) should not be in results.
         let body = "result = SomeFunction(arg)";
         let sites = extract_method_call_sites(body);
-        assert!(!sites.contains("SomeFunction"), "bare calls should not be collected");
+        assert!(
+            !sites.contains("SomeFunction"),
+            "bare calls should not be collected"
+        );
     }
 
     #[test]
@@ -431,7 +452,9 @@ mod tests {
     #[test]
     fn test_is_grpc_stub_import_python_pb2_grpc() {
         assert!(is_grpc_stub_import("import user_pb2_grpc"));
-        assert!(is_grpc_stub_import("from user_pb2_grpc import UserServiceStub"));
+        assert!(is_grpc_stub_import(
+            "from user_pb2_grpc import UserServiceStub"
+        ));
     }
 
     #[test]
@@ -443,7 +466,9 @@ mod tests {
     #[test]
     fn test_is_grpc_stub_import_typescript() {
         assert!(is_grpc_stub_import("import * as grpc from '@grpc/grpc-js'"));
-        assert!(is_grpc_stub_import("import { credentials } from '@grpc/grpc-js'"));
+        assert!(is_grpc_stub_import(
+            "import { credentials } from '@grpc/grpc-js'"
+        ));
     }
 
     #[test]
@@ -521,16 +546,17 @@ mod tests {
             "func doSearch(c SearchServiceClient, q string) {\n    resp, err := c.Search(ctx, &pb.SearchRequest{Query: q})\n    _ = resp; _ = err\n}",
             "go",
         );
-        let import = make_import(
-            "client/main.go",
-            "\"google.golang.org/grpc\"",
-            "go",
-        );
+        let import = make_import("client/main.go", "\"google.golang.org/grpc\"", "go");
 
         let nodes = vec![rpc.clone(), caller.clone(), import];
         let edges = grpc_client_calls_pass(&nodes);
 
-        assert_eq!(edges.len(), 1, "expected 1 Calls edge for Go, got {:?}", edges);
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected 1 Calls edge for Go, got {:?}",
+            edges
+        );
         assert_eq!(edges[0].from.name, "doSearch");
         assert_eq!(edges[0].to.name, "Search");
     }
@@ -553,7 +579,12 @@ mod tests {
         let nodes = vec![rpc.clone(), caller.clone(), import];
         let edges = grpc_client_calls_pass(&nodes);
 
-        assert_eq!(edges.len(), 1, "expected 1 Calls edge for TypeScript, got {:?}", edges);
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected 1 Calls edge for TypeScript, got {:?}",
+            edges
+        );
         assert_eq!(edges[0].from.name, "fetchUser");
         assert_eq!(edges[0].to.name, "GetUser");
     }
@@ -633,7 +664,12 @@ mod tests {
         let edges = grpc_client_calls_pass(&nodes);
 
         // Edge should match: getUser (lowerCamel) → normalized to GetUser (PascalCase) → found
-        assert_eq!(edges.len(), 1, "expected 1 Calls edge for Java lowerCamelCase call, got {:?}", edges);
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected 1 Calls edge for Java lowerCamelCase call, got {:?}",
+            edges
+        );
         assert_eq!(edges[0].from.name, "fetchUser");
         assert_eq!(edges[0].to.name, "GetUser");
     }
@@ -656,10 +692,16 @@ mod tests {
         // tonic (Rust gRPC) intentionally excluded — no Rust import pattern exists yet
         let mut fw_tonic = HashSet::new();
         fw_tonic.insert("tonic".to_string());
-        assert!(!should_run(&fw_tonic), "tonic must not trigger pass (no Rust import pattern)");
+        assert!(
+            !should_run(&fw_tonic),
+            "tonic must not trigger pass (no Rust import pattern)"
+        );
         let mut fw5 = HashSet::new();
         fw5.insert("fastapi".to_string());
-        assert!(!should_run(&fw5), "non-grpc framework should not trigger pass");
+        assert!(
+            !should_run(&fw5),
+            "non-grpc framework should not trigger pass"
+        );
     }
 
     #[test]
@@ -707,12 +749,20 @@ mod tests {
         let edges = grpc_client_calls_pass(&nodes);
 
         // Both candidates are plausible — both edges should be emitted.
-        assert_eq!(edges.len(), 2,
-            "should emit to all matching RPC candidates, got {:?}", edges);
-        assert!(edges.iter().any(|e| e.to.file == rpc_user.id.file),
-            "missing edge to user.proto");
-        assert!(edges.iter().any(|e| e.to.file == rpc_admin.id.file),
-            "missing edge to admin.proto");
+        assert_eq!(
+            edges.len(),
+            2,
+            "should emit to all matching RPC candidates, got {:?}",
+            edges
+        );
+        assert!(
+            edges.iter().any(|e| e.to.file == rpc_user.id.file),
+            "missing edge to user.proto"
+        );
+        assert!(
+            edges.iter().any(|e| e.to.file == rpc_admin.id.file),
+            "missing edge to admin.proto"
+        );
     }
 
     /// Dissent finding: verify that a function with no body produces no edges
@@ -740,7 +790,11 @@ mod tests {
         let nodes = vec![rpc, caller, import];
         let edges = grpc_client_calls_pass(&nodes);
 
-        assert!(edges.is_empty(), "empty body should produce no edges, got {:?}", edges);
+        assert!(
+            edges.is_empty(),
+            "empty body should produce no edges, got {:?}",
+            edges
+        );
     }
 
     /// Dissent finding: `parent_service` metadata is the key contract.
@@ -763,8 +817,11 @@ mod tests {
 
         // Regular function nodes have no `parent_service` — they are not indexed
         // as RPC targets, so no edge should be emitted.
-        assert!(edges.is_empty(),
-            "non-RPC functions must not be targeted by grpc pass, got {:?}", edges);
+        assert!(
+            edges.is_empty(),
+            "non-RPC functions must not be targeted by grpc pass, got {:?}",
+            edges
+        );
     }
 
     /// Adversarial: short method names (< 3 chars) must be skipped.
@@ -778,6 +835,10 @@ mod tests {
         let edges = grpc_client_calls_pass(&nodes);
 
         // "Do" is < 3 chars — should be skipped by the length guard.
-        assert!(edges.is_empty(), "short RPC names must be filtered, got {:?}", edges);
+        assert!(
+            edges.is_empty(),
+            "short RPC names must be filtered, got {:?}",
+            edges
+        );
     }
 }

@@ -25,11 +25,11 @@ use std::sync::OnceLock;
 
 use anyhow::Result;
 
-use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
-use crate::scanner::PatternConfig;
 use super::query::{CaptureSet, QueryExtractor, RouteQueryConfig};
 use super::string_literals::harvest_string_literals;
 use super::{ExtractionResult, Extractor};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
+use crate::scanner::PatternConfig;
 
 // ── Pattern config global ───────────────────────────────────────────
 
@@ -50,16 +50,19 @@ pub fn init_pattern_config(repo_root: &Path) {
 fn effective_pattern_suffixes() -> &'static [(String, String)] {
     // Initialized by init_pattern_config; if not yet called, use defaults.
     static DEFAULT_OWNED: OnceLock<Vec<(String, String)>> = OnceLock::new();
-    PATTERN_CONFIG.get().map(|v| v.as_slice()).unwrap_or_else(|| {
-        DEFAULT_OWNED
-            .get_or_init(|| {
-                crate::scanner::DEFAULT_PATTERN_SUFFIXES
-                    .iter()
-                    .map(|(s, h)| (s.to_string(), h.to_string()))
-                    .collect()
-            })
-            .as_slice()
-    })
+    PATTERN_CONFIG
+        .get()
+        .map(|v| v.as_slice())
+        .unwrap_or_else(|| {
+            DEFAULT_OWNED
+                .get_or_init(|| {
+                    crate::scanner::DEFAULT_PATTERN_SUFFIXES
+                        .iter()
+                        .map(|(s, h)| (s.to_string(), h.to_string()))
+                        .collect()
+                })
+                .as_slice()
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -228,13 +231,8 @@ impl GenericExtractor {
         // function names defined in this file. Emit Calls edges with Confidence::Detected.
         // Cross-file and method-chain calls are left to LSP.
         {
-            let same_file_calls = detect_same_file_calls(
-                tree.root_node(),
-                path,
-                source,
-                self.config,
-                &nodes,
-            );
+            let same_file_calls =
+                detect_same_file_calls(tree.root_node(), path, source, self.config, &nodes);
             edges.extend(same_file_calls);
         }
 
@@ -252,14 +250,18 @@ impl GenericExtractor {
         if !self.config.route_queries.is_empty() {
             let compiled = self.config.compiled_route_queries.get_or_init(|| {
                 let language = (self.config.language_fn)();
-                self.config.route_queries.iter()
-                    .map(|cfg| {
-                        match QueryExtractor::new(&language, cfg.query) {
-                            Ok(qe) => Some(qe),
-                            Err(err) => {
-                                tracing::warn!("route query '{}' failed to compile: {}", cfg.label, err);
-                                None
-                            }
+                self.config
+                    .route_queries
+                    .iter()
+                    .map(|cfg| match QueryExtractor::new(&language, cfg.query) {
+                        Ok(qe) => Some(qe),
+                        Err(err) => {
+                            tracing::warn!(
+                                "route query '{}' failed to compile: {}",
+                                cfg.label,
+                                err
+                            );
+                            None
                         }
                     })
                     .collect()
@@ -312,20 +314,29 @@ fn collect_nodes(
 
     // Match against the config table.
     if let Some(node_kind) = config.node_kinds.iter().find_map(|(ts_kind, nk)| {
-        if *ts_kind == kind_str { Some(nk.clone()) } else { None }
+        if *ts_kind == kind_str {
+            Some(nk.clone())
+        } else {
+            None
+        }
     }) {
         // Extract name.
         // 1. Full-text kinds (e.g. Rust use_declaration): use the whole node text.
         // 2. Nodes with both "trait" and "type" fields (Rust impl): combine as "Trait for Type".
         // 3. Default: "name" field child.
         let name = if config.full_text_name_kinds.contains(&kind_str) {
-            node.utf8_text(source).unwrap_or("unknown").trim().to_string()
+            node.utf8_text(source)
+                .unwrap_or("unknown")
+                .trim()
+                .to_string()
         } else if node.child_by_field_name("trait").is_some() {
             // Rust `impl Trait for Type` — combine to "Trait for Type".
-            let trait_name = node.child_by_field_name("trait")
+            let trait_name = node
+                .child_by_field_name("trait")
                 .and_then(|n| n.utf8_text(source).ok())
                 .unwrap_or("?");
-            let type_name = node.child_by_field_name("type")
+            let type_name = node
+                .child_by_field_name("type")
                 .and_then(|n| n.utf8_text(source).ok())
                 .unwrap_or("?");
             format!("{} for {}", trait_name, type_name)
@@ -367,13 +378,15 @@ fn collect_nodes(
             }
 
             // Static vs instance method detection for functions inside a scope.
-            if node_kind == NodeKind::Function && parent_scope.is_some()
-                && let Some(is_static) = detect_is_static(node, source, config) {
-                    metadata.insert(
-                        "is_static".to_string(),
-                        if is_static { "true" } else { "false" }.to_string(),
-                    );
-                }
+            if node_kind == NodeKind::Function
+                && parent_scope.is_some()
+                && let Some(is_static) = detect_is_static(node, source, config)
+            {
+                metadata.insert(
+                    "is_static".to_string(),
+                    if is_static { "true" } else { "false" }.to_string(),
+                );
+            }
 
             // Decorator/attribute collection.
             if !config.decorator_node_kinds.is_empty() {
@@ -389,7 +402,8 @@ fn collect_nodes(
                         // is_test: check decorator tokens for test patterns.
                         // Pass config.test_name_prefix so only languages that opt in
                         // (Python) use the test_* naming convention.
-                        let is_test = is_test_by_decorator(&decorators, &name, config.test_name_prefix);
+                        let is_test =
+                            is_test_by_decorator(&decorators, &name, config.test_name_prefix);
                         if is_test {
                             metadata.insert("is_test".to_string(), "true".to_string());
                         }
@@ -434,18 +448,16 @@ fn collect_nodes(
             if let Some(tp_kind) = config.type_param_node_kind {
                 for i in 0..node.child_count() {
                     if let Some(child) = node.child(i as u32)
-                        && child.kind() == tp_kind {
-                            if let Ok(text) = child.utf8_text(source) {
-                                let text = text.trim();
-                                if !text.is_empty() {
-                                    metadata.insert(
-                                        "type_params".to_string(),
-                                        text.to_string(),
-                                    );
-                                }
+                        && child.kind() == tp_kind
+                    {
+                        if let Ok(text) = child.utf8_text(source) {
+                            let text = text.trim();
+                            if !text.is_empty() {
+                                metadata.insert("type_params".to_string(), text.to_string());
                             }
-                            break;
                         }
+                        break;
+                    }
                 }
             }
 
@@ -463,19 +475,20 @@ fn collect_nodes(
             // Const value extraction.
             if node_kind == NodeKind::Const {
                 if let Some(value_field) = config.const_value_field
-                    && let Some(val_node) = node.child_by_field_name(value_field) {
-                        let val = val_node.utf8_text(source).unwrap_or("").trim().to_string();
-                        let is_scalar = val.starts_with('"') || val.starts_with('\'')
-                            || val.starts_with('`')
-                            || val.parse::<f64>().is_ok()
-                            || val == "true" || val == "false";
-                        if is_scalar && !val.is_empty() {
-                            let stripped = val.trim_matches('"')
-                                .trim_matches('\'')
-                                .trim_matches('`');
-                            metadata.insert("value".to_string(), stripped.to_string());
-                        }
+                    && let Some(val_node) = node.child_by_field_name(value_field)
+                {
+                    let val = val_node.utf8_text(source).unwrap_or("").trim().to_string();
+                    let is_scalar = val.starts_with('"')
+                        || val.starts_with('\'')
+                        || val.starts_with('`')
+                        || val.parse::<f64>().is_ok()
+                        || val == "true"
+                        || val == "false";
+                    if is_scalar && !val.is_empty() {
+                        let stripped = val.trim_matches('"').trim_matches('\'').trim_matches('`');
+                        metadata.insert("value".to_string(), stripped.to_string());
                     }
+                }
                 metadata.insert("synthetic".to_string(), "false".to_string());
             }
 
@@ -496,15 +509,19 @@ fn collect_nodes(
                 }
                 let (edge_file, target_name) = if let Some(ref resolved) = target_file {
                     // Use resolved file's stem as the module name
-                    let stem = resolved.file_stem()
+                    let stem = resolved
+                        .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or("unknown")
                         .to_string();
                     (resolved.clone(), stem)
                 } else {
                     let fallback = parse_import_target(&name);
-                    if fallback.is_empty() { (path.to_path_buf(), String::new()) }
-                    else { (path.to_path_buf(), fallback) }
+                    if fallback.is_empty() {
+                        (path.to_path_buf(), String::new())
+                    } else {
+                        (path.to_path_buf(), fallback)
+                    }
                 };
                 if !target_name.is_empty() {
                     Some(crate::graph::Edge {
@@ -528,8 +545,12 @@ fn collect_nodes(
                             crate::graph::Confidence::Detected
                         },
                     })
-                } else { None }
-            } else { None };
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             nodes.push(Node {
                 id: NodeId {
@@ -556,8 +577,8 @@ fn collect_nodes(
             // may support return type extraction even if param container isn't
             // accessible via a simple field name (e.g. C++).
             if node_kind == NodeKind::Function {
-                let has_type_edges = config.param_container_field.is_some()
-                    || config.return_type_field.is_some();
+                let has_type_edges =
+                    config.param_container_field.is_some() || config.return_type_field.is_some();
                 if has_type_edges {
                     let fn_id = NodeId {
                         root: String::new(),
@@ -568,47 +589,54 @@ fn collect_nodes(
                     // Parameter types
                     if let Some(param_field) = config.param_container_field
                         && let Some(params) = node.child_by_field_name(param_field)
-                            && let Some(type_field) = config.param_type_field {
-                                for i in 0..params.child_count() {
-                                    if let Some(param) = params.child(i as u32)
-                                        && let Some(tn) = param.child_by_field_name(type_field) {
-                                            let type_text = tn.utf8_text(source).unwrap_or("");
-                                            if let Some(type_name) = extract_user_type(type_text, config.type_requires_uppercase) {
-                                                edges.push(Edge {
-                                                    from: fn_id.clone(),
-                                                    to: NodeId {
-                                                        root: String::new(),
-                                                        file: path.to_path_buf(),
-                                                        name: type_name,
-                                                        kind: NodeKind::Struct,
-                                                    },
-                                                    kind: EdgeKind::DependsOn,
-                                                    source: ExtractionSource::TreeSitter,
-                                                    confidence: Confidence::Detected,
-                                                });
-                                            }
-                                        }
+                        && let Some(type_field) = config.param_type_field
+                    {
+                        for i in 0..params.child_count() {
+                            if let Some(param) = params.child(i as u32)
+                                && let Some(tn) = param.child_by_field_name(type_field)
+                            {
+                                let type_text = tn.utf8_text(source).unwrap_or("");
+                                if let Some(type_name) =
+                                    extract_user_type(type_text, config.type_requires_uppercase)
+                                {
+                                    edges.push(Edge {
+                                        from: fn_id.clone(),
+                                        to: NodeId {
+                                            root: String::new(),
+                                            file: path.to_path_buf(),
+                                            name: type_name,
+                                            kind: NodeKind::Struct,
+                                        },
+                                        kind: EdgeKind::DependsOn,
+                                        source: ExtractionSource::TreeSitter,
+                                        confidence: Confidence::Detected,
+                                    });
                                 }
                             }
+                        }
+                    }
                     // Return type (independent of param extraction)
                     if let Some(ret_field) = config.return_type_field
-                        && let Some(rn) = node.child_by_field_name(ret_field) {
-                            let ret_text = rn.utf8_text(source).unwrap_or("");
-                            if let Some(type_name) = extract_user_type(ret_text, config.type_requires_uppercase) {
-                                edges.push(Edge {
-                                    from: fn_id,
-                                    to: NodeId {
-                                        root: String::new(),
-                                        file: path.to_path_buf(),
-                                        name: type_name,
-                                        kind: NodeKind::Struct,
-                                    },
-                                    kind: EdgeKind::DependsOn,
-                                    source: ExtractionSource::TreeSitter,
-                                    confidence: Confidence::Detected,
-                                });
-                            }
+                        && let Some(rn) = node.child_by_field_name(ret_field)
+                    {
+                        let ret_text = rn.utf8_text(source).unwrap_or("");
+                        if let Some(type_name) =
+                            extract_user_type(ret_text, config.type_requires_uppercase)
+                        {
+                            edges.push(Edge {
+                                from: fn_id,
+                                to: NodeId {
+                                    root: String::new(),
+                                    file: path.to_path_buf(),
+                                    name: type_name,
+                                    kind: NodeKind::Struct,
+                                },
+                                kind: EdgeKind::DependsOn,
+                                source: ExtractionSource::TreeSitter,
+                                confidence: Confidence::Detected,
+                            });
                         }
+                    }
                 }
             }
 
@@ -617,7 +645,8 @@ fn collect_nodes(
                 let module_id = NodeId {
                     root: String::new(),
                     file: path.to_path_buf(),
-                    name: path.file_stem()
+                    name: path
+                        .file_stem()
                         .unwrap_or(std::ffi::OsStr::new("module"))
                         .to_string_lossy()
                         .to_string(),
@@ -639,11 +668,12 @@ fn collect_nodes(
 
             // Emit structural edge from parent scope to this node.
             if let Some((scope_name, parent_kind)) = parent_scope {
-                let edge_kind = if node_kind == NodeKind::Field || node_kind == NodeKind::EnumVariant {
-                    EdgeKind::HasField
-                } else {
-                    EdgeKind::Defines
-                };
+                let edge_kind =
+                    if node_kind == NodeKind::Field || node_kind == NodeKind::EnumVariant {
+                        EdgeKind::HasField
+                    } else {
+                        EdgeKind::Defines
+                    };
                 edges.push(Edge {
                     from: NodeId {
                         root: String::new(),
@@ -665,39 +695,40 @@ fn collect_nodes(
 
             // Trait implementation edge.
             if node_kind == NodeKind::Impl
-                && let Some(trait_node) = node.child_by_field_name("trait") {
-                    let trait_name = trait_node.utf8_text(source).unwrap_or("?").to_string();
-                    if let Some(type_node) = node.child_by_field_name("type") {
-                        let type_name = type_node.utf8_text(source).unwrap_or("?").to_string();
-                        edges.push(Edge {
-                            from: NodeId {
-                                root: String::new(),
-                                file: path.to_path_buf(),
-                                name: type_name,
-                                kind: NodeKind::Struct,
-                            },
-                            to: NodeId {
-                                root: String::new(),
-                                file: path.to_path_buf(),
-                                name: trait_name,
-                                kind: NodeKind::Trait,
-                            },
-                            kind: EdgeKind::Implements,
-                            source: ExtractionSource::TreeSitter,
-                            confidence: Confidence::Detected,
-                        });
-                    }
+                && let Some(trait_node) = node.child_by_field_name("trait")
+            {
+                let trait_name = trait_node.utf8_text(source).unwrap_or("?").to_string();
+                if let Some(type_node) = node.child_by_field_name("type") {
+                    let type_name = type_node.utf8_text(source).unwrap_or("?").to_string();
+                    edges.push(Edge {
+                        from: NodeId {
+                            root: String::new(),
+                            file: path.to_path_buf(),
+                            name: type_name,
+                            kind: NodeKind::Struct,
+                        },
+                        to: NodeId {
+                            root: String::new(),
+                            file: path.to_path_buf(),
+                            name: trait_name,
+                            kind: NodeKind::Trait,
+                        },
+                        kind: EdgeKind::Implements,
+                        source: ExtractionSource::TreeSitter,
+                        confidence: Confidence::Detected,
+                    });
                 }
+            }
 
             // Scope propagation into children.
             if config.scope_parent_kinds.contains(&kind_str) {
-                let scope_kind = if node_kind == NodeKind::Impl
-                    && node.child_by_field_name("trait").is_none() {
-                    // Plain `impl Foo` — methods belong to the struct, not the impl
-                    NodeKind::Struct
-                } else {
-                    node_kind
-                };
+                let scope_kind =
+                    if node_kind == NodeKind::Impl && node.child_by_field_name("trait").is_none() {
+                        // Plain `impl Foo` — methods belong to the struct, not the impl
+                        NodeKind::Struct
+                    } else {
+                        node_kind
+                    };
                 let scope = Some((name, scope_kind));
                 for i in 0..node.child_count() {
                     if let Some(child) = node.child(i as u32) {
@@ -730,18 +761,18 @@ const LOGICAL_OPERATORS: &[&str] = &["&&", "||", "and", "or"];
 /// These are not in `node_kinds` (they aren't extracted as top-level symbols),
 /// but branches inside them belong to the closure, not the enclosing function.
 const CLOSURE_NODE_KINDS: &[&str] = &[
-    "closure_expression",    // Rust
-    "lambda",                // Python
-    "arrow_function",        // TypeScript, JavaScript
-    "function_expression",   // JavaScript
-    "generator_function",    // JavaScript
-    "anonymous_function",    // PHP
-    "lambda_literal",        // Kotlin
-    "func_literal",          // Go
-    "lambda_expression",     // Java, C#
+    "closure_expression",  // Rust
+    "lambda",              // Python
+    "arrow_function",      // TypeScript, JavaScript
+    "function_expression", // JavaScript
+    "generator_function",  // JavaScript
+    "anonymous_function",  // PHP
+    "lambda_literal",      // Kotlin
+    "func_literal",        // Go
+    "lambda_expression",   // Java, C#
     // Note: Ruby "block" omitted — too generic, conflicts with Rust/other
     // languages where "block" is a plain scope, not a closure.
-    "do_block",              // Ruby (do...end blocks act as closures)
+    "do_block", // Ruby (do...end blocks act as closures)
 ];
 
 /// Count branch/decision-point nodes in a tree-sitter subtree.
@@ -783,9 +814,10 @@ pub(super) fn count_branches(
             // Skip nested function/closure bodies so they don't inflate the parent.
             if skip_nested_fns {
                 let child_kind = child.kind();
-                let is_fn = config.node_kinds.iter().any(|(ts_kind, nk)| {
-                    *ts_kind == child_kind && *nk == NodeKind::Function
-                });
+                let is_fn = config
+                    .node_kinds
+                    .iter()
+                    .any(|(ts_kind, nk)| *ts_kind == child_kind && *nk == NodeKind::Function);
                 if is_fn || CLOSURE_NODE_KINDS.contains(&child_kind) {
                     continue;
                 }
@@ -842,11 +874,7 @@ fn detect_pattern_hint(name: &str, kind: &NodeKind) -> Option<String> {
 /// - **Python:** Has `@staticmethod` decorator -> static; first param is `self`/`cls` -> instance
 /// - **Java/C#/TypeScript:** `static` keyword in function text -> static; else -> instance
 /// - Other languages with no `param_container_field` -> `None` (skip)
-fn detect_is_static(
-    node: tree_sitter::Node,
-    source: &[u8],
-    config: &LangConfig,
-) -> Option<bool> {
+fn detect_is_static(node: tree_sitter::Node, source: &[u8], config: &LangConfig) -> Option<bool> {
     match config.language_name {
         "rust" => detect_is_static_rust(node, source),
         "python" => detect_is_static_python(node, source),
@@ -868,7 +896,11 @@ fn detect_is_static_rust(node: tree_sitter::Node, source: &[u8]) -> Option<bool>
                 // Also check for named params that might be "self" variants
                 if param.is_named() && param.kind() != "," {
                     let text = param.utf8_text(source).unwrap_or("").trim();
-                    if text == "self" || text == "&self" || text == "&mut self" || text == "mut self" {
+                    if text == "self"
+                        || text == "&self"
+                        || text == "&mut self"
+                        || text == "mut self"
+                    {
                         return Some(false);
                     }
                     // First real parameter is not self -> static
@@ -882,8 +914,10 @@ fn detect_is_static_rust(node: tree_sitter::Node, source: &[u8]) -> Option<bool>
         // function_signature_item (trait methods) may not have "parameters" field;
         // check the body text for self
         let text = node.utf8_text(source).unwrap_or("");
-        if text.contains("&self") || text.contains("&mut self")
-            || text.contains("(self") || text.contains("( self")
+        if text.contains("&self")
+            || text.contains("&mut self")
+            || text.contains("(self")
+            || text.contains("( self")
             || text.contains("(mut self")
         {
             Some(false)
@@ -908,20 +942,22 @@ fn detect_is_static_python(node: tree_sitter::Node, source: &[u8]) -> Option<boo
 
     // Check if this function is wrapped in a decorated_definition
     if let Some(parent) = node.parent()
-        && parent.kind() == "decorated_definition" {
-            for i in 0..parent.child_count() {
-                if let Some(child) = parent.child(i as u32)
-                    && child.kind() == "decorator" {
-                        let dec_text = child.utf8_text(source).unwrap_or("");
-                        if dec_text.contains("staticmethod") {
-                            has_staticmethod = true;
-                        }
-                        if dec_text.contains("classmethod") {
-                            has_classmethod = true;
-                        }
-                    }
+        && parent.kind() == "decorated_definition"
+    {
+        for i in 0..parent.child_count() {
+            if let Some(child) = parent.child(i as u32)
+                && child.kind() == "decorator"
+            {
+                let dec_text = child.utf8_text(source).unwrap_or("");
+                if dec_text.contains("staticmethod") {
+                    has_staticmethod = true;
+                }
+                if dec_text.contains("classmethod") {
+                    has_classmethod = true;
+                }
             }
         }
+    }
 
     if has_staticmethod {
         return Some(true);
@@ -931,20 +967,27 @@ fn detect_is_static_python(node: tree_sitter::Node, source: &[u8]) -> Option<boo
     if let Some(params) = node.child_by_field_name("parameters") {
         for i in 0..params.child_count() {
             if let Some(param) = params.child(i as u32)
-                && param.is_named() && param.kind() != "," {
-                    let param_name = param.child_by_field_name("name")
-                        .or_else(|| {
-                            // Simple identifier parameter (no type annotation)
-                            if param.kind() == "identifier" { Some(param) } else { None }
-                        })
-                        .and_then(|n| n.utf8_text(source).ok())
-                        .unwrap_or("");
-                    if param_name == "self" || param_name == "cls" || has_classmethod {
-                        return Some(false); // instance or classmethod
-                    }
-                    // First param is something else and no @staticmethod -> static
-                    return Some(true);
+                && param.is_named()
+                && param.kind() != ","
+            {
+                let param_name = param
+                    .child_by_field_name("name")
+                    .or_else(|| {
+                        // Simple identifier parameter (no type annotation)
+                        if param.kind() == "identifier" {
+                            Some(param)
+                        } else {
+                            None
+                        }
+                    })
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+                if param_name == "self" || param_name == "cls" || has_classmethod {
+                    return Some(false); // instance or classmethod
                 }
+                // First param is something else and no @staticmethod -> static
+                return Some(true);
+            }
         }
         // No parameters and no @staticmethod -> static
         Some(true)
@@ -1001,11 +1044,7 @@ fn detect_is_static_keyword(node: tree_sitter::Node, source: &[u8]) -> Option<bo
 /// - **Java:** annotations live inside a `modifiers` child of the declaration.
 ///
 /// Returns a comma-separated string of decorator texts, or empty string if none found.
-fn collect_decorators(
-    node: tree_sitter::Node,
-    source: &[u8],
-    config: &LangConfig,
-) -> String {
+fn collect_decorators(node: tree_sitter::Node, source: &[u8], config: &LangConfig) -> String {
     let mut decorators = Vec::new();
 
     // Strategy 1: Check parent wrapper (Python `decorated_definition` pattern).
@@ -1015,15 +1054,17 @@ fn collect_decorators(
     //     decorator: @login_required
     //     function_definition: def foo(): ...
     if let Some(parent) = node.parent()
-        && parent.kind() == "decorated_definition" {
-            for i in 0..parent.child_count() {
-                if let Some(child) = parent.child(i as u32)
-                    && config.decorator_node_kinds.contains(&child.kind())
-                        && let Ok(text) = child.utf8_text(source) {
-                            decorators.push(text.trim().to_string());
-                        }
+        && parent.kind() == "decorated_definition"
+    {
+        for i in 0..parent.child_count() {
+            if let Some(child) = parent.child(i as u32)
+                && config.decorator_node_kinds.contains(&child.kind())
+                && let Ok(text) = child.utf8_text(source)
+            {
+                decorators.push(text.trim().to_string());
             }
         }
+    }
 
     // Strategy 2: Previous siblings (Rust attribute_item, TS decorator, C# attribute_list, Kotlin annotation).
     // Walk backward through siblings collecting decorator nodes.
@@ -1038,7 +1079,10 @@ fn collect_decorators(
             } else {
                 // Stop at the first non-decorator sibling (don't skip over code).
                 // Exception: skip comment nodes (they can appear between decorators).
-                if sib.kind() == "comment" || sib.kind() == "line_comment" || sib.kind() == "block_comment" {
+                if sib.kind() == "comment"
+                    || sib.kind() == "line_comment"
+                    || sib.kind() == "block_comment"
+                {
                     sibling = sib.prev_sibling();
                 } else {
                     break;
@@ -1055,15 +1099,17 @@ fn collect_decorators(
     if decorators.is_empty() {
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i as u32)
-                && child.kind() == "modifiers" {
-                    for j in 0..child.child_count() {
-                        if let Some(mod_child) = child.child(j as u32)
-                            && config.decorator_node_kinds.contains(&mod_child.kind())
-                                && let Ok(text) = mod_child.utf8_text(source) {
-                                    decorators.push(text.trim().to_string());
-                                }
+                && child.kind() == "modifiers"
+            {
+                for j in 0..child.child_count() {
+                    if let Some(mod_child) = child.child(j as u32)
+                        && config.decorator_node_kinds.contains(&mod_child.kind())
+                        && let Ok(text) = mod_child.utf8_text(source)
+                    {
+                        decorators.push(text.trim().to_string());
                     }
                 }
+            }
         }
     }
 
@@ -1074,9 +1120,10 @@ fn collect_decorators(
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i as u32)
                 && config.decorator_node_kinds.contains(&child.kind())
-                    && let Ok(text) = child.utf8_text(source) {
-                        decorators.push(text.trim().to_string());
-                    }
+                && let Ok(text) = child.utf8_text(source)
+            {
+                decorators.push(text.trim().to_string());
+            }
         }
     }
 
@@ -1102,19 +1149,15 @@ fn collect_decorators(
 ///
 /// Returns a space-joined string of comment lines with markers stripped, or
 /// empty string if no doc comments are found.
-fn collect_doc_comment(
-    node: tree_sitter::Node,
-    source: &[u8],
-    config: &LangConfig,
-) -> String {
+fn collect_doc_comment(node: tree_sitter::Node, source: &[u8], config: &LangConfig) -> String {
     let language_name = config.language_name;
     // The node kinds that represent comments in each language.
     // All of these trigger the preceding-sibling walk.
     const COMMENT_KINDS: &[&str] = &[
-        "line_comment",    // Rust (/// or //), Java, Kotlin, C#, Go
-        "block_comment",   // Rust (/** */), Java, C#
-        "comment",         // Python (# ...), TypeScript, JavaScript, Go
-        "doc_comment",     // Some grammars expose this as a distinct kind
+        "line_comment",  // Rust (/// or //), Java, Kotlin, C#, Go
+        "block_comment", // Rust (/** */), Java, C#
+        "comment",       // Python (# ...), TypeScript, JavaScript, Go
+        "doc_comment",   // Some grammars expose this as a distinct kind
     ];
 
     let mut comment_lines: Vec<String> = Vec::new();
@@ -1151,28 +1194,31 @@ fn collect_doc_comment(
     // whose value is a string literal. Controlled by config.docstring_in_body
     // to avoid language-specific logic in generic.rs.
     // This handles `def foo(): """docstring""" ...`
-    if comment_lines.is_empty() && config.docstring_in_body
-        && let Some(body_node) = node.child_by_field_name("body") {
-            for i in 0..body_node.child_count() {
-                if let Some(child) = body_node.child(i as u32) {
-                    if child.kind() == "expression_statement" {
-                        if let Some(inner) = child.child(0)
-                            && (inner.kind() == "string" || inner.kind() == "string_literal") {
-                                let raw = inner.utf8_text(source).unwrap_or("").trim();
-                                let cleaned = strip_comment_markers(raw, language_name);
-                                if !cleaned.is_empty() {
-                                    comment_lines.push(cleaned);
-                                }
-                            }
-                        break; // Only the first statement matters
+    if comment_lines.is_empty()
+        && config.docstring_in_body
+        && let Some(body_node) = node.child_by_field_name("body")
+    {
+        for i in 0..body_node.child_count() {
+            if let Some(child) = body_node.child(i as u32) {
+                if child.kind() == "expression_statement" {
+                    if let Some(inner) = child.child(0)
+                        && (inner.kind() == "string" || inner.kind() == "string_literal")
+                    {
+                        let raw = inner.utf8_text(source).unwrap_or("").trim();
+                        let cleaned = strip_comment_markers(raw, language_name);
+                        if !cleaned.is_empty() {
+                            comment_lines.push(cleaned);
+                        }
                     }
-                    // Skip decorators and blanks at the start
-                    if child.kind() != "decorator" {
-                        break;
-                    }
+                    break; // Only the first statement matters
+                }
+                // Skip decorators and blanks at the start
+                if child.kind() != "decorator" {
+                    break;
                 }
             }
         }
+    }
 
     comment_lines.join(" ")
 }
@@ -1184,7 +1230,8 @@ fn collect_doc_comment(
 fn strip_comment_markers(raw: &str, _language_name: &str) -> String {
     let mut result = String::new();
     for line in raw.lines() {
-        let stripped = line.trim()
+        let stripped = line
+            .trim()
             // Triple-quoted Python docstrings
             .trim_start_matches("\"\"\"")
             .trim_end_matches("\"\"\"")
@@ -1203,7 +1250,9 @@ fn strip_comment_markers(raw: &str, _language_name: &str) -> String {
             .trim_end_matches("*/")
             .trim();
         if !stripped.is_empty() {
-            if !result.is_empty() { result.push(' '); }
+            if !result.is_empty() {
+                result.push(' ');
+            }
             result.push_str(stripped);
         }
     }
@@ -1238,7 +1287,8 @@ pub(super) fn extract_signature(body: &str) -> String {
 pub(super) fn extract_user_type(type_text: &str, require_uppercase: bool) -> Option<String> {
     // Strip reference prefix (e.g. "&Foo", "&mut Foo")
     // Also strip Python/TS annotation prefix `: Foo` and `-> Foo`
-    let s = type_text.trim()
+    let s = type_text
+        .trim()
         .trim_start_matches("->")
         .trim_start_matches(':')
         .trim()
@@ -1248,7 +1298,8 @@ pub(super) fn extract_user_type(type_text: &str, require_uppercase: bool) -> Opt
         .trim_start_matches("const ")
         .trim();
     // Take first identifier (before `<` generics, `::` paths, `[` arrays, or `|` unions)
-    let ident = s.split(['<', ':', ' ', '[', '|', '?'])
+    let ident = s
+        .split(['<', ':', ' ', '[', '|', '?'])
         .next()
         .unwrap_or("")
         .trim();
@@ -1268,29 +1319,111 @@ pub(super) fn extract_user_type(type_text: &str, require_uppercase: bool) -> Opt
     // Skip known standard library / primitive types (cross-language)
     const PRIMITIVES: &[&str] = &[
         // Rust stdlib
-        "String", "Vec", "Option", "Result", "Box", "Rc", "Arc",
-        "HashMap", "HashSet", "BTreeMap", "BTreeSet", "Cow",
-        "Cell", "RefCell", "Mutex", "RwLock",
-        "Pin", "Future", "Stream", "Iterator",
+        "String",
+        "Vec",
+        "Option",
+        "Result",
+        "Box",
+        "Rc",
+        "Arc",
+        "HashMap",
+        "HashSet",
+        "BTreeMap",
+        "BTreeSet",
+        "Cow",
+        "Cell",
+        "RefCell",
+        "Mutex",
+        "RwLock",
+        "Pin",
+        "Future",
+        "Stream",
+        "Iterator",
         "Self",
         // Cross-language primitives (title-cased forms)
-        "Int", "Float", "Bool", "None", "Void",
-        "Any", "Number", "Object", "Undefined", "Null",
-        "Error", "Array", "Map", "Set", "List", "Dict",
-        "Promise", "Tuple", "Type", "Interface",
-        "Boolean", "Integer", "Double", "Long", "Short", "Byte", "Char",
+        "Int",
+        "Float",
+        "Bool",
+        "None",
+        "Void",
+        "Any",
+        "Number",
+        "Object",
+        "Undefined",
+        "Null",
+        "Error",
+        "Array",
+        "Map",
+        "Set",
+        "List",
+        "Dict",
+        "Promise",
+        "Tuple",
+        "Type",
+        "Interface",
+        "Boolean",
+        "Integer",
+        "Double",
+        "Long",
+        "Short",
+        "Byte",
+        "Char",
         // Lowercase primitives (Go, Python, C, etc.)
-        "int", "int8", "int16", "int32", "int64",
-        "uint", "uint8", "uint16", "uint32", "uint64",
-        "float32", "float64", "float", "double",
-        "string", "bool", "byte", "rune", "uintptr",
-        "error", "any", "comparable",
-        "str", "bytes", "list", "dict", "set", "tuple", "object", "type",
-        "void", "char", "short", "long", "unsigned", "signed",
-        "self", "none",
-        "usize", "isize", "u8", "u16", "u32", "u64", "u128",
-        "i8", "i16", "i32", "i64", "i128", "f32", "f64",
-        "comptime_int", "comptime_float", "noreturn",
+        "int",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "float32",
+        "float64",
+        "float",
+        "double",
+        "string",
+        "bool",
+        "byte",
+        "rune",
+        "uintptr",
+        "error",
+        "any",
+        "comparable",
+        "str",
+        "bytes",
+        "list",
+        "dict",
+        "set",
+        "tuple",
+        "object",
+        "type",
+        "void",
+        "char",
+        "short",
+        "long",
+        "unsigned",
+        "signed",
+        "self",
+        "none",
+        "usize",
+        "isize",
+        "u8",
+        "u16",
+        "u32",
+        "u64",
+        "u128",
+        "i8",
+        "i16",
+        "i32",
+        "i64",
+        "i128",
+        "f32",
+        "f64",
+        "comptime_int",
+        "comptime_float",
+        "noreturn",
     ];
     if PRIMITIVES.contains(&ident) {
         return None;
@@ -1301,7 +1434,11 @@ pub(super) fn extract_user_type(type_text: &str, require_uppercase: bool) -> Opt
 /// Parse the target module name from an import declaration text.
 /// Resolve an import statement to a target file path.
 /// Returns `Some(path)` if the import can be resolved to a file that exists.
-fn resolve_import_path(source_file: &Path, import_text: &str, language: &str) -> Option<std::path::PathBuf> {
+fn resolve_import_path(
+    source_file: &Path,
+    import_text: &str,
+    language: &str,
+) -> Option<std::path::PathBuf> {
     let parent = source_file.parent()?;
 
     match language {
@@ -1310,13 +1447,9 @@ fn resolve_import_path(source_file: &Path, import_text: &str, language: &str) ->
             // `from ..models.user import X` → `../models/user.py`
             let text = import_text.trim();
             let module_path = if text.starts_with("from ") {
-                text.strip_prefix("from ")?
-                    .split_whitespace()
-                    .next()?
+                text.strip_prefix("from ")?.split_whitespace().next()?
             } else if text.starts_with("import ") {
-                text.strip_prefix("import ")?
-                    .split_whitespace()
-                    .next()?
+                text.strip_prefix("import ")?.split_whitespace().next()?
             } else {
                 return None;
             };
@@ -1342,9 +1475,7 @@ fn resolve_import_path(source_file: &Path, import_text: &str, language: &str) ->
         "typescript" | "javascript" | "tsx" | "jsx" => {
             // `import X from './util/user_utils'` or `import X from '../util'`
             // Extract the path string from quotes
-            let path_str = import_text
-                .split(['\'', '"'])
-                .nth(1)?;
+            let path_str = import_text.split(['\'', '"']).nth(1)?;
             if !path_str.starts_with('.') {
                 return None; // non-relative imports (npm packages) can't be resolved
             }
@@ -1367,7 +1498,11 @@ fn parse_import_target(import_text: &str) -> String {
         .trim_end_matches(';')
         .trim();
     // Take the first path segment.
-    s.split([':','/','.']).next().unwrap_or("").trim().to_string()
+    s.split([':', '/', '.'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,10 +1541,7 @@ fn strip_quotes(s: &str) -> String {
 fn infer_method_from_name(name: &str, default: &str) -> String {
     let lower = name.to_lowercase();
     for method in &["get", "post", "put", "delete", "patch", "head", "options"] {
-        if lower == *method
-            || lower.ends_with(method)
-            || lower == format!("{}mapping", method)
-        {
+        if lower == *method || lower.ends_with(method) || lower == format!("{}mapping", method) {
             return method.to_uppercase();
         }
     }
@@ -1521,8 +1653,7 @@ fn run_route_queries(
 
             // Find the handler function in the pre-built index: scan the narrow
             // window [search_start, search_end] instead of the entire node list.
-            let handler = (search_start..=search_end)
-                .find_map(|line| fn_by_line.get(&line));
+            let handler = (search_start..=search_end).find_map(|line| fn_by_line.get(&line));
 
             if let Some(handler_id) = handler {
                 edges.push(crate::graph::Edge {
@@ -1575,9 +1706,10 @@ fn detect_is_async(node: tree_sitter::Node, source: &[u8]) -> bool {
     // and tree-sitter-typescript where `async` is a named child of `function_declaration`.
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32)
-            && child.kind() == "async" {
-                return true;
-            }
+            && child.kind() == "async"
+        {
+            return true;
+        }
     }
     // Strategy 3: fallback — inspect the raw source text of the function node.
     // Some grammar versions don't expose `async` as a separate child. This is a
@@ -1619,7 +1751,8 @@ fn is_test_by_decorator(decorators: &str, fn_name: &str, use_name_prefix: bool) 
     decorators
         .split(|c: char| c == ',' || c.is_whitespace())
         .any(|token| {
-            let t = token.trim()
+            let t = token
+                .trim()
                 // Strip Rust attribute brackets: `#[test]` → `test`
                 .trim_start_matches("#[")
                 .trim_end_matches(']')
@@ -1667,8 +1800,11 @@ fn emit_decorator_implements_edges(nodes: &[Node], _path: &Path) -> Vec<Edge> {
         };
         // Only emit for types/structs/classes that carry trait-impl semantics.
         match node.id.kind {
-            NodeKind::Struct | NodeKind::Enum | NodeKind::Trait
-            | NodeKind::Function | NodeKind::Other(_) => {}
+            NodeKind::Struct
+            | NodeKind::Enum
+            | NodeKind::Trait
+            | NodeKind::Function
+            | NodeKind::Other(_) => {}
             _ => continue,
         }
         // Split decorators on ", " but only at the top level (not inside parentheses).
@@ -1677,7 +1813,9 @@ fn emit_decorator_implements_edges(nodes: &[Node], _path: &Path) -> Vec<Edge> {
             let dec = dec.trim();
             if let Some(trait_names) = parse_decorator_trait_names(dec) {
                 for trait_name in trait_names {
-                    if trait_name.is_empty() { continue; }
+                    if trait_name.is_empty() {
+                        continue;
+                    }
                     edges.push(Edge {
                         from: node.id.clone(),
                         to: NodeId {
@@ -1784,28 +1922,75 @@ fn parse_decorator_trait_names(dec: &str) -> Option<Vec<String>> {
     // These are frequent decorators that produce noise if mapped to Implements.
     const SKIP_MARKERS: &[&str] = &[
         // Rust test markers
-        "test", "ignore", "allow", "deny", "warn", "forbid",
-        "cfg", "cfg_attr", "doc", "inline", "cold", "must_use",
-        "non_exhaustive", "repr", "deprecated", "macro_export",
-        "macro_use", "path", "recursion_limit",
+        "test",
+        "ignore",
+        "allow",
+        "deny",
+        "warn",
+        "forbid",
+        "cfg",
+        "cfg_attr",
+        "doc",
+        "inline",
+        "cold",
+        "must_use",
+        "non_exhaustive",
+        "repr",
+        "deprecated",
+        "macro_export",
+        "macro_use",
+        "path",
+        "recursion_limit",
         // Python / TS lifecycle markers
-        "staticmethod", "classmethod", "property", "abstractmethod",
+        "staticmethod",
+        "classmethod",
+        "property",
+        "abstractmethod",
         "override",
         // Java / JUnit
-        "Override", "Deprecated", "SuppressWarnings",
+        "Override",
+        "Deprecated",
+        "SuppressWarnings",
         // Route/endpoint decorators (already handled by route_queries pass)
-        "app", "router", "route", "get", "post", "put", "delete", "patch",
-        "head", "options", "blueprint", "api",
+        "app",
+        "router",
+        "route",
+        "get",
+        "post",
+        "put",
+        "delete",
+        "patch",
+        "head",
+        "options",
+        "blueprint",
+        "api",
         // Spring MVC / Spring Boot HTTP method mapping annotations
-        "getmapping", "postmapping", "putmapping", "deletemapping", "patchmapping",
-        "headmapping", "optionsmapping", "tracemapping", "requestmapping",
+        "getmapping",
+        "postmapping",
+        "putmapping",
+        "deletemapping",
+        "patchmapping",
+        "headmapping",
+        "optionsmapping",
+        "tracemapping",
+        "requestmapping",
         // Pytest / test lifecycle
-        "fixture", "mark", "pytest",
+        "fixture",
+        "mark",
+        "pytest",
         // DI / framework lifecycle decorators that don't map to trait impls
-        "component", "module", "controller", "service", "pipe",
+        "component",
+        "module",
+        "controller",
+        "service",
+        "pipe",
         // Common decorators whose target object is a namespace, not a trait
-        "app_context", "before_request", "after_request",
-        "login_required", "cached", "wraps",
+        "app_context",
+        "before_request",
+        "after_request",
+        "login_required",
+        "cached",
+        "wraps",
     ];
     if SKIP_MARKERS.iter().any(|&m| bare.eq_ignore_ascii_case(m)) {
         return None;
@@ -1915,9 +2100,10 @@ fn collect_calls(
     let kind = node.kind();
 
     // Check if this node is a function definition — update enclosing context.
-    let is_fn_def = config.node_kinds.iter().any(|(ts_kind, nk)| {
-        *ts_kind == kind && *nk == NodeKind::Function
-    });
+    let is_fn_def = config
+        .node_kinds
+        .iter()
+        .any(|(ts_kind, nk)| *ts_kind == kind && *nk == NodeKind::Function);
     let new_enclosing = if is_fn_def {
         node.child_by_field_name("name")
             .and_then(|n| n.utf8_text(source).ok())
@@ -1925,50 +2111,56 @@ fn collect_calls(
     } else {
         None
     };
-    let enclosing = if new_enclosing.is_some() { &new_enclosing } else { enclosing_fn };
+    let enclosing = if new_enclosing.is_some() {
+        &new_enclosing
+    } else {
+        enclosing_fn
+    };
 
     // If we're inside a function, check for call expressions.
     if let Some(caller_name) = enclosing
         && let Some((call_kind, name_field)) = config.call_expr_kinds
-            && kind == call_kind {
-                // Reject qualified calls: Java `obj.helper()` has an `object` field;
-                // Ruby `obj.method()` has a `receiver` field. Skip these — they are
-                // method dispatches, not bare same-file function calls.
-                let is_qualified = node.child_by_field_name("object").is_some()
-                    || node.child_by_field_name("receiver").is_some();
-                if !is_qualified {
-                    // Extract callee name from the designated field.
-                    // For Rust/TS: function field → may be an `identifier` directly,
-                    // or a `scoped_identifier` / `field_expression` — take only bare identifiers.
-                    if let Some(callee_node) = node.child_by_field_name(name_field) {
-                        let callee_kind = callee_node.kind();
-                        // Only resolve bare identifiers — skip method chains, scoped paths, etc.
-                        if (callee_kind == "identifier" || callee_kind == "simple_identifier")
-                            && let Ok(callee_name) = callee_node.utf8_text(source) {
-                                let callee_name = callee_name.trim();
-                                if file_fns.contains(callee_name) && callee_name != caller_name {
-                                    edges.push(Edge {
-                                        from: NodeId {
-                                            root: String::new(),
-                                            file: path.to_path_buf(),
-                                            name: caller_name.to_string(),
-                                            kind: NodeKind::Function,
-                                        },
-                                        to: NodeId {
-                                            root: String::new(),
-                                            file: path.to_path_buf(),
-                                            name: callee_name.to_string(),
-                                            kind: NodeKind::Function,
-                                        },
-                                        kind: EdgeKind::Calls,
-                                        source: ExtractionSource::TreeSitter,
-                                        confidence: Confidence::Detected,
-                                    });
-                                }
-                            }
+        && kind == call_kind
+    {
+        // Reject qualified calls: Java `obj.helper()` has an `object` field;
+        // Ruby `obj.method()` has a `receiver` field. Skip these — they are
+        // method dispatches, not bare same-file function calls.
+        let is_qualified = node.child_by_field_name("object").is_some()
+            || node.child_by_field_name("receiver").is_some();
+        if !is_qualified {
+            // Extract callee name from the designated field.
+            // For Rust/TS: function field → may be an `identifier` directly,
+            // or a `scoped_identifier` / `field_expression` — take only bare identifiers.
+            if let Some(callee_node) = node.child_by_field_name(name_field) {
+                let callee_kind = callee_node.kind();
+                // Only resolve bare identifiers — skip method chains, scoped paths, etc.
+                if (callee_kind == "identifier" || callee_kind == "simple_identifier")
+                    && let Ok(callee_name) = callee_node.utf8_text(source)
+                {
+                    let callee_name = callee_name.trim();
+                    if file_fns.contains(callee_name) && callee_name != caller_name {
+                        edges.push(Edge {
+                            from: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: caller_name.to_string(),
+                                kind: NodeKind::Function,
+                            },
+                            to: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: callee_name.to_string(),
+                                kind: NodeKind::Function,
+                            },
+                            kind: EdgeKind::Calls,
+                            source: ExtractionSource::TreeSitter,
+                            confidence: Confidence::Detected,
+                        });
                     }
                 }
             }
+        }
+    }
 
     // Recurse into children, passing the (possibly updated) enclosing context.
     for i in 0..node.child_count() {
@@ -2027,15 +2219,14 @@ fn detect_pub_use_with_modifier(
 ) {
     // Find the visibility_modifier child and read its exact text.
     // Captures pub, pub(crate), pub(super), pub(in ...) accurately.
-    let vis_text = (0..node.child_count())
-        .find_map(|i| {
-            let child = node.child(i as u32)?;
-            if child.kind() == vis_modifier {
-                child.utf8_text(source).ok().map(|t| t.trim().to_string())
-            } else {
-                None
-            }
-        });
+    let vis_text = (0..node.child_count()).find_map(|i| {
+        let child = node.child(i as u32)?;
+        if child.kind() == vis_modifier {
+            child.utf8_text(source).ok().map(|t| t.trim().to_string())
+        } else {
+            None
+        }
+    });
     let Some(vis) = vis_text else {
         return;
     };
@@ -2103,9 +2294,10 @@ fn collect_use_targets_inner(node: tree_sitter::Node, source: &[u8], targets: &m
                 // Fallback: iterate children but skip the path field
                 for i in 0..node.child_count() {
                     if let Some(child) = node.child(i as u32)
-                        && child.kind() == "use_list" {
-                            collect_use_targets_inner(child, source, targets);
-                        }
+                        && child.kind() == "use_list"
+                    {
+                        collect_use_targets_inner(child, source, targets);
+                    }
                 }
             }
         }
@@ -2121,12 +2313,13 @@ fn collect_use_targets_inner(node: tree_sitter::Node, source: &[u8], targets: &m
         "use_as_clause" => {
             // The second named child is the alias
             if let Some(alias) = node.child_by_field_name("alias")
-                && let Ok(text) = alias.utf8_text(source) {
-                    let t = text.trim().to_string();
-                    if !t.is_empty() && t != "self" && t != "_" {
-                        targets.push(t);
-                    }
+                && let Ok(text) = alias.utf8_text(source)
+            {
+                let t = text.trim().to_string();
+                if !t.is_empty() && t != "self" && t != "_" {
+                    targets.push(t);
                 }
+            }
         }
         // scoped_identifier: `crate::foo::Bar` — take the last segment
         "scoped_identifier" => {
@@ -2205,7 +2398,8 @@ fn detect_export_ts(
     // `export { X as Y }` → target is Y (the external name).
     let target = text
         .trim_end_matches(';')
-        .split([' ', '{', '}', ',']).find(|s| !s.is_empty() && *s != "export" && *s != "from")
+        .split([' ', '{', '}', ','])
+        .find(|s| !s.is_empty() && *s != "export" && *s != "from")
         .unwrap_or("")
         .trim();
     if target.is_empty() {
@@ -2258,7 +2452,7 @@ mod tests {
     #[test]
     fn test_rust_extractor_via_generic() {
         // Use the actual Rust config from rust.rs to test end-to-end.
-        use crate::extract::rust::{RustExtractor, RUST_CONFIG};
+        use crate::extract::rust::{RUST_CONFIG, RustExtractor};
         let _ = &RUST_CONFIG; // ensure config compiles
         let ext = RustExtractor::new();
         let code = r#"
@@ -2289,70 +2483,101 @@ pub fn hello() {}
         let kinds: Vec<_> = result.nodes.iter().map(|n| &n.id.kind).collect();
         assert!(kinds.contains(&&NodeKind::Struct), "Should find Foo struct");
         assert!(kinds.contains(&&NodeKind::Function), "Should find hello fn");
-        assert!(kinds.contains(&&NodeKind::Field), "Should find bar field: {:?}", kinds);
+        assert!(
+            kinds.contains(&&NodeKind::Field),
+            "Should find bar field: {:?}",
+            kinds
+        );
 
         // Assert structural edges are emitted — prevents silent regression
         // if the edge emission block is removed.
-        let has_field_edges: Vec<_> = result.edges.iter()
+        let has_field_edges: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::HasField)
             .collect();
         assert!(
             !has_field_edges.is_empty(),
             "Should emit HasField edges for struct fields, got edges: {:?}",
-            result.edges.iter().map(|e| format!("{:?}", e.kind)).collect::<Vec<_>>()
+            result
+                .edges
+                .iter()
+                .map(|e| format!("{:?}", e.kind))
+                .collect::<Vec<_>>()
         );
         // Verify a HasField edge connects Foo -> bar
         assert!(
-            has_field_edges.iter().any(|e| e.from.name == "Foo" && e.to.name == "bar"
-                && e.from.kind == NodeKind::Struct && e.to.kind == NodeKind::Field),
+            has_field_edges.iter().any(|e| e.from.name == "Foo"
+                && e.to.name == "bar"
+                && e.from.kind == NodeKind::Struct
+                && e.to.kind == NodeKind::Field),
             "Should have HasField edge from Foo struct to bar field"
         );
 
-        let defines_edges: Vec<_> = result.edges.iter()
+        let defines_edges: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Defines)
             .collect();
         assert!(
             !defines_edges.is_empty(),
             "Should emit Defines edges for impl methods, got edges: {:?}",
-            result.edges.iter().map(|e| format!("{:?}", e.kind)).collect::<Vec<_>>()
+            result
+                .edges
+                .iter()
+                .map(|e| format!("{:?}", e.kind))
+                .collect::<Vec<_>>()
         );
         // Verify a Defines edge connects Foo:struct -> do_thing (not Foo:impl)
         assert!(
-            defines_edges.iter().any(|e| e.from.name == "Foo" && e.from.kind == NodeKind::Struct
-                && e.to.name == "do_thing" && e.to.kind == NodeKind::Function),
+            defines_edges.iter().any(|e| e.from.name == "Foo"
+                && e.from.kind == NodeKind::Struct
+                && e.to.name == "do_thing"
+                && e.to.kind == NodeKind::Function),
             "Should have Defines edge from Foo:struct to do_thing method, got: {:?}",
             defines_edges
         );
 
         // Verify Implements edge: Foo:struct -> Greet:trait
-        let implements_edges: Vec<_> = result.edges.iter()
+        let implements_edges: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Implements)
             .collect();
         assert!(
-            implements_edges.iter().any(|e| e.from.name == "Foo" && e.from.kind == NodeKind::Struct
-                && e.to.name == "Greet" && e.to.kind == NodeKind::Trait),
+            implements_edges.iter().any(|e| e.from.name == "Foo"
+                && e.from.kind == NodeKind::Struct
+                && e.to.name == "Greet"
+                && e.to.kind == NodeKind::Trait),
             "Should have Implements edge from Foo:struct to Greet:trait, got: {:?}",
             implements_edges
         );
 
         // Verify module-level Defines: test:module -> hello:function
-        let module_defines: Vec<_> = result.edges.iter()
+        let module_defines: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Defines && e.from.kind == NodeKind::Module)
             .collect();
         assert!(
-            module_defines.iter().any(|e| e.from.name == "test" && e.to.name == "hello"
+            module_defines.iter().any(|e| e.from.name == "test"
+                && e.to.name == "hello"
                 && e.to.kind == NodeKind::Function),
             "Should have Defines edge from test:module to hello:function, got: {:?}",
             module_defines
         );
 
         // Verify DependsOn: do_thing:function -> Bar:struct (parameter type)
-        let depends_on_edges: Vec<_> = result.edges.iter()
+        let depends_on_edges: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::DependsOn)
             .collect();
         assert!(
-            depends_on_edges.iter().any(|e| e.from.name == "do_thing" && e.from.kind == NodeKind::Function
-                && e.to.name == "Bar" && e.to.kind == NodeKind::Struct),
+            depends_on_edges.iter().any(|e| e.from.name == "do_thing"
+                && e.from.kind == NodeKind::Function
+                && e.to.name == "Bar"
+                && e.to.kind == NodeKind::Struct),
             "Should have DependsOn edge from do_thing:function to Bar:struct, got: {:?}",
             depends_on_edges
         );
@@ -2366,7 +2591,9 @@ pub fn hello() {}
     fn depends_on_edges_for(config: &'static LangConfig, path: &str, code: &str) -> Vec<Edge> {
         let ext = GenericExtractor::new(config);
         let result = ext.run(Path::new(path), code).unwrap();
-        result.edges.into_iter()
+        result
+            .edges
+            .into_iter()
             .filter(|e| e.kind == EdgeKind::DependsOn && e.from.kind == NodeKind::Function)
             .collect()
     }
@@ -2426,7 +2653,8 @@ pub fn hello() {}
     fn test_depends_on_go_unexported_types() {
         // Go unexported types (lowercase) should still be detected as user types.
         use crate::extract::configs::GO_CONFIG;
-        let code = "package main\n\nfunc process(item myStruct) otherType {\n    return otherType{}\n}\n";
+        let code =
+            "package main\n\nfunc process(item myStruct) otherType {\n    return otherType{}\n}\n";
         let edges = depends_on_edges_for(&GO_CONFIG, "test.go", code);
         assert!(
             edges.iter().any(|e| e.to.name == "myStruct"),
@@ -2444,7 +2672,8 @@ pub fn hello() {}
     fn test_depends_on_go_skips_primitives() {
         // Go primitives (string, int, bool, error) should NOT produce DependsOn edges.
         use crate::extract::configs::GO_CONFIG;
-        let code = "package main\n\nfunc process(name string, count int) error {\n    return nil\n}\n";
+        let code =
+            "package main\n\nfunc process(name string, count int) error {\n    return nil\n}\n";
         let edges = depends_on_edges_for(&GO_CONFIG, "test.go", code);
         assert!(
             edges.is_empty(),
@@ -2527,8 +2756,10 @@ pub fn hello() {}
         // Kotlin tree-sitter-kotlin-ng does not expose function params/return type
         // via field names -- DependsOn intentionally skipped via None config.
         use crate::extract::configs::KOTLIN_CONFIG;
-        assert!(KOTLIN_CONFIG.param_container_field.is_none(),
-            "Kotlin param_container_field should be None (grammar lacks field names)");
+        assert!(
+            KOTLIN_CONFIG.param_container_field.is_none(),
+            "Kotlin param_container_field should be None (grammar lacks field names)"
+        );
     }
 
     #[test]
@@ -2536,8 +2767,10 @@ pub fn hello() {}
         // Swift tree-sitter does not expose function params via a container field,
         // and overloads the "name" field for types -- DependsOn intentionally skipped.
         use crate::extract::configs::SWIFT_CONFIG;
-        assert!(SWIFT_CONFIG.param_container_field.is_none(),
-            "Swift param_container_field should be None (grammar lacks container field)");
+        assert!(
+            SWIFT_CONFIG.param_container_field.is_none(),
+            "Swift param_container_field should be None (grammar lacks container field)"
+        );
     }
 
     #[test]
@@ -2545,8 +2778,10 @@ pub fn hello() {}
         // Zig tree-sitter: "parameters" is a child node kind, not a field name
         // on function_declaration -- DependsOn intentionally skipped.
         use crate::extract::configs::ZIG_CONFIG;
-        assert!(ZIG_CONFIG.param_container_field.is_none(),
-            "Zig param_container_field should be None (not a field name in grammar)");
+        assert!(
+            ZIG_CONFIG.param_container_field.is_none(),
+            "Zig param_container_field should be None (not a field name in grammar)"
+        );
     }
 
     #[test]
@@ -2564,7 +2799,10 @@ pub fn hello() {}
     fn test_extract_user_type_no_uppercase_required() {
         // With require_uppercase = false (Go, Python)
         assert_eq!(extract_user_type("Foo", false), Some("Foo".to_string()));
-        assert_eq!(extract_user_type("myStruct", false), Some("myStruct".to_string()));
+        assert_eq!(
+            extract_user_type("myStruct", false),
+            Some("myStruct".to_string())
+        );
         assert_eq!(extract_user_type("string", false), None); // primitive
         assert_eq!(extract_user_type("int", false), None); // primitive
         assert_eq!(extract_user_type("error", false), None); // Go builtin
@@ -2587,7 +2825,10 @@ fn simple() {
             .run(std::path::Path::new("test.rs"), code)
             .unwrap();
         let func = result.nodes.iter().find(|n| n.id.name == "simple").unwrap();
-        assert_eq!(func.metadata.get("cyclomatic").map(|s| s.as_str()), Some("1"));
+        assert_eq!(
+            func.metadata.get("cyclomatic").map(|s| s.as_str()),
+            Some("1")
+        );
     }
 
     #[test]
@@ -2606,7 +2847,11 @@ fn branchy(x: i32) -> i32 {
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(std::path::Path::new("test.rs"), code)
             .unwrap();
-        let func = result.nodes.iter().find(|n| n.id.name == "branchy").unwrap();
+        let func = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "branchy")
+            .unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
         assert_eq!(cc, 3, "if + else = 2 branches + 1 base = 3, got {}", cc);
     }
@@ -2630,9 +2875,17 @@ fn complex(items: &[Option<i32>]) -> i32 {
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(std::path::Path::new("test.rs"), code)
             .unwrap();
-        let func = result.nodes.iter().find(|n| n.id.name == "complex").unwrap();
+        let func = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "complex")
+            .unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
-        assert_eq!(cc, 5, "for + match + 2 arms = 4 branches + 1 base = 5, got {}", cc);
+        assert_eq!(
+            cc, 5,
+            "for + match + 2 arms = 4 branches + 1 base = 5, got {}",
+            cc
+        );
     }
 
     #[test]
@@ -2647,7 +2900,10 @@ struct Foo {
             .run(std::path::Path::new("test.rs"), code)
             .unwrap();
         let struc = result.nodes.iter().find(|n| n.id.name == "Foo").unwrap();
-        assert!(struc.metadata.get("cyclomatic").is_none(), "Structs should not have cyclomatic metadata");
+        assert!(
+            struc.metadata.get("cyclomatic").is_none(),
+            "Structs should not have cyclomatic metadata"
+        );
     }
 
     #[test]
@@ -2666,10 +2922,18 @@ def process(items):
         let result = GenericExtractor::new(&PYTHON_CONFIG)
             .run(std::path::Path::new("test.py"), code)
             .unwrap();
-        let func = result.nodes.iter().find(|n| n.id.name == "process").unwrap();
+        let func = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "process")
+            .unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
         // for_statement + if_statement + elif_clause + else_clause = 4 branches → cc = 5
-        assert_eq!(cc, 5, "for + if + elif + else = 4 branches + 1 base = 5, got {}", cc);
+        assert_eq!(
+            cc, 5,
+            "for + if + elif + else = 4 branches + 1 base = 5, got {}",
+            cc
+        );
     }
 
     #[test]
@@ -2690,7 +2954,11 @@ function route(req: Request): string {
         let func = result.nodes.iter().find(|n| n.id.name == "route").unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
         // if_statement + else_clause + ternary_expression = 3 branches → cc = 4
-        assert_eq!(cc, 4, "if + else + ternary = 3 branches + 1 base = 4, got {}", cc);
+        assert_eq!(
+            cc, 4,
+            "if + else + ternary = 3 branches + 1 base = 4, got {}",
+            cc
+        );
     }
 
     #[test]
@@ -2712,7 +2980,11 @@ func process(items []int) int {
         let result = GenericExtractor::new(&GO_CONFIG)
             .run(std::path::Path::new("test.go"), code)
             .unwrap();
-        let func = result.nodes.iter().find(|n| n.id.name == "process").unwrap();
+        let func = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "process")
+            .unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
         // Go tree-sitter doesn't emit else_clause; for_statement + if_statement = 2 branches → cc = 3
         assert_eq!(cc, 3, "for + if = 2 branches + 1 base = 3, got {}", cc);
@@ -2767,8 +3039,15 @@ fn math(a: i32, b: i32) -> i32 {
         let func = result.nodes.iter().find(|n| n.id.name == "math").unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
         // Pure arithmetic: no logical operators, no branches → cc = 1
-        assert_eq!(cc, 1, "Pure arithmetic function should have cc=1, got {}", cc);
-        eprintln!("ADVERSARIAL: Rust arithmetic cc={} (operator-aware filter working)", cc);
+        assert_eq!(
+            cc, 1,
+            "Pure arithmetic function should have cc=1, got {}",
+            cc
+        );
+        eprintln!(
+            "ADVERSARIAL: Rust arithmetic cc={} (operator-aware filter working)",
+            cc
+        );
     }
 
     #[test]
@@ -2799,14 +3078,29 @@ func validate(a int, b int) bool {
         let result2 = GenericExtractor::new(&GO_CONFIG)
             .run(std::path::Path::new("test.go"), logic_code)
             .unwrap();
-        let func2 = result2.nodes.iter().find(|n| n.id.name == "validate").unwrap();
+        let func2 = result2
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "validate")
+            .unwrap();
         let logic_cc: usize = func2.metadata.get("cyclomatic").unwrap().parse().unwrap();
 
         // Arithmetic: no logical operators → cc = 1
-        assert_eq!(arith_cc, 1, "Go arithmetic function should have cc=1, got {}", arith_cc);
+        assert_eq!(
+            arith_cc, 1,
+            "Go arithmetic function should have cc=1, got {}",
+            arith_cc
+        );
         // Logical: && + || = 2 logical operators → cc = 3
-        assert_eq!(logic_cc, 3, "Go logical function with && and || should have cc=3, got {}", logic_cc);
-        eprintln!("ADVERSARIAL: Go arithmetic cc={}, logical cc={}", arith_cc, logic_cc);
+        assert_eq!(
+            logic_cc, 3,
+            "Go logical function with && and || should have cc=3, got {}",
+            logic_cc
+        );
+        eprintln!(
+            "ADVERSARIAL: Go arithmetic cc={}, logical cc={}",
+            arith_cc, logic_cc
+        );
     }
 
     #[test]
@@ -2846,7 +3140,11 @@ fn dispatch(cmd: &str) -> i32 {
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(std::path::Path::new("test.rs"), code)
             .unwrap();
-        let func = result.nodes.iter().find(|n| n.id.name == "dispatch").unwrap();
+        let func = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "dispatch")
+            .unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
         // match_expression counts as 1, but each match_arm also counts.
         // The exact score depends on tree-sitter grammar details.
@@ -2867,7 +3165,11 @@ fn complex_guard(a: bool, b: bool, c: bool, d: bool) -> bool {
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(std::path::Path::new("test.rs"), code)
             .unwrap();
-        let func = result.nodes.iter().find(|n| n.id.name == "complex_guard").unwrap();
+        let func = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "complex_guard")
+            .unwrap();
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
         // 5 boolean operators → cc should be >= 5
         // (tree-sitter nesting means fewer binary_expression nodes than operators)
@@ -2896,8 +3198,15 @@ fn parent() {
         let cc: usize = func.metadata.get("cyclomatic").unwrap().parse().unwrap();
         // Closures (closure_expression) are now treated as complexity boundaries,
         // so the if/else inside the closure is NOT counted in the parent.
-        assert_eq!(cc, 1, "Parent with branchy closure should have cc=1 (closure is a boundary), got {}", cc);
-        eprintln!("ADVERSARIAL: parent with closure cc={} (closure branches excluded)", cc);
+        assert_eq!(
+            cc, 1,
+            "Parent with branchy closure should have cc=1 (closure is a boundary), got {}",
+            cc
+        );
+        eprintln!(
+            "ADVERSARIAL: parent with closure cc={} (closure branches excluded)",
+            cc
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2915,8 +3224,8 @@ fn parent() {
     fn test_enum_variants_typescript() {
         // TS enum variants use property_identifier/enum_assignment nodes,
         // handled in the TypeScript-specific extractor (not generic config).
-        use crate::extract::typescript::TypeScriptExtractor;
         use crate::extract::Extractor;
+        use crate::extract::typescript::TypeScriptExtractor;
         let extractor = TypeScriptExtractor::new();
         let code = r#"
 enum Direction {
@@ -2930,24 +3239,42 @@ enum Direction {
         let names: Vec<&str> = result.nodes.iter().map(|n| n.id.name.as_str()).collect();
 
         assert!(names.contains(&"Direction"), "Should find enum Direction");
-        assert!(names.contains(&"Up"), "Should find variant Up, got: {:?}", names);
+        assert!(
+            names.contains(&"Up"),
+            "Should find variant Up, got: {:?}",
+            names
+        );
         assert!(names.contains(&"Down"), "Should find variant Down");
-        assert!(names.contains(&"Left"), "Should find initialized variant Left");
-        assert!(names.contains(&"Right"), "Should find initialized variant Right");
+        assert!(
+            names.contains(&"Left"),
+            "Should find initialized variant Left"
+        );
+        assert!(
+            names.contains(&"Right"),
+            "Should find initialized variant Right"
+        );
 
         let up = result.nodes.iter().find(|n| n.id.name == "Up").unwrap();
-        assert_eq!(up.id.kind, NodeKind::Field, "TS variant should be Field kind");
+        assert_eq!(
+            up.id.kind,
+            NodeKind::Field,
+            "TS variant should be Field kind"
+        );
         assert_eq!(
             up.metadata.get("parent_scope"),
             Some(&"Direction".to_string()),
             "TS variant should have parent_scope = Direction"
         );
 
-        let has_field_edges: Vec<_> = result.edges.iter()
+        let has_field_edges: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::HasField)
             .collect();
         assert!(
-            has_field_edges.iter().any(|e| e.from.name == "Direction" && e.to.name == "Up"),
+            has_field_edges
+                .iter()
+                .any(|e| e.from.name == "Direction" && e.to.name == "Up"),
             "Should have HasField edge Direction -> Up"
         );
     }
@@ -2966,11 +3293,19 @@ enum Color {
         let names: Vec<&str> = nodes.iter().map(|n| n.id.name.as_str()).collect();
 
         assert!(names.contains(&"Color"), "Should find enum Color");
-        assert!(names.contains(&"RED"), "Should find variant RED, got: {:?}", names);
+        assert!(
+            names.contains(&"RED"),
+            "Should find variant RED, got: {:?}",
+            names
+        );
         assert!(names.contains(&"GREEN"), "Should find variant GREEN");
 
         let red = nodes.iter().find(|n| n.id.name == "RED").unwrap();
-        assert_eq!(red.id.kind, NodeKind::Field, "Java variant should be Field kind");
+        assert_eq!(
+            red.id.kind,
+            NodeKind::Field,
+            "Java variant should be Field kind"
+        );
         assert_eq!(
             red.metadata.get("parent_scope"),
             Some(&"Color".to_string()),
@@ -2992,11 +3327,19 @@ enum Status {
         let names: Vec<&str> = nodes.iter().map(|n| n.id.name.as_str()).collect();
 
         assert!(names.contains(&"Status"), "Should find enum Status");
-        assert!(names.contains(&"Active"), "Should find variant Active, got: {:?}", names);
+        assert!(
+            names.contains(&"Active"),
+            "Should find variant Active, got: {:?}",
+            names
+        );
         assert!(names.contains(&"Inactive"), "Should find variant Inactive");
 
         let active = nodes.iter().find(|n| n.id.name == "Active").unwrap();
-        assert_eq!(active.id.kind, NodeKind::Field, "C# variant should be Field kind");
+        assert_eq!(
+            active.id.kind,
+            NodeKind::Field,
+            "C# variant should be Field kind"
+        );
         assert_eq!(
             active.metadata.get("parent_scope"),
             Some(&"Status".to_string()),
@@ -3018,11 +3361,19 @@ enum Color {
         let names: Vec<&str> = nodes.iter().map(|n| n.id.name.as_str()).collect();
 
         assert!(names.contains(&"Color"), "Should find enum Color");
-        assert!(names.contains(&"RED"), "Should find variant RED, got: {:?}", names);
+        assert!(
+            names.contains(&"RED"),
+            "Should find variant RED, got: {:?}",
+            names
+        );
         assert!(names.contains(&"GREEN"), "Should find variant GREEN");
 
         let red = nodes.iter().find(|n| n.id.name == "RED").unwrap();
-        assert_eq!(red.id.kind, NodeKind::Field, "C++ enumerator should be Field kind");
+        assert_eq!(
+            red.id.kind,
+            NodeKind::Field,
+            "C++ enumerator should be Field kind"
+        );
         assert_eq!(
             red.metadata.get("parent_scope"),
             Some(&"Color".to_string()),
@@ -3064,9 +3415,20 @@ def handle():
 "#;
         let result = ext.run(Path::new("app.py"), code).unwrap();
         let handle = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
-        let decorators = handle.metadata.get("decorators").expect("Should have decorators");
-        assert!(decorators.contains("@app.route"), "Should contain @app.route, got: {}", decorators);
-        assert!(decorators.contains("@login_required"), "Should contain @login_required, got: {}", decorators);
+        let decorators = handle
+            .metadata
+            .get("decorators")
+            .expect("Should have decorators");
+        assert!(
+            decorators.contains("@app.route"),
+            "Should contain @app.route, got: {}",
+            decorators
+        );
+        assert!(
+            decorators.contains("@login_required"),
+            "Should contain @login_required, got: {}",
+            decorators
+        );
     }
 
     #[test]
@@ -3096,7 +3458,11 @@ def plain_function():
     pass
 "#;
         let result = ext.run(Path::new("app.py"), code).unwrap();
-        let func = result.nodes.iter().find(|n| n.id.name == "plain_function").unwrap();
+        let func = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "plain_function")
+            .unwrap();
         assert!(
             func.metadata.get("decorators").is_none(),
             "Undecorated function should not have decorators metadata"
@@ -3114,7 +3480,11 @@ fn test_something() {
 }
 "#;
         let result = ext.run(Path::new("lib.rs"), code).unwrap();
-        let func = result.nodes.iter().find(|n| n.id.name == "test_something").unwrap();
+        let func = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "test_something")
+            .unwrap();
         assert_eq!(
             func.metadata.get("decorators").map(|s| s.as_str()),
             Some("#[test]"),
@@ -3135,9 +3505,20 @@ pub struct Config {
 "#;
         let result = ext.run(Path::new("lib.rs"), code).unwrap();
         let config = result.nodes.iter().find(|n| n.id.name == "Config").unwrap();
-        let decorators = config.metadata.get("decorators").expect("Should have decorators");
-        assert!(decorators.contains("#[derive(Debug, Clone)]"), "Should contain derive, got: {}", decorators);
-        assert!(decorators.contains("#[serde(rename_all = \"camelCase\")]"), "Should contain serde, got: {}", decorators);
+        let decorators = config
+            .metadata
+            .get("decorators")
+            .expect("Should have decorators");
+        assert!(
+            decorators.contains("#[derive(Debug, Clone)]"),
+            "Should contain derive, got: {}",
+            decorators
+        );
+        assert!(
+            decorators.contains("#[serde(rename_all = \"camelCase\")]"),
+            "Should contain serde, got: {}",
+            decorators
+        );
     }
 
     #[test]
@@ -3186,9 +3567,20 @@ public class UserController {
 }
 "#;
         let result = ext.run(Path::new("UserController.java"), code).unwrap();
-        let func = result.nodes.iter().find(|n| n.id.name == "getUsers").unwrap();
-        let decorators = func.metadata.get("decorators").expect("Should have decorators");
-        assert!(decorators.contains("@GetMapping"), "Should contain @GetMapping, got: {}", decorators);
+        let func = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "getUsers")
+            .unwrap();
+        let decorators = func
+            .metadata
+            .get("decorators")
+            .expect("Should have decorators");
+        assert!(
+            decorators.contains("@GetMapping"),
+            "Should contain @GetMapping, got: {}",
+            decorators
+        );
     }
 
     #[test]
@@ -3202,10 +3594,25 @@ public class UserController {
 }
 "#;
         let result = ext.run(Path::new("UserController.java"), code).unwrap();
-        let cls = result.nodes.iter().find(|n| n.id.name == "UserController").unwrap();
-        let decorators = cls.metadata.get("decorators").expect("Should have decorators");
-        assert!(decorators.contains("@RestController"), "Should contain @RestController, got: {}", decorators);
-        assert!(decorators.contains("@RequestMapping"), "Should contain @RequestMapping, got: {}", decorators);
+        let cls = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "UserController")
+            .unwrap();
+        let decorators = cls
+            .metadata
+            .get("decorators")
+            .expect("Should have decorators");
+        assert!(
+            decorators.contains("@RestController"),
+            "Should contain @RestController, got: {}",
+            decorators
+        );
+        assert!(
+            decorators.contains("@RequestMapping"),
+            "Should contain @RequestMapping, got: {}",
+            decorators
+        );
     }
 
     #[test]
@@ -3218,9 +3625,20 @@ class UserController {
 }
 "#;
         let result = ext.run(Path::new("controller.ts"), code).unwrap();
-        let cls = result.nodes.iter().find(|n| n.id.name == "UserController").unwrap();
-        let decorators = cls.metadata.get("decorators").expect("Should have decorators");
-        assert!(decorators.contains("@Controller"), "Should contain @Controller, got: {}", decorators);
+        let cls = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "UserController")
+            .unwrap();
+        let decorators = cls
+            .metadata
+            .get("decorators")
+            .expect("Should have decorators");
+        assert!(
+            decorators.contains("@Controller"),
+            "Should contain @Controller, got: {}",
+            decorators
+        );
     }
 
     #[test]
@@ -3255,7 +3673,10 @@ def plain():
 "#;
         let result = ext.run(Path::new("app.py"), code).unwrap();
         let handle = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
-        assert!(handle.metadata.get("decorators").is_some(), "handle should have decorators");
+        assert!(
+            handle.metadata.get("decorators").is_some(),
+            "handle should have decorators"
+        );
 
         let plain = result.nodes.iter().find(|n| n.id.name == "plain").unwrap();
         assert!(
@@ -3277,8 +3698,15 @@ fn test_thing() {}
 fn plain() {}
 "#;
         let result = ext.run(Path::new("lib.rs"), code).unwrap();
-        let test_fn = result.nodes.iter().find(|n| n.id.name == "test_thing").unwrap();
-        assert_eq!(test_fn.metadata.get("decorators").map(|s| s.as_str()), Some("#[test]"));
+        let test_fn = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "test_thing")
+            .unwrap();
+        assert_eq!(
+            test_fn.metadata.get("decorators").map(|s| s.as_str()),
+            Some("#[test]")
+        );
 
         let plain = result.nodes.iter().find(|n| n.id.name == "plain").unwrap();
         assert!(
@@ -3324,7 +3752,10 @@ public class UserController {
 "#;
         let result = ext.run(Path::new("UserController.java"), code).unwrap();
         let handle = result.nodes.iter().find(|n| n.id.name == "handle").unwrap();
-        assert!(handle.metadata.get("decorators").is_some(), "handle should have @Override");
+        assert!(
+            handle.metadata.get("decorators").is_some(),
+            "handle should have @Override"
+        );
 
         let plain = result.nodes.iter().find(|n| n.id.name == "plain").unwrap();
         assert!(
@@ -3345,39 +3776,94 @@ public class UserController {
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("test.rs"), code)
             .unwrap();
-        let container = result.nodes.iter().find(|n| n.id.name == "Container").unwrap();
-        let tp = container.metadata.get("type_params").expect("Should have type_params");
-        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
-        assert!(tp.contains("Clone"), "type_params should contain Clone bound, got: {}", tp);
-        assert!(tp.contains("Send"), "type_params should contain Send bound, got: {}", tp);
+        let container = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Container")
+            .unwrap();
+        let tp = container
+            .metadata
+            .get("type_params")
+            .expect("Should have type_params");
+        assert!(
+            tp.contains("T"),
+            "type_params should contain T, got: {}",
+            tp
+        );
+        assert!(
+            tp.contains("Clone"),
+            "type_params should contain Clone bound, got: {}",
+            tp
+        );
+        assert!(
+            tp.contains("Send"),
+            "type_params should contain Send bound, got: {}",
+            tp
+        );
     }
 
     #[test]
     fn test_type_params_rust_generic_function() {
         use crate::extract::rust::RUST_CONFIG;
-        let code = "pub fn process<T: Display + Send>(item: T) -> String {\n    item.to_string()\n}\n";
+        let code =
+            "pub fn process<T: Display + Send>(item: T) -> String {\n    item.to_string()\n}\n";
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("test.rs"), code)
             .unwrap();
-        let func = result.nodes.iter().find(|n| n.id.name == "process").unwrap();
-        let tp = func.metadata.get("type_params").expect("Should have type_params");
-        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
-        assert!(tp.contains("Display"), "type_params should contain Display bound, got: {}", tp);
-        assert!(tp.contains("Send"), "type_params should contain Send bound, got: {}", tp);
+        let func = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "process")
+            .unwrap();
+        let tp = func
+            .metadata
+            .get("type_params")
+            .expect("Should have type_params");
+        assert!(
+            tp.contains("T"),
+            "type_params should contain T, got: {}",
+            tp
+        );
+        assert!(
+            tp.contains("Display"),
+            "type_params should contain Display bound, got: {}",
+            tp
+        );
+        assert!(
+            tp.contains("Send"),
+            "type_params should contain Send bound, got: {}",
+            tp
+        );
     }
 
     #[test]
     fn test_type_params_rust_multiple_params() {
         use crate::extract::rust::RUST_CONFIG;
-        let code = "pub fn merge<K: Ord, V: Clone>(a: Map<K, V>, b: Map<K, V>) -> Map<K, V> {\n    a\n}\n";
+        let code =
+            "pub fn merge<K: Ord, V: Clone>(a: Map<K, V>, b: Map<K, V>) -> Map<K, V> {\n    a\n}\n";
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("test.rs"), code)
             .unwrap();
         let func = result.nodes.iter().find(|n| n.id.name == "merge").unwrap();
-        let tp = func.metadata.get("type_params").expect("Should have type_params");
-        assert!(tp.contains("K"), "type_params should contain K, got: {}", tp);
-        assert!(tp.contains("V"), "type_params should contain V, got: {}", tp);
-        assert!(tp.contains("Ord"), "type_params should contain Ord, got: {}", tp);
+        let tp = func
+            .metadata
+            .get("type_params")
+            .expect("Should have type_params");
+        assert!(
+            tp.contains("K"),
+            "type_params should contain K, got: {}",
+            tp
+        );
+        assert!(
+            tp.contains("V"),
+            "type_params should contain V, got: {}",
+            tp
+        );
+        assert!(
+            tp.contains("Ord"),
+            "type_params should contain Ord, got: {}",
+            tp
+        );
     }
 
     #[test]
@@ -3397,14 +3883,30 @@ public class UserController {
     #[test]
     fn test_type_params_rust_trait() {
         use crate::extract::rust::RUST_CONFIG;
-        let code = "pub trait Converter<From, To> {\n    fn convert(&self, input: From) -> To;\n}\n";
+        let code =
+            "pub trait Converter<From, To> {\n    fn convert(&self, input: From) -> To;\n}\n";
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("test.rs"), code)
             .unwrap();
-        let trait_node = result.nodes.iter().find(|n| n.id.name == "Converter").unwrap();
-        let tp = trait_node.metadata.get("type_params").expect("Should have type_params");
-        assert!(tp.contains("From"), "type_params should contain From, got: {}", tp);
-        assert!(tp.contains("To"), "type_params should contain To, got: {}", tp);
+        let trait_node = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Converter")
+            .unwrap();
+        let tp = trait_node
+            .metadata
+            .get("type_params")
+            .expect("Should have type_params");
+        assert!(
+            tp.contains("From"),
+            "type_params should contain From, got: {}",
+            tp
+        );
+        assert!(
+            tp.contains("To"),
+            "type_params should contain To, got: {}",
+            tp
+        );
     }
 
     #[test]
@@ -3415,9 +3917,20 @@ public class UserController {
             .run(Path::new("test.rs"), code)
             .unwrap();
         let enum_node = result.nodes.iter().find(|n| n.id.name == "Result").unwrap();
-        let tp = enum_node.metadata.get("type_params").expect("Should have type_params");
-        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
-        assert!(tp.contains("E"), "type_params should contain E, got: {}", tp);
+        let tp = enum_node
+            .metadata
+            .get("type_params")
+            .expect("Should have type_params");
+        assert!(
+            tp.contains("T"),
+            "type_params should contain T, got: {}",
+            tp
+        );
+        assert!(
+            tp.contains("E"),
+            "type_params should contain E, got: {}",
+            tp
+        );
     }
 
     #[test]
@@ -3428,8 +3941,15 @@ public class UserController {
             .run(Path::new("test.rs"), code)
             .unwrap();
         let alias = result.nodes.iter().find(|n| n.id.name == "Result").unwrap();
-        let tp = alias.metadata.get("type_params").expect("Should have type_params");
-        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
+        let tp = alias
+            .metadata
+            .get("type_params")
+            .expect("Should have type_params");
+        assert!(
+            tp.contains("T"),
+            "type_params should contain T, got: {}",
+            tp
+        );
     }
 
     #[test]
@@ -3439,9 +3959,20 @@ public class UserController {
         let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
             .run(Path::new("test.ts"), code)
             .unwrap();
-        let func = result.nodes.iter().find(|n| n.id.name == "identity").unwrap();
-        let tp = func.metadata.get("type_params").expect("TS function should have type_params");
-        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
+        let func = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "identity")
+            .unwrap();
+        let tp = func
+            .metadata
+            .get("type_params")
+            .expect("TS function should have type_params");
+        assert!(
+            tp.contains("T"),
+            "type_params should contain T, got: {}",
+            tp
+        );
     }
 
     #[test]
@@ -3451,10 +3982,25 @@ public class UserController {
         let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
             .run(Path::new("test.ts"), code)
             .unwrap();
-        let iface = result.nodes.iter().find(|n| n.id.name == "Repository").unwrap();
-        let tp = iface.metadata.get("type_params").expect("TS interface should have type_params");
-        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
-        assert!(tp.contains("Entity"), "type_params should contain extends Entity, got: {}", tp);
+        let iface = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Repository")
+            .unwrap();
+        let tp = iface
+            .metadata
+            .get("type_params")
+            .expect("TS interface should have type_params");
+        assert!(
+            tp.contains("T"),
+            "type_params should contain T, got: {}",
+            tp
+        );
+        assert!(
+            tp.contains("Entity"),
+            "type_params should contain extends Entity, got: {}",
+            tp
+        );
     }
 
     #[test]
@@ -3465,8 +4011,15 @@ public class UserController {
             .run(Path::new("test.ts"), code)
             .unwrap();
         let class = result.nodes.iter().find(|n| n.id.name == "Box").unwrap();
-        let tp = class.metadata.get("type_params").expect("TS class should have type_params");
-        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
+        let tp = class
+            .metadata
+            .get("type_params")
+            .expect("TS class should have type_params");
+        assert!(
+            tp.contains("T"),
+            "type_params should contain T, got: {}",
+            tp
+        );
     }
 
     #[test]
@@ -3476,10 +4029,25 @@ public class UserController {
         let result = GenericExtractor::new(&JAVA_CONFIG)
             .run(Path::new("Test.java"), code)
             .unwrap();
-        let class = result.nodes.iter().find(|n| n.id.name == "Container").unwrap();
-        let tp = class.metadata.get("type_params").expect("Java class should have type_params");
-        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
-        assert!(tp.contains("Comparable"), "type_params should contain bound Comparable, got: {}", tp);
+        let class = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Container")
+            .unwrap();
+        let tp = class
+            .metadata
+            .get("type_params")
+            .expect("Java class should have type_params");
+        assert!(
+            tp.contains("T"),
+            "type_params should contain T, got: {}",
+            tp
+        );
+        assert!(
+            tp.contains("Comparable"),
+            "type_params should contain bound Comparable, got: {}",
+            tp
+        );
     }
 
     #[test]
@@ -3489,9 +4057,20 @@ public class UserController {
         let result = GenericExtractor::new(&JAVA_CONFIG)
             .run(Path::new("Util.java"), code)
             .unwrap();
-        let method = result.nodes.iter().find(|n| n.id.name == "identity").unwrap();
-        let tp = method.metadata.get("type_params").expect("Java method should have type_params");
-        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
+        let method = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "identity")
+            .unwrap();
+        let tp = method
+            .metadata
+            .get("type_params")
+            .expect("Java method should have type_params");
+        assert!(
+            tp.contains("T"),
+            "type_params should contain T, got: {}",
+            tp
+        );
     }
 
     #[test]
@@ -3502,15 +4081,26 @@ public class UserController {
             .run(Path::new("test.go"), code)
             .unwrap();
         let func = result.nodes.iter().find(|n| n.id.name == "Map").unwrap();
-        let tp = func.metadata.get("type_params").expect("Go function should have type_params");
-        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
-        assert!(tp.contains("U"), "type_params should contain U, got: {}", tp);
+        let tp = func
+            .metadata
+            .get("type_params")
+            .expect("Go function should have type_params");
+        assert!(
+            tp.contains("T"),
+            "type_params should contain T, got: {}",
+            tp
+        );
+        assert!(
+            tp.contains("U"),
+            "type_params should contain U, got: {}",
+            tp
+        );
     }
 
     #[test]
     fn test_type_params_no_generics_languages() {
         // Languages without generics should have type_param_node_kind = None
-        use crate::extract::configs::{JAVASCRIPT_CONFIG, LUA_CONFIG, RUBY_CONFIG, BASH_CONFIG};
+        use crate::extract::configs::{BASH_CONFIG, JAVASCRIPT_CONFIG, LUA_CONFIG, RUBY_CONFIG};
         assert!(JAVASCRIPT_CONFIG.type_param_node_kind.is_none());
         assert!(LUA_CONFIG.type_param_node_kind.is_none());
         assert!(RUBY_CONFIG.type_param_node_kind.is_none());
@@ -3528,9 +4118,20 @@ public class UserController {
             .run(Path::new("test.rs"), code)
             .unwrap();
         let node = result.nodes.iter().find(|n| n.id.name == "Ref").unwrap();
-        let tp = node.metadata.get("type_params").expect("Should have type_params with lifetime");
-        assert!(tp.contains("'a"), "type_params should contain lifetime 'a, got: {}", tp);
-        assert!(tp.contains("T"), "type_params should contain type T, got: {}", tp);
+        let tp = node
+            .metadata
+            .get("type_params")
+            .expect("Should have type_params with lifetime");
+        assert!(
+            tp.contains("'a"),
+            "type_params should contain lifetime 'a, got: {}",
+            tp
+        );
+        assert!(
+            tp.contains("T"),
+            "type_params should contain type T, got: {}",
+            tp
+        );
     }
 
     /// Adversarial: Rust impl block with generics
@@ -3542,17 +4143,41 @@ public class UserController {
             .run(Path::new("test.rs"), code)
             .unwrap();
         // The struct should have <T>
-        let wrapper = result.nodes.iter().find(|n| n.id.name == "Wrapper" && n.id.kind == NodeKind::Struct).unwrap();
-        let tp = wrapper.metadata.get("type_params").expect("Wrapper struct should have type_params");
-        assert!(tp.contains("T"), "struct type_params should contain T, got: {}", tp);
+        let wrapper = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Wrapper" && n.id.kind == NodeKind::Struct)
+            .unwrap();
+        let tp = wrapper
+            .metadata
+            .get("type_params")
+            .expect("Wrapper struct should have type_params");
+        assert!(
+            tp.contains("T"),
+            "struct type_params should contain T, got: {}",
+            tp
+        );
 
         // The impl block should have <T: Clone>
-        let impl_node = result.nodes.iter()
+        let impl_node = result
+            .nodes
+            .iter()
             .find(|n| n.id.kind == NodeKind::Impl && n.id.name.contains("Wrapper"))
             .unwrap();
-        let impl_tp = impl_node.metadata.get("type_params").expect("impl should have type_params");
-        assert!(impl_tp.contains("T"), "impl type_params should contain T, got: {}", impl_tp);
-        assert!(impl_tp.contains("Clone"), "impl type_params should contain Clone, got: {}", impl_tp);
+        let impl_tp = impl_node
+            .metadata
+            .get("type_params")
+            .expect("impl should have type_params");
+        assert!(
+            impl_tp.contains("T"),
+            "impl type_params should contain T, got: {}",
+            impl_tp
+        );
+        assert!(
+            impl_tp.contains("Clone"),
+            "impl type_params should contain Clone, got: {}",
+            impl_tp
+        );
     }
 
     /// Adversarial: deeply nested generics (e.g. HashMap<String, Vec<T>>)
@@ -3564,10 +4189,25 @@ public class UserController {
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("test.rs"), code)
             .unwrap();
-        let func = result.nodes.iter().find(|n| n.id.name == "transform").unwrap();
-        let tp = func.metadata.get("type_params").expect("Should have type_params");
-        assert!(tp.contains("Into<String>"), "type_params should contain Into<String>, got: {}", tp);
-        assert!(tp.contains("AsRef<str>"), "type_params should contain AsRef<str>, got: {}", tp);
+        let func = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "transform")
+            .unwrap();
+        let tp = func
+            .metadata
+            .get("type_params")
+            .expect("Should have type_params");
+        assert!(
+            tp.contains("Into<String>"),
+            "type_params should contain Into<String>, got: {}",
+            tp
+        );
+        assert!(
+            tp.contains("AsRef<str>"),
+            "type_params should contain AsRef<str>, got: {}",
+            tp
+        );
     }
 
     /// Adversarial: TypeScript with multiple type params and constraints
@@ -3579,24 +4219,51 @@ public class UserController {
             .run(Path::new("test.ts"), code)
             .unwrap();
         let func = result.nodes.iter().find(|n| n.id.name == "merge").unwrap();
-        let tp = func.metadata.get("type_params").expect("Should have type_params");
-        assert!(tp.contains("T"), "type_params should contain T, got: {}", tp);
-        assert!(tp.contains("U"), "type_params should contain U, got: {}", tp);
-        assert!(tp.contains("extends"), "type_params should contain extends keyword, got: {}", tp);
+        let tp = func
+            .metadata
+            .get("type_params")
+            .expect("Should have type_params");
+        assert!(
+            tp.contains("T"),
+            "type_params should contain T, got: {}",
+            tp
+        );
+        assert!(
+            tp.contains("U"),
+            "type_params should contain U, got: {}",
+            tp
+        );
+        assert!(
+            tp.contains("extends"),
+            "type_params should contain extends keyword, got: {}",
+            tp
+        );
     }
 
     /// Adversarial: Java wildcard bounds
     #[test]
     fn test_type_params_java_multiple_bounds() {
         use crate::extract::configs::JAVA_CONFIG;
-        let code = "class Sorter<T extends Comparable<T> & Serializable> {\n    void sort() {}\n}\n";
+        let code =
+            "class Sorter<T extends Comparable<T> & Serializable> {\n    void sort() {}\n}\n";
         let result = GenericExtractor::new(&JAVA_CONFIG)
             .run(Path::new("Sorter.java"), code)
             .unwrap();
         let class = result.nodes.iter().find(|n| n.id.name == "Sorter").unwrap();
-        let tp = class.metadata.get("type_params").expect("Should have type_params");
-        assert!(tp.contains("Comparable"), "type_params should contain Comparable bound, got: {}", tp);
-        assert!(tp.contains("Serializable"), "type_params should contain Serializable bound, got: {}", tp);
+        let tp = class
+            .metadata
+            .get("type_params")
+            .expect("Should have type_params");
+        assert!(
+            tp.contains("Comparable"),
+            "type_params should contain Comparable bound, got: {}",
+            tp
+        );
+        assert!(
+            tp.contains("Serializable"),
+            "type_params should contain Serializable bound, got: {}",
+            tp
+        );
     }
 
     // -- Design pattern hint detection tests --
@@ -3661,10 +4328,7 @@ public class UserController {
 
     #[test]
     fn test_pattern_hint_skips_import() {
-        assert_eq!(
-            detect_pattern_hint("use_factory", &NodeKind::Import),
-            None,
-        );
+        assert_eq!(detect_pattern_hint("use_factory", &NodeKind::Import), None,);
     }
 
     #[test]
@@ -3677,10 +4341,7 @@ public class UserController {
 
     #[test]
     fn test_pattern_hint_skips_field() {
-        assert_eq!(
-            detect_pattern_hint("factory_field", &NodeKind::Field),
-            None,
-        );
+        assert_eq!(detect_pattern_hint("factory_field", &NodeKind::Field), None,);
     }
 
     #[test]
@@ -3752,28 +4413,44 @@ struct PlainStruct {
             .run(Path::new("src/patterns.rs"), code)
             .unwrap();
 
-        let factory = result.nodes.iter().find(|n| n.id.name == "ConnectionFactory").unwrap();
+        let factory = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "ConnectionFactory")
+            .unwrap();
         assert_eq!(
             factory.metadata.get("pattern_hint").map(|s| s.as_str()),
             Some("factory"),
             "ConnectionFactory should have pattern_hint=factory",
         );
 
-        let observer = result.nodes.iter().find(|n| n.id.name == "EventObserver").unwrap();
+        let observer = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "EventObserver")
+            .unwrap();
         assert_eq!(
             observer.metadata.get("pattern_hint").map(|s| s.as_str()),
             Some("observer"),
             "EventObserver should have pattern_hint=observer",
         );
 
-        let handler_fn = result.nodes.iter().find(|n| n.id.name == "create_handler").unwrap();
+        let handler_fn = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "create_handler")
+            .unwrap();
         assert_eq!(
             handler_fn.metadata.get("pattern_hint").map(|s| s.as_str()),
             Some("handler"),
             "create_handler should have pattern_hint=handler",
         );
 
-        let plain = result.nodes.iter().find(|n| n.id.name == "PlainStruct").unwrap();
+        let plain = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "PlainStruct")
+            .unwrap();
         assert!(
             plain.metadata.get("pattern_hint").is_none(),
             "PlainStruct should NOT have a pattern_hint",
@@ -3790,7 +4467,10 @@ struct PlainStruct {
     #[test]
     fn test_pattern_hint_unicode_name() {
         // Non-ASCII name should not crash, and should not match
-        assert_eq!(detect_pattern_hint("FabrikController\u{00e9}", &NodeKind::Struct), None);
+        assert_eq!(
+            detect_pattern_hint("FabrikController\u{00e9}", &NodeKind::Struct),
+            None
+        );
         // But ASCII suffix after unicode prefix should match
         assert_eq!(
             detect_pattern_hint("\u{00e9}Factory", &NodeKind::Struct),
@@ -3814,7 +4494,10 @@ struct PlainStruct {
         // "FactoryUtil" -- "factory" is NOT a suffix here
         assert_eq!(detect_pattern_hint("FactoryUtil", &NodeKind::Struct), None);
         // "HandlerConfig" -- "handler" is NOT a suffix
-        assert_eq!(detect_pattern_hint("HandlerConfig", &NodeKind::Struct), None);
+        assert_eq!(
+            detect_pattern_hint("HandlerConfig", &NodeKind::Struct),
+            None
+        );
     }
 
     #[test]
@@ -3844,14 +4527,22 @@ struct PlainStruct {
             .run(Path::new("models.py"), code)
             .unwrap();
 
-        let repo = result.nodes.iter().find(|n| n.id.name == "UserRepository").unwrap();
+        let repo = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "UserRepository")
+            .unwrap();
         assert_eq!(
             repo.metadata.get("pattern_hint").map(|s| s.as_str()),
             Some("repository"),
             "Python class UserRepository should have pattern_hint=repository",
         );
 
-        let plain = result.nodes.iter().find(|n| n.id.name == "PlainModel").unwrap();
+        let plain = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "PlainModel")
+            .unwrap();
         assert!(
             plain.metadata.get("pattern_hint").is_none(),
             "PlainModel should NOT have a pattern_hint",
@@ -3861,19 +4552,28 @@ struct PlainStruct {
     #[test]
     fn test_pattern_hint_cross_language_typescript() {
         use crate::extract::configs::TYPESCRIPT_CONFIG;
-        let code = "class AuthMiddleware {\n  handle() {}\n}\n\nclass UserDTO {\n  name: string;\n}\n";
+        let code =
+            "class AuthMiddleware {\n  handle() {}\n}\n\nclass UserDTO {\n  name: string;\n}\n";
         let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
             .run(Path::new("auth.ts"), code)
             .unwrap();
 
-        let mw = result.nodes.iter().find(|n| n.id.name == "AuthMiddleware").unwrap();
+        let mw = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "AuthMiddleware")
+            .unwrap();
         assert_eq!(
             mw.metadata.get("pattern_hint").map(|s| s.as_str()),
             Some("middleware"),
             "TypeScript class AuthMiddleware should have pattern_hint=middleware",
         );
 
-        let dto = result.nodes.iter().find(|n| n.id.name == "UserDTO").unwrap();
+        let dto = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "UserDTO")
+            .unwrap();
         assert!(
             dto.metadata.get("pattern_hint").is_none(),
             "UserDTO should NOT have a pattern_hint",
@@ -3913,9 +4613,14 @@ pub fn process_payment(amount: u32) -> Result<(), Error> {
 }
 "#;
         let result = ext.extract(Path::new("test.rs"), code).unwrap();
-        let fn_node = result.nodes.iter().find(|n| n.id.name == "process_payment")
+        let fn_node = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "process_payment")
             .expect("should find process_payment");
-        let doc = fn_node.metadata.get("doc_comment")
+        let doc = fn_node
+            .metadata
+            .get("doc_comment")
             .expect("should have doc_comment metadata");
         assert!(
             doc.contains("Charges the card"),
@@ -3947,9 +4652,14 @@ pub struct PaymentProcessor {
 }
 "#;
         let result = ext.extract(Path::new("test.rs"), code).unwrap();
-        let struct_node = result.nodes.iter().find(|n| n.id.name == "PaymentProcessor")
+        let struct_node = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "PaymentProcessor")
             .expect("should find PaymentProcessor");
-        let doc = struct_node.metadata.get("doc_comment")
+        let doc = struct_node
+            .metadata
+            .get("doc_comment")
             .expect("PaymentProcessor should have doc_comment");
         assert!(
             doc.contains("payment processor"),
@@ -3968,7 +4678,10 @@ pub fn no_doc() -> u32 {
 }
 "#;
         let result = ext.extract(Path::new("test.rs"), code).unwrap();
-        let fn_node = result.nodes.iter().find(|n| n.id.name == "no_doc")
+        let fn_node = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "no_doc")
             .expect("should find no_doc");
         assert!(
             fn_node.metadata.get("doc_comment").is_none(),
@@ -3980,27 +4693,63 @@ pub fn no_doc() -> u32 {
     fn test_strip_comment_markers_rust_doc() {
         let raw = "/// Charges the card.\n/// Records the transaction.";
         let result = strip_comment_markers(raw, "rust");
-        assert!(!result.contains("///"), "markers should be stripped: {}", result);
-        assert!(result.contains("Charges the card"), "text should be preserved: {}", result);
-        assert!(result.contains("Records the transaction"), "second line should be included: {}", result);
+        assert!(
+            !result.contains("///"),
+            "markers should be stripped: {}",
+            result
+        );
+        assert!(
+            result.contains("Charges the card"),
+            "text should be preserved: {}",
+            result
+        );
+        assert!(
+            result.contains("Records the transaction"),
+            "second line should be included: {}",
+            result
+        );
     }
 
     #[test]
     fn test_strip_comment_markers_block_comment() {
         let raw = "/** Returns the result.\n * @param x the input\n */";
         let result = strip_comment_markers(raw, "typescript");
-        assert!(!result.contains("/**"), "block start should be stripped: {}", result);
-        assert!(!result.contains("*/"), "block end should be stripped: {}", result);
-        assert!(result.contains("Returns the result"), "content should be preserved: {}", result);
+        assert!(
+            !result.contains("/**"),
+            "block start should be stripped: {}",
+            result
+        );
+        assert!(
+            !result.contains("*/"),
+            "block end should be stripped: {}",
+            result
+        );
+        assert!(
+            result.contains("Returns the result"),
+            "content should be preserved: {}",
+            result
+        );
     }
 
     #[test]
     fn test_strip_comment_markers_single_line_block() {
         let raw = "/** Returns the computed value. */";
         let result = strip_comment_markers(raw, "java");
-        assert!(!result.contains("/**"), "opening delimiter should be stripped: {}", result);
-        assert!(!result.contains("*/"), "closing delimiter should be stripped: {}", result);
-        assert!(result.contains("Returns the computed value"), "content should be preserved: {}", result);
+        assert!(
+            !result.contains("/**"),
+            "opening delimiter should be stripped: {}",
+            result
+        );
+        assert!(
+            !result.contains("*/"),
+            "closing delimiter should be stripped: {}",
+            result
+        );
+        assert!(
+            result.contains("Returns the computed value"),
+            "content should be preserved: {}",
+            result
+        );
     }
 
     #[test]
@@ -4013,10 +4762,14 @@ pub fn no_doc() -> u32 {
 fn my_test_helper() {}
 "#;
         let result = ext.extract(Path::new("test.rs"), code).unwrap();
-        let fn_node = result.nodes.iter().find(|n| n.id.name == "my_test_helper")
+        let fn_node = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "my_test_helper")
             .expect("should find my_test_helper");
-        let doc = fn_node.metadata.get("doc_comment")
-            .expect("should extract doc comment even with #[test] attribute between comment and fn");
+        let doc = fn_node.metadata.get("doc_comment").expect(
+            "should extract doc comment even with #[test] attribute between comment and fn",
+        );
         assert!(
             doc.contains("test helper"),
             "doc comment should be extracted through attribute: {}",
@@ -4034,9 +4787,14 @@ def process_input(value):
     return value.upper()
 "#;
         let result = ext.extract(Path::new("test.py"), code).unwrap();
-        let fn_node = result.nodes.iter().find(|n| n.id.name == "process_input")
+        let fn_node = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "process_input")
             .expect("should find process_input");
-        let doc = fn_node.metadata.get("doc_comment")
+        let doc = fn_node
+            .metadata
+            .get("doc_comment")
             .expect("should have doc_comment for Python function with preceding comment");
         assert!(
             doc.contains("Converts the input"),
@@ -4059,7 +4817,10 @@ def process_input(value):
     return True
 "#;
         let result = ext.extract(Path::new("test.py"), code).unwrap();
-        let fn_node = result.nodes.iter().find(|n| n.id.name == "process_payment")
+        let fn_node = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "process_payment")
             .expect("should find process_payment");
         // Docstrings may or may not be captured depending on tree-sitter-python node kinds.
         // If captured, they should contain the meaningful text.
@@ -4093,13 +4854,23 @@ def get_items():
     pass
 "#;
         let result = ext.run(Path::new("routes.py"), code).unwrap();
-        let api_nodes: Vec<_> = result.nodes.iter()
+        let api_nodes: Vec<_> = result
+            .nodes
+            .iter()
             .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
             .collect();
-        assert_eq!(api_nodes.len(), 2, "should emit 2 ApiEndpoint nodes, got: {:?}",
-            api_nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>());
+        assert_eq!(
+            api_nodes.len(),
+            2,
+            "should emit 2 ApiEndpoint nodes, got: {:?}",
+            api_nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+        );
         assert!(
-            api_nodes.iter().any(|n| n.metadata.get("http_path").map(|p| p == "/users").unwrap_or(false)),
+            api_nodes.iter().any(|n| n
+                .metadata
+                .get("http_path")
+                .map(|p| p == "/users")
+                .unwrap_or(false)),
             "should have ApiEndpoint for /users"
         );
     }
@@ -4124,14 +4895,23 @@ def assign_role_to_user(user_id: str, role_name: str):
     pass
 "#;
         let result = ext.run(Path::new("roles.py"), code).unwrap();
-        let api_nodes: Vec<_> = result.nodes.iter()
+        let api_nodes: Vec<_> = result
+            .nodes
+            .iter()
             .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
             .collect();
-        assert_eq!(api_nodes.len(), 2,
+        assert_eq!(
+            api_nodes.len(),
+            2,
             "should emit 2 ApiEndpoint nodes for FastAPI router-method decorators, got: {:?}",
-            api_nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>());
+            api_nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+        );
         assert!(
-            api_nodes.iter().any(|n| n.metadata.get("http_method").map(|m| m == "POST").unwrap_or(false)),
+            api_nodes.iter().any(|n| n
+                .metadata
+                .get("http_method")
+                .map(|m| m == "POST")
+                .unwrap_or(false)),
             "should infer POST from @roles_router.post"
         );
     }
@@ -4151,13 +4931,18 @@ class UserController {
 }
 "#;
         let result = ext.run(Path::new("user.controller.ts"), code).unwrap();
-        let api_nodes: Vec<_> = result.nodes.iter()
+        let api_nodes: Vec<_> = result
+            .nodes
+            .iter()
             .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
             .collect();
         assert_eq!(api_nodes.len(), 2, "should emit 2 ApiEndpoint nodes");
         assert!(
             api_nodes.iter().any(|n| {
-                n.metadata.get("http_method").map(|m| m == "POST").unwrap_or(false)
+                n.metadata
+                    .get("http_method")
+                    .map(|m| m == "POST")
+                    .unwrap_or(false)
             }),
             "should have POST endpoint"
         );
@@ -4177,7 +4962,9 @@ def helper():
     pass
 "#;
         let result = ext.run(Path::new("test.py"), code).unwrap();
-        let fn_nodes: Vec<_> = result.nodes.iter()
+        let fn_nodes: Vec<_> = result
+            .nodes
+            .iter()
             .filter(|n| n.id.kind == NodeKind::Function)
             .collect();
         assert!(
@@ -4189,7 +4976,9 @@ def helper():
             "should still extract helper function"
         );
         // Both functions extracted AND the ApiEndpoint node
-        let api_nodes: Vec<_> = result.nodes.iter()
+        let api_nodes: Vec<_> = result
+            .nodes
+            .iter()
             .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
             .collect();
         assert_eq!(api_nodes.len(), 1, "should have exactly 1 ApiEndpoint node");
@@ -4214,18 +5003,26 @@ public class ItemController {
 }
 "#;
         let result = ext.run(Path::new("ItemController.java"), code).unwrap();
-        let api_nodes: Vec<_> = result.nodes.iter()
+        let api_nodes: Vec<_> = result
+            .nodes
+            .iter()
             .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
             .collect();
         assert_eq!(api_nodes.len(), 2, "should emit 2 ApiEndpoint nodes");
 
         let post_node = api_nodes.iter().find(|n| {
-            n.metadata.get("http_method").map(|m| m == "POST").unwrap_or(false)
+            n.metadata
+                .get("http_method")
+                .map(|m| m == "POST")
+                .unwrap_or(false)
         });
         assert!(
             post_node.is_some(),
             "should infer POST for @PostMapping, got: {:?}",
-            api_nodes.iter().map(|n| n.metadata.get("http_method")).collect::<Vec<_>>()
+            api_nodes
+                .iter()
+                .map(|n| n.metadata.get("http_method"))
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             post_node.unwrap().metadata.get("http_path"),
@@ -4234,7 +5031,10 @@ public class ItemController {
         );
 
         let get_node = api_nodes.iter().find(|n| {
-            n.metadata.get("http_method").map(|m| m == "GET").unwrap_or(false)
+            n.metadata
+                .get("http_method")
+                .map(|m| m == "GET")
+                .unwrap_or(false)
         });
         assert!(get_node.is_some(), "should infer GET for @GetMapping");
     }
@@ -4257,17 +5057,28 @@ def get_users():
 "#;
         let result = ext.run(Path::new("routes.py"), code).unwrap();
 
-        let implements: Vec<_> = result.edges.iter()
+        let implements: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Implements)
             .collect();
         assert_eq!(
-            implements.len(), 1,
+            implements.len(),
+            1,
             "should emit 1 Implements edge, got: {:?}",
             implements
         );
         let edge = &implements[0];
-        assert_eq!(edge.from.kind, NodeKind::ApiEndpoint, "Implements from should be ApiEndpoint");
-        assert_eq!(edge.to.kind, NodeKind::Function, "Implements to should be Function");
+        assert_eq!(
+            edge.from.kind,
+            NodeKind::ApiEndpoint,
+            "Implements from should be ApiEndpoint"
+        );
+        assert_eq!(
+            edge.to.kind,
+            NodeKind::Function,
+            "Implements to should be Function"
+        );
         assert_eq!(edge.to.name, "get_users", "handler should be get_users");
     }
 
@@ -4286,12 +5097,16 @@ class ItemController {
 "#;
         let result = ext.run(Path::new("item.controller.ts"), code).unwrap();
 
-        let implements: Vec<_> = result.edges.iter()
+        let implements: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Implements)
             .collect();
         assert_eq!(
-            implements.len(), 1,
-            "should emit 1 Implements edge for NestJS @Post, got edges: {:?}", implements
+            implements.len(),
+            1,
+            "should emit 1 Implements edge for NestJS @Post, got edges: {:?}",
+            implements
         );
         assert_eq!(implements[0].to.name, "create");
     }
@@ -4313,16 +5128,26 @@ def create_user():
 "#;
         let result = ext.run(Path::new("routes.py"), code).unwrap();
 
-        let implements: Vec<_> = result.edges.iter()
+        let implements: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Implements)
             .collect();
         assert_eq!(
-            implements.len(), 2,
-            "should emit 2 Implements edges for 2 routes, got: {:?}", implements
+            implements.len(),
+            2,
+            "should emit 2 Implements edges for 2 routes, got: {:?}",
+            implements
         );
         let handler_names: Vec<_> = implements.iter().map(|e| e.to.name.as_str()).collect();
-        assert!(handler_names.contains(&"get_users"), "should link to get_users");
-        assert!(handler_names.contains(&"create_user"), "should link to create_user");
+        assert!(
+            handler_names.contains(&"get_users"),
+            "should link to get_users"
+        );
+        assert!(
+            handler_names.contains(&"create_user"),
+            "should link to create_user"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4341,13 +5166,21 @@ fn sync_fn() {}
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("test.rs"), code)
             .unwrap();
-        let async_fn = result.nodes.iter().find(|n| n.id.name == "fetch_data").unwrap();
+        let async_fn = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "fetch_data")
+            .unwrap();
         assert_eq!(
             async_fn.metadata.get("is_async").map(|s| s.as_str()),
             Some("true"),
             "async fn should have is_async=true"
         );
-        let sync_fn = result.nodes.iter().find(|n| n.id.name == "sync_fn").unwrap();
+        let sync_fn = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "sync_fn")
+            .unwrap();
         assert!(
             sync_fn.metadata.get("is_async").is_none(),
             "sync fn should NOT have is_async metadata"
@@ -4361,7 +5194,11 @@ fn sync_fn() {}
         let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
             .run(Path::new("test.ts"), code)
             .unwrap();
-        let async_fn = result.nodes.iter().find(|n| n.id.name == "loadData").unwrap();
+        let async_fn = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "loadData")
+            .unwrap();
         assert_eq!(
             async_fn.metadata.get("is_async").map(|s| s.as_str()),
             Some("true"),
@@ -4382,7 +5219,11 @@ fn sync_fn() {}
             Some("true"),
             "async Python function should have is_async=true"
         );
-        let sync_fn = result.nodes.iter().find(|n| n.id.name == "sync_fn").unwrap();
+        let sync_fn = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "sync_fn")
+            .unwrap();
         assert!(
             sync_fn.metadata.get("is_async").is_none(),
             "sync Python function should NOT have is_async"
@@ -4404,19 +5245,31 @@ fn not_a_test() {}
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("test.rs"), code)
             .unwrap();
-        let test_fn = result.nodes.iter().find(|n| n.id.name == "my_test").unwrap();
+        let test_fn = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "my_test")
+            .unwrap();
         assert_eq!(
             test_fn.metadata.get("is_test").map(|s| s.as_str()),
             Some("true"),
             "#[test] function should have is_test=true"
         );
-        let async_test = result.nodes.iter().find(|n| n.id.name == "my_async_test").unwrap();
+        let async_test = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "my_async_test")
+            .unwrap();
         assert_eq!(
             async_test.metadata.get("is_test").map(|s| s.as_str()),
             Some("true"),
             "#[tokio::test] function should have is_test=true"
         );
-        let not_test = result.nodes.iter().find(|n| n.id.name == "not_a_test").unwrap();
+        let not_test = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "not_a_test")
+            .unwrap();
         assert!(
             not_test.metadata.get("is_test").is_none(),
             "production function should NOT have is_test metadata"
@@ -4430,7 +5283,11 @@ fn not_a_test() {}
         let result = GenericExtractor::new(&PYTHON_CONFIG)
             .run(Path::new("test.py"), code)
             .unwrap();
-        let test_fn = result.nodes.iter().find(|n| n.id.name == "test_my_feature").unwrap();
+        let test_fn = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "test_my_feature")
+            .unwrap();
         assert_eq!(
             test_fn.metadata.get("is_test").map(|s| s.as_str()),
             Some("true"),
@@ -4454,13 +5311,24 @@ pub struct Config {
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("test.rs"), code)
             .unwrap();
-        let impl_edges: Vec<_> = result.edges.iter()
+        let impl_edges: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Implements && e.from.name == "Config")
             .collect();
         let trait_names: Vec<&str> = impl_edges.iter().map(|e| e.to.name.as_str()).collect();
-        assert!(trait_names.contains(&"Debug"), "should emit Implements(Debug)");
-        assert!(trait_names.contains(&"Clone"), "should emit Implements(Clone)");
-        assert!(trait_names.contains(&"Serialize"), "should emit Implements(Serialize)");
+        assert!(
+            trait_names.contains(&"Debug"),
+            "should emit Implements(Debug)"
+        );
+        assert!(
+            trait_names.contains(&"Clone"),
+            "should emit Implements(Clone)"
+        );
+        assert!(
+            trait_names.contains(&"Serialize"),
+            "should emit Implements(Serialize)"
+        );
     }
 
     #[test]
@@ -4474,13 +5342,19 @@ fn my_test() {}
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("test.rs"), code)
             .unwrap();
-        let impl_from_test: Vec<_> = result.edges.iter()
-            .filter(|e| e.kind == EdgeKind::Implements && e.from.name == "my_test"
-                && e.to.name.to_lowercase() == "test")
+        let impl_from_test: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Implements
+                    && e.from.name == "my_test"
+                    && e.to.name.to_lowercase() == "test"
+            })
             .collect();
         assert!(
             impl_from_test.is_empty(),
-            "#[test] should NOT emit Implements(Test), got: {:?}", impl_from_test
+            "#[test] should NOT emit Implements(Test), got: {:?}",
+            impl_from_test
         );
     }
 
@@ -4488,11 +5362,14 @@ fn my_test() {}
     fn test_python_dataclass_decorator_implements() {
         use crate::extract::configs::PYTHON_CONFIG;
         // Python `@dataclass` on a class should emit Implements(DataClass)
-        let code = "from dataclasses import dataclass\n\n@dataclass\nclass Config:\n    name: str\n";
+        let code =
+            "from dataclasses import dataclass\n\n@dataclass\nclass Config:\n    name: str\n";
         let result = GenericExtractor::new(&PYTHON_CONFIG)
             .run(Path::new("test.py"), code)
             .unwrap();
-        let impl_edges: Vec<_> = result.edges.iter()
+        let impl_edges: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Implements && e.from.name == "Config")
             .collect();
         assert!(
@@ -4516,14 +5393,19 @@ def get_users():
             .run(Path::new("routes.py"), code)
             .unwrap();
         // Check no Implements from decorator pass for route decorators
-        let decorator_impl: Vec<_> = result.edges.iter()
-            .filter(|e| e.kind == EdgeKind::Implements && e.from.name == "get_users"
+        let decorator_impl: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Implements && e.from.name == "get_users"
                 // Route query edges go from ApiEndpoint→handler, not function→trait
-                && e.from.kind == NodeKind::Function)
+                && e.from.kind == NodeKind::Function
+            })
             .collect();
         assert!(
             decorator_impl.is_empty(),
-            "@app.route should not emit decorator Implements edge, got: {:?}", decorator_impl
+            "@app.route should not emit decorator Implements edge, got: {:?}",
+            decorator_impl
         );
     }
 
@@ -4546,13 +5428,20 @@ fn main_fn() -> i32 {
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("test.rs"), code)
             .unwrap();
-        let calls: Vec<_> = result.edges.iter()
+        let calls: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Calls)
             .collect();
         assert!(
-            calls.iter().any(|e| e.from.name == "main_fn" && e.to.name == "helper"),
+            calls
+                .iter()
+                .any(|e| e.from.name == "main_fn" && e.to.name == "helper"),
             "should emit Calls edge from main_fn to helper, got: {:?}",
-            calls.iter().map(|e| format!("{} -> {}", e.from.name, e.to.name)).collect::<Vec<_>>()
+            calls
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.name, e.to.name))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -4568,14 +5457,19 @@ fn main_fn() {
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("test.rs"), code)
             .unwrap();
-        let calls: Vec<_> = result.edges.iter()
+        let calls: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Calls)
             .collect();
         // No same-file functions named "println" — should be empty.
         assert!(
             calls.is_empty(),
             "should NOT emit Calls edge for macro/external call, got: {:?}",
-            calls.iter().map(|e| format!("{} -> {}", e.from.name, e.to.name)).collect::<Vec<_>>()
+            calls
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.name, e.to.name))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -4591,12 +5485,17 @@ fn recurse(n: i32) -> i32 {
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("test.rs"), code)
             .unwrap();
-        let self_loops: Vec<_> = result.edges.iter()
-            .filter(|e| e.kind == EdgeKind::Calls && e.from.name == "recurse" && e.to.name == "recurse")
+        let self_loops: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Calls && e.from.name == "recurse" && e.to.name == "recurse"
+            })
             .collect();
         assert!(
             self_loops.is_empty(),
-            "recursive call should not emit self-loop Calls edge, got: {:?}", self_loops
+            "recursive call should not emit self-loop Calls edge, got: {:?}",
+            self_loops
         );
     }
 
@@ -4607,13 +5506,20 @@ fn recurse(n: i32) -> i32 {
         let result = GenericExtractor::new(&PYTHON_CONFIG)
             .run(Path::new("test.py"), code)
             .unwrap();
-        let calls: Vec<_> = result.edges.iter()
+        let calls: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Calls)
             .collect();
         assert!(
-            calls.iter().any(|e| e.from.name == "main_fn" && e.to.name == "helper"),
+            calls
+                .iter()
+                .any(|e| e.from.name == "main_fn" && e.to.name == "helper"),
             "Python: should emit Calls from main_fn to helper, got: {:?}",
-            calls.iter().map(|e| format!("{} -> {}", e.from.name, e.to.name)).collect::<Vec<_>>()
+            calls
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.name, e.to.name))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -4628,13 +5534,19 @@ fn recurse(n: i32) -> i32 {
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("lib.rs"), code)
             .unwrap();
-        let re_exports: Vec<_> = result.edges.iter()
+        let re_exports: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::ReExports)
             .collect();
         assert!(
             !re_exports.is_empty(),
             "pub use should emit ReExports edge, got edges: {:?}",
-            result.edges.iter().map(|e| format!("{:?}", e.kind)).collect::<Vec<_>>()
+            result
+                .edges
+                .iter()
+                .map(|e| format!("{:?}", e.kind))
+                .collect::<Vec<_>>()
         );
         assert!(
             re_exports.iter().any(|e| e.to.name == "Bar"),
@@ -4650,8 +5562,13 @@ fn recurse(n: i32) -> i32 {
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("lib.rs"), code)
             .unwrap();
-        let pub_imports: Vec<_> = result.nodes.iter()
-            .filter(|n| n.id.kind == NodeKind::Import && n.metadata.get("visibility").map(|s| s.as_str()) == Some("pub"))
+        let pub_imports: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.id.kind == NodeKind::Import
+                    && n.metadata.get("visibility").map(|s| s.as_str()) == Some("pub")
+            })
             .collect();
         assert!(
             !pub_imports.is_empty(),
@@ -4667,7 +5584,9 @@ fn recurse(n: i32) -> i32 {
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("lib.rs"), code)
             .unwrap();
-        let re_exports: Vec<_> = result.edges.iter()
+        let re_exports: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::ReExports)
             .collect();
         assert!(
@@ -4688,10 +5607,20 @@ fn check_something() {}
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("src/main.rs"), code)
             .unwrap();
-        let test_fn = result.nodes.iter().find(|n| n.id.name == "check_something").unwrap();
+        let test_fn = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "check_something")
+            .unwrap();
         // Both is_test metadata AND decorators should be set
-        assert_eq!(test_fn.metadata.get("is_test").map(|s| s.as_str()), Some("true"));
-        assert!(test_fn.metadata.contains_key("decorators"), "decorators should also be preserved");
+        assert_eq!(
+            test_fn.metadata.get("is_test").map(|s| s.as_str()),
+            Some("true")
+        );
+        assert!(
+            test_fn.metadata.contains_key("decorators"),
+            "decorators should also be preserved"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4713,7 +5642,9 @@ fn my_fn() -> usize {
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("test.rs"), code)
             .unwrap();
-        let calls: Vec<_> = result.edges.iter()
+        let calls: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Calls)
             .collect();
         // v.len() is a method call — callee node is a field_expression, not bare identifier.
@@ -4740,9 +5671,14 @@ def test_add(x, y):
             .run(Path::new("test.py"), code)
             .unwrap();
         // @pytest.mark.parametrize is chained — should NOT emit Implements
-        let impl_edges: Vec<_> = result.edges.iter()
-            .filter(|e| e.kind == EdgeKind::Implements && e.from.name == "test_add"
-                && e.from.kind == NodeKind::Function)
+        let impl_edges: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Implements
+                    && e.from.name == "test_add"
+                    && e.from.kind == NodeKind::Function
+            })
             .collect();
         assert!(
             impl_edges.is_empty(),
@@ -4760,7 +5696,11 @@ def test_add(x, y):
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("test.rs"), code)
             .unwrap();
-        let struc = result.nodes.iter().find(|n| n.id.name == "TestHelper").unwrap();
+        let struc = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "TestHelper")
+            .unwrap();
         assert!(
             struc.metadata.get("is_test").is_none(),
             "struct TestHelper should NOT have is_test metadata"
@@ -4775,17 +5715,24 @@ def test_add(x, y):
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("lib.rs"), code)
             .unwrap();
-        let re_exports: Vec<_> = result.edges.iter()
+        let re_exports: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::ReExports)
             .collect();
         assert!(
             re_exports.is_empty(),
-            "pub use foo::* should NOT emit ReExports edge (wildcard), got: {:?}", re_exports
+            "pub use foo::* should NOT emit ReExports edge (wildcard), got: {:?}",
+            re_exports
         );
         // But visibility=pub should still be set
-        let pub_imports: Vec<_> = result.nodes.iter()
-            .filter(|n| n.id.kind == NodeKind::Import
-                && n.metadata.get("visibility").map(|s| s.as_str()) == Some("pub"))
+        let pub_imports: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.id.kind == NodeKind::Import
+                    && n.metadata.get("visibility").map(|s| s.as_str()) == Some("pub")
+            })
             .collect();
         assert!(
             !pub_imports.is_empty(),
@@ -4800,8 +5747,10 @@ def test_add(x, y):
         let decorators = r#"@app.route("/users/{id}"), @login_required"#;
         let parts = split_decorators(decorators);
         assert_eq!(
-            parts.len(), 2,
-            "should split into 2 decorators at top-level comma, got: {:?}", parts
+            parts.len(),
+            2,
+            "should split into 2 decorators at top-level comma, got: {:?}",
+            parts
         );
         assert_eq!(parts[0], r#"@app.route("/users/{id}")"#);
         assert_eq!(parts[1], "@login_required");
@@ -4812,7 +5761,11 @@ def test_add(x, y):
     fn test_split_decorators_derive_macro() {
         let decorators = "#[derive(Debug, Clone)]";
         let parts = split_decorators(decorators);
-        assert_eq!(parts.len(), 1, "derive with multiple traits should stay as 1 decorator");
+        assert_eq!(
+            parts.len(),
+            1,
+            "derive with multiple traits should stay as 1 decorator"
+        );
         assert_eq!(parts[0], "#[derive(Debug, Clone)]");
     }
 
@@ -4825,7 +5778,11 @@ def test_add(x, y):
         let result = GenericExtractor::new(&PYTHON_CONFIG)
             .run(Path::new("conftest.py"), code)
             .unwrap();
-        let fn_node = result.nodes.iter().find(|n| n.id.name == "my_fixture").unwrap();
+        let fn_node = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "my_fixture")
+            .unwrap();
         assert!(
             fn_node.metadata.get("is_test").is_none(),
             "@pytest.fixture should NOT set is_test, got: {:?}",
@@ -4845,8 +5802,12 @@ def test_add(x, y):
         let result = GenericExtractor::new(&JAVA_CONFIG)
             .run(Path::new("ApiController.java"), code)
             .unwrap();
-        let impl_edges: Vec<_> = result.edges.iter()
-            .filter(|e| e.kind == EdgeKind::Implements && e.to.name.to_lowercase().contains("mapping"))
+        let impl_edges: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Implements && e.to.name.to_lowercase().contains("mapping")
+            })
             .collect();
         assert!(
             impl_edges.is_empty(),
@@ -4871,13 +5832,16 @@ def test_add(x, y):
         let result = GenericExtractor::new(&JAVA_CONFIG)
             .run(Path::new("Foo.java"), code)
             .unwrap();
-        let qualified_calls: Vec<_> = result.edges.iter()
+        let qualified_calls: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Calls && e.to.name == "helper")
             .collect();
         // `obj.helper()` is a qualified call — should NOT produce a same-file Calls edge
         assert!(
             qualified_calls.is_empty(),
-            "Java obj.helper() should NOT emit Calls edge, got: {:?}", qualified_calls
+            "Java obj.helper() should NOT emit Calls edge, got: {:?}",
+            qualified_calls
         );
     }
 
@@ -4889,7 +5853,9 @@ def test_add(x, y):
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("lib.rs"), code)
             .unwrap();
-        let pub_imports: Vec<_> = result.nodes.iter()
+        let pub_imports: Vec<_> = result
+            .nodes
+            .iter()
             .filter(|n| n.id.kind == NodeKind::Import && n.metadata.contains_key("visibility"))
             .collect();
         assert!(
@@ -4900,7 +5866,8 @@ def test_add(x, y):
         let vis = pub_imports[0].metadata.get("visibility").unwrap();
         assert!(
             vis.contains("pub"),
-            "visibility should contain 'pub', got: {}", vis
+            "visibility should contain 'pub', got: {}",
+            vis
         );
     }
 
@@ -4912,17 +5879,21 @@ def test_add(x, y):
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("lib.rs"), code)
             .unwrap();
-        let re_exports: Vec<_> = result.edges.iter()
+        let re_exports: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::ReExports)
             .collect();
         let names: Vec<&str> = re_exports.iter().map(|e| e.to.name.as_str()).collect();
         assert!(
             names.contains(&"Alpha"),
-            "pub use {{Alpha, Beta}} should emit ReExports for Alpha, got: {:?}", names
+            "pub use {{Alpha, Beta}} should emit ReExports for Alpha, got: {:?}",
+            names
         );
         assert!(
             names.contains(&"Beta"),
-            "pub use {{Alpha, Beta}} should emit ReExports for Beta, got: {:?}", names
+            "pub use {{Alpha, Beta}} should emit ReExports for Beta, got: {:?}",
+            names
         );
     }
 
@@ -4942,7 +5913,11 @@ fn spawn_task() {
         let result = GenericExtractor::new(&RUST_CONFIG)
             .run(Path::new("test.rs"), code)
             .unwrap();
-        let fn_node = result.nodes.iter().find(|n| n.id.name == "spawn_task").unwrap();
+        let fn_node = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "spawn_task")
+            .unwrap();
         // spawn_task is not async itself — is_async should NOT be set
         // NOTE: This test documents the current behavior of the text fallback.
         // The text fallback checks `first_line.starts_with("async ")` which for

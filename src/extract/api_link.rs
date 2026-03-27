@@ -117,7 +117,12 @@ pub fn api_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
         if node.id.kind != NodeKind::Const {
             continue;
         }
-        if !node.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false) {
+        if !node
+            .metadata
+            .get("synthetic")
+            .map(|s| s == "true")
+            .unwrap_or(false)
+        {
             continue;
         }
         if !looks_like_url_path(&node.id.name) {
@@ -151,9 +156,9 @@ mod tests {
     use crate::graph::{EdgeKind, NodeKind};
 
     fn make_const(name: &str, file: &str) -> crate::graph::Node {
+        use crate::graph::{ExtractionSource, NodeId};
         use std::collections::BTreeMap;
         use std::path::PathBuf;
-        use crate::graph::{ExtractionSource, NodeId};
         crate::graph::Node {
             id: NodeId {
                 root: String::new(),
@@ -177,9 +182,9 @@ mod tests {
     }
 
     fn make_endpoint(method: &str, path: &str, file: &str) -> crate::graph::Node {
+        use crate::graph::{ExtractionSource, NodeId};
         use std::collections::BTreeMap;
         use std::path::PathBuf;
-        use crate::graph::{ExtractionSource, NodeId};
         let name = format!("{} {}", method, path);
         crate::graph::Node {
             id: NodeId {
@@ -230,7 +235,11 @@ mod tests {
         ];
         let edges = api_link_pass(&nodes);
 
-        assert_eq!(edges.len(), 1, "should match :id to {{id}} via normalisation");
+        assert_eq!(
+            edges.len(),
+            1,
+            "should match :id to {{id}} via normalisation"
+        );
     }
 
     /// Next.js `[id]` bracket style also normalises correctly.
@@ -242,7 +251,11 @@ mod tests {
         ];
         let edges = api_link_pass(&nodes);
 
-        assert_eq!(edges.len(), 1, "should match [id] to {{id}} via normalisation");
+        assert_eq!(
+            edges.len(),
+            1,
+            "should match [id] to {{id}} via normalisation"
+        );
     }
 
     /// Non-URL strings (e.g. MIME types) must NOT produce edges.
@@ -256,7 +269,8 @@ mod tests {
 
         assert!(
             edges.is_empty(),
-            "non-path string should produce no edge, got: {:?}", edges
+            "non-path string should produce no edge, got: {:?}",
+            edges
         );
     }
 
@@ -286,7 +300,11 @@ mod tests {
         ];
         let edges = api_link_pass(&nodes);
 
-        assert_eq!(edges.len(), 2, "both Const nodes should link to the endpoint");
+        assert_eq!(
+            edges.len(),
+            2,
+            "both Const nodes should link to the endpoint"
+        );
     }
 
     /// Cross-file: Const in one file links to ApiEndpoint in a different file.
@@ -308,20 +326,17 @@ mod tests {
     /// `normalize_path` handles multiple parameters in one path.
     #[test]
     fn test_normalize_path_multiple_params() {
-        assert_eq!(
-            normalize_path("/a/:x/b/:y"),
-            "/a/<param>/b/<param>"
-        );
-        assert_eq!(
-            normalize_path("/a/{x}/b/{y}"),
-            "/a/<param>/b/<param>"
-        );
+        assert_eq!(normalize_path("/a/:x/b/:y"), "/a/<param>/b/<param>");
+        assert_eq!(normalize_path("/a/{x}/b/{y}"), "/a/<param>/b/<param>");
     }
 
     /// The lone `/` root path is NOT treated as a URL path to avoid spurious matches.
     #[test]
     fn test_root_slash_not_treated_as_url() {
-        assert!(!looks_like_url_path("/"), "bare / should not be treated as a URL path");
+        assert!(
+            !looks_like_url_path("/"),
+            "bare / should not be treated as a URL path"
+        );
     }
 
     /// Static segments are preserved as-is.
@@ -339,9 +354,9 @@ mod tests {
     /// constants (e.g. `const REDIRECT_PATH: &str = "/admin"`) to endpoints.
     #[test]
     fn test_non_synthetic_const_not_linked() {
+        use crate::graph::{ExtractionSource, NodeId, NodeKind};
         use std::collections::BTreeMap;
         use std::path::PathBuf;
-        use crate::graph::{ExtractionSource, NodeId, NodeKind};
         let non_synthetic = crate::graph::Node {
             id: NodeId {
                 root: String::new(),
@@ -366,7 +381,8 @@ mod tests {
 
         assert!(
             edges.is_empty(),
-            "declared constant should NOT link to endpoint, got: {:?}", edges
+            "declared constant should NOT link to endpoint, got: {:?}",
+            edges
         );
     }
 
@@ -396,16 +412,17 @@ mod tests {
 
         assert!(
             edges.is_empty(),
-            "/payments should NOT match /payments/{{id}}: got {:?}", edges
+            "/payments should NOT match /payments/{{id}}: got {:?}",
+            edges
         );
     }
 
     /// Empty `http_path` in ApiEndpoint metadata must not panic or match anything.
     #[test]
     fn test_api_endpoint_without_http_path_metadata_does_not_panic() {
+        use crate::graph::{ExtractionSource, NodeId, NodeKind};
         use std::collections::BTreeMap;
         use std::path::PathBuf;
-        use crate::graph::{ExtractionSource, NodeId, NodeKind};
         let no_path_ep = crate::graph::Node {
             id: NodeId {
                 root: String::new(),

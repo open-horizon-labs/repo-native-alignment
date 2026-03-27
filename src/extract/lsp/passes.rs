@@ -6,15 +6,18 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
-use crate::graph::{
-    Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
+
+use super::transport::{
+    PipelinedTransport, find_enclosing_symbol, path_to_uri, uri_to_relative_path,
 };
-
-use super::transport::{PipelinedTransport, path_to_uri, find_enclosing_symbol, uri_to_relative_path};
-use super::{EnrichmentResult, LspEnricher, ZERO_EDGE_ABORT_THRESHOLD, ZERO_EDGE_MIN_WARMUP, ZERO_EDGE_TIMEOUT};
+use super::{
+    EnrichmentResult, LspEnricher, ZERO_EDGE_ABORT_THRESHOLD, ZERO_EDGE_MIN_WARMUP,
+    ZERO_EDGE_TIMEOUT,
+};
 use crate::scanner::LspConfig;
 
 impl LspEnricher {
@@ -47,7 +50,9 @@ impl LspEnricher {
                 Self::emit_crate_graph_edges(&crate_names, &pairs, &root_id, result);
                 tracing::info!(
                     "LSP Pass 0 complete in {:?}: {} crate nodes, {} DependsOn edges",
-                    pass0_start.elapsed(), crate_names.len(), pair_count
+                    pass0_start.elapsed(),
+                    crate_names.len(),
+                    pair_count
                 );
             }
             Ok(_) => {
@@ -87,18 +92,29 @@ impl LspEnricher {
         // Also skip diagnostic nodes (Other("diagnostic")) to prevent them from being
         // re-enriched via the generic Other/documentLink path on subsequent passes --
         // which would generate spurious DependsOn edges from diagnostics.
-        let enrichable_nodes: Vec<&Node> = matching_nodes.iter()
-            .filter(|n| matches!(n.id.kind,
-                NodeKind::Function | NodeKind::Trait | NodeKind::Other(_)
-                | NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const))
+        let enrichable_nodes: Vec<&Node> = matching_nodes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n.id.kind,
+                    NodeKind::Function
+                        | NodeKind::Trait
+                        | NodeKind::Other(_)
+                        | NodeKind::Struct
+                        | NodeKind::Enum
+                        | NodeKind::TypeAlias
+                        | NodeKind::Const
+                )
+            })
             .filter(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "diagnostic"))
             .filter(|n| {
                 // Skip test functions (have #[test] or #[tokio::test] decorator)
                 if n.id.kind == NodeKind::Function {
                     if let Some(decorators) = n.metadata.get("decorators")
-                        && (decorators.contains("#[test]") || decorators.contains("#[tokio::test]")) {
-                            return false;
-                        }
+                        && (decorators.contains("#[test]") || decorators.contains("#[tokio::test]"))
+                    {
+                        return false;
+                    }
                     // Also skip functions in test files
                     if crate::ranking::is_test_file(n) {
                         return false;
@@ -109,18 +125,34 @@ impl LspEnricher {
             .copied()
             .collect();
 
-        let ref_eligible = enrichable_nodes.iter()
-            .filter(|n| matches!(n.id.kind,
-                NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const))
+        let ref_eligible = enrichable_nodes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n.id.kind,
+                    NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const
+                )
+            })
             .count();
         tracing::info!(
             "LSP pipeline: {} enrichable nodes out of {} total ({}f, {}t, {}r, {}o) [references={}, call_hierarchy={}]",
-            enrichable_nodes.len(), matching_nodes.len(),
-            enrichable_nodes.iter().filter(|n| n.id.kind == NodeKind::Function).count(),
-            enrichable_nodes.iter().filter(|n| n.id.kind == NodeKind::Trait).count(),
+            enrichable_nodes.len(),
+            matching_nodes.len(),
+            enrichable_nodes
+                .iter()
+                .filter(|n| n.id.kind == NodeKind::Function)
+                .count(),
+            enrichable_nodes
+                .iter()
+                .filter(|n| n.id.kind == NodeKind::Trait)
+                .count(),
             ref_eligible,
-            enrichable_nodes.iter().filter(|n| matches!(n.id.kind, NodeKind::Other(_))).count(),
-            has_references, has_call_hierarchy,
+            enrichable_nodes
+                .iter()
+                .filter(|n| matches!(n.id.kind, NodeKind::Other(_)))
+                .count(),
+            has_references,
+            has_call_hierarchy,
         );
 
         // Concurrency control: TCP slow-start from 4 to 64.
@@ -164,35 +196,60 @@ impl LspEnricher {
                 match node.id.kind {
                     NodeKind::Function => {
                         Self::enrich_function_node(
-                            &transport, &file_uri, line, col, &node,
-                            &matching_owned, &refs_by_file, &root, &language,
-                            has_references, has_call_hierarchy,
-                            &mut edges, &mut new_nodes, &mut had_error,
+                            &transport,
+                            &file_uri,
+                            line,
+                            col,
+                            &node,
+                            &matching_owned,
+                            &refs_by_file,
+                            &root,
+                            &language,
+                            has_references,
+                            has_call_hierarchy,
+                            &mut edges,
+                            &mut new_nodes,
+                            &mut had_error,
                             &error_count,
-                        ).await;
+                        )
+                        .await;
                     }
                     NodeKind::Trait => {
                         Self::enrich_trait_node(
-                            &transport, &file_uri, line, col, &node,
-                            &matching_owned, &root,
+                            &transport,
+                            &file_uri,
+                            line,
+                            col,
+                            &node,
+                            &matching_owned,
+                            &root,
                             &mut edges,
-                        ).await;
+                        )
+                        .await;
                     }
                     NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const => {
                         if has_references {
                             Self::enrich_type_references(
-                                &transport, &file_uri, line, col, &node,
-                                &matching_owned, &root,
-                                &mut edges, &mut had_error, &error_count,
-                            ).await;
+                                &transport,
+                                &file_uri,
+                                line,
+                                col,
+                                &node,
+                                &matching_owned,
+                                &root,
+                                &mut edges,
+                                &mut had_error,
+                                &error_count,
+                            )
+                            .await;
                         }
                     }
                     _ => {
                         if matches!(node.id.kind, NodeKind::Other(_)) {
                             Self::enrich_document_links(
-                                &transport, &file_uri, &node, &root,
-                                &mut edges,
-                            ).await;
+                                &transport, &file_uri, &node, &root, &mut edges,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -202,7 +259,10 @@ impl LspEnricher {
                 if done >= 4 && !had_error && !ramped_up.swap(true, Ordering::Relaxed) {
                     let added = PIPELINE_MAX_CONCURRENCY - 4;
                     sem.add_permits(added);
-                    tracing::info!("LSP pipeline: ramp-up to {} concurrent", PIPELINE_MAX_CONCURRENCY);
+                    tracing::info!(
+                        "LSP pipeline: ramp-up to {} concurrent",
+                        PIPELINE_MAX_CONCURRENCY
+                    );
                 }
                 (edges, new_nodes, had_error)
             });
@@ -262,8 +322,11 @@ impl LspEnricher {
                 };
                 tracing::info!(
                     "LSP: {} processing... {}/{} nodes ({} edges found, {})",
-                    self.server_command, done, total_nodes,
-                    result.added_edges.len(), remaining,
+                    self.server_command,
+                    done,
+                    total_nodes,
+                    result.added_edges.len(),
+                    remaining,
                 );
                 last_progress_log = std::time::Instant::now();
                 last_logged_count = done;
@@ -273,12 +336,16 @@ impl LspEnricher {
             // OR spent >= 2 minutes with 0 edges, the language server is likely
             // misconfigured.
             if result.added_edges.is_empty()
-                && ((attempted >= ZERO_EDGE_ABORT_THRESHOLD && pass1_start.elapsed() >= ZERO_EDGE_MIN_WARMUP)
+                && ((attempted >= ZERO_EDGE_ABORT_THRESHOLD
+                    && pass1_start.elapsed() >= ZERO_EDGE_MIN_WARMUP)
                     || pass1_start.elapsed() > ZERO_EDGE_TIMEOUT)
             {
                 tracing::warn!(
                     "LSP: {} produced 0 edges after {}/{} nodes ({:.1}s) -- aborting (likely misconfigured)",
-                    self.server_command, attempted, total_nodes, pass1_start.elapsed().as_secs_f64(),
+                    self.server_command,
+                    attempted,
+                    total_nodes,
+                    pass1_start.elapsed().as_secs_f64(),
                 );
                 aborted = true;
                 join_set.abort_all();
@@ -288,7 +355,10 @@ impl LspEnricher {
 
         tracing::info!(
             "LSP Pass 1 complete in {:?}: {} edges from {} nodes ({} errors)",
-            pass1_start.elapsed(), result.added_edges.len(), attempted, errors,
+            pass1_start.elapsed(),
+            result.added_edges.len(),
+            attempted,
+            errors,
         );
 
         (attempted, errors, aborted)
@@ -329,13 +399,15 @@ impl LspEnricher {
                             continue;
                         }
 
-                        if ref_path == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end {
+                        if ref_path == node.id.file
+                            && ref_line >= node.line_start
+                            && ref_line <= node.line_end
+                        {
                             continue;
                         }
 
-                        let referrer_id = refs_by_file
-                            .get(ref_path.as_path())
-                            .and_then(|candidates| {
+                        let referrer_id =
+                            refs_by_file.get(ref_path.as_path()).and_then(|candidates| {
                                 let refs: Vec<&Node> = candidates.iter().collect();
                                 find_enclosing_symbol(&refs, &ref_path, ref_line)
                             });
@@ -385,7 +457,10 @@ impl LspEnricher {
                         for call in &calls {
                             let caller_uri = &call["from"]["uri"];
                             let caller_name = call["from"]["name"].as_str().unwrap_or("");
-                            let caller_line = call["from"]["range"]["start"]["line"].as_u64().unwrap_or(0) as usize + 1;
+                            let caller_line =
+                                call["from"]["range"]["start"]["line"].as_u64().unwrap_or(0)
+                                    as usize
+                                    + 1;
 
                             if let Some(uri_str) = caller_uri.as_str() {
                                 let caller_path = if let Some(p) = uri_str.strip_prefix("file://") {
@@ -402,8 +477,16 @@ impl LspEnricher {
                                 let key = (caller_path.clone(), caller_name.to_string());
                                 let caller_id = match refs_by_file_name.get(&key) {
                                     Some(ids) if ids.len() == 1 => Some(ids[0].clone()),
-                                    Some(_) => find_enclosing_symbol(&matching_refs, &caller_path, caller_line),
-                                    None => find_enclosing_symbol(&matching_refs, &caller_path, caller_line),
+                                    Some(_) => find_enclosing_symbol(
+                                        &matching_refs,
+                                        &caller_path,
+                                        caller_line,
+                                    ),
+                                    None => find_enclosing_symbol(
+                                        &matching_refs,
+                                        &caller_path,
+                                        caller_line,
+                                    ),
                                 };
 
                                 if let Some(caller) = caller_id {
@@ -427,7 +510,9 @@ impl LspEnricher {
                         for call in &calls {
                             let callee_uri = &call["to"]["uri"];
                             let callee_name = call["to"]["name"].as_str().unwrap_or("");
-                            let callee_line = call["to"]["range"]["start"]["line"].as_u64().unwrap_or(0) as usize + 1;
+                            let callee_line =
+                                call["to"]["range"]["start"]["line"].as_u64().unwrap_or(0) as usize
+                                    + 1;
 
                             if let Some(uri_str) = callee_uri.as_str() {
                                 let callee_path = if let Some(p) = uri_str.strip_prefix("file://") {
@@ -483,8 +568,16 @@ impl LspEnricher {
                                 let key = (callee_path.clone(), callee_name.to_string());
                                 let callee_id = match refs_by_file_name.get(&key) {
                                     Some(ids) if ids.len() == 1 => Some(ids[0].clone()),
-                                    Some(_) => find_enclosing_symbol(&matching_refs, &callee_path, callee_line),
-                                    None => find_enclosing_symbol(&matching_refs, &callee_path, callee_line),
+                                    Some(_) => find_enclosing_symbol(
+                                        &matching_refs,
+                                        &callee_path,
+                                        callee_line,
+                                    ),
+                                    None => find_enclosing_symbol(
+                                        &matching_refs,
+                                        &callee_path,
+                                        callee_line,
+                                    ),
                                 };
 
                                 if let Some(callee) = callee_id {
@@ -513,6 +606,7 @@ impl LspEnricher {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn enrich_trait_node(
         transport: &PipelinedTransport,
         file_uri: &lsp_types::Uri,
@@ -534,7 +628,8 @@ impl LspEnricher {
                         continue;
                     }
 
-                    let impl_id = matching_refs.iter()
+                    let impl_id = matching_refs
+                        .iter()
                         .filter(|n| n.id.file == impl_path)
                         .filter(|n| matches!(n.id.kind, NodeKind::Impl | NodeKind::Struct))
                         .filter(|n| n.line_start <= impl_line && n.line_end >= impl_line)
@@ -576,7 +671,10 @@ impl LspEnricher {
                 let matching_refs: Vec<&Node> = matching_owned.iter().collect();
                 let mut refs_by_file: HashMap<&Path, Vec<&Node>> = HashMap::new();
                 for n in &matching_refs {
-                    refs_by_file.entry(n.id.file.as_path()).or_default().push(*n);
+                    refs_by_file
+                        .entry(n.id.file.as_path())
+                        .or_default()
+                        .push(*n);
                 }
                 for loc in &locations {
                     let ref_path = uri_to_relative_path(&loc.uri, root);
@@ -586,13 +684,16 @@ impl LspEnricher {
                         continue;
                     }
 
-                    if ref_path == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end {
+                    if ref_path == node.id.file
+                        && ref_line >= node.line_start
+                        && ref_line <= node.line_end
+                    {
                         continue;
                     }
 
-                    let referrer_id = refs_by_file
-                        .get(ref_path.as_path())
-                        .and_then(|candidates| find_enclosing_symbol(candidates, &ref_path, ref_line));
+                    let referrer_id = refs_by_file.get(ref_path.as_path()).and_then(|candidates| {
+                        find_enclosing_symbol(candidates, &ref_path, ref_line)
+                    });
 
                     if let Some(referrer) = referrer_id {
                         if referrer == node.id {
@@ -626,32 +727,37 @@ impl LspEnricher {
         if let Ok(links) = Self::document_links_p(transport, file_uri).await {
             for link in &links {
                 if let Some(target) = link.get("target").and_then(|t| t.as_str())
-                    && let Some(target_path) = target.strip_prefix("file://") {
-                        let rel_target = PathBuf::from(target_path);
-                        let rel_target = rel_target.strip_prefix(root).unwrap_or(&rel_target).to_path_buf();
+                    && let Some(target_path) = target.strip_prefix("file://")
+                {
+                    let rel_target = PathBuf::from(target_path);
+                    let rel_target = rel_target
+                        .strip_prefix(root)
+                        .unwrap_or(&rel_target)
+                        .to_path_buf();
 
-                        if rel_target.to_string_lossy().starts_with("http") {
-                            continue;
-                        }
-
-                        let target_id = NodeId {
-                            root: node.id.root.clone(),
-                            file: rel_target.clone(),
-                            name: rel_target.file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("unknown")
-                                .to_string(),
-                            kind: NodeKind::Module,
-                        };
-
-                        edges.push(Edge {
-                            from: node.id.clone(),
-                            to: target_id,
-                            kind: EdgeKind::DependsOn,
-                            source: ExtractionSource::Lsp,
-                            confidence: Confidence::Confirmed,
-                        });
+                    if rel_target.to_string_lossy().starts_with("http") {
+                        continue;
                     }
+
+                    let target_id = NodeId {
+                        root: node.id.root.clone(),
+                        file: rel_target.clone(),
+                        name: rel_target
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        kind: NodeKind::Module,
+                    };
+
+                    edges.push(Edge {
+                        from: node.id.clone(),
+                        to: target_id,
+                        kind: EdgeKind::DependsOn,
+                        source: ExtractionSource::Lsp,
+                        confidence: Confidence::Confirmed,
+                    });
+                }
             }
         }
     }
@@ -674,15 +780,17 @@ impl LspEnricher {
 
         let type_nodes: Vec<&Node> = matching_nodes
             .iter()
-            .filter(|n| matches!(n.id.kind, NodeKind::Trait | NodeKind::Struct | NodeKind::Enum))
+            .filter(|n| {
+                matches!(
+                    n.id.kind,
+                    NodeKind::Trait | NodeKind::Struct | NodeKind::Enum
+                )
+            })
             .copied()
             .collect();
 
         if !type_nodes.is_empty() {
-            tracing::debug!(
-                "Type hierarchy pass: {} eligible nodes",
-                type_nodes.len()
-            );
+            tracing::debug!("Type hierarchy pass: {} eligible nodes", type_nodes.len());
         }
 
         let pass2_start = std::time::Instant::now();
@@ -701,9 +809,16 @@ impl LspEnricher {
             let (line, col) = Self::node_lsp_position(node);
 
             let ok = Self::enrich_type_hierarchy_p(
-                transport, &file_uri, line, col,
-                node, matching_nodes, root, result,
-            ).await;
+                transport,
+                &file_uri,
+                line,
+                col,
+                node,
+                matching_nodes,
+                root,
+                result,
+            )
+            .await;
 
             Self::update_type_hierarchy_strikes(
                 ok,
@@ -731,8 +846,11 @@ impl LspEnricher {
                 };
                 tracing::info!(
                     "LSP: {} type hierarchy... {}/{} nodes ({} edges total, {})",
-                    self.server_command, pass2_done, pass2_total,
-                    result.added_edges.len(), remaining,
+                    self.server_command,
+                    pass2_done,
+                    pass2_total,
+                    result.added_edges.len(),
+                    remaining,
                 );
                 pass2_last_log = std::time::Instant::now();
                 pass2_last_count = pass2_done;
@@ -740,12 +858,16 @@ impl LspEnricher {
 
             // Early abort: 0 new edges after 1,000 nodes + 30s warmup, OR 2 minutes
             if result.added_edges.len() == edges_before_pass2
-                && ((pass2_done >= ZERO_EDGE_ABORT_THRESHOLD as u64 && pass2_start.elapsed() >= ZERO_EDGE_MIN_WARMUP)
+                && ((pass2_done >= ZERO_EDGE_ABORT_THRESHOLD as u64
+                    && pass2_start.elapsed() >= ZERO_EDGE_MIN_WARMUP)
                     || pass2_start.elapsed() > ZERO_EDGE_TIMEOUT)
             {
                 tracing::warn!(
                     "LSP: {} type hierarchy produced 0 edges after {}/{} nodes ({:.1}s) -- aborting (likely misconfigured)",
-                    self.server_command, pass2_done, pass2_total, pass2_start.elapsed().as_secs_f64(),
+                    self.server_command,
+                    pass2_done,
+                    pass2_total,
+                    pass2_start.elapsed().as_secs_f64(),
                 );
                 break;
             }
@@ -780,14 +902,8 @@ impl LspEnricher {
         let is_rust = self.language == "rust";
 
         for (rel_file, file_nodes) in &nodes_by_file {
-            Self::emit_belongs_to_edges(
-                transport,
-                file_nodes,
-                rel_file,
-                root,
-                is_rust,
-                result,
-            ).await;
+            Self::emit_belongs_to_edges(transport, file_nodes, rel_file, root, is_rust, result)
+                .await;
         }
 
         // Remove duplicate module nodes (same stable_id emitted for multiple files in same dir)
@@ -807,13 +923,17 @@ impl LspEnricher {
         result.new_nodes = deduplicated_new_nodes;
 
         let belongs_to_count = result.added_edges.len() - edges_before;
-        let module_node_count = result.new_nodes.iter()
+        let module_node_count = result
+            .new_nodes
+            .iter()
             .filter(|n| matches!(n.id.kind, NodeKind::Module))
             .count();
         if belongs_to_count > 0 {
             tracing::info!(
                 "LSP Pass 4 complete in {:?}: {} BelongsTo edges, {} module nodes",
-                pass4_start.elapsed(), belongs_to_count, module_node_count
+                pass4_start.elapsed(),
+                belongs_to_count,
+                module_node_count
             );
         }
     }
@@ -858,14 +978,11 @@ impl LspEnricher {
                 Ok(hints) if !hints.is_empty() => {
                     let type_map = Self::group_inlay_hints_by_node(&hints, file_nodes);
                     for (stable_id, type_str) in type_map {
-                        result.updated_nodes.push((
-                            stable_id,
-                            {
-                                let mut patch = std::collections::BTreeMap::new();
-                                patch.insert("inferred_types".to_string(), type_str);
-                                patch
-                            },
-                        ));
+                        result.updated_nodes.push((stable_id, {
+                            let mut patch = std::collections::BTreeMap::new();
+                            patch.insert("inferred_types".to_string(), type_str);
+                            patch
+                        }));
                         hint_patches += 1;
                     }
                 }
@@ -873,7 +990,8 @@ impl LspEnricher {
                 Err(e) => {
                     tracing::debug!(
                         "textDocument/inlayHint failed for {}: {}",
-                        rel_file.display(), e
+                        rel_file.display(),
+                        e
                     );
                 }
             }
@@ -882,7 +1000,8 @@ impl LspEnricher {
         if hint_patches > 0 {
             tracing::info!(
                 "LSP Pass 5 complete in {:?}: {} nodes patched with inferred_types",
-                pass5_start.elapsed(), hint_patches
+                pass5_start.elapsed(),
+                hint_patches
             );
         }
     }
@@ -915,7 +1034,8 @@ impl LspEnricher {
 
         let unique_files: Vec<PathBuf> = {
             let mut seen = std::collections::HashSet::new();
-            matching_nodes.iter()
+            matching_nodes
+                .iter()
                 .map(|n| n.id.file.clone())
                 .filter(|f| seen.insert(f.clone()))
                 .collect()
@@ -932,7 +1052,8 @@ impl LspEnricher {
         if has_pull_diagnostics {
             tracing::info!(
                 "LSP diagnostics pass: pull-based for {} files ({})",
-                unique_files.len(), self.server_command
+                unique_files.len(),
+                self.server_command
             );
             let mut pull_raw_total = 0usize;
             let mut pull_files_with_diags = 0usize;
@@ -949,7 +1070,8 @@ impl LspEnricher {
                             pull_files_with_diags += 1;
                             tracing::debug!(
                                 "textDocument/diagnostic: {} raw items for {}",
-                                diags.len(), rel_file.display()
+                                diags.len(),
+                                rel_file.display()
                             );
                         }
                         let nodes = Self::build_diagnostic_nodes(
@@ -965,28 +1087,43 @@ impl LspEnricher {
                         result.new_nodes.extend(nodes);
                     }
                     Err(e) => {
-                        tracing::debug!("textDocument/diagnostic failed for {}: {}", rel_file.display(), e);
+                        tracing::debug!(
+                            "textDocument/diagnostic failed for {}: {}",
+                            rel_file.display(),
+                            e
+                        );
                     }
                 }
             }
             tracing::info!(
                 "LSP diagnostics pass: pull complete -- {} raw items from {} files with diagnostics (out of {} files)",
-                pull_raw_total, pull_files_with_diags, unique_files.len()
+                pull_raw_total,
+                pull_files_with_diags,
+                unique_files.len()
             );
         } else {
             let expected_uris: std::collections::HashSet<String> = unique_files
                 .iter()
-                .filter_map(|rel_file| path_to_uri(&root.join(rel_file)).ok().map(|u| u.to_string()))
+                .filter_map(|rel_file| {
+                    path_to_uri(&root.join(rel_file))
+                        .ok()
+                        .map(|u| u.to_string())
+                })
                 .collect();
 
             let captured: HashMap<String, Vec<serde_json::Value>> = {
                 let sink = diag_sink.lock().unwrap();
                 sink.clone()
             };
-            let relevant_count = captured.keys().filter(|u| expected_uris.contains(*u)).count();
+            let relevant_count = captured
+                .keys()
+                .filter(|u| expected_uris.contains(*u))
+                .count();
             tracing::info!(
                 "LSP diagnostics pass: push-captured {}/{} relevant files with diagnostics ({})",
-                relevant_count, captured.len(), self.server_command
+                relevant_count,
+                captured.len(),
+                self.server_command
             );
             for (uri, diags) in &captured {
                 if !expected_uris.contains(uri) {

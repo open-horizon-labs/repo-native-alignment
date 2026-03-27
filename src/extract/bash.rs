@@ -51,7 +51,12 @@ impl Extractor for BashExtractor {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_bash::LANGUAGE.into())?;
         if let Some(tree) = parser.parse(content, None) {
-            collect_allcaps_consts(tree.root_node(), path, content.as_bytes(), &mut result.nodes);
+            collect_allcaps_consts(
+                tree.root_node(),
+                path,
+                content.as_bytes(),
+                &mut result.nodes,
+            );
         }
 
         Ok(result)
@@ -69,12 +74,19 @@ fn collect_allcaps_consts(
         if let Some(name_node) = node.child_by_field_name("name") {
             let name_str = name_node.utf8_text(source).unwrap_or("").trim().to_string();
             if !name_str.is_empty()
-                && name_str.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-                && name_str.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
+                && name_str
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                && name_str
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_uppercase())
+                    .unwrap_or(false)
             {
                 let body = node.utf8_text(source).unwrap_or("").to_string();
                 let sig = body.lines().next().unwrap_or("").trim().to_string();
-                let value_str = node.child_by_field_name("value")
+                let value_str = node
+                    .child_by_field_name("value")
                     .and_then(|v| v.utf8_text(source).ok())
                     .map(|s| s.trim().to_string());
                 let mut metadata = BTreeMap::new();

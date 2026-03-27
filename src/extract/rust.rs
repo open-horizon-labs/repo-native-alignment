@@ -8,9 +8,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::graph::{
-    Confidence, Edge, EdgeKind, ExtractionSource, NodeId, NodeKind,
-};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, NodeId, NodeKind};
 
 use super::generic::{GenericExtractor, LangConfig};
 use super::query::RouteQueryConfig;
@@ -49,38 +47,40 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
     language_name: "rust",
     extensions: &["rs"],
     node_kinds: &[
-        ("function_item",    NodeKind::Function),
-        ("struct_item",      NodeKind::Struct),
-        ("trait_item",       NodeKind::Trait),
-        ("impl_item",        NodeKind::Impl),
-        ("enum_item",        NodeKind::Enum),
-        ("type_item",        NodeKind::TypeAlias),
-        ("const_item",       NodeKind::Const),
-        ("static_item",      NodeKind::Const),
-        ("mod_item",         NodeKind::Module),
-        ("use_declaration",  NodeKind::Import),
+        ("function_item", NodeKind::Function),
+        ("struct_item", NodeKind::Struct),
+        ("trait_item", NodeKind::Trait),
+        ("impl_item", NodeKind::Impl),
+        ("enum_item", NodeKind::Enum),
+        ("type_item", NodeKind::TypeAlias),
+        ("const_item", NodeKind::Const),
+        ("static_item", NodeKind::Const),
+        ("mod_item", NodeKind::Module),
+        ("use_declaration", NodeKind::Import),
         ("macro_definition", NodeKind::Macro),
-        ("field_declaration",        NodeKind::Field),
-        ("enum_variant",             NodeKind::EnumVariant),
-        ("function_signature_item",  NodeKind::Function),
+        ("field_declaration", NodeKind::Field),
+        ("enum_variant", NodeKind::EnumVariant),
+        ("function_signature_item", NodeKind::Function),
     ],
     scope_parent_kinds: &["impl_item", "struct_item", "enum_item", "trait_item"],
     const_value_field: Some("value"),
     // use_declaration: the name IS the full `use crate::foo::Bar;` text.
     full_text_name_kinds: &["use_declaration"],
-    string_literal_kinds: &[
-        ("string_literal", Some("string_content")),
-    ],
+    string_literal_kinds: &[("string_literal", Some("string_content"))],
     param_container_field: Some("parameters"),
     param_type_field: Some("type"),
     return_type_field: Some("return_type"),
     type_requires_uppercase: true,
     branch_node_types: &[
-        "if_expression", "else_clause",
-        "match_expression", "match_arm",
-        "for_expression", "while_expression", "loop_expression",
-        "binary_expression",  // covers && and || (also arithmetic — same trade-off as Go/TS/Java)
-        "try_expression",     // ?
+        "if_expression",
+        "else_clause",
+        "match_expression",
+        "match_arm",
+        "for_expression",
+        "while_expression",
+        "loop_expression",
+        "binary_expression", // covers && and || (also arithmetic — same trade-off as Go/TS/Java)
+        "try_expression",    // ?
     ],
     decorator_node_kinds: &["attribute_item"],
     type_param_node_kind: Some("type_parameters"),
@@ -128,14 +128,18 @@ impl Extractor for RustExtractor {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
         if let Some(tree) = parser.parse(content, None) {
-            detect_topology_patterns(tree.root_node(), path, content.as_bytes(), &mut result.edges);
+            detect_topology_patterns(
+                tree.root_node(),
+                path,
+                content.as_bytes(),
+                &mut result.edges,
+            );
             enrich_static_metadata(tree.root_node(), content.as_bytes(), &mut result.nodes);
         }
 
         Ok(result)
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Static item metadata enrichment
@@ -182,10 +186,12 @@ fn enrich_static_metadata_walk(
 
         // Find the matching node via HashMap lookup
         if let Some(&idx) = node_index.get(&(name.to_string(), line)) {
-            nodes[idx].metadata
+            nodes[idx]
+                .metadata
                 .insert("storage".to_string(), "static".to_string());
             if is_mutable {
-                nodes[idx].metadata
+                nodes[idx]
+                    .metadata
                     .insert("mutable".to_string(), "true".to_string());
             }
         }
@@ -218,41 +224,40 @@ fn detect_topology_patterns(
     let kind = node.kind();
 
     if kind == "call_expression"
-        && let Some(func_node) = node.child_by_field_name("function") {
-            let func_text = func_node.utf8_text(source).unwrap_or("");
+        && let Some(func_node) = node.child_by_field_name("function")
+    {
+        let func_text = func_node.utf8_text(source).unwrap_or("");
 
-            // Find the enclosing function for context
-            let enclosing = find_enclosing_function(node, source);
-            let from_name = enclosing.unwrap_or_else(|| "<top-level>".to_string());
+        // Find the enclosing function for context
+        let enclosing = find_enclosing_function(node, source);
+        let from_name = enclosing.unwrap_or_else(|| "<top-level>".to_string());
 
-            if func_text == "Command::new" || func_text.ends_with("::Command::new") {
-                let line = node.start_position().row + 1;
-                edges.push(make_topology_edge(
-                    path,
-                    &from_name,
-                    &format!("subprocess@L{}", line),
-                    "subprocess",
-                ));
-            } else if func_text == "TcpListener::bind"
-                || func_text.ends_with("::TcpListener::bind")
-            {
-                let line = node.start_position().row + 1;
-                edges.push(make_topology_edge(
-                    path,
-                    &from_name,
-                    &format!("tcp_listener@L{}", line),
-                    "network_listener",
-                ));
-            } else if func_text == "tokio::spawn" {
-                let line = node.start_position().row + 1;
-                edges.push(make_topology_edge(
-                    path,
-                    &from_name,
-                    &format!("async_task@L{}", line),
-                    "async_boundary",
-                ));
-            }
+        if func_text == "Command::new" || func_text.ends_with("::Command::new") {
+            let line = node.start_position().row + 1;
+            edges.push(make_topology_edge(
+                path,
+                &from_name,
+                &format!("subprocess@L{}", line),
+                "subprocess",
+            ));
+        } else if func_text == "TcpListener::bind" || func_text.ends_with("::TcpListener::bind") {
+            let line = node.start_position().row + 1;
+            edges.push(make_topology_edge(
+                path,
+                &from_name,
+                &format!("tcp_listener@L{}", line),
+                "network_listener",
+            ));
+        } else if func_text == "tokio::spawn" {
+            let line = node.start_position().row + 1;
+            edges.push(make_topology_edge(
+                path,
+                &from_name,
+                &format!("async_task@L{}", line),
+                "async_boundary",
+            ));
         }
+    }
 
     // Recurse
     for i in 0..node.child_count() {
@@ -267,9 +272,10 @@ fn find_enclosing_function(node: tree_sitter::Node, source: &[u8]) -> Option<Str
     let mut current = node.parent();
     while let Some(parent) = current {
         if parent.kind() == "function_item"
-            && let Some(name_node) = parent.child_by_field_name("name") {
-                return name_node.utf8_text(source).ok().map(|s| s.to_string());
-            }
+            && let Some(name_node) = parent.child_by_field_name("name")
+        {
+            return name_node.utf8_text(source).ok().map(|s| s.to_string());
+        }
         current = parent.parent();
     }
     None
@@ -350,24 +356,60 @@ pub const MAX_RETRIES: u32 = 5;
 pub const CONTENT_TYPE: &str = "application/json";
 "#;
         let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
-        let consts: Vec<_> = result.nodes.iter().filter(|n| n.id.kind == NodeKind::Const).collect();
+        let consts: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Const)
+            .collect();
         // 2 declared consts + 1 synthetic string literal ("application/json" len > 3)
         assert!(consts.len() >= 2, "Should find at least 2 const nodes");
 
-        let declared: Vec<_> = consts.iter().filter(|n| n.metadata.get("synthetic").map(|s| s.as_str()) == Some("false")).collect();
-        assert_eq!(declared.len(), 2, "Should find exactly 2 declared (non-synthetic) const nodes");
+        let declared: Vec<_> = consts
+            .iter()
+            .filter(|n| n.metadata.get("synthetic").map(|s| s.as_str()) == Some("false"))
+            .collect();
+        assert_eq!(
+            declared.len(),
+            2,
+            "Should find exactly 2 declared (non-synthetic) const nodes"
+        );
 
-        let max_retries = declared.iter().find(|n| n.id.name == "MAX_RETRIES").expect("Should find MAX_RETRIES");
-        assert_eq!(max_retries.metadata.get("value").map(|s| s.as_str()), Some("5"), "Should extract value 5");
-        assert_eq!(max_retries.metadata.get("synthetic").map(|s| s.as_str()), Some("false"));
+        let max_retries = declared
+            .iter()
+            .find(|n| n.id.name == "MAX_RETRIES")
+            .expect("Should find MAX_RETRIES");
+        assert_eq!(
+            max_retries.metadata.get("value").map(|s| s.as_str()),
+            Some("5"),
+            "Should extract value 5"
+        );
+        assert_eq!(
+            max_retries.metadata.get("synthetic").map(|s| s.as_str()),
+            Some("false")
+        );
 
-        let content_type = declared.iter().find(|n| n.id.name == "CONTENT_TYPE").expect("Should find CONTENT_TYPE");
-        assert!(content_type.metadata.get("value").is_some(), "Should extract string value");
+        let content_type = declared
+            .iter()
+            .find(|n| n.id.name == "CONTENT_TYPE")
+            .expect("Should find CONTENT_TYPE");
+        assert!(
+            content_type.metadata.get("value").is_some(),
+            "Should extract string value"
+        );
 
         // The string literal value should also be captured as a synthetic Const
-        let synthetic: Vec<_> = consts.iter().filter(|n| n.metadata.get("synthetic").map(|s| s.as_str()) == Some("true")).collect();
-        assert!(!synthetic.is_empty(), "Should capture at least 1 synthetic string literal");
-        assert!(synthetic.iter().any(|n| n.id.name == "application/json"), "Should capture 'application/json'");
+        let synthetic: Vec<_> = consts
+            .iter()
+            .filter(|n| n.metadata.get("synthetic").map(|s| s.as_str()) == Some("true"))
+            .collect();
+        assert!(
+            !synthetic.is_empty(),
+            "Should capture at least 1 synthetic string literal"
+        );
+        assert!(
+            synthetic.iter().any(|n| n.id.name == "application/json"),
+            "Should capture 'application/json'"
+        );
     }
 
     #[test]
@@ -530,10 +572,16 @@ type Callback = Box<dyn Fn(i32) -> bool>;
 
         let names: Vec<&str> = type_aliases.iter().map(|n| n.id.name.as_str()).collect();
         assert!(names.contains(&"Result"), "Should find type alias Result");
-        assert!(names.contains(&"Callback"), "Should find type alias Callback");
+        assert!(
+            names.contains(&"Callback"),
+            "Should find type alias Callback"
+        );
 
         // Type aliases should be embeddable
-        assert!(NodeKind::TypeAlias.is_embeddable(), "TypeAlias should be embeddable");
+        assert!(
+            NodeKind::TypeAlias.is_embeddable(),
+            "TypeAlias should be embeddable"
+        );
     }
 
     #[test]
@@ -568,7 +616,11 @@ pub enum Color {
 
         // Variants should have kind EnumVariant
         let active = result.nodes.iter().find(|n| n.id.name == "Active").unwrap();
-        assert_eq!(active.id.kind, NodeKind::EnumVariant, "Variant should be EnumVariant kind");
+        assert_eq!(
+            active.id.kind,
+            NodeKind::EnumVariant,
+            "Variant should be EnumVariant kind"
+        );
 
         // Variants should have parent_scope pointing to the enum
         assert_eq!(
@@ -591,7 +643,9 @@ pub enum Color {
             .filter(|e| e.kind == EdgeKind::HasField)
             .collect();
         assert!(
-            has_field_edges.iter().any(|e| e.from.name == "Status" && e.to.name == "Active"),
+            has_field_edges
+                .iter()
+                .any(|e| e.from.name == "Status" && e.to.name == "Active"),
             "Should have HasField edge Status -> Active"
         );
     }
@@ -612,15 +666,34 @@ pub const MAX_SIZE: usize = 1024;
         let consts: Vec<_> = result
             .nodes
             .iter()
-            .filter(|n| n.id.kind == NodeKind::Const && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("false"))
+            .filter(|n| {
+                n.id.kind == NodeKind::Const
+                    && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("false")
+            })
             .collect();
         let names: Vec<&str> = consts.iter().map(|n| n.id.name.as_str()).collect();
 
         // All four should be found as Const nodes
-        assert!(names.contains(&"LOGGER"), "Should find static LOGGER, got: {:?}", names);
-        assert!(names.contains(&"COUNTER"), "Should find static mut COUNTER, got: {:?}", names);
-        assert!(names.contains(&"VERSION"), "Should find static VERSION, got: {:?}", names);
-        assert!(names.contains(&"MAX_SIZE"), "Should find const MAX_SIZE, got: {:?}", names);
+        assert!(
+            names.contains(&"LOGGER"),
+            "Should find static LOGGER, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"COUNTER"),
+            "Should find static mut COUNTER, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"VERSION"),
+            "Should find static VERSION, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"MAX_SIZE"),
+            "Should find const MAX_SIZE, got: {:?}",
+            names
+        );
 
         // LOGGER should have storage=static, no mutable
         let logger = consts.iter().find(|n| n.id.name == "LOGGER").unwrap();
@@ -691,17 +764,31 @@ static MUTEX: Mutex<HashMap<String, i32>> = Mutex::new(HashMap::new());
 "#;
         let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
 
-        let pool = result.nodes.iter().find(|n| n.id.name == "POOL").expect("Should find POOL");
+        let pool = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "POOL")
+            .expect("Should find POOL");
         assert!(
             pool.metadata.get("value").is_none(),
             "Complex initializer should not have scalar value, got: {:?}",
             pool.metadata.get("value")
         );
-        assert_eq!(pool.metadata.get("storage").map(|s| s.as_str()), Some("static"));
+        assert_eq!(
+            pool.metadata.get("storage").map(|s| s.as_str()),
+            Some("static")
+        );
 
-        let mutex = result.nodes.iter().find(|n| n.id.name == "MUTEX").expect("Should find MUTEX");
+        let mutex = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "MUTEX")
+            .expect("Should find MUTEX");
         assert!(mutex.metadata.get("value").is_none());
-        assert_eq!(mutex.metadata.get("storage").map(|s| s.as_str()), Some("static"));
+        assert_eq!(
+            mutex.metadata.get("storage").map(|s| s.as_str()),
+            Some("static")
+        );
     }
 
     #[test]
@@ -739,10 +826,16 @@ macro_rules! simple_assert {
 
         let names: Vec<&str> = macros.iter().map(|n| n.id.name.as_str()).collect();
         assert!(names.contains(&"my_vec"), "Should find macro my_vec");
-        assert!(names.contains(&"simple_assert"), "Should find macro simple_assert");
+        assert!(
+            names.contains(&"simple_assert"),
+            "Should find macro simple_assert"
+        );
 
         // Macros should be embeddable
-        assert!(NodeKind::Macro.is_embeddable(), "Macro should be embeddable");
+        assert!(
+            NodeKind::Macro.is_embeddable(),
+            "Macro should be embeddable"
+        );
 
         // Macros should have language = rust
         assert_eq!(macros[0].language, "rust");
@@ -803,7 +896,10 @@ macro_rules! count {
         assert_eq!(macros.len(), 1, "Should find complex macro");
         assert_eq!(macros[0].id.name, "count");
         // Body should contain the macro content (for embedding)
-        assert!(!macros[0].body.is_empty(), "Macro body should be captured for embedding");
+        assert!(
+            !macros[0].body.is_empty(),
+            "Macro body should be captured for embedding"
+        );
     }
 
     /// Adversarial: const and static with same name in same file (NodeId collision risk)
@@ -820,8 +916,11 @@ static FOO: u32 = 42;
         let foos: Vec<_> = result
             .nodes
             .iter()
-            .filter(|n| n.id.name == "FOO" && n.id.kind == NodeKind::Const
-                && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("false"))
+            .filter(|n| {
+                n.id.name == "FOO"
+                    && n.id.kind == NodeKind::Const
+                    && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("false")
+            })
             .collect();
         // Both should be extracted even though they'll have same NodeId
         // (this is the pre-existing #119 issue)
@@ -832,7 +931,8 @@ static FOO: u32 = 42;
         );
         // At least one should have storage=static
         assert!(
-            foos.iter().any(|n| n.metadata.get("storage").map(|s| s.as_str()) == Some("static")),
+            foos.iter()
+                .any(|n| n.metadata.get("storage").map(|s| s.as_str()) == Some("static")),
             "At least one FOO should have storage=static"
         );
         // At least one should NOT have storage metadata (the const)
@@ -854,14 +954,23 @@ pub trait Service {
         let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
 
         // Trait itself should be found
-        let service = result.nodes.iter().find(|n| n.id.name == "Service" && n.id.kind == NodeKind::Trait);
+        let service = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Service" && n.id.kind == NodeKind::Trait);
         assert!(service.is_some(), "Should find trait Service");
 
         // Trait methods should be indexed as Function nodes
-        let serve = result.nodes.iter().find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function);
+        let serve = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function);
         assert!(serve.is_some(), "Should find trait method serve");
 
-        let stop = result.nodes.iter().find(|n| n.id.name == "stop" && n.id.kind == NodeKind::Function);
+        let stop = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "stop" && n.id.kind == NodeKind::Function);
         assert!(stop.is_some(), "Should find trait method stop");
 
         // Methods should have parent_scope pointing to the trait
@@ -906,15 +1015,27 @@ pub trait Handler {
         let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
 
         // Both signature-only and default methods should be found
-        let handle = result.nodes.iter().find(|n| n.id.name == "handle" && n.id.kind == NodeKind::Function);
+        let handle = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "handle" && n.id.kind == NodeKind::Function);
         assert!(handle.is_some(), "Should find signature-only method handle");
 
-        let name_fn = result.nodes.iter().find(|n| n.id.name == "name" && n.id.kind == NodeKind::Function);
+        let name_fn = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "name" && n.id.kind == NodeKind::Function);
         assert!(name_fn.is_some(), "Should find default method name");
 
         // Both should have parent_scope = Handler
-        assert_eq!(handle.unwrap().metadata.get("parent_scope"), Some(&"Handler".to_string()));
-        assert_eq!(name_fn.unwrap().metadata.get("parent_scope"), Some(&"Handler".to_string()));
+        assert_eq!(
+            handle.unwrap().metadata.get("parent_scope"),
+            Some(&"Handler".to_string())
+        );
+        assert_eq!(
+            name_fn.unwrap().metadata.get("parent_scope"),
+            Some(&"Handler".to_string())
+        );
     }
 
     #[test]
@@ -937,17 +1058,34 @@ impl Service for MyService {
 
         // There should be exactly 2 Function nodes named "serve":
         // one from the trait (function_signature_item) and one from the impl (function_item)
-        let serves: Vec<_> = result.nodes.iter()
+        let serves: Vec<_> = result
+            .nodes
+            .iter()
             .filter(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function)
             .collect();
-        assert_eq!(serves.len(), 2, "Should find exactly 2 serve methods (trait + impl), got: {}", serves.len());
+        assert_eq!(
+            serves.len(),
+            2,
+            "Should find exactly 2 serve methods (trait + impl), got: {}",
+            serves.len()
+        );
 
         // One should have parent_scope = Service (trait), other = Service for MyService (impl)
-        let trait_serve = serves.iter().find(|n| n.metadata.get("parent_scope") == Some(&"Service".to_string()));
-        assert!(trait_serve.is_some(), "Should find trait serve with parent_scope=Service");
+        let trait_serve = serves
+            .iter()
+            .find(|n| n.metadata.get("parent_scope") == Some(&"Service".to_string()));
+        assert!(
+            trait_serve.is_some(),
+            "Should find trait serve with parent_scope=Service"
+        );
 
-        let impl_serve = serves.iter().find(|n| n.metadata.get("parent_scope") == Some(&"Service for MyService".to_string()));
-        assert!(impl_serve.is_some(), "Should find impl serve with parent_scope=Service for MyService");
+        let impl_serve = serves
+            .iter()
+            .find(|n| n.metadata.get("parent_scope") == Some(&"Service for MyService".to_string()));
+        assert!(
+            impl_serve.is_some(),
+            "Should find impl serve with parent_scope=Service for MyService"
+        );
     }
 
     #[test]
@@ -966,20 +1104,52 @@ impl Foo {
         let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
 
         // new() has no self param -> static
-        let new_fn = result.nodes.iter().find(|n| n.id.name == "new" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(new_fn.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "new() should be static");
+        let new_fn = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "new" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            new_fn.metadata.get("is_static").map(|s| s.as_str()),
+            Some("true"),
+            "new() should be static"
+        );
 
         // instance(&self) -> not static
-        let instance = result.nodes.iter().find(|n| n.id.name == "instance" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(instance.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "instance() should not be static");
+        let instance = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "instance" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            instance.metadata.get("is_static").map(|s| s.as_str()),
+            Some("false"),
+            "instance() should not be static"
+        );
 
         // instance_mut(&mut self) -> not static
-        let instance_mut = result.nodes.iter().find(|n| n.id.name == "instance_mut" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(instance_mut.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "instance_mut() should not be static");
+        let instance_mut = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "instance_mut" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            instance_mut.metadata.get("is_static").map(|s| s.as_str()),
+            Some("false"),
+            "instance_mut() should not be static"
+        );
 
         // associated() has no self -> static
-        let associated = result.nodes.iter().find(|n| n.id.name == "associated" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(associated.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "associated() should be static");
+        let associated = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "associated" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            associated.metadata.get("is_static").map(|s| s.as_str()),
+            Some("true"),
+            "associated() should be static"
+        );
     }
 
     #[test]
@@ -988,8 +1158,15 @@ impl Foo {
         let code = "pub fn top_level() {}\n";
         let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
 
-        let func = result.nodes.iter().find(|n| n.id.name == "top_level").unwrap();
-        assert!(func.metadata.get("is_static").is_none(), "Top-level function should NOT have is_static");
+        let func = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "top_level")
+            .unwrap();
+        assert!(
+            func.metadata.get("is_static").is_none(),
+            "Top-level function should NOT have is_static"
+        );
     }
 
     #[test]
@@ -1003,11 +1180,27 @@ pub trait Service {
 "#;
         let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
 
-        let serve = result.nodes.iter().find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(serve.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "serve(&self) should be instance");
+        let serve = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            serve.metadata.get("is_static").map(|s| s.as_str()),
+            Some("false"),
+            "serve(&self) should be instance"
+        );
 
-        let create = result.nodes.iter().find(|n| n.id.name == "create" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(create.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "create() should be static");
+        let create = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "create" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            create.metadata.get("is_static").map(|s| s.as_str()),
+            Some("true"),
+            "create() should be static"
+        );
     }
 
     #[test]
@@ -1032,18 +1225,47 @@ pub fn handle_request() {}
 
         // Struct with #[derive]
         let config = result.nodes.iter().find(|n| n.id.name == "Config").unwrap();
-        let decorators = config.metadata.get("decorators").expect("Config should have decorators");
-        assert!(decorators.contains("#[derive(Debug, Clone)]"), "got: {}", decorators);
+        let decorators = config
+            .metadata
+            .get("decorators")
+            .expect("Config should have decorators");
+        assert!(
+            decorators.contains("#[derive(Debug, Clone)]"),
+            "got: {}",
+            decorators
+        );
 
         // Function with #[test]
-        let test_fn = result.nodes.iter().find(|n| n.id.name == "test_something").unwrap();
-        assert_eq!(test_fn.metadata.get("decorators").map(|s| s.as_str()), Some("#[test]"));
+        let test_fn = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "test_something")
+            .unwrap();
+        assert_eq!(
+            test_fn.metadata.get("decorators").map(|s| s.as_str()),
+            Some("#[test]")
+        );
 
         // Function with multiple attributes
-        let handle = result.nodes.iter().find(|n| n.id.name == "handle_request").unwrap();
-        let decorators = handle.metadata.get("decorators").expect("handle_request should have decorators");
-        assert!(decorators.contains("#[cfg(feature = \"mcp\")]"), "got: {}", decorators);
-        assert!(decorators.contains("#[instrument(skip(self))]"), "got: {}", decorators);
+        let handle = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "handle_request")
+            .unwrap();
+        let decorators = handle
+            .metadata
+            .get("decorators")
+            .expect("handle_request should have decorators");
+        assert!(
+            decorators.contains("#[cfg(feature = \"mcp\")]"),
+            "got: {}",
+            decorators
+        );
+        assert!(
+            decorators.contains("#[instrument(skip(self))]"),
+            "got: {}",
+            decorators
+        );
     }
 
     #[test]
@@ -1063,13 +1285,27 @@ async fn embed_texts(texts: Vec<String>) -> Vec<Vec<f32>> {
 }
 "#;
         let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
-        let fns: Vec<&str> = result.nodes.iter()
+        let fns: Vec<&str> = result
+            .nodes
+            .iter()
             .filter(|n| n.id.kind == NodeKind::Function)
             .map(|n| n.id.name.as_str())
             .collect();
-        assert!(fns.contains(&"private_helper"), "Should find private fn, got: {:?}", fns);
-        assert!(fns.contains(&"public_api"), "Should find public fn, got: {:?}", fns);
-        assert!(fns.contains(&"embed_texts"), "Should find async private fn, got: {:?}", fns);
+        assert!(
+            fns.contains(&"private_helper"),
+            "Should find private fn, got: {:?}",
+            fns
+        );
+        assert!(
+            fns.contains(&"public_api"),
+            "Should find public fn, got: {:?}",
+            fns
+        );
+        assert!(
+            fns.contains(&"embed_texts"),
+            "Should find async private fn, got: {:?}",
+            fns
+        );
     }
 
     /// Adversarial: impl with `self` value parameter (move semantics)
@@ -1086,11 +1322,27 @@ impl Builder {
 "#;
         let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
 
-        let build = result.nodes.iter().find(|n| n.id.name == "build" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(build.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "build(self) should be instance (self by value)");
+        let build = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "build" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            build.metadata.get("is_static").map(|s| s.as_str()),
+            Some("false"),
+            "build(self) should be instance (self by value)"
+        );
 
-        let consume = result.nodes.iter().find(|n| n.id.name == "consume" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(consume.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "consume(mut self) should be instance");
+        let consume = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "consume" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            consume.metadata.get("is_static").map(|s| s.as_str()),
+            Some("false"),
+            "consume(mut self) should be instance"
+        );
     }
 
     /// Adversarial: trait impl method with self param
@@ -1111,10 +1363,19 @@ impl Display for Foo {
         let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
 
         // Both the trait signature and impl method should be instance
-        let fmts: Vec<_> = result.nodes.iter().filter(|n| n.id.name == "fmt" && n.id.kind == NodeKind::Function).collect();
+        let fmts: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.name == "fmt" && n.id.kind == NodeKind::Function)
+            .collect();
         assert_eq!(fmts.len(), 2, "Should find 2 fmt methods");
         for f in &fmts {
-            assert_eq!(f.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "fmt(&self) should be instance: parent_scope={:?}", f.metadata.get("parent_scope"));
+            assert_eq!(
+                f.metadata.get("is_static").map(|s| s.as_str()),
+                Some("false"),
+                "fmt(&self) should be instance: parent_scope={:?}",
+                f.metadata.get("parent_scope")
+            );
         }
     }
 }

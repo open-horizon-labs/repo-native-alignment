@@ -10,19 +10,24 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::extract::ExtractorRegistry;
-use crate::graph::{Edge, Node};
 use crate::graph::index::GraphIndex;
+use crate::graph::{Edge, Node};
 use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
 use crate::scanner::Scanner;
 
 use super::helpers;
 use super::state::GraphState;
-use super::store::{
-    delete_nodes_for_roots, persist_graph_incremental, persist_graph_to_lance,
-};
+use super::store::{delete_nodes_for_roots, persist_graph_incremental, persist_graph_to_lance};
 
 /// LanceDB persist delta: (root_slug, root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove)
-pub(super) type LanceDelta = (String, PathBuf, Vec<Node>, Vec<Edge>, Vec<String>, HashSet<PathBuf>);
+pub(super) type LanceDelta = (
+    String,
+    PathBuf,
+    Vec<Node>,
+    Vec<Edge>,
+    Vec<String>,
+    HashSet<PathBuf>,
+);
 
 /// Result of scanning all workspace roots for file changes.
 pub(super) struct ScanResult {
@@ -79,11 +84,7 @@ pub(super) fn scan_roots(
             }
         } else {
             let state_path = cache_state_path(&root_slug);
-            match Scanner::with_excludes_and_state_path(
-                root_path.clone(),
-                excludes,
-                state_path,
-            ) {
+            match Scanner::with_excludes_and_state_path(root_path.clone(), excludes, state_path) {
                 Ok(s) => s,
                 Err(_) => continue,
             }
@@ -169,10 +170,9 @@ pub(super) async fn update_graph(
             .map(|e| e.stable_id())
             .collect();
 
-        graph_state.nodes.retain(|n| {
-            n.id.root != *root_slug
-                || !files_to_remove.contains(&n.id.file)
-        });
+        graph_state
+            .nodes
+            .retain(|n| n.id.root != *root_slug || !files_to_remove.contains(&n.id.file));
         graph_state.edges.retain(|e| {
             e.from.root != *root_slug
                 || (!files_to_remove.contains(&e.from.file)
@@ -189,7 +189,8 @@ pub(super) async fn update_graph(
             node.id.root = root_slug.clone();
         }
         // Build file index for suffix resolution
-        let file_index: HashSet<String> = graph_state.nodes
+        let file_index: HashSet<String> = graph_state
+            .nodes
             .iter()
             .chain(extraction.nodes.iter())
             .map(|n| n.id.file.to_string_lossy().to_string())
@@ -221,28 +222,29 @@ pub(super) async fn update_graph(
         let before_edge_ids: HashSet<String> =
             graph_state.edges.iter().map(|e| e.stable_id()).collect();
 
-        let root_pairs: Vec<(String, PathBuf)> =
-            WorkspaceConfig::load()
-                .with_primary_root(repo_root.to_path_buf())
-                .with_worktrees(repo_root)
-                .with_declared_roots(repo_root)
-                .resolved_roots()
-                .into_iter()
-                .map(|r| (r.slug, r.path))
-                .collect();
-        let primary_slug =
-            RootConfig::code_project(repo_root.to_path_buf()).slug();
+        let root_pairs: Vec<(String, PathBuf)> = WorkspaceConfig::load()
+            .with_primary_root(repo_root.to_path_buf())
+            .with_worktrees(repo_root)
+            .with_declared_roots(repo_root)
+            .resolved_roots()
+            .into_iter()
+            .map(|r| (r.slug, r.path))
+            .collect();
+        let primary_slug = RootConfig::code_project(repo_root.to_path_buf()).slug();
 
         // Only roots with file changes should trigger LSP enrichment.
-        let dirty_slugs: Option<HashSet<String>> = Some(scan_result.per_root_scans
-            .iter()
-            .filter(|(_, scan, _, _)| {
-                !scan.changed_files.is_empty()
-                    || !scan.new_files.is_empty()
-                    || !scan.deleted_files.is_empty()
-            })
-            .map(|(slug, _, _, _)| slug.clone())
-            .collect());
+        let dirty_slugs: Option<HashSet<String>> = Some(
+            scan_result
+                .per_root_scans
+                .iter()
+                .filter(|(_, scan, _, _)| {
+                    !scan.changed_files.is_empty()
+                        || !scan.new_files.is_empty()
+                        || !scan.deleted_files.is_empty()
+                })
+                .map(|(slug, _, _, _)| slug.clone())
+                .collect(),
+        );
 
         match crate::extract::consumers::emit_enrichment_pipeline(
             std::mem::take(&mut graph_state.nodes),
@@ -257,7 +259,9 @@ pub(super) async fn update_graph(
                 skip_lsp: false, // background scanner: LSP runs inline
             },
             dirty_slugs,
-        ).await {
+        )
+        .await
+        {
             Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
                 graph_state.nodes = enriched_nodes;
                 graph_state.edges = enriched_edges;
@@ -278,11 +282,15 @@ pub(super) async fn update_graph(
         {
             let mut seen_nodes = HashSet::new();
             graph_state.nodes.reverse();
-            graph_state.nodes.retain(|n| seen_nodes.insert(n.stable_id()));
+            graph_state
+                .nodes
+                .retain(|n| seen_nodes.insert(n.stable_id()));
             graph_state.nodes.reverse();
 
             let mut seen_edges = HashSet::new();
-            graph_state.edges.retain(|e| seen_edges.insert(e.stable_id()));
+            graph_state
+                .edges
+                .retain(|e| seen_edges.insert(e.stable_id()));
         }
 
         // Collect net-new nodes/edges from the passes for LanceDB persist.
@@ -320,17 +328,17 @@ pub(super) async fn update_graph(
     graph_state.index = GraphIndex::new();
     graph_state.index.rebuild_from_edges(&graph_state.edges);
     for node in &graph_state.nodes {
-        graph_state.index.ensure_node(
-            &node.stable_id(),
-            &node.id.kind.to_string(),
-        );
+        graph_state
+            .index
+            .ensure_node(&node.stable_id(), &node.id.kind.to_string());
     }
 
     // Recompute PageRank importance scores.
     let pagerank_scores = graph_state.index.compute_pagerank(0.85, 20);
     for node in &mut graph_state.nodes {
         if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
-            node.metadata.insert("importance".to_string(), format!("{:.6}", score));
+            node.metadata
+                .insert("importance".to_string(), format!("{:.6}", score));
         }
     }
 
@@ -357,7 +365,9 @@ pub(super) async fn persist_deltas(
     lance_write_lock: &tokio::sync::Mutex<()>,
 ) {
     let mut persisted_slugs: HashSet<String> = HashSet::new();
-    for (slug, root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove) in lance_deltas {
+    for (slug, root_path, upsert_nodes, upsert_edges, deleted_edge_ids, files_to_remove) in
+        lance_deltas
+    {
         let persist_result = {
             let _lance_guard = lance_write_lock.lock().await;
             let files_to_remove_vec: Vec<PathBuf> = files_to_remove.into_iter().collect();
@@ -374,12 +384,17 @@ pub(super) async fn persist_deltas(
             Ok(true) => {
                 tracing::info!("Background scan: schema migrated; performing full persist now");
                 let snap = graph.load_full();
-                let snapshot = snap.as_ref().as_ref()
+                let snapshot = snap
+                    .as_ref()
+                    .as_ref()
                     .map(|gs| (gs.nodes.clone(), gs.edges.clone()));
                 if let Some((nodes, edges)) = snapshot {
                     let _lance_guard = lance_write_lock.lock().await;
                     if let Err(e) = persist_graph_to_lance(repo_root, &nodes, &edges).await {
-                        tracing::error!("Background scan: full persist after migration failed: {:#}", e);
+                        tracing::error!(
+                            "Background scan: full persist after migration failed: {:#}",
+                            e
+                        );
                         continue;
                     }
                 }
@@ -389,7 +404,11 @@ pub(super) async fn persist_deltas(
                 persisted_slugs.insert(slug);
             }
             Err(e) => {
-                tracing::error!("Background scan: failed to persist graph delta for '{}': {:#}", slug, e);
+                tracing::error!(
+                    "Background scan: failed to persist graph delta for '{}': {:#}",
+                    slug,
+                    e
+                );
             }
         }
     }
@@ -397,9 +416,14 @@ pub(super) async fn persist_deltas(
     // Commit scanner state only for roots that persisted successfully.
     for (root_slug, _scan, _root_path, scanner) in per_root_scans {
         if persisted_slugs.contains(root_slug)
-            && let Err(e) = scanner.commit_state() {
-                tracing::error!("Background scan: failed to commit scanner state for '{}': {}", root_slug, e);
-            }
+            && let Err(e) = scanner.commit_state()
+        {
+            tracing::error!(
+                "Background scan: failed to commit scanner state for '{}': {}",
+                root_slug,
+                e
+            );
+        }
     }
 
     // Update freshness timestamp if any root persisted successfully.
@@ -416,10 +440,7 @@ pub(super) async fn persist_deltas(
     if !removed_slugs.is_empty() {
         let _lance_guard = lance_write_lock.lock().await;
         if let Err(e) = delete_nodes_for_roots(repo_root, removed_slugs).await {
-            tracing::warn!(
-                "Failed to delete LanceDB rows for removed worktrees: {}",
-                e
-            );
+            tracing::warn!("Failed to delete LanceDB rows for removed worktrees: {}", e);
         }
     }
 }

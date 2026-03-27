@@ -223,7 +223,10 @@ mod tests {
             "mode": "neighbors"
         }))
         .unwrap();
-        assert_eq!(s.node, Some("test:src/server.rs:RnaHandler:struct".to_string()));
+        assert_eq!(
+            s.node,
+            Some("test:src/server.rs:RnaHandler:struct".to_string())
+        );
     }
 
     #[test]
@@ -310,7 +313,10 @@ mod tests {
             "edge_types": ["calls", "implements"]
         }))
         .unwrap();
-        assert_eq!(s.edge_types, Some(vec!["calls".to_string(), "implements".to_string()]));
+        assert_eq!(
+            s.edge_types,
+            Some(vec!["calls".to_string(), "implements".to_string()])
+        );
     }
 
     #[test]
@@ -328,7 +334,8 @@ mod tests {
         let s = parse_search(json!({
             "node": "test:src/lib.rs:foo:function",
             "mode": "tests_for"
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(s.mode, Some("tests_for".to_string()));
     }
 
@@ -337,7 +344,8 @@ mod tests {
         let s = parse_search(json!({
             "query": "build_full_graph",
             "mode": "tests_for"
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(s.mode, Some("tests_for".to_string()));
     }
 
@@ -373,7 +381,8 @@ mod tests {
 
     #[test]
     fn test_search_minify_body_with_include_body() {
-        let s = parse_search(json!({"node": "x", "include_body": true, "minify_body": true})).unwrap();
+        let s =
+            parse_search(json!({"node": "x", "include_body": true, "minify_body": true})).unwrap();
         assert_eq!(s.include_body, Some(true));
         assert_eq!(s.minify_body, Some(true));
     }
@@ -382,11 +391,15 @@ mod tests {
     fn test_search_nodes_param() {
         let s = parse_search(json!({
             "nodes": ["root:file:name:kind", "root:file2:name2:kind"]
-        })).unwrap();
-        assert_eq!(s.nodes, Some(vec![
-            "root:file:name:kind".to_string(),
-            "root:file2:name2:kind".to_string(),
-        ]));
+        }))
+        .unwrap();
+        assert_eq!(
+            s.nodes,
+            Some(vec![
+                "root:file:name:kind".to_string(),
+                "root:file2:name2:kind".to_string(),
+            ])
+        );
     }
 
     #[test]
@@ -394,7 +407,8 @@ mod tests {
         let s = parse_search(json!({
             "nodes": ["root:file:name:kind"],
             "compact": true
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(s.compact, Some(true));
         assert!(s.nodes.is_some());
     }
@@ -411,7 +425,8 @@ mod tests {
             "node": "root:file:name:kind",
             "mode": "neighbors",
             "compact": true
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(s.compact, Some(true));
         assert_eq!(s.mode, Some("neighbors".to_string()));
     }
@@ -422,7 +437,8 @@ mod tests {
             "query": "test",
             "mode": "neighbors",
             "search_mode": "keyword"
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(s.search_mode, Some("keyword".to_string()));
     }
 
@@ -461,8 +477,12 @@ mod tests {
         let s = parse_search(json!({
             "query": "test",
             "artifact_types": ["commit", "outcome"]
-        })).unwrap();
-        assert_eq!(s.artifact_types, Some(vec!["commit".to_string(), "outcome".to_string()]));
+        }))
+        .unwrap();
+        assert_eq!(
+            s.artifact_types,
+            Some(vec!["commit".to_string(), "outcome".to_string()])
+        );
     }
 
     #[test]
@@ -477,7 +497,8 @@ mod tests {
             "query": "handler",
             "include_artifacts": false,
             "include_markdown": false
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(s.include_artifacts, Some(false));
         assert_eq!(s.include_markdown, Some(false));
     }
@@ -494,7 +515,8 @@ mod tests {
             "query": "test",
             "include_artifacts": false,
             "artifact_types": ["commit"]
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(s.include_artifacts, Some(false));
         assert_eq!(s.artifact_types, Some(vec!["commit".to_string()]));
     }
@@ -505,7 +527,8 @@ mod tests {
             "query": "test",
             "search_mode": "keyword",
             "include_artifacts": true
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(s.search_mode, Some("keyword".to_string()));
         assert_eq!(s.include_artifacts, Some(true));
         assert!(s.mode.is_none());
@@ -516,7 +539,8 @@ mod tests {
         let s = parse_search(json!({
             "query": "test",
             "artifact_types": []
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(s.artifact_types, Some(vec![]));
     }
 
@@ -634,7 +658,8 @@ mod tests {
 
     #[test]
     fn test_search_repo_relative_path() {
-        let s = parse_search(json!({"query": "test", "repo": ".claude/worktrees/my-feature"})).unwrap();
+        let s =
+            parse_search(json!({"query": "test", "repo": ".claude/worktrees/my-feature"})).unwrap();
         assert_eq!(s.repo, Some(".claude/worktrees/my-feature".to_string()));
     }
 
@@ -646,19 +671,24 @@ mod tests {
 
     #[test]
     fn test_repo_map_repo_with_path() {
-        let rm: super::RepoMap = serde_json::from_value(json!({"repo": "/path/to/worktree"})).unwrap();
+        let rm: super::RepoMap =
+            serde_json::from_value(json!({"repo": "/path/to/worktree"})).unwrap();
         assert_eq!(rm.repo, Some("/path/to/worktree".to_string()));
     }
 
     #[test]
     fn test_outcome_progress_repo_default_is_none() {
-        let op: super::OutcomeProgress = serde_json::from_value(json!({"outcome_id": "agent-alignment"})).unwrap();
+        let op: super::OutcomeProgress =
+            serde_json::from_value(json!({"outcome_id": "agent-alignment"})).unwrap();
         assert!(op.repo.is_none());
     }
 
     #[test]
     fn test_outcome_progress_repo_with_path() {
-        let op: super::OutcomeProgress = serde_json::from_value(json!({"outcome_id": "agent-alignment", "repo": "/path/to/worktree"})).unwrap();
+        let op: super::OutcomeProgress = serde_json::from_value(
+            json!({"outcome_id": "agent-alignment", "repo": "/path/to/worktree"}),
+        )
+        .unwrap();
         assert_eq!(op.repo, Some("/path/to/worktree".to_string()));
     }
 }

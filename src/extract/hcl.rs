@@ -47,7 +47,10 @@ impl Extractor for HclExtractor {
 
         collect_nodes(tree.root_node(), path, source, &mut nodes);
 
-        Ok(ExtractionResult { nodes, edges: Vec::new() })
+        Ok(ExtractionResult {
+            nodes,
+            edges: Vec::new(),
+        })
     }
 }
 
@@ -55,12 +58,7 @@ impl Extractor for HclExtractor {
 ///
 /// HCL blocks don't use named fields — children are positional:
 ///   identifier (block_type) [string_lit|identifier]* (labels) block_start body block_end
-fn collect_nodes(
-    node: tree_sitter::Node,
-    path: &Path,
-    source: &[u8],
-    nodes: &mut Vec<Node>,
-) {
+fn collect_nodes(node: tree_sitter::Node, path: &Path, source: &[u8], nodes: &mut Vec<Node>) {
     if node.kind() == "block" {
         let children: Vec<_> = (0..node.child_count())
             .filter_map(|i| node.child(i as u32))
@@ -115,31 +113,32 @@ fn collect_nodes(
 
         // For `variable` blocks, emit a Const node only when a default value is present
         if block_type == "variable"
-            && let Some(var_name) = labels.first() {
-                // Try to find `default = <value>` in the block body
-                let body_text = node.utf8_text(source).unwrap_or("").to_string();
-                let default_val = extract_hcl_attr(&body_text, "default");
-                if let Some(ref v) = default_val {
-                    let mut const_metadata = BTreeMap::new();
-                    const_metadata.insert("value".to_string(), v.clone());
-                    const_metadata.insert("synthetic".to_string(), "false".to_string());
-                    nodes.push(Node {
-                        id: NodeId {
-                            root: String::new(),
-                            file: path.to_path_buf(),
-                            name: var_name.clone(),
-                            kind: NodeKind::Const,
-                        },
-                        language: "hcl".to_string(),
-                        line_start: node.start_position().row + 1,
-                        line_end: node.end_position().row + 1,
-                        signature: format!("variable \"{}\"", var_name),
-                        body: body_text,
-                        metadata: const_metadata,
-                        source: ExtractionSource::TreeSitter,
-                    });
-                }
+            && let Some(var_name) = labels.first()
+        {
+            // Try to find `default = <value>` in the block body
+            let body_text = node.utf8_text(source).unwrap_or("").to_string();
+            let default_val = extract_hcl_attr(&body_text, "default");
+            if let Some(ref v) = default_val {
+                let mut const_metadata = BTreeMap::new();
+                const_metadata.insert("value".to_string(), v.clone());
+                const_metadata.insert("synthetic".to_string(), "false".to_string());
+                nodes.push(Node {
+                    id: NodeId {
+                        root: String::new(),
+                        file: path.to_path_buf(),
+                        name: var_name.clone(),
+                        kind: NodeKind::Const,
+                    },
+                    language: "hcl".to_string(),
+                    line_start: node.start_position().row + 1,
+                    line_end: node.end_position().row + 1,
+                    signature: format!("variable \"{}\"", var_name),
+                    body: body_text,
+                    metadata: const_metadata,
+                    source: ExtractionSource::TreeSitter,
+                });
             }
+        }
 
         // Don't recurse into block body for nested blocks (keeps graph flat)
         return;
@@ -195,23 +194,41 @@ fn block_name(block_type: &str, labels: &[String]) -> (NodeKind, String) {
             (NodeKind::Other("tf_data".to_string()), name)
         }
         "variable" => {
-            let name = labels.first().map(|s| format!("var.{}", s)).unwrap_or_else(|| "var.unknown".to_string());
+            let name = labels
+                .first()
+                .map(|s| format!("var.{}", s))
+                .unwrap_or_else(|| "var.unknown".to_string());
             (NodeKind::Other("tf_variable".to_string()), name)
         }
         "output" => {
-            let name = labels.first().cloned().unwrap_or_else(|| "output".to_string());
+            let name = labels
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "output".to_string());
             (NodeKind::Other("tf_output".to_string()), name)
         }
         "module" => {
-            let name = labels.first().map(|s| format!("module.{}", s)).unwrap_or_else(|| "module.unknown".to_string());
+            let name = labels
+                .first()
+                .map(|s| format!("module.{}", s))
+                .unwrap_or_else(|| "module.unknown".to_string());
             (NodeKind::Other("tf_module".to_string()), name)
         }
         "provider" => {
-            let name = labels.first().cloned().unwrap_or_else(|| "provider".to_string());
+            let name = labels
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "provider".to_string());
             (NodeKind::Other("tf_provider".to_string()), name)
         }
-        "terraform" => (NodeKind::Other("tf_config".to_string()), "terraform".to_string()),
-        "locals" => (NodeKind::Other("tf_locals".to_string()), "locals".to_string()),
+        "terraform" => (
+            NodeKind::Other("tf_config".to_string()),
+            "terraform".to_string(),
+        ),
+        "locals" => (
+            NodeKind::Other("tf_locals".to_string()),
+            "locals".to_string(),
+        ),
         other => {
             let name = if labels.is_empty() {
                 other.to_string()

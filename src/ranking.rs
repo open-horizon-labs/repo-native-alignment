@@ -24,7 +24,12 @@ use petgraph::Direction;
 /// which was a bug.
 pub fn kind_rank(n: &Node) -> u8 {
     match n.id.kind {
-        NodeKind::Function | NodeKind::Struct | NodeKind::Trait | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Macro => 0,
+        NodeKind::Function
+        | NodeKind::Struct
+        | NodeKind::Trait
+        | NodeKind::Enum
+        | NodeKind::TypeAlias
+        | NodeKind::Macro => 0,
         NodeKind::Const | NodeKind::Field | NodeKind::Impl => 1,
         NodeKind::Import | NodeKind::Module => 2,
         _ => 1,
@@ -36,8 +41,18 @@ pub fn kind_rank(n: &Node) -> u8 {
 /// every `.clone()` to `clone`, etc.). Filtered from display only -- PageRank
 /// scores stay accurate for graph traversal.
 pub const TRAIT_IMPL_METHODS: &[&str] = &[
-    "fmt", "clone", "drop", "default", "from", "into",
-    "deref", "deref_mut", "eq", "hash", "partial_cmp", "cmp",
+    "fmt",
+    "clone",
+    "drop",
+    "default",
+    "from",
+    "into",
+    "deref",
+    "deref_mut",
+    "eq",
+    "hash",
+    "partial_cmp",
+    "cmp",
 ];
 
 /// Returns true if a node looks like a trait impl method that should be
@@ -143,11 +158,7 @@ pub fn is_test_file(n: &Node) -> bool {
 ///
 /// 5. **Edge count (connectivity)** — symbols with more incoming + outgoing
 ///    edges are more central to the codebase and likely more relevant.
-pub fn sort_symbol_matches(
-    matches: &mut [&Node],
-    query_lower: &str,
-    index: &GraphIndex,
-) {
+pub fn sort_symbol_matches(matches: &mut [&Node], query_lower: &str, index: &GraphIndex) {
     matches.sort_by(|a, b| {
         let a_name_lower = a.id.name.to_lowercase();
         let b_name_lower = b.id.name.to_lowercase();
@@ -186,7 +197,9 @@ pub fn sort_symbol_matches(
         // fall back to edge count only when neither does.
         // Never mix normalized [0,1] scores with raw degree counts.
         let pagerank = |n: &Node| {
-            n.metadata.get("importance").and_then(|s| s.parse::<f64>().ok())
+            n.metadata
+                .get("importance")
+                .and_then(|s| s.parse::<f64>().ok())
         };
         let edge_count = |n: &Node| {
             let sid = n.stable_id();
@@ -195,7 +208,7 @@ pub fn sort_symbol_matches(
         };
         match (pagerank(a), pagerank(b)) {
             (Some(ai), Some(bi)) => bi.partial_cmp(&ai).unwrap_or(Ordering::Equal),
-            (Some(_), None) => Ordering::Less,   // a has score, ranks higher
+            (Some(_), None) => Ordering::Less, // a has score, ranks higher
             (None, Some(_)) => Ordering::Greater, // b has score, ranks higher
             (None, None) => edge_count(b).cmp(&edge_count(a)),
         }
@@ -205,8 +218,8 @@ pub fn sort_symbol_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{ExtractionSource, NodeId};
     use crate::graph::index::GraphIndex;
+    use crate::graph::{ExtractionSource, NodeId};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -279,10 +292,7 @@ mod tests {
         let mut matches: Vec<&Node> = vec![&test, &prod];
         sort_symbol_matches(&mut matches, "foo", &index);
 
-        assert_eq!(
-            matches[0].id.file,
-            PathBuf::from("src/lib.rs")
-        );
+        assert_eq!(matches[0].id.file, PathBuf::from("src/lib.rs"));
     }
 
     // ==================== Adversarial tests ====================
@@ -441,7 +451,11 @@ mod tests {
     #[test]
     fn test_macro_ranks_as_primary_definition() {
         let mac = make_node("my_macro", NodeKind::Macro, "a.rs");
-        assert_eq!(kind_rank(&mac), 0, "Macro should be tier 0 (primary definition)");
+        assert_eq!(
+            kind_rank(&mac),
+            0,
+            "Macro should be tier 0 (primary definition)"
+        );
     }
 
     /// Tier precedence: exact name match should beat kind priority.
@@ -510,7 +524,9 @@ mod tests {
     fn test_pagerank_node_beats_node_without_pagerank() {
         // Node with low PageRank score (0.1)
         let mut with_pr = make_node("hub", NodeKind::Function, "a.rs");
-        with_pr.metadata.insert("importance".to_string(), "0.1".to_string());
+        with_pr
+            .metadata
+            .insert("importance".to_string(), "0.1".to_string());
 
         // Node without PageRank — falls back to edge count in (None, None) arm
         let without_pr = make_node("hub", NodeKind::Function, "a.rs");
@@ -530,17 +546,23 @@ mod tests {
     #[test]
     fn test_pagerank_higher_score_ranks_first() {
         let mut high = make_node("hub", NodeKind::Function, "a.rs");
-        high.metadata.insert("importance".to_string(), "0.9".to_string());
+        high.metadata
+            .insert("importance".to_string(), "0.9".to_string());
 
         let mut low = make_node("hub", NodeKind::Function, "a.rs");
-        low.metadata.insert("importance".to_string(), "0.1".to_string());
+        low.metadata
+            .insert("importance".to_string(), "0.1".to_string());
 
         let index = empty_index();
         let mut matches: Vec<&Node> = vec![&low, &high];
         sort_symbol_matches(&mut matches, "hub", &index);
 
-        let first_imp: f64 = matches[0].metadata.get("importance")
-            .unwrap().parse().unwrap();
+        let first_imp: f64 = matches[0]
+            .metadata
+            .get("importance")
+            .unwrap()
+            .parse()
+            .unwrap();
         assert!(
             first_imp > 0.5,
             "Higher PageRank (0.9) should rank before lower (0.1), got {:.1} first",
@@ -567,57 +589,90 @@ mod tests {
     fn test_is_test_file_rust_tests_suffix() {
         // _tests.rs (plural)
         let node = make_node("f", NodeKind::Function, "src/helpers_tests.rs");
-        assert!(is_test_file(&node), "_tests.rs should be flagged as test file");
+        assert!(
+            is_test_file(&node),
+            "_tests.rs should be flagged as test file"
+        );
     }
 
     #[test]
     fn test_is_test_file_rust_spec_suffix() {
         let node = make_node("f", NodeKind::Function, "src/parser_spec.rs");
-        assert!(is_test_file(&node), "_spec.rs should be flagged as test file");
+        assert!(
+            is_test_file(&node),
+            "_spec.rs should be flagged as test file"
+        );
     }
 
     #[test]
     fn test_is_test_file_python_test_prefix() {
         let node = make_node("f", NodeKind::Function, "src/test_utils.py");
-        assert!(is_test_file(&node), "test_*.py should be flagged as test file");
+        assert!(
+            is_test_file(&node),
+            "test_*.py should be flagged as test file"
+        );
 
         // In subdirectory
         let node2 = make_node("f", NodeKind::Function, "lib/test_parser.py");
-        assert!(is_test_file(&node2), "lib/test_*.py should be flagged as test file");
+        assert!(
+            is_test_file(&node2),
+            "lib/test_*.py should be flagged as test file"
+        );
     }
 
     #[test]
     fn test_is_test_file_python_no_false_positive() {
         // "testimony.py" should NOT match — test_ must be prefix of filename
         let node = make_node("f", NodeKind::Function, "src/testimony.py");
-        assert!(!is_test_file(&node), "testimony.py should not be flagged as test file");
+        assert!(
+            !is_test_file(&node),
+            "testimony.py should not be flagged as test file"
+        );
     }
 
     #[test]
     fn test_is_test_file_smoke() {
         let node = make_node("f", NodeKind::Function, "src/smoke.rs");
-        assert!(is_test_file(&node), "smoke.rs should be flagged as test file");
+        assert!(
+            is_test_file(&node),
+            "smoke.rs should be flagged as test file"
+        );
 
         let node2 = make_node("f", NodeKind::Function, "src/smoke_test.rs");
-        assert!(is_test_file(&node2), "smoke_test.rs should be flagged as test file");
+        assert!(
+            is_test_file(&node2),
+            "smoke_test.rs should be flagged as test file"
+        );
     }
 
     #[test]
     fn test_is_test_file_bench() {
         let node = make_node("f", NodeKind::Function, "src/bench_ranking.rs");
-        assert!(is_test_file(&node), "bench_*.rs should be flagged as test file");
+        assert!(
+            is_test_file(&node),
+            "bench_*.rs should be flagged as test file"
+        );
 
         let node2 = make_node("f", NodeKind::Function, "benches/benchmark.rs");
-        assert!(is_test_file(&node2), "benchmark.rs should be flagged as test file");
+        assert!(
+            is_test_file(&node2),
+            "benchmark.rs should be flagged as test file"
+        );
     }
 
     #[test]
     fn test_is_test_file_fixtures_directory() {
         let node = make_node("f", NodeKind::Function, "tests/fixtures/helper.rs");
-        assert!(is_test_file(&node), "tests/fixtures/ should be flagged as test file");
+        assert!(
+            is_test_file(&node),
+            "tests/fixtures/ should be flagged as test file"
+        );
 
         let node2 = make_node("f", NodeKind::Function, "fixture/data.py");
-        assert!(is_test_file(&node2), "fixture/ at root should be flagged as test file");
+        assert!(
+            is_test_file(&node2),
+            "fixture/ at root should be flagged as test file"
+        );
     }
 
     #[test]
@@ -627,14 +682,20 @@ mod tests {
         // extraction would check the last component. Let's verify.
         let node = make_node("f", NodeKind::Function, "benchmarks/main.rs");
         // "main.rs" doesn't contain "bench" — this should NOT be flagged.
-        assert!(!is_test_file(&node), "benchmarks/main.rs should not be flagged (filename is main.rs)");
+        assert!(
+            !is_test_file(&node),
+            "benchmarks/main.rs should not be flagged (filename is main.rs)"
+        );
     }
 
     #[test]
     fn test_is_test_file_root_test_prefix() {
         // File at root starting with test_
         let node = make_node("f", NodeKind::Function, "test_integration.py");
-        assert!(is_test_file(&node), "root test_*.py should be flagged as test file");
+        assert!(
+            is_test_file(&node),
+            "root test_*.py should be flagged as test file"
+        );
     }
 
     // ==================== Adversarial: is_test_path edge cases ====================
@@ -647,8 +708,14 @@ mod tests {
     #[test]
     fn test_is_test_path_no_false_positive_protest_dir() {
         // "protest" contains "test" but not as "/test/" boundary
-        assert!(!is_test_path("protest/main.rs"), "protest/ should not be flagged");
-        assert!(!is_test_path("src/detest.rs"), "detest.rs should not be flagged");
+        assert!(
+            !is_test_path("protest/main.rs"),
+            "protest/ should not be flagged"
+        );
+        assert!(
+            !is_test_path("src/detest.rs"),
+            "detest.rs should not be flagged"
+        );
     }
 
     #[test]
@@ -666,14 +733,18 @@ mod tests {
         for (path, expected) in cases {
             let node = make_node("f", NodeKind::Function, path);
             assert_eq!(
-                is_test_path(path), expected,
+                is_test_path(path),
+                expected,
                 "is_test_path(\"{}\") should be {}",
-                path, expected
+                path,
+                expected
             );
             assert_eq!(
-                is_test_file(&node), expected,
+                is_test_file(&node),
+                expected,
                 "is_test_file for \"{}\" should be {}",
-                path, expected
+                path,
+                expected
             );
         }
     }
@@ -683,44 +754,66 @@ mod tests {
     #[test]
     fn test_is_trait_impl_method_fmt() {
         let node = make_node("fmt", NodeKind::Function, "src/types.rs");
-        assert!(is_trait_impl_method(&node), "fmt should be a trait impl method");
+        assert!(
+            is_trait_impl_method(&node),
+            "fmt should be a trait impl method"
+        );
     }
 
     #[test]
     fn test_is_trait_impl_method_clone() {
         let node = make_node("clone", NodeKind::Function, "src/types.rs");
-        assert!(is_trait_impl_method(&node), "clone should be a trait impl method");
+        assert!(
+            is_trait_impl_method(&node),
+            "clone should be a trait impl method"
+        );
     }
 
     #[test]
     fn test_is_trait_impl_method_from() {
         let node = make_node("from", NodeKind::Function, "src/types.rs");
-        assert!(is_trait_impl_method(&node), "from should be a trait impl method");
+        assert!(
+            is_trait_impl_method(&node),
+            "from should be a trait impl method"
+        );
     }
 
     #[test]
     fn test_is_trait_impl_method_case_insensitive() {
         let node = make_node("Fmt", NodeKind::Function, "src/types.rs");
-        assert!(is_trait_impl_method(&node), "Fmt should match (case-insensitive)");
+        assert!(
+            is_trait_impl_method(&node),
+            "Fmt should match (case-insensitive)"
+        );
     }
 
     #[test]
     fn test_is_trait_impl_method_not_function() {
         let node = make_node("fmt", NodeKind::Struct, "src/types.rs");
-        assert!(!is_trait_impl_method(&node), "struct named fmt should NOT be a trait impl method");
+        assert!(
+            !is_trait_impl_method(&node),
+            "struct named fmt should NOT be a trait impl method"
+        );
     }
 
     #[test]
     fn test_is_trait_impl_method_custom_name() {
         let node = make_node("process_data", NodeKind::Function, "src/main.rs");
-        assert!(!is_trait_impl_method(&node), "process_data is not a trait impl method");
+        assert!(
+            !is_trait_impl_method(&node),
+            "process_data is not a trait impl method"
+        );
     }
 
     #[test]
     fn test_is_trait_impl_method_all_names() {
         for name in TRAIT_IMPL_METHODS {
             let node = make_node(name, NodeKind::Function, "src/types.rs");
-            assert!(is_trait_impl_method(&node), "{} should be a trait impl method", name);
+            assert!(
+                is_trait_impl_method(&node),
+                "{} should be a trait impl method",
+                name
+            );
         }
     }
 
@@ -729,26 +822,40 @@ mod tests {
     #[test]
     fn test_is_test_function_by_decorator() {
         let mut node = make_node("test_my_feature", NodeKind::Function, "src/main.rs");
-        node.metadata.insert("decorators".to_string(), "test".to_string());
-        assert!(is_test_function(&node), "function with #[test] decorator should be detected");
+        node.metadata
+            .insert("decorators".to_string(), "test".to_string());
+        assert!(
+            is_test_function(&node),
+            "function with #[test] decorator should be detected"
+        );
     }
 
     #[test]
     fn test_is_test_function_by_path() {
         let node = make_node("helper", NodeKind::Function, "tests/test_main.rs");
-        assert!(is_test_function(&node), "function in test file should be detected");
+        assert!(
+            is_test_function(&node),
+            "function in test file should be detected"
+        );
     }
 
     #[test]
     fn test_is_test_function_production_code() {
         let node = make_node("process", NodeKind::Function, "src/main.rs");
-        assert!(!is_test_function(&node), "production function should not be detected");
+        assert!(
+            !is_test_function(&node),
+            "production function should not be detected"
+        );
     }
 
     #[test]
     fn test_is_test_function_not_function_kind() {
         let mut node = make_node("TestStruct", NodeKind::Struct, "tests/test_main.rs");
-        node.metadata.insert("decorators".to_string(), "test".to_string());
-        assert!(!is_test_function(&node), "struct should not be detected even with test decorator");
+        node.metadata
+            .insert("decorators".to_string(), "test".to_string());
+        assert!(
+            !is_test_function(&node),
+            "struct should not be detected even with test decorator"
+        );
     }
 }

@@ -18,30 +18,26 @@
 //! - `transport` — JSON-RPC framing: [`LspTransport`] (sequential, init-phase) and
 //!   [`PipelinedTransport`] (concurrent, enrichment-phase), plus URI helpers.
 
-mod transport;
 mod passes;
+mod transport;
 use transport::{LspTransport, PipelinedTransport, path_to_uri};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 
 use lsp_types::{
-    ClientCapabilities, GotoDefinitionParams, GotoDefinitionResponse,
-    InitializeParams, InitializeResult, Location, Position,
-    TextDocumentIdentifier, TextDocumentPositionParams, Uri,
+    ClientCapabilities, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams,
+    InitializeResult, Location, Position, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
 };
 
+use super::{Enricher, EnrichmentResult};
 use crate::graph::index::GraphIndex;
-use crate::graph::{
-    Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
-};
-use super::{EnrichmentResult, Enricher};
-
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 // ---------------------------------------------------------------------------
 // LspEnricher
@@ -306,20 +302,25 @@ impl LspEnricher {
             );
         }
 
-        let transport =
-            match LspTransport::spawn(&self.server_command, &self.server_args, startup_root).await {
-                Ok(t) => t,
-                Err(e) => {
-                    state.init_failed = true;
-                    tracing::warn!(
-                        "{} not available, skipping LSP enrichment for {}: {}",
-                        self.server_command,
-                        self.language,
-                        e
-                    );
-                    return Err(e);
-                }
-            };
+        let transport = match LspTransport::spawn(
+            &self.server_command,
+            &self.server_args,
+            startup_root,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                state.init_failed = true;
+                tracing::warn!(
+                    "{} not available, skipping LSP enrichment for {}: {}",
+                    self.server_command,
+                    self.language,
+                    e
+                );
+                return Err(e);
+            }
+        };
 
         // Always store the primary repo_root in root_path — this is used for
         // constructing absolute file paths in LSP requests (root.join(node.id.file)).
@@ -364,36 +365,40 @@ impl LspEnricher {
         // doesn't have it, so venv config is always delivered when a venv exists.
         let effective_settings = if self.language == "python" {
             let venv_candidates = [".venv", "venv", "env"];
-            if let Some(venv_name) = venv_candidates.iter().find(|&&name| startup_root.join(name).is_dir()) {
+            if let Some(venv_name) = venv_candidates
+                .iter()
+                .find(|&&name| startup_root.join(name).is_dir())
+            {
                 let venv_path_str = startup_root.to_string_lossy().to_string();
                 // Start from existing settings or an empty object, then
                 // unconditionally materialize python.analysis.{venvPath,venv}.
-                let mut merged = self.init_settings
+                let mut merged = self
+                    .init_settings
                     .as_ref()
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
-                let python_obj = merged
-                    .as_object_mut()
-                    .and_then(|root| {
-                        if !root.contains_key("python") {
-                            root.insert("python".into(), serde_json::json!({}));
-                        }
-                        root.get_mut("python")
-                    });
+                let python_obj = merged.as_object_mut().and_then(|root| {
+                    if !root.contains_key("python") {
+                        root.insert("python".into(), serde_json::json!({}));
+                    }
+                    root.get_mut("python")
+                });
                 if let Some(python_val) = python_obj {
-                    let analysis_obj = python_val
-                        .as_object_mut()
-                        .and_then(|p| {
-                            if !p.contains_key("analysis") {
-                                p.insert("analysis".into(), serde_json::json!({}));
-                            }
-                            p.get_mut("analysis")
-                        });
-                    if let Some(analysis_val) = analysis_obj
-                        && let Some(obj) = analysis_val.as_object_mut() {
-                            obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
-                            obj.insert("venv".into(), serde_json::Value::String(venv_name.to_string()));
+                    let analysis_obj = python_val.as_object_mut().and_then(|p| {
+                        if !p.contains_key("analysis") {
+                            p.insert("analysis".into(), serde_json::json!({}));
                         }
+                        p.get_mut("analysis")
+                    });
+                    if let Some(analysis_val) = analysis_obj
+                        && let Some(obj) = analysis_val.as_object_mut()
+                    {
+                        obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
+                        obj.insert(
+                            "venv".into(),
+                            serde_json::Value::String(venv_name.to_string()),
+                        );
+                    }
                 }
                 tracing::info!(
                     "pyright: found {} at '{}', adding venvPath/venv to initializationOptions",
@@ -445,14 +450,26 @@ impl LspEnricher {
             .map(|v| !v.is_null())
             .unwrap_or(false);
 
-        let init_result_parsed: InitializeResult = serde_json::from_value(init_result)
-            .context("Failed to parse initialize result")?;
+        let init_result_parsed: InitializeResult =
+            serde_json::from_value(init_result).context("Failed to parse initialize result")?;
 
-        let has_references = init_result_parsed.capabilities.references_provider.is_some();
-        let has_implementation = init_result_parsed.capabilities.implementation_provider.is_some();
+        let has_references = init_result_parsed
+            .capabilities
+            .references_provider
+            .is_some();
+        let has_implementation = init_result_parsed
+            .capabilities
+            .implementation_provider
+            .is_some();
         tracing::info!(
             "{} capabilities: references={}, call_hierarchy={}, implementation={}, type_hierarchy={}, pull_diagnostics={}, inlay_hints={}",
-            self.server_command, has_references, has_call_hierarchy, has_implementation, has_type_hierarchy, has_pull_diagnostics, has_inlay_hints
+            self.server_command,
+            has_references,
+            has_call_hierarchy,
+            has_implementation,
+            has_type_hierarchy,
+            has_pull_diagnostics,
+            has_inlay_hints
         );
 
         state.has_type_hierarchy = has_type_hierarchy;
@@ -467,7 +484,10 @@ impl LspEnricher {
             .notify("initialized", serde_json::json!({}))
             .await?;
 
-        tracing::info!("{} initialized, waiting for indexing...", self.server_command);
+        tracing::info!(
+            "{} initialized, waiting for indexing...",
+            self.server_command
+        );
 
         // Wait for the language server to finish indexing the workspace.
         // rust-analyzer (and most LSP servers) need time after `initialized`
@@ -531,7 +551,9 @@ impl LspEnricher {
             if last_progress_log.elapsed() >= tokio::time::Duration::from_secs(30) {
                 tracing::info!(
                     "LSP: waiting for {} to finish indexing ({}s elapsed, seen_serverStatus={})...",
-                    self.server_command, elapsed, seen_server_status
+                    self.server_command,
+                    elapsed,
+                    seen_server_status
                 );
                 last_progress_log = tokio::time::Instant::now();
             }
@@ -567,9 +589,20 @@ impl LspEnricher {
                             // rust-analyzer's readiness signal
                             "experimental/serverStatus" => {
                                 seen_server_status = true;
-                                let health = msg.pointer("/params/health").and_then(|h| h.as_str()).unwrap_or("");
-                                let quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(false);
-                                tracing::info!("{} serverStatus: health={}, quiescent={}", self.server_command, health, quiescent);
+                                let health = msg
+                                    .pointer("/params/health")
+                                    .and_then(|h| h.as_str())
+                                    .unwrap_or("");
+                                let quiescent = msg
+                                    .pointer("/params/quiescent")
+                                    .and_then(|q| q.as_bool())
+                                    .unwrap_or(false);
+                                tracing::info!(
+                                    "{} serverStatus: health={}, quiescent={}",
+                                    self.server_command,
+                                    health,
+                                    quiescent
+                                );
 
                                 // Track the raw quiescent bit separately from health.
                                 // Pass 3 cares about "done indexing" (quiescent=true),
@@ -579,7 +612,10 @@ impl LspEnricher {
                                 }
 
                                 if Self::server_status_is_ready(&msg) {
-                                    tracing::info!("{} ready (serverStatus: ok, quiescent)", self.server_command);
+                                    tracing::info!(
+                                        "{} ready (serverStatus: ok, quiescent)",
+                                        self.server_command
+                                    );
                                     server_ready = true;
                                     break;
                                 }
@@ -588,11 +624,15 @@ impl LspEnricher {
                                 if quiescent {
                                     tracing::info!(
                                         "{} quiescent=true (health={}), proceeding despite non-ok health",
-                                        self.server_command, health
+                                        self.server_command,
+                                        health
                                     );
                                     break;
                                 }
-                                tracing::debug!("{} not yet ready, continuing to wait for indexing...", self.server_command);
+                                tracing::debug!(
+                                    "{} not yet ready, continuing to wait for indexing...",
+                                    self.server_command
+                                );
                             }
                             // Respond to progress create requests (required by protocol)
                             "window/workDoneProgress/create" => {
@@ -607,10 +647,21 @@ impl LspEnricher {
                             }
                             "$/progress" => {
                                 // Log progress for debugging but don't use it for readiness
-                                let kind = msg.pointer("/params/value/kind").and_then(|k| k.as_str()).unwrap_or("");
-                                let title = msg.pointer("/params/value/title").and_then(|t| t.as_str()).unwrap_or("");
+                                let kind = msg
+                                    .pointer("/params/value/kind")
+                                    .and_then(|k| k.as_str())
+                                    .unwrap_or("");
+                                let title = msg
+                                    .pointer("/params/value/title")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("");
                                 if kind == "begin" || kind == "end" {
-                                    tracing::info!("{} progress {}: {}", self.server_command, kind, title);
+                                    tracing::info!(
+                                        "{} progress {}: {}",
+                                        self.server_command,
+                                        kind,
+                                        title
+                                    );
                                 }
                             }
                             _ => {}
@@ -635,19 +686,23 @@ impl LspEnricher {
                     if tokio::time::Instant::now() >= next_probe {
                         // Schedule next probe from probe start so cadence is ~5s regardless
                         // of whether the probe request itself times out or succeeds quickly.
-                        next_probe = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+                        next_probe =
+                            tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
 
                         let probe_result = tokio::time::timeout(
                             tokio::time::Duration::from_secs(5),
-                            transport.request("workspace/symbol", serde_json::json!({ "query": "" })),
-                        ).await;
+                            transport
+                                .request("workspace/symbol", serde_json::json!({ "query": "" })),
+                        )
+                        .await;
 
                         match probe_result {
                             Ok(Ok(_)) | Ok(Err(_)) => {
                                 if let Ok(Err(e)) = &probe_result {
                                     tracing::debug!(
                                         "{} probe returned error (server responsive): {}",
-                                        self.server_command, e
+                                        self.server_command,
+                                        e
                                     );
                                 }
                                 probe_success_count += 1;
@@ -655,13 +710,16 @@ impl LspEnricher {
                                     server_responsive = true;
                                     tracing::info!(
                                         "{} responsive (probe succeeded after {}s, no serverStatus) — validating indexing...",
-                                        self.server_command, elapsed
+                                        self.server_command,
+                                        elapsed
                                     );
                                     break;
                                 }
                                 tracing::debug!(
                                     "{} probe {}/2 succeeded ({}s elapsed), waiting for second confirmation...",
-                                    self.server_command, probe_success_count, elapsed
+                                    self.server_command,
+                                    probe_success_count,
+                                    elapsed
                                 );
                             }
                             Err(_) => {
@@ -669,11 +727,11 @@ impl LspEnricher {
                                 probe_success_count = 0;
                                 tracing::debug!(
                                     "{} probe timed out ({}s elapsed), server still starting...",
-                                    self.server_command, elapsed
+                                    self.server_command,
+                                    elapsed
                                 );
                             }
                         }
-
                     }
                 }
             }
@@ -713,48 +771,57 @@ impl LspEnricher {
                 // Drain any pending notifications before sending the validation request.
                 // Some servers (pyright) may send progress or diagnostic notifications
                 // that need to be consumed to avoid transport deadlock.
-                loop {
-                    match tokio::time::timeout(
-                        tokio::time::Duration::from_millis(100),
-                        transport.read_message(),
-                    ).await {
-                        Ok(Ok(msg)) => {
-                            // Handle workDoneProgress/create requests during drain
-                            if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
-                                if method == "window/workDoneProgress/create" {
-                                    if let Some(id) = msg.get("id") {
-                                        let response = serde_json::json!({
-                                            "jsonrpc": "2.0",
-                                            "id": id,
-                                            "result": null
-                                        });
-                                        let _ = transport.send_message(&response).await;
-                                    }
-                                } else if method == "$/progress" {
-                                    let kind = msg.pointer("/params/value/kind").and_then(|k| k.as_str()).unwrap_or("");
-                                    let title = msg.pointer("/params/value/title").and_then(|t| t.as_str()).unwrap_or("");
-                                    if kind == "begin" || kind == "end" {
-                                        tracing::info!("{} progress {}: {}", self.server_command, kind, title);
-                                    }
-                                } else if method == "experimental/serverStatus" {
-                                    // A late serverStatus notification arrived during Phase B.
-                                    // If quiescent=true, the server has finished indexing —
-                                    // skip the rest of validation and accept the authoritative signal.
-                                    let quiescent = msg.pointer("/params/quiescent")
-                                        .and_then(|q| q.as_bool())
-                                        .unwrap_or(false);
-                                    if quiescent {
-                                        tracing::info!(
-                                            "{} received experimental/serverStatus quiescent=true during Phase B validation — accepting",
-                                            self.server_command
-                                        );
-                                        server_ready = true;
-                                        saw_quiescent = true;
-                                    }
-                                }
+                while let Ok(Ok(msg)) = tokio::time::timeout(
+                    tokio::time::Duration::from_millis(100),
+                    transport.read_message(),
+                )
+                .await
+                {
+                    // Handle workDoneProgress/create requests during drain
+                    if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+                        if method == "window/workDoneProgress/create" {
+                            if let Some(id) = msg.get("id") {
+                                let response = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": null
+                                });
+                                let _ = transport.send_message(&response).await;
+                            }
+                        } else if method == "$/progress" {
+                            let kind = msg
+                                .pointer("/params/value/kind")
+                                .and_then(|k| k.as_str())
+                                .unwrap_or("");
+                            let title = msg
+                                .pointer("/params/value/title")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("");
+                            if kind == "begin" || kind == "end" {
+                                tracing::info!(
+                                    "{} progress {}: {}",
+                                    self.server_command,
+                                    kind,
+                                    title
+                                );
+                            }
+                        } else if method == "experimental/serverStatus" {
+                            // A late serverStatus notification arrived during Phase B.
+                            // If quiescent=true, the server has finished indexing —
+                            // skip the rest of validation and accept the authoritative signal.
+                            let quiescent = msg
+                                .pointer("/params/quiescent")
+                                .and_then(|q| q.as_bool())
+                                .unwrap_or(false);
+                            if quiescent {
+                                tracing::info!(
+                                    "{} received experimental/serverStatus quiescent=true during Phase B validation — accepting",
+                                    self.server_command
+                                );
+                                server_ready = true;
+                                saw_quiescent = true;
                             }
                         }
-                        _ => break, // No more pending messages
                     }
                 }
 
@@ -766,7 +833,8 @@ impl LspEnricher {
                 let validation_result = tokio::time::timeout(
                     tokio::time::Duration::from_secs(10),
                     transport.request("workspace/symbol", serde_json::json!({ "query": query })),
-                ).await;
+                )
+                .await;
 
                 let elapsed = start.elapsed().as_secs();
 
@@ -776,7 +844,10 @@ impl LspEnricher {
                         if symbol_count > 0 {
                             tracing::info!(
                                 "{} indexing validated: workspace/symbol(\"{}\") returned {} symbols ({}s elapsed)",
-                                self.server_command, query, symbol_count, elapsed
+                                self.server_command,
+                                query,
+                                symbol_count,
+                                elapsed
                             );
                             server_ready = true;
                             saw_quiescent = true;
@@ -785,8 +856,12 @@ impl LspEnricher {
                         consecutive_empty += 1;
                         tracing::info!(
                             "{} indexing validation {}/{}: workspace/symbol(\"{}\") returned 0 symbols ({}s elapsed, waiting {}s)",
-                            self.server_command, attempt, MAX_INDEXING_VALIDATION_ATTEMPTS,
-                            query, elapsed, validation_delay.as_secs()
+                            self.server_command,
+                            attempt,
+                            MAX_INDEXING_VALIDATION_ATTEMPTS,
+                            query,
+                            elapsed,
+                            validation_delay.as_secs()
                         );
                     }
                     Ok(Err(e)) => {
@@ -795,8 +870,12 @@ impl LspEnricher {
                         consecutive_empty += 1;
                         tracing::info!(
                             "{} indexing validation {}/{}: workspace/symbol(\"{}\") returned error: {} ({}s elapsed)",
-                            self.server_command, attempt, MAX_INDEXING_VALIDATION_ATTEMPTS,
-                            query, e, elapsed
+                            self.server_command,
+                            attempt,
+                            MAX_INDEXING_VALIDATION_ATTEMPTS,
+                            query,
+                            e,
+                            elapsed
                         );
                     }
                     Err(_) => {
@@ -806,8 +885,11 @@ impl LspEnricher {
                         // attempt counter and circuit breaker handle slow servers.
                         tracing::info!(
                             "{} indexing validation {}/{}: workspace/symbol(\"{}\") timed out ({}s elapsed, not counting as empty)",
-                            self.server_command, attempt, MAX_INDEXING_VALIDATION_ATTEMPTS,
-                            query, elapsed
+                            self.server_command,
+                            attempt,
+                            MAX_INDEXING_VALIDATION_ATTEMPTS,
+                            query,
+                            elapsed
                         );
                     }
                 }
@@ -822,7 +904,9 @@ impl LspEnricher {
                     tracing::warn!(
                         "{} indexing validation failed: {} consecutive empty responses across different queries — \
                          server is responsive but has not indexed the workspace ({}s elapsed)",
-                        self.server_command, consecutive_empty, elapsed
+                        self.server_command,
+                        consecutive_empty,
+                        elapsed
                     );
                     // server_ready stays false, saw_quiescent stays false.
                     // This means Pass 1 and Pass 3 will be skipped, which is
@@ -853,7 +937,8 @@ impl LspEnricher {
         } else if !server_ready {
             tracing::info!(
                 "{} readiness wait complete (server_ready=false, seen_serverStatus={}), proceeding",
-                self.server_command, seen_server_status
+                self.server_command,
+                seen_server_status
             );
         }
 
@@ -892,7 +977,9 @@ impl LspEnricher {
         if let Some(transport) = state.transport.take() {
             let diag_sink = Arc::clone(&state.diagnostics_sink);
             let pipelined = PipelinedTransport::from_sequential_with_diag_sink(
-                transport, diag_sink, state.was_quiescent
+                transport,
+                diag_sink,
+                state.was_quiescent,
             );
             tracing::info!("{} converted to pipelined transport", self.server_command);
             state.pipelined = Some(Arc::new(pipelined));
@@ -939,7 +1026,9 @@ impl LspEnricher {
         let result: serde_json::Value = transport
             .request("callHierarchy/outgoingCalls", &params)
             .await?;
-        if result.is_null() { return Ok(Vec::new()); }
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
         Ok(result.as_array().cloned().unwrap_or_default())
     }
 
@@ -952,7 +1041,9 @@ impl LspEnricher {
         let result: serde_json::Value = transport
             .request("callHierarchy/incomingCalls", &params)
             .await?;
-        if result.is_null() { return Ok(Vec::new()); }
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
         Ok(result.as_array().cloned().unwrap_or_default())
     }
 
@@ -967,7 +1058,9 @@ impl LspEnricher {
         let result: serde_json::Value = transport
             .request("textDocument/documentLink", &params)
             .await?;
-        if result.is_null() { return Ok(Vec::new()); }
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
         Ok(result.as_array().cloned().unwrap_or_default())
     }
 
@@ -1033,10 +1126,17 @@ impl LspEnricher {
                     raw = %col_str,
                     "name_col metadata could not be parsed as u32; falling back to signature scan"
                 );
-                node.signature.find(&node.id.name).map(|i| i as u32).unwrap_or(0)
+                node.signature
+                    .find(&node.id.name)
+                    .map(|i| i as u32)
+                    .unwrap_or(0)
             })
         } else {
-            let fallback = node.signature.find(&node.id.name).map(|i| i as u32).unwrap_or(0);
+            let fallback = node
+                .signature
+                .find(&node.id.name)
+                .map(|i| i as u32)
+                .unwrap_or(0);
             tracing::debug!(
                 node = %node.id.name,
                 col = fallback,
@@ -1050,11 +1150,7 @@ impl LspEnricher {
     /// Update the type hierarchy strike counter after a single enrich attempt.
     /// Resets on success, increments on failure, and disables the feature after
     /// `MAX_TYPE_HIERARCHY_STRIKES` consecutive failures.
-    fn update_type_hierarchy_strikes(
-        ok: bool,
-        strikes: &mut u32,
-        enabled: &mut bool,
-    ) {
+    fn update_type_hierarchy_strikes(ok: bool, strikes: &mut u32, enabled: &mut bool) {
         if ok {
             *strikes = 0;
         } else {
@@ -1116,7 +1212,8 @@ impl LspEnricher {
         root: &Path,
         result: &mut EnrichmentResult,
     ) -> bool {
-        let items = match Self::prepare_type_hierarchy_p(transport, file_uri, line, character).await {
+        let items = match Self::prepare_type_hierarchy_p(transport, file_uri, line, character).await
+        {
             Ok(items) if !items.is_empty() => items,
             Ok(_) => return true, // No type hierarchy item — not a failure
             Err(e) => {
@@ -1130,16 +1227,17 @@ impl LspEnricher {
             match Self::type_hierarchy_supertypes_p(transport, item).await {
                 Ok(supertypes) => {
                     for supertype in &supertypes {
-                        if let Some(target_id) = Self::resolve_type_hierarchy_item(
-                            supertype, matching_nodes, root,
-                        ) {
+                        if let Some(target_id) =
+                            Self::resolve_type_hierarchy_item(supertype, matching_nodes, root)
+                        {
                             // Skip self-references
                             if target_id == node.id {
                                 continue;
                             }
                             tracing::debug!(
                                 "Type hierarchy: {} implements supertype {}",
-                                node.id.name, target_id.name
+                                node.id.name,
+                                target_id.name
                             );
                             result.added_edges.push(Edge {
                                 from: node.id.clone(),
@@ -1154,11 +1252,11 @@ impl LspEnricher {
                 Err(e) => {
                     tracing::debug!(
                         "typeHierarchy/supertypes failed for {}: {}",
-                        node.id.name, e
+                        node.id.name,
+                        e
                     );
                 }
             }
-
         }
 
         true // prepare succeeded
@@ -1187,7 +1285,10 @@ impl LspEnricher {
             }
         };
 
-        let rel_path = abs_path.strip_prefix(root).unwrap_or(&abs_path).to_path_buf();
+        let rel_path = abs_path
+            .strip_prefix(root)
+            .unwrap_or(&abs_path)
+            .to_path_buf();
 
         // Skip external dependencies
         if rel_path.to_string_lossy().contains(".cargo") {
@@ -1201,12 +1302,16 @@ impl LspEnricher {
             .unwrap_or(0);
 
         // Try exact name + file match first
-        let candidates: Vec<_> = matching_nodes.iter()
+        let candidates: Vec<_> = matching_nodes
+            .iter()
             .filter(|n| n.id.file == rel_path)
             .filter(|n| n.id.name == name)
-            .filter(|n| matches!(n.id.kind,
-                NodeKind::Trait | NodeKind::Struct | NodeKind::Enum | NodeKind::Impl
-            ))
+            .filter(|n| {
+                matches!(
+                    n.id.kind,
+                    NodeKind::Trait | NodeKind::Struct | NodeKind::Enum | NodeKind::Impl
+                )
+            })
             .collect();
 
         if candidates.len() == 1 {
@@ -1217,33 +1322,44 @@ impl LspEnricher {
             // Ambiguous name match — use position to disambiguate (issue #2: name collision)
             tracing::debug!(
                 "resolve_type_hierarchy_item: {} candidates for '{}' in {}, using position tiebreaker",
-                candidates.len(), name, rel_path.display()
+                candidates.len(),
+                name,
+                rel_path.display()
             );
             if range_start_line > 0
-                && let Some(best) = candidates.iter()
+                && let Some(best) = candidates
+                    .iter()
                     .filter(|n| n.line_start <= range_start_line && n.line_end >= range_start_line)
                     .min_by_key(|n| n.line_end - n.line_start)
-                {
-                    return Some(best.id.clone());
-                }
+            {
+                return Some(best.id.clone());
+            }
             // If position doesn't help, pick closest by line_start
             if range_start_line > 0
-                && let Some(best) = candidates.iter()
-                    .min_by_key(|n| (n.line_start as isize - range_start_line as isize).unsigned_abs())
-                {
-                    return Some(best.id.clone());
-                }
+                && let Some(best) = candidates.iter().min_by_key(|n| {
+                    (n.line_start as isize - range_start_line as isize).unsigned_abs()
+                })
+            {
+                return Some(best.id.clone());
+            }
             // Last resort: take first
             return Some(candidates[0].id.clone());
         }
 
         // Fallback: find enclosing symbol at the position
-        matching_nodes.iter()
+        matching_nodes
+            .iter()
             .filter(|n| n.id.file == rel_path)
-            .filter(|n| matches!(n.id.kind,
-                NodeKind::Trait | NodeKind::Struct | NodeKind::Enum | NodeKind::Impl
-            ))
-            .filter(|n| range_start_line == 0 || (n.line_start <= range_start_line && n.line_end >= range_start_line))
+            .filter(|n| {
+                matches!(
+                    n.id.kind,
+                    NodeKind::Trait | NodeKind::Struct | NodeKind::Enum | NodeKind::Impl
+                )
+            })
+            .filter(|n| {
+                range_start_line == 0
+                    || (n.line_start <= range_start_line && n.line_end >= range_start_line)
+            })
             .min_by_key(|n| n.line_end - n.line_start)
             .map(|n| n.id.clone())
     }
@@ -1280,7 +1396,9 @@ impl LspEnricher {
         let result: serde_json::Value = transport
             .request("typeHierarchy/supertypes", &params)
             .await?;
-        if result.is_null() { return Ok(Vec::new()); }
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
         Ok(result.as_array().cloned().unwrap_or_default())
     }
 
@@ -1296,7 +1414,9 @@ impl LspEnricher {
         let result: serde_json::Value = transport
             .request("textDocument/diagnostic", &params)
             .await?;
-        if result.is_null() { return Ok(Vec::new()); }
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
         // Response is a DocumentDiagnosticReport — either "full" or "unchanged"
         // Full: { kind: "full", items: [...] }
         // Unchanged: { kind: "unchanged", resultId: "..." }
@@ -1309,14 +1429,23 @@ impl LspEnricher {
             file_uri.as_str(),
             serde_json::to_string(&result).unwrap_or_else(|_| "<serialize error>".into())
         );
-        let kind = result.get("kind").and_then(|k| k.as_str()).unwrap_or("full");
+        let kind = result
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or("full");
         if kind == "unchanged" {
             return Ok(Vec::new());
         }
-        let items = result.get("items").and_then(|i| i.as_array()).cloned().unwrap_or_default();
+        let items = result
+            .get("items")
+            .and_then(|i| i.as_array())
+            .cloned()
+            .unwrap_or_default();
         tracing::debug!(
             "textDocument/diagnostic: {} items (kind={}) for {}",
-            items.len(), kind, file_uri.as_str()
+            items.len(),
+            kind,
+            file_uri.as_str()
         );
         Ok(items)
     }
@@ -1356,7 +1485,10 @@ impl LspEnricher {
     ) -> Vec<Node> {
         // Resolve file path from URI
         let rel_path = {
-            let abs = match url::Url::parse(file_uri).ok().and_then(|u| u.to_file_path().ok()) {
+            let abs = match url::Url::parse(file_uri)
+                .ok()
+                .and_then(|u| u.to_file_path().ok())
+            {
                 Some(p) => p,
                 None => {
                     if let Some(p) = file_uri.strip_prefix("file://") {
@@ -1385,16 +1517,38 @@ impl LspEnricher {
                 continue;
             }
             let severity = Self::lsp_severity_to_str(severity_int);
-            let message = diag.get("message").and_then(|m| m.as_str()).unwrap_or("").trim().to_string();
+            let message = diag
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if message.is_empty() {
                 continue;
             }
-            let source = diag.get("source").and_then(|s| s.as_str()).unwrap_or(server_command);
+            let source = diag
+                .get("source")
+                .and_then(|s| s.as_str())
+                .unwrap_or(server_command);
 
-            let start_line = diag.pointer("/range/start/line").and_then(|l| l.as_u64()).unwrap_or(0) as usize + 1;
-            let start_char = diag.pointer("/range/start/character").and_then(|c| c.as_u64()).unwrap_or(0);
-            let end_line = diag.pointer("/range/end/line").and_then(|l| l.as_u64()).unwrap_or(0) as usize + 1;
-            let end_char = diag.pointer("/range/end/character").and_then(|c| c.as_u64()).unwrap_or(0);
+            let start_line = diag
+                .pointer("/range/start/line")
+                .and_then(|l| l.as_u64())
+                .unwrap_or(0) as usize
+                + 1;
+            let start_char = diag
+                .pointer("/range/start/character")
+                .and_then(|c| c.as_u64())
+                .unwrap_or(0);
+            let end_line = diag
+                .pointer("/range/end/line")
+                .and_then(|l| l.as_u64())
+                .unwrap_or(0) as usize
+                + 1;
+            let end_char = diag
+                .pointer("/range/end/character")
+                .and_then(|c| c.as_u64())
+                .unwrap_or(0);
             let range_str = format!("{}:{}-{}:{}", start_line, start_char, end_line, end_char);
 
             // Name: truncated message + line number for human readability in search results.
@@ -1510,8 +1664,12 @@ impl LspEnricher {
                 let parts: Vec<&str> = line.splitn(3, "->").collect();
                 if parts.len() >= 2 {
                     let from_id = parts[0].trim().trim_end_matches(';').to_string();
-                    let to_id = parts[1].split_whitespace().next()
-                        .unwrap_or("").trim_end_matches(';').to_string();
+                    let to_id = parts[1]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches(';')
+                        .to_string();
                     if from_id.starts_with('_') && to_id.starts_with('_') {
                         edges.push((from_id, to_id));
                     }
@@ -1525,7 +1683,8 @@ impl LspEnricher {
         crate_names.dedup();
 
         // Resolve edge IDs to crate names
-        let resolved_edges = edges.into_iter()
+        let resolved_edges = edges
+            .into_iter()
             .filter_map(|(from_id, to_id)| {
                 let from = id_to_name.get(&from_id)?;
                 let to = id_to_name.get(&to_id)?;
@@ -1625,32 +1784,32 @@ impl LspEnricher {
         // rust-analyzer returns an array of LocationLinks; the first gives the
         // parent module's URI which we use as the module path.
         if let Some(arr) = result.as_array()
-            && let Some(first) = arr.first() {
-                // The target URI gives us the parent file path; derive module name
-                // from the file name (e.g. `src/server/mod.rs` → `server`)
-                if let Some(uri_str) = first.get("targetUri").and_then(|u| u.as_str()) {
-                    // Extract the module name from the URI: strip file:// and get basename
-                    let path = if let Some(p) = uri_str.strip_prefix("file://") {
-                        PathBuf::from(p)
+            && let Some(first) = arr.first()
+        {
+            // The target URI gives us the parent file path; derive module name
+            // from the file name (e.g. `src/server/mod.rs` → `server`)
+            if let Some(uri_str) = first.get("targetUri").and_then(|u| u.as_str()) {
+                // Extract the module name from the URI: strip file:// and get basename
+                let path = if let Some(p) = uri_str.strip_prefix("file://") {
+                    PathBuf::from(p)
+                } else {
+                    PathBuf::from(uri_str)
+                };
+                let module_name = path.file_stem().and_then(|s| s.to_str()).map(|s| {
+                    if s == "mod" {
+                        // For mod.rs, use the directory name
+                        path.parent()
+                            .and_then(|p| p.file_name())
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(s)
+                            .to_string()
                     } else {
-                        PathBuf::from(uri_str)
-                    };
-                    let module_name = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .map(|s| if s == "mod" {
-                            // For mod.rs, use the directory name
-                            path.parent()
-                                .and_then(|p| p.file_name())
-                                .and_then(|n| n.to_str())
-                                .unwrap_or(s)
-                                .to_string()
-                        } else {
-                            s.to_string()
-                        });
-                    return Ok(module_name);
-                }
+                        s.to_string()
+                    }
+                });
+                return Ok(module_name);
             }
+        }
 
         Ok(None)
     }
@@ -1679,7 +1838,10 @@ impl LspEnricher {
         let module_name: Option<String> = if is_rust {
             let abs_path = root.join(rel_file);
             if let Ok(file_uri) = path_to_uri(&abs_path) {
-                Self::ra_parent_module(transport, &file_uri).await.ok().flatten()
+                Self::ra_parent_module(transport, &file_uri)
+                    .await
+                    .ok()
+                    .flatten()
             } else {
                 None
             }
@@ -1780,9 +1942,8 @@ impl LspEnricher {
             }
         });
 
-        let result: serde_json::Value = transport
-            .request("textDocument/inlayHint", &params)
-            .await?;
+        let result: serde_json::Value =
+            transport.request("textDocument/inlayHint", &params).await?;
 
         if result.is_null() {
             return Ok(Vec::new());
@@ -1811,7 +1972,7 @@ impl LspEnricher {
             let hint_line = hint
                 .pointer("/position/line")
                 .and_then(|l| l.as_u64())
-                .map(|l| l as usize + 1)  // Convert to 1-indexed
+                .map(|l| l as usize + 1) // Convert to 1-indexed
                 .unwrap_or(0);
 
             if hint_line == 0 {
@@ -1839,7 +2000,12 @@ impl LspEnricher {
             // Find the narrowest enclosing function/impl/struct for this hint line
             let enclosing = file_nodes
                 .iter()
-                .filter(|n| matches!(n.id.kind, NodeKind::Function | NodeKind::Impl | NodeKind::Struct))
+                .filter(|n| {
+                    matches!(
+                        n.id.kind,
+                        NodeKind::Function | NodeKind::Impl | NodeKind::Struct
+                    )
+                })
                 .filter(|n| n.line_start <= hint_line && n.line_end >= hint_line)
                 .min_by_key(|n| n.line_end - n.line_start);
 
@@ -1887,7 +2053,12 @@ impl Enricher for LspEnricher {
         self.config_file
     }
 
-    async fn enrich(&self, nodes: &[Node], _index: &GraphIndex, repo_root: &Path) -> Result<EnrichmentResult> {
+    async fn enrich(
+        &self,
+        nodes: &[Node],
+        _index: &GraphIndex,
+        repo_root: &Path,
+    ) -> Result<EnrichmentResult> {
         let mut result = EnrichmentResult::default();
 
         // Filter to nodes matching this enricher's language.
@@ -1898,11 +2069,20 @@ impl Enricher for LspEnricher {
             .filter(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "crate"))
             .collect();
 
-        let fn_count = matching_nodes.iter().filter(|n| n.id.kind == NodeKind::Function).count();
-        let trait_count = matching_nodes.iter().filter(|n| n.id.kind == NodeKind::Trait).count();
+        let fn_count = matching_nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Function)
+            .count();
+        let trait_count = matching_nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Trait)
+            .count();
         tracing::info!(
             "LSP enriching {} nodes ({} functions, {} traits) for {}",
-            matching_nodes.len(), fn_count, trait_count, self.language
+            matching_nodes.len(),
+            fn_count,
+            trait_count,
+            self.language
         );
 
         if matching_nodes.is_empty() {
@@ -1916,7 +2096,18 @@ impl Enricher for LspEnricher {
         }
 
         // Extract state under lock, then release for concurrent work.
-        let (transport, root, has_type_hierarchy, type_hierarchy_strikes, has_references, has_call_hierarchy, has_pull_diagnostics, has_inlay_hints, was_quiescent, diag_sink) = {
+        let (
+            transport,
+            root,
+            has_type_hierarchy,
+            type_hierarchy_strikes,
+            has_references,
+            has_call_hierarchy,
+            has_pull_diagnostics,
+            has_inlay_hints,
+            was_quiescent,
+            diag_sink,
+        ) = {
             let state = self.state.lock().await;
             let root = state
                 .root_path
@@ -1928,11 +2119,23 @@ impl Enricher for LspEnricher {
             };
             let diag_sink = Arc::clone(&state.diagnostics_sink);
             let was_quiescent = transport.quiescent_flag.load(Ordering::Acquire);
-            (transport, root, state.has_type_hierarchy, state.type_hierarchy_strikes, state.has_references, state.has_call_hierarchy, state.has_pull_diagnostics, state.has_inlay_hints, was_quiescent, diag_sink)
+            (
+                transport,
+                root,
+                state.has_type_hierarchy,
+                state.type_hierarchy_strikes,
+                state.has_references,
+                state.has_call_hierarchy,
+                state.has_pull_diagnostics,
+                state.has_inlay_hints,
+                was_quiescent,
+                diag_sink,
+            )
         };
 
         // Pass 0: crate-level dependency graph (Rust only, no quiescence needed)
-        self.run_pass0_crate_graph(&transport, &matching_nodes, &mut result).await;
+        self.run_pass0_crate_graph(&transport, &matching_nodes, &mut result)
+            .await;
 
         // Guard: skip enrichment passes when server never reached quiescent state
         if !was_quiescent {
@@ -1948,9 +2151,8 @@ impl Enricher for LspEnricher {
         }
 
         // Shared state for concurrent passes
-        let matching_nodes_owned: Arc<Vec<Node>> = Arc::new(
-            matching_nodes.iter().map(|n| (*n).clone()).collect()
-        );
+        let matching_nodes_owned: Arc<Vec<Node>> =
+            Arc::new(matching_nodes.iter().map(|n| (*n).clone()).collect());
         let refs_by_file_shared: Arc<HashMap<std::path::PathBuf, Vec<Node>>> = {
             let mut map: HashMap<std::path::PathBuf, Vec<Node>> = HashMap::new();
             for n in matching_nodes_owned.iter() {
@@ -1960,18 +2162,30 @@ impl Enricher for LspEnricher {
         };
 
         // Pass 1: call hierarchy, references, implementations, document links (concurrent)
-        let (attempted, errors, aborted) = self.run_pass1_references(
-            &transport, &root, &matching_nodes, &matching_nodes_owned,
-            &refs_by_file_shared, has_references, has_call_hierarchy,
-            &mut result,
-        ).await;
+        let (attempted, errors, aborted) = self
+            .run_pass1_references(
+                &transport,
+                &root,
+                &matching_nodes,
+                &matching_nodes_owned,
+                &refs_by_file_shared,
+                has_references,
+                has_call_hierarchy,
+                &mut result,
+            )
+            .await;
 
         // Pass 2: type hierarchy (sequential -- strike counting needs order)
-        let (has_type_hierarchy, type_hierarchy_strikes) = self.run_pass2_type_hierarchy(
-            &transport, &root, &matching_nodes,
-            has_type_hierarchy, type_hierarchy_strikes,
-            &mut result,
-        ).await;
+        let (has_type_hierarchy, type_hierarchy_strikes) = self
+            .run_pass2_type_hierarchy(
+                &transport,
+                &root,
+                &matching_nodes,
+                has_type_hierarchy,
+                type_hierarchy_strikes,
+                &mut result,
+            )
+            .await;
 
         // Persist strike counter back to state
         {
@@ -1981,10 +2195,18 @@ impl Enricher for LspEnricher {
         }
 
         // Pass 4: BelongsTo edges -- module hierarchy
-        self.run_pass4_belongs_to(&transport, &root, &matching_nodes, &mut result).await;
+        self.run_pass4_belongs_to(&transport, &root, &matching_nodes, &mut result)
+            .await;
 
         // Pass 5: InlayHints -- inferred types in embeddings
-        self.run_pass5_inlay_hints(&transport, &root, &matching_nodes, has_inlay_hints, &mut result).await;
+        self.run_pass5_inlay_hints(
+            &transport,
+            &root,
+            &matching_nodes,
+            has_inlay_hints,
+            &mut result,
+        )
+        .await;
 
         // Pass 3: diagnostics (runs last, guarded by quiescence)
         if !was_quiescent {
@@ -1994,13 +2216,20 @@ impl Enricher for LspEnricher {
             );
         } else {
             self.run_pass3_diagnostics(
-                &transport, &root, &matching_nodes,
-                has_pull_diagnostics, &diag_sink, repo_root,
+                &transport,
+                &root,
+                &matching_nodes,
+                has_pull_diagnostics,
+                &diag_sink,
+                repo_root,
                 &mut result,
-            ).await;
+            )
+            .await;
         }
 
-        let diag_count = result.new_nodes.iter()
+        let diag_count = result
+            .new_nodes
+            .iter()
             .filter(|n| matches!(&n.id.kind, NodeKind::Other(s) if s == "diagnostic"))
             .count();
         tracing::info!(
@@ -2028,8 +2257,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::str::FromStr;
 
-    use super::*;
     use super::transport::{find_enclosing_symbol, uri_to_relative_path};
+    use super::*;
 
     /// Verify the Enricher trait can be implemented (compile-time check).
     #[tokio::test]
@@ -2066,7 +2295,10 @@ mod tests {
         assert_eq!(enricher.name(), "dummy");
 
         let index = GraphIndex::new();
-        let result = enricher.enrich(&[], &index, std::path::Path::new(".")).await.unwrap();
+        let result = enricher
+            .enrich(&[], &index, std::path::Path::new("."))
+            .await
+            .unwrap();
         assert!(result.added_edges.is_empty());
         assert!(result.updated_nodes.is_empty());
     }
@@ -2138,7 +2370,10 @@ mod tests {
             source: ExtractionSource::TreeSitter,
         }];
 
-        let result = enricher.enrich(&nodes, &index, std::path::Path::new(".")).await.unwrap();
+        let result = enricher
+            .enrich(&nodes, &index, std::path::Path::new("."))
+            .await
+            .unwrap();
         assert!(result.added_edges.is_empty());
     }
 
@@ -2152,7 +2387,11 @@ mod tests {
         assert_eq!(registry.len(), 0);
 
         let registry = EnricherRegistry::with_builtins();
-        assert!(registry.len() >= 30, "should have 30+ auto-discovered LSP servers, got {}", registry.len());
+        assert!(
+            registry.len() >= 30,
+            "should have 30+ auto-discovered LSP servers, got {}",
+            registry.len()
+        );
     }
 
     /// Verify multiple enrichers can be registered and coexist.
@@ -2185,7 +2424,15 @@ mod tests {
 
         // Enrich with no nodes should work fine for all enrichers
         let index = GraphIndex::new();
-        let result = registry.enrich_all(&[], &index, &["rust".to_string(), "python".to_string()], std::path::Path::new("."), &[]).await;
+        let result = registry
+            .enrich_all(
+                &[],
+                &index,
+                &["rust".to_string(), "python".to_string()],
+                std::path::Path::new("."),
+                &[],
+            )
+            .await;
         assert!(result.added_edges.is_empty());
     }
 
@@ -2209,7 +2456,7 @@ mod tests {
         base_settings: &serde_json::Value,
         language: &str,
         startup_root: &std::path::Path,
-        venv_name: &str,   // the venv subdir that "exists" (simulated)
+        venv_name: &str, // the venv subdir that "exists" (simulated)
     ) -> serde_json::Value {
         if language == "python" {
             let venv_candidates = [".venv", "venv", "env"];
@@ -2221,7 +2468,10 @@ mod tests {
                     if let Some(analysis_obj) = python_obj.get_mut("analysis") {
                         if let Some(obj) = analysis_obj.as_object_mut() {
                             obj.insert("venvPath".into(), serde_json::Value::String(venv_path_str));
-                            obj.insert("venv".into(), serde_json::Value::String(venv_name.to_string()));
+                            obj.insert(
+                                "venv".into(),
+                                serde_json::Value::String(venv_name.to_string()),
+                            );
                         }
                     }
                 }
@@ -2304,7 +2554,8 @@ mod tests {
         });
         let startup_root = std::path::Path::new("/tmp/client");
 
-        let effective_settings = apply_pyright_venv_settings(&base_settings, "typescript", startup_root, ".venv");
+        let effective_settings =
+            apply_pyright_venv_settings(&base_settings, "typescript", startup_root, ".venv");
 
         // TypeScript settings should be unchanged — venv detection only fires for python
         assert_eq!(effective_settings, base_settings);
@@ -2357,8 +2608,14 @@ mod tests {
         let result = uri_to_relative_path(&outside_uri, &root);
         // Should be the decoded absolute path, NOT contain %20
         let result_str = result.to_string_lossy();
-        assert!(!result_str.contains("%20"), "fallback should not contain raw percent-encoding: {result_str}");
-        assert!(result_str.contains("other project"), "path should be decoded: {result_str}");
+        assert!(
+            !result_str.contains("%20"),
+            "fallback should not contain raw percent-encoding: {result_str}"
+        );
+        assert!(
+            result_str.contains("other project"),
+            "path should be decoded: {result_str}"
+        );
 
         // 2. Encoded root path matches exactly the file — relative should be empty/current dir.
         let root2 = PathBuf::from("/home/user/my project");
@@ -2372,7 +2629,13 @@ mod tests {
     // Tests for resolve_type_hierarchy_item (pure function, no LSP server needed)
     // -----------------------------------------------------------------------
 
-    fn make_node(file: &str, name: &str, kind: NodeKind, line_start: usize, line_end: usize) -> Node {
+    fn make_node(
+        file: &str,
+        name: &str,
+        kind: NodeKind,
+        line_start: usize,
+        line_end: usize,
+    ) -> Node {
         let kind_str = match &kind {
             NodeKind::Trait => "trait",
             NodeKind::Struct => "struct",
@@ -2433,7 +2696,9 @@ mod tests {
         // The resolved node should be the one at line 50-60 (node2)
         let resolved_id = result.unwrap();
         assert!(
-            nodes.iter().any(|n| n.id == resolved_id && n.line_start == 50),
+            nodes
+                .iter()
+                .any(|n| n.id == resolved_id && n.line_start == 50),
             "should resolve to the node at line 50, not line 10"
         );
     }
@@ -2454,10 +2719,20 @@ mod tests {
     #[test]
     fn test_resolve_type_hierarchy_external_dependency_filtered() {
         let root = PathBuf::from("/project");
-        let node = make_node(".cargo/registry/src/tokio/lib.rs", "Runtime", NodeKind::Struct, 1, 100);
+        let node = make_node(
+            ".cargo/registry/src/tokio/lib.rs",
+            "Runtime",
+            NodeKind::Struct,
+            1,
+            100,
+        );
         let nodes: Vec<&Node> = vec![&node];
 
-        let item = make_type_hierarchy_item("Runtime", "file:///project/.cargo/registry/src/tokio/lib.rs", 0);
+        let item = make_type_hierarchy_item(
+            "Runtime",
+            "file:///project/.cargo/registry/src/tokio/lib.rs",
+            0,
+        );
         let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
         assert!(result.is_none(), ".cargo paths should be filtered out");
     }
@@ -2518,7 +2793,10 @@ mod tests {
         let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
 
         // Must resolve to something, not panic or return None
-        assert!(result.is_some(), "should resolve even with identical candidates");
+        assert!(
+            result.is_some(),
+            "should resolve even with identical candidates"
+        );
 
         // Must be deterministic across calls
         let result2 = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
@@ -2576,11 +2854,7 @@ mod tests {
         let nodes: Vec<&Node> = vec![&node];
 
         // Percent-encoded Chinese characters: 中文 = %E4%B8%AD%E6%96%87
-        let item = make_type_hierarchy_item(
-            "Foo",
-            "file:///project/src/%E4%B8%AD%E6%96%87.rs",
-            0,
-        );
+        let item = make_type_hierarchy_item("Foo", "file:///project/src/%E4%B8%AD%E6%96%87.rs", 0);
         let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
         assert_eq!(
             result.unwrap().name,
@@ -2617,7 +2891,10 @@ mod tests {
         });
         // url::Url::parse("not-a-url") => Err, fallback strip_prefix("file://") => None
         let result = LspEnricher::resolve_type_hierarchy_item(&item_bad, &nodes, &root);
-        assert!(result.is_none(), "URI without file:// scheme should fail gracefully");
+        assert!(
+            result.is_none(),
+            "URI without file:// scheme should fail gracefully"
+        );
     }
 
     /// Type hierarchy item with unexpected field types (name as number, uri as null).
@@ -2658,7 +2935,10 @@ mod tests {
         });
         // Should still resolve — line defaults to 0 when not parseable
         let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
-        assert!(result.is_some(), "bad line type should degrade gracefully, not prevent resolution");
+        assert!(
+            result.is_some(),
+            "bad line type should degrade gracefully, not prevent resolution"
+        );
     }
 
     /// When range is completely missing from the item, resolution should still
@@ -2675,7 +2955,11 @@ mod tests {
             "kind": 5
         });
         let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
-        assert_eq!(result.unwrap().name, "Foo", "missing range should not prevent unique match");
+        assert_eq!(
+            result.unwrap().name,
+            "Foo",
+            "missing range should not prevent unique match"
+        );
     }
 
     /// If the node kind is Function (not Trait/Struct/Enum/Impl), the candidate
@@ -2689,7 +2973,10 @@ mod tests {
 
         let item = make_type_hierarchy_item("process", "file:///project/src/lib.rs", 0);
         let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
-        assert!(result.is_none(), "Functions should not be resolved as type hierarchy targets");
+        assert!(
+            result.is_none(),
+            "Functions should not be resolved as type hierarchy targets"
+        );
     }
 
     /// Empty matching_nodes should return None, not panic.
@@ -2709,16 +2996,22 @@ mod tests {
     fn test_resolve_type_hierarchy_cargo_filter_nested() {
         let root = PathBuf::from("/project");
         // A node that happens to be under a .cargo subdir in the repo
-        let node = make_node("vendor/.cargo/config.toml/Foo", "Foo", NodeKind::Struct, 1, 10);
+        let node = make_node(
+            "vendor/.cargo/config.toml/Foo",
+            "Foo",
+            NodeKind::Struct,
+            1,
+            10,
+        );
         let nodes: Vec<&Node> = vec![&node];
 
-        let item = make_type_hierarchy_item(
-            "Foo",
-            "file:///project/vendor/.cargo/config.toml/Foo",
-            0,
-        );
+        let item =
+            make_type_hierarchy_item("Foo", "file:///project/vendor/.cargo/config.toml/Foo", 0);
         let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
-        assert!(result.is_none(), "paths containing .cargo anywhere should be filtered");
+        assert!(
+            result.is_none(),
+            "paths containing .cargo anywhere should be filtered"
+        );
     }
 
     /// Position tiebreaker when the LSP range doesn't overlap any candidate's
@@ -2740,7 +3033,10 @@ mod tests {
         // Line 35 (0-indexed: 34, +1=35) doesn't overlap [10,20] or [50,60]
         let item = make_type_hierarchy_item("Config", "file:///project/src/lib.rs", 34);
         let result = LspEnricher::resolve_type_hierarchy_item(&item, &nodes, &root);
-        assert!(result.is_some(), "should fall back to closest-by-line_start");
+        assert!(
+            result.is_some(),
+            "should fall back to closest-by-line_start"
+        );
 
         // The resolver picks closest by unsigned distance: |10-35|=25, |50-35|=15
         // So node2 should be selected. But since NodeId doesn't include line info,
@@ -2749,7 +3045,10 @@ mod tests {
         assert_eq!(resolved.name, "Config");
         // NOTE: NodeId equality means we can't distinguish which physical node
         // was chosen from the returned ID alone. This is a design limitation.
-        assert_eq!(node1.id, node2.id, "NodeId lacks position — identical-name nodes are indistinguishable");
+        assert_eq!(
+            node1.id, node2.id,
+            "NodeId lacks position — identical-name nodes are indistinguishable"
+        );
     }
 
     /// Verify that an item with a non-file URI scheme (e.g. untitled:, http://)
@@ -2779,7 +3078,10 @@ mod tests {
         let enricher = LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]);
         let state = enricher.state.try_lock().unwrap();
         assert_eq!(state.type_hierarchy_strikes, 0);
-        assert!(!state.has_type_hierarchy, "should default to false until init confirms");
+        assert!(
+            !state.has_type_hierarchy,
+            "should default to false until init confirms"
+        );
     }
 
     /// If LspState has type hierarchy disabled (has_type_hierarchy = false),
@@ -2838,7 +3140,9 @@ mod tests {
 
         // This may succeed or fail depending on whether we're in a Cargo project.
         // Either way, it should not panic.
-        let _result = enricher.enrich(&nodes, &index, std::path::Path::new(".")).await;
+        let _result = enricher
+            .enrich(&nodes, &index, std::path::Path::new("."))
+            .await;
     }
 
     /// Verify that the quiescent readiness condition matches the rust-analyzer
@@ -2856,20 +3160,28 @@ mod tests {
         };
 
         // quiescent: true, health: ok => READY (server finished background work)
-        assert!(LspEnricher::server_status_is_ready(&make_status("ok", true)),
-            "quiescent: true + health: ok should be ready");
+        assert!(
+            LspEnricher::server_status_is_ready(&make_status("ok", true)),
+            "quiescent: true + health: ok should be ready"
+        );
 
         // quiescent: false, health: ok => NOT READY (still indexing)
-        assert!(!LspEnricher::server_status_is_ready(&make_status("ok", false)),
-            "quiescent: false + health: ok should NOT be ready");
+        assert!(
+            !LspEnricher::server_status_is_ready(&make_status("ok", false)),
+            "quiescent: false + health: ok should NOT be ready"
+        );
 
         // quiescent: true, health: warning => NOT READY (unhealthy)
-        assert!(!LspEnricher::server_status_is_ready(&make_status("warning", true)),
-            "health: warning should NOT be ready regardless of quiescent");
+        assert!(
+            !LspEnricher::server_status_is_ready(&make_status("warning", true)),
+            "health: warning should NOT be ready regardless of quiescent"
+        );
 
         // quiescent: true, health: error => NOT READY (unhealthy)
-        assert!(!LspEnricher::server_status_is_ready(&make_status("error", true)),
-            "health: error should NOT be ready regardless of quiescent");
+        assert!(
+            !LspEnricher::server_status_is_ready(&make_status("error", true)),
+            "health: error should NOT be ready regardless of quiescent"
+        );
 
         // Missing quiescent field defaults to false (NOT ready)
         // Conservative: if the server doesn't tell us it's quiescent, assume it's not
@@ -2877,23 +3189,29 @@ mod tests {
             "method": "experimental/serverStatus",
             "params": { "health": "ok" }
         });
-        assert!(!LspEnricher::server_status_is_ready(&no_quiescent),
-            "missing quiescent should default to false (not ready)");
+        assert!(
+            !LspEnricher::server_status_is_ready(&no_quiescent),
+            "missing quiescent should default to false (not ready)"
+        );
 
         // Adversarial: completely empty params should not be ready
         let empty_params = serde_json::json!({
             "method": "experimental/serverStatus",
             "params": {}
         });
-        assert!(!LspEnricher::server_status_is_ready(&empty_params),
-            "empty params should not be ready");
+        assert!(
+            !LspEnricher::server_status_is_ready(&empty_params),
+            "empty params should not be ready"
+        );
 
         // Adversarial: missing params entirely should not be ready
         let no_params = serde_json::json!({
             "method": "experimental/serverStatus"
         });
-        assert!(!LspEnricher::server_status_is_ready(&no_params),
-            "missing params should not be ready");
+        assert!(
+            !LspEnricher::server_status_is_ready(&no_params),
+            "missing params should not be ready"
+        );
 
         // Adversarial: quiescent as string "true" should not be ready
         // (must be boolean true, not string)
@@ -2901,8 +3219,10 @@ mod tests {
             "method": "experimental/serverStatus",
             "params": { "health": "ok", "quiescent": "true" }
         });
-        assert!(!LspEnricher::server_status_is_ready(&string_quiescent),
-            "quiescent as string 'true' should not be ready (must be bool)");
+        assert!(
+            !LspEnricher::server_status_is_ready(&string_quiescent),
+            "quiescent as string 'true' should not be ready (must be bool)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2922,7 +3242,10 @@ mod tests {
 
         // Line 5 is before any symbol -- module-level use statement
         let result = find_enclosing_symbol(&refs, Path::new("src/lib.rs"), 5);
-        assert!(result.is_none(), "module-level reference should not resolve to any symbol");
+        assert!(
+            result.is_none(),
+            "module-level reference should not resolve to any symbol"
+        );
 
         // Line 22 is between symbols -- also module level
         let result = find_enclosing_symbol(&refs, Path::new("src/lib.rs"), 22);
@@ -2940,19 +3263,24 @@ mod tests {
 
         // Line 15 is inside both MyImpl and inner_fn -- should resolve to inner_fn
         let result = find_enclosing_symbol(&refs, Path::new("src/lib.rs"), 15);
-        assert_eq!(result.unwrap().name, "inner_fn", "should resolve to narrowest enclosing symbol");
+        assert_eq!(
+            result.unwrap().name,
+            "inner_fn",
+            "should resolve to narrowest enclosing symbol"
+        );
     }
 
     /// Dissent finding: references in a different file should not match.
     #[test]
     fn test_find_enclosing_symbol_wrong_file_returns_none() {
-        let nodes = vec![
-            make_node("src/lib.rs", "my_fn", NodeKind::Function, 1, 50),
-        ];
+        let nodes = vec![make_node("src/lib.rs", "my_fn", NodeKind::Function, 1, 50)];
         let refs: Vec<&Node> = nodes.iter().collect();
 
         let result = find_enclosing_symbol(&refs, Path::new("src/other.rs"), 10);
-        assert!(result.is_none(), "reference in different file should not match");
+        assert!(
+            result.is_none(),
+            "reference in different file should not match"
+        );
     }
 
     /// Verify find_enclosing_symbol resolves Enum and Const scopes
@@ -2967,11 +3295,19 @@ mod tests {
 
         // Line inside enum -- should resolve after filter expansion
         let result = find_enclosing_symbol(&refs, Path::new("src/lib.rs"), 10);
-        assert_eq!(result.unwrap().name, "MyEnum", "Enum should now resolve in find_enclosing_symbol");
+        assert_eq!(
+            result.unwrap().name,
+            "MyEnum",
+            "Enum should now resolve in find_enclosing_symbol"
+        );
 
         // Line inside const -- should resolve after filter expansion
         let result = find_enclosing_symbol(&refs, Path::new("src/lib.rs"), 27);
-        assert_eq!(result.unwrap().name, "MY_CONST", "Const should now resolve in find_enclosing_symbol");
+        assert_eq!(
+            result.unwrap().name,
+            "MY_CONST",
+            "Const should now resolve in find_enclosing_symbol"
+        );
     }
 
     /// Verify the self-reference filtering logic: a reference at the definition
@@ -2983,34 +3319,55 @@ mod tests {
         // Reference at the definition site
         let ref_file = PathBuf::from("src/lib.rs");
         let ref_line: usize = 15;
-        let is_self_ref = ref_file == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end;
-        assert!(is_self_ref, "reference within definition site should be detected as self-reference");
+        let is_self_ref =
+            ref_file == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end;
+        assert!(
+            is_self_ref,
+            "reference within definition site should be detected as self-reference"
+        );
 
         // Reference in same file but outside definition
         let ref_line: usize = 25;
-        let is_self_ref = ref_file == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end;
-        assert!(!is_self_ref, "reference outside definition should not be self-reference");
+        let is_self_ref =
+            ref_file == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end;
+        assert!(
+            !is_self_ref,
+            "reference outside definition should not be self-reference"
+        );
 
         // Reference in different file
         let ref_file = PathBuf::from("src/other.rs");
         let ref_line: usize = 15;
-        let is_self_ref = ref_file == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end;
-        assert!(!is_self_ref, "reference in different file should not be self-reference");
+        let is_self_ref =
+            ref_file == node.id.file && ref_line >= node.line_start && ref_line <= node.line_end;
+        assert!(
+            !is_self_ref,
+            "reference in different file should not be self-reference"
+        );
     }
 
     /// Verify that .cargo path filtering works correctly.
     #[test]
     fn test_cargo_dep_filtering_logic() {
-        let cargo_path = PathBuf::from("/home/user/.cargo/registry/src/index.crates.io/serde-1.0.0/src/lib.rs");
-        assert!(cargo_path.to_string_lossy().contains(".cargo"), ".cargo dependency should be detected");
+        let cargo_path =
+            PathBuf::from("/home/user/.cargo/registry/src/index.crates.io/serde-1.0.0/src/lib.rs");
+        assert!(
+            cargo_path.to_string_lossy().contains(".cargo"),
+            ".cargo dependency should be detected"
+        );
 
         let project_path = PathBuf::from("src/lib.rs");
-        assert!(!project_path.to_string_lossy().contains(".cargo"), "project file should not be filtered");
+        assert!(
+            !project_path.to_string_lossy().contains(".cargo"),
+            "project file should not be filtered"
+        );
 
         // Dissent edge case: project with "cargo" in name
         let tricky_path = PathBuf::from("my-cargo-tool/src/lib.rs");
-        assert!(!tricky_path.to_string_lossy().contains(".cargo"),
-            "project with 'cargo' in name (no dot prefix) should not be filtered");
+        assert!(
+            !tricky_path.to_string_lossy().contains(".cargo"),
+            "project with 'cargo' in name (no dot prefix) should not be filtered"
+        );
     }
 
     /// Verify ReferencedBy edge kind has correct weight and string representation.
@@ -3065,7 +3422,10 @@ mod tests {
         };
 
         // Verify the experimental capability is set
-        let experimental = init_params.capabilities.experimental.as_ref()
+        let experimental = init_params
+            .capabilities
+            .experimental
+            .as_ref()
             .expect("experimental capabilities must be set");
         assert_eq!(
             experimental.get("serverStatusNotification"),
@@ -3093,8 +3453,10 @@ mod tests {
             let seen_server_status = false;
             let server_ready = true;
             let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
-            assert!(was_quiescent,
-                "probe + validation success must set was_quiescent=true — Pass 1/3 should run");
+            assert!(
+                was_quiescent,
+                "probe + validation success must set was_quiescent=true — Pass 1/3 should run"
+            );
         }
 
         // Case 2: Probe succeeds but validation returns 0 symbols → was_quiescent = false
@@ -3104,9 +3466,11 @@ mod tests {
             let seen_server_status = false;
             let server_ready = false;
             let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
-            assert!(!was_quiescent,
+            assert!(
+                !was_quiescent,
                 "probe success with failed validation must NOT set was_quiescent — \
-                 Pass 1/3 must be skipped (server responsive but not indexed, #576)");
+                 Pass 1/3 must be skipped (server responsive but not indexed, #576)"
+            );
         }
 
         // Case 3: Neither probe nor validation succeed → was_quiescent = false
@@ -3115,8 +3479,10 @@ mod tests {
             let seen_server_status = false;
             let server_ready = false;
             let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
-            assert!(!was_quiescent,
-                "no probe success must not set was_quiescent — server never responded");
+            assert!(
+                !was_quiescent,
+                "no probe success must not set was_quiescent — server never responded"
+            );
         }
 
         // Case 4: serverStatus path (not probe) — quiescent=true → was_quiescent = true
@@ -3125,8 +3491,10 @@ mod tests {
             let seen_server_status = true;
             let server_ready = true;
             let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
-            assert!(was_quiescent,
-                "serverStatus quiescent=true must set was_quiescent regardless of probe path");
+            assert!(
+                was_quiescent,
+                "serverStatus quiescent=true must set was_quiescent regardless of probe path"
+            );
         }
 
         // Case 5: serverStatus path — not quiescent → was_quiescent = false
@@ -3135,9 +3503,11 @@ mod tests {
             let seen_server_status = true;
             let server_ready = false;
             let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
-            assert!(!was_quiescent,
+            assert!(
+                !was_quiescent,
                 "serverStatus without quiescent=true must NOT set was_quiescent — \
-                 server timed out during indexing");
+                 server timed out during indexing"
+            );
         }
     }
 
@@ -3150,17 +3520,24 @@ mod tests {
         // here to verify the design contract: at least 3 diverse queries so a
         // project missing "main" can still pass validation.
         let queries = &["main", "init", "test", "get", "set", "app"];
-        assert!(queries.len() >= 3,
+        assert!(
+            queries.len() >= 3,
             "need at least 3 validation queries to avoid false negatives \
-             from projects that happen to lack a particular symbol name");
+             from projects that happen to lack a particular symbol name"
+        );
         // Verify no empty strings — an empty query would bypass validation
         // since workspace/symbol("") returns all symbols (or matches anything).
-        assert!(queries.iter().all(|q| !q.is_empty()),
-            "validation queries must be non-empty strings — empty query bypasses validation");
+        assert!(
+            queries.iter().all(|q| !q.is_empty()),
+            "validation queries must be non-empty strings — empty query bypasses validation"
+        );
         // Verify no duplicates
         let unique: std::collections::HashSet<&&str> = queries.iter().collect();
-        assert_eq!(unique.len(), queries.len(),
-            "validation queries must be unique");
+        assert_eq!(
+            unique.len(),
+            queries.len(),
+            "validation queries must be unique"
+        );
     }
 
     /// Adversarial: verify the early-exit condition for indexing validation.
@@ -3175,20 +3552,28 @@ mod tests {
         };
 
         // Boundary: 2 empties at attempt 3 — NOT enough evidence
-        assert!(!check_early_exit(2, 3),
-            "2 consecutive empty responses is not enough to declare server unindexed");
+        assert!(
+            !check_early_exit(2, 3),
+            "2 consecutive empty responses is not enough to declare server unindexed"
+        );
 
         // Boundary: 3 empties at attempt 2 — too early to give up
-        assert!(!check_early_exit(3, 2),
-            "should not exit early on attempt 2 even with 3 empties — give more time");
+        assert!(
+            !check_early_exit(3, 2),
+            "should not exit early on attempt 2 even with 3 empties — give more time"
+        );
 
         // Exact threshold: 3 empties at attempt 3 — exit
-        assert!(check_early_exit(3, 3),
-            "3 consecutive empty responses at attempt 3 should trigger early exit");
+        assert!(
+            check_early_exit(3, 3),
+            "3 consecutive empty responses at attempt 3 should trigger early exit"
+        );
 
         // Above threshold: 4 empties at attempt 4
-        assert!(check_early_exit(4, 4),
-            "4 empties at attempt 4 should also trigger early exit");
+        assert!(
+            check_early_exit(4, 4),
+            "4 empties at attempt 4 should also trigger early exit"
+        );
 
         // Edge: attempt 1 with 0 empties — never exit
         assert!(!check_early_exit(0, 1));
@@ -3196,8 +3581,10 @@ mod tests {
         // Scenario: 3 timeouts + 0 empties at attempt 3 — should NOT exit
         // because timeouts don't count toward consecutive_empty
         // (server is actively indexing, not returning empty results)
-        assert!(!check_early_exit(0, 3),
-            "timeouts should not trigger early exit — only empty results and errors count");
+        assert!(
+            !check_early_exit(0, 3),
+            "timeouts should not trigger early exit — only empty results and errors count"
+        );
     }
 
     /// Adversarial: verify validation query rotation covers all queries
@@ -3215,11 +3602,17 @@ mod tests {
         }
 
         // All 6 queries should be used exactly once in 6 attempts
-        assert_eq!(used.len(), queries.len(),
-            "6 attempts should use all 6 queries");
+        assert_eq!(
+            used.len(),
+            queries.len(),
+            "6 attempts should use all 6 queries"
+        );
         let unique: std::collections::HashSet<&&str> = used.iter().collect();
-        assert_eq!(unique.len(), queries.len(),
-            "each query should be used exactly once in 6 attempts — no repeats");
+        assert_eq!(
+            unique.len(),
+            queries.len(),
+            "each query should be used exactly once in 6 attempts — no repeats"
+        );
     }
 
     /// Adversarial: verify the was_quiescent formula handles the edge case
@@ -3235,9 +3628,11 @@ mod tests {
         let seen_server_status = true;
         let server_ready = false; // probe never ran
         let was_quiescent = saw_quiescent || (!seen_server_status && server_ready);
-        assert!(was_quiescent,
+        assert!(
+            was_quiescent,
             "serverStatus quiescent=true must produce was_quiescent=true \
-             even when probe path was not exercised");
+             even when probe path was not exercised"
+        );
     }
 
     /// Integration test: run LSP enrichment against the RNA repo itself.
@@ -3257,31 +3652,40 @@ mod tests {
         use crate::scanner::Scanner;
 
         // Find the repo root (where Cargo.toml is)
-        let repo_root = std::env::current_dir()
-            .expect("failed to get cwd");
-        assert!(repo_root.join("Cargo.toml").exists(),
-            "test must be run from the repo root");
+        let repo_root = std::env::current_dir().expect("failed to get cwd");
+        assert!(
+            repo_root.join("Cargo.toml").exists(),
+            "test must be run from the repo root"
+        );
 
         // Scan the repo to get files
-        let mut scanner = Scanner::new(repo_root.clone())
-            .expect("failed to create scanner");
-        let scan_result = scanner.scan()
-            .expect("scan failed");
+        let mut scanner = Scanner::new(repo_root.clone()).expect("failed to create scanner");
+        let scan_result = scanner.scan().expect("scan failed");
 
         // Extract nodes from scanned files
         let registry = ExtractorRegistry::default();
         let extraction = registry.extract_scan_result(&repo_root, &scan_result);
         let nodes = extraction.nodes;
-        assert!(nodes.len() > 100, "expected >100 nodes from RNA repo, got {}", nodes.len());
+        assert!(
+            nodes.len() > 100,
+            "expected >100 nodes from RNA repo, got {}",
+            nodes.len()
+        );
 
         // Create enricher and run
         let enricher = LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]);
         let index = GraphIndex::new();
-        let result = enricher.enrich(&nodes, &index, &repo_root).await
+        let result = enricher
+            .enrich(&nodes, &index, &repo_root)
+            .await
             .expect("LSP enrichment failed");
 
         let edge_count = result.added_edges.len();
-        eprintln!("LSP enrichment produced {} edges from {} nodes", edge_count, nodes.len());
+        eprintln!(
+            "LSP enrichment produced {} edges from {} nodes",
+            edge_count,
+            nodes.len()
+        );
 
         // Regression guard for #379: check was_quiescent first so failures
         // report a clear message rather than just "0 edges".
@@ -3289,21 +3693,30 @@ mod tests {
             let state = enricher.state.lock().await;
             state.was_quiescent
         };
-        assert!(was_quiescent,
+        assert!(
+            was_quiescent,
             "rust-analyzer did not reach quiescent state — this is the root cause of the \
-             #379 regression. Check that rust-analyzer can index the repo within 120s.");
+             #379 regression. Check that rust-analyzer can index the repo within 120s."
+        );
 
-        assert!(edge_count > 100,
+        assert!(
+            edge_count > 100,
             "expected >100 LSP edges from RNA repo, got {}. \
              This likely means rust-analyzer is not responding to call hierarchy queries.",
-            edge_count);
+            edge_count
+        );
 
         // Check that we have Calls edges specifically
-        let calls_edges = result.added_edges.iter()
+        let calls_edges = result
+            .added_edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Calls)
             .count();
-        assert!(calls_edges > 50,
-            "expected >50 Calls edges, got {}", calls_edges);
+        assert!(
+            calls_edges > 50,
+            "expected >50 Calls edges, got {}",
+            calls_edges
+        );
     }
 
     /// Regression test for #379: verify that LspState.was_quiescent defaults to false.
@@ -3316,9 +3729,11 @@ mod tests {
         let enricher = LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]);
         // The state is accessed via the async lock; use a blocking read for testing.
         let state = enricher.state.blocking_lock();
-        assert!(!state.was_quiescent,
+        assert!(
+            !state.was_quiescent,
             "was_quiescent must default to false — Pass 3 must be skipped until \
-             the server explicitly reaches quiescent=true (regression guard for #379)");
+             the server explicitly reaches quiescent=true (regression guard for #379)"
+        );
     }
 
     /// Regression test for #379 round 4: Pass 1 (call hierarchy) must also be
@@ -3335,11 +3750,13 @@ mod tests {
     fn test_lsp_state_was_quiescent_defaults_false_protects_pass1() {
         let enricher = LspEnricher::new("rust", "rust-analyzer", &[], &["rs"]);
         let state = enricher.state.blocking_lock();
-        assert!(!state.was_quiescent,
+        assert!(
+            !state.was_quiescent,
             "was_quiescent must default to false — Pass 1 (call hierarchy) must be skipped \
              until the server explicitly reaches quiescent=true. Without this guard, the \
              zero-edge abort fires on large repos where RA doesn't index within 120s \
-             (regression: #379 r4)");
+             (regression: #379 r4)"
+        );
     }
 
     /// Verify the was_quiescent logic: only servers that sent serverStatus but
@@ -3360,8 +3777,10 @@ mod tests {
             "method": "experimental/serverStatus",
             "params": { "health": "ok", "quiescent": true }
         });
-        assert!(LspEnricher::server_status_is_ready(&ready_msg),
-            "health=ok + quiescent=true must be ready — saw_quiescent=true, Pass 3 runs");
+        assert!(
+            LspEnricher::server_status_is_ready(&ready_msg),
+            "health=ok + quiescent=true must be ready — saw_quiescent=true, Pass 3 runs"
+        );
 
         // health="warning" + quiescent=true: server_ready=false but saw_quiescent=true → Pass 3 runs
         // (compile errors but done indexing — diagnostics are needed precisely in this state)
@@ -3369,18 +3788,22 @@ mod tests {
             "method": "experimental/serverStatus",
             "params": { "health": "warning", "quiescent": true }
         });
-        assert!(!LspEnricher::server_status_is_ready(&warning_quiescent),
+        assert!(
+            !LspEnricher::server_status_is_ready(&warning_quiescent),
             "health=warning is not 'ready' (server_ready=false), but saw_quiescent=true \
-             means was_quiescent=true and Pass 3 will run correctly");
+             means was_quiescent=true and Pass 3 will run correctly"
+        );
 
         // quiescent=false: saw_quiescent stays false, Pass 3 blocked if deadline expires
         let not_quiescent = serde_json::json!({
             "method": "experimental/serverStatus",
             "params": { "health": "ok", "quiescent": false }
         });
-        assert!(!LspEnricher::server_status_is_ready(&not_quiescent),
+        assert!(
+            !LspEnricher::server_status_is_ready(&not_quiescent),
             "quiescent=false: saw_quiescent=false — if deadline expires with only these \
-             messages, seen_server_status=true and saw_quiescent=false → was_quiescent=false");
+             messages, seen_server_status=true and saw_quiescent=false → was_quiescent=false"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3426,20 +3849,47 @@ mod tests {
         assert_eq!(nodes.len(), 2, "error and warning should produce 2 nodes");
 
         // Check error node — name format is "[severity:line] message"
-        let error_node = nodes.iter().find(|n| n.id.name.starts_with("[error:142]")).unwrap();
+        let error_node = nodes
+            .iter()
+            .find(|n| n.id.name.starts_with("[error:142]"))
+            .unwrap();
         assert_eq!(error_node.id.file, PathBuf::from("src/service.rs"));
-        assert_eq!(error_node.id.kind, NodeKind::Other("diagnostic".to_string()));
+        assert_eq!(
+            error_node.id.kind,
+            NodeKind::Other("diagnostic".to_string())
+        );
         assert_eq!(error_node.line_start, 142); // 0-indexed line 141 -> 1-indexed 142
-        assert_eq!(error_node.metadata.get("diagnostic_severity").unwrap(), "error");
-        assert_eq!(error_node.metadata.get("diagnostic_message").unwrap(), "type mismatch");
-        assert_eq!(error_node.metadata.get("diagnostic_source").unwrap(), "rust-analyzer");
-        assert_eq!(error_node.metadata.get("diagnostic_range").unwrap(), "142:4-142:20");
-        assert_eq!(error_node.metadata.get("diagnostic_timestamp").unwrap(), "1700000000");
+        assert_eq!(
+            error_node.metadata.get("diagnostic_severity").unwrap(),
+            "error"
+        );
+        assert_eq!(
+            error_node.metadata.get("diagnostic_message").unwrap(),
+            "type mismatch"
+        );
+        assert_eq!(
+            error_node.metadata.get("diagnostic_source").unwrap(),
+            "rust-analyzer"
+        );
+        assert_eq!(
+            error_node.metadata.get("diagnostic_range").unwrap(),
+            "142:4-142:20"
+        );
+        assert_eq!(
+            error_node.metadata.get("diagnostic_timestamp").unwrap(),
+            "1700000000"
+        );
 
         // Check warning node — name includes line number for uniqueness
-        let warn_node = nodes.iter().find(|n| n.id.name.starts_with("[warning:89]")).unwrap();
+        let warn_node = nodes
+            .iter()
+            .find(|n| n.id.name.starts_with("[warning:89]"))
+            .unwrap();
         assert_eq!(warn_node.line_start, 89);
-        assert_eq!(warn_node.metadata.get("diagnostic_severity").unwrap(), "warning");
+        assert_eq!(
+            warn_node.metadata.get("diagnostic_severity").unwrap(),
+            "warning"
+        );
     }
 
     /// Verify that Information (3) and Hint (4) diagnostics are filtered out.
@@ -3470,7 +3920,10 @@ mod tests {
             2,
         );
 
-        assert!(nodes.is_empty(), "information and hint diagnostics should not produce nodes");
+        assert!(
+            nodes.is_empty(),
+            "information and hint diagnostics should not produce nodes"
+        );
     }
 
     /// Verify that an empty diagnostics list produces no nodes (zero-error files rule).
@@ -3494,13 +3947,11 @@ mod tests {
     #[test]
     fn test_build_diagnostic_nodes_cargo_path_filtered() {
         let root = PathBuf::from("/project");
-        let diags = vec![
-            serde_json::json!({
-                "severity": 1,
-                "message": "some error",
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
-            }),
-        ];
+        let diags = vec![serde_json::json!({
+            "severity": 1,
+            "message": "some error",
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
+        })];
 
         let nodes = LspEnricher::build_diagnostic_nodes(
             "file:///project/.cargo/registry/tokio/src/lib.rs",
@@ -3520,13 +3971,11 @@ mod tests {
     fn test_build_diagnostic_nodes_long_message_truncated_in_name() {
         let root = PathBuf::from("/project");
         let long_msg = "a".repeat(200);
-        let diags = vec![
-            serde_json::json!({
-                "severity": 1,
-                "message": long_msg,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
-            }),
-        ];
+        let diags = vec![serde_json::json!({
+            "severity": 1,
+            "message": long_msg,
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
+        })];
 
         let nodes = LspEnricher::build_diagnostic_nodes(
             "file:///project/src/lib.rs",
@@ -3542,25 +3991,36 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         let node = &nodes[0];
         // Name should be truncated (max 80 chars message snippet + "[error:N] " prefix + "...")
-        assert!(node.id.name.len() < 200, "node name should be truncated for long messages");
-        assert!(node.id.name.ends_with("..."), "truncated name should end with ...");
+        assert!(
+            node.id.name.len() < 200,
+            "node name should be truncated for long messages"
+        );
+        assert!(
+            node.id.name.ends_with("..."),
+            "truncated name should end with ..."
+        );
         // Name includes the line number for uniqueness
-        assert!(node.id.name.starts_with("[error:1]"), "name should include severity and line number");
+        assert!(
+            node.id.name.starts_with("[error:1]"),
+            "name should include severity and line number"
+        );
         // Full message preserved in metadata
-        assert_eq!(node.metadata.get("diagnostic_message").unwrap().len(), 200, "full message preserved in metadata");
+        assert_eq!(
+            node.metadata.get("diagnostic_message").unwrap().len(),
+            200,
+            "full message preserved in metadata"
+        );
     }
 
     /// Verify diagnostic node has ExtractionSource::Lsp.
     #[test]
     fn test_build_diagnostic_nodes_source_is_lsp() {
         let root = PathBuf::from("/project");
-        let diags = vec![
-            serde_json::json!({
-                "severity": 1,
-                "message": "error",
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
-            }),
-        ];
+        let diags = vec![serde_json::json!({
+            "severity": 1,
+            "message": "error",
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
+        })];
 
         let nodes = LspEnricher::build_diagnostic_nodes(
             "file:///project/src/lib.rs",
@@ -3591,14 +4051,12 @@ mod tests {
     #[test]
     fn test_build_diagnostic_nodes_has_all_metadata_fields() {
         let root = PathBuf::from("/project");
-        let diags = vec![
-            serde_json::json!({
-                "severity": 1,
-                "message": "test error",
-                "source": "my-lsp",
-                "range": { "start": { "line": 9, "character": 4 }, "end": { "line": 9, "character": 10 } }
-            }),
-        ];
+        let diags = vec![serde_json::json!({
+            "severity": 1,
+            "message": "test error",
+            "source": "my-lsp",
+            "range": { "start": { "line": 9, "character": 4 }, "end": { "line": 9, "character": 10 } }
+        })];
 
         let nodes = LspEnricher::build_diagnostic_nodes(
             "file:///project/src/lib.rs",
@@ -3613,11 +4071,26 @@ mod tests {
 
         assert_eq!(nodes.len(), 1);
         let meta = &nodes[0].metadata;
-        assert!(meta.contains_key("diagnostic_severity"), "missing diagnostic_severity");
-        assert!(meta.contains_key("diagnostic_source"), "missing diagnostic_source");
-        assert!(meta.contains_key("diagnostic_message"), "missing diagnostic_message");
-        assert!(meta.contains_key("diagnostic_range"), "missing diagnostic_range");
-        assert!(meta.contains_key("diagnostic_timestamp"), "missing diagnostic_timestamp");
+        assert!(
+            meta.contains_key("diagnostic_severity"),
+            "missing diagnostic_severity"
+        );
+        assert!(
+            meta.contains_key("diagnostic_source"),
+            "missing diagnostic_source"
+        );
+        assert!(
+            meta.contains_key("diagnostic_message"),
+            "missing diagnostic_message"
+        );
+        assert!(
+            meta.contains_key("diagnostic_range"),
+            "missing diagnostic_range"
+        );
+        assert!(
+            meta.contains_key("diagnostic_timestamp"),
+            "missing diagnostic_timestamp"
+        );
         assert_eq!(meta.get("diagnostic_timestamp").unwrap(), "1234567890");
         assert_eq!(nodes[0].id.root, "myroot");
     }
@@ -3626,13 +4099,11 @@ mod tests {
     #[test]
     fn test_build_diagnostic_nodes_missing_severity_defaults_to_error() {
         let root = PathBuf::from("/project");
-        let diags = vec![
-            serde_json::json!({
-                // No severity field — should default to 1 (error)
-                "message": "something bad",
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
-            }),
-        ];
+        let diags = vec![serde_json::json!({
+            // No severity field — should default to 1 (error)
+            "message": "something bad",
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
+        })];
 
         let nodes = LspEnricher::build_diagnostic_nodes(
             "file:///project/src/lib.rs",
@@ -3645,8 +4116,15 @@ mod tests {
             2,
         );
 
-        assert_eq!(nodes.len(), 1, "missing severity defaults to error which should produce a node");
-        assert_eq!(nodes[0].metadata.get("diagnostic_severity").unwrap(), "error");
+        assert_eq!(
+            nodes.len(),
+            1,
+            "missing severity defaults to error which should produce a node"
+        );
+        assert_eq!(
+            nodes[0].metadata.get("diagnostic_severity").unwrap(),
+            "error"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3682,14 +4160,24 @@ mod tests {
             2,
         );
 
-        assert_eq!(nodes.len(), 2, "identical messages at different lines should produce 2 nodes");
+        assert_eq!(
+            nodes.len(),
+            2,
+            "identical messages at different lines should produce 2 nodes"
+        );
         // NodeIds must be distinct
         let id0 = nodes[0].id.to_stable_id();
         let id1 = nodes[1].id.to_stable_id();
-        assert_ne!(id0, id1, "different line positions should produce distinct NodeIds");
+        assert_ne!(
+            id0, id1,
+            "different line positions should produce distinct NodeIds"
+        );
         // Names should include the line number
-        assert!(nodes[0].id.name.contains(":10]") || nodes[0].id.name.contains(":25]"),
-            "name should include line 10 or 25: got '{}'", nodes[0].id.name);
+        assert!(
+            nodes[0].id.name.contains(":10]") || nodes[0].id.name.contains(":25]"),
+            "name should include line 10 or 25: got '{}'",
+            nodes[0].id.name
+        );
     }
 
     /// Dissent finding #1: stale diagnostic nodes should be identifiable by timestamp.
@@ -3697,13 +4185,11 @@ mod tests {
     #[test]
     fn test_build_diagnostic_nodes_timestamp_preserved_for_staleness_detection() {
         let root = PathBuf::from("/project");
-        let diags = vec![
-            serde_json::json!({
-                "severity": 1,
-                "message": "an error",
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
-            }),
-        ];
+        let diags = vec![serde_json::json!({
+            "severity": 1,
+            "message": "an error",
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
+        })];
 
         let ts = "1700123456";
         let nodes = LspEnricher::build_diagnostic_nodes(
@@ -3754,7 +4240,10 @@ mod tests {
             2,
         );
 
-        assert!(nodes.is_empty(), "empty/whitespace messages should not produce nodes");
+        assert!(
+            nodes.is_empty(),
+            "empty/whitespace messages should not produce nodes"
+        );
     }
 
     /// Adversarial: malformed range fields (null, missing, out of order).
@@ -3787,7 +4276,11 @@ mod tests {
         );
 
         // Should produce nodes despite malformed ranges (default to line 1)
-        assert_eq!(nodes.len(), 2, "malformed range should not prevent node creation");
+        assert_eq!(
+            nodes.len(),
+            2,
+            "malformed range should not prevent node creation"
+        );
         for node in &nodes {
             assert_eq!(node.line_start, 1, "missing range should default to line 1");
         }
@@ -3823,7 +4316,10 @@ mod tests {
             2,
         );
 
-        assert!(nodes.is_empty(), "severity 0 and 100 should be filtered (only 1 and 2 are stored)");
+        assert!(
+            nodes.is_empty(),
+            "severity 0 and 100 should be filtered (only 1 and 2 are stored)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3838,14 +4334,12 @@ mod tests {
     #[test]
     fn test_build_diagnostic_nodes_unlinked_file_warning_captured() {
         let root = PathBuf::from("/project");
-        let diags = vec![
-            serde_json::json!({
-                "severity": 2,  // Warning
-                "message": "This file is not included in any crates [unlinked-file]",
-                "source": "rust-analyzer",
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }
-            }),
-        ];
+        let diags = vec![serde_json::json!({
+            "severity": 2,  // Warning
+            "message": "This file is not included in any crates [unlinked-file]",
+            "source": "rust-analyzer",
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }
+        })];
 
         let nodes = LspEnricher::build_diagnostic_nodes(
             "file:///project/src/service.rs",
@@ -3858,10 +4352,16 @@ mod tests {
             2,
         );
 
-        assert_eq!(nodes.len(), 1,
+        assert_eq!(
+            nodes.len(),
+            1,
             "unlinked-file at severity 2 (Warning) should produce a diagnostic node; \
-             if this fails, RA is reporting it as Information (3) which gets filtered");
-        assert_eq!(nodes[0].metadata.get("diagnostic_severity").unwrap(), "warning");
+             if this fails, RA is reporting it as Information (3) which gets filtered"
+        );
+        assert_eq!(
+            nodes[0].metadata.get("diagnostic_severity").unwrap(),
+            "warning"
+        );
     }
 
     /// Adversarial: "unlinked-file" diagnostic at severity 3 (Information)
@@ -3870,14 +4370,12 @@ mod tests {
     #[test]
     fn test_build_diagnostic_nodes_unlinked_file_information_filtered() {
         let root = PathBuf::from("/project");
-        let diags = vec![
-            serde_json::json!({
-                "severity": 3,  // Information — below our capture threshold
-                "message": "This file is not included in any crates [unlinked-file]",
-                "source": "rust-analyzer",
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }
-            }),
-        ];
+        let diags = vec![serde_json::json!({
+            "severity": 3,  // Information — below our capture threshold
+            "message": "This file is not included in any crates [unlinked-file]",
+            "source": "rust-analyzer",
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }
+        })];
 
         let nodes = LspEnricher::build_diagnostic_nodes(
             "file:///project/src/service.rs",
@@ -3890,9 +4388,11 @@ mod tests {
             2,
         );
 
-        assert!(nodes.is_empty(),
+        assert!(
+            nodes.is_empty(),
             "unlinked-file at severity 3 (Information) should be filtered; \
-             this is intentional — Information diagnostics are too noisy for code-understanding queries");
+             this is intentional — Information diagnostics are too noisy for code-understanding queries"
+        );
     }
 
     /// When max_severity_int=4 (hint level), Information (3) diagnostics are captured.
@@ -3900,13 +4400,11 @@ mod tests {
     #[test]
     fn test_build_diagnostic_nodes_information_captured_when_threshold_is_information() {
         let root = PathBuf::from("/project");
-        let diags = vec![
-            serde_json::json!({
-                "severity": 3,  // Information
-                "message": "consider using async",
-                "range": { "start": { "line": 5, "character": 0 }, "end": { "line": 5, "character": 5 } }
-            }),
-        ];
+        let diags = vec![serde_json::json!({
+            "severity": 3,  // Information
+            "message": "consider using async",
+            "range": { "start": { "line": 5, "character": 0 }, "end": { "line": 5, "character": 5 } }
+        })];
 
         let nodes = LspEnricher::build_diagnostic_nodes(
             "file:///project/src/lib.rs",
@@ -3919,7 +4417,11 @@ mod tests {
             3, // max_severity_int = Information
         );
 
-        assert_eq!(nodes.len(), 1, "information diagnostic should be captured at threshold=3");
+        assert_eq!(
+            nodes.len(),
+            1,
+            "information diagnostic should be captured at threshold=3"
+        );
         assert_eq!(
             nodes[0].metadata.get("diagnostic_severity").unwrap(),
             "information"
@@ -3958,12 +4460,13 @@ mod tests {
             4, // max_severity_int = Hint
         );
 
-        assert_eq!(nodes.len(), 2, "hint-level diagnostics should be captured at threshold=4");
+        assert_eq!(
+            nodes.len(),
+            2,
+            "hint-level diagnostics should be captured at threshold=4"
+        );
         for node in &nodes {
-            assert_eq!(
-                node.metadata.get("diagnostic_severity").unwrap(),
-                "hint"
-            );
+            assert_eq!(node.metadata.get("diagnostic_severity").unwrap(), "hint");
         }
     }
 
@@ -3971,13 +4474,11 @@ mod tests {
     #[test]
     fn test_build_diagnostic_nodes_severity_zero_always_filtered() {
         let root = PathBuf::from("/project");
-        let diags = vec![
-            serde_json::json!({
-                "severity": 0,
-                "message": "invalid severity",
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
-            }),
-        ];
+        let diags = vec![serde_json::json!({
+            "severity": 0,
+            "message": "invalid severity",
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }
+        })];
 
         // Even with hint-level threshold (4), severity 0 must be filtered
         let nodes = LspEnricher::build_diagnostic_nodes(
@@ -3991,7 +4492,10 @@ mod tests {
             4, // hint level — most permissive threshold
         );
 
-        assert!(nodes.is_empty(), "severity 0 is not a valid LSP value and must always be filtered");
+        assert!(
+            nodes.is_empty(),
+            "severity 0 is not a valid LSP value and must always be filtered"
+        );
     }
 
     /// DiagnosticMinSeverity::max_severity_int returns the correct floor for each variant.
@@ -4008,7 +4512,10 @@ mod tests {
     #[test]
     fn test_diagnostic_min_severity_default_is_warning() {
         use crate::scanner::DiagnosticMinSeverity;
-        assert_eq!(DiagnosticMinSeverity::default(), DiagnosticMinSeverity::Warning);
+        assert_eq!(
+            DiagnosticMinSeverity::default(),
+            DiagnosticMinSeverity::Warning
+        );
     }
 
     /// LspConfig deserializes "hint" correctly.
@@ -4024,7 +4531,10 @@ mod tests {
     fn test_lsp_config_default_is_warning() {
         use crate::scanner::{DiagnosticMinSeverity, LspConfig};
         let config = LspConfig::default();
-        assert_eq!(config.diagnostic_min_severity, DiagnosticMinSeverity::Warning);
+        assert_eq!(
+            config.diagnostic_min_severity,
+            DiagnosticMinSeverity::Warning
+        );
     }
 
     /// Adversarial: was_quiescent guard is the same for both Pass 1 and Pass 3.
@@ -4036,15 +4546,21 @@ mod tests {
         let state = enricher.state.blocking_lock();
         // Both Pass 1 and Pass 3 check was_quiescent before running.
         // With the default false, both are guarded.
-        assert!(!state.was_quiescent,
+        assert!(
+            !state.was_quiescent,
             "was_quiescent=false must prevent Pass 1 AND Pass 3; \
-             the early return at Pass 1 guard covers both passes");
+             the early return at Pass 1 guard covers both passes"
+        );
         // has_pull_diagnostics also defaults false (not yet initialized)
-        assert!(!state.has_pull_diagnostics,
-            "has_pull_diagnostics must default false (not yet initialized from LSP capabilities)");
+        assert!(
+            !state.has_pull_diagnostics,
+            "has_pull_diagnostics must default false (not yet initialized from LSP capabilities)"
+        );
         // has_inlay_hints also defaults false (not yet initialized)
-        assert!(!state.has_inlay_hints,
-            "has_inlay_hints must default false (not yet initialized from LSP capabilities)");
+        assert!(
+            !state.has_inlay_hints,
+            "has_inlay_hints must default false (not yet initialized from LSP capabilities)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4090,11 +4606,16 @@ mod tests {
 
         let type_map = LspEnricher::group_inlay_hints_by_node(&hints, &file_nodes);
         let stable_id = fn_node.id.to_stable_id();
-        assert!(type_map.contains_key(&stable_id),
-            "hints within fn lines should be attributed to the function");
+        assert!(
+            type_map.contains_key(&stable_id),
+            "hints within fn lines should be attributed to the function"
+        );
         let types_str = &type_map[&stable_id];
         assert!(types_str.contains("f64"), "should contain f64");
-        assert!(types_str.contains("OrderTotal"), "should contain OrderTotal");
+        assert!(
+            types_str.contains("OrderTotal"),
+            "should contain OrderTotal"
+        );
     }
 
     /// Parameter hints (kind=2) are filtered out
@@ -4103,16 +4624,17 @@ mod tests {
         let fn_node = make_fn_node_with_lines("src/lib.rs", "do_thing", 1, 10);
         let file_nodes: Vec<&Node> = vec![&fn_node];
 
-        let hints = vec![
-            serde_json::json!({
-                "kind": 2,  // parameter hint — should be ignored
-                "position": { "line": 4, "character": 5 },
-                "label": "amount:"
-            }),
-        ];
+        let hints = vec![serde_json::json!({
+            "kind": 2,  // parameter hint — should be ignored
+            "position": { "line": 4, "character": 5 },
+            "label": "amount:"
+        })];
 
         let type_map = LspEnricher::group_inlay_hints_by_node(&hints, &file_nodes);
-        assert!(type_map.is_empty(), "parameter hints (kind=2) should be filtered");
+        assert!(
+            type_map.is_empty(),
+            "parameter hints (kind=2) should be filtered"
+        );
     }
 
     /// Type hints outside all function ranges produce no entries
@@ -4121,17 +4643,17 @@ mod tests {
         let fn_node = make_fn_node_with_lines("src/lib.rs", "small_fn", 5, 8);
         let file_nodes: Vec<&Node> = vec![&fn_node];
 
-        let hints = vec![
-            serde_json::json!({
-                "kind": 1,
-                "position": { "line": 20, "character": 5 },  // 0-indexed line 20 → 1-indexed 21
-                "label": ": String"
-            }),
-        ];
+        let hints = vec![serde_json::json!({
+            "kind": 1,
+            "position": { "line": 20, "character": 5 },  // 0-indexed line 20 → 1-indexed 21
+            "label": ": String"
+        })];
 
         let type_map = LspEnricher::group_inlay_hints_by_node(&hints, &file_nodes);
-        assert!(type_map.is_empty(),
-            "hints outside all function line ranges should produce no entries");
+        assert!(
+            type_map.is_empty(),
+            "hints outside all function line ranges should produce no entries"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4180,7 +4702,8 @@ mod tests {
         assert_eq!(pairs.len(), 2);
         let from_names: Vec<&str> = pairs.iter().map(|(f, _)| f.as_str()).collect();
         assert!(from_names.iter().all(|&f| f == "rna"));
-        let to_names: std::collections::HashSet<&str> = pairs.iter().map(|(_, t)| t.as_str()).collect();
+        let to_names: std::collections::HashSet<&str> =
+            pairs.iter().map(|(_, t)| t.as_str()).collect();
         assert!(to_names.contains("lancedb"));
         assert!(to_names.contains("petgraph"));
     }
@@ -4200,33 +4723,41 @@ mod tests {
 }"#;
         let (crate_names, pairs) = LspEnricher::parse_crate_graph_dot(dot);
         // Isolated crate should be in crate_names even with no edges
-        assert_eq!(crate_names, vec!["standalone_crate"],
-            "isolated crate should appear in crate_names");
+        assert_eq!(
+            crate_names,
+            vec!["standalone_crate"],
+            "isolated crate should appear in crate_names"
+        );
         assert!(pairs.is_empty(), "no edges should produce empty pairs");
     }
 
     #[test]
     fn test_emit_crate_graph_edges_nodes_and_edges() {
         let crate_names = vec!["crate_a".to_string(), "crate_b".to_string()];
-        let pairs = vec![
-            ("crate_a".to_string(), "crate_b".to_string()),
-        ];
+        let pairs = vec![("crate_a".to_string(), "crate_b".to_string())];
         let mut result = EnrichmentResult::default();
         LspEnricher::emit_crate_graph_edges(&crate_names, &pairs, "my_root", &mut result);
 
         // Should have 2 crate nodes
-        let crate_nodes: Vec<_> = result.new_nodes.iter()
+        let crate_nodes: Vec<_> = result
+            .new_nodes
+            .iter()
             .filter(|n| matches!(&n.id.kind, NodeKind::Other(s) if s == "crate"))
             .collect();
         assert_eq!(crate_nodes.len(), 2);
 
         // Bodies should be non-empty (crate name as body for embedding quality)
         for n in &crate_nodes {
-            assert!(!n.body.is_empty(), "crate node body should be the crate name");
+            assert!(
+                !n.body.is_empty(),
+                "crate node body should be the crate name"
+            );
         }
 
         // Should have 1 DependsOn edge
-        let dep_edges: Vec<_> = result.added_edges.iter()
+        let dep_edges: Vec<_> = result
+            .added_edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::DependsOn)
             .collect();
         assert_eq!(dep_edges.len(), 1);
@@ -4248,8 +4779,15 @@ mod tests {
 }"#;
         let (crate_names, pairs) = LspEnricher::parse_crate_graph_dot(dot);
         // _99 has no label; edge should be filtered out but known_crate node is preserved
-        assert_eq!(crate_names, vec!["known_crate"], "known crate should still be in crate_names");
-        assert!(pairs.is_empty(), "dangling edge to unknown node should produce no pairs");
+        assert_eq!(
+            crate_names,
+            vec!["known_crate"],
+            "known crate should still be in crate_names"
+        );
+        assert!(
+            pairs.is_empty(),
+            "dangling edge to unknown node should produce no pairs"
+        );
     }
 
     /// Label with special characters (hyphens, underscores — common in Rust crate names)
@@ -4325,7 +4863,9 @@ mod tests {
         let mut result = EnrichmentResult::default();
         LspEnricher::emit_crate_graph_edges(&crate_names, &pairs, "root", &mut result);
 
-        let crate_nodes: Vec<_> = result.new_nodes.iter()
+        let crate_nodes: Vec<_> = result
+            .new_nodes
+            .iter()
             .filter(|n| matches!(&n.id.kind, NodeKind::Other(s) if s == "crate"))
             .collect();
         assert_eq!(crate_nodes.len(), 1, "isolated crate should get a node");

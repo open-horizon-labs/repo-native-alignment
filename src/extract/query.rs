@@ -243,7 +243,10 @@ async def create_item():
         let tree = parser.parse(source, None).unwrap();
 
         let captures = extractor.run(tree.root_node(), source.as_bytes());
-        assert!(!captures.is_empty(), "should detect FastAPI router.post decorator");
+        assert!(
+            !captures.is_empty(),
+            "should detect FastAPI router.post decorator"
+        );
 
         let path = captures[0].get("path").unwrap_or("");
         assert!(path.contains("/items"), "expected '/items', got: {path:?}");
@@ -576,7 +579,10 @@ public class ItemController {
         let tree = parser.parse(source, None).unwrap();
 
         let captures = extractor.run(tree.root_node(), source.as_bytes());
-        assert!(!captures.is_empty(), "should detect @PostMapping annotation");
+        assert!(
+            !captures.is_empty(),
+            "should detect @PostMapping annotation"
+        );
 
         let path = captures[0].get("path").unwrap_or("");
         assert!(path.contains("/items"), "expected '/items', got: {path:?}");
@@ -611,7 +617,10 @@ public class UserResource {
 
         let captures = extractor.run(tree.root_node(), source.as_bytes());
         // @Path not in the narrowed pattern — correctly excluded (deferred to #390)
-        assert!(captures.is_empty(), "@Path should not be captured by narrowed pattern");
+        assert!(
+            captures.is_empty(),
+            "@Path should not be captured by narrowed pattern"
+        );
     }
 
     /// Verify non-route annotations like `@Override` are not captured.
@@ -707,7 +716,10 @@ func main() {
 
         let captures = extractor.run(tree.root_node(), source.as_bytes());
         // HandleFunc not in the pattern — correctly excluded
-        assert!(captures.is_empty(), "HandleFunc should not be captured by narrowed pattern");
+        assert!(
+            captures.is_empty(),
+            "HandleFunc should not be captured by narrowed pattern"
+        );
     }
 
     /// Verify `router.GET("/items", handler)` is captured (gin).
@@ -802,7 +814,10 @@ async fn create_item(item: web::Json<Item>) -> impl Responder {
         let tree = parser.parse(source, None).unwrap();
 
         let captures = extractor.run(tree.root_node(), source.as_bytes());
-        assert!(!captures.is_empty(), "should detect #[post] route attribute");
+        assert!(
+            !captures.is_empty(),
+            "should detect #[post] route attribute"
+        );
 
         let path = captures[0].get("path").unwrap_or("");
         assert!(path.contains("/items"), "expected '/items', got: {path:?}");
@@ -832,7 +847,10 @@ struct User {
         let tree = parser.parse(source, None).unwrap();
 
         let captures = extractor.run(tree.root_node(), source.as_bytes());
-        assert!(captures.is_empty(), "#[derive] should not be captured as route");
+        assert!(
+            captures.is_empty(),
+            "#[derive] should not be captured as route"
+        );
     }
 
     // ── Ruby Sinatra / Rails route detection ──────────────────────────────
@@ -953,7 +971,10 @@ router.post('/items', async (req, res) => {
         let tree = parser.parse(source, None).unwrap();
 
         let captures = extractor.run(tree.root_node(), source.as_bytes());
-        assert!(!captures.is_empty(), "should detect Express router.post route");
+        assert!(
+            !captures.is_empty(),
+            "should detect Express router.post route"
+        );
 
         let path = captures[0].get("path").unwrap_or("");
         assert!(path.contains("/items"), "expected '/items', got: {path:?}");

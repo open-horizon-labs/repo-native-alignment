@@ -327,8 +327,7 @@ impl QueryResult {
             ));
 
             // Top 5 files by symbol count, with up to 3 key symbols each
-            let mut files_sorted: Vec<(&String, &Vec<&Node>)> =
-                file_symbols.iter().collect();
+            let mut files_sorted: Vec<(&String, &Vec<&Node>)> = file_symbols.iter().collect();
             files_sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
             for (file, symbols) in files_sorted.iter().take(5) {
@@ -341,18 +340,12 @@ impl QueryResult {
                     ));
                 }
                 if symbols.len() > 3 {
-                    out.push_str(&format!(
-                        "- ...and {} more symbols\n",
-                        symbols.len() - 3
-                    ));
+                    out.push_str(&format!("- ...and {} more symbols\n", symbols.len() - 3));
                 }
                 out.push('\n');
             }
             if files_sorted.len() > 5 {
-                out.push_str(&format!(
-                    "...and {} more files\n\n",
-                    files_sorted.len() - 5
-                ));
+                out.push_str(&format!("...and {} more files\n\n", files_sorted.len() - 5));
             }
 
             out.push_str(

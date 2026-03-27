@@ -91,42 +91,46 @@ fn scan_root(root_slug: &str, root_path: &Path) -> ManifestResult {
         // JS / TypeScript
         let pkg_json = dir.join("package.json");
         if pkg_json.exists()
-            && let Ok(content) = std::fs::read_to_string(&pkg_json) {
-                let manifest_file = relative_to(root_path, &pkg_json);
-                let (n, e) = parse_package_json(&content, &manifest_file, root_slug);
-                nodes.extend(n);
-                edges.extend(e);
-            }
+            && let Ok(content) = std::fs::read_to_string(&pkg_json)
+        {
+            let manifest_file = relative_to(root_path, &pkg_json);
+            let (n, e) = parse_package_json(&content, &manifest_file, root_slug);
+            nodes.extend(n);
+            edges.extend(e);
+        }
 
         // Python — pyproject.toml
         let pyproject = dir.join("pyproject.toml");
         if pyproject.exists()
-            && let Ok(content) = std::fs::read_to_string(&pyproject) {
-                let manifest_file = relative_to(root_path, &pyproject);
-                let (n, e) = parse_pyproject_toml(&content, &manifest_file, root_slug);
-                nodes.extend(n);
-                edges.extend(e);
-            }
+            && let Ok(content) = std::fs::read_to_string(&pyproject)
+        {
+            let manifest_file = relative_to(root_path, &pyproject);
+            let (n, e) = parse_pyproject_toml(&content, &manifest_file, root_slug);
+            nodes.extend(n);
+            edges.extend(e);
+        }
 
         // Python — requirements.txt
         let requirements = dir.join("requirements.txt");
         if requirements.exists()
-            && let Ok(content) = std::fs::read_to_string(&requirements) {
-                let manifest_file = relative_to(root_path, &requirements);
-                let (n, e) = parse_requirements_txt(&content, &manifest_file, root_slug);
-                nodes.extend(n);
-                edges.extend(e);
-            }
+            && let Ok(content) = std::fs::read_to_string(&requirements)
+        {
+            let manifest_file = relative_to(root_path, &requirements);
+            let (n, e) = parse_requirements_txt(&content, &manifest_file, root_slug);
+            nodes.extend(n);
+            edges.extend(e);
+        }
 
         // Go — go.mod
         let go_mod = dir.join("go.mod");
         if go_mod.exists()
-            && let Ok(content) = std::fs::read_to_string(&go_mod) {
-                let manifest_file = relative_to(root_path, &go_mod);
-                let (n, e) = parse_go_mod(&content, &manifest_file, root_slug);
-                nodes.extend(n);
-                edges.extend(e);
-            }
+            && let Ok(content) = std::fs::read_to_string(&go_mod)
+        {
+            let manifest_file = relative_to(root_path, &go_mod);
+            let (n, e) = parse_go_mod(&content, &manifest_file, root_slug);
+            nodes.extend(n);
+            edges.extend(e);
+        }
     }
 
     ManifestResult { nodes, edges }
@@ -147,11 +151,18 @@ fn candidate_manifest_dirs(root_path: &Path) -> Vec<PathBuf> {
 }
 
 /// Recursively collect subdirectories for manifest scanning, up to `max_depth`.
-fn collect_manifest_dirs(dir: &Path, current_depth: usize, max_depth: usize, dirs: &mut Vec<PathBuf>) {
+fn collect_manifest_dirs(
+    dir: &Path,
+    current_depth: usize,
+    max_depth: usize,
+    dirs: &mut Vec<PathBuf>,
+) {
     if current_depth > max_depth {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return; };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -347,10 +358,7 @@ pub fn parse_pyproject_toml(
     let deps = extract_toml_string_array(content, "dependencies");
 
     // Normalise PEP 508 specifiers: "requests>=2.0" → "requests"
-    let dep_names: Vec<String> = deps
-        .iter()
-        .filter_map(|s| pep508_name(s))
-        .collect();
+    let dep_names: Vec<String> = deps.iter().filter_map(|s| pep508_name(s)).collect();
 
     if dep_names.is_empty() {
         let node = make_package_node(package_name, manifest_file, "python", root_slug);
@@ -479,11 +487,7 @@ fn pep508_name(spec: &str) -> Option<String> {
         .take_while(|c| !matches!(c, '[' | ';' | '>' | '<' | '=' | '~' | '!'))
         .collect();
     let name = name.trim().to_string();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
+    if name.is_empty() { None } else { Some(name) }
 }
 
 // ---------------------------------------------------------------------------
@@ -611,8 +615,8 @@ fn parse_go_require_line(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use crate::graph::EdgeKind;
+    use std::path::PathBuf;
 
     fn manifest(name: &str) -> PathBuf {
         PathBuf::from(name)
@@ -633,9 +637,18 @@ mod tests {
         }"#;
         let (nodes, edges) = parse_package_json(content, &manifest("package.json"), "root");
 
-        assert!(nodes.iter().any(|n| n.id.name == "my-app"), "package node missing");
-        assert!(nodes.iter().any(|n| n.id.name == "react"), "react dep node missing");
-        assert!(nodes.iter().any(|n| n.id.name == "lodash"), "lodash dep node missing");
+        assert!(
+            nodes.iter().any(|n| n.id.name == "my-app"),
+            "package node missing"
+        );
+        assert!(
+            nodes.iter().any(|n| n.id.name == "react"),
+            "react dep node missing"
+        );
+        assert!(
+            nodes.iter().any(|n| n.id.name == "lodash"),
+            "lodash dep node missing"
+        );
         assert_eq!(edges.len(), 2, "expected 2 DependsOn edges");
         assert!(edges.iter().all(|e| e.from.name == "my-app"));
         assert!(edges.iter().all(|e| e.kind == EdgeKind::DependsOn));
@@ -730,7 +743,10 @@ name = "solo"
     #[test]
     fn test_pep508_name_strips_version() {
         assert_eq!(pep508_name("requests>=2.0").as_deref(), Some("requests"));
-        assert_eq!(pep508_name("Django [security] >= 2.0").as_deref(), Some("Django"));
+        assert_eq!(
+            pep508_name("Django [security] >= 2.0").as_deref(),
+            Some("Django")
+        );
         assert_eq!(pep508_name("pkg-name").as_deref(), Some("pkg-name"));
         assert_eq!(pep508_name("").as_deref(), None);
     }
@@ -784,11 +800,26 @@ require (
 "#;
         let (nodes, edges) = parse_go_mod(content, &manifest("go.mod"), "root");
 
-        assert!(nodes.iter().any(|n| n.id.name == "github.com/myorg/myapp"), "module node missing");
-        assert!(nodes.iter().any(|n| n.id.name == "github.com/gin-gonic/gin"));
-        assert!(nodes.iter().any(|n| n.id.name == "github.com/stretchr/testify"));
+        assert!(
+            nodes.iter().any(|n| n.id.name == "github.com/myorg/myapp"),
+            "module node missing"
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.id.name == "github.com/gin-gonic/gin")
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.id.name == "github.com/stretchr/testify")
+        );
         assert_eq!(edges.len(), 2);
-        assert!(edges.iter().all(|e| e.from.name == "github.com/myorg/myapp"));
+        assert!(
+            edges
+                .iter()
+                .all(|e| e.from.name == "github.com/myorg/myapp")
+        );
     }
 
     #[test]
@@ -850,7 +881,11 @@ require (
         let content = r#"{"name": "pkg", "dependencies": {"dep": "1.0"}}"#;
         let (nodes, edges) = parse_package_json(content, &manifest("package.json"), "myroot");
         assert!(nodes.iter().all(|n| n.id.root == "myroot"));
-        assert!(edges.iter().all(|e| e.from.root == "myroot" && e.to.root == "myroot"));
+        assert!(
+            edges
+                .iter()
+                .all(|e| e.from.root == "myroot" && e.to.root == "myroot")
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -865,7 +900,11 @@ require (
             "devDependencies": {"jest": "29"}
         }"#;
         let (_, edges) = parse_package_json(content, &manifest("package.json"), "root");
-        assert_eq!(edges.len(), 2, "should include both dependencies and devDependencies");
+        assert_eq!(
+            edges.len(),
+            2,
+            "should include both dependencies and devDependencies"
+        );
     }
 
     #[test]
@@ -885,7 +924,10 @@ name = "img-tool"
 dependencies = ["Pillow[jpeg]>=9.0"]
 "#;
         let (nodes, edges) = parse_pyproject_toml(content, &manifest("pyproject.toml"), "root");
-        assert!(nodes.iter().any(|n| n.id.name == "Pillow"), "extras should be stripped");
+        assert!(
+            nodes.iter().any(|n| n.id.name == "Pillow"),
+            "extras should be stripped"
+        );
         assert_eq!(edges.len(), 1);
     }
 

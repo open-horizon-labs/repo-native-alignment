@@ -153,7 +153,13 @@ fn infer_method_from_sdk_fn_name(name: &str) -> String {
             // Verify the character after the prefix is uppercase (camelCase boundary)
             // or the name IS the prefix (e.g. a function literally named "get").
             let rest = &name[prefix.len()..];
-            if rest.is_empty() || rest.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+            if rest.is_empty()
+                || rest
+                    .chars()
+                    .next()
+                    .map(|c| c.is_uppercase())
+                    .unwrap_or(false)
+            {
                 return method.to_string();
             }
         }
@@ -231,25 +237,38 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
             continue;
         }
         if let Some(op_id) = node.metadata.get("operation_id")
-            && !op_id.is_empty() {
-                let key = normalize_operation_id(op_id);
-                endpoint_by_op_id.entry(key).or_default().push(node.id.clone());
-            }
+            && !op_id.is_empty()
+        {
+            let key = normalize_operation_id(op_id);
+            endpoint_by_op_id
+                .entry(key)
+                .or_default()
+                .push(node.id.clone());
+        }
         if let Some(http_path) = node.metadata.get("http_path")
-            && !http_path.is_empty() {
-                let norm_path = normalize_url_path(http_path);
-                // Extract the HTTP method from the endpoint name (e.g. "GET /users/{id}")
-                // or from the http_method metadata field.
-                let method = node.metadata.get("http_method")
-                    .map(|m| m.to_uppercase())
-                    .unwrap_or_else(|| {
-                        // Fall back to extracting from node name: "GET /path" → "GET"
-                        node.id.name.split_whitespace().next()
-                            .unwrap_or("GET")
-                            .to_uppercase()
-                    });
-                endpoint_by_path_method.entry((norm_path, method)).or_default().push(node.id.clone());
-            }
+            && !http_path.is_empty()
+        {
+            let norm_path = normalize_url_path(http_path);
+            // Extract the HTTP method from the endpoint name (e.g. "GET /users/{id}")
+            // or from the http_method metadata field.
+            let method = node
+                .metadata
+                .get("http_method")
+                .map(|m| m.to_uppercase())
+                .unwrap_or_else(|| {
+                    // Fall back to extracting from node name: "GET /path" → "GET"
+                    node.id
+                        .name
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("GET")
+                        .to_uppercase()
+                });
+            endpoint_by_path_method
+                .entry((norm_path, method))
+                .or_default()
+                .push(node.id.clone());
+        }
     }
 
     // Fast path: no ApiEndpoints means no edges to emit regardless of strategy.
@@ -266,14 +285,20 @@ pub fn openapi_sdk_link_pass(all_nodes: &[Node]) -> Vec<Edge> {
     //
     // Root is included in the key to prevent cross-root contamination in monorepos
     // where two roots may contain different versions of the same SDK filename.
-    let mut url_consts_by_root_file_line: HashMap<(String, PathBuf, usize), Vec<String>> = HashMap::new();
+    let mut url_consts_by_root_file_line: HashMap<(String, PathBuf, usize), Vec<String>> =
+        HashMap::new();
     if !endpoint_by_path_method.is_empty() {
         for node in all_nodes {
             if node.id.kind != NodeKind::Const {
                 continue;
             }
             // Only synthetic Const nodes (string literals from harvest_string_literals).
-            if !node.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false) {
+            if !node
+                .metadata
+                .get("synthetic")
+                .map(|s| s == "true")
+                .unwrap_or(false)
+            {
                 continue;
             }
             if !is_generated_sdk_file(&node.id.file) {
@@ -423,8 +448,12 @@ mod tests {
         // Extract http_method from node name (e.g. "GET /workspaces/{id}/foo" → "GET").
         // If the name starts with a known HTTP method, set it in metadata so the pass
         // can use (path, method) keying for unambiguous matching.
-        let method = name.split_whitespace().next().unwrap_or("GET").to_uppercase();
-        if ["GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS"].contains(&method.as_str()) {
+        let method = name
+            .split_whitespace()
+            .next()
+            .unwrap_or("GET")
+            .to_uppercase();
+        if ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"].contains(&method.as_str()) {
             metadata.insert("http_method".to_string(), method);
         }
         Node {
@@ -506,7 +535,10 @@ mod tests {
 
     #[test]
     fn test_normalize_url_path_no_params() {
-        assert_eq!(normalize_url_path("/workspaces/expertunities"), "/workspaces/expertunities");
+        assert_eq!(
+            normalize_url_path("/workspaces/expertunities"),
+            "/workspaces/expertunities"
+        );
     }
 
     // --- is_generated_sdk_file ---
@@ -518,7 +550,9 @@ mod tests {
 
     #[test]
     fn test_generated_dot_ts_detected() {
-        assert!(is_generated_sdk_file(&PathBuf::from("src/api/client.generated.ts")));
+        assert!(is_generated_sdk_file(&PathBuf::from(
+            "src/api/client.generated.ts"
+        )));
     }
 
     #[test]
@@ -528,22 +562,30 @@ mod tests {
 
     #[test]
     fn test_underscore_generated_py_detected() {
-        assert!(is_generated_sdk_file(&PathBuf::from("src/api_generated.py")));
+        assert!(is_generated_sdk_file(&PathBuf::from(
+            "src/api_generated.py"
+        )));
     }
 
     #[test]
     fn test_underscore_generated_go_detected() {
-        assert!(is_generated_sdk_file(&PathBuf::from("src/client_generated.go")));
+        assert!(is_generated_sdk_file(&PathBuf::from(
+            "src/client_generated.go"
+        )));
     }
 
     #[test]
     fn test_generated_client_ts_detected() {
-        assert!(is_generated_sdk_file(&PathBuf::from("src/generated_client.ts")));
+        assert!(is_generated_sdk_file(&PathBuf::from(
+            "src/generated_client.ts"
+        )));
     }
 
     #[test]
     fn test_openapi_client_detected() {
-        assert!(is_generated_sdk_file(&PathBuf::from("src/openapi_client.ts")));
+        assert!(is_generated_sdk_file(&PathBuf::from(
+            "src/openapi_client.ts"
+        )));
     }
 
     #[test]
@@ -558,7 +600,9 @@ mod tests {
 
     #[test]
     fn test_regular_service_not_detected() {
-        assert!(!is_generated_sdk_file(&PathBuf::from("src/services/user_service.ts")));
+        assert!(!is_generated_sdk_file(&PathBuf::from(
+            "src/services/user_service.ts"
+        )));
     }
 
     #[test]
@@ -598,7 +642,11 @@ mod tests {
         ];
         let edges = openapi_sdk_link_pass(&nodes);
 
-        assert_eq!(edges.len(), 1, "snake_case SDK fn should match camelCase op_id");
+        assert_eq!(
+            edges.len(),
+            1,
+            "snake_case SDK fn should match camelCase op_id"
+        );
     }
 
     #[test]
@@ -612,7 +660,8 @@ mod tests {
 
         assert!(
             edges.is_empty(),
-            "function in non-generated file should produce no edge, got: {:?}", edges
+            "function in non-generated file should produce no edge, got: {:?}",
+            edges
         );
     }
 
@@ -625,13 +674,13 @@ mod tests {
             n.metadata.remove("operation_id");
             n
         };
-        let nodes = vec![
-            make_sdk_fn("listUsers", "src/api/sdk.gen.ts"),
-            ep_no_op_id,
-        ];
+        let nodes = vec![make_sdk_fn("listUsers", "src/api/sdk.gen.ts"), ep_no_op_id];
         let edges = openapi_sdk_link_pass(&nodes);
 
-        assert!(edges.is_empty(), "endpoint without operation_id must not match via strategy 1");
+        assert!(
+            edges.is_empty(),
+            "endpoint without operation_id must not match via strategy 1"
+        );
     }
 
     #[test]
@@ -654,7 +703,11 @@ mod tests {
 
     #[test]
     fn test_no_sdk_functions_no_edges() {
-        let nodes = vec![make_api_endpoint("GET /users", "listUsers", "openapi/api.yaml")];
+        let nodes = vec![make_api_endpoint(
+            "GET /users",
+            "listUsers",
+            "openapi/api.yaml",
+        )];
         let edges = openapi_sdk_link_pass(&nodes);
         assert!(edges.is_empty());
     }
@@ -680,7 +733,11 @@ mod tests {
         // SDK in frontend root, spec in backend root — must still link
         let nodes = vec![
             make_sdk_fn("getUser", "apps/frontend/src/api/sdk.gen.ts"),
-            make_api_endpoint("GET /users/{id}", "getUser", "apps/backend/openapi/api.yaml"),
+            make_api_endpoint(
+                "GET /users/{id}",
+                "getUser",
+                "apps/backend/openapi/api.yaml",
+            ),
         ];
         let edges = openapi_sdk_link_pass(&nodes);
 
@@ -694,13 +751,17 @@ mod tests {
     #[test]
     fn test_only_generated_file_linked_when_both_present() {
         let nodes = vec![
-            make_sdk_fn("listUsers", "src/api/sdk.gen.ts"),          // generated
+            make_sdk_fn("listUsers", "src/api/sdk.gen.ts"), // generated
             make_sdk_fn("listUsers", "src/services/user_service.ts"), // not generated
             make_api_endpoint("GET /users", "listUsers", "openapi/api.yaml"),
         ];
         let edges = openapi_sdk_link_pass(&nodes);
 
-        assert_eq!(edges.len(), 1, "only the generated file should produce an edge");
+        assert_eq!(
+            edges.len(),
+            1,
+            "only the generated file should produce an edge"
+        );
         assert_eq!(
             edges[0].from.file,
             PathBuf::from("src/api/sdk.gen.ts"),
@@ -736,7 +797,8 @@ mod tests {
 
         assert!(
             edges.is_empty(),
-            "ambiguous op_id (2 endpoints) must produce no edge, got: {:?}", edges
+            "ambiguous op_id (2 endpoints) must produce no edge, got: {:?}",
+            edges
         );
     }
 
@@ -774,7 +836,12 @@ mod tests {
         ];
         let edges = openapi_sdk_link_pass(&nodes);
 
-        assert_eq!(edges.len(), 1, "URL co-location should produce 1 Implements edge, got: {:?}", edges);
+        assert_eq!(
+            edges.len(),
+            1,
+            "URL co-location should produce 1 Implements edge, got: {:?}",
+            edges
+        );
         let e = &edges[0];
         assert_eq!(e.kind, EdgeKind::Implements);
         assert_eq!(e.from.name, "getWorkspacesIdExpertunities");
@@ -797,7 +864,11 @@ mod tests {
             ),
         ];
         let edges = openapi_sdk_link_pass(&nodes);
-        assert_eq!(edges.len(), 1, "param-normalised path match must produce edge");
+        assert_eq!(
+            edges.len(),
+            1,
+            "param-normalised path match must produce edge"
+        );
     }
 
     /// URL co-location: Const node on a DIFFERENT line must not link.
@@ -818,7 +889,8 @@ mod tests {
         let edges = openapi_sdk_link_pass(&nodes);
         assert!(
             edges.is_empty(),
-            "Const on different line must not produce edge, got: {:?}", edges
+            "Const on different line must not produce edge, got: {:?}",
+            edges
         );
     }
 
@@ -840,7 +912,8 @@ mod tests {
         let edges = openapi_sdk_link_pass(&nodes);
         assert!(
             edges.is_empty(),
-            "Const in different file must not produce edge, got: {:?}", edges
+            "Const in different file must not produce edge, got: {:?}",
+            edges
         );
     }
 
@@ -861,7 +934,8 @@ mod tests {
         let edges = openapi_sdk_link_pass(&nodes);
         assert!(
             edges.is_empty(),
-            "function in non-SDK file must not produce edge via URL co-location, got: {:?}", edges
+            "function in non-SDK file must not produce edge via URL co-location, got: {:?}",
+            edges
         );
     }
 
@@ -869,9 +943,12 @@ mod tests {
     #[test]
     fn test_url_colocation_non_synthetic_const_no_edge() {
         let sdk_file = "client/src/api.gen/sdk.gen.ts";
-        let mut non_synthetic_const = make_url_const("/workspaces/{id}/expertunities", sdk_file, 10);
+        let mut non_synthetic_const =
+            make_url_const("/workspaces/{id}/expertunities", sdk_file, 10);
         // Remove the synthetic flag (or set to false)
-        non_synthetic_const.metadata.insert("synthetic".to_string(), "false".to_string());
+        non_synthetic_const
+            .metadata
+            .insert("synthetic".to_string(), "false".to_string());
 
         let nodes = vec![
             make_sdk_fn_at_line("getWorkspacesIdExpertunities", sdk_file, 10),
@@ -886,7 +963,8 @@ mod tests {
         let edges = openapi_sdk_link_pass(&nodes);
         assert!(
             edges.is_empty(),
-            "non-synthetic Const must not be used for URL co-location, got: {:?}", edges
+            "non-synthetic Const must not be used for URL co-location, got: {:?}",
+            edges
         );
     }
 
@@ -903,7 +981,11 @@ mod tests {
         ];
         let edges = openapi_sdk_link_pass(&nodes);
         // Exactly one edge — strategy 1 matched first, strategy 2 was skipped.
-        assert_eq!(edges.len(), 1, "exactly one edge, no duplicate from strategy 2");
+        assert_eq!(
+            edges.len(),
+            1,
+            "exactly one edge, no duplicate from strategy 2"
+        );
         assert_eq!(edges[0].from.name, "listUsers");
     }
 
@@ -932,7 +1014,8 @@ mod tests {
         let edges = openapi_sdk_link_pass(&nodes);
         assert!(
             edges.is_empty(),
-            "ambiguous path must not produce edge, got: {:?}", edges
+            "ambiguous path must not produce edge, got: {:?}",
+            edges
         );
     }
 
@@ -960,7 +1043,11 @@ mod tests {
             ),
         ];
         let edges = openapi_sdk_link_pass(&nodes);
-        assert_eq!(edges.len(), 2, "two functions must each link to their endpoint");
+        assert_eq!(
+            edges.len(),
+            2,
+            "two functions must each link to their endpoint"
+        );
         let from_names: Vec<_> = edges.iter().map(|e| e.from.name.as_str()).collect();
         assert!(from_names.contains(&"getWorkspacesIdExpertunities"));
         assert!(from_names.contains(&"getWorkspacesIdActivities"));
@@ -983,9 +1070,8 @@ mod tests {
         url_const_b.id.root = "service-b".to_string();
 
         // Endpoint in root B
-        let mut ep_b = make_api_endpoint_with_path(
-            "GET /items", "", "/items", "service-b/src/api/routes.py",
-        );
+        let mut ep_b =
+            make_api_endpoint_with_path("GET /items", "", "/items", "service-b/src/api/routes.py");
         ep_b.id.root = "service-b".to_string();
 
         let nodes = vec![sdk_fn_a, url_const_b, ep_b];
@@ -993,7 +1079,8 @@ mod tests {
 
         assert!(
             edges.is_empty(),
-            "cross-root URL Const must not pollute SDK function from a different root, got: {:?}", edges
+            "cross-root URL Const must not pollute SDK function from a different root, got: {:?}",
+            edges
         );
     }
 
@@ -1008,9 +1095,8 @@ mod tests {
         let mut url_const = make_url_const("/items", sdk_file, 5);
         url_const.id.root = "service-a".to_string(); // same root as function
 
-        let mut ep = make_api_endpoint_with_path(
-            "GET /items", "", "/items", "service-a/src/api/routes.py",
-        );
+        let mut ep =
+            make_api_endpoint_with_path("GET /items", "", "/items", "service-a/src/api/routes.py");
         ep.id.root = "service-a".to_string();
 
         let nodes = vec![sdk_fn, url_const, ep];
@@ -1038,13 +1124,26 @@ mod tests {
         ];
         let edges = openapi_sdk_link_pass(&nodes);
 
-        assert_eq!(edges.len(), 2, "GET and POST functions must each link independently, got: {:?}", edges);
+        assert_eq!(
+            edges.len(),
+            2,
+            "GET and POST functions must each link independently, got: {:?}",
+            edges
+        );
         let get_edge = edges.iter().find(|e| e.from.name == "getUsers");
         let post_edge = edges.iter().find(|e| e.from.name == "postUsers");
         assert!(get_edge.is_some(), "getUsers must have an edge");
         assert!(post_edge.is_some(), "postUsers must have an edge");
-        assert_eq!(get_edge.unwrap().to.name, "GET /users", "getUsers must link to GET endpoint");
-        assert_eq!(post_edge.unwrap().to.name, "POST /users", "postUsers must link to POST endpoint");
+        assert_eq!(
+            get_edge.unwrap().to.name,
+            "GET /users",
+            "getUsers must link to GET endpoint"
+        );
+        assert_eq!(
+            post_edge.unwrap().to.name,
+            "POST /users",
+            "postUsers must link to POST endpoint"
+        );
     }
 
     /// Verify infer_method_from_sdk_fn_name helper.
@@ -1052,9 +1151,15 @@ mod tests {
     fn test_infer_method_from_sdk_fn_name() {
         assert_eq!(infer_method_from_sdk_fn_name("getWorkspacesId"), "GET");
         assert_eq!(infer_method_from_sdk_fn_name("postAdminAgents"), "POST");
-        assert_eq!(infer_method_from_sdk_fn_name("deleteWorkspacesId"), "DELETE");
+        assert_eq!(
+            infer_method_from_sdk_fn_name("deleteWorkspacesId"),
+            "DELETE"
+        );
         assert_eq!(infer_method_from_sdk_fn_name("patchResourcesId"), "PATCH");
-        assert_eq!(infer_method_from_sdk_fn_name("putWorkspacesIdDocument"), "PUT");
+        assert_eq!(
+            infer_method_from_sdk_fn_name("putWorkspacesIdDocument"),
+            "PUT"
+        );
         assert_eq!(infer_method_from_sdk_fn_name("headHealth"), "HEAD");
         assert_eq!(infer_method_from_sdk_fn_name("optionsHealth"), "OPTIONS");
         // Default for unknown prefixes

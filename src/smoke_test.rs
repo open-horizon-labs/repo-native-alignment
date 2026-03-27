@@ -17,12 +17,15 @@ use petgraph::Direction;
 
 use crate::embed::EmbeddingIndex;
 use crate::extract::ExtractorRegistry;
-use crate::graph::{Edge, EdgeKind, Node};
 use crate::graph::index::GraphIndex;
+use crate::graph::{Edge, EdgeKind, Node};
 use crate::query;
 use crate::roots::WorkspaceConfig;
 use crate::scanner::Scanner;
-use crate::server::{check_and_migrate_schema, graph_lance_path, load_graph_from_lance, persist_graph_incremental, persist_graph_to_lance};
+use crate::server::{
+    check_and_migrate_schema, graph_lance_path, load_graph_from_lance, persist_graph_incremental,
+    persist_graph_to_lance,
+};
 
 // ── Args ────────────────────────────────────────────────────────────
 
@@ -63,20 +66,35 @@ pub enum CheckStatus {
 
 impl Check {
     fn pass(name: &'static str, detail: impl Into<String>) -> Self {
-        Check { name, status: CheckStatus::Pass, detail: Some(detail.into()) }
+        Check {
+            name,
+            status: CheckStatus::Pass,
+            detail: Some(detail.into()),
+        }
     }
     fn fail(name: &'static str, detail: impl Into<String>) -> Self {
-        Check { name, status: CheckStatus::Fail, detail: Some(detail.into()) }
+        Check {
+            name,
+            status: CheckStatus::Fail,
+            detail: Some(detail.into()),
+        }
     }
     fn skip(name: &'static str, detail: impl Into<String>) -> Self {
-        Check { name, status: CheckStatus::Skip, detail: Some(detail.into()) }
+        Check {
+            name,
+            status: CheckStatus::Skip,
+            detail: Some(detail.into()),
+        }
     }
 }
 
 // ── Runner ──────────────────────────────────────────────────────────
 
 pub async fn run(args: &TestArgs) -> Result<bool> {
-    let repo = args.repo.canonicalize().unwrap_or_else(|_| args.repo.clone());
+    let repo = args
+        .repo
+        .canonicalize()
+        .unwrap_or_else(|_| args.repo.clone());
     tracing::info!("Smoke: starting RNA pipeline test for {}", repo.display());
     let mut checks: Vec<Check> = Vec::new();
 
@@ -93,7 +111,10 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
             s
         }
         Err(e) => {
-            checks.push(Check::fail("scanner_init", format!("Scanner::new failed: {}", e)));
+            checks.push(Check::fail(
+                "scanner_init",
+                format!("Scanner::new failed: {}", e),
+            ));
             return Ok(print_and_return(args, checks));
         }
     };
@@ -143,7 +164,10 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
         extraction.edges.len()
     );
     if symbol_count > 0 {
-        checks.push(Check::pass("symbol_extraction", format!("{} symbols extracted", symbol_count)));
+        checks.push(Check::pass(
+            "symbol_extraction",
+            format!("{} symbols extracted", symbol_count),
+        ));
     } else {
         checks.push(Check::fail("symbol_extraction", "No symbols extracted"));
     }
@@ -163,7 +187,10 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
         graph_index_start.elapsed(),
         all_edges.len()
     );
-    checks.push(Check::pass("graph_index", format!("{} edges indexed", all_edges.len())));
+    checks.push(Check::pass(
+        "graph_index",
+        format!("{} edges indexed", all_edges.len()),
+    ));
 
     // 5. Embedding index
     let embed_start = std::time::Instant::now();
@@ -177,11 +204,15 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
                         "Smoke: embedding index reused in {:?}",
                         embed_start.elapsed()
                     );
-                    checks.push(Check::pass("embed_index", "Persisted embedding index reused"));
+                    checks.push(Check::pass(
+                        "embed_index",
+                        "Persisted embedding index reused",
+                    ));
                     Some(idx)
                 }
                 Ok(crate::embed::SearchOutcome::NotReady) | Err(_) => {
-                    let embeddable: Vec<_> = all_nodes.iter()
+                    let embeddable: Vec<_> = all_nodes
+                        .iter()
                         .filter(|n| n.id.root != "external")
                         .take(50)
                         .cloned()
@@ -193,11 +224,17 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
                                 embed_start.elapsed(),
                                 count
                             );
-                            checks.push(Check::pass("embed_index", format!("{} vectors written", count)));
+                            checks.push(Check::pass(
+                                "embed_index",
+                                format!("{} vectors written", count),
+                            ));
                             Some(idx)
                         }
                         Err(e) => {
-                            checks.push(Check::fail("embed_index", format!("Embedding failed: {}", e)));
+                            checks.push(Check::fail(
+                                "embed_index",
+                                format!("Embedding failed: {}", e),
+                            ));
                             None
                         }
                     }
@@ -205,81 +242,137 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
             }
         }
         Err(e) => {
-            checks.push(Check::fail("embed_index", format!("EmbeddingIndex::new failed: {}", e)));
+            checks.push(Check::fail(
+                "embed_index",
+                format!("EmbeddingIndex::new failed: {}", e),
+            ));
             None
         }
     };
 
     // 6. search (artifact path) — embed search for "main"
     match &embed_index {
-        Some(idx) => {
-            match idx.search("main", None, 5).await {
-                Ok(crate::embed::SearchOutcome::Results(results)) if !results.is_empty() => {
-                    checks.push(Check::pass("search_artifacts", format!("{} results for query \"main\"", results.len())));
-                }
-                Ok(crate::embed::SearchOutcome::NotReady) => {
-                    checks.push(Check::skip("search_artifacts", "Embedding table not built yet"));
-                }
-                Ok(_) => {
-                    checks.push(Check::fail("search_artifacts", "Query \"main\" returned 0 results"));
-                }
-                Err(e) => {
-                    checks.push(Check::fail("search_artifacts", format!("search() error: {}", e)));
-                }
+        Some(idx) => match idx.search("main", None, 5).await {
+            Ok(crate::embed::SearchOutcome::Results(results)) if !results.is_empty() => {
+                checks.push(Check::pass(
+                    "search_artifacts",
+                    format!("{} results for query \"main\"", results.len()),
+                ));
             }
-        }
+            Ok(crate::embed::SearchOutcome::NotReady) => {
+                checks.push(Check::skip(
+                    "search_artifacts",
+                    "Embedding table not built yet",
+                ));
+            }
+            Ok(_) => {
+                checks.push(Check::fail(
+                    "search_artifacts",
+                    "Query \"main\" returned 0 results",
+                ));
+            }
+            Err(e) => {
+                checks.push(Check::fail(
+                    "search_artifacts",
+                    format!("search() error: {}", e),
+                ));
+            }
+        },
         None => {
-            checks.push(Check::skip("search_artifacts", "Skipped (no embedding index)"));
+            checks.push(Check::skip(
+                "search_artifacts",
+                "Skipped (no embedding index)",
+            ));
         }
     }
 
     // 6b. Keyword (BM25) search — verifies FTS index is present and functional
     match &embed_index {
         Some(idx) => {
-            match idx.search_with_mode("main", None, 5, crate::embed::SearchMode::Keyword).await {
+            match idx
+                .search_with_mode("main", None, 5, crate::embed::SearchMode::Keyword)
+                .await
+            {
                 Ok(crate::embed::SearchOutcome::Results(results)) if !results.is_empty() => {
-                    checks.push(Check::pass("keyword_search", format!("{} result(s) for keyword query \"main\"", results.len())));
+                    checks.push(Check::pass(
+                        "keyword_search",
+                        format!("{} result(s) for keyword query \"main\"", results.len()),
+                    ));
                 }
                 Ok(crate::embed::SearchOutcome::NotReady) => {
-                    checks.push(Check::skip("keyword_search", "Embedding table not built yet"));
+                    checks.push(Check::skip(
+                        "keyword_search",
+                        "Embedding table not built yet",
+                    ));
                 }
                 Ok(_) => {
-                    checks.push(Check::fail("keyword_search", "Keyword query \"main\" returned 0 results — FTS index may be missing"));
+                    checks.push(Check::fail(
+                        "keyword_search",
+                        "Keyword query \"main\" returned 0 results — FTS index may be missing",
+                    ));
                 }
                 Err(e) => {
-                    checks.push(Check::fail("keyword_search", format!("Keyword search error: {}", e)));
+                    checks.push(Check::fail(
+                        "keyword_search",
+                        format!("Keyword search error: {}", e),
+                    ));
                 }
             }
         }
         None => {
-            checks.push(Check::skip("keyword_search", "Skipped (no embedding index)"));
+            checks.push(Check::skip(
+                "keyword_search",
+                "Skipped (no embedding index)",
+            ));
         }
     }
 
     // 8. search_symbols path — substring search on extracted nodes
     let query_lower = "main";
-    let symbol_matches: Vec<_> = all_nodes.iter()
-        .filter(|n| n.id.name.to_lowercase().contains(query_lower) || n.signature.to_lowercase().contains(query_lower))
+    let symbol_matches: Vec<_> = all_nodes
+        .iter()
+        .filter(|n| {
+            n.id.name.to_lowercase().contains(query_lower)
+                || n.signature.to_lowercase().contains(query_lower)
+        })
         .collect();
     if !symbol_matches.is_empty() {
-        checks.push(Check::pass("search_symbols", format!("{} symbols match \"{}\"", symbol_matches.len(), query_lower)));
+        checks.push(Check::pass(
+            "search_symbols",
+            format!("{} symbols match \"{}\"", symbol_matches.len(), query_lower),
+        ));
     } else {
-        checks.push(Check::fail("search_symbols", format!("No symbols match \"{}\"", query_lower)));
+        checks.push(Check::fail(
+            "search_symbols",
+            format!("No symbols match \"{}\"", query_lower),
+        ));
     }
 
     // 9. outcome_progress path
     match query::outcome_progress(&repo, "agent-alignment", &all_nodes) {
         Ok(result) => {
             let outcome_count = result.outcomes.len();
-            if outcome_count > 0 || !result.markdown_chunks.is_empty() || !result.code_symbols.is_empty() {
-                checks.push(Check::pass("outcome_progress", format!("{} outcomes in progress result", outcome_count)));
+            if outcome_count > 0
+                || !result.markdown_chunks.is_empty()
+                || !result.code_symbols.is_empty()
+            {
+                checks.push(Check::pass(
+                    "outcome_progress",
+                    format!("{} outcomes in progress result", outcome_count),
+                ));
             } else {
                 // No outcomes for "agent-alignment" is possible but worth noting
-                checks.push(Check::skip("outcome_progress", "outcome_progress returned empty (outcome may not exist)"));
+                checks.push(Check::skip(
+                    "outcome_progress",
+                    "outcome_progress returned empty (outcome may not exist)",
+                ));
             }
         }
         Err(e) => {
-            checks.push(Check::fail("outcome_progress", format!("outcome_progress error: {}", e)));
+            checks.push(Check::fail(
+                "outcome_progress",
+                format!("outcome_progress error: {}", e),
+            ));
         }
     }
 
@@ -287,7 +380,10 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     let workspace = WorkspaceConfig::load().with_primary_root(repo.clone());
     let roots = workspace.resolved_roots();
     if !roots.is_empty() {
-        checks.push(Check::pass("list_roots", format!("{} workspace root(s)", roots.len())));
+        checks.push(Check::pass(
+            "list_roots",
+            format!("{} workspace root(s)", roots.len()),
+        ));
     } else {
         checks.push(Check::fail("list_roots", "No workspace roots resolved"));
     }
@@ -307,16 +403,24 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
 
     // 15. Cross-language constants smoke test
     // Part A: in-memory extraction
-    let const_nodes: Vec<_> = all_nodes.iter()
+    let const_nodes: Vec<_> = all_nodes
+        .iter()
         .filter(|n| n.id.kind == crate::graph::NodeKind::Const)
         .collect();
     if const_nodes.is_empty() {
         checks.push(Check::fail("const_extraction", "No Const nodes extracted"));
     } else {
-        let with_value = const_nodes.iter().filter(|n| n.metadata.contains_key("value")).count();
+        let with_value = const_nodes
+            .iter()
+            .filter(|n| n.metadata.contains_key("value"))
+            .count();
         checks.push(Check::pass(
             "const_extraction",
-            format!("{} Const nodes, {} with value", const_nodes.len(), with_value),
+            format!(
+                "{} Const nodes, {} with value",
+                const_nodes.len(),
+                with_value
+            ),
         ));
     }
 
@@ -351,7 +455,9 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     checks.push(run_lsp_status_footer_check());
 
     // 26. Subsystem detection — verifies detect_communities returns >0 subsystems when coupling edges exist
-    checks.push(run_subsystem_detection_check(&index, &all_nodes, &all_edges));
+    checks.push(run_subsystem_detection_check(
+        &index, &all_nodes, &all_edges,
+    ));
 
     // 27. Impact output size — verifies impact traversal output stays under 50K chars
     checks.push(run_impact_output_size_check(&index, &all_nodes).await);
@@ -383,7 +489,10 @@ async fn run_incremental_persist_check() -> Check {
     let temp_dir = std::env::temp_dir().join("rna-smoke-incremental");
     let _ = std::fs::remove_dir_all(&temp_dir);
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        return Check::fail("incremental_persist", format!("Could not create temp dir: {}", e));
+        return Check::fail(
+            "incremental_persist",
+            format!("Could not create temp dir: {}", e),
+        );
     }
 
     let fixture_path = temp_dir.join("rna_smoke_fixture.rs");
@@ -397,7 +506,10 @@ pub fn rna_smoke_old_fn() -> u32 { 1 }\n\
 pub fn rna_smoke_common_fn() -> u32 { 2 }\n\
 ";
     if let Err(e) = std::fs::write(&fixture_path, initial_content) {
-        return Check::fail("incremental_persist", format!("Could not write initial fixture: {}", e));
+        return Check::fail(
+            "incremental_persist",
+            format!("Could not write initial fixture: {}", e),
+        );
     }
 
     // Step 2: Extract symbols from the initial file and persist as initial state.
@@ -414,18 +526,20 @@ pub fn rna_smoke_common_fn() -> u32 { 2 }\n\
 
     if initial_nodes.is_empty() {
         // Tree-sitter may not parse .rs in temp dir — skip rather than fail.
-        return Check::skip("incremental_persist", "No symbols extracted from initial fixture (tree-sitter parse skipped)");
+        return Check::skip(
+            "incremental_persist",
+            "No symbols extracted from initial fixture (tree-sitter parse skipped)",
+        );
     }
 
     // Seed LanceDB with the initial state.
-    if let Err(e) = persist_graph_incremental(
-        &temp_dir,
-        &initial_nodes,
-        &initial_edges,
-        &[],
-        &[],
-    ).await {
-        return Check::fail("incremental_persist", format!("Initial persist failed: {}", e));
+    if let Err(e) =
+        persist_graph_incremental(&temp_dir, &initial_nodes, &initial_edges, &[], &[]).await
+    {
+        return Check::fail(
+            "incremental_persist",
+            format!("Initial persist failed: {}", e),
+        );
     }
 
     // Step 3: Update the file — remove old_fn, add new_fn, keep common_fn.
@@ -437,7 +551,10 @@ pub fn rna_smoke_new_fn() -> u32 { 3 }\n\
 pub fn rna_smoke_common_fn() -> u32 { 2 }\n\
 ";
     if let Err(e) = std::fs::write(&fixture_path, updated_content) {
-        return Check::fail("incremental_persist", format!("Could not write updated fixture: {}", e));
+        return Check::fail(
+            "incremental_persist",
+            format!("Could not write updated fixture: {}", e),
+        );
     }
 
     // Step 4: Simulate what update_graph_incrementally does:
@@ -461,44 +578,73 @@ pub fn rna_smoke_common_fn() -> u32 { 2 }\n\
         &upsert_edges,
         &[],
         &files_to_remove,
-    ).await {
-        return Check::fail("incremental_persist", format!("Incremental persist failed: {}", e));
+    )
+    .await
+    {
+        return Check::fail(
+            "incremental_persist",
+            format!("Incremental persist failed: {}", e),
+        );
     }
 
     // Step 5: Query LanceDB and verify: old_fn gone, new_fn present.
     let db_path = graph_lance_path(&temp_dir);
-    let db = match lancedb::connect(db_path.to_str().unwrap_or("")).execute().await {
+    let db = match lancedb::connect(db_path.to_str().unwrap_or(""))
+        .execute()
+        .await
+    {
         Ok(d) => d,
-        Err(e) => return Check::fail("incremental_persist", format!("Could not open LanceDB: {}", e)),
+        Err(e) => {
+            return Check::fail(
+                "incremental_persist",
+                format!("Could not open LanceDB: {}", e),
+            );
+        }
     };
     let table = match db.open_table("symbols").execute().await {
         Ok(t) => t,
-        Err(e) => return Check::fail("incremental_persist", format!("Could not open symbols table: {}", e)),
+        Err(e) => {
+            return Check::fail(
+                "incremental_persist",
+                format!("Could not open symbols table: {}", e),
+            );
+        }
     };
     let stream = match table.query().execute().await {
         Ok(s) => s,
-        Err(e) => return Check::fail("incremental_persist", format!("Could not query symbols: {}", e)),
+        Err(e) => {
+            return Check::fail(
+                "incremental_persist",
+                format!("Could not query symbols: {}", e),
+            );
+        }
     };
     let batches: Vec<arrow_array::RecordBatch> = match stream.try_collect().await {
         Ok(b) => b,
-        Err(e) => return Check::fail("incremental_persist", format!("Could not collect batches: {}", e)),
+        Err(e) => {
+            return Check::fail(
+                "incremental_persist",
+                format!("Could not collect batches: {}", e),
+            );
+        }
     };
 
     let mut found_old = false;
     let mut found_new = false;
     for batch in &batches {
         if let Some(names_col) = batch.column_by_name("name")
-            && let Some(names) = names_col.as_any().downcast_ref::<StringArray>() {
-                for i in 0..batch.num_rows() {
-                    let name = names.value(i);
-                    if name.contains("rna_smoke_old_fn") {
-                        found_old = true;
-                    }
-                    if name.contains("rna_smoke_new_fn") {
-                        found_new = true;
-                    }
+            && let Some(names) = names_col.as_any().downcast_ref::<StringArray>()
+        {
+            for i in 0..batch.num_rows() {
+                let name = names.value(i);
+                if name.contains("rna_smoke_old_fn") {
+                    found_old = true;
+                }
+                if name.contains("rna_smoke_new_fn") {
+                    found_new = true;
                 }
             }
+        }
     }
 
     // Clean up temp dir.
@@ -534,24 +680,43 @@ async fn run_worktree_check(repo: &Path) -> Check {
 
     // Clean up any leftover worktree from a previous run
     let _ = std::process::Command::new("git")
-        .args(["worktree", "remove", "--force", worktree_path.to_str().unwrap_or("")])
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            worktree_path.to_str().unwrap_or(""),
+        ])
         .current_dir(repo)
         .output();
 
     // Create worktree
     let add_result = std::process::Command::new("git")
-        .args(["worktree", "add", worktree_path.to_str().unwrap_or(""), "-b", "smoke-test-branch"])
+        .args([
+            "worktree",
+            "add",
+            worktree_path.to_str().unwrap_or(""),
+            "-b",
+            "smoke-test-branch",
+        ])
         .current_dir(repo)
         .output();
 
     let add_out = match add_result {
         Ok(o) => o,
-        Err(e) => return Check::skip("worktree_smoke", format!("git worktree add failed to run: {}", e)),
+        Err(e) => {
+            return Check::skip(
+                "worktree_smoke",
+                format!("git worktree add failed to run: {}", e),
+            );
+        }
     };
 
     if !add_out.status.success() {
         let stderr = String::from_utf8_lossy(&add_out.stderr);
-        return Check::skip("worktree_smoke", format!("git worktree add failed: {}", stderr.trim()));
+        return Check::skip(
+            "worktree_smoke",
+            format!("git worktree add failed: {}", stderr.trim()),
+        );
     }
 
     // Write a unique function to the worktree
@@ -564,29 +729,30 @@ async fn run_worktree_check(repo: &Path) -> Check {
 
     if let Err(e) = std::fs::write(&test_file, &content) {
         cleanup_worktree(repo, &worktree_path);
-        return Check::skip("worktree_smoke", format!("Could not write fixture file: {}", e));
+        return Check::skip(
+            "worktree_smoke",
+            format!("Could not write fixture file: {}", e),
+        );
     }
 
     // Scan the worktree root
     let scan_result: Option<Vec<crate::graph::Node>> = {
         match Scanner::new(worktree_path.clone()) {
-            Ok(mut s) => {
-                match s.scan() {
-                    Ok(_) => {
-                        let all_files = s.all_known_files();
-                        let full_scan = crate::scanner::ScanResult {
-                            changed_files: Vec::new(),
-                            new_files: all_files,
-                            deleted_files: Vec::new(),
-                            scan_duration: std::time::Duration::ZERO,
-                        };
-                        let reg = ExtractorRegistry::with_builtins();
-                        let extraction = reg.extract_scan_result(&worktree_path, &full_scan);
-                        Some(extraction.nodes)
-                    }
-                    Err(_) => None,
+            Ok(mut s) => match s.scan() {
+                Ok(_) => {
+                    let all_files = s.all_known_files();
+                    let full_scan = crate::scanner::ScanResult {
+                        changed_files: Vec::new(),
+                        new_files: all_files,
+                        deleted_files: Vec::new(),
+                        scan_duration: std::time::Duration::ZERO,
+                    };
+                    let reg = ExtractorRegistry::with_builtins();
+                    let extraction = reg.extract_scan_result(&worktree_path, &full_scan);
+                    Some(extraction.nodes)
                 }
-            }
+                Err(_) => None,
+            },
             Err(_) => None,
         }
     };
@@ -594,9 +760,14 @@ async fn run_worktree_check(repo: &Path) -> Check {
     // Assert the unique function was found
     let result = match scan_result {
         Some(nodes) => {
-            let found = nodes.iter().any(|n| n.id.name.contains(unique_fn_name) || n.signature.contains(unique_fn_name));
+            let found = nodes.iter().any(|n| {
+                n.id.name.contains(unique_fn_name) || n.signature.contains(unique_fn_name)
+            });
             if found {
-                Check::pass("worktree_smoke", format!("Function '{}' found in worktree scan", unique_fn_name))
+                Check::pass(
+                    "worktree_smoke",
+                    format!("Function '{}' found in worktree scan", unique_fn_name),
+                )
             } else {
                 // Not a hard CI failure until feat/rna-worktree-awareness is merged
                 // requires feat/rna-worktree-awareness to be merged
@@ -610,7 +781,10 @@ async fn run_worktree_check(repo: &Path) -> Check {
                 )
             }
         }
-        None => Check::skip("worktree_smoke", "Could not scan worktree (scanner init failed)"),
+        None => Check::skip(
+            "worktree_smoke",
+            "Could not scan worktree (scanner init failed)",
+        ),
     };
 
     cleanup_worktree(repo, &worktree_path);
@@ -620,42 +794,65 @@ async fn run_worktree_check(repo: &Path) -> Check {
 /// Persist a subset of nodes to a temp LanceDB, reload, and verify Const `value` survives.
 async fn run_const_lance_roundtrip(nodes: &[Node], edges: &[Edge]) -> Check {
     // Pick at most 50 nodes so the write is fast; ensure at least one Const with a value
-    let const_with_value: Vec<_> = nodes.iter()
+    let const_with_value: Vec<_> = nodes
+        .iter()
         .filter(|n| n.id.kind == crate::graph::NodeKind::Const && n.metadata.contains_key("value"))
         .cloned()
         .collect();
 
     if const_with_value.is_empty() {
-        return Check::skip("const_lance_roundtrip", "No Const nodes with value — skipping LanceDB round-trip check");
+        return Check::skip(
+            "const_lance_roundtrip",
+            "No Const nodes with value — skipping LanceDB round-trip check",
+        );
     }
 
     // Use a temp dir as the fake repo root for LanceDB
     let tmp_root = std::env::temp_dir().join("rna-smoke-const-lance-roundtrip");
     if let Err(e) = std::fs::create_dir_all(&tmp_root) {
-        return Check::fail("const_lance_roundtrip", format!("Failed to create temp dir: {}", e));
+        return Check::fail(
+            "const_lance_roundtrip",
+            format!("Failed to create temp dir: {}", e),
+        );
     }
     let tmp_root = tmp_root.as_path();
 
     // Persist: use the const nodes + a small sample of other nodes
-    let sample: Vec<_> = nodes.iter().take(50).cloned()
+    let sample: Vec<_> = nodes
+        .iter()
+        .take(50)
+        .cloned()
         .chain(const_with_value.iter().cloned())
         .collect();
     // Deduplicate by stable_id
     let mut seen = std::collections::HashSet::new();
-    let deduped: Vec<_> = sample.into_iter().filter(|n| seen.insert(n.stable_id())).collect();
+    let deduped: Vec<_> = sample
+        .into_iter()
+        .filter(|n| seen.insert(n.stable_id()))
+        .collect();
 
     if let Err(e) = persist_graph_to_lance(tmp_root, &deduped, edges).await {
-        return Check::fail("const_lance_roundtrip", format!("persist_graph_to_lance failed: {}", e));
+        return Check::fail(
+            "const_lance_roundtrip",
+            format!("persist_graph_to_lance failed: {}", e),
+        );
     }
 
     // Reload
     let reloaded = match load_graph_from_lance(tmp_root).await {
         Ok(state) => state,
-        Err(e) => return Check::fail("const_lance_roundtrip", format!("load_graph_from_lance failed: {}", e)),
+        Err(e) => {
+            return Check::fail(
+                "const_lance_roundtrip",
+                format!("load_graph_from_lance failed: {}", e),
+            );
+        }
     };
 
     // Assert Const nodes still have value after reload
-    let reloaded_consts_with_value = reloaded.nodes.iter()
+    let reloaded_consts_with_value = reloaded
+        .nodes
+        .iter()
         .filter(|n| n.id.kind == crate::graph::NodeKind::Const && n.metadata.contains_key("value"))
         .count();
 
@@ -663,18 +860,29 @@ async fn run_const_lance_roundtrip(nodes: &[Node], edges: &[Edge]) -> Check {
     let _ = std::fs::remove_dir_all(tmp_root);
 
     if reloaded_consts_with_value == 0 {
-        Check::fail("const_lance_roundtrip", "Const nodes lost `value` metadata after LanceDB round-trip")
+        Check::fail(
+            "const_lance_roundtrip",
+            "Const nodes lost `value` metadata after LanceDB round-trip",
+        )
     } else {
         Check::pass(
             "const_lance_roundtrip",
-            format!("{} Const nodes retained `value` after persist→reload", reloaded_consts_with_value),
+            format!(
+                "{} Const nodes retained `value` after persist→reload",
+                reloaded_consts_with_value
+            ),
         )
     }
 }
 
 fn cleanup_worktree(repo: &Path, worktree_path: &Path) {
     let _ = std::process::Command::new("git")
-        .args(["worktree", "remove", "--force", worktree_path.to_str().unwrap_or("")])
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            worktree_path.to_str().unwrap_or(""),
+        ])
         .current_dir(repo)
         .output();
     // Also delete the branch if it exists
@@ -696,16 +904,19 @@ fn cleanup_worktree(repo: &Path, worktree_path: &Path) {
 /// - That node has `metadata["virtual"] == "true"`
 /// - That node's name contains `"::"` (FQN, e.g. `lancedb::connect`)
 async fn run_external_calls_check() -> Check {
+    use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
     use arrow_array::{Array, BooleanArray, StringArray};
     use futures::TryStreamExt;
     use lancedb::query::ExecutableQuery;
     use std::collections::BTreeMap;
-    use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
 
     let temp_dir = std::env::temp_dir().join("rna-smoke-external-calls");
     let _ = std::fs::remove_dir_all(&temp_dir);
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        return Check::fail("external_calls_persist", format!("Could not create temp dir: {}", e));
+        return Check::fail(
+            "external_calls_persist",
+            format!("Could not create temp dir: {}", e),
+        );
     }
 
     // Synthesise a virtual node that mimics what LspEnricher produces for an
@@ -731,45 +942,57 @@ async fn run_external_calls_check() -> Check {
     };
 
     // Step 1: Persist the virtual node via persist_graph_incremental.
-    if let Err(e) = persist_graph_incremental(
-        &temp_dir,
-        &[virtual_node],
-        &[],
-        &[],
-        &[],
-    ).await {
+    if let Err(e) = persist_graph_incremental(&temp_dir, &[virtual_node], &[], &[], &[]).await {
         let _ = std::fs::remove_dir_all(&temp_dir);
-        return Check::fail("external_calls_persist", format!("persist_graph_incremental failed: {}", e));
+        return Check::fail(
+            "external_calls_persist",
+            format!("persist_graph_incremental failed: {}", e),
+        );
     }
 
     // Step 2: Reload from LanceDB — simulates a server restart.
     let db_path = graph_lance_path(&temp_dir);
-    let db = match lancedb::connect(db_path.to_str().unwrap_or("")).execute().await {
+    let db = match lancedb::connect(db_path.to_str().unwrap_or(""))
+        .execute()
+        .await
+    {
         Ok(d) => d,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&temp_dir);
-            return Check::fail("external_calls_persist", format!("Could not open LanceDB: {}", e));
+            return Check::fail(
+                "external_calls_persist",
+                format!("Could not open LanceDB: {}", e),
+            );
         }
     };
     let table = match db.open_table("symbols").execute().await {
         Ok(t) => t,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&temp_dir);
-            return Check::fail("external_calls_persist", format!("Could not open symbols table: {}", e));
+            return Check::fail(
+                "external_calls_persist",
+                format!("Could not open symbols table: {}", e),
+            );
         }
     };
     let stream = match table.query().execute().await {
         Ok(s) => s,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&temp_dir);
-            return Check::fail("external_calls_persist", format!("Could not query symbols: {}", e));
+            return Check::fail(
+                "external_calls_persist",
+                format!("Could not query symbols: {}", e),
+            );
         }
     };
     let batches: Vec<arrow_array::RecordBatch> = match stream.try_collect().await {
         Ok(b) => b,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&temp_dir);
-            return Check::fail("external_calls_persist", format!("Could not collect batches: {}", e));
+            return Check::fail(
+                "external_calls_persist",
+                format!("Could not collect batches: {}", e),
+            );
         }
     };
 
@@ -779,20 +1002,23 @@ async fn run_external_calls_check() -> Check {
     let mut found_fqn = false;
 
     for batch in &batches {
-        let root_ids = match batch.column_by_name("root_id")
+        let root_ids = match batch
+            .column_by_name("root_id")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>())
         {
             Some(a) => a,
             None => continue,
         };
-        let names = match batch.column_by_name("name")
+        let names = match batch
+            .column_by_name("name")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>())
         {
             Some(a) => a,
             None => continue,
         };
         // Typed meta_virtual column — Boolean, nullable.
-        let meta_virtual_col = batch.column_by_name("meta_virtual")
+        let meta_virtual_col = batch
+            .column_by_name("meta_virtual")
             .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
 
         for i in 0..batch.num_rows() {
@@ -803,9 +1029,11 @@ async fn run_external_calls_check() -> Check {
                 found_fqn = true;
                 // Check meta_virtual typed column for true
                 if let Some(col) = meta_virtual_col
-                    && !col.is_null(i) && col.value(i) {
-                        found_virtual_true = true;
-                    }
+                    && !col.is_null(i)
+                    && col.value(i)
+                {
+                    found_virtual_true = true;
+                }
             }
         }
     }
@@ -836,14 +1064,16 @@ async fn run_external_calls_check() -> Check {
     }
 }
 
-
 /// list_roots check: verifies WorkspaceConfig::with_primary_root() returns at least 1 root
 /// that matches the test repo path.
 fn run_list_roots_check(repo: &Path) -> Check {
     let workspace = WorkspaceConfig::load().with_primary_root(repo.to_path_buf());
     let roots = workspace.resolved_roots();
     if roots.is_empty() {
-        return Check::fail("list_roots_check", "No workspace roots resolved from with_primary_root()");
+        return Check::fail(
+            "list_roots_check",
+            "No workspace roots resolved from with_primary_root()",
+        );
     }
     let primary_matches = roots.iter().any(|r| r.path == repo);
     if !primary_matches {
@@ -852,7 +1082,10 @@ fn run_list_roots_check(repo: &Path) -> Check {
             format!(
                 "Primary root {} not found in resolved roots: {:?}",
                 repo.display(),
-                roots.iter().map(|r| r.path.display().to_string()).collect::<Vec<_>>()
+                roots
+                    .iter()
+                    .map(|r| r.path.display().to_string())
+                    .collect::<Vec<_>>()
             ),
         )
     } else {
@@ -871,7 +1104,12 @@ async fn run_worktree_roots_check(repo: &Path) -> Check {
 
     // Clean up any pre-existing worktree / branch
     let _ = std::process::Command::new("git")
-        .args(["worktree", "remove", "--force", worktree_path.to_str().unwrap_or("")])
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            worktree_path.to_str().unwrap_or(""),
+        ])
         .current_dir(repo)
         .output();
     let _ = std::process::Command::new("git")
@@ -881,19 +1119,31 @@ async fn run_worktree_roots_check(repo: &Path) -> Check {
 
     // Create a linked worktree
     let add_out = match std::process::Command::new("git")
-        .args(["worktree", "add", worktree_path.to_str().unwrap_or(""), "-b", branch_name])
+        .args([
+            "worktree",
+            "add",
+            worktree_path.to_str().unwrap_or(""),
+            "-b",
+            branch_name,
+        ])
         .current_dir(repo)
         .output()
     {
         Ok(o) => o,
         Err(e) => {
-            return Check::skip("worktree_roots_check", format!("git worktree add failed: {}", e));
+            return Check::skip(
+                "worktree_roots_check",
+                format!("git worktree add failed: {}", e),
+            );
         }
     };
 
     if !add_out.status.success() {
         let stderr = String::from_utf8_lossy(&add_out.stderr);
-        return Check::skip("worktree_roots_check", format!("git worktree add failed: {}", stderr.trim()));
+        return Check::skip(
+            "worktree_roots_check",
+            format!("git worktree add failed: {}", stderr.trim()),
+        );
     }
 
     // Build workspace config with primary root + worktrees
@@ -904,7 +1154,12 @@ async fn run_worktree_roots_check(repo: &Path) -> Check {
 
     // Clean up before asserting
     let _ = std::process::Command::new("git")
-        .args(["worktree", "remove", "--force", worktree_path.to_str().unwrap_or("")])
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            worktree_path.to_str().unwrap_or(""),
+        ])
         .current_dir(repo)
         .output();
     let _ = std::process::Command::new("git")
@@ -916,7 +1171,10 @@ async fn run_worktree_roots_check(repo: &Path) -> Check {
     if found {
         Check::pass(
             "worktree_roots_check",
-            format!("with_worktrees() detected the linked worktree at {}", worktree_path.display()),
+            format!(
+                "with_worktrees() detected the linked worktree at {}",
+                worktree_path.display()
+            ),
         )
     } else {
         Check::skip(
@@ -939,7 +1197,10 @@ async fn run_metadata_roundtrip_check() -> Check {
     let temp_dir = std::env::temp_dir().join("rna-smoke-metadata-roundtrip");
     let _ = std::fs::remove_dir_all(&temp_dir);
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        return Check::fail("metadata_roundtrip", format!("Could not create temp dir: {}", e));
+        return Check::fail(
+            "metadata_roundtrip",
+            format!("Could not create temp dir: {}", e),
+        );
     }
 
     let mut meta = BTreeMap::new();
@@ -966,7 +1227,10 @@ async fn run_metadata_roundtrip_check() -> Check {
     // Persist via the full DROP+CREATE path
     if let Err(e) = persist_graph_to_lance(&temp_dir, &[node], &[]).await {
         let _ = std::fs::remove_dir_all(&temp_dir);
-        return Check::fail("metadata_roundtrip", format!("persist_graph_to_lance failed: {}", e));
+        return Check::fail(
+            "metadata_roundtrip",
+            format!("persist_graph_to_lance failed: {}", e),
+        );
     }
 
     // Reload from LanceDB
@@ -974,7 +1238,10 @@ async fn run_metadata_roundtrip_check() -> Check {
         Ok(s) => s,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&temp_dir);
-            return Check::fail("metadata_roundtrip", format!("load_graph_from_lance failed: {}", e));
+            return Check::fail(
+                "metadata_roundtrip",
+                format!("load_graph_from_lance failed: {}", e),
+            );
         }
     };
 
@@ -983,7 +1250,10 @@ async fn run_metadata_roundtrip_check() -> Check {
     // Find the node and verify metadata
     let reloaded = state.nodes.iter().find(|n| n.id.name == "test_metadata_fn");
     match reloaded {
-        None => Check::fail("metadata_roundtrip", "Node 'test_metadata_fn' not found after reload"),
+        None => Check::fail(
+            "metadata_roundtrip",
+            "Node 'test_metadata_fn' not found after reload",
+        ),
         Some(n) => {
             let missing: Vec<_> = meta
                 .iter()
@@ -993,12 +1263,18 @@ async fn run_metadata_roundtrip_check() -> Check {
             if missing.is_empty() {
                 Check::pass(
                     "metadata_roundtrip",
-                    format!("Node metadata round-tripped correctly ({} keys)", meta.len()),
+                    format!(
+                        "Node metadata round-tripped correctly ({} keys)",
+                        meta.len()
+                    ),
                 )
             } else {
                 Check::fail(
                     "metadata_roundtrip",
-                    format!("Metadata mismatch after reload — missing or wrong: {:?}", missing),
+                    format!(
+                        "Metadata mismatch after reload — missing or wrong: {:?}",
+                        missing
+                    ),
                 )
             }
         }
@@ -1009,7 +1285,10 @@ async fn run_metadata_roundtrip_check() -> Check {
 /// and that they are findable by kind.
 fn run_search_symbols_check(nodes: &[crate::graph::Node]) -> Check {
     if nodes.is_empty() {
-        return Check::skip("search_symbols_check", "No nodes available (extraction may have failed)");
+        return Check::skip(
+            "search_symbols_check",
+            "No nodes available (extraction may have failed)",
+        );
     }
 
     let function_nodes: Vec<_> = nodes
@@ -1044,7 +1323,10 @@ fn run_search_symbols_check(nodes: &[crate::graph::Node]) -> Check {
 /// that neighbors() is callable and returns sensible results.
 fn run_graph_query_check(index: &GraphIndex, nodes: &[crate::graph::Node]) -> Check {
     if nodes.is_empty() {
-        return Check::skip("graph_query_check", "No nodes available — skipping graph query");
+        return Check::skip(
+            "graph_query_check",
+            "No nodes available — skipping graph query",
+        );
     }
 
     let node_count = index.node_count();
@@ -1078,38 +1360,53 @@ fn run_graph_query_check(index: &GraphIndex, nodes: &[crate::graph::Node]) -> Ch
 }
 
 fn run_lsp_status_footer_check() -> Check {
-    use crate::server::{format_freshness, LspEnrichmentStatus};
+    use crate::server::{LspEnrichmentStatus, format_freshness};
 
     let status = LspEnrichmentStatus::default();
 
     // Not started → no LSP in footer
     let footer = format_freshness(100, Some(std::time::Instant::now()), Some(&status));
     if footer.contains("LSP") {
-        return Check::fail("lsp_status_footer", "Footer shows LSP segment in NotStarted state");
+        return Check::fail(
+            "lsp_status_footer",
+            "Footer shows LSP segment in NotStarted state",
+        );
     }
 
     // Server found (binary on PATH, enrichment not started) → "LSP: {name} found, waiting to start"
     status.set_server_found();
     let footer = format_freshness(100, Some(std::time::Instant::now()), Some(&status));
     if !footer.contains("found, waiting to start") {
-        return Check::fail("lsp_status_footer", format!("Expected 'found, waiting to start', got: {}", footer));
+        return Check::fail(
+            "lsp_status_footer",
+            format!("Expected 'found, waiting to start', got: {}", footer),
+        );
     }
 
     // Running → "LSP: enriching"
     status.set_running();
     let footer = format_freshness(100, Some(std::time::Instant::now()), Some(&status));
     if !footer.contains("LSP: enriching") {
-        return Check::fail("lsp_status_footer", format!("Expected 'LSP: enriching', got: {}", footer));
+        return Check::fail(
+            "lsp_status_footer",
+            format!("Expected 'LSP: enriching', got: {}", footer),
+        );
     }
 
     // Complete → "LSP: enriched (N edges in Xs)"
     status.set_complete(42);
     let footer = format_freshness(100, Some(std::time::Instant::now()), Some(&status));
     if !footer.contains("42 edges") {
-        return Check::fail("lsp_status_footer", format!("Expected '42 edges', got: {}", footer));
+        return Check::fail(
+            "lsp_status_footer",
+            format!("Expected '42 edges', got: {}", footer),
+        );
     }
 
-    Check::pass("lsp_status_footer", "Footer renders all 4 LSP states correctly")
+    Check::pass(
+        "lsp_status_footer",
+        "Footer renders all 4 LSP states correctly",
+    )
 }
 
 /// HEAD-change detection check.
@@ -1129,11 +1426,7 @@ fn run_lsp_status_footer_check() -> Check {
 /// not the full reindex cycle.
 fn run_head_change_detection_check() -> Check {
     fn read_head_oid(repo: &git2::Repository) -> Option<git2::Oid> {
-        repo.head()
-            .ok()?
-            .peel_to_commit()
-            .ok()
-            .map(|c| c.id())
+        repo.head().ok()?.peel_to_commit().ok().map(|c| c.id())
     }
 
     fn make_commit(repo: &git2::Repository, message: &str) -> Result<git2::Oid, git2::Error> {
@@ -1167,7 +1460,7 @@ fn run_head_change_detection_check() -> Check {
             return Check::fail(
                 "head_change_detection",
                 format!("git2::Repository::init failed: {}", e),
-            )
+            );
         }
     };
 
@@ -1184,7 +1477,7 @@ fn run_head_change_detection_check() -> Check {
             return Check::fail(
                 "head_change_detection",
                 "Could not read HEAD OID after first commit",
-            )
+            );
         }
     };
 
@@ -1201,7 +1494,7 @@ fn run_head_change_detection_check() -> Check {
             return Check::fail(
                 "head_change_detection",
                 "Could not read HEAD OID after second commit",
-            )
+            );
         }
     };
 
@@ -1223,7 +1516,7 @@ fn run_head_change_detection_check() -> Check {
             return Check::fail(
                 "head_change_detection",
                 "Could not re-read HEAD OID for stable-state check",
-            )
+            );
         }
     };
     if oid_b != oid_b2 {
@@ -1259,9 +1552,10 @@ async fn run_search_artifact_semantic_check(embed_index: &Option<EmbeddingIndex>
     };
 
     match index.search("alignment", None, 5).await {
-        Ok(crate::embed::SearchOutcome::NotReady) => {
-            Check::skip("search_artifacts_semantic", "Embedding table not built yet — index is still building")
-        }
+        Ok(crate::embed::SearchOutcome::NotReady) => Check::skip(
+            "search_artifacts_semantic",
+            "Embedding table not built yet — index is still building",
+        ),
         Ok(crate::embed::SearchOutcome::Results(results)) => {
             if results.is_empty() {
                 Check::skip(
@@ -1280,9 +1574,10 @@ async fn run_search_artifact_semantic_check(embed_index: &Option<EmbeddingIndex>
                 )
             }
         }
-        Err(e) => {
-            Check::fail("search_artifacts_semantic", format!("Semantic search failed: {}", e))
-        }
+        Err(e) => Check::fail(
+            "search_artifacts_semantic",
+            format!("Semantic search failed: {}", e),
+        ),
     }
 }
 
@@ -1300,20 +1595,29 @@ async fn run_schema_version_check() -> Check {
     let temp_dir = std::env::temp_dir().join("rna-smoke-schema-version");
     let _ = std::fs::remove_dir_all(&temp_dir);
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        return Check::fail("schema_version_check", format!("Could not create temp dir: {}", e));
+        return Check::fail(
+            "schema_version_check",
+            format!("Could not create temp dir: {}", e),
+        );
     }
 
     let db_path = temp_dir.join(".oh").join(".cache").join("lance");
     if let Err(e) = std::fs::create_dir_all(&db_path) {
         let _ = std::fs::remove_dir_all(&temp_dir);
-        return Check::fail("schema_version_check", format!("Could not create lance dir: {}", e));
+        return Check::fail(
+            "schema_version_check",
+            format!("Could not create lance dir: {}", e),
+        );
     }
 
     // Step 1: Seed schema_version file with version 0 (stale) and create a dummy
     // directory to simulate existing LanceDB data.
     if let Err(e) = std::fs::write(db_path.join("schema_version"), "0") {
         let _ = std::fs::remove_dir_all(&temp_dir);
-        return Check::fail("schema_version_check", format!("Failed to seed stale version file: {}", e));
+        return Check::fail(
+            "schema_version_check",
+            format!("Failed to seed stale version file: {}", e),
+        );
     }
     // Create a dummy table directory so has_lance_data() detects stale data.
     if let Err(e) = std::fs::create_dir_all(db_path.join("symbols.lance")) {
@@ -1329,7 +1633,10 @@ async fn run_schema_version_check() -> Check {
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&temp_dir);
-            return Check::fail("schema_version_check", format!("check_and_migrate_schema failed: {}", e));
+            return Check::fail(
+                "schema_version_check",
+                format!("check_and_migrate_schema failed: {}", e),
+            );
         }
     };
 
@@ -1347,12 +1654,18 @@ async fn run_schema_version_check() -> Check {
             Ok(v) => v,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&temp_dir);
-                return Check::fail("schema_version_check", format!("Failed to parse stored version: {}", e));
+                return Check::fail(
+                    "schema_version_check",
+                    format!("Failed to parse stored version: {}", e),
+                );
             }
         },
         Err(e) => {
             let _ = std::fs::remove_dir_all(&temp_dir);
-            return Check::fail("schema_version_check", format!("Failed to read version file: {}", e));
+            return Check::fail(
+                "schema_version_check",
+                format!("Failed to read version file: {}", e),
+            );
         }
     };
 
@@ -1360,7 +1673,10 @@ async fn run_schema_version_check() -> Check {
         let _ = std::fs::remove_dir_all(&temp_dir);
         return Check::fail(
             "schema_version_check",
-            format!("Stored version {} != SCHEMA_VERSION {}", stored_version, SCHEMA_VERSION),
+            format!(
+                "Stored version {} != SCHEMA_VERSION {}",
+                stored_version, SCHEMA_VERSION
+            ),
         );
     }
 
@@ -1369,7 +1685,10 @@ async fn run_schema_version_check() -> Check {
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&temp_dir);
-            return Check::fail("schema_version_check", format!("Second check_and_migrate_schema failed: {}", e));
+            return Check::fail(
+                "schema_version_check",
+                format!("Second check_and_migrate_schema failed: {}", e),
+            );
         }
     };
 
@@ -1384,9 +1703,7 @@ async fn run_schema_version_check() -> Check {
 
     Check::pass(
         "schema_version_check",
-        format!(
-            "Migration detected stale v0→v{SCHEMA_VERSION}, then confirmed no-op on re-check"
-        ),
+        format!("Migration detected stale v0→v{SCHEMA_VERSION}, then confirmed no-op on re-check"),
     )
 }
 
@@ -1396,7 +1713,10 @@ async fn run_broken_symlink_check() -> Check {
     let temp_dir = std::env::temp_dir().join("rna-smoke-broken-symlink");
     let _ = std::fs::remove_dir_all(&temp_dir);
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        return Check::fail("broken_symlink", format!("Could not create temp dir: {}", e));
+        return Check::fail(
+            "broken_symlink",
+            format!("Could not create temp dir: {}", e),
+        );
     }
 
     // Init a git repo so the scanner can use it
@@ -1411,7 +1731,10 @@ async fn run_broken_symlink_check() -> Check {
     // Create a broken symlink
     #[cfg(unix)]
     {
-        let _ = std::os::unix::fs::symlink("/nonexistent/path/that/does/not/exist", temp_dir.join("broken-link.rs"));
+        let _ = std::os::unix::fs::symlink(
+            "/nonexistent/path/that/does/not/exist",
+            temp_dir.join("broken-link.rs"),
+        );
     }
 
     // Scan — should complete without error
@@ -1425,12 +1748,18 @@ async fn run_broken_symlink_check() -> Check {
             let _ = std::fs::remove_dir_all(&temp_dir);
             Check::pass(
                 "broken_symlink",
-                format!("Scan completed with broken symlink present ({} files)", result.changed_files.len() + result.new_files.len()),
+                format!(
+                    "Scan completed with broken symlink present ({} files)",
+                    result.changed_files.len() + result.new_files.len()
+                ),
             )
         }
         Err(e) => {
             let _ = std::fs::remove_dir_all(&temp_dir);
-            Check::fail("broken_symlink", format!("Scan crashed on broken symlink: {}", e))
+            Check::fail(
+                "broken_symlink",
+                format!("Scan crashed on broken symlink: {}", e),
+            )
         }
     }
 }
@@ -1515,8 +1844,8 @@ fn run_subsystem_detection_check(index: &GraphIndex, nodes: &[Node], edges: &[Ed
         // graph is large but coupling nodes are sparse (e.g., LSP enrichment
         // only ran briefly), returning 0 subsystems is correct behavior, not
         // a bug. Mirror that density check here to decide skip vs. fail.
-        let is_sparse = prod_count > 100
-            && (nodes_with_coupling as f64) < (prod_count as f64 * 0.05);
+        let is_sparse =
+            prod_count > 100 && (nodes_with_coupling as f64) < (prod_count as f64 * 0.05);
 
         if is_sparse {
             Check::skip(
@@ -1562,7 +1891,8 @@ async fn run_impact_output_size_check(index: &GraphIndex, nodes: &[Node]) -> Che
 
     // Find the highest-PageRank node
     let pagerank_scores = index.compute_pagerank(0.85, 20);
-    let best_node = nodes.iter()
+    let best_node = nodes
+        .iter()
         .filter(|n| n.id.root != "external")
         .max_by(|a, b| {
             let sa = pagerank_scores.get(&a.stable_id()).copied().unwrap_or(0.0);
@@ -1699,7 +2029,12 @@ fn run_short_id_resolution_check(_index: &GraphIndex, _nodes: &[Node]) -> Check 
     // Strip the root prefix to get the short ID
     let short_id = match full_id.split_once(':') {
         Some((_root, rest)) => rest.to_string(),
-        None => return Check::fail("short_id_resolution", "Node stable_id has no colon separator"),
+        None => {
+            return Check::fail(
+                "short_id_resolution",
+                "Node stable_id has no colon separator",
+            );
+        }
     };
 
     let resolved = graph_state.resolve_node_id(&short_id);
@@ -1740,19 +2075,28 @@ fn run_short_id_resolution_check(_index: &GraphIndex, _nodes: &[Node]) -> Check 
 /// This catches LSP edges being lost during persist.
 async fn run_edge_persist_parity_check(nodes: &[Node], edges: &[Edge]) -> Check {
     if nodes.is_empty() {
-        return Check::skip("edge_persist_parity", "No nodes available for edge parity check");
+        return Check::skip(
+            "edge_persist_parity",
+            "No nodes available for edge parity check",
+        );
     }
 
     let temp_dir = std::env::temp_dir().join("rna-smoke-edge-persist-parity");
     let _ = std::fs::remove_dir_all(&temp_dir);
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        return Check::fail("edge_persist_parity", format!("Could not create temp dir: {}", e));
+        return Check::fail(
+            "edge_persist_parity",
+            format!("Could not create temp dir: {}", e),
+        );
     }
 
     // Persist the graph
     if let Err(e) = persist_graph_to_lance(&temp_dir, nodes, edges).await {
         let _ = std::fs::remove_dir_all(&temp_dir);
-        return Check::fail("edge_persist_parity", format!("persist_graph_to_lance failed: {}", e));
+        return Check::fail(
+            "edge_persist_parity",
+            format!("persist_graph_to_lance failed: {}", e),
+        );
     }
 
     // Reload from LanceDB
@@ -1760,7 +2104,10 @@ async fn run_edge_persist_parity_check(nodes: &[Node], edges: &[Edge]) -> Check 
         Ok(state) => state,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&temp_dir);
-            return Check::fail("edge_persist_parity", format!("load_graph_from_lance failed: {}", e));
+            return Check::fail(
+                "edge_persist_parity",
+                format!("load_graph_from_lance failed: {}", e),
+            );
         }
     };
 
@@ -1786,7 +2133,9 @@ async fn run_edge_persist_parity_check(nodes: &[Node], edges: &[Edge]) -> Check 
             "edge_persist_parity",
             format!(
                 "Edge count mismatch: original={}, reloaded={} (parity: {:.1}%). Edges may be lost during persist.",
-                original_edge_count, reloaded_edge_count, parity_ratio * 100.0
+                original_edge_count,
+                reloaded_edge_count,
+                parity_ratio * 100.0
             ),
         )
     } else {
@@ -1794,7 +2143,9 @@ async fn run_edge_persist_parity_check(nodes: &[Node], edges: &[Edge]) -> Check 
             "edge_persist_parity",
             format!(
                 "Edge persist parity OK: original={}, reloaded={} (parity: {:.1}%)",
-                original_edge_count, reloaded_edge_count, parity_ratio * 100.0
+                original_edge_count,
+                reloaded_edge_count,
+                parity_ratio * 100.0
             ),
         )
     }
@@ -1813,10 +2164,16 @@ fn truncate_for_display(s: &str, max_len: usize) -> String {
 
 fn print_and_return(args: &TestArgs, checks: Vec<Check>) -> bool {
     let all_passed = checks.iter().all(|c| c.status != CheckStatus::Fail);
-    let result = SmokeResult { pass: all_passed, checks };
+    let result = SmokeResult {
+        pass: all_passed,
+        checks,
+    };
 
     if args.format == "json" {
-        println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
     } else {
         println!("RNA Pipeline Smoke Test");
         println!("=======================");
@@ -1827,7 +2184,12 @@ fn print_and_return(args: &TestArgs, checks: Vec<Check>) -> bool {
                 CheckStatus::Skip => "SKIP",
             };
             let detail = c.detail.as_deref().unwrap_or("");
-            println!("  [{icon}] {name}: {detail}", icon = icon, name = c.name, detail = detail);
+            println!(
+                "  [{icon}] {name}: {detail}",
+                icon = icon,
+                name = c.name,
+                detail = detail
+            );
         }
         println!("=======================");
         if result.pass {

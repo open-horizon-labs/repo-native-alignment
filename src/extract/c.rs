@@ -52,7 +52,12 @@ impl Extractor for CExtractor {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_c::LANGUAGE.into())?;
         if let Some(tree) = parser.parse(content, None) {
-            collect_c_functions(tree.root_node(), path, content.as_bytes(), &mut result.nodes);
+            collect_c_functions(
+                tree.root_node(),
+                path,
+                content.as_bytes(),
+                &mut result.nodes,
+            );
         }
 
         Ok(result)
@@ -69,9 +74,10 @@ fn extract_c_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
         "pointer_declarator" => {
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i as u32)
-                    && let Some(name) = extract_c_name(child, source) {
-                        return Some(name);
-                    }
+                    && let Some(name) = extract_c_name(child, source)
+                {
+                    return Some(name);
+                }
             }
             None
         }
@@ -80,34 +86,30 @@ fn extract_c_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
 }
 
 /// Walk AST for C function definitions (complex declarator extraction).
-fn collect_c_functions(
-    node: tree_sitter::Node,
-    path: &Path,
-    source: &[u8],
-    nodes: &mut Vec<Node>,
-) {
+fn collect_c_functions(node: tree_sitter::Node, path: &Path, source: &[u8], nodes: &mut Vec<Node>) {
     if node.kind() == "function_definition"
         && let Some(declarator) = node.child_by_field_name("declarator")
-            && let Some(name) = extract_c_name(declarator, source) {
-                let body = node.utf8_text(source).unwrap_or("").to_string();
-                let sig = body.lines().next().unwrap_or("").trim().to_string();
+        && let Some(name) = extract_c_name(declarator, source)
+    {
+        let body = node.utf8_text(source).unwrap_or("").to_string();
+        let sig = body.lines().next().unwrap_or("").trim().to_string();
 
-                nodes.push(Node {
-                    id: NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name,
-                        kind: NodeKind::Function,
-                    },
-                    language: "c".to_string(),
-                    line_start: node.start_position().row + 1,
-                    line_end: node.end_position().row + 1,
-                    signature: sig,
-                    body,
-                    metadata: BTreeMap::new(),
-                    source: ExtractionSource::TreeSitter,
-                });
-            }
+        nodes.push(Node {
+            id: NodeId {
+                root: String::new(),
+                file: path.to_path_buf(),
+                name,
+                kind: NodeKind::Function,
+            },
+            language: "c".to_string(),
+            line_start: node.start_position().row + 1,
+            line_end: node.end_position().row + 1,
+            signature: sig,
+            body,
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
+        });
+    }
 
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {

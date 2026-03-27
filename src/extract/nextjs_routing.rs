@@ -59,9 +59,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::graph::{
-    Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
-};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 // ---------------------------------------------------------------------------
 // Public result type and entry point
@@ -216,7 +214,9 @@ fn find_pages_router_suffix(rel: &str) -> Option<&str> {
 /// The caller must have already stripped any monorepo prefix and optional
 /// `src/` via `find_app_router_suffix`.
 fn is_app_router_route_inner(rel: &str) -> bool {
-    let Some(idx) = rel.rfind('/') else { return false; };
+    let Some(idx) = rel.rfind('/') else {
+        return false;
+    };
     let filename = &rel[idx + 1..];
     let dir = &rel[..idx];
 
@@ -247,7 +247,9 @@ fn is_pages_router_route_inner(rel: &str) -> bool {
     if !rel.starts_with("pages/api/") && rel != "pages/api" {
         return false;
     }
-    let Some(idx) = rel.rfind('/') else { return false; };
+    let Some(idx) = rel.rfind('/') else {
+        return false;
+    };
     let filename = &rel[idx + 1..];
 
     let is_api_file = filename.ends_with(".ts")
@@ -317,7 +319,10 @@ fn process_app_router_file(
         let mut metadata = BTreeMap::new();
         metadata.insert("http_method".to_string(), "ANY".to_string());
         metadata.insert("http_path".to_string(), http_path.clone());
-        metadata.insert("source_convention".to_string(), "nextjs_app_router".to_string());
+        metadata.insert(
+            "source_convention".to_string(),
+            "nextjs_app_router".to_string(),
+        );
         result.nodes.push(Node {
             id: NodeId {
                 root: root_slug.to_string(),
@@ -342,7 +347,10 @@ fn process_app_router_file(
         let mut metadata = BTreeMap::new();
         metadata.insert("http_method".to_string(), method.clone());
         metadata.insert("http_path".to_string(), http_path.clone());
-        metadata.insert("source_convention".to_string(), "nextjs_app_router".to_string());
+        metadata.insert(
+            "source_convention".to_string(),
+            "nextjs_app_router".to_string(),
+        );
 
         let endpoint_id = NodeId {
             root: root_slug.to_string(),
@@ -354,7 +362,9 @@ fn process_app_router_file(
         // Emit Implements edge to the handler function.
         // Use `local_name` so that aliased re-exports like `export { handler as GET }`
         // correctly link to the `handler` Function node (not a non-existent `GET` node).
-        if let Some(handler_id) = fn_index.get(&(rel_path.to_path_buf(), binding.local_name.clone())) {
+        if let Some(handler_id) =
+            fn_index.get(&(rel_path.to_path_buf(), binding.local_name.clone()))
+        {
             result.edges.push(Edge {
                 from: endpoint_id.clone(),
                 to: handler_id.clone(),
@@ -417,10 +427,7 @@ fn derive_app_router_path(rel: &str) -> String {
     }
 
     // Convert directory segments: [id] → {id}, [...slug] → {slug}
-    let segments: Vec<String> = dir_part
-        .split('/')
-        .map(convert_nextjs_segment)
-        .collect();
+    let segments: Vec<String> = dir_part.split('/').map(convert_nextjs_segment).collect();
 
     format!("/{}", segments.join("/"))
 }
@@ -465,7 +472,10 @@ fn process_pages_router_file(
     let mut metadata = BTreeMap::new();
     metadata.insert("http_method".to_string(), method.to_string());
     metadata.insert("http_path".to_string(), http_path.clone());
-    metadata.insert("source_convention".to_string(), "nextjs_pages_router".to_string());
+    metadata.insert(
+        "source_convention".to_string(),
+        "nextjs_pages_router".to_string(),
+    );
 
     let endpoint_id = NodeId {
         root: root_slug.to_string(),
@@ -478,8 +488,7 @@ fn process_pages_router_file(
     // Next.js Pages Router default export is named "default" or the handler
     // function. We try common patterns: "default", "handler".
     for handler_name in &["default", "handler"] {
-        if let Some(handler_id) =
-            fn_index.get(&(rel_path.to_path_buf(), handler_name.to_string()))
+        if let Some(handler_id) = fn_index.get(&(rel_path.to_path_buf(), handler_name.to_string()))
         {
             result.edges.push(Edge {
                 from: endpoint_id.clone(),
@@ -526,10 +535,7 @@ fn derive_pages_router_path(rel: &str) -> String {
     let path_part = without_ext.strip_suffix("/index").unwrap_or(without_ext);
 
     // Convert dynamic segments
-    let segments: Vec<String> = path_part
-        .split('/')
-        .map(convert_nextjs_segment)
-        .collect();
+    let segments: Vec<String> = path_part.split('/').map(convert_nextjs_segment).collect();
 
     format!("/{}", segments.join("/"))
 }
@@ -654,31 +660,32 @@ pub fn find_exported_http_methods(content: &str) -> Vec<MethodBinding> {
                 }
                 // Extract the inner content of `{ … }`
                 if let (Some(open), Some(close)) = (block.find('{'), block.rfind('}'))
-                    && open < close {
-                        let inner = &block[open + 1..close];
-                        for item in inner.split(',') {
-                            let item = item.trim().trim_end_matches(',').trim();
-                            if item.is_empty() {
-                                continue;
-                            }
-                            // `handler as METHOD` or just `METHOD`
-                            let (local, exported) = if let Some(pos) = item.find(" as ") {
-                                (item[..pos].trim(), item[pos + 4..].trim())
-                            } else {
-                                (item, item)
-                            };
-                            // Check if exported name is an HTTP method
-                            if HTTP_METHODS.contains(&exported)
-                                && !bindings.iter().any(|b| b.http_method == exported)
-                            {
-                                bindings.push(MethodBinding {
-                                    http_method: exported.to_string(),
-                                    local_name: local.to_string(),
-                                    line: block_start,
-                                });
-                            }
+                    && open < close
+                {
+                    let inner = &block[open + 1..close];
+                    for item in inner.split(',') {
+                        let item = item.trim().trim_end_matches(',').trim();
+                        if item.is_empty() {
+                            continue;
+                        }
+                        // `handler as METHOD` or just `METHOD`
+                        let (local, exported) = if let Some(pos) = item.find(" as ") {
+                            (item[..pos].trim(), item[pos + 4..].trim())
+                        } else {
+                            (item, item)
+                        };
+                        // Check if exported name is an HTTP method
+                        if HTTP_METHODS.contains(&exported)
+                            && !bindings.iter().any(|b| b.http_method == exported)
+                        {
+                            bindings.push(MethodBinding {
+                                http_method: exported.to_string(),
+                                local_name: local.to_string(),
+                                line: block_start,
+                            });
                         }
                     }
+                }
             }
         }
         i += 1;
@@ -738,20 +745,21 @@ fn language_from_path(path: &Path) -> String {
 /// infinite recursion from directory link cycles and to prevent accidentally
 /// walking large external trees linked into the project.
 fn walk_for_nextjs(root: &Path, callback: &mut impl FnMut(&Path)) {
-    let Ok(entries) = std::fs::read_dir(root) else { return; };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
     for entry in entries.flatten() {
         // Use file_type() rather than path.is_dir()/is_file() so that symlinks
         // are not followed — path.is_dir() follows symlinks and can recurse into
         // cycles or large external trees.
-        let Ok(ft) = entry.file_type() else { continue; };
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
         if ft.is_symlink() {
             continue;
         }
         let path = entry.path();
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if ft.is_dir() {
             if should_skip_dir(name) {
                 continue;
@@ -870,10 +878,7 @@ mod tests {
 
     #[test]
     fn test_pages_router_index_file() {
-        assert_eq!(
-            derive_pages_router_path("pages/api/index.ts"),
-            "/api"
-        );
+        assert_eq!(derive_pages_router_path("pages/api/index.ts"), "/api");
     }
 
     // -----------------------------------------------------------------------
@@ -918,7 +923,9 @@ mod tests {
         assert!(is_app_router_route("client/src/app/api/payments/route.ts"));
         assert!(is_app_router_route("client/app/api/payments/route.ts"));
         // Deeper nesting
-        assert!(is_app_router_route("packages/web/src/app/api/users/route.tsx"));
+        assert!(is_app_router_route(
+            "packages/web/src/app/api/users/route.tsx"
+        ));
         assert!(is_app_router_route("apps/frontend/app/api/route.js"));
     }
 
@@ -926,7 +933,9 @@ mod tests {
     fn test_is_pages_router_route_monorepo_prefix() {
         assert!(is_pages_router_route("client/src/pages/api/payments.ts"));
         assert!(is_pages_router_route("client/pages/api/payments.ts"));
-        assert!(is_pages_router_route("packages/web/src/pages/api/users/[id].ts"));
+        assert!(is_pages_router_route(
+            "packages/web/src/pages/api/users/[id].ts"
+        ));
         // Still reject noise
         assert!(!is_pages_router_route("client/pages/api/_app.ts"));
         assert!(!is_pages_router_route("client/pages/api/payments.test.ts"));
@@ -935,22 +944,46 @@ mod tests {
     #[test]
     fn test_find_app_router_suffix() {
         // Direct root
-        assert_eq!(find_app_router_suffix("app/api/payments/route.ts"), Some("app/api/payments/route.ts"));
+        assert_eq!(
+            find_app_router_suffix("app/api/payments/route.ts"),
+            Some("app/api/payments/route.ts")
+        );
         // src/ prefix
-        assert_eq!(find_app_router_suffix("src/app/api/payments/route.ts"), Some("app/api/payments/route.ts"));
+        assert_eq!(
+            find_app_router_suffix("src/app/api/payments/route.ts"),
+            Some("app/api/payments/route.ts")
+        );
         // Monorepo prefix
-        assert_eq!(find_app_router_suffix("client/src/app/api/payments/route.ts"), Some("app/api/payments/route.ts"));
-        assert_eq!(find_app_router_suffix("client/app/api/payments/route.ts"), Some("app/api/payments/route.ts"));
+        assert_eq!(
+            find_app_router_suffix("client/src/app/api/payments/route.ts"),
+            Some("app/api/payments/route.ts")
+        );
+        assert_eq!(
+            find_app_router_suffix("client/app/api/payments/route.ts"),
+            Some("app/api/payments/route.ts")
+        );
         // No match
         assert_eq!(find_app_router_suffix("lib/utils.ts"), None);
     }
 
     #[test]
     fn test_find_pages_router_suffix() {
-        assert_eq!(find_pages_router_suffix("pages/api/payments.ts"), Some("pages/api/payments.ts"));
-        assert_eq!(find_pages_router_suffix("src/pages/api/payments.ts"), Some("pages/api/payments.ts"));
-        assert_eq!(find_pages_router_suffix("client/src/pages/api/payments.ts"), Some("pages/api/payments.ts"));
-        assert_eq!(find_pages_router_suffix("client/pages/api/payments.ts"), Some("pages/api/payments.ts"));
+        assert_eq!(
+            find_pages_router_suffix("pages/api/payments.ts"),
+            Some("pages/api/payments.ts")
+        );
+        assert_eq!(
+            find_pages_router_suffix("src/pages/api/payments.ts"),
+            Some("pages/api/payments.ts")
+        );
+        assert_eq!(
+            find_pages_router_suffix("client/src/pages/api/payments.ts"),
+            Some("pages/api/payments.ts")
+        );
+        assert_eq!(
+            find_pages_router_suffix("client/pages/api/payments.ts"),
+            Some("pages/api/payments.ts")
+        );
         assert_eq!(find_pages_router_suffix("lib/utils.ts"), None);
     }
 
@@ -1005,7 +1038,10 @@ export const DELETE = async (req: Request) => {
 }
 "#;
         let bindings = find_exported_http_methods(content);
-        assert!(methods_in(&bindings).contains(&"DELETE"), "should find DELETE");
+        assert!(
+            methods_in(&bindings).contains(&"DELETE"),
+            "should find DELETE"
+        );
     }
 
     #[test]
@@ -1028,9 +1064,21 @@ export const POSTFIX = "something"
 "#;
         let bindings = find_exported_http_methods(content);
         let methods = methods_in(&bindings);
-        assert!(!methods.contains(&"GET"), "GETTER should not match GET, got: {:?}", methods);
-        assert!(!methods.contains(&"DELETE"), "DELETED should not match DELETE, got: {:?}", methods);
-        assert!(!methods.contains(&"POST"), "POSTFIX should not match POST, got: {:?}", methods);
+        assert!(
+            !methods.contains(&"GET"),
+            "GETTER should not match GET, got: {:?}",
+            methods
+        );
+        assert!(
+            !methods.contains(&"DELETE"),
+            "DELETED should not match DELETE, got: {:?}",
+            methods
+        );
+        assert!(
+            !methods.contains(&"POST"),
+            "POSTFIX should not match POST, got: {:?}",
+            methods
+        );
     }
 
     #[test]
@@ -1038,36 +1086,63 @@ export const POSTFIX = "something"
         // Direct re-export: `export { GET }`
         let content1 = "export { GET }\n";
         let b1 = find_exported_http_methods(content1);
-        assert!(methods_in(&b1).contains(&"GET"), "should detect export {{ GET }}");
+        assert!(
+            methods_in(&b1).contains(&"GET"),
+            "should detect export {{ GET }}"
+        );
         // local_name == http_method for direct re-export
         assert_eq!(b1[0].local_name, "GET");
 
         // Aliased re-export: `export { handler as POST }`
         let content2 = "export { handler as POST }\n";
         let b2 = find_exported_http_methods(content2);
-        assert!(methods_in(&b2).contains(&"POST"), "should detect export {{ handler as POST }}");
+        assert!(
+            methods_in(&b2).contains(&"POST"),
+            "should detect export {{ handler as POST }}"
+        );
         // local_name should be "handler"
-        assert_eq!(b2[0].local_name, "handler", "local_name should be the original function name");
+        assert_eq!(
+            b2[0].local_name, "handler",
+            "local_name should be the original function name"
+        );
 
         // Multiple re-exports: `export { GET, POST }`
         let content3 = "export { GET, POST }\n";
         let b3 = find_exported_http_methods(content3);
-        assert!(methods_in(&b3).contains(&"GET"), "should detect GET in multi-export");
-        assert!(methods_in(&b3).contains(&"POST"), "should detect POST in multi-export");
+        assert!(
+            methods_in(&b3).contains(&"GET"),
+            "should detect GET in multi-export"
+        );
+        assert!(
+            methods_in(&b3).contains(&"POST"),
+            "should detect POST in multi-export"
+        );
 
         // Re-export with FROM: `export { GET } from './handler'`
         let content4 = "export { GET } from './handler'\n";
         let b4 = find_exported_http_methods(content4);
-        assert!(methods_in(&b4).contains(&"GET"), "should detect export {{ GET }} from ...");
+        assert!(
+            methods_in(&b4).contains(&"GET"),
+            "should detect export {{ GET }} from ..."
+        );
 
         // Multiline export block
         let content5 = "export {\n  handler as GET,\n  handler as POST\n}\n";
         let b5 = find_exported_http_methods(content5);
-        assert!(methods_in(&b5).contains(&"GET"), "should detect GET from multiline block");
-        assert!(methods_in(&b5).contains(&"POST"), "should detect POST from multiline block");
+        assert!(
+            methods_in(&b5).contains(&"GET"),
+            "should detect GET from multiline block"
+        );
+        assert!(
+            methods_in(&b5).contains(&"POST"),
+            "should detect POST from multiline block"
+        );
         // local_name should be "handler" for aliased exports
         for b in &b5 {
-            assert_eq!(b.local_name, "handler", "local_name for aliased multiline should be 'handler'");
+            assert_eq!(
+                b.local_name, "handler",
+                "local_name for aliased multiline should be 'handler'"
+            );
         }
     }
 
@@ -1123,13 +1198,21 @@ export const POSTFIX = "something"
             .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
             .collect();
 
-        assert_eq!(endpoints.len(), 2, "expected 2 ApiEndpoint nodes, got: {:?}", endpoints);
+        assert_eq!(
+            endpoints.len(),
+            2,
+            "expected 2 ApiEndpoint nodes, got: {:?}",
+            endpoints
+        );
 
         let paths: Vec<_> = endpoints
             .iter()
             .map(|n| n.metadata.get("http_path").cloned().unwrap_or_default())
             .collect();
-        assert!(paths.iter().all(|p| p == "/api/payments"), "all should have path /api/payments");
+        assert!(
+            paths.iter().all(|p| p == "/api/payments"),
+            "all should have path /api/payments"
+        );
 
         let methods: std::collections::HashSet<_> = endpoints
             .iter()
@@ -1152,7 +1235,8 @@ export const POSTFIX = "something"
         fs::write(
             api_dir.join("users.ts"),
             "export default function handler(req, res) { res.json([]) }\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let roots = vec![("test".to_string(), root)];
         let result = nextjs_routing_pass(&roots, &[]);
@@ -1187,7 +1271,8 @@ export const POSTFIX = "something"
         std::fs::write(
             route_dir.join("route.ts"),
             "export async function GET() {}\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         // Create a matching Function node
         let handler_node = Node {
@@ -1233,7 +1318,8 @@ export const POSTFIX = "something"
         std::fs::write(
             route_dir.join("route.ts"),
             "async function handler() {}\nexport { handler as GET }\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         // Tree-sitter would produce a Function node named "handler"
         let handler_node = Node {
@@ -1255,16 +1341,24 @@ export const POSTFIX = "something"
         let roots = vec![("test".to_string(), root)];
         let result = nextjs_routing_pass(&roots, &[handler_node]);
 
-        let endpoints: Vec<_> = result.nodes.iter()
-            .filter(|n| n.id.kind == NodeKind::ApiEndpoint).collect();
+        let endpoints: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
         assert_eq!(endpoints.len(), 1, "should emit 1 ApiEndpoint node");
         assert_eq!(endpoints[0].id.name, "GET /api/orders");
 
-        let implements_edges: Vec<_> = result.edges.iter()
-            .filter(|e| e.kind == EdgeKind::Implements).collect();
+        let implements_edges: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Implements)
+            .collect();
         assert_eq!(implements_edges.len(), 1, "should emit 1 Implements edge");
-        assert_eq!(implements_edges[0].to.name, "handler",
-            "Implements edge should link to 'handler' (local_name), not 'GET'");
+        assert_eq!(
+            implements_edges[0].to.name, "handler",
+            "Implements edge should link to 'handler' (local_name), not 'GET'"
+        );
     }
 
     #[test]
@@ -1313,7 +1407,11 @@ export const POSTFIX = "something"
         // Create a real route file
         let route_dir = root.join("app").join("api").join("real");
         fs::create_dir_all(&route_dir).unwrap();
-        fs::write(route_dir.join("route.ts"), "export async function GET() {}\n").unwrap();
+        fs::write(
+            route_dir.join("route.ts"),
+            "export async function GET() {}\n",
+        )
+        .unwrap();
 
         // Create a symlink loop: root/loop_link → root (infinite recursion if followed)
         let loop_link = root.join("loop_link");
@@ -1348,9 +1446,17 @@ export const POSTFIX = "something"
         // Next.js parallel route: app/@dashboard/api/payments/route.ts
         // This is NOT an API route file in the conventional sense — the `@dashboard`
         // slot means it renders into a layout slot, not a standalone HTTP handler.
-        let route_dir = root.join("app").join("@dashboard").join("api").join("payments");
+        let route_dir = root
+            .join("app")
+            .join("@dashboard")
+            .join("api")
+            .join("payments");
         fs::create_dir_all(&route_dir).unwrap();
-        fs::write(route_dir.join("route.ts"), "export async function GET() {}\n").unwrap();
+        fs::write(
+            route_dir.join("route.ts"),
+            "export async function GET() {}\n",
+        )
+        .unwrap();
 
         let roots = vec![("test".to_string(), root)];
         let result = nextjs_routing_pass(&roots, &[]);
@@ -1434,7 +1540,11 @@ export async function DELETE() {}
             .iter()
             .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
             .collect();
-        assert_eq!(endpoints.len(), 1, "empty file should emit ANY catch-all endpoint");
+        assert_eq!(
+            endpoints.len(),
+            1,
+            "empty file should emit ANY catch-all endpoint"
+        );
         assert_eq!(
             endpoints[0].metadata.get("http_method").map(|s| s.as_str()),
             Some("ANY")

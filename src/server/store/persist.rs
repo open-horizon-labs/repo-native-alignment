@@ -7,15 +7,15 @@ use std::time::Duration;
 use anyhow::Context;
 use arrow_array::RecordBatchIterator;
 
-use crate::graph::{Node, Edge};
-use crate::graph::store::{symbols_schema, edges_schema, SCHEMA_VERSION};
+use crate::graph::store::{SCHEMA_VERSION, edges_schema, symbols_schema};
+use crate::graph::{Edge, Node};
 
-use super::batch::{build_symbols_batch, build_edges_batch};
+use super::batch::{build_edges_batch, build_symbols_batch};
+use super::graph_lance_path;
 use super::migrate::{
     check_and_migrate_schema, drop_all_lance_tables, is_conflict_error, is_schema_mismatch_error,
     read_committed_scan_version, write_committed_scan_version,
 };
-use super::graph_lance_path;
 
 /// Persist graph nodes and edges to LanceDB using append-only versioned writes.
 ///
@@ -56,7 +56,8 @@ pub(crate) async fn persist_graph_to_lance(
 
     tracing::debug!(
         "persist_graph_to_lance: committed_version={} -> writing new_version={}",
-        committed_version, new_version
+        committed_version,
+        new_version
     );
 
     // -- Append symbols (nodes) with new_version --
@@ -78,7 +79,8 @@ pub(crate) async fn persist_graph_to_lance(
                                 attempts += 1;
                                 tracing::warn!(
                                     "LanceDB conflict on symbols append (attempt {}), retrying in {}ms",
-                                    attempts, 100 * attempts
+                                    attempts,
+                                    100 * attempts
                                 );
                                 tokio::time::sleep(Duration::from_millis(100 * attempts)).await;
                             } else if is_schema_mismatch_error(&err) {
@@ -139,7 +141,8 @@ pub(crate) async fn persist_graph_to_lance(
                                 attempts += 1;
                                 tracing::warn!(
                                     "LanceDB conflict on edges append (attempt {}), retrying in {}ms",
-                                    attempts, 100 * attempts
+                                    attempts,
+                                    100 * attempts
                                 );
                                 tokio::time::sleep(Duration::from_millis(100 * attempts)).await;
                             } else if is_schema_mismatch_error(&err) {
@@ -175,7 +178,9 @@ pub(crate) async fn persist_graph_to_lance(
 
     tracing::info!(
         "Persisted graph to LanceDB: {} nodes, {} edges (scan_version={})",
-        nodes.len(), edges.len(), new_version
+        nodes.len(),
+        edges.len(),
+        new_version
     );
 
     // -- Background compaction: remove stale version rows --
@@ -194,7 +199,10 @@ pub(crate) async fn persist_graph_to_lance(
 ///
 /// This is called automatically after each successful `persist_graph_to_lance`.
 /// Non-fatal: a failure here leaves stale rows that will be cleaned up next scan.
-pub(crate) async fn compact_stale_versions(db_path: &Path, committed_version: u64) -> anyhow::Result<()> {
+pub(crate) async fn compact_stale_versions(
+    db_path: &Path,
+    committed_version: u64,
+) -> anyhow::Result<()> {
     // Keep committed_version and committed_version - 1 (one buffer).
     // Delete everything older.
     if committed_version < 2 {
@@ -212,16 +220,27 @@ pub(crate) async fn compact_stale_versions(db_path: &Path, committed_version: u6
     let mut deleted_symbols = 0u64;
     let mut deleted_edges = 0u64;
 
-    for (table_name, deleted_count) in [("symbols", &mut deleted_symbols), ("edges", &mut deleted_edges)] {
+    for (table_name, deleted_count) in [
+        ("symbols", &mut deleted_symbols),
+        ("edges", &mut deleted_edges),
+    ] {
         if let Ok(tbl) = db.open_table(table_name).execute().await {
             // Count rows before deletion for logging.
             match tbl.delete(&predicate).await {
                 Ok(_) => {
                     *deleted_count = 1; // deletion succeeded (LanceDB doesn't return count)
-                    tracing::debug!("compact_stale_versions: deleted stale rows from {} (scan_version < {})", table_name, cutoff);
+                    tracing::debug!(
+                        "compact_stale_versions: deleted stale rows from {} (scan_version < {})",
+                        table_name,
+                        cutoff
+                    );
                 }
                 Err(e) => {
-                    tracing::warn!("compact_stale_versions: delete from {} failed: {}", table_name, e);
+                    tracing::warn!(
+                        "compact_stale_versions: delete from {} failed: {}",
+                        table_name,
+                        e
+                    );
                 }
             }
         }
@@ -260,7 +279,10 @@ pub(crate) async fn persist_graph_incremental(
 
     // Pre-flight: ensure schema version matches before any LanceDB writes.
     if check_and_migrate_schema(&db_path).await? {
-        tracing::info!("Schema migrated to v{} during incremental update -- cache rebuilt; caller should do a full persist", SCHEMA_VERSION);
+        tracing::info!(
+            "Schema migrated to v{} during incremental update -- cache rebuilt; caller should do a full persist",
+            SCHEMA_VERSION
+        );
         // Migration dropped stale tables -- incremental upsert against empty
         // tables is incorrect. Return true so the caller does a full persist.
         return Ok(true);
@@ -284,16 +306,17 @@ pub(crate) async fn persist_graph_incremental(
     {
         // 1. Delete symbols for removed/changed files first so upsert is clean.
         if !deleted_files.is_empty()
-            && let Ok(tbl) = db.open_table("symbols").execute().await {
-                let quoted: Vec<String> = deleted_files
-                    .iter()
-                    .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
-                    .collect();
-                let predicate = format!("file_path IN ({})", quoted.join(", "));
-                if let Err(e) = tbl.delete(&predicate).await {
-                    tracing::warn!("Failed to delete symbols for removed files: {}", e);
-                }
+            && let Ok(tbl) = db.open_table("symbols").execute().await
+        {
+            let quoted: Vec<String> = deleted_files
+                .iter()
+                .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
+                .collect();
+            let predicate = format!("file_path IN ({})", quoted.join(", "));
+            if let Err(e) = tbl.delete(&predicate).await {
+                tracing::warn!("Failed to delete symbols for removed files: {}", e);
             }
+        }
 
         // 2. Upsert changed/added nodes (insert new, update existing by stable id).
         if !upsert_nodes.is_empty() {
@@ -305,7 +328,8 @@ pub(crate) async fn persist_graph_incremental(
                     // Retry on conflict: another process may be writing simultaneously.
                     let mut attempts: u64 = 0;
                     loop {
-                        let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+                        let batches =
+                            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
                         let mut merge = tbl.merge_insert(&["id"]);
                         merge
                             .when_matched_update_all(None)
@@ -332,7 +356,9 @@ pub(crate) async fn persist_graph_incremental(
                                     );
                                     tokio::time::sleep(Duration::from_millis(100 * attempts)).await;
                                 } else {
-                                    return Err(err).context("Failed to merge_insert symbols table after retries");
+                                    return Err(err).context(
+                                        "Failed to merge_insert symbols table after retries",
+                                    );
                                 }
                             }
                         }
@@ -354,16 +380,17 @@ pub(crate) async fn persist_graph_incremental(
     {
         // 1. Delete edges that referenced removed/changed files (by stable edge ID).
         if !deleted_edge_ids.is_empty()
-            && let Ok(tbl) = db.open_table("edges").execute().await {
-                let quoted: Vec<String> = deleted_edge_ids
-                    .iter()
-                    .map(|id| format!("'{}'", id.replace('\'', "''")))
-                    .collect();
-                let predicate = format!("id IN ({})", quoted.join(", "));
-                if let Err(e) = tbl.delete(&predicate).await {
-                    tracing::warn!("Failed to delete edges for removed files: {}", e);
-                }
+            && let Ok(tbl) = db.open_table("edges").execute().await
+        {
+            let quoted: Vec<String> = deleted_edge_ids
+                .iter()
+                .map(|id| format!("'{}'", id.replace('\'', "''")))
+                .collect();
+            let predicate = format!("id IN ({})", quoted.join(", "));
+            if let Err(e) = tbl.delete(&predicate).await {
+                tracing::warn!("Failed to delete edges for removed files: {}", e);
             }
+        }
 
         // 2. Upsert changed/added edges.
         if !upsert_edges.is_empty() {
@@ -375,7 +402,8 @@ pub(crate) async fn persist_graph_incremental(
                     // Retry on conflict: another process may be writing simultaneously.
                     let mut attempts: u64 = 0;
                     loop {
-                        let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+                        let batches =
+                            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
                         let mut merge = tbl.merge_insert(&["id"]);
                         merge
                             .when_matched_update_all(None)
@@ -401,7 +429,9 @@ pub(crate) async fn persist_graph_incremental(
                                     );
                                     tokio::time::sleep(Duration::from_millis(100 * attempts)).await;
                                 } else {
-                                    return Err(err).context("Failed to merge_insert edges table after retries");
+                                    return Err(err).context(
+                                        "Failed to merge_insert edges table after retries",
+                                    );
                                 }
                             }
                         }
@@ -434,8 +464,8 @@ pub(crate) async fn persist_graph_incremental(
 /// Scans the same set of tables that `delete_nodes_for_roots` prunes so that
 /// stale roots present in any table are discovered (not just symbols).
 pub(crate) async fn get_stored_root_ids(repo_root: &Path) -> anyhow::Result<Vec<String>> {
-    use arrow_array::StringArray;
     use arrow_array::Array;
+    use arrow_array::StringArray;
     use futures::TryStreamExt;
     use lancedb::query::{ExecutableQuery, QueryBase};
 
@@ -473,13 +503,14 @@ pub(crate) async fn get_stored_root_ids(repo_root: &Path) -> anyhow::Result<Vec<
 
         for batch in &batches {
             if let Some(col) = batch.column_by_name("root_id")
-                && let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                    for i in 0..arr.len() {
-                        if !arr.is_null(i) {
-                            root_ids.insert(arr.value(i).to_string());
-                        }
+                && let Some(arr) = col.as_any().downcast_ref::<StringArray>()
+            {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        root_ids.insert(arr.value(i).to_string());
                     }
                 }
+            }
         }
     }
 
@@ -490,7 +521,10 @@ pub(crate) async fn get_stored_root_ids(repo_root: &Path) -> anyhow::Result<Vec<
 ///
 /// Called when a worktree is detected as removed (during background scan or
 /// at startup when stale roots are found in LanceDB).
-pub(crate) async fn delete_nodes_for_roots(repo_root: &Path, slugs: &[String]) -> anyhow::Result<()> {
+pub(crate) async fn delete_nodes_for_roots(
+    repo_root: &Path,
+    slugs: &[String],
+) -> anyhow::Result<()> {
     if slugs.is_empty() {
         return Ok(());
     }
@@ -515,19 +549,17 @@ pub(crate) async fn delete_nodes_for_roots(repo_root: &Path, slugs: &[String]) -
     // Delete from all tables that carry a root_id column.
     for table_name in ["symbols", "edges", "file_index", "pr_merges"] {
         if let Ok(tbl) = db.open_table(table_name).execute().await
-            && let Err(e) = tbl.delete(&predicate).await {
-                tracing::warn!(
-                    "Failed to delete {} for removed worktrees: {}",
-                    table_name,
-                    e
-                );
-            }
+            && let Err(e) = tbl.delete(&predicate).await
+        {
+            tracing::warn!(
+                "Failed to delete {} for removed worktrees: {}",
+                table_name,
+                e
+            );
+        }
     }
 
-    tracing::info!(
-        "Pruned LanceDB rows for stale roots: {}",
-        slugs.join(", ")
-    );
+    tracing::info!("Pruned LanceDB rows for stale roots: {}", slugs.join(", "));
     Ok(())
 }
 
@@ -536,10 +568,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use super::*;
     use super::super::graph_lance_path;
-    use super::super::migrate::{read_committed_scan_version, scan_version_path, drop_all_lance_tables};
     use super::super::load::load_graph_from_lance;
+    use super::super::migrate::{
+        drop_all_lance_tables, read_committed_scan_version, scan_version_path,
+    };
+    use super::*;
     use crate::graph::{ExtractionSource, NodeId, NodeKind};
 
     fn make_test_node(name: &str) -> Node {
@@ -608,7 +642,11 @@ mod tests {
 
         let node2 = make_test_node("after_recovery");
         let result = persist_graph_incremental(repo_root, &[node2], &[], &[], &[]).await;
-        assert!(result.is_ok(), "persist after drop should succeed, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "persist after drop should succeed, got: {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -621,13 +659,21 @@ mod tests {
         persist_graph_to_lance(repo_root, &[node_a], &[])
             .await
             .expect("first persist failed");
-        assert_eq!(read_committed_scan_version(&db_path), 1, "first persist should write version 1");
+        assert_eq!(
+            read_committed_scan_version(&db_path),
+            1,
+            "first persist should write version 1"
+        );
 
         let node_b = make_test_node("fn_b");
         persist_graph_to_lance(repo_root, &[node_b], &[])
             .await
             .expect("second persist failed");
-        assert_eq!(read_committed_scan_version(&db_path), 2, "second persist should write version 2");
+        assert_eq!(
+            read_committed_scan_version(&db_path),
+            2,
+            "second persist should write version 2"
+        );
     }
 
     #[tokio::test]
@@ -645,12 +691,13 @@ mod tests {
             .await
             .expect("second persist");
 
-        let state = load_graph_from_lance(repo_root)
-            .await
-            .expect("load failed");
+        let state = load_graph_from_lance(repo_root).await.expect("load failed");
         let names: Vec<&str> = state.nodes.iter().map(|n| n.id.name.as_str()).collect();
         assert!(names.contains(&"fn_v2"), "fn_v2 should be present");
-        assert!(!names.contains(&"fn_v1"), "fn_v1 (old version) should not be present");
+        assert!(
+            !names.contains(&"fn_v1"),
+            "fn_v1 (old version) should not be present"
+        );
     }
 
     #[tokio::test]
@@ -668,8 +715,14 @@ mod tests {
 
         let state = load_graph_from_lance(repo_root).await.expect("load failed");
         let names: Vec<&str> = state.nodes.iter().map(|n| n.id.name.as_str()).collect();
-        assert!(names.contains(&"fn_v3"), "fn_v3 should be present (current version)");
-        assert!(!names.contains(&"fn_v1"), "fn_v1 should have been compacted");
+        assert!(
+            names.contains(&"fn_v3"),
+            "fn_v3 should be present (current version)"
+        );
+        assert!(
+            !names.contains(&"fn_v1"),
+            "fn_v1 should have been compacted"
+        );
     }
 
     #[tokio::test]
@@ -683,25 +736,45 @@ mod tests {
             .expect("full rebuild");
         assert_eq!(read_committed_scan_version(&db_path), 1);
 
-        persist_graph_incremental(repo_root, &[make_test_node("fn_incremental")], &[], &[], &[])
-            .await
-            .expect("incremental write");
-        assert_eq!(read_committed_scan_version(&db_path), 1, "incremental must not change version pointer");
+        persist_graph_incremental(
+            repo_root,
+            &[make_test_node("fn_incremental")],
+            &[],
+            &[],
+            &[],
+        )
+        .await
+        .expect("incremental write");
+        assert_eq!(
+            read_committed_scan_version(&db_path),
+            1,
+            "incremental must not change version pointer"
+        );
 
-        let state = load_graph_from_lance(repo_root).await.expect("load after incremental");
+        let state = load_graph_from_lance(repo_root)
+            .await
+            .expect("load after incremental");
         let names: Vec<&str> = state.nodes.iter().map(|n| n.id.name.as_str()).collect();
         assert!(names.contains(&"fn_base"), "fn_base should be present");
-        assert!(names.contains(&"fn_incremental"), "fn_incremental should be present");
+        assert!(
+            names.contains(&"fn_incremental"),
+            "fn_incremental should be present"
+        );
 
         persist_graph_to_lance(repo_root, &[make_test_node("fn_v2")], &[])
             .await
             .expect("second full rebuild");
         assert_eq!(read_committed_scan_version(&db_path), 2);
 
-        let state2 = load_graph_from_lance(repo_root).await.expect("load after second rebuild");
+        let state2 = load_graph_from_lance(repo_root)
+            .await
+            .expect("load after second rebuild");
         let names2: Vec<&str> = state2.nodes.iter().map(|n| n.id.name.as_str()).collect();
         assert!(names2.contains(&"fn_v2"), "fn_v2 should be present");
-        assert!(!names2.contains(&"fn_incremental"), "fn_incremental (version 1) should not appear after version 2 rebuild");
+        assert!(
+            !names2.contains(&"fn_incremental"),
+            "fn_incremental (version 1) should not appear after version 2 rebuild"
+        );
     }
 
     #[tokio::test]
@@ -715,10 +788,19 @@ mod tests {
             .expect("full rebuild");
 
         let _ = std::fs::remove_file(scan_version_path(&db_path));
-        assert_eq!(read_committed_scan_version(&db_path), 0, "missing file should read as 0");
+        assert_eq!(
+            read_committed_scan_version(&db_path),
+            0,
+            "missing file should read as 0"
+        );
 
-        let state = load_graph_from_lance(repo_root).await.expect("load without version file");
+        let state = load_graph_from_lance(repo_root)
+            .await
+            .expect("load without version file");
         let names: Vec<&str> = state.nodes.iter().map(|n| n.id.name.as_str()).collect();
-        assert!(names.contains(&"fn_any"), "fn_any should be visible with no version filter");
+        assert!(
+            names.contains(&"fn_any"),
+            "fn_any should be visible with no version filter"
+        );
     }
 }

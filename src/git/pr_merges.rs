@@ -22,10 +22,7 @@ use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, N
 /// Symbol-level `Modified` edges are created separately via
 /// `link_pr_to_symbols`, since symbol nodes may not exist yet at
 /// extraction time.
-pub fn extract_pr_merges(
-    repo_root: &Path,
-    limit: Option<usize>,
-) -> Result<(Vec<Node>, Vec<Edge>)> {
+pub fn extract_pr_merges(repo_root: &Path, limit: Option<usize>) -> Result<(Vec<Node>, Vec<Edge>)> {
     let repo = Repository::open(repo_root).context("Failed to open git repository")?;
     let mut revwalk = repo.revwalk().context("Failed to create revwalk")?;
     revwalk
@@ -42,9 +39,7 @@ pub fn extract_pr_merges(
             break;
         }
         let oid = oid_result.context("Failed to get commit oid from revwalk")?;
-        let commit = repo
-            .find_commit(oid)
-            .context("Failed to find commit")?;
+        let commit = repo.find_commit(oid).context("Failed to find commit")?;
 
         // Only merge commits (2+ parents)
         if commit.parent_count() < 2 {
@@ -220,9 +215,10 @@ pub fn extract_branch_name(message: &str) -> Option<String> {
 
     // "Merge pull request #N from user/branch"
     if first_line.starts_with("Merge pull request")
-        && let Some(from_idx) = first_line.find(" from ") {
-            return Some(first_line[from_idx + 6..].trim().to_string());
-        }
+        && let Some(from_idx) = first_line.find(" from ")
+    {
+        return Some(first_line[from_idx + 6..].trim().to_string());
+    }
 
     // "Merge branch 'feature-x'" or "Merge branch 'feature-x' into main"
     if let Some(rest) = first_line.strip_prefix("Merge branch '") {
@@ -329,14 +325,15 @@ fn collect_pr_commit_outcome_tags(repo: &Repository, merge_commit: &git2::Commit
 
     for oid_result in revwalk {
         if let Ok(oid) = oid_result
-            && let Ok(commit) = repo.find_commit(oid) {
-                let message = commit.message().unwrap_or("");
-                for tag in extract_outcome_tags(message) {
-                    if !tags.contains(&tag) {
-                        tags.push(tag);
-                    }
+            && let Ok(commit) = repo.find_commit(oid)
+        {
+            let message = commit.message().unwrap_or("");
+            for tag in extract_outcome_tags(message) {
+                if !tags.contains(&tag) {
+                    tags.push(tag);
                 }
             }
+        }
     }
 
     tags
@@ -392,8 +389,7 @@ mod tests {
 
     #[test]
     fn test_extract_outcome_tags_deduplicated() {
-        let tags =
-            extract_outcome_tags("[outcome:foo] and again [outcome:foo]");
+        let tags = extract_outcome_tags("[outcome:foo] and again [outcome:foo]");
         assert_eq!(tags, vec!["foo"]);
     }
 
@@ -575,9 +571,7 @@ mod tests {
             .expect("Failed to peel to commit");
 
         // Build merge tree (use the branch tree since it has the new file)
-        let merge_tree = repo
-            .find_tree(tree_oid)
-            .expect("Failed to find merge tree");
+        let merge_tree = repo.find_tree(tree_oid).expect("Failed to find merge tree");
 
         let merge_msg = format!("Merge branch '{}'", branch_name);
         let merge_oid = repo
@@ -622,7 +616,10 @@ mod tests {
 
         // Should have a Serves edge to agent-alignment outcome
         // (from the branch commit's [outcome:agent-alignment] tag)
-        let serves_edges: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Serves).collect();
+        let serves_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Serves)
+            .collect();
         assert_eq!(serves_edges.len(), 1);
         assert_eq!(serves_edges[0].to.name, "agent-alignment");
     }

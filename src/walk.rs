@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use anyhow::Result;
+use std::path::{Path, PathBuf};
 
 /// Walk the repo directory tree, respecting .gitignore rules.
 /// Returns files matching the given extension filter.
@@ -75,18 +75,16 @@ fn walk_dir_git2(
         if path.is_dir() {
             // Skip subdirectories that are independently-indexed git worktrees.
             if is_worktree_with_own_cache(&path) {
-                tracing::info!(
-                    "skipping worktree {}: has own RNA cache",
-                    path.display()
-                );
+                tracing::info!("skipping worktree {}: has own RNA cache", path.display());
                 continue;
             }
             walk_dir_git2(repo, &path, repo_root, extensions, files)?;
         } else if path.is_file()
             && let Some(ext) = path.extension().and_then(|e| e.to_str())
-                && extensions.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
-                    files.push(path);
-                }
+            && extensions.iter().any(|e| e.eq_ignore_ascii_case(ext))
+        {
+            files.push(path);
+        }
     }
     Ok(())
 }
@@ -112,23 +110,27 @@ fn walk_dir_basic(dir: &Path, extensions: &[&str], files: &mut Vec<PathBuf>) -> 
             continue;
         }
         if path.is_dir() {
-            if name_str == ".git" || name_str == "target" || name_str == "node_modules" || name_str == "vendor" || name_str == ".build" || name_str == "dist" {
+            if name_str == ".git"
+                || name_str == "target"
+                || name_str == "node_modules"
+                || name_str == "vendor"
+                || name_str == ".build"
+                || name_str == "dist"
+            {
                 continue;
             }
             // Skip subdirectories that are independently-indexed git worktrees.
             if is_worktree_with_own_cache(&path) {
-                tracing::info!(
-                    "skipping worktree {}: has own RNA cache",
-                    path.display()
-                );
+                tracing::info!("skipping worktree {}: has own RNA cache", path.display());
                 continue;
             }
             walk_dir_basic(&path, extensions, files)?;
         } else if path.is_file()
             && let Some(ext) = path.extension().and_then(|e| e.to_str())
-                && extensions.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
-                    files.push(path);
-                }
+            && extensions.iter().any(|e| e.eq_ignore_ascii_case(ext))
+        {
+            files.push(path);
+        }
     }
     Ok(())
 }

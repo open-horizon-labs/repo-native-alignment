@@ -11,12 +11,13 @@ pub(crate) const SUBSYSTEM_KEY: &str = "subsystem";
 
 use crate::embed::EmbeddingIndex;
 use crate::extract::ExtractorRegistry;
-use crate::graph::{Edge, Node, NodeKind};
 use crate::graph::index::GraphIndex;
 use crate::graph::store::SCHEMA_VERSION;
+use crate::graph::{Edge, Node, NodeKind};
 use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
 use crate::scanner::{ScanResult, Scanner};
 
+use super::RnaHandler;
 use super::helpers;
 use super::state::GraphState;
 use super::store::{
@@ -24,7 +25,6 @@ use super::store::{
     get_stored_root_ids, graph_lance_path, load_graph_from_lance, persist_graph_incremental,
     persist_graph_to_lance,
 };
-use super::RnaHandler;
 
 impl RnaHandler {
     /// Maximum time to wait for pre-warm to finish before falling back to
@@ -72,13 +72,13 @@ impl RnaHandler {
             let _build_guard = self.graph_build_lock.lock().await;
             // Re-check after acquiring lock — another call may have already updated.
             let current2 = self.graph.load_full();
-            if let Some(ref gs2) = *current2 {
-                if !Arc::ptr_eq(gs, gs2) {
-                    // Graph was updated while we waited for the lock.
-                    scanner.commit_state()?;
-                    *self.last_scan.lock().unwrap() = std::time::Instant::now();
-                    return Ok(Arc::clone(gs2));
-                }
+            if let Some(ref gs2) = *current2
+                && !Arc::ptr_eq(gs, gs2)
+            {
+                // Graph was updated while we waited for the lock.
+                scanner.commit_state()?;
+                *self.last_scan.lock().unwrap() = std::time::Instant::now();
+                return Ok(Arc::clone(gs2));
             }
 
             // Fast path: tree-sitter extraction only (no LSP, no passes, no persist).
@@ -93,17 +93,23 @@ impl RnaHandler {
                 .chain(scan.changed_files.iter())
                 .cloned()
                 .collect();
-            fast_state.nodes.retain(|n| !files_to_remove.contains(&n.id.file));
+            fast_state
+                .nodes
+                .retain(|n| !files_to_remove.contains(&n.id.file));
             fast_state.edges.retain(|e| {
-                !files_to_remove.iter().any(|f| e.from.file == *f || e.to.file == *f)
+                !files_to_remove
+                    .iter()
+                    .any(|f| e.from.file == *f || e.to.file == *f)
             });
 
             // Extract new + changed files via tree-sitter
-            let (mut extraction, _enc_stats) = registry.extract_scan_result_with_stats(&self.repo_root, &scan);
+            let (mut extraction, _enc_stats) =
+                registry.extract_scan_result_with_stats(&self.repo_root, &scan);
             for node in &mut extraction.nodes {
                 node.id.root = primary_slug.clone();
             }
-            let file_index: std::collections::HashSet<String> = fast_state.nodes
+            let file_index: std::collections::HashSet<String> = fast_state
+                .nodes
                 .iter()
                 .chain(extraction.nodes.iter())
                 .map(|n| n.id.file.to_string_lossy().to_string())
@@ -120,7 +126,9 @@ impl RnaHandler {
             fast_state.index = crate::graph::index::GraphIndex::new();
             fast_state.index.rebuild_from_edges(&fast_state.edges);
             for node in &fast_state.nodes {
-                fast_state.index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+                fast_state
+                    .index
+                    .ensure_node(&node.stable_id(), &node.id.kind.to_string());
             }
 
             // Atomic swap: tool calls see tree-sitter results immediately
@@ -150,7 +158,9 @@ impl RnaHandler {
                 tokio::spawn(async move {
                     tracing::info!(
                         "Spawned background incremental pipeline: {} changed, {} new, {} deleted",
-                        scan.changed_files.len(), scan.new_files.len(), scan.deleted_files.len()
+                        scan.changed_files.len(),
+                        scan.new_files.len(),
+                        scan.deleted_files.len()
                     );
                     // Serialize with other graph builds to prevent concurrent pipeline runs.
                     let _build_guard = graph_build_lock.lock().await;
@@ -158,15 +168,17 @@ impl RnaHandler {
                     // may have already processed these changes. Check by comparing with the
                     // fast_arc we stored — if they differ, someone else updated.
                     let current_snap = handler_graph.load_full();
-                    if let Some(ref current_gs) = *current_snap {
-                        if !Arc::ptr_eq(current_gs, &fast_arc_for_check) {
-                            // Another update happened; skip this pipeline run.
-                            tracing::info!("Background incremental pipeline: graph already updated, skipping");
-                            if let Err(e) = scanner.commit_state() {
-                                tracing::error!("Failed to commit scanner state: {}", e);
-                            }
-                            return;
+                    if let Some(ref current_gs) = *current_snap
+                        && !Arc::ptr_eq(current_gs, &fast_arc_for_check)
+                    {
+                        // Another update happened; skip this pipeline run.
+                        tracing::info!(
+                            "Background incremental pipeline: graph already updated, skipping"
+                        );
+                        if let Err(e) = scanner.commit_state() {
+                            tracing::error!("Failed to commit scanner state: {}", e);
                         }
+                        return;
                     }
 
                     // Run the full pipeline on the base state (which has LSP edges, etc.)
@@ -180,26 +192,37 @@ impl RnaHandler {
                         .chain(scan.changed_files.iter())
                         .cloned()
                         .collect();
-                    let deleted_edge_ids: Vec<String> = full_state.edges
+                    let deleted_edge_ids: Vec<String> = full_state
+                        .edges
                         .iter()
-                        .filter(|e| files_to_remove.iter().any(|f| e.from.file == *f || e.to.file == *f))
+                        .filter(|e| {
+                            files_to_remove
+                                .iter()
+                                .any(|f| e.from.file == *f || e.to.file == *f)
+                        })
                         .map(|e| e.stable_id())
                         .collect();
-                    full_state.nodes.retain(|n| !files_to_remove.contains(&n.id.file));
+                    full_state
+                        .nodes
+                        .retain(|n| !files_to_remove.contains(&n.id.file));
                     full_state.edges.retain(|e| {
-                        !files_to_remove.iter().any(|f| e.from.file == *f || e.to.file == *f)
+                        !files_to_remove
+                            .iter()
+                            .any(|f| e.from.file == *f || e.to.file == *f)
                     });
 
                     // Extract new + changed files
                     let registry = ExtractorRegistry::with_builtins();
-                    let (mut extraction, enc_stats) = registry.extract_scan_result_with_stats(&repo_root, &scan);
+                    let (mut extraction, enc_stats) =
+                        registry.extract_scan_result_with_stats(&repo_root, &scan);
                     if let Ok(mut stats) = scan_stats.write() {
                         stats.merge_encoding_stats(&primary_slug, &enc_stats);
                     }
                     for node in &mut extraction.nodes {
                         node.id.root = primary_slug.clone();
                     }
-                    let file_index: std::collections::HashSet<String> = full_state.nodes
+                    let file_index: std::collections::HashSet<String> = full_state
+                        .nodes
                         .iter()
                         .chain(extraction.nodes.iter())
                         .map(|n| n.id.file.to_string_lossy().to_string())
@@ -264,17 +287,23 @@ impl RnaHandler {
                                 skip_lsp: false, // incremental background path: LSP runs inline
                             },
                             dirty_slugs,
-                        ).await {
+                        )
+                        .await
+                        {
                             Ok((enriched_nodes, enriched_edges, detected_frameworks)) => {
                                 full_state.nodes = enriched_nodes;
                                 full_state.edges = enriched_edges;
                                 full_state.detected_frameworks = detected_frameworks;
 
                                 // Update LSP status
-                                let lsp_edge_count = full_state.edges.iter()
+                                let lsp_edge_count = full_state
+                                    .edges
+                                    .iter()
                                     .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
                                     .count();
-                                let lsp_call_edge_count = full_state.edges.iter()
+                                let lsp_call_edge_count = full_state
+                                    .edges
+                                    .iter()
                                     .filter(|e| {
                                         e.source == crate::graph::ExtractionSource::Lsp
                                             && matches!(e.kind, crate::graph::EdgeKind::Calls)
@@ -288,7 +317,8 @@ impl RnaHandler {
                             }
                             Err(e) => {
                                 tracing::error!(
-                                    "Background incremental pipeline: enrichment failed: {:#}", e
+                                    "Background incremental pipeline: enrichment failed: {:#}",
+                                    e
                                 );
                                 if let Err(e) = scanner.commit_state() {
                                     tracing::error!("Failed to commit scanner state: {}", e);
@@ -316,47 +346,67 @@ impl RnaHandler {
                     {
                         let mut seen_nodes = std::collections::HashSet::new();
                         full_state.nodes.reverse();
-                        full_state.nodes.retain(|n| seen_nodes.insert(n.stable_id()));
+                        full_state
+                            .nodes
+                            .retain(|n| seen_nodes.insert(n.stable_id()));
                         full_state.nodes.reverse();
                         let mut seen_edges = std::collections::HashSet::new();
-                        full_state.edges.retain(|e| seen_edges.insert(e.stable_id()));
+                        full_state
+                            .edges
+                            .retain(|e| seen_edges.insert(e.stable_id()));
                     }
 
                     // Rebuild index
                     full_state.index = GraphIndex::new();
                     full_state.index.rebuild_from_edges(&full_state.edges);
                     for node in &full_state.nodes {
-                        full_state.index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+                        full_state
+                            .index
+                            .ensure_node(&node.stable_id(), &node.id.kind.to_string());
                     }
 
                     // PageRank
                     let pagerank_scores = full_state.index.compute_pagerank(0.85, 20);
                     for node in &mut full_state.nodes {
                         if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
-                            node.metadata.insert("importance".to_string(), format!("{:.6}", score));
+                            node.metadata
+                                .insert("importance".to_string(), format!("{:.6}", score));
                         }
                     }
 
                     // Subsystem detection
                     {
-                        let node_file_map: std::collections::HashMap<String, String> = full_state.nodes
+                        let node_file_map: std::collections::HashMap<String, String> = full_state
+                            .nodes
                             .iter()
                             .filter(|n| n.id.root != "external")
                             .map(|n| (n.stable_id(), n.id.file.display().to_string()))
                             .collect();
-                        let mut subsystems = full_state.index.detect_communities(&pagerank_scores, &node_file_map);
+                        let mut subsystems = full_state
+                            .index
+                            .detect_communities(&pagerank_scores, &node_file_map);
                         {
-                            let mut name_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-                            for s in &subsystems { *name_counts.entry(s.name.clone()).or_default() += 1; }
+                            let mut name_counts: std::collections::HashMap<String, usize> =
+                                std::collections::HashMap::new();
+                            for s in &subsystems {
+                                *name_counts.entry(s.name.clone()).or_default() += 1;
+                            }
                             for s in &mut subsystems {
                                 if name_counts.get(&s.name).copied().unwrap_or(0) > 1
-                                    && let Some(iface) = s.interfaces.first() {
-                                        let short = iface.node_id.split(':').rev().nth(1).unwrap_or(&iface.node_id);
-                                        s.name = format!("{}/{}", s.name, short);
-                                    }
+                                    && let Some(iface) = s.interfaces.first()
+                                {
+                                    let short = iface
+                                        .node_id
+                                        .split(':')
+                                        .rev()
+                                        .nth(1)
+                                        .unwrap_or(&iface.node_id);
+                                    s.name = format!("{}/{}", s.name, short);
+                                }
                             }
                         }
-                        let mut node_subsystem: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                        let mut node_subsystem: std::collections::HashMap<String, String> =
+                            std::collections::HashMap::new();
                         for subsystem in &subsystems {
                             for member_id in &subsystem.member_ids {
                                 node_subsystem.insert(member_id.clone(), subsystem.name.clone());
@@ -368,8 +418,12 @@ impl RnaHandler {
                             let new_sub = node_subsystem.get(&sid).cloned();
                             if old_sub != new_sub {
                                 match new_sub {
-                                    Some(name) => { node.metadata.insert(SUBSYSTEM_KEY.to_owned(), name); }
-                                    None => { node.metadata.remove(SUBSYSTEM_KEY); }
+                                    Some(name) => {
+                                        node.metadata.insert(SUBSYSTEM_KEY.to_owned(), name);
+                                    }
+                                    None => {
+                                        node.metadata.remove(SUBSYSTEM_KEY);
+                                    }
                                 }
                                 upsert_node_ids.insert(sid);
                             }
@@ -395,50 +449,71 @@ impl RnaHandler {
                         }
                         for n in &full_state.nodes {
                             let sid = n.stable_id();
-                            if !node_ids_before_group2.contains(&sid) { upsert_node_ids.insert(sid); }
+                            if !node_ids_before_group2.contains(&sid) {
+                                upsert_node_ids.insert(sid);
+                            }
                         }
                         for e in &full_state.edges {
                             let sid = e.stable_id();
-                            if !edge_ids_before_group2.contains(&sid) { upsert_edges.push(e.clone()); }
+                            if !edge_ids_before_group2.contains(&sid) {
+                                upsert_edges.push(e.clone());
+                            }
                         }
                     }
 
                     // Update index for virtual nodes
                     for node in &full_state.nodes {
-                        if matches!(&node.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
-                            full_state.index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+                        if matches!(&node.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event"))
+                        {
+                            full_state
+                                .index
+                                .ensure_node(&node.stable_id(), &node.id.kind.to_string());
                         }
                     }
                     for edge in &full_state.edges {
-                        if matches!(&edge.to.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+                        if matches!(&edge.to.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event"))
+                        {
                             full_state.index.add_edge(
-                                &edge.from.to_stable_id(), &edge.from.kind.to_string(),
-                                &edge.to.to_stable_id(), &edge.to.kind.to_string(),
+                                &edge.from.to_stable_id(),
+                                &edge.from.kind.to_string(),
+                                &edge.to.to_stable_id(),
+                                &edge.to.kind.to_string(),
                                 edge.kind.clone(),
                             );
                         }
                     }
 
                     // Re-embed changed-file symbols
-                    let changed_files: std::collections::HashSet<_> = scan.changed_files
-                        .iter().chain(scan.new_files.iter()).collect();
+                    let changed_files: std::collections::HashSet<_> = scan
+                        .changed_files
+                        .iter()
+                        .chain(scan.new_files.iter())
+                        .collect();
                     let embed_guard = embed_index.load();
                     if let Some(ref embed_idx) = **embed_guard {
-                        let changed_file_nodes: Vec<_> = full_state.nodes
+                        let changed_file_nodes: Vec<_> = full_state
+                            .nodes
                             .iter()
                             .filter(|n| changed_files.iter().any(|f| n.id.file == **f))
                             .cloned()
                             .collect();
                         if let Err(e) = embed_idx.reindex_nodes(&changed_file_nodes).await {
                             tracing::warn!("Background incremental: re-embed failed: {}", e);
-                            if let Err(e2) = embed_idx.index_all_with_symbols(&repo_root, &full_state.nodes).await {
-                                tracing::warn!("Background incremental: full embed rebuild also failed: {}", e2);
+                            if let Err(e2) = embed_idx
+                                .index_all_with_symbols(&repo_root, &full_state.nodes)
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Background incremental: full embed rebuild also failed: {}",
+                                    e2
+                                );
                             }
                         }
                     }
 
                     // Build upsert data with post-PageRank importance scores
-                    let upsert_nodes: Vec<Node> = full_state.nodes
+                    let upsert_nodes: Vec<Node> = full_state
+                        .nodes
                         .iter()
                         .filter(|n| upsert_node_ids.contains(&n.stable_id()))
                         .cloned()
@@ -448,38 +523,57 @@ impl RnaHandler {
                     let persist_result = {
                         let _lance_guard = lance_write_lock.lock().await;
                         persist_graph_incremental(
-                            &repo_root, &upsert_nodes, &upsert_edges,
-                            &deleted_edge_ids, &files_to_remove_all,
-                        ).await
+                            &repo_root,
+                            &upsert_nodes,
+                            &upsert_edges,
+                            &deleted_edge_ids,
+                            &files_to_remove_all,
+                        )
+                        .await
                     };
                     let persist_ok = match persist_result {
                         Ok(true) => {
                             let _lance_guard = lance_write_lock.lock().await;
-                            match persist_graph_to_lance(&repo_root, &full_state.nodes, &full_state.edges).await {
+                            match persist_graph_to_lance(
+                                &repo_root,
+                                &full_state.nodes,
+                                &full_state.edges,
+                            )
+                            .await
+                            {
                                 Ok(()) => true,
-                                Err(e) => { tracing::error!("Full persist after migration failed: {:#}", e); false }
+                                Err(e) => {
+                                    tracing::error!("Full persist after migration failed: {:#}", e);
+                                    false
+                                }
                             }
                         }
                         Ok(false) => true,
-                        Err(e) => { tracing::error!("Incremental persist failed: {:#}", e); false }
+                        Err(e) => {
+                            tracing::error!("Incremental persist failed: {:#}", e);
+                            false
+                        }
                     };
 
-                    if persist_ok {
-                        if let Err(e) = scanner.commit_state() {
-                            tracing::error!("Failed to commit scanner state: {}", e);
-                        }
+                    if persist_ok && let Err(e) = scanner.commit_state() {
+                        tracing::error!("Failed to commit scanner state: {}", e);
                     }
 
                     full_state.last_scan_completed_at = Some(std::time::Instant::now());
 
                     // Atomic swap: publish the fully enriched graph
                     handler_graph.store(Arc::new(Some(Arc::new(full_state))));
-                    tracing::info!("Background incremental pipeline complete -- enriched graph swapped in");
+                    tracing::info!(
+                        "Background incremental pipeline complete -- enriched graph swapped in"
+                    );
                 });
             }
 
             // Start background scanner (once) to keep index warm
-            if !self.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if !self
+                .background_scanner_started
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
                 self.spawn_background_scanner();
             }
             return Ok(fast_arc);
@@ -487,7 +581,10 @@ impl RnaHandler {
 
         // Slow path: no graph exists yet.
         // If pre-warm is in progress, wait for it instead of building a duplicate.
-        if self.prewarm_started.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .prewarm_started
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             tracing::info!("Waiting for pre-warm to finish...");
             let prewarm_deadline = tokio::time::Instant::now() + Self::PREWARM_TIMEOUT;
             loop {
@@ -511,7 +608,10 @@ impl RnaHandler {
             let snap = self.graph.load_full();
             if let Some(ref gs) = *snap {
                 *self.last_scan.lock().unwrap() = std::time::Instant::now();
-                if !self.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                if !self
+                    .background_scanner_started
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
                     self.spawn_background_scanner();
                 }
                 return Ok(Arc::clone(gs));
@@ -524,7 +624,10 @@ impl RnaHandler {
         let snap = self.graph.load_full();
         if let Some(ref gs) = *snap {
             *self.last_scan.lock().unwrap() = std::time::Instant::now();
-            if !self.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if !self
+                .background_scanner_started
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
                 self.spawn_background_scanner();
             }
             return Ok(Arc::clone(gs));
@@ -537,7 +640,10 @@ impl RnaHandler {
                 self.graph.store(Arc::new(Some(Arc::clone(&new_arc))));
                 *self.last_scan.lock().unwrap() = std::time::Instant::now();
                 self.graph_build_status.set_ready();
-                if !self.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                if !self
+                    .background_scanner_started
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
                     self.spawn_background_scanner();
                 }
                 Ok(new_arc)
@@ -563,7 +669,10 @@ impl RnaHandler {
         self.build_full_graph_inner(true).await
     }
 
-    pub(crate) async fn build_full_graph_inner(&self, spawn_background: bool) -> anyhow::Result<GraphState> {
+    pub(crate) async fn build_full_graph_inner(
+        &self,
+        spawn_background: bool,
+    ) -> anyhow::Result<GraphState> {
         // Invalidate cached root slugs since workspace/worktree config may have changed.
         self.invalidate_non_code_root_slugs_cache();
 
@@ -648,10 +757,8 @@ impl RnaHandler {
             .filter(|r| !r.config.lsp_only)
             .map(|r| r.slug.clone())
             .collect();
-        let all_declared_slugs: std::collections::HashSet<String> = resolved_roots
-            .iter()
-            .map(|r| r.slug.clone())
-            .collect();
+        let all_declared_slugs: std::collections::HashSet<String> =
+            resolved_roots.iter().map(|r| r.slug.clone()).collect();
         // Synthetic root IDs (e.g., "external" for LSP virtual nodes) are never
         // discovered by WorkspaceConfig but are valid -- skip them during stale pruning.
         const RESERVED_ROOT_IDS: &[&str] = &["external"];
@@ -665,7 +772,8 @@ impl RnaHandler {
         let mut has_new_root = false;
         match get_stored_root_ids(&self.repo_root).await {
             Ok(stored) => {
-                let stored_set: std::collections::HashSet<String> = stored.iter().cloned().collect();
+                let stored_set: std::collections::HashSet<String> =
+                    stored.iter().cloned().collect();
                 let stale: Vec<String> = stored
                     .into_iter()
                     .filter(|s| !all_declared_slugs.contains(s))
@@ -685,7 +793,9 @@ impl RnaHandler {
                 // nodes were never persisted and must be included in a fresh build.
                 let new_slugs: Vec<&str> = live_slugs
                     .iter()
-                    .filter(|s| !stored_set.contains(*s) && !RESERVED_ROOT_IDS.contains(&s.as_str()))
+                    .filter(|s| {
+                        !stored_set.contains(*s) && !RESERVED_ROOT_IDS.contains(&s.as_str())
+                    })
                     .map(|s| s.as_str())
                     .collect();
                 if !new_slugs.is_empty() {
@@ -707,7 +817,8 @@ impl RnaHandler {
         // any declared root is absent from LanceDB (nodes committed to scanner state
         // but never persisted).
         let mut any_root_changed = has_new_root;
-        let mut scanners: Vec<(String, Scanner, crate::scanner::ScanResult, PathBuf, bool)> = Vec::new();
+        let mut scanners: Vec<(String, Scanner, crate::scanner::ScanResult, PathBuf, bool)> =
+            Vec::new();
 
         for resolved_root in &resolved_roots {
             // Skip lsp_only roots: their files are already covered by the primary root
@@ -729,11 +840,7 @@ impl RnaHandler {
                 Scanner::with_excludes(root_path.clone(), excludes)?
             } else {
                 let state_path = cache_state_path(root_slug);
-                Scanner::with_excludes_and_state_path(
-                    root_path.clone(),
-                    excludes,
-                    state_path,
-                )?
+                Scanner::with_excludes_and_state_path(root_path.clone(), excludes, state_path)?
             };
 
             let scan_result = scanner.scan()?;
@@ -755,11 +862,18 @@ impl RnaHandler {
                 any_root_changed = true;
             }
 
-            scanners.push((root_slug.clone(), scanner, scan_result, root_path.clone(), root_has_changes));
+            scanners.push((
+                root_slug.clone(),
+                scanner,
+                scan_result,
+                root_path.clone(),
+                root_has_changes,
+            ));
         }
 
         {
-            let total_files: usize = scanners.iter()
+            let total_files: usize = scanners
+                .iter()
                 .map(|(_, _, scan, _, _)| scan.new_files.len() + scan.changed_files.len())
                 .sum();
             self.graph_build_status.set_building(total_files);
@@ -794,16 +908,26 @@ impl RnaHandler {
                                 Ok(true) => {
                                     // Ensure FTS indexes exist -- table may predate hybrid search.
                                     idx.ensure_fts_index().await;
-                                    tracing::info!("Reusing existing embedding index (no changes detected)");
+                                    tracing::info!(
+                                        "Reusing existing embedding index (no changes detected)"
+                                    );
                                     self.embed_index.store(Arc::new(Some(idx)));
                                 }
                                 Ok(false) => {
-                                    match idx.index_all_with_symbols(&self.repo_root, &state.nodes).await {
+                                    match idx
+                                        .index_all_with_symbols(&self.repo_root, &state.nodes)
+                                        .await
+                                    {
                                         Ok(count) => {
-                                            tracing::info!("Built embedding index: {} items (table was missing)", count);
+                                            tracing::info!(
+                                                "Built embedding index: {} items (table was missing)",
+                                                count
+                                            );
                                             self.embed_index.store(Arc::new(Some(idx)));
                                         }
-                                        Err(e) => tracing::warn!("Failed to embed cached graph: {}", e),
+                                        Err(e) => {
+                                            tracing::warn!("Failed to embed cached graph: {}", e)
+                                        }
                                     }
                                 }
                                 Err(e) => tracing::warn!("Failed to check embedding table: {}", e),
@@ -834,7 +958,9 @@ impl RnaHandler {
                                     "LSP sentinel present -- LSP enrichment already persisted, skipping"
                                 );
                                 // Mark LSP as complete using the actual persisted call edge count.
-                                let call_count = state.edges.iter()
+                                let call_count = state
+                                    .edges
+                                    .iter()
                                     .filter(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
                                     .count();
                                 self.lsp_status.set_complete(call_count);
@@ -914,18 +1040,19 @@ impl RnaHandler {
                     let cached_edges = cached_edges_by_root.remove(root_slug);
 
                     if let Some(nodes) = cached_nodes
-                        && !nodes.is_empty() {
-                            let edges = cached_edges.unwrap_or_default();
-                            tracing::info!(
-                                "Clean root '{}': loaded {} nodes, {} edges from cache (preserving LSP edges)",
-                                root_slug,
-                                nodes.len(),
-                                edges.len()
-                            );
-                            all_nodes.extend(nodes);
-                            all_edges.extend(edges);
-                            continue;
-                        }
+                        && !nodes.is_empty()
+                    {
+                        let edges = cached_edges.unwrap_or_default();
+                        tracing::info!(
+                            "Clean root '{}': loaded {} nodes, {} edges from cache (preserving LSP edges)",
+                            root_slug,
+                            nodes.len(),
+                            edges.len()
+                        );
+                        all_nodes.extend(nodes);
+                        all_edges.extend(edges);
+                        continue;
+                    }
                     // Fall through to full extract if cache had no nodes for this root.
                     // This root needs LSP enrichment since it has no cached LSP edges.
                     tracing::info!(
@@ -943,7 +1070,8 @@ impl RnaHandler {
                 deleted_files: Vec::new(),
                 scan_duration: std::time::Duration::ZERO,
             };
-            let (mut extraction, enc_stats) = registry.extract_scan_result_with_stats(root_path, &full_scan);
+            let (mut extraction, enc_stats) =
+                registry.extract_scan_result_with_stats(root_path, &full_scan);
 
             // Record encoding stats for this root (full scan: replace totals).
             if let Ok(mut stats) = self.scan_stats.write() {
@@ -954,7 +1082,8 @@ impl RnaHandler {
                 node.id.root = root_slug.clone();
             }
             // Build file index for suffix matching import edges
-            let file_index: std::collections::HashSet<String> = extraction.nodes
+            let file_index: std::collections::HashSet<String> = extraction
+                .nodes
                 .iter()
                 .map(|n| n.id.file.to_string_lossy().to_string())
                 .collect();
@@ -972,35 +1101,38 @@ impl RnaHandler {
             // are produced by the background enricher and would otherwise be lost on
             // every incremental rebuild.
             let mut lsp_carry_count = 0usize;
-            if *root_changed && has_cached_graph
-                && let Some(cached_edges) = cached_edges_by_root.remove(root_slug) {
-                    let node_ids: std::collections::HashSet<String> = extraction.nodes
-                        .iter()
-                        .map(|n| n.stable_id())
-                        .collect();
-                    for edge in cached_edges {
-                        if edge.source == crate::graph::ExtractionSource::Lsp {
-                            let from_id = edge.from.to_stable_id();
-                            let to_id = edge.to.to_stable_id();
-                            // Require the source node to still exist. For the
-                            // target, only require existence if it belongs to
-                            // the same dirty root -- external/virtual targets
-                            // may not be in our extraction node set.
-                            let from_exists = node_ids.contains(&from_id);
-                            let to_exists = edge.to.root != *root_slug
-                                || node_ids.contains(&to_id);
-                            if from_exists && to_exists {
-                                extraction.edges.push(edge);
-                                lsp_carry_count += 1;
-                            }
+            if *root_changed
+                && has_cached_graph
+                && let Some(cached_edges) = cached_edges_by_root.remove(root_slug)
+            {
+                let node_ids: std::collections::HashSet<String> =
+                    extraction.nodes.iter().map(|n| n.stable_id()).collect();
+                for edge in cached_edges {
+                    if edge.source == crate::graph::ExtractionSource::Lsp {
+                        let from_id = edge.from.to_stable_id();
+                        let to_id = edge.to.to_stable_id();
+                        // Require the source node to still exist. For the
+                        // target, only require existence if it belongs to
+                        // the same dirty root -- external/virtual targets
+                        // may not be in our extraction node set.
+                        let from_exists = node_ids.contains(&from_id);
+                        let to_exists = edge.to.root != *root_slug || node_ids.contains(&to_id);
+                        if from_exists && to_exists {
+                            extraction.edges.push(edge);
+                            lsp_carry_count += 1;
                         }
                     }
                 }
+            }
 
             tracing::info!(
                 "Extracted from '{}'{}: {} nodes, {} edges{}",
                 root_slug,
-                if *root_changed { " (dirty)" } else { " (no cache)" },
+                if *root_changed {
+                    " (dirty)"
+                } else {
+                    " (no cache)"
+                },
                 extraction.nodes.len(),
                 extraction.edges.len(),
                 if lsp_carry_count > 0 {
@@ -1027,9 +1159,8 @@ impl RnaHandler {
                 .map(|(slug, _, _, _, _)| slug.as_str())
                 .collect();
             let non_code = self.non_code_root_slugs();
-            let is_virtual_root = |root: &str| -> bool {
-                root == "external" || non_code.contains(root)
-            };
+            let is_virtual_root =
+                |root: &str| -> bool { root == "external" || non_code.contains(root) };
             // Use remaining entries from pre-indexed maps (roots not consumed by clean-root reuse).
             let mut ext_node_count = 0usize;
             let mut ext_edge_count = 0usize;
@@ -1136,7 +1267,8 @@ impl RnaHandler {
                         skip_lsp: spawn_background, // #574: MCP server path skips LSP here, spawns it in background
                     },
                     dirty_slugs,
-                ).await?;
+                )
+                .await?;
             all_nodes = enriched_nodes;
             all_edges = enriched_edges;
             all_detected_frameworks = detected_frameworks;
@@ -1145,10 +1277,12 @@ impl RnaHandler {
             // LSP status stays "running" — the background LSP task will update it.
             // When skip_lsp=false (CLI path), check LSP edges now.
             if !spawn_background {
-                let lsp_edge_count = all_edges.iter()
+                let lsp_edge_count = all_edges
+                    .iter()
                     .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
                     .count();
-                let lsp_call_edge_count = all_edges.iter()
+                let lsp_call_edge_count = all_edges
+                    .iter()
                     .filter(|e| {
                         e.source == crate::graph::ExtractionSource::Lsp
                             && matches!(e.kind, crate::graph::EdgeKind::Calls)
@@ -1158,7 +1292,8 @@ impl RnaHandler {
                     self.lsp_status.set_complete(lsp_call_edge_count);
                     tracing::info!(
                         "LSP enrichment complete (via bus): {} LSP call edges, {} total LSP edges",
-                        lsp_call_edge_count, lsp_edge_count,
+                        lsp_call_edge_count,
+                        lsp_edge_count,
                     );
                 } else {
                     self.lsp_status.set_unavailable();
@@ -1184,7 +1319,9 @@ impl RnaHandler {
             if before_edges != all_edges.len() {
                 tracing::debug!(
                     "Post-pass dedup: {} → {} edges ({} duplicates removed)",
-                    before_edges, all_edges.len(), before_edges - all_edges.len()
+                    before_edges,
+                    all_edges.len(),
+                    before_edges - all_edges.len()
                 );
             }
         }
@@ -1207,10 +1344,14 @@ impl RnaHandler {
         let pagerank_scores = index.compute_pagerank(0.85, 20);
         for node in &mut all_nodes {
             if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
-                node.metadata.insert("importance".to_string(), format!("{:.6}", score));
+                node.metadata
+                    .insert("importance".to_string(), format!("{:.6}", score));
             }
         }
-        tracing::info!("Computed PageRank importance for {} nodes", pagerank_scores.len());
+        tracing::info!(
+            "Computed PageRank importance for {} nodes",
+            pagerank_scores.len()
+        );
 
         // 6b. Detect subsystems and write cluster_id to node metadata.
         // This runs after PageRank (which detect_communities needs) and before
@@ -1233,15 +1374,16 @@ impl RnaHandler {
                 }
                 for s in &mut subsystems {
                     if name_counts.get(&s.name).copied().unwrap_or(0) > 1
-                        && let Some(iface) = s.interfaces.first() {
-                            let short = iface
-                                .node_id
-                                .split(':')
-                                .rev()
-                                .nth(1)
-                                .unwrap_or(&iface.node_id);
-                            s.name = format!("{}/{}", s.name, short);
-                        }
+                        && let Some(iface) = s.interfaces.first()
+                    {
+                        let short = iface
+                            .node_id
+                            .split(':')
+                            .rev()
+                            .nth(1)
+                            .unwrap_or(&iface.node_id);
+                        s.name = format!("{}/{}", s.name, short);
+                    }
                 }
             }
             // Build node_id -> subsystem_name lookup
@@ -1277,13 +1419,16 @@ impl RnaHandler {
             // Routed via EventBus: CommunityDetectionComplete → SubsystemConsumer
             // → SubsystemNodesComplete. This decouples graph.rs from the pass
             // functions and satisfies ADR Constraint 7.
-            let primary_slug = crate::roots::RootConfig::code_project(self.repo_root.clone()).slug();
+            let primary_slug =
+                crate::roots::RootConfig::code_project(self.repo_root.clone()).slug();
             let (sub_added_nodes, sub_added_edges) =
                 crate::extract::consumers::emit_community_detection(
                     primary_slug.clone(),
                     subsystems.clone(),
                     all_nodes.clone(),
-                ).await.unwrap_or_else(|e| {
+                )
+                .await
+                .unwrap_or_else(|e| {
                     tracing::warn!("Subsystem promotion via bus failed (non-fatal): {}", e);
                     (vec![], vec![])
                 });
@@ -1299,12 +1444,14 @@ impl RnaHandler {
             // then adds only those to the index. This is O(total nodes + total edges)
             // for the scan but O(virtual nodes) for the index operations.
             for node in &all_nodes {
-                if matches!(&node.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+                if matches!(&node.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event"))
+                {
                     index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
                 }
             }
             for edge in &all_edges {
-                if matches!(&edge.to.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+                if matches!(&edge.to.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event"))
+                {
                     index.add_edge(
                         &edge.from.to_stable_id(),
                         &edge.from.kind.to_string(),
@@ -1334,7 +1481,9 @@ impl RnaHandler {
             if before != after {
                 tracing::debug!(
                     "Full-build edge dedup: {} → {} edges ({} duplicates removed)",
-                    before, after, before - after
+                    before,
+                    after,
+                    before - after
                 );
             }
         }
@@ -1363,7 +1512,11 @@ impl RnaHandler {
 
             // Write extraction sentinel but NOT the LSP sentinel — LSP hasn't run yet.
             // The background LSP task will write the LSP sentinel after enrichment.
-            super::sentinel::write_extract_sentinel(&self.repo_root, all_nodes.len(), all_edges.len());
+            super::sentinel::write_extract_sentinel(
+                &self.repo_root,
+                all_nodes.len(),
+                all_edges.len(),
+            );
             // Clear any stale LSP sentinel so the next startup knows LSP is pending.
             super::sentinel::clear_lsp_sentinel(&self.repo_root);
             drop(_lance_guard);
@@ -1378,7 +1531,10 @@ impl RnaHandler {
                             stored_after.into_iter().collect();
                         let missing: Vec<String> = live_slugs
                             .iter()
-                            .filter(|s| !stored_after_set.contains(*s) && !RESERVED_ROOT_IDS.contains(&s.as_str()))
+                            .filter(|s| {
+                                !stored_after_set.contains(*s)
+                                    && !RESERVED_ROOT_IDS.contains(&s.as_str())
+                            })
                             .cloned()
                             .collect();
                         if !missing.is_empty() {
@@ -1519,8 +1675,7 @@ impl RnaHandler {
             .edges
             .iter()
             .filter(|e| {
-                files_to_remove.contains(&e.from.file)
-                    || files_to_remove.contains(&e.to.file)
+                files_to_remove.contains(&e.from.file) || files_to_remove.contains(&e.to.file)
             })
             .map(|e| e.stable_id())
             .collect();
@@ -1529,12 +1684,12 @@ impl RnaHandler {
             .nodes
             .retain(|n| !files_to_remove.contains(&n.id.file));
         graph.edges.retain(|e| {
-            !files_to_remove.contains(&e.from.file)
-                && !files_to_remove.contains(&e.to.file)
+            !files_to_remove.contains(&e.from.file) && !files_to_remove.contains(&e.to.file)
         });
 
         // Extract new + changed files
-        let (mut extraction, enc_stats) = registry.extract_scan_result_with_stats(&self.repo_root, &scan);
+        let (mut extraction, enc_stats) =
+            registry.extract_scan_result_with_stats(&self.repo_root, &scan);
 
         // Set root slug on extracted nodes and edges.
         // Extractors don't set root -- the caller must assign it, matching the
@@ -1549,7 +1704,8 @@ impl RnaHandler {
             node.id.root = primary_slug.clone();
         }
         // Build file index from existing graph + new extraction for suffix matching
-        let file_index: std::collections::HashSet<String> = graph.nodes
+        let file_index: std::collections::HashSet<String> = graph
+            .nodes
             .iter()
             .chain(extraction.nodes.iter())
             .map(|n| n.id.file.to_string_lossy().to_string())
@@ -1651,7 +1807,9 @@ impl RnaHandler {
                         skip_lsp: false, // update_graph_with_scan: LSP runs inline (already incremental)
                     },
                     dirty_slugs,
-                ).await.map_err(|e| {
+                )
+                .await
+                .map_err(|e| {
                     // Pipeline invariant violated — abort the incremental update so the
                     // partial graph is not persisted. Scanner state is not committed on
                     // Err return, so the next scan will retry the full pass sequence.
@@ -1726,7 +1884,8 @@ impl RnaHandler {
         let pagerank_scores = graph.index.compute_pagerank(0.85, 20);
         for node in &mut graph.nodes {
             if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
-                node.metadata.insert("importance".to_string(), format!("{:.6}", score));
+                node.metadata
+                    .insert("importance".to_string(), format!("{:.6}", score));
             }
         }
 
@@ -1739,7 +1898,9 @@ impl RnaHandler {
                 .map(|n| (n.stable_id(), n.id.file.display().to_string()))
                 .collect();
 
-            let mut subsystems = graph.index.detect_communities(&pagerank_scores, &node_file_map);
+            let mut subsystems = graph
+                .index
+                .detect_communities(&pagerank_scores, &node_file_map);
             // Deduplicate subsystem names (matching repo_map rendering)
             {
                 let mut name_counts: std::collections::HashMap<String, usize> =
@@ -1749,15 +1910,16 @@ impl RnaHandler {
                 }
                 for s in &mut subsystems {
                     if name_counts.get(&s.name).copied().unwrap_or(0) > 1
-                        && let Some(iface) = s.interfaces.first() {
-                            let short = iface
-                                .node_id
-                                .split(':')
-                                .rev()
-                                .nth(1)
-                                .unwrap_or(&iface.node_id);
-                            s.name = format!("{}/{}", s.name, short);
-                        }
+                        && let Some(iface) = s.interfaces.first()
+                    {
+                        let short = iface
+                            .node_id
+                            .split(':')
+                            .rev()
+                            .nth(1)
+                            .unwrap_or(&iface.node_id);
+                        s.name = format!("{}/{}", s.name, short);
+                    }
                 }
             }
             let mut node_subsystem: std::collections::HashMap<String, String> =
@@ -1774,8 +1936,12 @@ impl RnaHandler {
                 let new_sub = node_subsystem.get(&sid).cloned();
                 if old_sub != new_sub {
                     match new_sub {
-                        Some(name) => { node.metadata.insert(SUBSYSTEM_KEY.to_owned(), name); }
-                        None => { node.metadata.remove(SUBSYSTEM_KEY); }
+                        Some(name) => {
+                            node.metadata.insert(SUBSYSTEM_KEY.to_owned(), name);
+                        }
+                        None => {
+                            node.metadata.remove(SUBSYSTEM_KEY);
+                        }
                     }
                     // Include in upsert set so LanceDB gets the updated metadata
                     upsert_node_ids.insert(sid);
@@ -1799,8 +1965,13 @@ impl RnaHandler {
                     primary_slug.clone(),
                     subsystems.clone(),
                     graph.nodes.clone(),
-                ).await.unwrap_or_else(|e| {
-                    tracing::warn!("Incremental subsystem promotion via bus failed (non-fatal): {}", e);
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "Incremental subsystem promotion via bus failed (non-fatal): {}",
+                        e
+                    );
                     (vec![], vec![])
                 });
             if !sub_added_nodes.is_empty() || !sub_added_edges.is_empty() {
@@ -1829,12 +2000,16 @@ impl RnaHandler {
         // The index was rebuilt at line ~1275 (before these passes ran), so virtual nodes
         // are missing. Add only virtual nodes here — O(virtual nodes + their edges).
         for node in &graph.nodes {
-            if matches!(&node.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
-                graph.index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+            if matches!(&node.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event"))
+            {
+                graph
+                    .index
+                    .ensure_node(&node.stable_id(), &node.id.kind.to_string());
             }
         }
         for edge in &graph.edges {
-            if matches!(&edge.to.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+            if matches!(&edge.to.kind, NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event"))
+            {
                 graph.index.add_edge(
                     &edge.from.to_stable_id(),
                     &edge.from.kind.to_string(),
@@ -1857,12 +2032,18 @@ impl RnaHandler {
                 .collect();
             match embed_idx.reindex_nodes(&changed_file_nodes).await {
                 Ok(count) => {
-                    tracing::info!("Re-embedded {} changed-file nodes after incremental update", count)
+                    tracing::info!(
+                        "Re-embedded {} changed-file nodes after incremental update",
+                        count
+                    )
                 }
                 Err(e) => {
                     // reindex_nodes falls back to no-op if the table doesn't exist;
                     // do a full rebuild instead.
-                    tracing::warn!("Targeted re-embed failed ({}), falling back to full rebuild", e);
+                    tracing::warn!(
+                        "Targeted re-embed failed ({}), falling back to full rebuild",
+                        e
+                    );
                     if let Err(e2) = embed_idx
                         .index_all_with_symbols(&self.repo_root, &graph.nodes)
                         .await
@@ -1910,9 +2091,13 @@ impl RnaHandler {
         };
         let persist_succeeded = match persist_result {
             Ok(true) => {
-                tracing::info!("Schema migrated during incremental update; performing full persist now");
+                tracing::info!(
+                    "Schema migrated during incremental update; performing full persist now"
+                );
                 let _lance_guard = self.lance_write_lock.lock().await;
-                if let Err(e) = persist_graph_to_lance(&self.repo_root, &graph.nodes, &graph.edges).await {
+                if let Err(e) =
+                    persist_graph_to_lance(&self.repo_root, &graph.nodes, &graph.edges).await
+                {
                     tracing::error!("Full persist after migration failed: {:#}", e);
                     // Don't block MCP response — log and treat as persist failure.
                     // Scanner state won't be committed so next scan retries.
@@ -1934,14 +2119,12 @@ impl RnaHandler {
         // Commit fallback scanner state only after successful persist.
         // If persist failed, scanner state is left uncommitted so the next scan
         // re-detects the same changes and retries the LanceDB write.
-        if persist_succeeded
-            && let Some(scanner) = fallback_scanner {
-                scanner.commit_state()?;
-            }
+        if persist_succeeded && let Some(scanner) = fallback_scanner {
+            scanner.commit_state()?;
+        }
 
         graph.last_scan_completed_at = Some(std::time::Instant::now());
 
         Ok(())
     }
 }
-

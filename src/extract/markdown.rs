@@ -192,15 +192,16 @@ fn emit_hierarchy_edges(nodes: &[Node], edges: &mut Vec<Edge>) {
 
     for node in nodes {
         if let Some(parent_text) = node.metadata.get("parent_heading")
-            && let Some(parent_id) = heading_to_node.get(parent_text.as_str()) {
-                edges.push(Edge {
-                    from: (*parent_id).clone(),
-                    to: node.id.clone(),
-                    kind: EdgeKind::Defines,
-                    source: ExtractionSource::Markdown,
-                    confidence: Confidence::Detected,
-                });
-            }
+            && let Some(parent_id) = heading_to_node.get(parent_text.as_str())
+        {
+            edges.push(Edge {
+                from: (*parent_id).clone(),
+                to: node.id.clone(),
+                kind: EdgeKind::Defines,
+                source: ExtractionSource::Markdown,
+                confidence: Confidence::Detected,
+            });
+        }
     }
 }
 
@@ -409,16 +410,17 @@ fn detect_oh_kind(path: &Path) -> Option<String> {
 
         // .oh/ artifact family
         if name == ".oh"
-            && let Some(next) = components.get(i + 1) {
-                let dir = next.as_os_str().to_string_lossy();
-                return match dir.as_ref() {
-                    "outcomes" => Some("outcome".to_string()),
-                    "signals" => Some("signal".to_string()),
-                    "guardrails" => Some("guardrail".to_string()),
-                    "metis" => Some("metis".to_string()),
-                    _ => None,
-                };
-            }
+            && let Some(next) = components.get(i + 1)
+        {
+            let dir = next.as_os_str().to_string_lossy();
+            return match dir.as_ref() {
+                "outcomes" => Some("outcome".to_string()),
+                "signals" => Some("signal".to_string()),
+                "guardrails" => Some("guardrail".to_string()),
+                "metis" => Some("metis".to_string()),
+                _ => None,
+            };
+        }
 
         // .cursorrules — root-level file (component before this is the last)
         if name == ".cursorrules" && i == n - 1 {
@@ -438,16 +440,18 @@ fn detect_oh_kind(path: &Path) -> Option<String> {
         // .serena/memories/ — any file under this directory
         if name == ".serena"
             && let Some(next) = components.get(i + 1)
-                && next.as_os_str() == "memories" {
-                    return Some("serena-memory".to_string());
-                }
+            && next.as_os_str() == "memories"
+        {
+            return Some("serena-memory".to_string());
+        }
 
         // .github/copilot-instructions.md
         if name == ".github"
             && let Some(next) = components.get(i + 1)
-                && next.as_os_str() == "copilot-instructions.md" {
-                    return Some("copilot-instruction".to_string());
-                }
+            && next.as_os_str() == "copilot-instructions.md"
+        {
+            return Some("copilot-instruction".to_string());
+        }
     }
     None
 }
@@ -474,7 +478,11 @@ fn extract_frontmatter(content: &str) -> BTreeMap<String, String> {
             }
             if let Some((key, value)) = line.split_once(':') {
                 let key = key.trim().to_string();
-                let value = value.trim().trim_matches('\'').trim_matches('"').to_string();
+                let value = value
+                    .trim()
+                    .trim_matches('\'')
+                    .trim_matches('"')
+                    .to_string();
                 if !key.is_empty() {
                     result.insert(key, value);
                 }
@@ -487,10 +495,7 @@ fn extract_frontmatter(content: &str) -> BTreeMap<String, String> {
 
 /// Parse markdown source directly (avoids re-reading the file from disk
 /// since the extractor framework already provides the content).
-fn parse_markdown_file_from_source(
-    source: &str,
-    path: &Path,
-) -> Vec<crate::types::MarkdownChunk> {
+fn parse_markdown_file_from_source(source: &str, path: &Path) -> Vec<crate::types::MarkdownChunk> {
     crate::markdown::parse_markdown_source(source, path)
 }
 
@@ -502,7 +507,8 @@ mod tests {
     #[test]
     fn test_markdown_extractor_basic() {
         let extractor = MarkdownExtractor::new();
-        let content = "# Title\n\nIntro text.\n\n## Section A\n\nContent A.\n\n## Section B\n\nContent B.\n";
+        let content =
+            "# Title\n\nIntro text.\n\n## Section A\n\nContent A.\n\n## Section B\n\nContent B.\n";
         let result = extractor.extract(Path::new("doc.md"), content).unwrap();
 
         assert_eq!(result.nodes.len(), 3);
@@ -578,8 +584,7 @@ mod tests {
     #[test]
     fn test_markdown_extractor_nested_headings() {
         let extractor = MarkdownExtractor::new();
-        let content =
-            "# Top\n\n## Sub\n\n### Deep\n\nDeep content.\n\n## Another Sub\n\nMore.\n";
+        let content = "# Top\n\n## Sub\n\n### Deep\n\nDeep content.\n\n## Another Sub\n\nMore.\n";
         let result = extractor.extract(Path::new("doc.md"), content).unwrap();
 
         assert_eq!(result.nodes.len(), 4);
@@ -608,9 +613,7 @@ mod tests {
 
     #[test]
     fn test_frontmatter_extraction() {
-        let fm = extract_frontmatter(
-            "---\nid: test\nstatus: active\n---\n\n# Hello\n",
-        );
+        let fm = extract_frontmatter("---\nid: test\nstatus: active\n---\n\n# Hello\n");
         assert_eq!(fm.get("id"), Some(&"test".to_string()));
         assert_eq!(fm.get("status"), Some(&"active".to_string()));
     }
@@ -623,9 +626,7 @@ mod tests {
 
     #[test]
     fn test_frontmatter_quoted_values() {
-        let fm = extract_frontmatter(
-            "---\ntitle: 'My Title'\ndesc: \"A description\"\n---\n",
-        );
+        let fm = extract_frontmatter("---\ntitle: 'My Title'\ndesc: \"A description\"\n---\n");
         assert_eq!(fm.get("title"), Some(&"My Title".to_string()));
         assert_eq!(fm.get("desc"), Some(&"A description".to_string()));
     }
@@ -642,22 +643,34 @@ mod tests {
 
     #[test]
     fn test_detect_oh_kind_outcome() {
-        assert_eq!(detect_oh_kind(Path::new(".oh/outcomes/my-outcome.md")), Some("outcome".to_string()));
+        assert_eq!(
+            detect_oh_kind(Path::new(".oh/outcomes/my-outcome.md")),
+            Some("outcome".to_string())
+        );
     }
 
     #[test]
     fn test_detect_oh_kind_signal() {
-        assert_eq!(detect_oh_kind(Path::new(".oh/signals/my-signal.md")), Some("signal".to_string()));
+        assert_eq!(
+            detect_oh_kind(Path::new(".oh/signals/my-signal.md")),
+            Some("signal".to_string())
+        );
     }
 
     #[test]
     fn test_detect_oh_kind_guardrail() {
-        assert_eq!(detect_oh_kind(Path::new(".oh/guardrails/my-guardrail.md")), Some("guardrail".to_string()));
+        assert_eq!(
+            detect_oh_kind(Path::new(".oh/guardrails/my-guardrail.md")),
+            Some("guardrail".to_string())
+        );
     }
 
     #[test]
     fn test_detect_oh_kind_metis() {
-        assert_eq!(detect_oh_kind(Path::new(".oh/metis/my-learning.md")), Some("metis".to_string()));
+        assert_eq!(
+            detect_oh_kind(Path::new(".oh/metis/my-learning.md")),
+            Some("metis".to_string())
+        );
     }
 
     #[test]
@@ -752,7 +765,10 @@ mod tests {
     fn test_detect_oh_kind_github_other_files_not_tagged() {
         // Other .github/ files should not get copilot-instruction tag
         assert_eq!(detect_oh_kind(Path::new(".github/workflows/ci.yml")), None);
-        assert_eq!(detect_oh_kind(Path::new(".github/PULL_REQUEST_TEMPLATE.md")), None);
+        assert_eq!(
+            detect_oh_kind(Path::new(".github/PULL_REQUEST_TEMPLATE.md")),
+            None
+        );
     }
 
     #[test]
@@ -778,10 +794,7 @@ mod tests {
         let extractor = MarkdownExtractor::new();
         let content = "# Project Context\n\nThis is a Rust project.\n";
         let result = extractor
-            .extract(
-                Path::new(".serena/memories/project-context.md"),
-                content,
-            )
+            .extract(Path::new(".serena/memories/project-context.md"), content)
             .unwrap();
         assert!(!result.nodes.is_empty());
         for node in &result.nodes {
@@ -798,11 +811,17 @@ mod tests {
     fn test_oh_artifact_gets_oh_kind_metadata() {
         let extractor = MarkdownExtractor::new();
         let content = "---\nid: test-outcome\nstatus: active\n---\n\n# My Outcome\n\nContent.\n";
-        let result = extractor.extract(Path::new(".oh/outcomes/test-outcome.md"), content).unwrap();
+        let result = extractor
+            .extract(Path::new(".oh/outcomes/test-outcome.md"), content)
+            .unwrap();
         assert!(!result.nodes.is_empty());
         for node in &result.nodes {
-            assert_eq!(node.metadata.get("oh_kind"), Some(&"outcome".to_string()),
-                "node {} should have oh_kind=outcome", node.id.name);
+            assert_eq!(
+                node.metadata.get("oh_kind"),
+                Some(&"outcome".to_string()),
+                "node {} should have oh_kind=outcome",
+                node.id.name
+            );
         }
     }
 
@@ -810,10 +829,14 @@ mod tests {
     fn test_non_oh_file_no_oh_kind() {
         let extractor = MarkdownExtractor::new();
         let content = "# Regular Doc\n\nContent.\n";
-        let result = extractor.extract(Path::new("docs/readme.md"), content).unwrap();
+        let result = extractor
+            .extract(Path::new("docs/readme.md"), content)
+            .unwrap();
         for node in &result.nodes {
-            assert!(node.metadata.get("oh_kind").is_none(),
-                "non-.oh/ node should not have oh_kind metadata");
+            assert!(
+                node.metadata.get("oh_kind").is_none(),
+                "non-.oh/ node should not have oh_kind metadata"
+            );
         }
     }
 
@@ -836,10 +859,17 @@ mod tests {
         assert_eq!(result.nodes.len(), 3);
 
         // Should have 2 Defines edges: Top -> Child A, Top -> Child B
-        let defines: Vec<_> = result.edges.iter()
+        let defines: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Defines)
             .collect();
-        assert_eq!(defines.len(), 2, "Expected 2 hierarchy edges, got {}", defines.len());
+        assert_eq!(
+            defines.len(),
+            2,
+            "Expected 2 hierarchy edges, got {}",
+            defines.len()
+        );
 
         // Both edges should come from "Top"
         for edge in &defines {
@@ -857,15 +887,25 @@ mod tests {
         let content = "# Top\n\n## Mid\n\n### Deep\n\nDeep content.\n";
         let result = extractor.extract(Path::new("doc.md"), content).unwrap();
 
-        let defines: Vec<_> = result.edges.iter()
+        let defines: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Defines)
             .collect();
         assert_eq!(defines.len(), 2);
 
         // Top -> Mid
-        assert!(defines.iter().any(|e| e.from.name == "Top" && e.to.name == "Mid"));
+        assert!(
+            defines
+                .iter()
+                .any(|e| e.from.name == "Top" && e.to.name == "Mid")
+        );
         // Mid -> Deep
-        assert!(defines.iter().any(|e| e.from.name == "Mid" && e.to.name == "Deep"));
+        assert!(
+            defines
+                .iter()
+                .any(|e| e.from.name == "Mid" && e.to.name == "Deep")
+        );
     }
 
     #[test]
@@ -874,25 +914,42 @@ mod tests {
         let content = "# Solo\n\nJust one section.\n";
         let result = extractor.extract(Path::new("doc.md"), content).unwrap();
 
-        let defines: Vec<_> = result.edges.iter()
+        let defines: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Defines)
             .collect();
-        assert_eq!(defines.len(), 0, "Single section should have no hierarchy edges");
+        assert_eq!(
+            defines.len(),
+            0,
+            "Single section should have no hierarchy edges"
+        );
     }
 
     #[test]
     fn test_frontmatter_ref_edges_outcome() {
         let extractor = MarkdownExtractor::new();
         let content = "---\nid: agent-scoping-accuracy\noutcome: agent-alignment\n---\n\n# Agent Scoping Accuracy\n\nSignal content.\n";
-        let result = extractor.extract(Path::new(".oh/signals/agent-scoping-accuracy.md"), content).unwrap();
+        let result = extractor
+            .extract(Path::new(".oh/signals/agent-scoping-accuracy.md"), content)
+            .unwrap();
 
-        let depends: Vec<_> = result.edges.iter()
+        let depends: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::DependsOn)
             .collect();
-        assert_eq!(depends.len(), 1, "Should have 1 DependsOn edge for outcome ref");
+        assert_eq!(
+            depends.len(),
+            1,
+            "Should have 1 DependsOn edge for outcome ref"
+        );
 
         let edge = &depends[0];
-        assert_eq!(edge.to.file, PathBuf::from(".oh/outcomes/agent-alignment.md"));
+        assert_eq!(
+            edge.to.file,
+            PathBuf::from(".oh/outcomes/agent-alignment.md")
+        );
         assert_eq!(edge.to.name, "agent-alignment");
     }
 
@@ -900,38 +957,60 @@ mod tests {
     fn test_frontmatter_ref_edges_no_refs() {
         let extractor = MarkdownExtractor::new();
         let content = "---\nid: my-outcome\nstatus: active\n---\n\n# My Outcome\n\nContent.\n";
-        let result = extractor.extract(Path::new(".oh/outcomes/my-outcome.md"), content).unwrap();
+        let result = extractor
+            .extract(Path::new(".oh/outcomes/my-outcome.md"), content)
+            .unwrap();
 
-        let depends: Vec<_> = result.edges.iter()
+        let depends: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::DependsOn)
             .collect();
-        assert_eq!(depends.len(), 0, "Non-reference frontmatter keys should not produce edges");
+        assert_eq!(
+            depends.len(),
+            0,
+            "Non-reference frontmatter keys should not produce edges"
+        );
     }
 
     #[test]
     fn test_link_edges_relative_path() {
         let extractor = MarkdownExtractor::new();
         let content = "# Overview\n\nSee [signals](./signals/agent-scoping.md) for details.\n";
-        let result = extractor.extract(Path::new(".oh/outcomes/agent-alignment.md"), content).unwrap();
+        let result = extractor
+            .extract(Path::new(".oh/outcomes/agent-alignment.md"), content)
+            .unwrap();
 
-        let refs: Vec<_> = result.edges.iter()
+        let refs: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::References)
             .collect();
         assert_eq!(refs.len(), 1, "Should have 1 References edge for link");
-        assert_eq!(refs[0].to.file, PathBuf::from(".oh/outcomes/signals/agent-scoping.md"));
+        assert_eq!(
+            refs[0].to.file,
+            PathBuf::from(".oh/outcomes/signals/agent-scoping.md")
+        );
     }
 
     #[test]
     fn test_link_edges_parent_relative() {
         let extractor = MarkdownExtractor::new();
         let content = "# Signal\n\nSee [outcome](../outcomes/agent-alignment.md).\n";
-        let result = extractor.extract(Path::new(".oh/signals/my-signal.md"), content).unwrap();
+        let result = extractor
+            .extract(Path::new(".oh/signals/my-signal.md"), content)
+            .unwrap();
 
-        let refs: Vec<_> = result.edges.iter()
+        let refs: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::References)
             .collect();
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].to.file, PathBuf::from(".oh/outcomes/agent-alignment.md"));
+        assert_eq!(
+            refs[0].to.file,
+            PathBuf::from(".oh/outcomes/agent-alignment.md")
+        );
     }
 
     #[test]
@@ -940,7 +1019,9 @@ mod tests {
         let content = "# Links\n\nSee [docs](https://example.com) and [mail](mailto:a@b.com).\n";
         let result = extractor.extract(Path::new("doc.md"), content).unwrap();
 
-        let refs: Vec<_> = result.edges.iter()
+        let refs: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::References)
             .collect();
         assert_eq!(refs.len(), 0, "External URLs should not produce edges");
@@ -952,7 +1033,9 @@ mod tests {
         let content = "# Intro\n\nSee [below](#details).\n";
         let result = extractor.extract(Path::new("doc.md"), content).unwrap();
 
-        let refs: Vec<_> = result.edges.iter()
+        let refs: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::References)
             .collect();
         assert_eq!(refs.len(), 0, "Anchor-only links should not produce edges");
@@ -962,9 +1045,13 @@ mod tests {
     fn test_link_edges_strip_anchor_from_path() {
         let extractor = MarkdownExtractor::new();
         let content = "# Doc\n\nSee [section](./other.md#heading).\n";
-        let result = extractor.extract(Path::new("docs/readme.md"), content).unwrap();
+        let result = extractor
+            .extract(Path::new("docs/readme.md"), content)
+            .unwrap();
 
-        let refs: Vec<_> = result.edges.iter()
+        let refs: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::References)
             .collect();
         assert_eq!(refs.len(), 1);
@@ -975,11 +1062,25 @@ mod tests {
     fn test_all_edge_types_combined() {
         let extractor = MarkdownExtractor::new();
         let content = "---\nid: my-signal\noutcome: agent-alignment\n---\n\n# My Signal\n\nSee [guardrail](../guardrails/no-lang.md).\n\n## Metrics\n\nDetails.\n";
-        let result = extractor.extract(Path::new(".oh/signals/my-signal.md"), content).unwrap();
+        let result = extractor
+            .extract(Path::new(".oh/signals/my-signal.md"), content)
+            .unwrap();
 
-        let defines: Vec<_> = result.edges.iter().filter(|e| e.kind == EdgeKind::Defines).collect();
-        let depends: Vec<_> = result.edges.iter().filter(|e| e.kind == EdgeKind::DependsOn).collect();
-        let refs: Vec<_> = result.edges.iter().filter(|e| e.kind == EdgeKind::References).collect();
+        let defines: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Defines)
+            .collect();
+        let depends: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::DependsOn)
+            .collect();
+        let refs: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::References)
+            .collect();
 
         assert!(!defines.is_empty(), "Should have hierarchy edges");
         assert!(!depends.is_empty(), "Should have frontmatter ref edges");
@@ -996,37 +1097,65 @@ mod tests {
     #[test]
     fn test_normalize_path_preserves_leading_parent() {
         // Leading .. should be preserved when there's nothing to pop
-        assert_eq!(normalize_path(Path::new("../outside.md")), PathBuf::from("../outside.md"));
-        assert_eq!(normalize_path(Path::new("../../up.md")), PathBuf::from("../../up.md"));
+        assert_eq!(
+            normalize_path(Path::new("../outside.md")),
+            PathBuf::from("../outside.md")
+        );
+        assert_eq!(
+            normalize_path(Path::new("../../up.md")),
+            PathBuf::from("../../up.md")
+        );
     }
 
     #[test]
     fn test_normalize_path_absolute_stays_absolute() {
         // .. should not pop past root directory
-        assert_eq!(normalize_path(Path::new("/foo/../../..")), PathBuf::from("/"));
-        assert_eq!(normalize_path(Path::new("/a/b/../c")), PathBuf::from("/a/c"));
+        assert_eq!(
+            normalize_path(Path::new("/foo/../../..")),
+            PathBuf::from("/")
+        );
+        assert_eq!(
+            normalize_path(Path::new("/a/b/../c")),
+            PathBuf::from("/a/c")
+        );
     }
 
     #[test]
     fn test_link_edges_skip_non_markdown_targets() {
         let extractor = MarkdownExtractor::new();
         let content = "# Doc\n\nSee [code](../src/lib.rs) and [license](../LICENSE).\n";
-        let result = extractor.extract(Path::new("docs/readme.md"), content).unwrap();
-        let refs: Vec<_> = result.edges.iter()
+        let result = extractor
+            .extract(Path::new("docs/readme.md"), content)
+            .unwrap();
+        let refs: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::References)
             .collect();
-        assert_eq!(refs.len(), 0, "Non-markdown targets should not produce edges");
+        assert_eq!(
+            refs.len(),
+            0,
+            "Non-markdown targets should not produce edges"
+        );
     }
 
     #[test]
     fn test_link_edges_dedup_same_target_different_anchors() {
         let extractor = MarkdownExtractor::new();
         let content = "# Doc\n\nSee [sec1](./other.md#one) and [sec2](./other.md#two).\n";
-        let result = extractor.extract(Path::new("docs/readme.md"), content).unwrap();
-        let refs: Vec<_> = result.edges.iter()
+        let result = extractor
+            .extract(Path::new("docs/readme.md"), content)
+            .unwrap();
+        let refs: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::References)
             .collect();
-        assert_eq!(refs.len(), 1, "Same target with different anchors should produce one edge");
+        assert_eq!(
+            refs.len(),
+            1,
+            "Same target with different anchors should produce one edge"
+        );
     }
 
     // --- Adversarial tests ---
@@ -1035,7 +1164,10 @@ mod tests {
     fn test_empty_markdown_no_edges() {
         let extractor = MarkdownExtractor::new();
         let result = extractor.extract(Path::new("empty.md"), "").unwrap();
-        assert!(result.edges.is_empty(), "Empty markdown should produce no edges");
+        assert!(
+            result.edges.is_empty(),
+            "Empty markdown should produce no edges"
+        );
     }
 
     #[test]
@@ -1043,10 +1175,16 @@ mod tests {
         let extractor = MarkdownExtractor::new();
         let content = "---\nid: test\nstatus: active\n---\n";
         let result = extractor.extract(Path::new("fm.md"), content).unwrap();
-        let defines: Vec<_> = result.edges.iter()
+        let defines: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Defines)
             .collect();
-        assert_eq!(defines.len(), 0, "Frontmatter-only doc has no heading hierarchy");
+        assert_eq!(
+            defines.len(),
+            0,
+            "Frontmatter-only doc has no heading hierarchy"
+        );
     }
 
     #[test]
@@ -1054,11 +1192,17 @@ mod tests {
         let extractor = MarkdownExtractor::new();
         let content = "# Links\n\nSee [a](./a.md), [b](./b.md), and [c](https://ext.com).\n";
         let result = extractor.extract(Path::new("doc.md"), content).unwrap();
-        let refs: Vec<_> = result.edges.iter()
+        let refs: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::References)
             .collect();
         // 2 local links, 1 external (skipped)
-        assert_eq!(refs.len(), 2, "Should emit edges for 2 local links, skip 1 external");
+        assert_eq!(
+            refs.len(),
+            2,
+            "Should emit edges for 2 local links, skip 1 external"
+        );
     }
 
     #[test]
@@ -1066,10 +1210,16 @@ mod tests {
         let extractor = MarkdownExtractor::new();
         let content = "---\nid: test\noutcome:\n---\n\n# Test\n\nContent.\n";
         let result = extractor.extract(Path::new("doc.md"), content).unwrap();
-        let depends: Vec<_> = result.edges.iter()
+        let depends: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::DependsOn)
             .collect();
-        assert_eq!(depends.len(), 0, "Empty frontmatter value should not produce edge");
+        assert_eq!(
+            depends.len(),
+            0,
+            "Empty frontmatter value should not produce edge"
+        );
     }
 
     #[test]
@@ -1078,10 +1228,16 @@ mod tests {
         let extractor = MarkdownExtractor::new();
         let content = "## A\n\nContent A.\n\n## B\n\nContent B.\n\n## C\n\nContent C.\n";
         let result = extractor.extract(Path::new("doc.md"), content).unwrap();
-        let defines: Vec<_> = result.edges.iter()
+        let defines: Vec<_> = result
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Defines)
             .collect();
-        assert_eq!(defines.len(), 0, "Same-level siblings should not have hierarchy edges");
+        assert_eq!(
+            defines.len(),
+            0,
+            "Same-level siblings should not have hierarchy edges"
+        );
     }
 
     // --- Adversarial: agent memory detection boundary conditions ---
@@ -1095,8 +1251,11 @@ mod tests {
         // always used for rules only.
         let result = detect_oh_kind(Path::new(".cursor/settings/keybindings.json"));
         // Currently tagged — documented as known behavior, not a bug to fix now.
-        assert_eq!(result, Some("cursor-rule".to_string()),
-            ".cursor/** is broadly tagged as cursor-rule (documented behavior)");
+        assert_eq!(
+            result,
+            Some("cursor-rule".to_string()),
+            ".cursor/** is broadly tagged as cursor-rule (documented behavior)"
+        );
     }
 
     #[test]
@@ -1125,8 +1284,11 @@ mod tests {
         // A file named .cursorrules deep in a subdirectory should still be tagged
         // (detect_oh_kind scans all components, not just the last)
         let result = detect_oh_kind(Path::new("some/nested/.cursorrules"));
-        assert_eq!(result, Some("cursor-rule".to_string()),
-            "Nested .cursorrules should also be tagged");
+        assert_eq!(
+            result,
+            Some("cursor-rule".to_string()),
+            "Nested .cursorrules should also be tagged"
+        );
     }
 
     #[test]
@@ -1134,6 +1296,9 @@ mod tests {
         // Only the specific copilot-instructions.md file gets the tag
         assert_eq!(detect_oh_kind(Path::new(".github/CONTRIBUTING.md")), None);
         assert_eq!(detect_oh_kind(Path::new(".github/SECURITY.md")), None);
-        assert_eq!(detect_oh_kind(Path::new(".github/ISSUE_TEMPLATE/bug.md")), None);
+        assert_eq!(
+            detect_oh_kind(Path::new(".github/ISSUE_TEMPLATE/bug.md")),
+            None
+        );
     }
 }

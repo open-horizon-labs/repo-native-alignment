@@ -48,14 +48,19 @@ impl Extractor for JsonExtractor {
         // Walk: document → object → pair (top-level only)
         let root = tree.root_node();
         for i in 0..root.child_count() {
-            let Some(child) = root.child(i as u32) else { continue };
+            let Some(child) = root.child(i as u32) else {
+                continue;
+            };
             if child.kind() == "object" {
                 extract_top_level_keys(child, path, source, &mut nodes);
                 break;
             }
         }
 
-        Ok(ExtractionResult { nodes, edges: Vec::new() })
+        Ok(ExtractionResult {
+            nodes,
+            edges: Vec::new(),
+        })
     }
 }
 
@@ -66,12 +71,16 @@ fn extract_top_level_keys(
     nodes: &mut Vec<Node>,
 ) {
     for i in 0..object.child_count() {
-        let Some(child) = object.child(i as u32) else { continue };
+        let Some(child) = object.child(i as u32) else {
+            continue;
+        };
         if child.kind() != "pair" {
             continue;
         }
 
-        let Some(key_node) = child.child_by_field_name("key") else { continue };
+        let Some(key_node) = child.child_by_field_name("key") else {
+            continue;
+        };
         let key = key_node
             .utf8_text(source)
             .unwrap_or("")
@@ -90,9 +99,9 @@ fn extract_top_level_keys(
 
         // Check if value is a scalar (string, number, boolean, null — not object/array)
         let val_node_opt = child.child_by_field_name("value");
-        let is_scalar = val_node_opt.map(|v| {
-            !matches!(v.kind(), "object" | "array")
-        }).unwrap_or(false);
+        let is_scalar = val_node_opt
+            .map(|v| !matches!(v.kind(), "object" | "array"))
+            .unwrap_or(false);
 
         // Truncate large values
         let body = if value_text.len() > 500 {
@@ -103,7 +112,10 @@ fn extract_top_level_keys(
 
         let (kind, metadata) = if is_scalar && !value_text.trim().is_empty() {
             let mut m = BTreeMap::new();
-            m.insert("value".to_string(), value_text.trim().trim_matches('"').to_string());
+            m.insert(
+                "value".to_string(),
+                value_text.trim().trim_matches('"').to_string(),
+            );
             m.insert("synthetic".to_string(), "true".to_string());
             (NodeKind::Const, m)
         } else {

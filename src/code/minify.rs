@@ -31,7 +31,10 @@ pub fn minify_body(body: &str, language: &str) -> String {
 
 fn minify_ts(body: &str) -> String {
     let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into()).is_err() {
+    if parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
+        .is_err()
+    {
         return minify_text(body, "typescript");
     }
     minify_with_ast(&mut parser, body, "typescript", collect_ts_locals)
@@ -41,7 +44,10 @@ fn minify_javascript(body: &str) -> String {
     // Use the dedicated JavaScript parser for JS/JSX to avoid
     // subtle TSX-versus-JS ambiguity in edge cases.
     let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&tree_sitter_javascript::LANGUAGE.into()).is_err() {
+    if parser
+        .set_language(&tree_sitter_javascript::LANGUAGE.into())
+        .is_err()
+    {
         return minify_text(body, "javascript");
     }
     minify_with_ast(&mut parser, body, "javascript", collect_ts_locals)
@@ -68,11 +74,7 @@ fn collect_ts_locals(
                         locals.insert(name.clone(), s.clone());
                         s
                     };
-                    ranges.push((
-                        name_node.start_byte(),
-                        name_node.end_byte(),
-                        short,
-                    ));
+                    ranges.push((name_node.start_byte(), name_node.end_byte(), short));
                 }
             }
         }
@@ -86,19 +88,19 @@ fn collect_ts_locals(
             }
         }
         "catch_clause" => {
-            if let Some(param) = node.child_by_field_name("parameter") {
-                if param.kind() == "identifier" {
-                    let name = param.utf8_text(source).unwrap_or("").to_string();
-                    if name.len() > 2 {
-                        let short = if let Some(existing) = locals.get(&name) {
-                            existing.clone()
-                        } else {
-                            let s = make_short_name(&name, used);
-                            locals.insert(name, s.clone());
-                            s
-                        };
-                        ranges.push((param.start_byte(), param.end_byte(), short));
-                    }
+            if let Some(param) = node.child_by_field_name("parameter")
+                && param.kind() == "identifier"
+            {
+                let name = param.utf8_text(source).unwrap_or("").to_string();
+                if name.len() > 2 {
+                    let short = if let Some(existing) = locals.get(&name) {
+                        existing.clone()
+                    } else {
+                        let s = make_short_name(&name, used);
+                        locals.insert(name, s.clone());
+                        s
+                    };
+                    ranges.push((param.start_byte(), param.end_byte(), short));
                 }
             }
         }
@@ -109,8 +111,11 @@ fn collect_ts_locals(
         if let Some(child) = node.child(i as u32) {
             // Don't descend into nested function bodies — their locals are separate scope
             match child.kind() {
-                "arrow_function" | "function_declaration" | "function_expression"
-                | "method_definition" | "generator_function_declaration" => continue,
+                "arrow_function"
+                | "function_declaration"
+                | "function_expression"
+                | "method_definition"
+                | "generator_function_declaration" => continue,
                 _ => collect_ts_locals(child, source, locals, ranges, used),
             }
         }
@@ -127,21 +132,20 @@ fn collect_for_binding(
     // Handle `const x` in `for (const x of ...)` — the node is a lexical_declaration
     if node.kind() == "lexical_declaration" || node.kind() == "variable_declaration" {
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
-                if child.kind() == "variable_declarator" {
-                    if let Some(name_node) = child.child_by_field_name("name") {
-                        let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                        if name_node.kind() == "identifier" && !name.is_empty() && name.len() > 2 {
-                            let short = if let Some(existing) = locals.get(&name) {
-                                existing.clone()
-                            } else {
-                                let s = make_short_name(&name, used);
-                                locals.insert(name, s.clone());
-                                s
-                            };
-                            ranges.push((name_node.start_byte(), name_node.end_byte(), short));
-                        }
-                    }
+            if let Some(child) = node.child(i as u32)
+                && child.kind() == "variable_declarator"
+                && let Some(name_node) = child.child_by_field_name("name")
+            {
+                let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                if name_node.kind() == "identifier" && !name.is_empty() && name.len() > 2 {
+                    let short = if let Some(existing) = locals.get(&name) {
+                        existing.clone()
+                    } else {
+                        let s = make_short_name(&name, used);
+                        locals.insert(name, s.clone());
+                        s
+                    };
+                    ranges.push((name_node.start_byte(), name_node.end_byte(), short));
                 }
             }
         }
@@ -160,15 +164,12 @@ fn collect_for_binding(
     }
 }
 
-
-
-
 /// Generate a deterministic 3-char base-36 name for a variable.
 /// Stable across files and projects — same original name always produces the same short name.
 /// Uses a collision set to handle the rare case two names hash to the same output.
 fn make_short_name(original: &str, used: &mut std::collections::HashSet<String>) -> String {
-    use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
 
     const ALPHA: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789"; // base-36 with letter-only first char: 26 * 36 * 36 = 33,696 slots
 
@@ -220,14 +221,19 @@ fn extract_wrapper_body(wrapped: &str) -> &str {
     wrapped
 }
 
-
 fn build_legend(locals: &HashMap<String, String>) -> String {
     if locals.is_empty() {
         return String::new();
     }
-    let mut entries: Vec<_> = locals.iter().map(|(orig, short)| (short.clone(), orig.clone())).collect();
+    let mut entries: Vec<_> = locals
+        .iter()
+        .map(|(orig, short)| (short.clone(), orig.clone()))
+        .collect();
     entries.sort();
-    let parts: Vec<String> = entries.iter().map(|(short, orig)| format!("{}={}", short, orig)).collect();
+    let parts: Vec<String> = entries
+        .iter()
+        .map(|(short, orig)| format!("{}={}", short, orig))
+        .collect();
     format!("// {}", parts.join(" "))
 }
 
@@ -259,7 +265,12 @@ struct LangConfig {
 }
 
 const TS_CONFIG: LangConfig = LangConfig {
-    scope_boundaries: &["function_declaration", "function_expression", "method_definition", "generator_function_declaration"],
+    scope_boundaries: &[
+        "function_declaration",
+        "function_expression",
+        "method_definition",
+        "generator_function_declaration",
+    ],
     closures: &["arrow_function"],
     member_expr: "member_expression",
     shorthand_prop: "shorthand_property_identifier",
@@ -341,7 +352,13 @@ fn minify_with_ast(
     let mut rename_ranges: Vec<(usize, usize, String)> = Vec::new();
     let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    collect_locals(body_node, source, &mut locals, &mut rename_ranges, &mut used_names);
+    collect_locals(
+        body_node,
+        source,
+        &mut locals,
+        &mut rename_ranges,
+        &mut used_names,
+    );
     collect_references(body_node, source, &locals, &mut rename_ranges, config);
 
     // Sort descending by start, deduplicate
@@ -367,23 +384,33 @@ fn minify_with_ast(
     if legend.is_empty() {
         cleaned
     } else {
-        let prefix = if config.comment_prefix == "#" { "# " } else { "// " };
+        let prefix = if config.comment_prefix == "#" {
+            "# "
+        } else {
+            "// "
+        };
         let legend_line = format!("{}{}", prefix, legend.trim_start_matches("// "));
         format!("{}\n{}", cleaned, legend_line)
     }
 }
 
 /// Find function body for any supported language.
-fn find_function_body_generic<'a>(root: tree_sitter::Node<'a>, language: &str) -> Option<tree_sitter::Node<'a>> {
-    fn find_body<'a>(node: tree_sitter::Node<'a>, fn_kinds: &[&str]) -> Option<tree_sitter::Node<'a>> {
+fn find_function_body_generic<'a>(
+    root: tree_sitter::Node<'a>,
+    language: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    fn find_body<'a>(
+        node: tree_sitter::Node<'a>,
+        fn_kinds: &[&str],
+    ) -> Option<tree_sitter::Node<'a>> {
         if fn_kinds.contains(&node.kind()) {
             return node.child_by_field_name("body");
         }
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
-                if let Some(body) = find_body(child, fn_kinds) {
-                    return Some(body);
-                }
+            if let Some(child) = node.child(i as u32)
+                && let Some(body) = find_body(child, fn_kinds)
+            {
+                return Some(body);
             }
         }
         None
@@ -392,8 +419,13 @@ fn find_function_body_generic<'a>(root: tree_sitter::Node<'a>, language: &str) -
         "rust" => &["function_item"],
         "python" => &["function_definition"],
         "go" => &["function_declaration", "method_declaration"],
-        _ => &["function_declaration", "function_expression", "method_definition",
-               "arrow_function", "generator_function_declaration"],
+        _ => &[
+            "function_declaration",
+            "function_expression",
+            "method_definition",
+            "arrow_function",
+            "generator_function_declaration",
+        ],
     };
     find_body(root, fn_kinds)
 }
@@ -406,33 +438,43 @@ fn collect_references(
     ranges: &mut Vec<(usize, usize, String)>,
     config: &LangConfig,
 ) {
-    if node.kind() == "identifier" || (!config.shorthand_prop.is_empty() && node.kind() == config.shorthand_prop) {
+    if node.kind() == "identifier"
+        || (!config.shorthand_prop.is_empty() && node.kind() == config.shorthand_prop)
+    {
         let text = node.utf8_text(source).unwrap_or("");
         if let Some(short) = locals.get(text) {
             if let Some(parent) = node.parent() {
                 // Don't rename property access targets
                 if parent.kind() == config.member_expr {
-                    if let Some(prop) = parent.child_by_field_name(if config.member_expr == "attribute" { "attribute" } else { "property" }) {
-                        if prop.id() == node.id() {
-                            return;
-                        }
+                    if let Some(prop) =
+                        parent.child_by_field_name(if config.member_expr == "attribute" {
+                            "attribute"
+                        } else {
+                            "property"
+                        })
+                        && prop.id() == node.id()
+                    {
+                        return;
                     }
                     // Rust field_expression: field name is "field" not "property"
-                    if config.member_expr == "field_expression" {
-                        if let Some(field) = parent.child_by_field_name("field") {
-                            if field.id() == node.id() {
-                                return;
-                            }
-                        }
+                    if config.member_expr == "field_expression"
+                        && let Some(field) = parent.child_by_field_name("field")
+                        && field.id() == node.id()
+                    {
+                        return;
                     }
                 }
                 // Don't rename object/struct literal keys
-                if parent.kind() == "pair" || parent.kind() == "field_initializer" {
-                    if let Some(key) = parent.child_by_field_name(if parent.kind() == "field_initializer" { "field" } else { "key" }) {
-                        if key.id() == node.id() {
-                            return;
-                        }
-                    }
+                if (parent.kind() == "pair" || parent.kind() == "field_initializer")
+                    && let Some(key) =
+                        parent.child_by_field_name(if parent.kind() == "field_initializer" {
+                            "field"
+                        } else {
+                            "key"
+                        })
+                    && key.id() == node.id()
+                {
+                    return;
                 }
                 // Don't rename imports
                 if parent.kind().contains("import") {
@@ -441,7 +483,11 @@ fn collect_references(
             }
             // Expand shorthand properties to preserve object shape
             if !config.shorthand_prop.is_empty() && node.kind() == config.shorthand_prop {
-                ranges.push((node.start_byte(), node.end_byte(), format!("{}: {}", text, short)));
+                ranges.push((
+                    node.start_byte(),
+                    node.end_byte(),
+                    format!("{}: {}", text, short),
+                ));
             } else {
                 ranges.push((node.start_byte(), node.end_byte(), short.clone()));
             }
@@ -486,7 +532,10 @@ fn register_local(
 
 /// Indent a body for Python wrapping.
 fn indent_body(body: &str, indent: &str) -> String {
-    body.lines().map(|l| format!("{}{}", indent, l)).collect::<Vec<_>>().join("\n")
+    body.lines()
+        .map(|l| format!("{}{}", indent, l))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Extract body from Python `def __wrapper__():` wrapper.
@@ -549,7 +598,9 @@ fn collect_rust_pattern_bindings(
 ) {
     if node.kind() == "identifier" {
         let name = node.utf8_text(source).unwrap_or("");
-        if name != "_" { register_local(name, node, locals, ranges, used); }
+        if name != "_" {
+            register_local(name, node, locals, ranges, used);
+        }
     } else if node.kind() == "tuple_pattern" || node.kind() == "slice_pattern" {
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i as u32) {
@@ -604,29 +655,31 @@ fn collect_python_locals(
         "with_statement" => {
             // with expr as name:
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
-                    if child.kind() == "as_pattern" {
-                        if let Some(alias) = child.child_by_field_name("alias") {
-                            collect_python_targets(alias, source, locals, ranges, used);
-                        }
-                    }
+                if let Some(child) = node.child(i as u32)
+                    && child.kind() == "as_pattern"
+                    && let Some(alias) = child.child_by_field_name("alias")
+                {
+                    collect_python_targets(alias, source, locals, ranges, used);
                 }
             }
         }
         "named_expression" => {
             // walrus operator: name := expr
-            if let Some(name) = node.child_by_field_name("name") {
-                if name.kind() == "identifier" {
-                    let text = name.utf8_text(source).unwrap_or("");
-                    register_local(text, name, locals, ranges, used);
-                }
+            if let Some(name) = node.child_by_field_name("name")
+                && name.kind() == "identifier"
+            {
+                let text = name.utf8_text(source).unwrap_or("");
+                register_local(text, name, locals, ranges, used);
             }
         }
         _ => {}
     }
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            if child.kind() == "function_definition" || child.kind() == "class_definition" || child.kind() == "lambda" {
+            if child.kind() == "function_definition"
+                || child.kind() == "class_definition"
+                || child.kind() == "lambda"
+            {
                 continue;
             }
             collect_python_locals(child, source, locals, ranges, used);
@@ -648,7 +701,11 @@ fn collect_python_targets(
         if name != "self" && name != "cls" && name != "_" {
             register_local(name, node, locals, ranges, used);
         }
-    } else if node.kind() == "tuple" || node.kind() == "list" || node.kind() == "pattern_list" || node.kind() == "tuple_pattern" {
+    } else if node.kind() == "tuple"
+        || node.kind() == "list"
+        || node.kind() == "pattern_list"
+        || node.kind() == "tuple_pattern"
+    {
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i as u32) {
                 collect_python_targets(child, source, locals, ranges, used);
@@ -676,12 +733,11 @@ fn collect_go_locals(
         "var_declaration" => {
             // var x int = ...
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
-                    if child.kind() == "var_spec" {
-                        if let Some(name) = child.child_by_field_name("name") {
-                            collect_go_id_list(name, source, locals, ranges, used);
-                        }
-                    }
+                if let Some(child) = node.child(i as u32)
+                    && child.kind() == "var_spec"
+                    && let Some(name) = child.child_by_field_name("name")
+                {
+                    collect_go_id_list(name, source, locals, ranges, used);
                 }
             }
         }
@@ -695,8 +751,10 @@ fn collect_go_locals(
     }
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            if child.kind() == "function_declaration" || child.kind() == "method_declaration"
-                || child.kind() == "func_literal" {
+            if child.kind() == "function_declaration"
+                || child.kind() == "method_declaration"
+                || child.kind() == "func_literal"
+            {
                 continue;
             }
             collect_go_locals(child, source, locals, ranges, used);
@@ -714,7 +772,8 @@ fn collect_go_id_list(
 ) {
     if node.kind() == "identifier" {
         let name = node.utf8_text(source).unwrap_or("");
-        if name != "_" && name != "err" { // keep common Go conventions short
+        if name != "_" && name != "err" {
+            // keep common Go conventions short
             register_local(name, node, locals, ranges, used);
         }
     } else if node.kind() == "expression_list" {
@@ -726,14 +785,16 @@ fn collect_go_id_list(
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Rust minification (simpler — no type stripping since types are meaningful)
 // ---------------------------------------------------------------------------
 
 fn minify_rust(body: &str) -> String {
     let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&tree_sitter_rust::LANGUAGE.into()).is_err() {
+    if parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .is_err()
+    {
         return minify_text(body, "rust");
     }
     minify_with_ast(&mut parser, body, "rust", collect_rust_locals)
@@ -745,7 +806,10 @@ fn minify_rust(body: &str) -> String {
 
 fn minify_python(body: &str) -> String {
     let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&tree_sitter_python::LANGUAGE.into()).is_err() {
+    if parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .is_err()
+    {
         return minify_text(body, "python");
     }
     minify_with_ast(&mut parser, body, "python", collect_python_locals)
@@ -757,7 +821,10 @@ fn minify_python(body: &str) -> String {
 
 fn minify_go(body: &str) -> String {
     let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&tree_sitter_go::LANGUAGE.into()).is_err() {
+    if parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .is_err()
+    {
         return minify_text(body, "go");
     }
     minify_with_ast(&mut parser, body, "go", collect_go_locals)
@@ -818,7 +885,10 @@ fn minify_text(body: &str, language: &str) -> String {
         result.push(trimmed);
     }
 
-    let start = result.iter().position(|s| !s.is_empty()).unwrap_or(result.len());
+    let start = result
+        .iter()
+        .position(|s| !s.is_empty())
+        .unwrap_or(result.len());
     let end = result
         .iter()
         .rposition(|s| !s.is_empty())
@@ -939,10 +1009,21 @@ mod tests {
         // Code lines should use short names, not originals
         let code_lines: Vec<&str> = result.lines().filter(|l| !l.starts_with("// ")).collect();
         let code = code_lines.join("\n");
-        assert!(!code.contains("userCount"), "userCount should be renamed in code: {}", code);
+        assert!(
+            !code.contains("userCount"),
+            "userCount should be renamed in code: {}",
+            code
+        );
         // Legend should map short names back to originals
-        let legend = result.lines().find(|l| l.starts_with("// ")).expect("should have legend");
-        assert!(legend.contains("userCount"), "legend should mention userCount: {}", legend);
+        let legend = result
+            .lines()
+            .find(|l| l.starts_with("// "))
+            .expect("should have legend");
+        assert!(
+            legend.contains("userCount"),
+            "legend should mention userCount: {}",
+            legend
+        );
     }
 
     #[test]
@@ -953,7 +1034,6 @@ mod tests {
         assert!(result.contains("x"));
         assert!(!result.contains("// ")); // no legend needed
     }
-
 
     #[test]
     fn test_preserves_property_access() {

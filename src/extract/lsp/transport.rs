@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -41,9 +41,7 @@ pub(super) fn path_to_uri(path: &Path) -> Result<Uri> {
 /// Find the narrowest enclosing function/impl/struct at a given file + line.
 /// Returns None if no symbol contains this location.
 pub(super) fn find_enclosing_symbol(nodes: &[&Node], file: &Path, line: usize) -> Option<NodeId> {
-    let file_matches: Vec<_> = nodes.iter()
-        .filter(|n| n.id.file == file)
-        .collect();
+    let file_matches: Vec<_> = nodes.iter().filter(|n| n.id.file == file).collect();
 
     if file_matches.is_empty() {
         // Try matching just the filename if full path doesn't match
@@ -51,7 +49,11 @@ pub(super) fn find_enclosing_symbol(nodes: &[&Node], file: &Path, line: usize) -
         tracing::debug!(
             "No nodes match path '{}', trying {} node paths",
             file_str,
-            nodes.iter().map(|n| n.id.file.display().to_string()).collect::<std::collections::HashSet<_>>().len()
+            nodes
+                .iter()
+                .map(|n| n.id.file.display().to_string())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
         );
         // Log first few node paths for comparison
         for n in nodes.iter().take(3) {
@@ -59,10 +61,20 @@ pub(super) fn find_enclosing_symbol(nodes: &[&Node], file: &Path, line: usize) -
         }
     }
 
-    file_matches.iter()
-        .filter(|n| matches!(n.id.kind,
-            NodeKind::Function | NodeKind::Impl | NodeKind::Struct
-            | NodeKind::Trait | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Const))
+    file_matches
+        .iter()
+        .filter(|n| {
+            matches!(
+                n.id.kind,
+                NodeKind::Function
+                    | NodeKind::Impl
+                    | NodeKind::Struct
+                    | NodeKind::Trait
+                    | NodeKind::Enum
+                    | NodeKind::TypeAlias
+                    | NodeKind::Const
+            )
+        })
         .filter(|n| n.line_start <= line && n.line_end >= line)
         .min_by_key(|n| n.line_end - n.line_start)
         .map(|n| n.id.clone())
@@ -83,9 +95,15 @@ pub(super) fn uri_to_relative_path(uri: &Uri, root: &Path) -> PathBuf {
             let rel = abs_path.strip_prefix(root).unwrap_or(&abs_path);
             return rel.to_path_buf();
         }
-        tracing::debug!(uri = uri_str, "uri_to_relative_path: url::Url parsed but to_file_path() failed; falling back to raw strip");
+        tracing::debug!(
+            uri = uri_str,
+            "uri_to_relative_path: url::Url parsed but to_file_path() failed; falling back to raw strip"
+        );
     } else {
-        tracing::debug!(uri = uri_str, "uri_to_relative_path: url::Url::parse failed; falling back to raw strip");
+        tracing::debug!(
+            uri = uri_str,
+            "uri_to_relative_path: url::Url::parse failed; falling back to raw strip"
+        );
     }
 
     // Fallback for non-standard URIs: strip the scheme prefix without decoding.
@@ -159,7 +177,10 @@ impl LspTransport {
         match result {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(anyhow::anyhow!("LSP request {} timed out after 60s", method)),
+            Err(_) => Err(anyhow::anyhow!(
+                "LSP request {} timed out after 60s",
+                method
+            )),
         }
     }
 
@@ -198,12 +219,16 @@ impl LspTransport {
 
             // Check if this is our response
             if let Some(id) = msg.get("id")
-                && id.as_i64() == Some(expected_id) {
-                    if let Some(error) = msg.get("error") {
-                        return Err(anyhow::anyhow!("LSP error: {}", error));
-                    }
-                    return Ok(msg.get("result").cloned().unwrap_or(serde_json::Value::Null));
+                && id.as_i64() == Some(expected_id)
+            {
+                if let Some(error) = msg.get("error") {
+                    return Err(anyhow::anyhow!("LSP error: {}", error));
                 }
+                return Ok(msg
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null));
+            }
 
             // Otherwise it's a notification or a response to a different request -- skip it
         }
@@ -244,11 +269,7 @@ impl LspTransport {
         // Send exit notification
         let _ = self.notify("exit", serde_json::Value::Null).await;
         // Wait for process to exit
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            self.child.wait(),
-        )
-        .await;
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), self.child.wait()).await;
         Ok(())
     }
 }
@@ -272,7 +293,9 @@ pub(super) struct PipelinedTransport {
     /// Uses std::sync::Mutex (not tokio) because the critical section is
     /// non-async (just HashMap insert/remove) and we want minimal overhead
     /// under high concurrency.
-    pending: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>>,
+    pending: Arc<
+        std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>,
+    >,
     /// Buffer for textDocument/publishDiagnostics notifications.
     /// Maps document URI to the most-recently-received diagnostics array.
     /// The reader loop fills this as notifications arrive; enrichment reads it
@@ -308,8 +331,9 @@ impl PipelinedTransport {
         let reader = transport.reader;
         let next_id = transport.next_id;
 
-        let pending: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let pending: Arc<
+            std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         let quiescent_flag = Arc::new(AtomicBool::new(initial_quiescent));
 
@@ -339,7 +363,9 @@ impl PipelinedTransport {
     /// is received — allowing later `enrich()` calls to proceed after RA finishes indexing.
     async fn reader_loop(
         mut reader: BufReader<tokio::process::ChildStdout>,
-        pending: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>>,
+        pending: Arc<
+            std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>,
+        >,
         diagnostics_sink: Arc<std::sync::Mutex<HashMap<String, Vec<serde_json::Value>>>>,
         quiescent_flag: Arc<AtomicBool>,
     ) {
@@ -353,7 +379,8 @@ impl PipelinedTransport {
                     let mut map = pending.lock().unwrap();
                     for (id, sender) in map.drain() {
                         let _ = sender.send(Err(anyhow::anyhow!(
-                            "LSP transport closed while waiting for response {}", id
+                            "LSP transport closed while waiting for response {}",
+                            id
                         )));
                     }
                     break;
@@ -369,7 +396,10 @@ impl PipelinedTransport {
                         let result = if let Some(error) = msg.get("error") {
                             Err(anyhow::anyhow!("LSP error: {}", error))
                         } else {
-                            Ok(msg.get("result").cloned().unwrap_or(serde_json::Value::Null))
+                            Ok(msg
+                                .get("result")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null))
                         };
                         let _ = sender.send(result);
                     }
@@ -378,34 +408,58 @@ impl PipelinedTransport {
                 // It has both "id" and "method" — it's a server-to-client *request*
                 // (e.g. window/workDoneProgress/create). We need to respond.
                 if let Some(method) = msg.get("method").and_then(|m| m.as_str())
-                    && method == "window/workDoneProgress/create" {
-                        // We can't write back from the reader loop without the writer.
-                        // These are non-critical during enrichment; log and skip.
-                        tracing::debug!("PipelinedTransport: ignoring server request {} (id={})", method, id);
-                    }
+                    && method == "window/workDoneProgress/create"
+                {
+                    // We can't write back from the reader loop without the writer.
+                    // These are non-critical during enrichment; log and skip.
+                    tracing::debug!(
+                        "PipelinedTransport: ignoring server request {} (id={})",
+                        method,
+                        id
+                    );
+                }
             }
 
             // Notifications: log progress, capture diagnostics, ignore the rest
             if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
                 match method {
                     "$/progress" => {
-                        let kind = msg.pointer("/params/value/kind").and_then(|k| k.as_str()).unwrap_or("");
-                        let title = msg.pointer("/params/value/title").and_then(|t| t.as_str()).unwrap_or("");
+                        let kind = msg
+                            .pointer("/params/value/kind")
+                            .and_then(|k| k.as_str())
+                            .unwrap_or("");
+                        let title = msg
+                            .pointer("/params/value/title")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("");
                         if kind == "begin" || kind == "end" {
                             tracing::debug!("PipelinedTransport progress {}: {}", kind, title);
                         }
                     }
                     "experimental/serverStatus" => {
-                        let health = msg.pointer("/params/health").and_then(|h| h.as_str()).unwrap_or("");
-                        let quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(true);
-                        tracing::debug!("PipelinedTransport serverStatus: health={}, quiescent={}", health, quiescent);
+                        let health = msg
+                            .pointer("/params/health")
+                            .and_then(|h| h.as_str())
+                            .unwrap_or("");
+                        let quiescent = msg
+                            .pointer("/params/quiescent")
+                            .and_then(|q| q.as_bool())
+                            .unwrap_or(true);
+                        tracing::debug!(
+                            "PipelinedTransport serverStatus: health={}, quiescent={}",
+                            health,
+                            quiescent
+                        );
                         // Live-update the quiescent flag. Once RA becomes quiescent
                         // (even after the initialization timeout), later enrich() calls
                         // can proceed. This prevents the one-time timeout from permanently
                         // blocking all subsequent enrichment for the session.
                         if quiescent {
                             quiescent_flag.store(true, Ordering::Release);
-                            tracing::info!("PipelinedTransport: server became quiescent (health={}), Pass 1 now enabled", health);
+                            tracing::info!(
+                                "PipelinedTransport: server became quiescent (health={}), Pass 1 now enabled",
+                                health
+                            );
                         }
                     }
                     "textDocument/publishDiagnostics" => {
@@ -413,7 +467,8 @@ impl PipelinedTransport {
                         // params.uri: document URI
                         // params.diagnostics: array of Diagnostic objects
                         if let Some(uri) = msg.pointer("/params/uri").and_then(|u| u.as_str()) {
-                            let diags = msg.pointer("/params/diagnostics")
+                            let diags = msg
+                                .pointer("/params/diagnostics")
                                 .and_then(|d| d.as_array())
                                 .cloned()
                                 .unwrap_or_default();
@@ -433,7 +488,9 @@ impl PipelinedTransport {
     }
 
     /// Read a single Content-Length framed LSP message.
-    async fn read_message(reader: &mut BufReader<tokio::process::ChildStdout>) -> Result<serde_json::Value> {
+    async fn read_message(
+        reader: &mut BufReader<tokio::process::ChildStdout>,
+    ) -> Result<serde_json::Value> {
         let mut content_length: Option<usize> = None;
 
         // Read headers
@@ -503,12 +560,20 @@ impl PipelinedTransport {
         let timeout = tokio::time::Duration::from_secs(30);
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(anyhow::anyhow!("LSP response channel closed for {} (id={})", method, id)),
+            Ok(Err(_)) => Err(anyhow::anyhow!(
+                "LSP response channel closed for {} (id={})",
+                method,
+                id
+            )),
             Err(_) => {
                 // Remove the pending entry on timeout
                 let mut map = self.pending.lock().unwrap();
                 map.remove(&id);
-                Err(anyhow::anyhow!("LSP request {} timed out after 30s (id={})", method, id))
+                Err(anyhow::anyhow!(
+                    "LSP request {} timed out after 30s (id={})",
+                    method,
+                    id
+                ))
             }
         }
     }

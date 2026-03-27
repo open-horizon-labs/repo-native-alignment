@@ -121,7 +121,10 @@ pub fn fastapi_router_prefix_pass(nodes: &mut [Node], root_pairs: &[(String, Pat
         .filter(|n| {
             n.language == "python"
                 && n.id.kind == NodeKind::ApiEndpoint
-                && n.metadata.get("router_var").map(|v| !v.is_empty()).unwrap_or(false)
+                && n.metadata
+                    .get("router_var")
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
         })
         .map(|n| n.id.file.clone())
         .collect();
@@ -142,7 +145,9 @@ pub fn fastapi_router_prefix_pass(nodes: &mut [Node], root_pairs: &[(String, Pat
             Ok(prefixes) if !prefixes.is_empty() => {
                 // Merge into global map (constructor-arg prefix takes precedence over include_router).
                 for (var, prefix) in &prefixes {
-                    global_prefix_map.entry(var.clone()).or_insert_with(|| prefix.clone());
+                    global_prefix_map
+                        .entry(var.clone())
+                        .or_insert_with(|| prefix.clone());
                 }
                 file_prefix_map.insert(file_path.clone(), prefixes);
             }
@@ -150,7 +155,8 @@ pub fn fastapi_router_prefix_pass(nodes: &mut [Node], root_pairs: &[(String, Pat
             Err(e) => {
                 tracing::warn!(
                     "fastapi_router_prefix: could not read {:?}: {}",
-                    file_path, e
+                    file_path,
+                    e
                 );
             }
         }
@@ -162,10 +168,7 @@ pub fn fastapi_router_prefix_pass(nodes: &mut [Node], root_pairs: &[(String, Pat
         // Collect all router_var names that still need a prefix (no same-file prefix found).
         let unresolved_vars: std::collections::HashSet<String> = nodes
             .iter()
-            .filter(|n| {
-                n.language == "python"
-                    && n.id.kind == NodeKind::ApiEndpoint
-            })
+            .filter(|n| n.language == "python" && n.id.kind == NodeKind::ApiEndpoint)
             .filter_map(|n| n.metadata.get("router_var"))
             .filter(|v| !v.is_empty() && !global_prefix_map.contains_key(*v))
             .cloned()
@@ -298,9 +301,7 @@ fn walk_dir_for_include_router(
 /// `include_router(var, prefix=...)` call args.
 ///
 /// Returns `Err` only if the file cannot be read.
-fn extract_prefixes_from_file(
-    path: &Path,
-) -> Result<HashMap<String, String>, std::io::Error> {
+fn extract_prefixes_from_file(path: &Path) -> Result<HashMap<String, String>, std::io::Error> {
     let content = std::fs::read_to_string(path)?;
     let mut map = extract_router_prefixes_from_str(&content);
     // Also pick up include_router prefixes in the same file.
@@ -346,7 +347,8 @@ pub(crate) fn extract_router_prefixes_from_str(content: &str) -> HashMap<String,
 
         // If both "prefix" and a closing ")" are on the same line, try
         // the single-line parser directly.
-        if trimmed.contains("prefix") && trimmed.contains(')')
+        if trimmed.contains("prefix")
+            && trimmed.contains(')')
             && let Some((var, prefix)) = parse_api_router_assignment(trimmed)
         {
             map.insert(var, prefix);
@@ -411,7 +413,8 @@ pub(crate) fn extract_include_router_prefixes_from_str(content: &str) -> HashMap
         }
 
         // Try single-line parse first.
-        if trimmed.contains("prefix") && trimmed.contains(')')
+        if trimmed.contains("prefix")
+            && trimmed.contains(')')
             && let Some((var, prefix)) = parse_include_router_call(trimmed)
         {
             map.insert(var, prefix);
@@ -473,7 +476,11 @@ fn extract_include_router_var(args: &str) -> Option<String> {
     if let Some(pos) = args.find("router=") {
         // Make sure this is `router=` not `include_router=` or similar.
         // The char before `router=` must be a word-boundary character.
-        let before_pos = if pos > 0 { args.as_bytes()[pos - 1] } else { b'(' };
+        let before_pos = if pos > 0 {
+            args.as_bytes()[pos - 1]
+        } else {
+            b'('
+        };
         if before_pos == b'(' || before_pos == b',' || before_pos == b' ' {
             let after = args[pos + "router=".len()..].trim_start();
             let var = take_identifier(after);
@@ -490,11 +497,7 @@ fn extract_include_router_var(args: &str) -> Option<String> {
         return None;
     }
     let var = take_identifier(first_arg);
-    if !var.is_empty() {
-        Some(var)
-    } else {
-        None
-    }
+    if !var.is_empty() { Some(var) } else { None }
 }
 
 /// Take a Python identifier from the start of `s`.
@@ -617,7 +620,8 @@ fn apply_prefix(node: &mut Node, prefix: &str) {
             Some(p) => p.clone(),
             None => return,
         };
-        node.metadata.insert("http_path_local".to_string(), raw.clone());
+        node.metadata
+            .insert("http_path_local".to_string(), raw.clone());
         raw
     };
 
@@ -629,7 +633,8 @@ fn apply_prefix(node: &mut Node, prefix: &str) {
 
     let full_path = join_paths(prefix, &local_path);
 
-    node.metadata.insert("http_path".to_string(), full_path.clone());
+    node.metadata
+        .insert("http_path".to_string(), full_path.clone());
     node.id.name = format!("{} {}", method, full_path);
     node.signature = format!("[route_decorator] {} {}", method, full_path);
 }
@@ -654,13 +659,21 @@ mod tests {
 
     #[test]
     fn test_join_paths() {
-        assert_eq!(join_paths("/workspaces/{id}", "/expertunities"),
-                   "/workspaces/{id}/expertunities");
+        assert_eq!(
+            join_paths("/workspaces/{id}", "/expertunities"),
+            "/workspaces/{id}/expertunities"
+        );
         assert_eq!(join_paths("/api", "/users"), "/api/users");
         assert_eq!(join_paths("/api/", "/users"), "/api/users");
     }
 
-    fn make_api_endpoint(file: &str, _name: &str, method: &str, http_path: &str, router_var: Option<&str>) -> Node {
+    fn make_api_endpoint(
+        file: &str,
+        _name: &str,
+        method: &str,
+        http_path: &str,
+        router_var: Option<&str>,
+    ) -> Node {
         let mut metadata = BTreeMap::new();
         metadata.insert("http_method".to_string(), method.to_string());
         metadata.insert("http_path".to_string(), http_path.to_string());
@@ -692,7 +705,10 @@ mod tests {
 workspace_router = APIRouter(prefix="/workspaces/{id}")
 "#;
         let map = extract_router_prefixes_from_str(content);
-        assert_eq!(map.get("workspace_router").map(|s| s.as_str()), Some("/workspaces/{id}"));
+        assert_eq!(
+            map.get("workspace_router").map(|s| s.as_str()),
+            Some("/workspaces/{id}")
+        );
     }
 
     #[test]
@@ -726,7 +742,10 @@ router = APIRouter(tags=["workspaces"], prefix="/workspaces")
         // Prefix must start with `/` to be valid.
         let content = r#"router = APIRouter(prefix="no-slash")"#;
         let map = extract_router_prefixes_from_str(content);
-        assert!(map.is_empty(), "prefix without leading slash must be ignored");
+        assert!(
+            map.is_empty(),
+            "prefix without leading slash must be ignored"
+        );
     }
 
     #[test]
@@ -737,7 +756,10 @@ items_router = APIRouter(prefix="/items")
 "#;
         let map = extract_router_prefixes_from_str(content);
         assert_eq!(map.len(), 2);
-        assert_eq!(map.get("workspace_router").map(|s| s.as_str()), Some("/workspaces/{id}"));
+        assert_eq!(
+            map.get("workspace_router").map(|s| s.as_str()),
+            Some("/workspaces/{id}")
+        );
         assert_eq!(map.get("items_router").map(|s| s.as_str()), Some("/items"));
     }
 
@@ -770,10 +792,7 @@ items_router = APIRouter(prefix="/items")
         // Note: this is unusual but we test robustness
         let content = r#"app.include_router(items_router, tags=["items"], prefix="/items")"#;
         let map = extract_include_router_prefixes_from_str(content);
-        assert_eq!(
-            map.get("items_router").map(|s| s.as_str()),
-            Some("/items"),
-        );
+        assert_eq!(map.get("items_router").map(|s| s.as_str()), Some("/items"),);
     }
 
     #[test]
@@ -791,14 +810,20 @@ items_router = APIRouter(prefix="/items")
     fn test_include_router_no_prefix_ignored() {
         let content = r#"app.include_router(router_without_prefix)"#;
         let map = extract_include_router_prefixes_from_str(content);
-        assert!(map.is_empty(), "include_router without prefix must produce no entry");
+        assert!(
+            map.is_empty(),
+            "include_router without prefix must produce no entry"
+        );
     }
 
     #[test]
     fn test_include_router_prefix_no_leading_slash_ignored() {
         let content = r#"app.include_router(bad_router, prefix="no-slash")"#;
         let map = extract_include_router_prefixes_from_str(content);
-        assert!(map.is_empty(), "prefix without leading slash must be ignored");
+        assert!(
+            map.is_empty(),
+            "prefix without leading slash must be ignored"
+        );
     }
 
     #[test]
@@ -810,7 +835,10 @@ app.include_router(auth_router, prefix="/auth")
 "#;
         let map = extract_include_router_prefixes_from_str(content);
         assert_eq!(map.len(), 3);
-        assert_eq!(map.get("workspace_router").map(|s| s.as_str()), Some("/workspaces"));
+        assert_eq!(
+            map.get("workspace_router").map(|s| s.as_str()),
+            Some("/workspaces")
+        );
         assert_eq!(map.get("user_router").map(|s| s.as_str()), Some("/users"));
         assert_eq!(map.get("auth_router").map(|s| s.as_str()), Some("/auth"));
     }
@@ -831,7 +859,10 @@ app.include_router(auth_router, prefix="/auth")
 
     #[test]
     fn test_join_paths_standard() {
-        assert_eq!(join_paths("/workspaces/{id}", "/expertunities"), "/workspaces/{id}/expertunities");
+        assert_eq!(
+            join_paths("/workspaces/{id}", "/expertunities"),
+            "/workspaces/{id}/expertunities"
+        );
     }
 
     #[test]
@@ -857,9 +888,15 @@ app.include_router(auth_router, prefix="/auth")
             Some("workspace_router"),
         );
         apply_prefix(&mut node, "/workspaces/{id}");
-        assert_eq!(node.metadata.get("http_path").map(|s| s.as_str()), Some("/workspaces/{id}/expertunities"));
+        assert_eq!(
+            node.metadata.get("http_path").map(|s| s.as_str()),
+            Some("/workspaces/{id}/expertunities")
+        );
         assert_eq!(node.id.name, "GET /workspaces/{id}/expertunities");
-        assert_eq!(node.signature, "[route_decorator] GET /workspaces/{id}/expertunities");
+        assert_eq!(
+            node.signature,
+            "[route_decorator] GET /workspaces/{id}/expertunities"
+        );
     }
 
     /// Verifies that `apply_prefix` is idempotent: calling it twice with the same
@@ -899,23 +936,25 @@ app.include_router(auth_router, prefix="/auth")
     /// Acceptance test: `APIRouter(prefix=...)` in same file.
     #[test]
     fn test_pass_prepends_prefix_to_local_path() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         // Write a Python file with an APIRouter assignment
         let mut tmpfile = NamedTempFile::new().unwrap();
-        writeln!(tmpfile, r#"workspace_router = APIRouter(prefix="/workspaces/{{id}}")"#).unwrap();
+        writeln!(
+            tmpfile,
+            r#"workspace_router = APIRouter(prefix="/workspaces/{{id}}")"#
+        )
+        .unwrap();
         let path = tmpfile.path().to_path_buf();
 
-        let mut nodes = vec![
-            make_api_endpoint(
-                path.to_str().unwrap(),
-                "GET /expertunities",
-                "GET",
-                "/expertunities",
-                Some("workspace_router"),
-            ),
-        ];
+        let mut nodes = vec![make_api_endpoint(
+            path.to_str().unwrap(),
+            "GET /expertunities",
+            "GET",
+            "/expertunities",
+            Some("workspace_router"),
+        )];
         fastapi_router_prefix_pass(&mut nodes, &[]);
 
         let ep = &nodes[0];
@@ -944,8 +983,8 @@ app.include_router(auth_router, prefix="/auth")
     /// `http_path = "/workspaces/{workspace_id}/expertunities/"`.
     #[test]
     fn test_pass_include_router_cross_file_prefix() {
-        use tempfile::{NamedTempFile, TempDir};
         use std::io::Write;
+        use tempfile::{NamedTempFile, TempDir};
 
         // Create a temp dir representing the project root.
         let tmp_dir = TempDir::new().unwrap();
@@ -963,15 +1002,13 @@ app.include_router(auth_router, prefix="/auth")
         ).unwrap();
 
         let root_pairs = vec![("repo".to_string(), tmp_dir.path().to_path_buf())];
-        let mut nodes = vec![
-            make_api_endpoint(
-                endpoint_path.to_str().unwrap(),
-                "GET /",
-                "GET",
-                "/",
-                Some("expertunities_router"),
-            ),
-        ];
+        let mut nodes = vec![make_api_endpoint(
+            endpoint_path.to_str().unwrap(),
+            "GET /",
+            "GET",
+            "/",
+            Some("expertunities_router"),
+        )];
         fastapi_router_prefix_pass(&mut nodes, &root_pairs);
 
         let ep = &nodes[0];
@@ -986,14 +1023,18 @@ app.include_router(auth_router, prefix="/auth")
     /// the APIRouter constructor arg takes precedence.
     #[test]
     fn test_constructor_prefix_takes_precedence_over_include_router() {
-        use tempfile::{NamedTempFile, TempDir};
         use std::io::Write;
+        use tempfile::{NamedTempFile, TempDir};
 
         let tmp_dir = TempDir::new().unwrap();
 
         // Endpoint file: router has a constructor prefix.
         let mut endpoint_file = NamedTempFile::new_in(tmp_dir.path()).unwrap();
-        writeln!(endpoint_file, r#"my_router = APIRouter(prefix="/constructor-prefix")"#).unwrap();
+        writeln!(
+            endpoint_file,
+            r#"my_router = APIRouter(prefix="/constructor-prefix")"#
+        )
+        .unwrap();
         let endpoint_path = endpoint_file.path().to_path_buf();
 
         // Parent file also has an include_router with a DIFFERENT prefix.
@@ -1001,18 +1042,17 @@ app.include_router(auth_router, prefix="/auth")
         std::fs::write(
             &main_py,
             r#"app.include_router(my_router, prefix="/include-router-prefix")"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let root_pairs = vec![("repo".to_string(), tmp_dir.path().to_path_buf())];
-        let mut nodes = vec![
-            make_api_endpoint(
-                endpoint_path.to_str().unwrap(),
-                "GET /endpoint",
-                "GET",
-                "/endpoint",
-                Some("my_router"),
-            ),
-        ];
+        let mut nodes = vec![make_api_endpoint(
+            endpoint_path.to_str().unwrap(),
+            "GET /endpoint",
+            "GET",
+            "/endpoint",
+            Some("my_router"),
+        )];
         fastapi_router_prefix_pass(&mut nodes, &root_pairs);
 
         // Constructor prefix takes precedence.
@@ -1026,24 +1066,25 @@ app.include_router(auth_router, prefix="/auth")
     /// Nodes without `router_var` metadata are untouched.
     #[test]
     fn test_pass_leaves_nodes_without_router_var_unchanged() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         let mut tmpfile = NamedTempFile::new().unwrap();
         writeln!(tmpfile, r#"app = FastAPI()"#).unwrap();
         let path = tmpfile.path().to_path_buf();
 
-        let mut nodes = vec![
-            make_api_endpoint(
-                path.to_str().unwrap(),
-                "GET /users",
-                "GET",
-                "/users",
-                None, // no router_var
-            ),
-        ];
+        let mut nodes = vec![make_api_endpoint(
+            path.to_str().unwrap(),
+            "GET /users",
+            "GET",
+            "/users",
+            None, // no router_var
+        )];
         fastapi_router_prefix_pass(&mut nodes, &[]);
-        assert_eq!(nodes[0].metadata.get("http_path").map(|s| s.as_str()), Some("/users"));
+        assert_eq!(
+            nodes[0].metadata.get("http_path").map(|s| s.as_str()),
+            Some("/users")
+        );
     }
 
     // ── fast path (no matching nodes → no file I/O) ───────────────────────
@@ -1062,8 +1103,14 @@ app.include_router(auth_router, prefix="/auth")
             make_api_endpoint("/app/routes.py", "POST /users", "POST", "/users", None),
         ];
         fastapi_router_prefix_pass(&mut nodes, &[]);
-        assert_eq!(nodes[0].metadata.get("http_path").map(|s| s.as_str()), Some("/users"));
-        assert_eq!(nodes[1].metadata.get("http_path").map(|s| s.as_str()), Some("/users"));
+        assert_eq!(
+            nodes[0].metadata.get("http_path").map(|s| s.as_str()),
+            Some("/users")
+        );
+        assert_eq!(
+            nodes[1].metadata.get("http_path").map(|s| s.as_str()),
+            Some("/users")
+        );
     }
 
     // ── multi-line APIRouter detection ────────────────────────────────────
@@ -1081,7 +1128,8 @@ app.include_router(auth_router, prefix="/auth")
 
     #[test]
     fn test_extracts_multiline_prefix_with_other_kwargs() {
-        let content = "items_router = APIRouter(\n    tags=[\"items\"],\n    prefix=\"/items\"\n)\n";
+        let content =
+            "items_router = APIRouter(\n    tags=[\"items\"],\n    prefix=\"/items\"\n)\n";
         let map = extract_router_prefixes_from_str(content);
         assert_eq!(
             map.get("items_router").map(|s| s.as_str()),
@@ -1094,56 +1142,88 @@ app.include_router(auth_router, prefix="/auth")
     /// `router_var` key (defensive test).
     #[test]
     fn test_pass_skips_non_python_nodes() {
-        let mut node = make_api_endpoint("routes.ts", "GET /users", "GET", "/users", Some("router"));
+        let mut node =
+            make_api_endpoint("routes.ts", "GET /users", "GET", "/users", Some("router"));
         node.language = "typescript".to_string();
         let mut nodes = vec![node];
         fastapi_router_prefix_pass(&mut nodes, &[]);
-        assert_eq!(nodes[0].metadata.get("http_path").map(|s| s.as_str()), Some("/users"));
+        assert_eq!(
+            nodes[0].metadata.get("http_path").map(|s| s.as_str()),
+            Some("/users")
+        );
     }
 
     /// If the file does not contain an APIRouter assignment for the referenced
     /// variable, the node path is left unchanged.
     #[test]
     fn test_pass_noop_when_no_matching_prefix() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         let mut tmpfile = NamedTempFile::new().unwrap();
         writeln!(tmpfile, "# no APIRouter assignments here").unwrap();
         let path = tmpfile.path().to_path_buf();
 
-        let mut nodes = vec![
-            make_api_endpoint(
-                path.to_str().unwrap(),
-                "GET /users",
-                "GET",
-                "/users",
-                Some("users_router"),
-            ),
-        ];
+        let mut nodes = vec![make_api_endpoint(
+            path.to_str().unwrap(),
+            "GET /users",
+            "GET",
+            "/users",
+            Some("users_router"),
+        )];
         fastapi_router_prefix_pass(&mut nodes, &[]);
-        assert_eq!(nodes[0].metadata.get("http_path").map(|s| s.as_str()), Some("/users"));
+        assert_eq!(
+            nodes[0].metadata.get("http_path").map(|s| s.as_str()),
+            Some("/users")
+        );
     }
 
     /// Multiple endpoints in the same file using the same router all get the prefix.
     #[test]
     fn test_pass_applies_to_all_endpoints_with_same_router_var() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         let mut tmpfile = NamedTempFile::new().unwrap();
         writeln!(tmpfile, r#"items_router = APIRouter(prefix="/items")"#).unwrap();
         let path = tmpfile.path().to_path_buf();
 
         let mut nodes = vec![
-            make_api_endpoint(path.to_str().unwrap(), "GET /", "GET", "/", Some("items_router")),
-            make_api_endpoint(path.to_str().unwrap(), "POST /", "POST", "/", Some("items_router")),
-            make_api_endpoint(path.to_str().unwrap(), "GET /{id}", "GET", "/{id}", Some("items_router")),
+            make_api_endpoint(
+                path.to_str().unwrap(),
+                "GET /",
+                "GET",
+                "/",
+                Some("items_router"),
+            ),
+            make_api_endpoint(
+                path.to_str().unwrap(),
+                "POST /",
+                "POST",
+                "/",
+                Some("items_router"),
+            ),
+            make_api_endpoint(
+                path.to_str().unwrap(),
+                "GET /{id}",
+                "GET",
+                "/{id}",
+                Some("items_router"),
+            ),
         ];
         fastapi_router_prefix_pass(&mut nodes, &[]);
 
-        assert_eq!(nodes[0].metadata.get("http_path").map(|s| s.as_str()), Some("/items/"));
-        assert_eq!(nodes[1].metadata.get("http_path").map(|s| s.as_str()), Some("/items/"));
-        assert_eq!(nodes[2].metadata.get("http_path").map(|s| s.as_str()), Some("/items/{id}"));
+        assert_eq!(
+            nodes[0].metadata.get("http_path").map(|s| s.as_str()),
+            Some("/items/")
+        );
+        assert_eq!(
+            nodes[1].metadata.get("http_path").map(|s| s.as_str()),
+            Some("/items/")
+        );
+        assert_eq!(
+            nodes[2].metadata.get("http_path").map(|s| s.as_str()),
+            Some("/items/{id}")
+        );
     }
 }

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::Context;
 
-use crate::graph::store::{SCHEMA_VERSION, EXTRACTION_VERSION};
+use crate::graph::store::{EXTRACTION_VERSION, SCHEMA_VERSION};
 
 /// Path to the committed scan_version pointer file.
 ///
@@ -95,17 +95,26 @@ pub(crate) async fn check_and_migrate_schema(db_path: &Path) -> anyhow::Result<b
             // extraction_version must survive so the next extraction-version bump
             // still triggers its scan-state reset correctly.
             // scan_version is deleted (reset to 0 on next read) since all rows are gone.
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             if name == "schema_version" || name == "extraction_version" {
                 continue;
             }
             if path.is_dir() {
                 std::fs::remove_dir_all(&path).with_context(|| {
-                    format!("check_and_migrate_schema: failed to remove directory {}", path.display())
+                    format!(
+                        "check_and_migrate_schema: failed to remove directory {}",
+                        path.display()
+                    )
                 })?;
             } else {
                 std::fs::remove_file(&path).with_context(|| {
-                    format!("check_and_migrate_schema: failed to remove file {}", path.display())
+                    format!(
+                        "check_and_migrate_schema: failed to remove file {}",
+                        path.display()
+                    )
                 })?;
             }
         }
@@ -117,7 +126,13 @@ pub(crate) async fn check_and_migrate_schema(db_path: &Path) -> anyhow::Result<b
         .execute()
         .await
     {
-        for table_name in &["symbols", "edges", "pr_merges", "file_index", "_schema_meta"] {
+        for table_name in &[
+            "symbols",
+            "edges",
+            "pr_merges",
+            "file_index",
+            "_schema_meta",
+        ] {
             let _ = db.drop_table(table_name, &[]).await;
         }
     }
@@ -138,14 +153,12 @@ pub(crate) async fn check_and_migrate_schema(db_path: &Path) -> anyhow::Result<b
 fn has_lance_data(db_path: &Path) -> bool {
     std::fs::read_dir(db_path)
         .map(|entries| {
-            entries
-                .flatten()
-                .any(|e| {
-                    let name = e.file_name();
-                    let name = name.to_string_lossy();
-                    // LanceDB stores tables as directories; skip our version file
-                    name != "schema_version" && e.path().is_dir()
-                })
+            entries.flatten().any(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                // LanceDB stores tables as directories; skip our version file
+                name != "schema_version" && e.path().is_dir()
+            })
         })
         .unwrap_or(false)
 }
@@ -201,13 +214,8 @@ pub(crate) fn check_and_migrate_extraction_version(
         let primary_state = repo_root.join(".oh").join(".cache").join("scan-state.json");
         if primary_state.exists() {
             match std::fs::remove_file(&primary_state) {
-                Ok(()) => tracing::info!(
-                    "Cleared primary scan-state (extraction version upgrade)"
-                ),
-                Err(e) => tracing::warn!(
-                    "Failed to clear primary scan-state: {}",
-                    e
-                ),
+                Ok(()) => tracing::info!("Cleared primary scan-state (extraction version upgrade)"),
+                Err(e) => tracing::warn!("Failed to clear primary scan-state: {}", e),
             }
         }
 
@@ -220,11 +228,9 @@ pub(crate) fn check_and_migrate_extraction_version(
                         "Cleared scan-state for root '{}' (extraction version upgrade)",
                         slug
                     ),
-                    Err(e) => tracing::warn!(
-                        "Failed to clear scan-state for root '{}': {}",
-                        slug,
-                        e
-                    ),
+                    Err(e) => {
+                        tracing::warn!("Failed to clear scan-state for root '{}': {}", slug, e)
+                    }
                 }
             }
         }
@@ -259,17 +265,28 @@ pub(super) fn drop_all_lance_tables(db_path: &Path) {
             }
             if path.is_dir() {
                 if let Err(e) = std::fs::remove_dir_all(&path) {
-                    tracing::warn!("drop_all_lance_tables: failed to remove {}: {}", path.display(), e);
+                    tracing::warn!(
+                        "drop_all_lance_tables: failed to remove {}: {}",
+                        path.display(),
+                        e
+                    );
                 }
             } else if let Err(e) = std::fs::remove_file(&path) {
-                tracing::warn!("drop_all_lance_tables: failed to remove {}: {}", path.display(), e);
+                tracing::warn!(
+                    "drop_all_lance_tables: failed to remove {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
     }
     // Reset the version file so check_and_migrate_schema re-initialises cleanly.
     let version_file = db_path.join("schema_version");
     if let Err(e) = std::fs::write(&version_file, SCHEMA_VERSION.to_string()) {
-        tracing::warn!("drop_all_lance_tables: failed to write schema_version: {}", e);
+        tracing::warn!(
+            "drop_all_lance_tables: failed to write schema_version: {}",
+            e
+        );
     }
 }
 
@@ -325,13 +342,20 @@ mod tests {
         std::fs::write(db_path.join("extraction_version"), "0").unwrap();
         let primary_state = repo_root.join(".oh").join(".cache").join("scan-state.json");
         std::fs::create_dir_all(primary_state.parent().unwrap()).unwrap();
-        std::fs::write(&primary_state, r#"{"dir_mtimes":{},"file_mtimes":{},"file_content_hashes":{}}"#).unwrap();
+        std::fs::write(
+            &primary_state,
+            r#"{"dir_mtimes":{},"file_mtimes":{},"file_content_hashes":{}}"#,
+        )
+        .unwrap();
 
         // Migration should return true and clear the state file.
         let migrated = check_and_migrate_extraction_version(&db_path, repo_root, &[])
             .expect("migration failed");
         assert!(migrated, "expected migration=true for stale version");
-        assert!(!primary_state.exists(), "scan-state should be cleared after migration");
+        assert!(
+            !primary_state.exists(),
+            "scan-state should be cleared after migration"
+        );
 
         // The version file should now contain EXTRACTION_VERSION.
         let stored: u32 = std::fs::read_to_string(db_path.join("extraction_version"))
@@ -370,8 +394,7 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(
-            stored,
-            EXTRACTION_VERSION,
+            stored, EXTRACTION_VERSION,
             "extraction_version file should contain current EXTRACTION_VERSION"
         );
 
@@ -444,7 +467,8 @@ mod tests {
         let type_err = anyhow::anyhow!("type mismatch: expected Int32, got Utf8");
         assert!(is_schema_mismatch_error(&type_err));
 
-        let batch_err = anyhow::anyhow!("Invalid RecordBatch: number of columns does not match schema");
+        let batch_err =
+            anyhow::anyhow!("Invalid RecordBatch: number of columns does not match schema");
         assert!(is_schema_mismatch_error(&batch_err));
 
         let conflict = anyhow::anyhow!("write conflict detected");
@@ -470,14 +494,23 @@ mod tests {
 
         drop_all_lance_tables(&db_path);
 
-        assert!(!db_path.join("symbols.lance").exists(), "symbols.lance should be removed");
-        assert!(!db_path.join("edges.lance").exists(), "edges.lance should be removed");
+        assert!(
+            !db_path.join("symbols.lance").exists(),
+            "symbols.lance should be removed"
+        );
+        assert!(
+            !db_path.join("edges.lance").exists(),
+            "edges.lance should be removed"
+        );
 
         let written = std::fs::read_to_string(db_path.join("schema_version")).unwrap();
         assert_eq!(written, SCHEMA_VERSION.to_string());
 
         let ev = std::fs::read_to_string(db_path.join("extraction_version")).unwrap();
-        assert_eq!(ev, "42", "extraction_version must survive drop_all_lance_tables");
+        assert_eq!(
+            ev, "42",
+            "extraction_version must survive drop_all_lance_tables"
+        );
     }
 
     #[test]
@@ -514,7 +547,10 @@ mod tests {
 
         drop_all_lance_tables(&db_path);
 
-        assert!(!db_path.join("scan_version").exists(), "scan_version should be removed by drop_all_lance_tables");
+        assert!(
+            !db_path.join("scan_version").exists(),
+            "scan_version should be removed by drop_all_lance_tables"
+        );
         assert_eq!(
             std::fs::read_to_string(db_path.join("extraction_version")).unwrap(),
             "5"
