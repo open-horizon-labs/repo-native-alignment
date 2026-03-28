@@ -71,13 +71,14 @@ LSP provides the raw semantic data — call hierarchy, type hierarchy, reference
 | **What's embedded** | N/A | Function bodies, all markdown, commits | Function bodies | Nothing | Nothing | N/A |
 | **Indexed together** | N/A | Code + markdown + git history | Code only | N/A | N/A | N/A |
 | **Score normalization** | N/A | relevance-ranked, test files demoted | Raw similarity | N/A | N/A | N/A |
+| **Body retrieval** | Reference only | `include_body` returns full source; `minify_body` strips comments + shortens locals via tree-sitter AST (TS/JS, Rust, Python, Go) with legend | None | None | None | Reference only |
 | **Markdown** | N/A | Heading-scoped chunks with hierarchy | None | None | None | N/A |
 
 RNA's unique advantage: semantic search spans code AND business artifacts in the same vector space. "Find functions related to our payment reliability outcome" is a query only RNA can answer. Results are relevance-ranked: exact name > contains > signature-only, definitions before imports, production code before tests. CGR's UniXcoder is a code-specific model (better at pure code semantics), but RNA embeds function bodies, all markdown (chunked by heading), and commit messages together — breadth over specialization.
 
 ## MCP Tool Philosophy
 
-**RNA: 4 tools** — one `search` tool handles code symbols, artifacts, markdown, commits, and graph traversal. Supports subsystem-scoped search (`subsystem=`), cross-subsystem edge filtering (`target_subsystem=`), and impact mode that auto-summarizes large results into a subsystem-grouped breakdown (triggered above 30 nodes or 40K chars). `outcome_progress` for business alignment. `repo_map` for orientation — includes automatically detected architectural subsystems with cohesion scores and interfaces. `list_roots` for workspace management. CLI and MCP share a service layer — every capability available in both interfaces.
+**RNA: 4 tools** — one `search` tool handles code symbols, artifacts, markdown, commits, and graph traversal. Supports subsystem-scoped search (`subsystem=`), cross-subsystem edge filtering (`target_subsystem=`), body retrieval with optional tree-sitter minification (`include_body`, `minify_body`), and impact mode that auto-summarizes large results into a subsystem-grouped breakdown (triggered above 30 nodes or 40K chars). `outcome_progress` for business alignment. `repo_map` for orientation — includes automatically detected architectural subsystems with cohesion scores and interfaces. `list_roots` for workspace management. CLI and MCP share a service layer — every capability available in both interfaces.
 
 **CGR: 10 tools** — mix of read + write + admin (file editing, database wipes, project deletion).
 
@@ -96,8 +97,9 @@ RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents
 3. **Deeper semantic search** — Function bodies (not just names), all markdown (chunked by heading with hierarchy), and commits in one vector space. Results are relevance-ranked with test file demotion. CGR embeds function bodies but with raw scores. CGC doesn't embed at all.
 4. **Semantic graph entry points** — `search(query="database pool", mode="impact")` works directly. No need to look up a `node_id` first. CGR and CGC require exact node identifiers.
 5. **Cross-encoder reranking** — `search(rerank: true)` re-scores top candidates with a Jina cross-encoder for precise NL query results. None of the others have reranking.
-6. **Subsystem detection** — `repo_map` automatically clusters the codebase into 8-12 architectural subsystems using Louvain community detection on actual call edges. No configuration required. Agents can scope search to a subsystem, filter cross-subsystem edges, and see the architecture on first call. CGR, CGC, and codeTree return flat symbol or file lists.
-7. **Impact summaries that don't flood context** — `search(mode="impact")` on high-connectivity nodes auto-summarizes into a subsystem-grouped breakdown instead of returning hundreds of raw node listings. Triggered above 30 nodes or 40K chars. Before v0.1.12, high-connectivity nodes like `EdgeKind` would return 157K characters of raw output, overflowing context.
+6. **Token-efficient body retrieval** — `search(include_body: true, minify_body: true)` returns function bodies with comments stripped and locals shortened via tree-sitter AST walks (TS/JS, Rust, Python, Go) plus a deterministic legend. Agents get full implementation context at ~40-60% fewer tokens than raw source. No other tool minifies bodies for LLM consumption.
+7. **Subsystem detection** — `repo_map` automatically clusters the codebase into 8-12 architectural subsystems using Louvain community detection on actual call edges. No configuration required. Agents can scope search to a subsystem, filter cross-subsystem edges, and see the architecture on first call. CGR, CGC, and codeTree return flat symbol or file lists.
+8. **Impact summaries that don't flood context** — `search(mode="impact")` on high-connectivity nodes auto-summarizes into a subsystem-grouped breakdown instead of returning hundreds of raw node listings. Triggered above 30 nodes or 40K chars. Before v0.1.12, high-connectivity nodes like `EdgeKind` would return 157K characters of raw output, overflowing context.
 
 ## What RNA Does That Others Don't
 

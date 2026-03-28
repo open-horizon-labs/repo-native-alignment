@@ -158,7 +158,7 @@ This explores your codebase, asks about your aims, writes `AGENTS.md`, scaffolds
 
 | Tool | What it's for |
 |------|--------------|
-| `search` | Code symbols, artifacts, commits, and markdown — flat or graph traversal (`mode`: neighbors, impact, reachable, tests_for, cycles, path). Scope to a subsystem (`subsystem=`), filter cross-subsystem edges (`target_subsystem=`), use `compact: true` for ~25x fewer tokens, `rerank: true` for precision. |
+| `search` | Code symbols, artifacts, commits, and markdown — flat or graph traversal (`mode`: neighbors, impact, reachable, tests_for, cycles, path). Scope to a subsystem (`subsystem=`), filter cross-subsystem edges (`target_subsystem=`), use `compact: true` for ~25x fewer tokens, `rerank: true` for precision. Use `include_body: true` to return function bodies; add `minify_body: true` to strip comments and shorten locals with a legend (tree-sitter AST for TS/JS, Rust, Python, Go; text fallback for others). |
 | `repo_map` | Repository orientation: detected subsystems with their key interfaces, top symbols by importance, hotspot files, active outcomes, entry points. One call replaces an exploratory loop. |
 | `outcome_progress` | Connect business outcomes to code: outcome → tagged commits → changed files → symbols. Optional `include_impact: true` for risk-classified blast radius. |
 | `list_roots` | Show configured workspace roots with live scan stats (symbols, edges, detected frameworks, LSP edge counts per language, scan phase). Includes LSP servers available to install for each root's detected languages. |
