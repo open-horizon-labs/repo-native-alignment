@@ -76,17 +76,17 @@ Initialize it at pipeline start:
 
 ## Phase 1: Problem Statement → GitHub Issue
 
-**Goal:** Ensure the work has a crisp problem statement captured in a GitHub issue.
+**Goal:** Ensure the work has a crisp problem statement captured in a GitHub issue. **This must happen FIRST — before any exploration or coding.**
 
 ### If an issue number was provided:
 1. Read the issue: `gh issue view <number>`
 2. Assess: does it already have a clear problem statement? (outcome-focused, testable, solution-agnostic)
 3. If yes — extract it into the session file, move to Phase 2.
-4. If no — run the `/problem-statement` process against the issue description to reframe it.
+4. If no — run the `/problem-statement` agent to reframe it.
 5. Update the issue body with the reframed problem statement: `gh issue edit <number> --body ...`
 
 ### If only a description was provided:
-1. Run the `/problem-statement` process to frame the problem.
+1. **Immediately** spawn the `oh-problem-statement` agent to frame the problem. Do not skip this or inline a quick summary — the framing process surfaces X-Y problems, separates WHAT from HOW, and identifies constraint flexibility.
 2. Create a GitHub issue with the problem statement as the body:
    ```bash
    gh issue create --title "<crisp title>" --body "$(cat <<'EOF'
@@ -100,6 +100,8 @@ Initialize it at pipeline start:
    ```
 3. Record the issue number in the session file.
 
+**The issue is your anchor.** Every subsequent phase references it. Create it now, not later.
+
 ### Phase 1 output:
 - A GitHub issue with a clear problem statement and acceptance criteria
 - Session file updated with the problem statement
@@ -108,9 +110,43 @@ Initialize it at pipeline start:
 
 ---
 
-## Phase 2: Solution Space → PR Description
+## Phase 2: Branch + PR → Solution Space
 
-**Goal:** Explore candidate solutions and draft a PR with the chosen approach.
+**Goal:** Create the branch and push a draft PR **immediately**, then explore solutions. The PR exists from the start so progress is visible and reviewers can follow along.
+
+### Step 1: Create branch and push PR FIRST
+
+Do this **before** solution exploration:
+
+1. Create a feature branch:
+   ```bash
+   git checkout -b <issue-number>-<slug> main
+   ```
+
+2. Create and push the draft PR with a minimal description:
+   ```bash
+   git commit --allow-empty -m "wip: <issue-title>"
+   git push -u origin <issue-number>-<slug>
+   gh pr create --draft --title "<title>" --body "$(cat <<'EOF'
+   Closes #<issue-number>
+
+   ## Problem
+   <from Phase 1>
+
+   ## Solution
+   _Exploring — will update with chosen approach._
+
+   ## Acceptance Criteria
+   <copied from issue>
+   EOF
+   )"
+   ```
+
+3. Record the PR number in the session file.
+
+### Step 2: Explore solution space
+
+Now that the PR exists:
 
 1. Run the `/solution-space` process, using the problem statement from Phase 1 as input.
    - Generate 3-4 candidates at different levels (band-aid → redesign)
@@ -119,14 +155,9 @@ Initialize it at pipeline start:
 
    **Bias against Local Optimum solutions.** Band-aids are sometimes the right call (cheap, reversible). Redesigns dissolve problems. But Local Optimum / "refactor the locking" type solutions are the danger zone — they add complexity without changing the model. If your recommended solution involves intricate multi-phase coordination, new lock protocols, or careful ordering constraints, you are probably optimizing the wrong thing. Step up to Reframe or Redesign. Check: has this codebase solved a similar problem before? (`search` for prior art.)
 
-2. Create a feature branch:
+2. Update the PR description with the chosen solution:
    ```bash
-   git checkout -b <issue-number>-<slug> main
-   ```
-
-3. Draft the PR description from the solution space output:
-   ```bash
-   gh pr create --draft --title "<title>" --body "$(cat <<'EOF'
+   gh pr edit <pr-number> --body "$(cat <<'EOF'
    ## Summary
    <1-2 sentence summary of chosen approach>
 
@@ -150,13 +181,14 @@ Initialize it at pipeline start:
    )"
    ```
 
-4. Update session file with solution space analysis and PR number.
+3. Update session file with solution space analysis.
 
 ### Phase 2 output:
-- A draft PR with solution exploration in the description
+- A draft PR pushed to remote (visible to reviewers from the start)
+- PR description updated with solution exploration
 - Session file updated with solution space and PR number
 
-**Gate:** Do not proceed to Phase 3 without a draft PR.
+**Gate:** Do not proceed to Phase 3 without a draft PR pushed to remote.
 
 ---
 

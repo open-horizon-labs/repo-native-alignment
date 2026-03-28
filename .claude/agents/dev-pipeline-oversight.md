@@ -52,6 +52,12 @@ Same as `/dev-pipeline`:
 
 Spawn the `dev-pipeline` agent with the full arguments. Wait for it to complete.
 
+**Verify early artifacts exist before waiting:** After spawning, confirm within the first few minutes that:
+1. A GitHub issue was created (Phase 1 — problem-statement agent must run, not be skipped)
+2. A draft PR was pushed to remote (Phase 2 — happens before solution exploration, not after)
+
+If the dev-pipeline agent starts coding without an issue or PR, that's a process failure — stop it and restart.
+
 ```
 Agent(subagent_type="dev-pipeline", prompt="<full args passed to this agent>")
 ```
