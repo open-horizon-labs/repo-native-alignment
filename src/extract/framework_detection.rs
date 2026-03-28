@@ -584,6 +584,57 @@ static FRAMEWORK_RULES: &[FrameworkRule] = &[
         display_name: "GORM",
     },
     // -------------------------------------------------------------------------
+    // C# / .NET frameworks
+    // -------------------------------------------------------------------------
+    FrameworkRule {
+        import_pattern: "Microsoft.AspNetCore",
+        language: "csharp",
+        framework_id: "aspnet",
+        display_name: "ASP.NET Core",
+    },
+    FrameworkRule {
+        import_pattern: "Microsoft.AspNetCore.OpenApi",
+        language: "csharp",
+        framework_id: "aspnet-openapi",
+        display_name: "ASP.NET OpenAPI",
+    },
+    FrameworkRule {
+        import_pattern: "Microsoft.EntityFrameworkCore",
+        language: "csharp",
+        framework_id: "efcore",
+        display_name: "Entity Framework Core",
+    },
+    FrameworkRule {
+        import_pattern: "Npgsql",
+        language: "csharp",
+        framework_id: "npgsql",
+        display_name: "Npgsql (PostgreSQL)",
+    },
+    FrameworkRule {
+        import_pattern: "Dapper",
+        language: "csharp",
+        framework_id: "dapper",
+        display_name: "Dapper",
+    },
+    FrameworkRule {
+        import_pattern: "Minio",
+        language: "csharp",
+        framework_id: "minio",
+        display_name: "MinIO",
+    },
+    FrameworkRule {
+        import_pattern: "BCrypt",
+        language: "csharp",
+        framework_id: "bcrypt-net",
+        display_name: "BCrypt.Net",
+    },
+    FrameworkRule {
+        import_pattern: "System.Text.Json",
+        language: "csharp",
+        framework_id: "system-text-json",
+        display_name: "System.Text.Json",
+    },
+    // -------------------------------------------------------------------------
     // Rust frameworks
     // -------------------------------------------------------------------------
     FrameworkRule {
