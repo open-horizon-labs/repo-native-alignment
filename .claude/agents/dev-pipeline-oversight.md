@@ -8,126 +8,46 @@ mcpServers:
 
 # /dev-pipeline-oversight
 
-**dev-pipeline + post-merge comment audit.** Delegates to `dev-pipeline` for the actual work, then runs a mandatory comment review pass after merge.
-
-> **Use RNA tools for code navigation — not Grep/Read.**
-> - **MCP tools** (`search`, `repo_map`, `graph_query`) — project-level context: guardrails, outcomes, cross-cutting impact.
-> - **CLI in your worktree** — for code within your working directory:
->   ```bash
->   repo-native-alignment search --repo . "query" --limit 5
->   repo-native-alignment graph --node "file:symbol:kind" --repo . --mode neighbors
->   ```
->
-> **MANDATORY scan before any code navigation.** Before reading any source file during Phase 5 (the followup fix branch), verify the index:
-> ```bash
-> COUNT=$(repo-native-alignment search "" --repo . --limit 1 2>/dev/null | grep -o "[0-9]* symbols" | head -1)
-> echo "RNA ready: $COUNT indexed"
-> # If 0 or failed, rebuild:
-> if [ -z "$COUNT" ] || [ "$COUNT" = "0" ]; then
->   repo-native-alignment scan --repo . --full 2>&1 | tail -2
-> fi
-> ```
->
-> **Friction consequence:** Any Grep/Read used for code navigation after the scan has run is a `skipped` friction event. Log it to `.oh/friction-logs/<original-pr>-oversight.md`. An oversight run that uses Grep 10 times and logs 0 friction events has failed at self-monitoring, not succeeded at code review.
-
-## Why this exists
-
-The ship agent catches code issues during its review/fix steps, but external reviewers (CodeRabbit, the review skill, human comments) post findings *on the PR* that can slip through:
-
-- CodeRabbit posts detailed findings with severity levels — some get addressed during the fix step, others don't
-- The review skill flags issues in PR comments that the ship agent may not see
-- Human reviewers leave comments that arrive after the ship agent has moved past the fix step
-
-The result: PRs merge with unaddressed findings. This agent closes that gap.
+**dev-pipeline + post-merge comment audit.** Catches findings that slip through the ship agent.
 
 ## Arguments
 
-Same as `/dev-pipeline`:
-
-`/dev-pipeline-oversight <issue-number-or-description>`
+Same as dev-pipeline: `/dev-pipeline-oversight <issue-number-or-description>`
 
 ## Process
 
 ### Phase 1-4: Delegate to dev-pipeline
 
-Spawn the `dev-pipeline` agent with the full arguments. Wait for it to complete.
+```
+Agent(subagent_type="dev-pipeline", prompt="<full args>")
+```
 
-```
-Agent(subagent_type="dev-pipeline", prompt="<full args passed to this agent>")
-```
+**Early verification:** Confirm within the first few minutes that a GitHub issue AND a draft PR were pushed. If the agent starts coding without either, stop it — that's a process failure.
 
 ### Phase 5: Post-Merge Comment Audit
 
-**This phase runs AFTER the dev-pipeline agent completes and the PR is merged.**
+Runs AFTER Phase 4 merges. Skip if Phase 4 did not merge.
 
-1. **Get the PR number** from the dev-pipeline's session file or output.
-
-2. **Fetch ALL PR comments** — not just the ship agent's:
+1. Fetch ALL PR comments:
    ```bash
    gh api repos/{owner}/{repo}/pulls/{pr}/comments --paginate
    gh api repos/{owner}/{repo}/issues/{pr}/comments --paginate
    ```
 
-3. **Categorize each comment:**
-   - **CodeRabbit findings** — look for severity markers (Critical, Major, Minor)
-   - **Review skill findings** — look for "Ship Step" or review-style assessments
-   - **Human comments** — anything from non-bot users
-   - **Ship agent posts** — the agent's own step reports (already addressed)
+2. For each non-ship-agent comment, verify it was addressed:
+   - Code change made? Commit that fixes it? Reply explaining why not?
+   - If none: **unaddressed**.
 
-4. **For each non-ship-agent finding, verify it was addressed:**
-   - Was the specific code change suggested actually made?
-   - Was there a commit that addresses the concern?
-   - Was there a reply explaining why it was intentionally not addressed?
-   - If none of the above: **flag as unaddressed**
+3. Priority: Critical=must fix. Major=must fix or document why not. Minor=fix if easy.
 
-5. **Create a followup PR if needed:**
-   - If any findings are unaddressed, fix them in a new branch
-   - Create a PR titled `fix: address review findings from #<original-PR>`
-   - Reference each finding being fixed
-   - Run `cargo check --lib` and relevant tests before pushing
-
-6. **Report results:**
-   - Post a summary to the session file
-   - If all findings were addressed (by dev-pipeline or by the followup PR), report clean
-   - If any findings couldn't be fixed (e.g., design disagreement), flag for human review
-
-### Audit checklist
-
-For each external comment, check:
-
-- [ ] **Critical findings** — must be fixed, no exceptions
-- [ ] **Major findings** — must be fixed unless there's a documented reason not to
-- [ ] **Minor findings** — fix if straightforward, document if not
-- [ ] **Return value semantics** — verify callers' log messages match actual behavior
-- [ ] **Error handling** — verify errors aren't silently swallowed
-- [ ] **Test assertions** — verify tests actually assert what they claim to test
-- [ ] **Duplicate work** — verify no unnecessary re-computation flagged by reviewers
+4. If anything unaddressed: fix in a new branch `fix: address review findings from #<PR>`, push PR.
 
 ### Delivery spot-check
 
-**After the comment audit, verify the feature actually works end-to-end.** This catches the "unit tests pass but integration is broken" gap that comments alone won't reveal.
-
-1. Read the PR's ship step 7b (delivery verification) comment
-2. If 7b was marked N/A — skip this check
-3. If 7b was verified via unit tests only — **run the actual CLI or MCP command** that exercises the feature with real data
-4. If the feature doesn't produce visible output in real usage, **flag it** and create a fix
+After comment audit, run the actual CLI/MCP command that exercises the feature with real data. Unit tests passing ≠ integration working.
 
 ### What NOT to do
 
-- Don't re-run the entire ship pipeline
-- Don't create a new issue for the followup (it's a PR-scoped fix)
-- Don't wait for user input between finding and fixing — fix everything, then report
-- Don't fix things that were intentionally designed that way (check for explicit replies)
-
-## Automation Rules
-
-Same as dev-pipeline, plus:
-- Phase 5 runs automatically after Phase 4 completes with a merge
-- If Phase 4 did NOT merge (ABANDON/RECONSIDER), skip Phase 5
-- The followup PR (if created) should be small and focused — only fixes for unaddressed findings
-
-## Position in Framework
-
-**Wraps:** `dev-pipeline` (Phases 1-4)
-**Adds:** Phase 5 (post-merge comment audit)
-**Use instead of:** `dev-pipeline` when the PR is likely to get external review comments (complex changes, performance work, API changes)
+- Don't re-run the ship pipeline
+- Don't create new issues for the followup (it's PR-scoped)
+- Don't wait for user input between finding and fixing

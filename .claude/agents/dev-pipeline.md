@@ -8,296 +8,67 @@ mcpServers:
 
 # /dev-pipeline
 
-Full development pipeline: **problem-statement → solution-space → execute → ship.**
-
-Takes a feature or bug from framing through merge. Each phase feeds the next via a session file. The pipeline ensures nothing is skipped — no coding without a problem statement, no merging without the /ship quality gate.
-
-> **Use RNA tools — not Grep/Read — for all code navigation.**
->
-> - **MCP tools** (`search`, `repo_map`, `outcome_progress`, `graph_query`) — project-level context: guardrails, outcomes, metis, cross-cutting impact analysis.
->   - **When working in a worktree**, use the `repo` parameter to scope queries to your worktree's graph:
->     ```text
->     mcp__rna-mcp__search(query="build_code_embedding_text", repo="/path/to/worktree")
->     mcp__rna-mcp__repo_map(repo="/path/to/worktree")
->     ```
->     The worktree must be scanned first: `repo-native-alignment scan --repo /path/to/worktree`
->   - Without `repo`, MCP tools query the server's configured repo (main repo).
-> - **CLI in your worktree** — code navigation WITHIN your working directory. Use these Bash commands from inside your worktree:
->   ```bash
->   repo-native-alignment search --repo . "what you're looking for" --limit 5
->   repo-native-alignment graph --node "file.rs:function:kind" --repo . --mode neighbors
->   ```
->   **The worktree MUST be scanned before querying.** See the MANDATORY scan step in Phase 3 below — do not skip it.
->
-> **Friction logging:** Every Grep/Read used for code navigation after the scan has run is a friction event. Log it to the session file's `## RNA Tool Friction Log` table with severity `skipped`. See guardrail: `dogfood-rna-tools`.
-
-> **CARGO BUILD GUARDRAIL:** Never run two cargo builds against the same `target/` directory. Each pipeline gets its own worktree with its own `CARGO_TARGET_DIR` (see Phase 3 worktree setup). Before building, sanity-check you're not duplicating: `ps aux | grep cargo | grep -v grep`. A second cargo process targeting the same directory blocks silently on the file lock, hanging indefinitely. See `.oh/guardrails/no-parallel-cargo-agents.md`.
+**problem-statement → solution-space → execute → ship.** Four phases, each gates the next.
 
 ## Arguments
 
 `/dev-pipeline <issue-number-or-description>`
 
-- If a GitHub issue number is given (e.g., `140`), read it as the starting context.
-- If a description is given, use it to frame the problem in Phase 1.
-- If both, the issue is the source of truth; the description is supplementary context.
-
 ## Session File
 
-All phases write to `.oh/sessions/<issue-number>-dev.md` (or `<slug>-dev.md` if no issue yet).
-
-Initialize it at pipeline start:
-
-```markdown
-# Dev Pipeline — <title>
-**Issue:** #<number> (or "pending")
-**PR:** (filled in Phase 3)
-**Started:** <timestamp>
-
-## Phase 1: Problem Statement
-(filled by Phase 1)
-
-## Phase 2: Solution Space
-(filled by Phase 2)
-
-## Phase 3: Execute
-(filled by Phase 3)
-
-## Phase 4: Ship
-(filled by Phase 4)
-
-## RNA Tool Friction Log
-<!-- Append entries as you encounter friction with RNA MCP tools. -->
-<!-- Format: | Phase | Tool | What happened | What you did instead | Severity | -->
-| Phase | Tool | What happened | Workaround | Severity |
-|-------|------|---------------|------------|----------|
-```
+Write all phase outputs to `.oh/sessions/<issue-number>-dev.md`. Include an `## RNA Tool Friction Log` table — every Grep/Read used for code navigation after scan is a `skipped` friction event.
 
 ---
 
-## Phase 1: Problem Statement → GitHub Issue
+## Phase 1: GitHub Issue (problem-statement)
 
-**Goal:** Ensure the work has a crisp problem statement captured in a GitHub issue.
+**Create the issue FIRST. It is the anchor for everything.**
 
-### If an issue number was provided:
-1. Read the issue: `gh issue view <number>`
-2. Assess: does it already have a clear problem statement? (outcome-focused, testable, solution-agnostic)
-3. If yes — extract it into the session file, move to Phase 2.
-4. If no — run the `/problem-statement` process against the issue description to reframe it.
-5. Update the issue body with the reframed problem statement: `gh issue edit <number> --body ...`
+- If issue number given: read it, check for clear problem statement + acceptance criteria. Reframe with `oh-problem-statement` agent if needed.
+- If description given: **spawn `oh-problem-statement` agent** (do not skip or inline), then `gh issue create` with the output.
 
-### If only a description was provided:
-1. Run the `/problem-statement` process to frame the problem.
-2. Create a GitHub issue with the problem statement as the body:
-   ```bash
-   gh issue create --title "<crisp title>" --body "$(cat <<'EOF'
-   ## Problem Statement
-   ...
-
-   ## Acceptance Criteria
-   - [ ] ...
-   EOF
-   )"
-   ```
-3. Record the issue number in the session file.
-
-### Phase 1 output:
-- A GitHub issue with a clear problem statement and acceptance criteria
-- Session file updated with the problem statement
-
-**Gate:** Do not proceed to Phase 2 without acceptance criteria on the issue.
+**Gate:** No Phase 2 without acceptance criteria on a GitHub issue.
 
 ---
 
-## Phase 2: Solution Space → PR Description
+## Phase 2: Branch + Draft PR → Solution Space
 
-**Goal:** Explore candidate solutions and draft a PR with the chosen approach.
+**Push the PR IMMEDIATELY — before solution exploration.** Progress must be visible from the start.
 
-1. Run the `/solution-space` process, using the problem statement from Phase 1 as input.
-   - Generate 3-4 candidates at different levels (band-aid → redesign)
-   - Evaluate trade-offs
-   - Recommend with reasoning
+1. `git checkout -b <issue-number>-<slug> main`
+2. `git commit --allow-empty -m "wip: <title>"` → `git push -u origin` → `gh pr create --draft`
+3. **Then** spawn `oh-solution-space` agent. Bias against Local Optimum solutions — if it involves intricate coordination or new lock protocols, step up to Reframe/Redesign.
+4. Update PR description with chosen solution.
 
-   **Bias against Local Optimum solutions.** Band-aids are sometimes the right call (cheap, reversible). Redesigns dissolve problems. But Local Optimum / "refactor the locking" type solutions are the danger zone — they add complexity without changing the model. If your recommended solution involves intricate multi-phase coordination, new lock protocols, or careful ordering constraints, you are probably optimizing the wrong thing. Step up to Reframe or Redesign. Check: has this codebase solved a similar problem before? (`search` for prior art.)
-
-2. Create a feature branch:
-   ```bash
-   git checkout -b <issue-number>-<slug> main
-   ```
-
-3. Draft the PR description from the solution space output:
-   ```bash
-   gh pr create --draft --title "<title>" --body "$(cat <<'EOF'
-   ## Summary
-   <1-2 sentence summary of chosen approach>
-
-   Closes #<issue-number>
-
-   ## Problem
-   <from Phase 1>
-
-   ## Solution
-   **Selected:** <recommended option>
-   **Level:** <band-aid / local optimum / reframe / redesign>
-
-   <rationale — why this approach, why not the others>
-
-   ## Acceptance Criteria
-   <copied from issue>
-
-   ## Test Plan
-   - [ ] ...
-   EOF
-   )"
-   ```
-
-4. Update session file with solution space analysis and PR number.
-
-### Phase 2 output:
-- A draft PR with solution exploration in the description
-- Session file updated with solution space and PR number
-
-**Gate:** Do not proceed to Phase 3 without a draft PR.
+**Gate:** No Phase 3 without a draft PR pushed to remote.
 
 ---
 
 ## Phase 3: Execute
 
-**Goal:** Implement the chosen solution.
+1. Set up worktree: `scripts/prep-worktree.sh .claude/worktrees/<issue> <branch>`, set `CARGO_TARGET_DIR=$PWD/target`
+2. **Scan before coding:** `repo-native-alignment scan --repo . --full` — verify non-zero symbol count before touching any source file
+3. Spawn `oh-execute` agent with the session file as context
+4. Push commits to PR branch. Tag with `[outcome:X]` if relevant.
 
-### Worktree setup (warm build cache)
-
-> **IMPORTANT: Do NOT use `isolation: "worktree"` on the Agent tool to launch this pipeline.**
-> The built-in isolation creates worktrees that lock `main`, doesn't use `prep-worktree.sh` for warm caches, and can create nested worktrees-inside-worktrees. The pipeline manages its own worktree below.
-
-Before building, set up an isolated worktree with a warm Cargo cache:
-
-```bash
-scripts/prep-worktree.sh .claude/worktrees/<issue-number> <branch-name>
-cd .claude/worktrees/<issue-number>
-export CARGO_TARGET_DIR=$PWD/target
-```
-
-This hardlinks the main repo's `target/` directory so `cargo build` only recompiles the delta (seconds, not minutes). All `cargo build`, `cargo test`, and `cargo clippy` commands in Phase 3 and Phase 4 must run inside the worktree with `CARGO_TARGET_DIR` set.
-
-**Cleanup:** After Phase 4 completes (or on pipeline failure), remove the worktree:
-```bash
-git worktree remove .claude/worktrees/<issue-number> --force
-```
-
-### MANDATORY: RNA scan before touching any code
-
-**You CANNOT start coding until the RNA index is live in the worktree.** Run this before opening any source file:
-
-```bash
-# Step 1: verify index is already populated
-COUNT=$(repo-native-alignment search "" --repo . --limit 1 2>/dev/null | grep -o "[0-9]* symbols" | head -1)
-echo "RNA ready: $COUNT indexed"
-
-# Step 2: if count is 0 or the command failed, run a full scan first
-# (only needed on a fresh worktree — takes ~10s)
-repo-native-alignment scan --repo . --full 2>&1 | tail -2
-```
-
-If after scanning the count is still 0, stop and investigate before proceeding. A zero-node index means code navigation will silently fall back to Grep/Read, producing incomplete results and friction events.
-
-**Once the index is live, use RNA for ALL code navigation in this worktree:**
-
-```bash
-# Find symbols, understand existing patterns
-repo-native-alignment search "what you need" --repo . --limit 5
-
-# Understand a specific symbol's callers or dependencies
-repo-native-alignment graph --node "file.rs:function:kind" --repo . --mode neighbors
-```
-
-**Friction consequence:** If you use `grep`, `rg`, or `Read(file)` for code navigation _after_ the scan has run, that is a friction event. Log it immediately to the session file's `## RNA Tool Friction Log` table with severity `skipped`. A pipeline with 20 Grep calls and 0 friction log entries is not frictionless — it is unmonitored. The log exists to improve RNA; suppressing it by not logging makes the tool permanently worse.
-
-### Implementation
-
-Launch the `/execute` process (via the `oh-execute` agent) with the session file as context:
-
-- The agent reads the session file for aim, problem statement, and selected solution
-- Pre-flight, build, drift detection, salvage if needed
-- Commits are pushed to the PR branch
-- Tag commits with `[outcome:X]` if a relevant outcome exists
-
-After execution completes:
-1. Update session file with execution notes
-2. Push final commits
-3. Keep the PR as draft; Ship Step 3b will mark it ready after review/dissent fixes
-
-### Phase 3 output:
-- Implementation committed and pushed to the PR branch
-- PR remains draft until Ship Step 3b
-- Session file updated with execution status
-
-**Gate:** Do not proceed to Phase 4 if execution produced SALVAGE verdict. Surface the salvage to the user and stop.
+**Gate:** SALVAGE verdict → stop and surface to user.
 
 ---
 
 ## Phase 4: Ship
 
-**Goal:** Quality gate and merge via the `ship` agent (`.claude/agents/ship.md`).
-
-> **CRITICAL: You MUST spawn the ship agent. Do NOT inline the ship steps yourself.**
-> The ship agent posts each step's findings as PR comments — review, dissent, adversarial test results, merit assessment, etc. These comments are the auditable quality record. If you simulate the ship steps in your own context instead of spawning the agent, the findings exist only in the session file and are invisible on the PR. This is a process failure — a quality gate that isn't visible is no gate at all.
->
-> See guardrail: `ship-steps-visible-on-pr`.
-
-Spawn the **`ship` agent** using the **Agent tool** with the PR number:
+**Spawn the `ship` agent. Do NOT inline ship steps.**
 
 ```
-Agent(subagent_type="ship", prompt="/ship <PR-number>\n\nWORKTREE: <worktree-path>\nCARGO_TARGET_DIR: <worktree-path>/target\n\n<any additional context about CodeRabbit findings, blocking issues, etc.>")
+Agent(subagent_type="ship", prompt="/ship <PR-number>\n\nWORKTREE: <path>\nCARGO_TARGET_DIR: <path>/target")
 ```
 
-> **DO NOT use Bash to run `claude` CLI commands.** Do not run `Bash(claude --agent ...)` or any variant. The Agent tool is a first-class tool available to you — use it directly. Running `claude` as a subprocess does not work and will waste time trying different CLI flags that don't exist.
-
-This launches the full 13-step pipeline as an autonomous agent:
-
-1. Review
-2. Dissent
-3. Fix
-3b. Mark ready (triggers smoke tests + CodeRabbit review)
-4. Adversarial test
-5. Merit assessment
-6. Resolve TODOs
-7a. Manual verification
-7b. Delivery verification
-8. README
-9. Smoke test
-10. CI green
-10b. Final comment sweep (catches CodeRabbit/human findings posted after step 3b)
-11. Merge
-
-The ship agent runs autonomously — do not wait for user prompts between steps. **Each substantive step MUST post its findings as a PR comment** (per `.claude/agents/ship.md`).
-
-### Phase 4 output:
-- PR merged (or stopped with verdict if issues found)
-- Session file updated with ship pipeline results
+Ship posts each step's findings as PR comments — that's the auditable quality record. Cleanup worktree after.
 
 ---
 
-## Automation Rules
+## Rules
 
-- **Do not wait** for user prompts between phases. When one phase completes and its gate passes, immediately start the next.
-- **Stop and ask** only if:
-  - Phase 1 can't determine acceptance criteria (needs user input)
-  - Phase 3 produces a SALVAGE verdict
-  - Phase 4 produces ABANDON/RECONSIDER verdict or CI fails after 2 fix attempts
-- **Record metis** if any phase surfaces a new learning: write to `.oh/metis/<slug>.md`
-
-## Friction Reporting
-
-When an RNA tool falls short — wrong results, missing data, too slow, or you fell back to Grep/Read — append to the session file's `## RNA Tool Friction Log` table.
-
-**At pipeline end**, summarize friction events with recommendations (file issue, update existing issue, or note as known limitation).
-
-## Position in Framework
-
-**This is the full pipeline.** It composes:
-- `/problem-statement` (Phase 1)
-- `/solution-space` (Phase 2)
-- `/execute` (Phase 3)
-- `/ship` (Phase 4)
-
-For partial runs, use the individual skills directly. `/dev-pipeline` is for end-to-end delivery of a single issue.
+- **No waiting** between phases — gate passes, next phase starts.
+- **Stop and ask** only for: unclear acceptance criteria, SALVAGE verdict, CI fails after 2 fix attempts.
+- **RNA tools for code nav**, not Grep/Read. Log friction when you fall back.
