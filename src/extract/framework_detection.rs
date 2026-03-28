@@ -586,17 +586,31 @@ static FRAMEWORK_RULES: &[FrameworkRule] = &[
     // -------------------------------------------------------------------------
     // C# / .NET frameworks
     // -------------------------------------------------------------------------
-    FrameworkRule {
-        import_pattern: "Microsoft.AspNetCore",
-        language: "csharp",
-        framework_id: "aspnet",
-        display_name: "ASP.NET Core",
-    },
+    // More specific patterns must come before broader ones — detection deduplicates
+    // by framework_id so ordering only affects which import triggers first.
     FrameworkRule {
         import_pattern: "Microsoft.AspNetCore.OpenApi",
         language: "csharp",
         framework_id: "aspnet-openapi",
         display_name: "ASP.NET OpenAPI",
+    },
+    FrameworkRule {
+        import_pattern: "Microsoft.AspNetCore.SignalR",
+        language: "csharp",
+        framework_id: "signalr",
+        display_name: "SignalR",
+    },
+    FrameworkRule {
+        import_pattern: "Microsoft.AspNetCore.Identity",
+        language: "csharp",
+        framework_id: "aspnet-identity",
+        display_name: "ASP.NET Identity",
+    },
+    FrameworkRule {
+        import_pattern: "Microsoft.AspNetCore",
+        language: "csharp",
+        framework_id: "aspnet",
+        display_name: "ASP.NET Core",
     },
     FrameworkRule {
         import_pattern: "Microsoft.EntityFrameworkCore",
@@ -633,12 +647,6 @@ static FRAMEWORK_RULES: &[FrameworkRule] = &[
         language: "csharp",
         framework_id: "system-text-json",
         display_name: "System.Text.Json",
-    },
-    FrameworkRule {
-        import_pattern: "Microsoft.AspNetCore.SignalR",
-        language: "csharp",
-        framework_id: "signalr",
-        display_name: "SignalR",
     },
     FrameworkRule {
         import_pattern: "MediatR",
@@ -705,12 +713,6 @@ static FRAMEWORK_RULES: &[FrameworkRule] = &[
         language: "csharp",
         framework_id: "refit",
         display_name: "Refit",
-    },
-    FrameworkRule {
-        import_pattern: "Microsoft.AspNetCore.Identity",
-        language: "csharp",
-        framework_id: "aspnet-identity",
-        display_name: "ASP.NET Identity",
     },
     FrameworkRule {
         import_pattern: "Npgsql.EntityFrameworkCore",
@@ -858,7 +860,13 @@ static FRAMEWORK_RULES: &[FrameworkRule] = &[
     },
     FrameworkRule {
         import_pattern: "jose",
-        language: "",
+        language: "typescript",
+        framework_id: "jwt",
+        display_name: "jose (JWT)",
+    },
+    FrameworkRule {
+        import_pattern: "jose",
+        language: "javascript",
         framework_id: "jwt",
         display_name: "jose (JWT)",
     },
@@ -921,12 +929,6 @@ static FRAMEWORK_RULES: &[FrameworkRule] = &[
         language: "",
         framework_id: "rabbitmq-js",
         display_name: "amqplib (RabbitMQ)",
-    },
-    FrameworkRule {
-        import_pattern: "ai",
-        language: "typescript",
-        framework_id: "vercel-ai",
-        display_name: "Vercel AI SDK",
     },
     FrameworkRule {
         import_pattern: "@ai-sdk/",
@@ -1096,13 +1098,14 @@ pub fn framework_detection_pass(all_nodes: &[Node], root_id: &str) -> FrameworkD
     }
 
     // Emit DependsOn edges from Import nodes to framework nodes.
-    // Deduplicate: one edge per (file, framework) pair to avoid
+    // Deduplicate: one edge per (root, file, framework) triple to avoid
     // noisy per-import edges when a file has multiple imports from the same framework.
-    let mut seen_file_fw: HashSet<(String, String)> = HashSet::new();
+    // Include root in the key so multi-root workspaces don't collapse different files.
+    let mut seen_file_fw: HashSet<(String, String, String)> = HashSet::new();
     let mut edges: Vec<Edge> = Vec::new();
     for (import_id, framework_id) in &import_framework_pairs {
         let file_key = import_id.file.display().to_string();
-        if !seen_file_fw.insert((file_key, framework_id.clone())) {
+        if !seen_file_fw.insert((import_id.root.clone(), file_key, framework_id.clone())) {
             continue;
         }
         if let Some(fw_node_id) = framework_node_ids.get(framework_id) {
