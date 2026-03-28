@@ -167,6 +167,8 @@ This explores your codebase, asks about your aims, writes `AGENTS.md`, scaffolds
 
 **Worktree-aware queries:** Agents working in a git worktree can query their own code by passing the absolute path: `search(query="...", repo="/absolute/path/to/worktree")`. The worktree must be scanned first.
 
+**Index-updating indicator:** When the background scanner is actively rebuilding the index (triggered by a HEAD change), `search`, `repo_map`, and `outcome_progress` responses append: `_Index updating in background — results reflect last complete scan._` No note appears when the index is current. This is informational — results are still valid, just from the previous complete scan.
+
 ### CLI ↔ MCP Equivalence
 
 CLI and MCP share the same index. Run `scan --full` from the CLI to build the complete index, then query via either interface.

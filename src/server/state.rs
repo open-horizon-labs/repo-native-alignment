@@ -268,6 +268,16 @@ impl GraphBuildStatus {
             GraphBuildState::Failed => Some("build failed".to_string()),
         }
     }
+
+    /// Returns `true` when the background scanner is actively rebuilding the
+    /// index (triggered by a HEAD change or manual rescan).
+    ///
+    /// Used by tool handlers to append a lightweight staleness note so agents
+    /// know results reflect the last complete scan, not the current HEAD.
+    /// One atomic load — zero I/O, zero git operations.
+    pub fn is_building(&self) -> bool {
+        self.current_state() == GraphBuildState::Building
+    }
 }
 
 // ── Embedding build status ───────────────────────────────────────────
@@ -1407,11 +1417,26 @@ mod tests {
     }
 
     #[test]
+    fn test_graph_build_status_is_building() {
+        let status = GraphBuildStatus::default();
+        // NotStarted -> false
+        assert!(!status.is_building());
+        // Building -> true
+        status.set_building(42);
+        assert!(status.is_building());
+        // Ready -> false
+        status.set_ready();
+        assert!(!status.is_building());
+    }
+
+    #[test]
     fn test_graph_build_status_failed() {
         let status = GraphBuildStatus::default();
         status.set_failed("disk full".to_string());
         let msg = status.status_message().unwrap();
         assert!(msg.contains("disk full"), "got: {}", msg);
+        // Failed is not "building"
+        assert!(!status.is_building());
     }
 
     #[test]

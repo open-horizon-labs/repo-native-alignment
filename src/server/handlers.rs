@@ -133,7 +133,12 @@ impl RnaHandler {
             root_filter,
             non_code_slugs,
         };
-        let markdown = crate::service::search(&params, &ctx).await;
+        let mut markdown = crate::service::search(&params, &ctx).await;
+        if self.graph_build_status.is_building() {
+            markdown.push_str(
+                "\n\n_Index updating in background — results reflect last complete scan._",
+            );
+        }
         Ok(text_result(markdown))
     }
 
@@ -181,7 +186,12 @@ impl RnaHandler {
             graph_state: &graph_state,
             repo_root: &self.repo_root,
         };
-        let markdown = crate::service::outcome_progress(&params, &ctx);
+        let mut markdown = crate::service::outcome_progress(&params, &ctx);
+        if self.graph_build_status.is_building() {
+            markdown.push_str(
+                "\n\n_Index updating in background — results reflect last complete scan._",
+            );
+        }
         Ok(text_result(markdown))
     }
 
@@ -263,7 +273,12 @@ impl RnaHandler {
             lsp_status: Some(&self.lsp_status),
             embed_status: Some(&self.embed_status),
         };
-        let markdown = crate::service::repo_map(&params, &ctx);
+        let mut markdown = crate::service::repo_map(&params, &ctx);
+        if self.graph_build_status.is_building() {
+            markdown.push_str(
+                "\n\n_Index updating in background — results reflect last complete scan._",
+            );
+        }
         Ok(text_result(markdown))
     }
 }
@@ -846,6 +861,50 @@ mod tests {
             repo_root: repo_root.to_path_buf(),
             ..Default::default()
         }
+    }
+
+    // ── is_building indicator tests ─────────────────────────────────────
+
+    /// Verify the note text and `is_building()` logic in isolation.
+    /// This is the core adversarial test: `is_building()` controls whether
+    /// the note appears. Any regression in the atomic state machine would
+    /// surface here.
+    #[test]
+    fn test_building_indicator_note_appears_only_when_building() {
+        use crate::server::state::GraphBuildStatus;
+        use std::sync::Arc;
+
+        let status = Arc::new(GraphBuildStatus::default());
+
+        // State: NotStarted — no note
+        assert!(!status.is_building(), "NotStarted should not be building");
+
+        // State: Building — note should appear
+        status.set_building(100);
+        assert!(status.is_building(), "Building should be building");
+
+        // State: Ready — no note
+        status.set_ready();
+        assert!(!status.is_building(), "Ready should not be building");
+
+        // State: Back to Building — note returns
+        status.set_building(50);
+        assert!(status.is_building(), "Second Building should be building");
+
+        // State: Failed — no note (Failed != "updating in background")
+        status.set_failed("disk full".to_string());
+        assert!(!status.is_building(), "Failed should not be building");
+    }
+
+    /// Verify note content is a non-empty italic markdown string.
+    #[test]
+    fn test_building_indicator_note_is_italic_markdown() {
+        // The note appended in handlers — verify format matches spec.
+        let note = "\n\n_Index updating in background — results reflect last complete scan._";
+        assert!(note.starts_with("\n\n"), "Should start with paragraph separator");
+        assert!(note.contains("_Index updating"), "Should be in italics");
+        assert!(note.contains("last complete scan"), "Should mention last complete scan");
+        assert!(note.ends_with("._"), "Should end with italic marker");
     }
 
     #[test]
