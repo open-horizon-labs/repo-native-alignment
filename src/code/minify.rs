@@ -25,6 +25,7 @@ pub fn minify_body(body: &str, language: &str) -> String {
         "rust" | "rs" => "rust",
         "python" | "py" => "python",
         "go" | "golang" => "go",
+        "csharp" | "c#" | "cs" => "csharp",
         _ => language,
     };
 
@@ -34,6 +35,7 @@ pub fn minify_body(body: &str, language: &str) -> String {
         "rust" => minify_rust(body),
         "python" => minify_python(body),
         "go" => minify_go(body),
+        "csharp" => minify_csharp(body),
         _ => minify_text(body, lang),
     }
 }
@@ -314,12 +316,21 @@ const GO_CONFIG: LangConfig = LangConfig {
     comment_prefix: "//",
 };
 
+const CSHARP_CONFIG: LangConfig = LangConfig {
+    scope_boundaries: &["local_function_statement", "anonymous_method_expression"],
+    closures: &["lambda_expression"],
+    member_expr: "member_access_expression",
+    shorthand_prop: "",
+    comment_prefix: "//",
+};
+
 fn lang_config(language: &str) -> &'static LangConfig {
     match language {
         "typescript" | "tsx" | "javascript" | "jsx" => &TS_CONFIG,
         "rust" => &RUST_CONFIG,
         "python" => &PYTHON_CONFIG,
         "go" => &GO_CONFIG,
+        "csharp" => &CSHARP_CONFIG,
         _ => &TS_CONFIG,
     }
 }
@@ -343,6 +354,7 @@ fn minify_with_ast(
                     "rust" => format!("fn __wrapper__() {{\n{}\n}}", body),
                     "python" => format!("def __wrapper__():\n{}", indent_body(body, "    ")),
                     "go" => format!("func __wrapper__() {{\n{}\n}}", body),
+                    "csharp" => format!("class __W__ {{\n{}\n}}", body),
                     _ => format!("function __wrapper__() {{\n{}\n}}", body),
                 };
                 match parser.parse(&wrapper, None) {
@@ -432,6 +444,11 @@ fn find_function_body_generic<'a>(
         "rust" => &["function_item"],
         "python" => &["function_definition"],
         "go" => &["function_declaration", "method_declaration"],
+        "csharp" => &[
+            "method_declaration",
+            "constructor_declaration",
+            "local_function_statement",
+        ],
         _ => &[
             "function_declaration",
             "function_expression",
@@ -900,6 +917,110 @@ fn minify_go(body: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// C# minification
+// ---------------------------------------------------------------------------
+
+fn minify_csharp(body: &str) -> String {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+        .is_err()
+    {
+        return minify_text(body, "csharp");
+    }
+    minify_with_ast(&mut parser, body, "csharp", collect_csharp_locals)
+}
+
+/// C#: local variable declarations, foreach, for, catch, using statements.
+fn collect_csharp_locals(
+    node: tree_sitter::Node,
+    source: &[u8],
+    locals: &mut HashMap<String, String>,
+    ranges: &mut Vec<(usize, usize, String)>,
+    used: &mut std::collections::HashSet<String>,
+) {
+    match node.kind() {
+        // local_declaration_statement -> variable_declaration -> variable_declarator(identifier)
+        "local_declaration_statement" | "variable_declaration" => {
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    if child.kind() == "variable_declaration"
+                        || child.kind() == "variable_declarator"
+                    {
+                        collect_csharp_locals(child, source, locals, ranges, used);
+                    }
+                }
+            }
+            return; // already recursed into the children we need
+        }
+        "variable_declarator" => {
+            // First identifier child is the variable name
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32)
+                    && child.kind() == "identifier"
+                {
+                    let name = child.utf8_text(source).unwrap_or("");
+                    register_local(name, child, locals, ranges, used);
+                    break;
+                }
+            }
+        }
+        "foreach_statement" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                if left.kind() == "identifier" {
+                    let name = left.utf8_text(source).unwrap_or("");
+                    register_local(name, left, locals, ranges, used);
+                }
+            }
+        }
+        "for_statement" => {
+            if let Some(init) = node.child_by_field_name("initializer") {
+                collect_csharp_locals(init, source, locals, ranges, used);
+            }
+        }
+        "catch_clause" => {
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32)
+                    && child.kind() == "catch_declaration"
+                {
+                    for j in 0..child.child_count() {
+                        if let Some(id) = child.child(j as u32)
+                            && id.kind() == "identifier"
+                        {
+                            let name = id.utf8_text(source).unwrap_or("");
+                            register_local(name, id, locals, ranges, used);
+                        }
+                    }
+                }
+            }
+        }
+        "using_statement" => {
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    if child.kind() == "variable_declaration" {
+                        collect_csharp_locals(child, source, locals, ranges, used);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            let kind = child.kind();
+            if kind == "local_function_statement"
+                || kind == "anonymous_method_expression"
+                || kind == "lambda_expression"
+            {
+                continue;
+            }
+            collect_csharp_locals(child, source, locals, ranges, used);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Text-based fallback (phase 1 logic, retained)
 // ---------------------------------------------------------------------------
 
@@ -1173,5 +1294,51 @@ mod tests {
         let last_line = result.lines().last().unwrap();
         assert!(last_line.starts_with("// "));
         assert!(last_line.contains("longName"));
+    }
+
+    // -- C# tree-sitter minification tests --
+
+    #[test]
+    fn test_csharp_renames_long_locals() {
+        let input = "var userCount = 5;\nvar result = userCount + 1;\nreturn result;";
+        let result = minify_body(input, "csharp");
+        let code_lines: Vec<&str> = result.lines().filter(|l| !l.starts_with("// ")).collect();
+        let code = code_lines.join("\n");
+        assert!(
+            !code.contains("userCount"),
+            "userCount should be renamed: {}",
+            code
+        );
+        let legend = result.lines().find(|l| l.starts_with("// ")).expect("should have legend");
+        assert!(legend.contains("userCount"), "legend should mention userCount: {}", legend);
+    }
+
+    #[test]
+    fn test_csharp_preserves_short_names() {
+        let input = "var x = 5;\nreturn x;";
+        let result = minify_body(input, "csharp");
+        assert!(result.contains("x"));
+    }
+
+    #[test]
+    fn test_csharp_preserves_member_access() {
+        let input = "var result = obj.PropertyName;\nreturn result;";
+        let result = minify_body(input, "csharp");
+        assert!(result.contains("PropertyName"), "property should be preserved: {}", result);
+    }
+
+    #[test]
+    fn test_csharp_preserves_method_calls() {
+        let input = "var data = FetchUserById(id);\nreturn data;";
+        let result = minify_body(input, "csharp");
+        assert!(result.contains("FetchUserById"), "method name should be preserved: {}", result);
+    }
+
+    #[test]
+    fn test_csharp_alias_cs() {
+        let input = "var longVariable = 42;\nConsole.WriteLine(longVariable);";
+        let result = minify_body(input, "cs");
+        let legend = result.lines().find(|l| l.starts_with("// "));
+        assert!(legend.is_some(), "cs alias should produce legend: {}", result);
     }
 }
