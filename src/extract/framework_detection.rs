@@ -998,6 +998,8 @@ static FRAMEWORK_RULES: &[FrameworkRule] = &[
 pub struct FrameworkDetectionResult {
     /// Virtual `NodeKind::Other("framework")` nodes, one per detected framework.
     pub nodes: Vec<Node>,
+    /// `DependsOn` edges from Import nodes to the framework nodes they matched.
+    pub edges: Vec<crate::graph::Edge>,
     /// Set of detected framework IDs for gating conditional extractors.
     pub detected_frameworks: HashSet<String>,
 }
@@ -1020,7 +1022,11 @@ pub struct FrameworkDetectionResult {
 /// `result.nodes`. The `detected_frameworks` set is stored in `GraphState` for
 /// conditional extractor gating.
 pub fn framework_detection_pass(all_nodes: &[Node], root_id: &str) -> FrameworkDetectionResult {
+    use crate::graph::{Confidence, Edge, EdgeKind};
+
     let mut detected: HashSet<String> = HashSet::new();
+    // Track (import_node_id, framework_id) pairs for edge creation.
+    let mut import_framework_pairs: Vec<(NodeId, String)> = Vec::new();
 
     for node in all_nodes {
         if node.id.kind != NodeKind::Import {
@@ -1042,6 +1048,7 @@ pub fn framework_detection_pass(all_nodes: &[Node], root_id: &str) -> FrameworkD
             let pattern = rule.import_pattern.to_lowercase();
             if import_text.contains(pattern.as_str()) {
                 detected.insert(rule.framework_id.to_string());
+                import_framework_pairs.push((node.id.clone(), rule.framework_id.to_string()));
             }
         }
     }
@@ -1049,12 +1056,14 @@ pub fn framework_detection_pass(all_nodes: &[Node], root_id: &str) -> FrameworkD
     if detected.is_empty() {
         return FrameworkDetectionResult {
             nodes: Vec::new(),
+            edges: Vec::new(),
             detected_frameworks: HashSet::new(),
         };
     }
 
     // Emit one framework node per detected framework.
     let mut nodes: Vec<Node> = Vec::with_capacity(detected.len());
+    let mut framework_node_ids: std::collections::HashMap<String, NodeId> = std::collections::HashMap::new();
     for framework_id in &detected {
         // Look up display name.
         let display_name = FRAMEWORK_RULES
@@ -1066,13 +1075,16 @@ pub fn framework_detection_pass(all_nodes: &[Node], root_id: &str) -> FrameworkD
         let mut metadata = BTreeMap::new();
         metadata.insert("display_name".to_string(), display_name.to_string());
 
+        let node_id = NodeId {
+            root: root_id.to_string(),
+            file: PathBuf::from(format!("frameworks/{}", framework_id)),
+            name: framework_id.clone(),
+            kind: NodeKind::Other("framework".to_string()),
+        };
+        framework_node_ids.insert(framework_id.clone(), node_id.clone());
+
         nodes.push(Node {
-            id: NodeId {
-                root: root_id.to_string(),
-                file: PathBuf::from(format!("frameworks/{}", framework_id)),
-                name: framework_id.clone(),
-                kind: NodeKind::Other("framework".to_string()),
-            },
+            id: node_id,
             language: String::new(),
             line_start: 0,
             line_end: 0,
@@ -1083,12 +1095,34 @@ pub fn framework_detection_pass(all_nodes: &[Node], root_id: &str) -> FrameworkD
         });
     }
 
+    // Emit DependsOn edges from Import nodes to framework nodes.
+    // Deduplicate: one edge per (file, framework) pair to avoid
+    // noisy per-import edges when a file has multiple imports from the same framework.
+    let mut seen_file_fw: HashSet<(String, String)> = HashSet::new();
+    let mut edges: Vec<Edge> = Vec::new();
+    for (import_id, framework_id) in &import_framework_pairs {
+        let file_key = import_id.file.display().to_string();
+        if !seen_file_fw.insert((file_key, framework_id.clone())) {
+            continue;
+        }
+        if let Some(fw_node_id) = framework_node_ids.get(framework_id) {
+            edges.push(Edge {
+                from: import_id.clone(),
+                to: fw_node_id.clone(),
+                kind: EdgeKind::DependsOn,
+                confidence: Confidence::Detected,
+                source: ExtractionSource::TreeSitter,
+            });
+        }
+    }
+
     // Sort for deterministic output.
     nodes.sort_by(|a, b| a.id.name.cmp(&b.id.name));
 
     tracing::info!(
-        "Framework detection: {} framework(s) detected: [{}]",
+        "Framework detection: {} framework(s) detected, {} DependsOn edge(s): [{}]",
         nodes.len(),
+        edges.len(),
         nodes
             .iter()
             .map(|n| n.id.name.as_str())
@@ -1098,6 +1132,7 @@ pub fn framework_detection_pass(all_nodes: &[Node], root_id: &str) -> FrameworkD
 
     FrameworkDetectionResult {
         nodes,
+        edges,
         detected_frameworks: detected,
     }
 }

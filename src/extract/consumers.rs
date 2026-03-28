@@ -614,6 +614,9 @@ impl EnrichmentFinalizer {
             if !result.nodes.is_empty() {
                 all_nodes.extend(result.nodes);
             }
+            if !result.edges.is_empty() {
+                all_edges.extend(result.edges);
+            }
         }
 
         // Step 3: fastapi_router_prefix — rewrites `http_path` on FastAPI ApiEndpoint nodes
