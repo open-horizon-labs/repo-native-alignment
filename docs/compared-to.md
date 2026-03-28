@@ -21,42 +21,42 @@ RNA uses LSP internally as one enrichment source (call hierarchy, type hierarchy
 
 ## At a Glance
 
-| | **LSP (baseline)** | **RNA** | **Code-Graph-RAG** | **CodeGraphContext** | **codeTree** | **Serena** |
-|---|---|---|---|---|---|---|
-| **Install** | Editor plugin or PATH binary | `cargo install` / binary | Docker + uv + Memgraph + API key | `pip install` + (KuzuDB\|Neo4j) | `pip install mcp-server-codetree` | `pip install mcp-server-serena` |
-| **External deps** | One server per language | None | Docker, Memgraph, LLM API | Graph DB (embedded or Docker) | None | None (LSP servers auto-downloaded) |
-| **Languages parsed** | 1 per server | 30 | 11 | 14 | 10 | 30+ |
-| **Graph storage** | In-memory per session | embedded graph + vector index | Memgraph (Docker) | KuzuDB/FalkorDB/Neo4j | SQLite (embedded) | None (LSP only, no persistent graph) |
-| **Embeddings** | None | MiniLM-L6-v2 on Metal GPU (local) | UniXcoder (local) | None | None | None |
-| **LSP integration** | Is LSP | 38 servers, batch enrichment | None | None | None | 44+ tools via solidlsp |
-| **Query model** | Single-symbol, single-hop | Multi-hop, cross-language | Multi-hop | Multi-hop | Multi-hop | Single-symbol (LSP calls, not graph) |
-| **MCP tools** | N/A (protocol, not MCP) | 4 | 10 | 17 | 23 | 44+ |
-| **CLI parity** | N/A | Full (shared service layer) | N/A | N/A | N/A | N/A |
-| **Cross-encoder reranking** | None | Jina Reranker v1 Turbo (opt-in) | None | None | None | None |
-| **Business context** | None | Outcomes, signals, guardrails, metis | None | None | None | Agent memories (markdown files, agent-written) |
+| | **LSP (baseline)** | **RNA** | **Code-Graph-RAG** | **CodeGraphContext** | **GitNexus** | **codeTree** | **Serena** |
+|---|---|---|---|---|---|---|---|
+| **Install** | Editor plugin or PATH binary | `cargo install` / binary | Docker + uv + Memgraph + API key | `pip install` + (KuzuDB\|Neo4j) | `npm install -g gitnexus` | `pip install mcp-server-codetree` | `pip install mcp-server-serena` |
+| **External deps** | One server per language | None | Docker, Memgraph, LLM API | Graph DB (embedded or Docker) | None (LadybugDB embedded) | None | None (LSP servers auto-downloaded) |
+| **Languages parsed** | 1 per server | 30 | 11 | 14 | 15 | 10 | 30+ |
+| **Graph storage** | In-memory per session | embedded graph + vector index | Memgraph (Docker) | KuzuDB/FalkorDB/Neo4j | LadybugDB (embedded graph + vector + FTS) | SQLite (embedded) | None (LSP only, no persistent graph) |
+| **Embeddings** | None | MiniLM-L6-v2 on Metal GPU (local) | UniXcoder (local) | None | Snowflake Arctic Embed XS (opt-in `--embeddings`) | None | None |
+| **LSP integration** | Is LSP | 38 servers, batch enrichment | None | None | None | None | 44+ tools via solidlsp |
+| **Query model** | Single-symbol, single-hop | Multi-hop, cross-language | Multi-hop | Multi-hop | Multi-hop (Cypher) | Multi-hop | Single-symbol (LSP calls, not graph) |
+| **MCP tools** | N/A (protocol, not MCP) | 4 | 10 | 17 | 7 | 23 | 44+ |
+| **CLI parity** | N/A | Full (shared service layer) | N/A | N/A | Yes (`query`, `context`, `impact`, `cypher`) | N/A | N/A |
+| **Cross-encoder reranking** | None | Jina Reranker v1 Turbo (opt-in) | None | None | None | None | None |
+| **Business context** | None | Outcomes, signals, guardrails, metis | None | None | None | None | Agent memories (markdown files, agent-written) |
 
 ## Architecture Trade-offs
 
-| Axis | LSP | RNA | CGR | CGC | CT | Serena |
-|------|-----|-----|-----|-----|-----|--------|
-| **Cold start** | Server init (seconds) | ~5-10s scan, ~2min embed (adaptive LSP wait) | Index + Docker startup | Index + DB setup | ~1s scan + SQLite index | LSP server init (seconds) |
-| **Warm restart** | Server re-init | <1s (on-disk cache). `scan --full` is incremental — re-extracts only changed files, re-runs LSP only on changed nodes. ~0.1s on no-change runs. | Memgraph persists | DB persists | SQLite persists (mtime invalidation) | LSP server re-init |
-| **Memory** | Per-server process | in-process (no external DB) | Docker container | External or embedded DB | In-process (SQLite) | Per-server process |
-| **Query latency** | ms per hop (N round-trips) | ms total (in-process, single call) | Network hop to Memgraph | Network hop or embedded | ms (embedded SQLite) | ms per hop (N LSP round-trips) |
-| **Offline capable** | Yes | Fully offline | Needs Docker | Depends on DB choice | Fully offline | Yes |
+| Axis | LSP | RNA | CGR | CGC | GitNexus | CT | Serena |
+|------|-----|-----|-----|-----|----------|-----|--------|
+| **Cold start** | Server init (seconds) | ~5-10s scan, ~2min embed (adaptive LSP wait) | Index + Docker startup | Index + DB setup | Requires `gitnexus analyze` first (~251s for large repos) | ~1s scan + SQLite index | LSP server init (seconds) |
+| **Warm restart** | Server re-init | <1s (on-disk cache). `scan --full` is incremental — re-extracts only changed files, re-runs LSP only on changed nodes. ~0.1s on no-change runs. | Memgraph persists | DB persists | Fast (LadybugDB on disk) | SQLite persists (mtime invalidation) | LSP server re-init |
+| **Memory** | Per-server process | in-process (no external DB) | Docker container | External or embedded DB | In-process (no external DB) | In-process (SQLite) | Per-server process |
+| **Query latency** | ms per hop (N round-trips) | ms total (in-process, single call) | Network hop to Memgraph | Network hop or embedded | ms (embedded, Cypher overhead per traversal) | ms (embedded SQLite) | ms per hop (N LSP round-trips) |
+| **Offline capable** | Yes | Fully offline | Needs Docker | Depends on DB choice | Fully offline | Fully offline | Yes |
 
 RNA's zero-dependency design is a deliberate architectural choice. `cargo install` → works. No Docker, no external DB, no API key.
 
 ## Graph Quality
 
-| Edge source | LSP | RNA | CGR | CGC | CT | Serena |
-|-------------|-----|-----|-----|-----|-----|--------|
-| Tree-sitter (syntactic) | None | 30 extractors (22 code + 4 config + 4 schema) | 11 languages | 14 languages | 10 languages | None (uses LSP not tree-sitter) |
-| LSP (semantic) | Is the source (1 lang/server) | 38 language servers, call + type hierarchy | None | None | None | Is the source (30+ servers) |
-| SCIP (compiler) | None | Not needed — LSP covers the same edges | None | Pyright, tsc, scip-go, scip-rust | None | None |
-| Embedding similarity | None | MiniLM-L6-v2, cosine distance | UniXcoder | None | None | None |
-| Cross-language | No (one server per language) | Yes (unified graph) | Yes | Yes | Yes | Yes (separate servers) |
-| Multi-hop | No (agent must loop) | Yes (single call) | Yes | Yes | Yes | No (agent must loop) |
+| Edge source | LSP | RNA | CGR | CGC | GitNexus | CT | Serena |
+|-------------|-----|-----|-----|-----|----------|-----|--------|
+| Tree-sitter (syntactic) | None | 30 extractors (22 code + 4 config + 4 schema) | 11 languages | 14 languages | 15 languages | 10 languages | None (uses LSP not tree-sitter) |
+| LSP (semantic) | Is the source (1 lang/server) | 38 language servers, call + type hierarchy | None | None | None | None | Is the source (30+ servers) |
+| SCIP (compiler) | None | Not needed — LSP covers the same edges | None | Pyright, tsc, scip-go, scip-rust | None | None | None |
+| Embedding similarity | None | MiniLM-L6-v2, cosine distance | UniXcoder | None | Snowflake Arctic Embed XS (opt-in) | None | None |
+| Cross-language | No (one server per language) | Yes (unified graph) | Yes | Yes | Yes | Yes | Yes (separate servers) |
+| Multi-hop | No (agent must loop) | Yes (single call) | Yes | Yes | Yes (Cypher) | Yes | No (agent must loop) |
 
 LSP provides the raw semantic data — call hierarchy, type hierarchy, references — but only for one language at a time, one hop at a time. RNA consumes LSP as one enrichment source among several, fuses the results into a cross-language graph, and exposes multi-hop traversal. CGR and CGC skip LSP entirely, relying on tree-sitter (syntactic) or SCIP (compiler) for edges. RNA's two-tier approach (tree-sitter + LSP) gives the broadest coverage with the highest accuracy. 30 extractors from tree-sitter (22 code languages + 8 config/schema formats), then 38 LSP servers add compiler-grade call hierarchies and type relationships that neither CGR nor CGC have.
 
@@ -64,15 +64,15 @@ LSP provides the raw semantic data — call hierarchy, type hierarchy, reference
 
 ## Semantic Search
 
-| | LSP | RNA | CGR | CGC | CT | Serena |
-|---|---|---|---|---|---|---|
-| **Model** | N/A | MiniLM-L6-v2 + Jina Reranker v1 Turbo | UniXcoder (code-specific) | None | None | N/A |
-| **Hardware** | N/A | Metal GPU on Apple Silicon, CPU fallback | CPU | N/A | N/A | N/A |
-| **What's embedded** | N/A | Function bodies, all markdown, commits | Function bodies | Nothing | Nothing | N/A |
-| **Indexed together** | N/A | Code + markdown + git history | Code only | N/A | N/A | N/A |
-| **Score normalization** | N/A | relevance-ranked, test files demoted | Raw similarity | N/A | N/A | N/A |
-| **Body retrieval** | Reference only | `include_body` (requires `node`/`nodes`) returns full source; `minify_body` strips comments + shortens locals via tree-sitter AST (TS/JS, Rust, Python, Go) with legend | None | None | None | Reference only |
-| **Markdown** | N/A | Heading-scoped chunks with hierarchy | None | None | None | N/A |
+| | LSP | RNA | CGR | CGC | GitNexus | CT | Serena |
+|---|---|---|---|---|---|---|---|
+| **Model** | N/A | MiniLM-L6-v2 + Jina Reranker v1 Turbo | UniXcoder (code-specific) | None | Snowflake Arctic Embed XS (opt-in) | None | N/A |
+| **Hardware** | N/A | Metal GPU on Apple Silicon, CPU fallback | CPU | N/A | GPU optional (transformers.js), CPU fallback | N/A | N/A |
+| **What's embedded** | N/A | Function bodies, all markdown, commits | Function bodies | Nothing | Function bodies, node content | Nothing | N/A |
+| **Indexed together** | N/A | Code + markdown + git history | Code only | N/A | Code + limited docs | N/A | N/A |
+| **Score normalization** | N/A | relevance-ranked, test files demoted | Raw similarity | N/A | RRF (BM25 + semantic) | N/A | N/A |
+| **Body retrieval** | Reference only | `include_body` (requires `node`/`nodes`) returns full source; `minify_body` strips comments + shortens locals via tree-sitter AST (TS/JS, Rust, Python, Go) with legend | None | None | `include_content: true` (binary on/off, no minification) | None | Reference only |
+| **Markdown** | N/A | Heading-scoped chunks with hierarchy | None | None | Limited | None | N/A |
 
 RNA's unique advantage: semantic search spans code AND business artifacts in the same vector space. "Find functions related to our payment reliability outcome" is a query only RNA can answer. Results are relevance-ranked: exact name > contains > signature-only, definitions before imports, production code before tests. CGR's UniXcoder is a code-specific model (better at pure code semantics), but RNA embeds function bodies, all markdown (chunked by heading), and commit messages together — breadth over specialization.
 
@@ -83,6 +83,8 @@ RNA's unique advantage: semantic search spans code AND business artifacts in the
 **CGR: 10 tools** — mix of read + write + admin (file editing, database wipes, project deletion).
 
 **CGC: 17 tools** — broad coverage including visualization, dead code detection, complexity analysis, file watching.
+
+**GitNexus: 7 tools** — `query` (hybrid BM25+semantic search over execution flows), `context` (callers, callees, process participation for one symbol), `impact` (blast radius with depth-grouped risk: d=1 "WILL BREAK", d=2 "LIKELY AFFECTED", d=3 "MAY NEED TESTING"), `detect_changes` (uncommitted git diff → affected symbols and processes), `rename` (multi-file rename with graph confidence vs. text-search confidence), `cypher` (ad-hoc Cypher queries against the full schema), `list_repos` (multi-repo discovery). Tools accept `task_context` and `goal` parameters for ranking — the same query returns different results depending on what the agent is working on. All tools support an optional `repo` parameter for multi-repo setups.
 
 **codeTree: 23 tools** — breadth-first structural analysis covering graph queries, skeleton views, clone detection, taint/dataflow analysis, dead code detection, doc suggestions, change impact, and repository map.
 
@@ -100,6 +102,7 @@ RNA's tool count is deliberately lower. RNA is read/align infrastructure; agents
 6. **Token-efficient body retrieval** — `search(include_body: true, minify_body: true)` returns function bodies with comments stripped and locals shortened via tree-sitter AST walks (TS/JS, Rust, Python, Go) plus a deterministic legend. Agents get full implementation context at ~40-60% fewer tokens than raw source. No other tool minifies bodies for LLM consumption.
 7. **Subsystem detection** — `repo_map` automatically clusters the codebase into 8-12 architectural subsystems using Louvain community detection on actual call edges. No configuration required. Agents can scope search to a subsystem, filter cross-subsystem edges, and see the architecture on first call. CGR, CGC, and codeTree return flat symbol or file lists.
 8. **Impact summaries that don't flood context** — `search(mode="impact")` on high-connectivity nodes auto-summarizes into a subsystem-grouped breakdown instead of returning hundreds of raw node listings. Triggered above 30 nodes or 40K chars. Before v0.1.12, high-connectivity nodes like `EdgeKind` would return 157K characters of raw output, overflowing context.
+9. **No analysis-gate** — RNA indexes incrementally on first use. GitNexus and CGC require an upfront analysis step before any query works. For large repos, GitNexus's `gitnexus analyze` takes ~251s (132s of that is LadybugDB's single-writer write bottleneck). RNA's fast path (tree-sitter extraction) is visible to agents in under a second; LSP enrichment arrives in the background.
 
 ## What RNA Does That Others Don't
 
@@ -124,6 +127,19 @@ RNA is read-only infrastructure — it serves agents, it doesn't act as one. Thi
 - **Code-specific embedding model** — CGR uses UniXcoder (trained on code). RNA uses MiniLM-L6-v2 (general-purpose text model) because it needs to embed code, markdown, and business artifacts in the same space. Trade-off: slightly less code-specific precision, much broader coverage.
 - **SCIP indexing** — CGC supports Pyright, tsc, scip-go, scip-rust for compiler-grade precision in 4 languages. RNA spiked SCIP (#114) and concluded LSP provides the same semantic edges without requiring separate build-time indexers.
 - **Symbol-aware code editing** — Serena has `replace_symbol_body` and `rename_symbol` tools that edit code at the symbol level, not just read it. RNA is read-only infrastructure; agents use their own editors for writes.
+- **Execution flow detection** — GitNexus detects "processes": multi-hop call chains traced from entry points (functions with no internal callers) forward via BFS through CALLS edges, grouped and labeled heuristically ("HandleLogin → CreateSession"). This gives agents an intermediate abstraction between individual symbols and architectural subsystems. RNA has the graph data to compute this (entry-point detection, reachable traversal, Calls edges) but doesn't yet surface pre-computed flows as first-class objects. See the [GitNexus salvage](.oh/sessions/gitnexus-salvage.md) for the porting analysis.
+- **Multi-file rename with confidence** — GitNexus's `rename` tool combines graph-derived references (high confidence) with regex text search (lower confidence) and tags each edit accordingly. RNA is read-only; rename is the agent's job using its own editor tools.
+- **Web-based graph visualization** — GitNexus ships a React/Sigma.js UI for visual graph exploration and AI chat. RNA serves agents, not humans browsing a graph.
+
+## A Note on Storage Architecture
+
+RNA, GitNexus, and CGC all use embedded graph databases — no Docker required — but make different bets:
+
+**RNA (LanceDB + petgraph):** Two purpose-built stores. LanceDB (Apache-licensed, DataBricks-backed, Arrow-native) is the persistent canonical source for vectors, FTS, and edges. petgraph is an in-memory throwaway index rebuilt from LanceDB on startup — pure Rust for microsecond BFS, Dijkstra, PageRank, Tarjan SCC. Incremental writes go to LanceDB first; petgraph is always derived. This split tolerates drift gracefully and puts graph algorithms in pure Rust memory with no query overhead.
+
+**GitNexus (LadybugDB):** One store for everything — graph (Cypher), vectors (HNSW), and BM25 (FTS extension) — via LadybugDB, an embedded property graph database. Unified storage means cross-modality joins happen in one Cypher query. The cost: a single-writer bottleneck (132s for 5.67M edges in benchmarks), and vector index requires a full rebuild to update.
+
+**CGC (KuzuDB/Neo4j/FalkorDB):** Plugin-selectable backends. Flexible, but no embeddings — semantic search isn't in the design.
 
 ## Summary
 
@@ -131,8 +147,8 @@ RNA does code graph queries better (more languages, LSP edges, in-process speed,
 
 ## Sources
 
-Sources:
 - [Code-Graph-RAG salvage analysis](../.oh/sessions/cgr-salvage.md)
 - [CodeGraphContext salvage analysis](../.oh/sessions/codegraphcontext-salvage.md)
 - [codeTree salvage analysis](../.oh/sessions/codetree-salvage.md)
 - [Serena salvage analysis](../.oh/sessions/serena-salvage.md)
+- [GitNexus salvage analysis](../.oh/sessions/gitnexus-salvage.md)
