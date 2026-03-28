@@ -6,9 +6,6 @@
 //! - `scan_roots()` -- resolve workspace roots, detect file changes
 //! - `update_graph()` -- apply changes, run enrichment pipeline
 //! - `persist_deltas()` -- write to LanceDB, commit scanner state
-// EXTRACTION_VERSION is deprecated (#526) but still used for backward-compat migration.
-#![allow(deprecated)]
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -18,7 +15,7 @@ use crate::roots::{RootConfig, WorkspaceConfig};
 use crate::scanner::Scanner;
 
 use super::state::GraphState;
-use super::store::{check_and_migrate_extraction_version, persist_graph_to_lance};
+use super::store::persist_graph_to_lance;
 use super::{PipelineResult, RnaHandler};
 
 /// Check if a cached graph is missing enrichment passes output that should exist.
@@ -780,37 +777,6 @@ impl RnaHandler {
             return self
                 .run_pipeline_foreground_full(on_progress, pipeline_start)
                 .await;
-        }
-
-        // Pre-flight: check extraction version. If it changed (e.g., EXTRACTION_VERSION
-        // bumped in a new binary), clear scan-state files and fall back to full rebuild so
-        // all files are re-extracted with the updated extraction logic.
-        // Without this check the incremental path skips build_full_graph_inner (which
-        // contains the extraction-version guard) and reports "incremental, no changes".
-        {
-            let workspace = WorkspaceConfig::load()
-                .with_primary_root(self.repo_root.clone())
-                .with_worktrees(&self.repo_root)
-                .with_claude_memory(&self.repo_root)
-                .with_agent_memories(&self.repo_root)
-                .with_declared_roots(&self.repo_root);
-            let secondary_slugs: Vec<String> = workspace
-                .resolved_roots()
-                .iter()
-                .filter(|r| r.path != self.repo_root)
-                .map(|r| r.slug.clone())
-                .collect();
-            if check_and_migrate_extraction_version(&db_path, &self.repo_root, &secondary_slugs)? {
-                tracing::info!(
-                    "Extraction version migrated during incremental pre-flight -- falling back to full rebuild"
-                );
-                on_progress("Extraction version upgrade detected -- rebuilding from scratch.");
-                // Clear sentinels -- they reference the old extraction version and are now stale.
-                super::sentinel::clear_sentinels(&self.repo_root);
-                return self
-                    .run_pipeline_foreground_full(on_progress, pipeline_start)
-                    .await;
-            }
         }
 
         // Phase 1: Scan to detect changes.

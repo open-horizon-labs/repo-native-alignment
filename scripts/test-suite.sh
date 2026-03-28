@@ -259,8 +259,6 @@ check "FastapiRouterPrefixPass struct defined (#519)" \
   "grep -r 'FastapiRouterPrefixPass\|fastapi_router_prefix' $RNA_REPO/src/ 2>/dev/null | grep -v test | wc -l" "[1-9]"
 check "FastapiRouterPrefixConsumer registered in build_builtin_bus (#519/#523)" \
   "grep -c 'FastapiRouterPrefixConsumer' $RNA_REPO/src/extract/consumers.rs 2>/dev/null" "[1-9]"
-check "EXTRACTION_VERSION >= 13 for router_var metadata (#519)" \
-  "grep 'EXTRACTION_VERSION' $RNA_REPO/src/graph/store.rs | grep -o '[0-9]*' | tail -1" "1[3-9]\|[2-9][0-9]"
 check "router_var metadata extracted in generic.rs (#519)" \
   "grep -c 'router_var' $RNA_REPO/src/extract/generic.rs 2>/dev/null" "[1-9]"
 
@@ -302,10 +300,8 @@ check "EmbeddingIndexerConsumer::stub defined (#530)" \
 check "All production lance_repo_root opts are None (#530)" \
   "grep -c 'BusOptions\|lance_repo_root.*None\|embed_idx.*None' $RNA_REPO/src/server/graph.rs 2>/dev/null" "[1-9]"
 
-# ── FASTAPI PREFIX IDEMPOTENCY + EXTRACTION_VERSION BUMP (#531) ───────────
-echo "" && echo "--- FastAPI prefix idempotency + EXTRACTION_VERSION bump (#531) ---"
-check "EXTRACTION_VERSION >= 14 for http_path_local field (#531)" \
-  "grep 'EXTRACTION_VERSION' $RNA_REPO/src/graph/store.rs | grep -o '[0-9]*' | tail -1" "1[4-9]\|[2-9][0-9]"
+# ── FASTAPI PREFIX IDEMPOTENCY (#531) ───────────────────────────────────────
+echo "" && echo "--- FastAPI prefix idempotency (#531) ---"
 check "http_path_local stored for idempotency (#531)" \
   "grep -c 'http_path_local' $RNA_REPO/src/extract/fastapi_router_prefix.rs 2>/dev/null" "[1-9]"
 check "FastapiRouterPrefixConsumer present in consumers.rs (#531/#523)" \

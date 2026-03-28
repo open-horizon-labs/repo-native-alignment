@@ -12,7 +12,7 @@ Authoritative sources: `src/graph/mod.rs`, `src/graph/store.rs`, `src/server/sto
 
 RNA persists data in LanceDB at `.oh/.cache/lance/` relative to the repository root. The current schema version is tracked in `.oh/.cache/lance/schema_version`. When this file does not match `SCHEMA_VERSION` (currently `18`), the graph tables (`symbols`, `edges`, `pr_merges`, `file_index`) are dropped and rebuilt from scratch. The `artifacts` embedding table is managed separately and is not covered by `SCHEMA_VERSION` — it has its own schema validation at startup (see `artifacts` table section below).
 
-A separate `.oh/.cache/lance/extraction_version` file tracks the global extraction logic version (`EXTRACTION_VERSION`, currently `14`). This integer is **deprecated** as of v0.1.15 (#526) — per-consumer content-addressed cache keys have replaced the single global sentinel (see [Section 6](#6-content-addressed-consumer-cache)). The file is still read for backward-compatible sentinel detection on cold start, but new consumer invalidation is driven by `ExtractionConsumer::version()` return values, not this file.
+The `extraction_version` file that used to live alongside `schema_version` has been removed as of v0.2.x (#620). Per-consumer content-addressed cache keys (see [Section 6](#6-content-addressed-consumer-cache)) replaced the single global sentinel in v0.1.15 (#526). Legacy `extraction_version` files on disk are no longer read or written and will be cleaned up by the next schema migration.
 
 ### `symbols` table
 
@@ -518,7 +518,7 @@ Override to `false` for consumers that:
 - Trigger external side-effects that must run every time (e.g., `LanceDBConsumer`, `EmbeddingIndexerConsumer`).
 - Read filesystem state beyond the event payload (e.g., `ManifestConsumer`, `TreeSitterConsumer`).
 
-**Migration from `EXTRACTION_VERSION`:** The global `EXTRACTION_VERSION` integer (`src/graph/store.rs`) is deprecated and kept only for backward-compatible sentinel reads on cold start. New invalidation is driven exclusively by `ConsumerCacheKey`.
+**Supersedes `EXTRACTION_VERSION`:** The global `EXTRACTION_VERSION` integer was removed in v0.2.x (#620). Invalidation is driven exclusively by `ConsumerCacheKey`.
 
 ---
 

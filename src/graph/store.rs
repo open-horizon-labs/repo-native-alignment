@@ -16,44 +16,6 @@ use arrow_schema::{DataType, Field, Schema};
 /// Also surfaced in the index freshness footer on `search`.
 pub const SCHEMA_VERSION: u32 = 18; // gRPC proto columns: parent_service, rpc_request_type, rpc_response_type
 
-/// Extraction version for source-level extraction logic.
-///
-/// **Deprecated** — replaced by content-addressed per-consumer cache keys (#526).
-///
-/// Each `ExtractionConsumer` now declares `fn version() -> u64`. The cache key for
-/// a consumer+event pair is `(blake3(event.canonical_bytes()), consumer.version())`.
-/// Changing one consumer's `version()` only invalidates that consumer's cache, not all
-/// consumers.
-///
-/// This constant is retained for backward compatibility with the sentinel system
-/// (`SentinelData::extraction_version`) and the `check_and_migrate_extraction_version`
-/// call site in the server pipeline. Both will be removed in a follow-up cleanup.
-///
-/// **Do not bump this constant.** Instead, bump the `version()` of the specific consumer
-/// whose extraction logic changed. Config-driven consumers (`CustomExtractorConsumer`)
-/// derive their version from `blake3(toml_file_contents)` automatically.
-///
-/// Historical bump log (kept for reference, not for future use):
-/// - Bumped to 1 for doc_comment metadata extraction (#401).
-/// - Bumped to 3 for new C, PHP, HTML, Scala, Dart, Elixir extractors (#435).
-/// - Bumped to 4 for Next.js routing pass (#440) and monorepo subdirectory roots (#442).
-/// - Bumped to 5 for subsystem first-class nodes (#470).
-/// - Bumped to 6 for framework detection pass (#469).
-/// - Bumped to 7 for pub/sub + websocket extractors (#464/#467).
-/// - Bumped to 8 for cross-file import-calls pass (#462).
-/// - Bumped to 9 for background scanner post-extraction passes (#471).
-/// - Bumped to 10 for generic extractor-config pass (#467).
-/// - Bumped to 11 for openapi_sdk_link_pass (#465).
-/// - Bumped to 12 for gRPC client calls pass (#466).
-/// - Bumped to 13 for FastAPI router prefix pass (#517).
-/// - Bumped to 14 for idempotent FastAPI prefix rewrite (#528 followup).
-#[deprecated(
-    since = "0.1.8",
-    note = "Use ExtractionConsumer::version() + content-addressed cache keys instead (#526). \
-            Do not bump this constant — bump the specific consumer's version() instead."
-)]
-pub const EXTRACTION_VERSION: u32 = 14;
-
 /// Arrow schema for the `symbols` table.
 ///
 /// Stores code symbols (functions, structs, traits, etc.) with embeddings
@@ -261,21 +223,6 @@ mod tests {
     fn test_schema_version_constant() {
         // SCHEMA_VERSION must be at least 17 (bumped for scan_version column #477)
         assert!(SCHEMA_VERSION >= 17, "SCHEMA_VERSION should be >= 17");
-    }
-
-    /// `EXTRACTION_VERSION` is now deprecated (#526). The global integer is replaced by
-    /// per-consumer content-addressed cache keys: `(blake3(event_payload), consumer.version())`.
-    /// This test verifies the constant still holds its historical value (14) so that the
-    /// sentinel backward-compat path continues to read old sentinel files correctly.
-    /// Do not bump this value — bump the specific consumer's `version()` instead.
-    #[test]
-    #[allow(deprecated)]
-    fn test_extraction_version_is_frozen_at_14() {
-        assert_eq!(
-            EXTRACTION_VERSION, 14,
-            "EXTRACTION_VERSION is frozen at 14 (#526). \
-             Do not bump — use ExtractionConsumer::version() instead."
-        );
     }
 
     #[test]

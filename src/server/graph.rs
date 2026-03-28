@@ -1,6 +1,4 @@
 //! Graph lifecycle: building, incremental updates, and state management.
-// EXTRACTION_VERSION is deprecated (#526) but still used for backward-compat migration.
-#![allow(deprecated)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,9 +19,8 @@ use super::RnaHandler;
 use super::helpers;
 use super::state::GraphState;
 use super::store::{
-    check_and_migrate_extraction_version, check_and_migrate_schema, delete_nodes_for_roots,
-    get_stored_root_ids, graph_lance_path, load_graph_from_lance, persist_graph_incremental,
-    persist_graph_to_lance,
+    check_and_migrate_schema, delete_nodes_for_roots, get_stored_root_ids, graph_lance_path,
+    load_graph_from_lance, persist_graph_incremental, persist_graph_to_lance,
 };
 
 impl RnaHandler {
@@ -714,27 +711,6 @@ impl RnaHandler {
             .with_agent_memories(&self.repo_root)
             .with_declared_roots(&self.repo_root);
         let resolved_roots = workspace.resolved_roots();
-
-        // Check extraction version: if it changed, clear scan-state files for all roots
-        // to force full re-extraction with updated extraction logic (e.g., doc_comment #401).
-        let secondary_slugs: Vec<String> = resolved_roots
-            .iter()
-            .filter(|r| r.path != self.repo_root)
-            .map(|r| r.slug.clone())
-            .collect();
-        match check_and_migrate_extraction_version(&db_path, &self.repo_root, &secondary_slugs) {
-            Ok(true) => {
-                tracing::info!(
-                    "Extraction version migrated to v{} — scan-state cleared, full re-extraction required",
-                    crate::graph::store::EXTRACTION_VERSION
-                );
-                // Scan-state files are cleared; the scanner below will see all files as new.
-            }
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!("Extraction version check failed (proceeding): {}", e);
-            }
-        }
 
         // Prune stale roots: compare discovered roots against what LanceDB has stored.
         // Worktrees removed while the server was offline leave orphaned rows that cause
