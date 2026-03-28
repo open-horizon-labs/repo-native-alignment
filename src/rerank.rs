@@ -5,8 +5,9 @@
 //! pairs jointly. This produces more precise relevance scores than bi-encoder
 //! embeddings, which encode query and document independently.
 //!
-//! The reranker is opt-in (`rerank: true` on the search tool) to avoid latency
-//! regression for simple lookups. It is lazy-loaded on first use.
+//! The reranker is on by default for MCP (where queries are agent-driven and
+//! benefit from precision) and opt-in for CLI (`--rerank`). It is lazy-loaded
+//! on first use.
 
 use std::sync::Mutex;
 

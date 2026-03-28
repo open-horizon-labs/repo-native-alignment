@@ -117,7 +117,7 @@ impl SearchParams {
             compact: args.compact.unwrap_or(false),
             nodes: args.nodes.clone(),
             search_mode: args.search_mode.clone(),
-            rerank: args.rerank.unwrap_or(false),
+            rerank: args.rerank.unwrap_or(true),
             include_artifacts: args.include_artifacts.unwrap_or(true),
             include_markdown: args.include_markdown.unwrap_or(true),
             artifact_types: args.artifact_types.clone(),
