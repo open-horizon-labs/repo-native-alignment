@@ -133,7 +133,12 @@ impl RnaHandler {
             root_filter,
             non_code_slugs,
         };
-        let markdown = crate::service::search(&params, &ctx).await;
+        let mut markdown = crate::service::search(&params, &ctx).await;
+        if self.graph_build_status.is_building() {
+            markdown.push_str(
+                "\n\n_Index updating in background — results reflect last complete scan._",
+            );
+        }
         Ok(text_result(markdown))
     }
 
@@ -181,7 +186,12 @@ impl RnaHandler {
             graph_state: &graph_state,
             repo_root: &self.repo_root,
         };
-        let markdown = crate::service::outcome_progress(&params, &ctx);
+        let mut markdown = crate::service::outcome_progress(&params, &ctx);
+        if self.graph_build_status.is_building() {
+            markdown.push_str(
+                "\n\n_Index updating in background — results reflect last complete scan._",
+            );
+        }
         Ok(text_result(markdown))
     }
 
@@ -263,7 +273,12 @@ impl RnaHandler {
             lsp_status: Some(&self.lsp_status),
             embed_status: Some(&self.embed_status),
         };
-        let markdown = crate::service::repo_map(&params, &ctx);
+        let mut markdown = crate::service::repo_map(&params, &ctx);
+        if self.graph_build_status.is_building() {
+            markdown.push_str(
+                "\n\n_Index updating in background — results reflect last complete scan._",
+            );
+        }
         Ok(text_result(markdown))
     }
 }
