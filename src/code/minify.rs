@@ -561,10 +561,10 @@ fn remove_param_bindings(
                 } else {
                     child
                 };
-                if ident.kind() == "identifier" {
-                    if let Ok(name) = ident.utf8_text(source) {
-                        locals.remove(name);
-                    }
+                if ident.kind() == "identifier"
+                    && let Ok(name) = ident.utf8_text(source)
+                {
+                    locals.remove(name);
                 }
             } else {
                 // Recurse for nested patterns (destructuring, rest params, etc.)
