@@ -71,14 +71,14 @@ LSP provides the raw semantic data — call hierarchy, type hierarchy, reference
 | **What's embedded** | N/A | Function bodies, all markdown, commits | Function bodies | Nothing | Nothing | N/A |
 | **Indexed together** | N/A | Code + markdown + git history | Code only | N/A | N/A | N/A |
 | **Score normalization** | N/A | relevance-ranked, test files demoted | Raw similarity | N/A | N/A | N/A |
-| **Body retrieval** | Reference only | `include_body` returns full source; `minify_body` strips comments + shortens locals via tree-sitter AST (TS/JS, Rust, Python, Go) with legend | None | None | None | Reference only |
+| **Body retrieval** | Reference only | `include_body` (requires `node`/`nodes`) returns full source; `minify_body` strips comments + shortens locals via tree-sitter AST (TS/JS, Rust, Python, Go) with legend | None | None | None | Reference only |
 | **Markdown** | N/A | Heading-scoped chunks with hierarchy | None | None | None | N/A |
 
 RNA's unique advantage: semantic search spans code AND business artifacts in the same vector space. "Find functions related to our payment reliability outcome" is a query only RNA can answer. Results are relevance-ranked: exact name > contains > signature-only, definitions before imports, production code before tests. CGR's UniXcoder is a code-specific model (better at pure code semantics), but RNA embeds function bodies, all markdown (chunked by heading), and commit messages together — breadth over specialization.
 
 ## MCP Tool Philosophy
 
-**RNA: 4 tools** — one `search` tool handles code symbols, artifacts, markdown, commits, and graph traversal. Supports subsystem-scoped search (`subsystem=`), cross-subsystem edge filtering (`target_subsystem=`), body retrieval with optional tree-sitter minification (`include_body`, `minify_body`), and impact mode that auto-summarizes large results into a subsystem-grouped breakdown (triggered above 30 nodes or 40K chars). `outcome_progress` for business alignment. `repo_map` for orientation — includes automatically detected architectural subsystems with cohesion scores and interfaces. `list_roots` for workspace management. CLI and MCP share a service layer — every capability available in both interfaces.
+**RNA: 4 tools** — one `search` tool handles code symbols, artifacts, markdown, commits, and graph traversal. Supports subsystem-scoped search (`subsystem=`), cross-subsystem edge filtering (`target_subsystem=`), body retrieval with optional tree-sitter minification (`include_body` + `minify_body`, requires `node`/`nodes`), and impact mode that auto-summarizes large results into a subsystem-grouped breakdown (triggered above 30 nodes or 40K chars). `outcome_progress` for business alignment. `repo_map` for orientation — includes automatically detected architectural subsystems with cohesion scores and interfaces. `list_roots` for workspace management. CLI and MCP share a service layer — every capability available in both interfaces.
 
 **CGR: 10 tools** — mix of read + write + admin (file editing, database wipes, project deletion).
 
