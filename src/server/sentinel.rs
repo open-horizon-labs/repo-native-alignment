@@ -95,14 +95,14 @@ pub fn read_extract_sentinel(repo_root: &Path) -> Option<SentinelData> {
 
 /// Read the LSP sentinel. Returns `None` if absent, stale, or corrupt.
 ///
-/// `None` means LSP enrichment has not completed for this schema/extraction version
+/// `None` means LSP enrichment has not completed for this schema version
 /// and should be re-run. `Some(_)` means LSP completed and its results are in LanceDB.
 pub fn read_lsp_sentinel(repo_root: &Path) -> Option<SentinelData> {
     read_sentinel(&lsp_sentinel_path(repo_root), "lsp")
 }
 
-/// Delete both sentinels. Called when a full rebuild is triggered (schema migration,
-/// extraction version bump, or explicit `--full` with cache invalidation).
+/// Delete both sentinels. Called when a full rebuild is triggered (schema migration
+/// or explicit `--full` with cache invalidation).
 pub fn clear_sentinels(repo_root: &Path) {
     clear_sentinel(&extract_sentinel_path(repo_root), "extract");
     clear_sentinel(&lsp_sentinel_path(repo_root), "lsp");
