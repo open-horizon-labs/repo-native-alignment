@@ -11,6 +11,7 @@ pub mod api_link;
 pub mod bash;
 pub mod c;
 pub mod cache;
+pub mod aspnet_endpoints;
 pub mod configs;
 pub mod consumers;
 pub mod cpp;

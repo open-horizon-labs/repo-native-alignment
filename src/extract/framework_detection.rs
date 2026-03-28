@@ -584,6 +584,167 @@ static FRAMEWORK_RULES: &[FrameworkRule] = &[
         display_name: "GORM",
     },
     // -------------------------------------------------------------------------
+    // C# / .NET frameworks
+    // -------------------------------------------------------------------------
+    // More specific patterns must come before broader ones — detection deduplicates
+    // by framework_id so ordering only affects which import triggers first.
+    FrameworkRule {
+        import_pattern: "Microsoft.AspNetCore.OpenApi",
+        language: "csharp",
+        framework_id: "aspnet-openapi",
+        display_name: "ASP.NET OpenAPI",
+    },
+    FrameworkRule {
+        import_pattern: "Microsoft.AspNetCore.SignalR",
+        language: "csharp",
+        framework_id: "signalr",
+        display_name: "SignalR",
+    },
+    FrameworkRule {
+        import_pattern: "Microsoft.AspNetCore.Identity",
+        language: "csharp",
+        framework_id: "aspnet-identity",
+        display_name: "ASP.NET Identity",
+    },
+    FrameworkRule {
+        import_pattern: "Microsoft.AspNetCore",
+        language: "csharp",
+        framework_id: "aspnet",
+        display_name: "ASP.NET Core",
+    },
+    FrameworkRule {
+        import_pattern: "Microsoft.EntityFrameworkCore",
+        language: "csharp",
+        framework_id: "efcore",
+        display_name: "Entity Framework Core",
+    },
+    FrameworkRule {
+        import_pattern: "Npgsql",
+        language: "csharp",
+        framework_id: "npgsql",
+        display_name: "Npgsql (PostgreSQL)",
+    },
+    FrameworkRule {
+        import_pattern: "Dapper",
+        language: "csharp",
+        framework_id: "dapper",
+        display_name: "Dapper",
+    },
+    FrameworkRule {
+        import_pattern: "Minio",
+        language: "csharp",
+        framework_id: "minio",
+        display_name: "MinIO",
+    },
+    FrameworkRule {
+        import_pattern: "BCrypt",
+        language: "csharp",
+        framework_id: "bcrypt-net",
+        display_name: "BCrypt.Net",
+    },
+    FrameworkRule {
+        import_pattern: "System.Text.Json",
+        language: "csharp",
+        framework_id: "system-text-json",
+        display_name: "System.Text.Json",
+    },
+    FrameworkRule {
+        import_pattern: "MediatR",
+        language: "csharp",
+        framework_id: "mediatr",
+        display_name: "MediatR (CQRS)",
+    },
+    FrameworkRule {
+        import_pattern: "MassTransit",
+        language: "csharp",
+        framework_id: "masstransit",
+        display_name: "MassTransit",
+    },
+    FrameworkRule {
+        import_pattern: "Hangfire",
+        language: "csharp",
+        framework_id: "hangfire",
+        display_name: "Hangfire",
+    },
+    FrameworkRule {
+        import_pattern: "Polly",
+        language: "csharp",
+        framework_id: "polly",
+        display_name: "Polly",
+    },
+    FrameworkRule {
+        import_pattern: "AutoMapper",
+        language: "csharp",
+        framework_id: "automapper",
+        display_name: "AutoMapper",
+    },
+    FrameworkRule {
+        import_pattern: "FluentValidation",
+        language: "csharp",
+        framework_id: "fluentvalidation",
+        display_name: "FluentValidation",
+    },
+    FrameworkRule {
+        import_pattern: "Serilog",
+        language: "csharp",
+        framework_id: "serilog",
+        display_name: "Serilog",
+    },
+    FrameworkRule {
+        import_pattern: "Duende.IdentityServer",
+        language: "csharp",
+        framework_id: "identityserver",
+        display_name: "Duende IdentityServer",
+    },
+    FrameworkRule {
+        import_pattern: "Orleans",
+        language: "csharp",
+        framework_id: "orleans",
+        display_name: "Orleans",
+    },
+    FrameworkRule {
+        import_pattern: "Wolverine",
+        language: "csharp",
+        framework_id: "wolverine",
+        display_name: "Wolverine",
+    },
+    FrameworkRule {
+        import_pattern: "Refit",
+        language: "csharp",
+        framework_id: "refit",
+        display_name: "Refit",
+    },
+    FrameworkRule {
+        import_pattern: "Npgsql.EntityFrameworkCore",
+        language: "csharp",
+        framework_id: "ef-postgres",
+        display_name: "EF Core + PostgreSQL",
+    },
+    FrameworkRule {
+        import_pattern: "Microsoft.EntityFrameworkCore.SqlServer",
+        language: "csharp",
+        framework_id: "ef-sqlserver",
+        display_name: "EF Core + SQL Server",
+    },
+    FrameworkRule {
+        import_pattern: "Xunit",
+        language: "csharp",
+        framework_id: "xunit",
+        display_name: "xUnit",
+    },
+    FrameworkRule {
+        import_pattern: "NUnit",
+        language: "csharp",
+        framework_id: "nunit",
+        display_name: "NUnit",
+    },
+    FrameworkRule {
+        import_pattern: "Moq",
+        language: "csharp",
+        framework_id: "moq",
+        display_name: "Moq",
+    },
+    // -------------------------------------------------------------------------
     // Rust frameworks
     // -------------------------------------------------------------------------
     FrameworkRule {
@@ -652,6 +813,183 @@ static FRAMEWORK_RULES: &[FrameworkRule] = &[
         framework_id: "diesel",
         display_name: "Diesel ORM",
     },
+    FrameworkRule {
+        import_pattern: "reqwest",
+        language: "rust",
+        framework_id: "reqwest",
+        display_name: "reqwest",
+    },
+    // -------------------------------------------------------------------------
+    // JavaScript / TypeScript — additional frameworks
+    // -------------------------------------------------------------------------
+    FrameworkRule {
+        import_pattern: "axios",
+        language: "",
+        framework_id: "axios",
+        display_name: "Axios",
+    },
+    FrameworkRule {
+        import_pattern: "mongoose",
+        language: "",
+        framework_id: "mongoose",
+        display_name: "Mongoose (MongoDB)",
+    },
+    FrameworkRule {
+        import_pattern: "sequelize",
+        language: "",
+        framework_id: "sequelize",
+        display_name: "Sequelize",
+    },
+    FrameworkRule {
+        import_pattern: "drizzle-orm",
+        language: "",
+        framework_id: "drizzle",
+        display_name: "Drizzle ORM",
+    },
+    FrameworkRule {
+        import_pattern: "knex",
+        language: "",
+        framework_id: "knex",
+        display_name: "Knex.js",
+    },
+    FrameworkRule {
+        import_pattern: "jsonwebtoken",
+        language: "",
+        framework_id: "jwt",
+        display_name: "jsonwebtoken",
+    },
+    FrameworkRule {
+        import_pattern: "jose",
+        language: "typescript",
+        framework_id: "jwt",
+        display_name: "jose (JWT)",
+    },
+    FrameworkRule {
+        import_pattern: "jose",
+        language: "javascript",
+        framework_id: "jwt",
+        display_name: "jose (JWT)",
+    },
+    FrameworkRule {
+        import_pattern: "passport",
+        language: "",
+        framework_id: "passport",
+        display_name: "Passport.js",
+    },
+    FrameworkRule {
+        import_pattern: "next-auth",
+        language: "",
+        framework_id: "next-auth",
+        display_name: "NextAuth.js",
+    },
+    FrameworkRule {
+        import_pattern: "@auth/",
+        language: "",
+        framework_id: "next-auth",
+        display_name: "Auth.js",
+    },
+    FrameworkRule {
+        import_pattern: "jest",
+        language: "",
+        framework_id: "jest",
+        display_name: "Jest",
+    },
+    FrameworkRule {
+        import_pattern: "vitest",
+        language: "",
+        framework_id: "vitest",
+        display_name: "Vitest",
+    },
+    FrameworkRule {
+        import_pattern: "mocha",
+        language: "",
+        framework_id: "mocha",
+        display_name: "Mocha",
+    },
+    FrameworkRule {
+        import_pattern: "@aws-sdk/",
+        language: "",
+        framework_id: "aws-sdk",
+        display_name: "AWS SDK",
+    },
+    FrameworkRule {
+        import_pattern: "aws-sdk",
+        language: "",
+        framework_id: "aws-sdk",
+        display_name: "AWS SDK v2",
+    },
+    FrameworkRule {
+        import_pattern: "bullmq",
+        language: "",
+        framework_id: "bullmq",
+        display_name: "BullMQ",
+    },
+    FrameworkRule {
+        import_pattern: "amqplib",
+        language: "",
+        framework_id: "rabbitmq-js",
+        display_name: "amqplib (RabbitMQ)",
+    },
+    FrameworkRule {
+        import_pattern: "@ai-sdk/",
+        language: "",
+        framework_id: "vercel-ai",
+        display_name: "Vercel AI SDK",
+    },
+    // -------------------------------------------------------------------------
+    // Python — additional frameworks
+    // -------------------------------------------------------------------------
+    FrameworkRule {
+        import_pattern: "requests",
+        language: "python",
+        framework_id: "requests",
+        display_name: "Requests",
+    },
+    FrameworkRule {
+        import_pattern: "sqlmodel",
+        language: "python",
+        framework_id: "sqlmodel",
+        display_name: "SQLModel",
+    },
+    FrameworkRule {
+        import_pattern: "peewee",
+        language: "python",
+        framework_id: "peewee",
+        display_name: "Peewee",
+    },
+    FrameworkRule {
+        import_pattern: "transformers",
+        language: "python",
+        framework_id: "transformers",
+        display_name: "HuggingFace Transformers",
+    },
+    FrameworkRule {
+        import_pattern: "torch",
+        language: "python",
+        framework_id: "pytorch",
+        display_name: "PyTorch",
+    },
+    FrameworkRule {
+        import_pattern: "tensorflow",
+        language: "python",
+        framework_id: "tensorflow",
+        display_name: "TensorFlow",
+    },
+    FrameworkRule {
+        import_pattern: "ollama",
+        language: "python",
+        framework_id: "ollama",
+        display_name: "Ollama",
+    },
+    // -------------------------------------------------------------------------
+    // Go — additional frameworks
+    // -------------------------------------------------------------------------
+    FrameworkRule {
+        import_pattern: "nats",
+        language: "go",
+        framework_id: "nats-go",
+        display_name: "NATS",
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -662,6 +1000,8 @@ static FRAMEWORK_RULES: &[FrameworkRule] = &[
 pub struct FrameworkDetectionResult {
     /// Virtual `NodeKind::Other("framework")` nodes, one per detected framework.
     pub nodes: Vec<Node>,
+    /// `DependsOn` edges from Import nodes to the framework nodes they matched.
+    pub edges: Vec<crate::graph::Edge>,
     /// Set of detected framework IDs for gating conditional extractors.
     pub detected_frameworks: HashSet<String>,
 }
@@ -684,7 +1024,11 @@ pub struct FrameworkDetectionResult {
 /// `result.nodes`. The `detected_frameworks` set is stored in `GraphState` for
 /// conditional extractor gating.
 pub fn framework_detection_pass(all_nodes: &[Node], root_id: &str) -> FrameworkDetectionResult {
+    use crate::graph::{Confidence, Edge, EdgeKind};
+
     let mut detected: HashSet<String> = HashSet::new();
+    // Track (import_node_id, framework_id) pairs for edge creation.
+    let mut import_framework_pairs: Vec<(NodeId, String)> = Vec::new();
 
     for node in all_nodes {
         if node.id.kind != NodeKind::Import {
@@ -706,6 +1050,7 @@ pub fn framework_detection_pass(all_nodes: &[Node], root_id: &str) -> FrameworkD
             let pattern = rule.import_pattern.to_lowercase();
             if import_text.contains(pattern.as_str()) {
                 detected.insert(rule.framework_id.to_string());
+                import_framework_pairs.push((node.id.clone(), rule.framework_id.to_string()));
             }
         }
     }
@@ -713,12 +1058,14 @@ pub fn framework_detection_pass(all_nodes: &[Node], root_id: &str) -> FrameworkD
     if detected.is_empty() {
         return FrameworkDetectionResult {
             nodes: Vec::new(),
+            edges: Vec::new(),
             detected_frameworks: HashSet::new(),
         };
     }
 
     // Emit one framework node per detected framework.
     let mut nodes: Vec<Node> = Vec::with_capacity(detected.len());
+    let mut framework_node_ids: std::collections::HashMap<String, NodeId> = std::collections::HashMap::new();
     for framework_id in &detected {
         // Look up display name.
         let display_name = FRAMEWORK_RULES
@@ -730,13 +1077,16 @@ pub fn framework_detection_pass(all_nodes: &[Node], root_id: &str) -> FrameworkD
         let mut metadata = BTreeMap::new();
         metadata.insert("display_name".to_string(), display_name.to_string());
 
+        let node_id = NodeId {
+            root: root_id.to_string(),
+            file: PathBuf::from(format!("frameworks/{}", framework_id)),
+            name: framework_id.clone(),
+            kind: NodeKind::Other("framework".to_string()),
+        };
+        framework_node_ids.insert(framework_id.clone(), node_id.clone());
+
         nodes.push(Node {
-            id: NodeId {
-                root: root_id.to_string(),
-                file: PathBuf::from(format!("frameworks/{}", framework_id)),
-                name: framework_id.clone(),
-                kind: NodeKind::Other("framework".to_string()),
-            },
+            id: node_id,
             language: String::new(),
             line_start: 0,
             line_end: 0,
@@ -747,12 +1097,35 @@ pub fn framework_detection_pass(all_nodes: &[Node], root_id: &str) -> FrameworkD
         });
     }
 
+    // Emit DependsOn edges from Import nodes to framework nodes.
+    // Deduplicate: one edge per (root, file, framework) triple to avoid
+    // noisy per-import edges when a file has multiple imports from the same framework.
+    // Include root in the key so multi-root workspaces don't collapse different files.
+    let mut seen_file_fw: HashSet<(String, String, String)> = HashSet::new();
+    let mut edges: Vec<Edge> = Vec::new();
+    for (import_id, framework_id) in &import_framework_pairs {
+        let file_key = import_id.file.display().to_string();
+        if !seen_file_fw.insert((import_id.root.clone(), file_key, framework_id.clone())) {
+            continue;
+        }
+        if let Some(fw_node_id) = framework_node_ids.get(framework_id) {
+            edges.push(Edge {
+                from: import_id.clone(),
+                to: fw_node_id.clone(),
+                kind: EdgeKind::DependsOn,
+                confidence: Confidence::Detected,
+                source: ExtractionSource::TreeSitter,
+            });
+        }
+    }
+
     // Sort for deterministic output.
     nodes.sort_by(|a, b| a.id.name.cmp(&b.id.name));
 
     tracing::info!(
-        "Framework detection: {} framework(s) detected: [{}]",
+        "Framework detection: {} framework(s) detected, {} DependsOn edge(s): [{}]",
         nodes.len(),
+        edges.len(),
         nodes
             .iter()
             .map(|n| n.id.name.as_str())
@@ -762,6 +1135,7 @@ pub fn framework_detection_pass(all_nodes: &[Node], root_id: &str) -> FrameworkD
 
     FrameworkDetectionResult {
         nodes,
+        edges,
         detected_frameworks: detected,
     }
 }

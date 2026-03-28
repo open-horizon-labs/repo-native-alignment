@@ -614,6 +614,9 @@ impl EnrichmentFinalizer {
             if !result.nodes.is_empty() {
                 all_nodes.extend(result.nodes);
             }
+            if !result.edges.is_empty() {
+                all_edges.extend(result.edges);
+            }
         }
 
         // Step 3: fastapi_router_prefix — rewrites `http_path` on FastAPI ApiEndpoint nodes
@@ -765,6 +768,17 @@ impl EnrichmentFinalizer {
             let new_edges = crate::extract::grpc::grpc_client_calls_pass(&all_nodes);
             if !new_edges.is_empty() {
                 all_edges.extend(new_edges);
+            }
+        }
+        // aspnet_endpoint_pass — extract MapGet/MapPost/etc. as ApiEndpoint nodes
+        if detected_frameworks.contains("aspnet") {
+            let result = crate::extract::aspnet_endpoints::aspnet_endpoint_pass(
+                &self.root_pairs,
+                &all_nodes,
+            );
+            if !result.nodes.is_empty() || !result.edges.is_empty() {
+                all_nodes.extend(result.nodes);
+                all_edges.extend(result.edges);
             }
         }
         // extractor_config — config-driven boundary detection per workspace root
@@ -1177,6 +1191,52 @@ impl ExtractionConsumer for GrpcConsumer {
         tracing::debug!("GrpcConsumer: root '{}' has .proto files (stub)", slug);
         Ok(vec![ExtractionEvent::PassComplete {
             pass_name: "grpc_proto",
+            added_nodes: 0,
+            added_edges: 0,
+        }])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AspNetEndpointConsumer
+// ---------------------------------------------------------------------------
+
+/// Subscribes to `FrameworkDetected("aspnet")` — signals that ASP.NET Core is in use.
+///
+/// **ADR pattern:** Framework-gated pass as a consumer — wakes only when its
+/// framework fires. The actual endpoint extraction (`aspnet_endpoint_pass`) runs
+/// inside `EnrichmentFinalizer` which has access to the full node set and root_pairs.
+///
+/// Subscribes to: `FrameworkDetected`
+/// Emits: `PassComplete`
+pub struct AspNetEndpointConsumer;
+
+#[async_trait]
+impl ExtractionConsumer for AspNetEndpointConsumer {
+    fn name(&self) -> &str {
+        "aspnet_endpoints"
+    }
+
+    fn subscribes_to(&self) -> &[ExtractionEventKind] {
+        &[ExtractionEventKind::FrameworkDetected]
+    }
+
+    async fn on_event(&self, event: &ExtractionEvent) -> anyhow::Result<Vec<ExtractionEvent>> {
+        let ExtractionEvent::FrameworkDetected {
+            slug, framework, ..
+        } = event
+        else {
+            return Ok(vec![]);
+        };
+        if framework != "aspnet" {
+            return Ok(vec![]);
+        }
+        tracing::debug!(
+            "AspNetEndpointConsumer: root '{}' aspnet detected — endpoint extraction will run in EnrichmentFinalizer",
+            slug,
+        );
+        Ok(vec![ExtractionEvent::PassComplete {
+            pass_name: "aspnet_endpoints",
             added_nodes: 0,
             added_edges: 0,
         }])
@@ -2229,6 +2289,7 @@ pub fn build_builtin_bus(
     bus.register(Box::new(NextjsRoutingConsumer::new(root_pairs)));
     bus.register(Box::new(PubSubConsumer));
     bus.register(Box::new(WebSocketConsumer));
+    bus.register(Box::new(AspNetEndpointConsumer));
 
     // --- PassesComplete consumers ---
     // LanceDBConsumer: persist graph on PassesComplete.
@@ -2852,8 +2913,9 @@ mod tests {
             lsp_count + // LanguageDetected: LspConsumer × N (real, Phase 3)
             3 +        // AllEnrichmentsDone: ApiLinkConsumer, TestedByConsumer,
                        //   EnrichmentFinalizer
-            6 +        // FrameworkDetected: FrameworkDetectionConsumer, FastapiRouterPrefixConsumer,
-                       //   SdkPathInferenceConsumer, NextjsRoutingConsumer, PubSubConsumer, WebSocketConsumer
+            7 +        // FrameworkDetected: FrameworkDetectionConsumer, FastapiRouterPrefixConsumer,
+                       //   SdkPathInferenceConsumer, NextjsRoutingConsumer, PubSubConsumer, WebSocketConsumer,
+                       //   AspNetEndpointConsumer
             2; // PassesComplete: SubsystemConsumer, LanceDBConsumer
         assert_eq!(
             bus.len(),

@@ -943,12 +943,11 @@ fn collect_csharp_locals(
         // local_declaration_statement -> variable_declaration -> variable_declarator(identifier)
         "local_declaration_statement" | "variable_declaration" => {
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
-                    if child.kind() == "variable_declaration"
-                        || child.kind() == "variable_declarator"
-                    {
-                        collect_csharp_locals(child, source, locals, ranges, used);
-                    }
+                if let Some(child) = node.child(i as u32)
+                    && (child.kind() == "variable_declaration"
+                        || child.kind() == "variable_declarator")
+                {
+                    collect_csharp_locals(child, source, locals, ranges, used);
                 }
             }
             return; // already recursed into the children we need
@@ -966,11 +965,11 @@ fn collect_csharp_locals(
             }
         }
         "foreach_statement" => {
-            if let Some(left) = node.child_by_field_name("left") {
-                if left.kind() == "identifier" {
-                    let name = left.utf8_text(source).unwrap_or("");
-                    register_local(name, left, locals, ranges, used);
-                }
+            if let Some(left) = node.child_by_field_name("left")
+                && left.kind() == "identifier"
+            {
+                let name = left.utf8_text(source).unwrap_or("");
+                register_local(name, left, locals, ranges, used);
             }
         }
         "for_statement" => {
@@ -996,10 +995,10 @@ fn collect_csharp_locals(
         }
         "using_statement" => {
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
-                    if child.kind() == "variable_declaration" {
-                        collect_csharp_locals(child, source, locals, ranges, used);
-                    }
+                if let Some(child) = node.child(i as u32)
+                    && child.kind() == "variable_declaration"
+                {
+                    collect_csharp_locals(child, source, locals, ranges, used);
                 }
             }
         }
