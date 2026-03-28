@@ -2913,8 +2913,9 @@ mod tests {
             lsp_count + // LanguageDetected: LspConsumer × N (real, Phase 3)
             3 +        // AllEnrichmentsDone: ApiLinkConsumer, TestedByConsumer,
                        //   EnrichmentFinalizer
-            6 +        // FrameworkDetected: FrameworkDetectionConsumer, FastapiRouterPrefixConsumer,
-                       //   SdkPathInferenceConsumer, NextjsRoutingConsumer, PubSubConsumer, WebSocketConsumer
+            7 +        // FrameworkDetected: FrameworkDetectionConsumer, FastapiRouterPrefixConsumer,
+                       //   SdkPathInferenceConsumer, NextjsRoutingConsumer, PubSubConsumer, WebSocketConsumer,
+                       //   AspNetEndpointConsumer
             2; // PassesComplete: SubsystemConsumer, LanceDBConsumer
         assert_eq!(
             bus.len(),

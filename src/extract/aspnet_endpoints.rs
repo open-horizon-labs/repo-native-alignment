@@ -80,13 +80,17 @@ fn extract_endpoints_from_source(
 ) {
     for (i, line) in content.lines().enumerate() {
         let trimmed = line.trim();
+        // Skip comments to avoid false-positive extraction.
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+            continue;
+        }
         for &(map_method, http_method) in MAP_METHODS {
             // Match patterns like: app.MapGet("/path", ...) or .MapGet("/path", ...)
             let Some(map_pos) = trimmed.find(map_method) else {
                 continue;
             };
-            // Expect '(' after the method name
-            let after_method = &trimmed[map_pos + map_method.len()..];
+            // Allow whitespace between method name and '(' (valid C# formatting).
+            let after_method = trimmed[map_pos + map_method.len()..].trim_start();
             if !after_method.starts_with('(') {
                 continue;
             }
@@ -115,8 +119,8 @@ fn extract_endpoints_from_source(
             result.nodes.push(Node {
                 id: node_id,
                 language: "csharp".to_string(),
-                line_start: i,
-                line_end: i,
+                line_start: i + 1,
+                line_end: i + 1,
                 signature: format!("{}.{}(\"{}\", ...)", "app", map_method, route),
                 body: String::new(),
                 metadata,
@@ -178,5 +182,39 @@ app.MapGet(routeVar, handler);
         extract_endpoints_from_source(content, &path, "test", &mut result);
         // Variable routes are skipped (not string literal)
         assert!(result.nodes.is_empty());
+    }
+
+    #[test]
+    fn test_commented_out_endpoints_skipped() {
+        let content = r#"
+// app.MapGet("/debug", handler);
+/* app.MapPost("/old", handler); */
+app.MapGet("/real", handler);
+"#;
+        let mut result = ExtractionResult::default();
+        let path = PathBuf::from("src/Program.cs");
+        extract_endpoints_from_source(content, &path, "test", &mut result);
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].id.name, "GET /real");
+    }
+
+    #[test]
+    fn test_line_numbers_are_1_based() {
+        let content = "app.MapGet(\"/first\", handler);\napp.MapPost(\"/second\", handler);";
+        let mut result = ExtractionResult::default();
+        let path = PathBuf::from("src/Program.cs");
+        extract_endpoints_from_source(content, &path, "test", &mut result);
+        assert_eq!(result.nodes[0].line_start, 1);
+        assert_eq!(result.nodes[1].line_start, 2);
+    }
+
+    #[test]
+    fn test_whitespace_before_paren() {
+        let content = "app.MapGet (\"/spaced\", handler);";
+        let mut result = ExtractionResult::default();
+        let path = PathBuf::from("src/Program.cs");
+        extract_endpoints_from_source(content, &path, "test", &mut result);
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].id.name, "GET /spaced");
     }
 }
