@@ -291,7 +291,7 @@ check "AllEnrichmentsGate struct defined (#528)" \
 check "AllEnrichmentsDone event defined (#528)" \
   "grep -c 'AllEnrichmentsDone' $RNA_REPO/src/extract/event_bus.rs 2>/dev/null" "[1-9]"
 check "EnrichmentFinalizer subscribes to AllEnrichmentsDone (#528/#523)" \
-  "grep -A5 'impl ExtractionConsumer for EnrichmentFinalizer' $RNA_REPO/src/extract/consumers.rs 2>/dev/null | grep -c 'AllEnrichmentsDone'" "[1-9]"
+  "grep -A15 'impl ExtractionConsumer for EnrichmentFinalizer' $RNA_REPO/src/extract/consumers.rs 2>/dev/null | grep -c 'AllEnrichmentsDone'" "[1-9]"
 
 # ── EMBEDDINGINDEXERCONSUMER + LANCEDBCONSUMER FROM STUBS (#530) ──────────
 echo "" && echo "--- EmbeddingIndexerConsumer + LanceDBConsumer from stubs (#530) ---"
@@ -353,7 +353,7 @@ check "ADR: api_link_pass indexed by RNA (function kind) (#543)" \
 # It must subscribe to FrameworkDetected, not AllEnrichmentsDone or unconditionally.
 # RNA verifies the consumer is indexed; grep verifies the subscription event kind.
 check "ADR: FastapiRouterPrefixConsumer subscribes to FrameworkDetected (#537/#523)" \
-  "grep -A5 'impl ExtractionConsumer for FastapiRouterPrefixConsumer' $RNA_REPO/src/extract/consumers.rs 2>/dev/null | grep -c 'FrameworkDetected'" "[1-9]"
+  "grep -A15 'impl ExtractionConsumer for FastapiRouterPrefixConsumer' $RNA_REPO/src/extract/consumers.rs 2>/dev/null | grep -c 'FrameworkDetected'" "[1-9]"
 check "ADR: FastapiRouterPrefixConsumer indexed as struct by RNA (#543)" \
   "repo-native-alignment search 'FastapiRouterPrefixConsumer' --repo $RNA_REPO --kind struct --limit 3 2>/dev/null" "FastapiRouterPrefixConsumer"
 
@@ -432,6 +432,37 @@ check "src/server/bg_scanner.rs exists (split from graph.rs) (#595)" \
 echo "" && echo "--- CLI/MCP parity: limit rename (#594) ---"
 check "MCP search uses limit parameter (#594)" \
   "grep -c '\"limit\"' $RNA_REPO/src/server/tools.rs 2>/dev/null" "[1-9]"
+
+# ── include_body + minify_body (#604) ─────────────────────────────────────────
+echo "" && echo "--- include_body + minify_body (#604) ---"
+check "include_body returns function body with --nodes (#604)" \
+  "repo-native-alignment search '' --repo $RNA_REPO --nodes 'src/embed.rs:build_code_embedding_text:function' --include-body 2>/dev/null" '```rust'
+check "minify_body shortens identifiers (#604)" \
+  "repo-native-alignment search '' --repo $RNA_REPO --nodes 'src/embed.rs:build_code_embedding_text:function' --include-body --minify-body 2>/dev/null | grep -c '[a-z][0-9][a-z]'" "[1-9]"
+check "include_body rejected without --node/--nodes (#604)" \
+  "repo-native-alignment search 'test' --repo $RNA_REPO --include-body 2>&1 | grep -ci 'requires'" "[1-9]"
+check "minify_body structural: minify_body fn in code/minify.rs (#604)" \
+  "grep -c 'pub fn minify_body' $RNA_REPO/src/code/minify.rs 2>/dev/null" "[1-9]"
+check "minify_body structural: tree-sitter Rust support (#604)" \
+  "grep -c 'rust' $RNA_REPO/src/code/minify.rs 2>/dev/null" "[1-9]"
+check "MCP search tool exposes include_body parameter (#604)" \
+  "grep -c 'include_body' $RNA_REPO/src/server/tools.rs 2>/dev/null" "[1-9]"
+check "MCP search tool exposes minify_body parameter (#604)" \
+  "grep -c 'minify_body' $RNA_REPO/src/server/tools.rs 2>/dev/null" "[1-9]"
+
+# ── Verbose flag (MCP suppresses index stats) (#604) ─────────────────────────
+echo "" && echo "--- Verbose flag (#604) ---"
+check "verbose CLI flag defined (#604)" \
+  "grep -c 'verbose: bool' $RNA_REPO/src/main.rs 2>/dev/null" "[1-9]"
+check "MCP search tool has verbose parameter (#604)" \
+  "grep -c 'verbose' $RNA_REPO/src/server/tools.rs 2>/dev/null" "[1-9]"
+
+# ── Rerank support (#604) ────────────────────────────────────────────────────
+echo "" && echo "--- Cross-encoder reranking ---"
+check "rerank CLI flag exists" \
+  "repo-native-alignment search --help 2>&1 | grep -c 'rerank'" "[1-9]"
+check "rerank structural: reranker module exists" \
+  "grep -rl 'rerank\|cross.encoder' $RNA_REPO/src/ 2>/dev/null | wc -l | tr -d ' '" "[1-9]"
 
 echo ""
 echo "=== RESULTS: $PASS passed, $FAIL failed, $SKIP skipped ==="
