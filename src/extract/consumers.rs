@@ -2276,7 +2276,7 @@ fn build_single_language_enricher(language: &str) -> Arc<dyn crate::extract::Enr
         ),
         ("java", "jdtls", &[], &["java"]),
         ("ruby", "solargraph", &["stdio"], &["rb"]),
-        ("csharp", "omnisharp", &["-lsp"], &["cs"]),
+        ("csharp", "csharp-ls", &[], &["cs"]),
         ("swift", "sourcekit-lsp", &[], &["swift"]),
         ("kotlin", "kotlin-language-server", &[], &["kt", "kts"]),
         ("lua", "lua-language-server", &[], &["lua"]),
