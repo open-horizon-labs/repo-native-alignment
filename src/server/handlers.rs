@@ -108,7 +108,10 @@ impl RnaHandler {
                 root_filter: None,
                 non_code_slugs: std::collections::HashSet::new(),
             };
-            let markdown = crate::service::search(&params, &ctx).await;
+            let mut markdown = crate::service::search(&params, &ctx).await;
+            if let Some(hint) = super::staleness::check_staleness(&repo_path) {
+                markdown.push_str(&hint);
+            }
             return Ok(text_result(markdown));
         }
 
@@ -133,7 +136,10 @@ impl RnaHandler {
             root_filter,
             non_code_slugs,
         };
-        let markdown = crate::service::search(&params, &ctx).await;
+        let mut markdown = crate::service::search(&params, &ctx).await;
+        if let Some(hint) = super::staleness::check_staleness(&self.repo_root) {
+            markdown.push_str(&hint);
+        }
         Ok(text_result(markdown))
     }
 
@@ -157,7 +163,10 @@ impl RnaHandler {
                 graph_state: &external_graph,
                 repo_root: &repo_path,
             };
-            let markdown = crate::service::outcome_progress(&params, &ctx);
+            let mut markdown = crate::service::outcome_progress(&params, &ctx);
+            if let Some(hint) = super::staleness::check_staleness(&repo_path) {
+                markdown.push_str(&hint);
+            }
             return Ok(text_result(markdown));
         }
 
@@ -181,7 +190,10 @@ impl RnaHandler {
             graph_state: &graph_state,
             repo_root: &self.repo_root,
         };
-        let markdown = crate::service::outcome_progress(&params, &ctx);
+        let mut markdown = crate::service::outcome_progress(&params, &ctx);
+        if let Some(hint) = super::staleness::check_staleness(&self.repo_root) {
+            markdown.push_str(&hint);
+        }
         Ok(text_result(markdown))
     }
 
@@ -238,7 +250,10 @@ impl RnaHandler {
                 lsp_status: None,
                 embed_status: None,
             };
-            let markdown = crate::service::repo_map(&params, &ctx);
+            let mut markdown = crate::service::repo_map(&params, &ctx);
+            if let Some(hint) = super::staleness::check_staleness(&repo_path) {
+                markdown.push_str(&hint);
+            }
             return Ok(text_result(markdown));
         }
 
@@ -263,7 +278,10 @@ impl RnaHandler {
             lsp_status: Some(&self.lsp_status),
             embed_status: Some(&self.embed_status),
         };
-        let markdown = crate::service::repo_map(&params, &ctx);
+        let mut markdown = crate::service::repo_map(&params, &ctx);
+        if let Some(hint) = super::staleness::check_staleness(&self.repo_root) {
+            markdown.push_str(&hint);
+        }
         Ok(text_result(markdown))
     }
 }

@@ -8,6 +8,7 @@ mod graph;
 pub mod handlers;
 pub mod helpers;
 pub mod sentinel;
+pub mod staleness;
 pub mod state;
 pub mod store;
 pub mod tools;
