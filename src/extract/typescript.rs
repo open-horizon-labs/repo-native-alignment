@@ -9,12 +9,10 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::graph::{
-    Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
-};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 use super::configs::TYPESCRIPT_CONFIG;
-use super::generic::{count_branches, GenericExtractor};
+use super::generic::{GenericExtractor, count_branches};
 use super::{ExtractionResult, Extractor};
 
 /// TypeScript tree-sitter extractor (handles .ts and .tsx files).
@@ -213,24 +211,25 @@ fn emit_ts_type_edges(
     if let Some(params) = value_node.child_by_field_name("parameters") {
         for i in 0..params.child_count() {
             if let Some(param) = params.child(i as u32)
-                && let Some(tn) = param.child_by_field_name("type") {
-                    let type_text = tn.utf8_text(source).unwrap_or("");
-                    // type_requires_uppercase = true for TypeScript
-                    if let Some(type_name) = extract_user_type(type_text, true) {
-                        edges.push(Edge {
-                            from: fn_id.clone(),
-                            to: NodeId {
-                                root: String::new(),
-                                file: path.to_path_buf(),
-                                name: type_name,
-                                kind: NodeKind::Struct,
-                            },
-                            kind: EdgeKind::DependsOn,
-                            source: ExtractionSource::TreeSitter,
-                            confidence: Confidence::Detected,
-                        });
-                    }
+                && let Some(tn) = param.child_by_field_name("type")
+            {
+                let type_text = tn.utf8_text(source).unwrap_or("");
+                // type_requires_uppercase = true for TypeScript
+                if let Some(type_name) = extract_user_type(type_text, true) {
+                    edges.push(Edge {
+                        from: fn_id.clone(),
+                        to: NodeId {
+                            root: String::new(),
+                            file: path.to_path_buf(),
+                            name: type_name,
+                            kind: NodeKind::Struct,
+                        },
+                        kind: EdgeKind::DependsOn,
+                        source: ExtractionSource::TreeSitter,
+                        confidence: Confidence::Detected,
+                    });
                 }
+            }
         }
     }
 
@@ -300,123 +299,111 @@ fn collect_ts_specials(
             for i in 0..node.child_count() {
                 if let Some(decl) = node.child(i as u32)
                     && decl.kind() == "variable_declarator"
-                        && let Some(name_node) = decl.child_by_field_name("name") {
-                            let name_str =
-                                name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
-                            // Skip destructuring patterns
-                            if name_str.starts_with('{') || name_str.starts_with('[') {
-                                continue;
-                            }
+                    && let Some(name_node) = decl.child_by_field_name("name")
+                {
+                    let name_str = name_node
+                        .utf8_text(source)
+                        .unwrap_or("unknown")
+                        .trim()
+                        .to_string();
+                    // Skip destructuring patterns
+                    if name_str.starts_with('{') || name_str.starts_with('[') {
+                        continue;
+                    }
 
-                            // Check if value is an arrow function or function expression
-                            let value_node = decl.child_by_field_name("value");
-                            let is_fn = value_node
-                                .as_ref()
-                                .map(|v| is_function_value(v.kind()))
-                                .unwrap_or(false);
+                    // Check if value is an arrow function or function expression
+                    let value_node = decl.child_by_field_name("value");
+                    let is_fn = value_node
+                        .as_ref()
+                        .map(|v| is_function_value(v.kind()))
+                        .unwrap_or(false);
 
-                            if is_fn {
-                                let value_n = value_node.unwrap();
-                                let body = node.utf8_text(source).unwrap_or("").to_string();
-                                let signature =
-                                    build_arrow_signature(decl_keyword, &name_str, value_n, source);
+                    if is_fn {
+                        let value_n = value_node.unwrap();
+                        let body = node.utf8_text(source).unwrap_or("").to_string();
+                        let signature =
+                            build_arrow_signature(decl_keyword, &name_str, value_n, source);
 
-                                let mut metadata = BTreeMap::new();
-                                metadata.insert(
-                                    "name_col".to_string(),
-                                    name_node.start_position().column.to_string(),
-                                );
+                        let mut metadata = BTreeMap::new();
+                        metadata.insert(
+                            "name_col".to_string(),
+                            name_node.start_position().column.to_string(),
+                        );
 
-                                // Cyclomatic complexity for arrow/function expressions
-                                if !TYPESCRIPT_CONFIG.branch_node_types.is_empty() {
-                                    let branches =
-                                        count_branches(value_n, source, &TYPESCRIPT_CONFIG, true);
-                                    metadata.insert(
-                                        "cyclomatic".to_string(),
-                                        (1 + branches).to_string(),
-                                    );
-                                }
-
-                                nodes.push(Node {
-                                    id: NodeId {
-                                        root: String::new(),
-                                        file: path.to_path_buf(),
-                                        name: name_str.clone(),
-                                        kind: NodeKind::Function,
-                                    },
-                                    language: "typescript".to_string(),
-                                    line_start: node.start_position().row + 1,
-                                    line_end: node.end_position().row + 1,
-                                    signature,
-                                    body,
-                                    metadata,
-                                    source: ExtractionSource::TreeSitter,
-                                });
-
-                                // Emit module-level Defines edge (mirrors generic extractor)
-                                emit_module_defines_edge(
-                                    path,
-                                    &name_str,
-                                    NodeKind::Function,
-                                    edges,
-                                );
-
-                                // Emit DependsOn edges for parameter/return types
-                                emit_ts_type_edges(path, &name_str, value_n, source, edges);
-                            } else {
-                                // Scalar const — preserve existing behavior (only for `const`)
-                                if decl_keyword == "const" {
-                                    let value_str = value_node
-                                        .and_then(|v| v.utf8_text(source).ok())
-                                        .map(|s| s.trim().to_string());
-                                    let signature =
-                                        decl_text.lines().next().unwrap_or("").trim().to_string();
-                                    let mut metadata = BTreeMap::new();
-                                    metadata.insert(
-                                        "name_col".to_string(),
-                                        name_node.start_position().column.to_string(),
-                                    );
-                                    if let Some(ref v) = value_str {
-                                        let stripped = v.trim_matches('"').trim_matches('\'');
-                                        let is_scalar = v.starts_with('"')
-                                            || v.starts_with('\'')
-                                            || v.parse::<f64>().is_ok()
-                                            || v == "true"
-                                            || v == "false";
-                                        if is_scalar {
-                                            metadata.insert(
-                                                "value".to_string(),
-                                                stripped.to_string(),
-                                            );
-                                        }
-                                    }
-                                    metadata.insert("synthetic".to_string(), "false".to_string());
-                                    nodes.push(Node {
-                                        id: NodeId {
-                                            root: String::new(),
-                                            file: path.to_path_buf(),
-                                            name: name_str.clone(),
-                                            kind: NodeKind::Const,
-                                        },
-                                        language: "typescript".to_string(),
-                                        line_start: node.start_position().row + 1,
-                                        line_end: node.end_position().row + 1,
-                                        signature,
-                                        body: decl_text.clone(),
-                                        metadata,
-                                        source: ExtractionSource::TreeSitter,
-                                    });
-
-                                    // Emit module-level Defines edge for const nodes
-                                    emit_module_defines_edge(
-                                        path,
-                                        &name_str,
-                                        NodeKind::Const,
-                                        edges,
-                                    );
-                                }
-                            }
+                        // Cyclomatic complexity for arrow/function expressions
+                        if !TYPESCRIPT_CONFIG.branch_node_types.is_empty() {
+                            let branches =
+                                count_branches(value_n, source, &TYPESCRIPT_CONFIG, true);
+                            metadata.insert("cyclomatic".to_string(), (1 + branches).to_string());
                         }
+
+                        nodes.push(Node {
+                            id: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: name_str.clone(),
+                                kind: NodeKind::Function,
+                            },
+                            language: "typescript".to_string(),
+                            line_start: node.start_position().row + 1,
+                            line_end: node.end_position().row + 1,
+                            signature,
+                            body,
+                            metadata,
+                            source: ExtractionSource::TreeSitter,
+                        });
+
+                        // Emit module-level Defines edge (mirrors generic extractor)
+                        emit_module_defines_edge(path, &name_str, NodeKind::Function, edges);
+
+                        // Emit DependsOn edges for parameter/return types
+                        emit_ts_type_edges(path, &name_str, value_n, source, edges);
+                    } else {
+                        // Scalar const — preserve existing behavior (only for `const`)
+                        if decl_keyword == "const" {
+                            let value_str = value_node
+                                .and_then(|v| v.utf8_text(source).ok())
+                                .map(|s| s.trim().to_string());
+                            let signature =
+                                decl_text.lines().next().unwrap_or("").trim().to_string();
+                            let mut metadata = BTreeMap::new();
+                            metadata.insert(
+                                "name_col".to_string(),
+                                name_node.start_position().column.to_string(),
+                            );
+                            if let Some(ref v) = value_str {
+                                let stripped = v.trim_matches('"').trim_matches('\'');
+                                let is_scalar = v.starts_with('"')
+                                    || v.starts_with('\'')
+                                    || v.parse::<f64>().is_ok()
+                                    || v == "true"
+                                    || v == "false";
+                                if is_scalar {
+                                    metadata.insert("value".to_string(), stripped.to_string());
+                                }
+                            }
+                            metadata.insert("synthetic".to_string(), "false".to_string());
+                            nodes.push(Node {
+                                id: NodeId {
+                                    root: String::new(),
+                                    file: path.to_path_buf(),
+                                    name: name_str.clone(),
+                                    kind: NodeKind::Const,
+                                },
+                                language: "typescript".to_string(),
+                                line_start: node.start_position().row + 1,
+                                line_end: node.end_position().row + 1,
+                                signature,
+                                body: decl_text.clone(),
+                                metadata,
+                                source: ExtractionSource::TreeSitter,
+                            });
+
+                            // Emit module-level Defines edge for const nodes
+                            emit_module_defines_edge(path, &name_str, NodeKind::Const, edges);
+                        }
+                    }
+                }
             }
         }
         "import_statement" => {
@@ -455,12 +442,7 @@ fn collect_ts_specials(
             }
 
             // Emit module-level Defines edge for import nodes
-            emit_module_defines_edge(
-                path,
-                &import_node.id.name,
-                NodeKind::Import,
-                edges,
-            );
+            emit_module_defines_edge(path, &import_node.id.name, NodeKind::Import, edges);
 
             nodes.push(import_node);
         }
@@ -469,7 +451,10 @@ fn collect_ts_specials(
                 let name_str = name.utf8_text(source).unwrap_or("unknown").to_string();
                 let body = node.utf8_text(source).unwrap_or("").to_string();
                 let mut metadata = BTreeMap::new();
-                metadata.insert("name_col".to_string(), name.start_position().column.to_string());
+                metadata.insert(
+                    "name_col".to_string(),
+                    name.start_position().column.to_string(),
+                );
 
                 nodes.push(Node {
                     id: NodeId {
@@ -488,12 +473,7 @@ fn collect_ts_specials(
                 });
 
                 // Emit module-level Defines edge for type alias nodes
-                emit_module_defines_edge(
-                    path,
-                    &name_str,
-                    NodeKind::TypeAlias,
-                    edges,
-                );
+                emit_module_defines_edge(path, &name_str, NodeKind::TypeAlias, edges);
             }
         }
         // Enum variants: `enum Direction { Up, Down = 1 }`
@@ -503,7 +483,8 @@ fn collect_ts_specials(
         // generic to add to node_kinds.
         "enum_body" => {
             // Find the parent enum_declaration to get the enum name
-            let enum_name = node.parent()
+            let enum_name = node
+                .parent()
                 .and_then(|p| p.child_by_field_name("name"))
                 .and_then(|n| n.utf8_text(source).ok())
                 .unwrap_or("unknown")
@@ -517,7 +498,8 @@ fn collect_ts_specials(
                         }
                         "enum_assignment" => {
                             // The name is the first `property_identifier` child
-                            child.child(0)
+                            child
+                                .child(0)
                                 .filter(|c| c.kind() == "property_identifier")
                                 .and_then(|c| c.utf8_text(source).ok())
                                 .map(|s| s.to_string())
@@ -534,7 +516,8 @@ fn collect_ts_specials(
                             child.start_position().column
                         } else {
                             // enum_assignment: use the property_identifier child's column
-                            child.child(0)
+                            child
+                                .child(0)
                                 .filter(|c| c.kind() == "property_identifier")
                                 .map(|c| c.start_position().column)
                                 .unwrap_or(child.start_position().column)
@@ -594,8 +577,11 @@ fn collect_ts_specials(
             if is_fn {
                 let value_n = value_node.unwrap();
                 if let Some(name_node) = node.child_by_field_name("name") {
-                    let name_str =
-                        name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
+                    let name_str = name_node
+                        .utf8_text(source)
+                        .unwrap_or("unknown")
+                        .trim()
+                        .to_string();
                     let body = node.utf8_text(source).unwrap_or("").to_string();
 
                     // Build signature for class property — use appropriate style
@@ -619,7 +605,10 @@ fn collect_ts_specials(
                         if return_type.is_empty() {
                             format!("{} = {}{} =>", name_str, async_prefix, params)
                         } else {
-                            format!("{} = {}{}{} =>", name_str, async_prefix, params, return_type)
+                            format!(
+                                "{} = {}{}{} =>",
+                                name_str, async_prefix, params, return_type
+                            )
                         }
                     } else {
                         // function_expression
@@ -641,27 +630,24 @@ fn collect_ts_specials(
 
                     // Cyclomatic complexity
                     if !TYPESCRIPT_CONFIG.branch_node_types.is_empty() {
-                        let branches =
-                            count_branches(value_n, source, &TYPESCRIPT_CONFIG, true);
+                        let branches = count_branches(value_n, source, &TYPESCRIPT_CONFIG, true);
                         metadata.insert("cyclomatic".to_string(), (1 + branches).to_string());
                     }
 
                     // Determine parent scope (class name) and emit Defines edge
                     if let Some(class_node) = find_ancestor_class(node)
                         && let Some(class_name_node) = class_node.child_by_field_name("name")
-                            && let Ok(class_name) = class_name_node.utf8_text(source) {
-                                metadata.insert(
-                                    "parent_scope".to_string(),
-                                    class_name.to_string(),
-                                );
-                                emit_class_defines_edge(
-                                    path,
-                                    class_name,
-                                    &name_str,
-                                    NodeKind::Function,
-                                    edges,
-                                );
-                            }
+                        && let Ok(class_name) = class_name_node.utf8_text(source)
+                    {
+                        metadata.insert("parent_scope".to_string(), class_name.to_string());
+                        emit_class_defines_edge(
+                            path,
+                            class_name,
+                            &name_str,
+                            NodeKind::Function,
+                            edges,
+                        );
+                    }
 
                     // Emit DependsOn edges for parameter/return types
                     emit_ts_type_edges(path, &name_str, value_n, source, edges);
@@ -1221,7 +1207,10 @@ type Handler = (req: Request) => Response;
             .iter()
             .filter(|n| matches!(&n.id.kind, NodeKind::Other(s) if s == "type_alias"))
             .collect();
-        assert!(others.is_empty(), "Should not use Other(\"type_alias\") anymore");
+        assert!(
+            others.is_empty(),
+            "Should not use Other(\"type_alias\") anymore"
+        );
     }
 
     #[test]
@@ -1322,10 +1311,7 @@ const PORT = 3000;
         let defines: Vec<_> = result
             .edges
             .iter()
-            .filter(|e| {
-                e.kind == EdgeKind::Defines
-                    && e.to.name == "PORT"
-            })
+            .filter(|e| e.kind == EdgeKind::Defines && e.to.name == "PORT")
             .collect();
         assert_eq!(
             defines.len(),
@@ -1345,10 +1331,7 @@ import { Router } from 'express';
         let defines: Vec<_> = result
             .edges
             .iter()
-            .filter(|e| {
-                e.kind == EdgeKind::Defines
-                    && e.to.kind == NodeKind::Import
-            })
+            .filter(|e| e.kind == EdgeKind::Defines && e.to.kind == NodeKind::Import)
             .collect();
         assert_eq!(
             defines.len(),
@@ -1415,17 +1398,28 @@ interface Service {
     stop(): Promise<void>;
 }
 "#;
-        let result = extractor.extract(Path::new("src/service.ts"), code).unwrap();
+        let result = extractor
+            .extract(Path::new("src/service.ts"), code)
+            .unwrap();
 
         // Interface itself should be found as Trait
-        let service = result.nodes.iter().find(|n| n.id.name == "Service" && n.id.kind == NodeKind::Trait);
+        let service = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Service" && n.id.kind == NodeKind::Trait);
         assert!(service.is_some(), "Should find interface Service");
 
         // Method signatures should be indexed as Function nodes
-        let serve = result.nodes.iter().find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function);
+        let serve = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function);
         assert!(serve.is_some(), "Should find interface method serve");
 
-        let stop = result.nodes.iter().find(|n| n.id.name == "stop" && n.id.kind == NodeKind::Function);
+        let stop = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "stop" && n.id.kind == NodeKind::Function);
         assert!(stop.is_some(), "Should find interface method stop");
 
         // Methods should have parent_scope pointing to the interface
@@ -1461,14 +1455,38 @@ class MyService {
 "#;
         let result = extractor.extract(Path::new("service.ts"), code).unwrap();
 
-        let create = result.nodes.iter().find(|n| n.id.name == "create" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(create.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "static create() should be static");
+        let create = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "create" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            create.metadata.get("is_static").map(|s| s.as_str()),
+            Some("true"),
+            "static create() should be static"
+        );
 
-        let serve = result.nodes.iter().find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(serve.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "serve() should be instance");
+        let serve = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            serve.metadata.get("is_static").map(|s| s.as_str()),
+            Some("false"),
+            "serve() should be instance"
+        );
 
-        let count = result.nodes.iter().find(|n| n.id.name == "count" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(count.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "static count() should be static");
+        let count = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "count" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            count.metadata.get("is_static").map(|s| s.as_str()),
+            Some("true"),
+            "static count() should be static"
+        );
     }
 
     #[test]
@@ -1477,7 +1495,14 @@ class MyService {
         let code = "function topLevel(): void {}\n";
         let result = extractor.extract(Path::new("app.ts"), code).unwrap();
 
-        let func = result.nodes.iter().find(|n| n.id.name == "topLevel").unwrap();
-        assert!(func.metadata.get("is_static").is_none(), "Top-level function should NOT have is_static");
+        let func = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "topLevel")
+            .unwrap();
+        assert!(
+            func.metadata.get("is_static").is_none(),
+            "Top-level function should NOT have is_static"
+        );
     }
 }

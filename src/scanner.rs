@@ -26,10 +26,7 @@ use crate::walk::is_worktree_with_own_cache;
 /// `tracing::info!` message in every walk code path.
 fn skip_if_independent_worktree(path: &Path) -> bool {
     if is_worktree_with_own_cache(path) {
-        tracing::info!(
-            "skipping worktree {}: has own RNA cache",
-            path.display()
-        );
+        tracing::info!("skipping worktree {}: has own RNA cache", path.display());
         return true;
     }
     false
@@ -39,10 +36,10 @@ fn skip_if_independent_worktree(path: &Path) -> bool {
 
 pub const DEFAULT_EXCLUDES: &[&str] = &[
     "node_modules/",
-    ".next/",        // Next.js build output
-    ".nuxt/",        // Nuxt.js build output
-    ".svelte-kit/",  // SvelteKit build output
-    "out/",          // Next.js static export
+    ".next/",       // Next.js build output
+    ".nuxt/",       // Nuxt.js build output
+    ".svelte-kit/", // SvelteKit build output
+    "out/",         // Next.js static export
     ".venv/",
     "venv/",
     ".env/",
@@ -59,7 +56,7 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     "vendor/",
     ".build/",
     ".cache/",
-    "coverage/",     // test coverage output
+    "coverage/", // test coverage output
     ".gradle/",
     ".mvn/",
     "*.pyc",
@@ -110,7 +107,8 @@ impl ScanConfig {
                 Err(e) => {
                     tracing::warn!(
                         "Failed to parse [scanner] section in {}: {}",
-                        config_path.display(), e
+                        config_path.display(),
+                        e
                     );
                     Self::default()
                 }
@@ -121,13 +119,10 @@ impl ScanConfig {
 
     /// Merge config with a base exclude list to produce the final exclude list.
     fn apply_to_base_excludes(&self, mut excludes: Vec<String>) -> Vec<String> {
-        let include_set: std::collections::HashSet<&str> = self.include.iter()
-            .map(|s| s.as_str())
-            .collect();
+        let include_set: std::collections::HashSet<&str> =
+            self.include.iter().map(|s| s.as_str()).collect();
         excludes.retain(|pattern| !include_set.contains(pattern.as_str()));
-        let mut exclude_set: std::collections::HashSet<String> = excludes.iter()
-            .cloned()
-            .collect();
+        let mut exclude_set: std::collections::HashSet<String> = excludes.iter().cloned().collect();
         for extra in &self.exclude {
             if exclude_set.insert(extra.clone()) {
                 excludes.push(extra.clone());
@@ -219,7 +214,8 @@ impl PatternConfig {
                 Err(e) => {
                     tracing::warn!(
                         "Failed to parse [patterns] section in {}: {}",
-                        config_path.display(), e
+                        config_path.display(),
+                        e
                     );
                     Self::default()
                 }
@@ -232,7 +228,9 @@ impl PatternConfig {
     /// plus extra custom patterns.
     pub fn effective_suffixes(&self) -> Vec<(String, String)> {
         // Normalize disable list once for case-insensitive comparison.
-        let disable_lower: std::collections::HashSet<String> = self.disable.iter()
+        let disable_lower: std::collections::HashSet<String> = self
+            .disable
+            .iter()
             .map(|d| d.to_ascii_lowercase())
             .collect();
 
@@ -284,7 +282,6 @@ pub enum DiagnosticMinSeverity {
     /// Store all diagnostics including hints (severity ≤ 4).
     Hint,
 }
-
 
 impl DiagnosticMinSeverity {
     /// Return the maximum LSP severity integer that should be stored.
@@ -348,7 +345,8 @@ impl LspConfig {
                 Err(e) => {
                     tracing::warn!(
                         "Failed to parse [lsp] section in {}: {}",
-                        config_path.display(), e
+                        config_path.display(),
+                        e
                     );
                     Self::default()
                 }
@@ -497,7 +495,6 @@ impl ScanResult {
             .collect()
     }
 }
-
 
 /// The scanner: detects file changes incrementally.
 pub struct Scanner {
@@ -848,8 +845,7 @@ impl Scanner {
         tracing::debug!("Scanner: enumerating directory {}", rel_dir_display);
 
         // Directory mtime changed: enumerate contents
-        let entries =
-            fs::read_dir(dir).with_context(|| format!("read_dir: {}", dir.display()))?;
+        let entries = fs::read_dir(dir).with_context(|| format!("read_dir: {}", dir.display()))?;
 
         for entry in entries {
             let entry = entry?;
@@ -870,10 +866,7 @@ impl Scanner {
                     .to_path_buf();
 
                 if self.is_excluded(&rel_file) {
-                    tracing::debug!(
-                        "Scanner: skipping excluded file {}",
-                        rel_file.display()
-                    );
+                    tracing::debug!("Scanner: skipping excluded file {}", rel_file.display());
                     continue;
                 }
 
@@ -936,13 +929,9 @@ impl Scanner {
         } else {
             rel_dir.display().to_string()
         };
-        tracing::debug!(
-            "Scanner: rechecking unchanged subtree {}",
-            rel_dir_display
-        );
+        tracing::debug!("Scanner: rechecking unchanged subtree {}", rel_dir_display);
 
-        let entries =
-            fs::read_dir(dir).with_context(|| format!("read_dir: {}", dir.display()))?;
+        let entries = fs::read_dir(dir).with_context(|| format!("read_dir: {}", dir.display()))?;
 
         for entry in entries {
             let entry = entry?;
@@ -1133,7 +1122,8 @@ impl Scanner {
         }
 
         let mut opts = git2::DiffOptions::new();
-        let diff = match repo.diff_tree_to_tree(Some(&old_tree), Some(&head_tree), Some(&mut opts)) {
+        let diff = match repo.diff_tree_to_tree(Some(&old_tree), Some(&head_tree), Some(&mut opts))
+        {
             Ok(diff) => diff,
             Err(err) => {
                 tracing::debug!(
@@ -1296,7 +1286,8 @@ fn save_state_to_path(path: &Path, state: &ScanState) -> Result<()> {
 
 fn dir_modified_time(path: &Path) -> Result<SystemTime> {
     match fs::symlink_metadata(path) {
-        Ok(meta) => meta.modified()
+        Ok(meta) => meta
+            .modified()
             .with_context(|| format!("modified time for {}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::debug!("Skipping inaccessible path: {}", path.display());
@@ -1308,7 +1299,8 @@ fn dir_modified_time(path: &Path) -> Result<SystemTime> {
 
 fn file_modified_time(path: &Path) -> Result<SystemTime> {
     match fs::symlink_metadata(path) {
-        Ok(meta) => meta.modified()
+        Ok(meta) => meta
+            .modified()
             .with_context(|| format!("modified time for {}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::debug!("Skipping inaccessible path: {}", path.display());
@@ -1386,14 +1378,20 @@ mod tests {
         assert!(!is_dir_excluded("target*/", "not-target"));
 
         // file exclude also respects glob dir patterns
-        assert!(is_file_excluded("target*/", "target-194/debug/build/foo.rmeta"));
+        assert!(is_file_excluded(
+            "target*/",
+            "target-194/debug/build/foo.rmeta"
+        ));
         assert!(is_file_excluded("target*/", "target/release/libfoo.rlib"));
         assert!(!is_file_excluded("target*/", "src/main.rs"));
     }
 
     #[test]
     fn test_binary_extension_excludes() {
-        assert!(is_file_excluded("*.rmeta", "target/debug/deps/libfoo.rmeta"));
+        assert!(is_file_excluded(
+            "*.rmeta",
+            "target/debug/deps/libfoo.rmeta"
+        ));
         assert!(is_file_excluded("*.rlib", "target/release/libfoo.rlib"));
         assert!(is_file_excluded("*.bc", "target/debug/deps/foo.bc"));
         assert!(is_file_excluded("*.a", "lib/libfoo.a"));
@@ -1648,7 +1646,6 @@ mod tests {
         assert!(all.contains(&PathBuf::from("src/main.rs")));
     }
 
-
     // ── mtime skip optimization ─────────────────────────────────────
 
     #[test]
@@ -1829,7 +1826,9 @@ mod tests {
         let result2 = scanner2.scan().unwrap();
 
         assert!(
-            result2.changed_files.contains(&PathBuf::from("src/main.rs")),
+            result2
+                .changed_files
+                .contains(&PathBuf::from("src/main.rs")),
             "Real content change should be detected. changed: {:?}",
             result2.changed_files,
         );
@@ -1851,14 +1850,21 @@ mod tests {
         // Load persisted state and check content hashes
         let state = load_state(root).unwrap();
         assert!(
-            state.file_content_hashes.contains_key(&PathBuf::from("src/main.rs")),
+            state
+                .file_content_hashes
+                .contains_key(&PathBuf::from("src/main.rs")),
             "Content hash should be persisted. hashes: {:?}",
             state.file_content_hashes.keys().collect::<Vec<_>>()
         );
 
         // Verify it's a valid BLAKE3 hex hash (64 chars)
         let hash = &state.file_content_hashes[&PathBuf::from("src/main.rs")];
-        assert_eq!(hash.len(), 64, "BLAKE3 hex hash should be 64 chars, got: {}", hash);
+        assert_eq!(
+            hash.len(),
+            64,
+            "BLAKE3 hex hash should be 64 chars, got: {}",
+            hash
+        );
     }
 
     #[test]
@@ -1886,11 +1892,17 @@ mod tests {
         // Load state — deleted file's hash should be gone
         let state = load_state(root).unwrap();
         assert!(
-            !state.file_content_hashes.contains_key(&PathBuf::from("src/old.rs")),
+            !state
+                .file_content_hashes
+                .contains_key(&PathBuf::from("src/old.rs")),
             "Deleted file hash should be removed from state"
         );
         // But existing file's hash should remain
-        assert!(state.file_content_hashes.contains_key(&PathBuf::from("src/main.rs")));
+        assert!(
+            state
+                .file_content_hashes
+                .contains_key(&PathBuf::from("src/main.rs"))
+        );
     }
 
     // ── Deferred commit tests ─────────────────────────────────────
@@ -1969,15 +1981,22 @@ mod tests {
 
         let mut scanner2 = Scanner::new(root.to_path_buf()).unwrap();
         let result2 = scanner2.scan().unwrap();
-        assert!(result2.changed_files.contains(&PathBuf::from("src/main.rs")));
+        assert!(
+            result2
+                .changed_files
+                .contains(&PathBuf::from("src/main.rs"))
+        );
         // Intentionally skip commit (simulates failed graph update)
 
         let mut scanner3 = Scanner::new(root.to_path_buf()).unwrap();
         let result3 = scanner3.scan().unwrap();
         assert!(
-            result3.changed_files.contains(&PathBuf::from("src/main.rs")),
+            result3
+                .changed_files
+                .contains(&PathBuf::from("src/main.rs")),
             "Uncommitted modified file must be re-detected. changed: {:?}, new: {:?}",
-            result3.changed_files, result3.new_files,
+            result3.changed_files,
+            result3.new_files,
         );
     }
 
@@ -2030,7 +2049,8 @@ mod tests {
         let mut scanner2 = Scanner::new(root.to_path_buf()).unwrap();
         let result2 = scanner2.scan().unwrap();
         assert_eq!(
-            result2.new_files.len(), 2,
+            result2.new_files.len(),
+            2,
             "Both uncommitted new files must be detected. new: {:?}",
             result2.new_files,
         );
@@ -2043,8 +2063,16 @@ mod tests {
         let config = PatternConfig::default();
         let suffixes = config.effective_suffixes();
         assert_eq!(suffixes.len(), DEFAULT_PATTERN_SUFFIXES.len());
-        assert!(suffixes.iter().any(|(s, h)| s == "factory" && h == "factory"));
-        assert!(suffixes.iter().any(|(s, h)| s == "manager" && h == "manager"));
+        assert!(
+            suffixes
+                .iter()
+                .any(|(s, h)| s == "factory" && h == "factory")
+        );
+        assert!(
+            suffixes
+                .iter()
+                .any(|(s, h)| s == "manager" && h == "manager")
+        );
     }
 
     #[test]
@@ -2057,10 +2085,7 @@ mod tests {
         assert!(!suffixes.iter().any(|(_, h)| h == "manager"));
         assert!(!suffixes.iter().any(|(_, h)| h == "service"));
         assert!(suffixes.iter().any(|(_, h)| h == "factory"));
-        assert_eq!(
-            suffixes.len(),
-            DEFAULT_PATTERN_SUFFIXES.len() - 2,
-        );
+        assert_eq!(suffixes.len(), DEFAULT_PATTERN_SUFFIXES.len() - 2,);
     }
 
     #[test]
@@ -2073,12 +2098,17 @@ mod tests {
             disable: vec![],
         };
         let suffixes = config.effective_suffixes();
-        assert!(suffixes.iter().any(|(s, h)| s == "gateway" && h == "gateway"));
-        assert!(suffixes.iter().any(|(s, h)| s == "interactor" && h == "interactor"));
-        assert_eq!(
-            suffixes.len(),
-            DEFAULT_PATTERN_SUFFIXES.len() + 2,
+        assert!(
+            suffixes
+                .iter()
+                .any(|(s, h)| s == "gateway" && h == "gateway")
         );
+        assert!(
+            suffixes
+                .iter()
+                .any(|(s, h)| s == "interactor" && h == "interactor")
+        );
+        assert_eq!(suffixes.len(), DEFAULT_PATTERN_SUFFIXES.len() + 2,);
     }
 
     #[test]
@@ -2095,32 +2125,40 @@ mod tests {
         let factory_count = suffixes.iter().filter(|(s, _)| s == "factory").count();
         assert_eq!(factory_count, 1);
         // The built-in hint is retained
-        assert!(suffixes.iter().any(|(s, h)| s == "factory" && h == "factory"));
+        assert!(
+            suffixes
+                .iter()
+                .any(|(s, h)| s == "factory" && h == "factory")
+        );
     }
 
     #[test]
     fn test_pattern_config_disable_and_extra_combined() {
         let config = PatternConfig {
-            extra: vec![
-                ["gateway".to_string(), "gateway".to_string()],
-            ],
+            extra: vec![["gateway".to_string(), "gateway".to_string()]],
             disable: vec!["manager".to_string()],
         };
         let suffixes = config.effective_suffixes();
         assert!(!suffixes.iter().any(|(_, h)| h == "manager"));
-        assert!(suffixes.iter().any(|(s, h)| s == "gateway" && h == "gateway"));
+        assert!(
+            suffixes
+                .iter()
+                .any(|(s, h)| s == "gateway" && h == "gateway")
+        );
     }
 
     #[test]
     fn test_pattern_config_extra_normalizes_case() {
         let config = PatternConfig {
-            extra: vec![
-                ["Gateway".to_string(), "GATEWAY".to_string()],
-            ],
+            extra: vec![["Gateway".to_string(), "GATEWAY".to_string()]],
             disable: vec![],
         };
         let suffixes = config.effective_suffixes();
-        assert!(suffixes.iter().any(|(s, h)| s == "gateway" && h == "gateway"));
+        assert!(
+            suffixes
+                .iter()
+                .any(|(s, h)| s == "gateway" && h == "gateway")
+        );
     }
 
     #[test]
@@ -2144,8 +2182,16 @@ disable = ["manager"]
 
         let suffixes = config.effective_suffixes();
         assert!(!suffixes.iter().any(|(_, h)| h == "manager"));
-        assert!(suffixes.iter().any(|(s, h)| s == "gateway" && h == "gateway"));
-        assert!(suffixes.iter().any(|(s, h)| s == "usecase" && h == "use_case"));
+        assert!(
+            suffixes
+                .iter()
+                .any(|(s, h)| s == "gateway" && h == "gateway")
+        );
+        assert!(
+            suffixes
+                .iter()
+                .any(|(s, h)| s == "usecase" && h == "use_case")
+        );
     }
 
     #[test]
@@ -2186,7 +2232,11 @@ exclude = ["dist/"]
         };
         let suffixes = config.effective_suffixes();
         // "gateway" extra should be present
-        assert!(suffixes.iter().any(|(s, h)| s == "gateway" && h == "gateway"));
+        assert!(
+            suffixes
+                .iter()
+                .any(|(s, h)| s == "gateway" && h == "gateway")
+        );
         // "interactor" extra should be blocked because its hint "blocked" is in disable
         assert!(!suffixes.iter().any(|(s, _)| s == "interactor"));
     }
@@ -2234,10 +2284,17 @@ exclude = ["dist/"]
         let tmp = TempDir::new().unwrap();
         let oh_dir = tmp.path().join(".oh");
         fs::create_dir_all(&oh_dir).unwrap();
-        fs::write(oh_dir.join("config.toml"), "[scanner]\nexclude = [\"benchmark/\"]\n").unwrap();
+        fs::write(
+            oh_dir.join("config.toml"),
+            "[scanner]\nexclude = [\"benchmark/\"]\n",
+        )
+        .unwrap();
 
         let roots = load_declared_roots(tmp.path());
-        assert!(roots.is_empty(), "No [workspace.roots] section should yield empty vec");
+        assert!(
+            roots.is_empty(),
+            "No [workspace.roots] section should yield empty vec"
+        );
     }
 
     #[test]
@@ -2245,7 +2302,10 @@ exclude = ["dist/"]
         let tmp = TempDir::new().unwrap();
         // No .oh/ directory at all
         let roots = load_declared_roots(tmp.path());
-        assert!(roots.is_empty(), "Missing config file should yield empty vec");
+        assert!(
+            roots.is_empty(),
+            "Missing config file should yield empty vec"
+        );
     }
 
     // ── LspConfig integration tests ─────────────────────────────────
@@ -2258,7 +2318,8 @@ exclude = ["dist/"]
         fs::write(
             root.join(".oh/config.toml"),
             "[lsp]\ndiagnostic_min_severity = \"hint\"\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let config = LspConfig::load(root);
         assert_eq!(config.diagnostic_min_severity, DiagnosticMinSeverity::Hint);
@@ -2269,7 +2330,10 @@ exclude = ["dist/"]
     fn test_lsp_config_load_missing_file_returns_warning_default() {
         let tmp = TempDir::new().unwrap();
         let config = LspConfig::load(tmp.path());
-        assert_eq!(config.diagnostic_min_severity, DiagnosticMinSeverity::Warning);
+        assert_eq!(
+            config.diagnostic_min_severity,
+            DiagnosticMinSeverity::Warning
+        );
     }
 
     #[test]
@@ -2280,11 +2344,15 @@ exclude = ["dist/"]
         fs::write(
             root.join(".oh/config.toml"),
             "[scanner]\nexclude = [\"benchmark/\"]\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let config = LspConfig::load(root);
-        assert_eq!(config.diagnostic_min_severity, DiagnosticMinSeverity::Warning,
-            "missing [lsp] section should default to Warning");
+        assert_eq!(
+            config.diagnostic_min_severity,
+            DiagnosticMinSeverity::Warning,
+            "missing [lsp] section should default to Warning"
+        );
     }
 
     #[test]
@@ -2301,7 +2369,8 @@ exclude = ["dist/"]
             fs::write(
                 root.join(".oh/config.toml"),
                 format!("[lsp]\ndiagnostic_min_severity = \"{toml_value}\"\n"),
-            ).unwrap();
+            )
+            .unwrap();
 
             let config = LspConfig::load(root);
             assert_eq!(
@@ -2323,17 +2392,23 @@ exclude = ["dist/"]
         fs::write(
             root.join(".oh/config.toml"),
             "[scanner]\nexclude = [\"benchmark/\"]\n\n[lsp]\ndiagnostic_min_severity = \"warn\"\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         // LspConfig falls back to default (Warning) — its own section failed
         let lsp = LspConfig::load(root);
-        assert_eq!(lsp.diagnostic_min_severity, DiagnosticMinSeverity::Warning,
-            "bad [lsp] value should fall back to Warning default");
+        assert_eq!(
+            lsp.diagnostic_min_severity,
+            DiagnosticMinSeverity::Warning,
+            "bad [lsp] value should fall back to Warning default"
+        );
 
         // ScanConfig must still see its exclude, not fall back to empty
         let scan = ScanConfig::load(root);
-        assert!(scan.exclude.contains(&"benchmark/".to_string()),
-            "bad [lsp] section must not cause ScanConfig to fall back to defaults");
+        assert!(
+            scan.exclude.contains(&"benchmark/".to_string()),
+            "bad [lsp] section must not cause ScanConfig to fall back to defaults"
+        );
     }
 
     // ── Worktree skip tests ─────────────────────────────────────────
@@ -2355,33 +2430,60 @@ exclude = ["dist/"]
         // Subdirectory that IS a worktree with its own cache — should be skipped
         let wt = root.join("worktrees/feature-branch");
         fs::create_dir_all(&wt).unwrap();
-        fs::write(wt.join(".git"), "gitdir: ../../.git/worktrees/feature-branch\n").unwrap();
+        fs::write(
+            wt.join(".git"),
+            "gitdir: ../../.git/worktrees/feature-branch\n",
+        )
+        .unwrap();
         fs::create_dir_all(wt.join(".oh/.cache/lance")).unwrap();
-        create_file(root, "worktrees/feature-branch/src/feature.rs", "pub fn feature() {}");
+        create_file(
+            root,
+            "worktrees/feature-branch/src/feature.rs",
+            "pub fn feature() {}",
+        );
 
         // Subdirectory that is a worktree WITHOUT a cache — should be indexed by main scan
         let wt_no_cache = root.join("worktrees/no-cache-branch");
         fs::create_dir_all(&wt_no_cache).unwrap();
-        fs::write(wt_no_cache.join(".git"), "gitdir: ../../.git/worktrees/no-cache-branch\n").unwrap();
-        create_file(root, "worktrees/no-cache-branch/src/lib.rs", "pub fn helper() {}");
+        fs::write(
+            wt_no_cache.join(".git"),
+            "gitdir: ../../.git/worktrees/no-cache-branch\n",
+        )
+        .unwrap();
+        create_file(
+            root,
+            "worktrees/no-cache-branch/src/lib.rs",
+            "pub fn helper() {}",
+        );
 
         // ── First scan (new-file path) ──────────────────────────────
         let mut scanner = Scanner::new(root.to_path_buf()).unwrap();
         let result = scanner.scan().unwrap();
 
-        let all_files: Vec<_> = result.new_files.iter().chain(result.changed_files.iter()).collect();
+        let all_files: Vec<_> = result
+            .new_files
+            .iter()
+            .chain(result.changed_files.iter())
+            .collect();
 
         assert!(
             all_files.iter().any(|p| p.ends_with("main.rs")),
-            "main repo file must be found; got: {:?}", all_files
+            "main repo file must be found; got: {:?}",
+            all_files
         );
         assert!(
-            !all_files.iter().any(|p| p.to_string_lossy().contains("feature-branch")),
-            "worktree with own cache must be skipped; got: {:?}", all_files
+            !all_files
+                .iter()
+                .any(|p| p.to_string_lossy().contains("feature-branch")),
+            "worktree with own cache must be skipped; got: {:?}",
+            all_files
         );
         assert!(
-            all_files.iter().any(|p| p.to_string_lossy().contains("no-cache-branch")),
-            "worktree without cache must be indexed; got: {:?}", all_files
+            all_files
+                .iter()
+                .any(|p| p.to_string_lossy().contains("no-cache-branch")),
+            "worktree without cache must be indexed; got: {:?}",
+            all_files
         );
 
         // ── Second scan (carry_forward_subtree / unchanged-dir path) ─
@@ -2394,11 +2496,18 @@ exclude = ["dist/"]
 
         // No files should change between scans (no filesystem mutations).
         // The worktree with its own cache must still be absent.
-        let all_files2: Vec<_> = result2.new_files.iter().chain(result2.changed_files.iter()).collect();
+        let all_files2: Vec<_> = result2
+            .new_files
+            .iter()
+            .chain(result2.changed_files.iter())
+            .collect();
 
         assert!(
-            !all_files2.iter().any(|p| p.to_string_lossy().contains("feature-branch")),
-            "carry_forward path: worktree with own cache must still be skipped; got: {:?}", all_files2
+            !all_files2
+                .iter()
+                .any(|p| p.to_string_lossy().contains("feature-branch")),
+            "carry_forward path: worktree with own cache must still be skipped; got: {:?}",
+            all_files2
         );
     }
 }

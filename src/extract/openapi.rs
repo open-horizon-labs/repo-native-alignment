@@ -11,9 +11,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde_yaml::Value;
 
-use crate::graph::{
-    Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
-};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 use super::{ExtractionResult, Extractor};
 
@@ -70,9 +68,10 @@ impl Extractor for OpenApiExtractor {
 
         // Extract component schemas (OpenAPI 3.x)
         if let Some(components) = doc.get("components")
-            && let Some(schemas) = components.get("schemas") {
-                extract_schemas(schemas, path, &mut nodes, &mut edges);
-            }
+            && let Some(schemas) = components.get("schemas")
+        {
+            extract_schemas(schemas, path, &mut nodes, &mut edges);
+        }
 
         // Extract definitions (Swagger 2.x / JSON Schema)
         if let Some(definitions) = doc.get("definitions") {
@@ -84,12 +83,7 @@ impl Extractor for OpenApiExtractor {
 }
 
 /// Extract API endpoint paths.
-fn extract_paths(
-    paths: &Value,
-    file_path: &Path,
-    nodes: &mut Vec<Node>,
-    edges: &mut Vec<Edge>,
-) {
+fn extract_paths(paths: &Value, file_path: &Path, nodes: &mut Vec<Node>, edges: &mut Vec<Edge>) {
     let mapping = match paths.as_mapping() {
         Some(m) => m,
         None => return,
@@ -169,11 +163,7 @@ fn extract_refs_from_operation(
 
     for ref_path in refs {
         // Extract schema name from $ref like "#/components/schemas/User"
-        let schema_name = ref_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&ref_path)
-            .to_string();
+        let schema_name = ref_path.rsplit('/').next().unwrap_or(&ref_path).to_string();
 
         if !schema_name.is_empty() {
             edges.push(Edge {
@@ -258,104 +248,102 @@ fn extract_schemas(
 
         // Extract enum values from the schema definition
         if let Some(enum_values) = schema_def.get("enum")
-            && let Some(enum_seq) = enum_values.as_sequence() {
-                for enum_val in enum_seq {
-                    let val_str = match enum_val {
-                        Value::String(s) => s.clone(),
-                        Value::Number(n) => n.to_string(),
-                        Value::Bool(b) => b.to_string(),
-                        _ => continue,
-                    };
-                    if !val_str.is_empty() {
-                        let mut const_metadata = BTreeMap::new();
-                        const_metadata.insert("value".to_string(), val_str.clone());
-                        const_metadata.insert("synthetic".to_string(), "true".to_string());
-                        nodes.push(Node {
-                            id: NodeId {
-                                root: String::new(),
-                                file: file_path.to_path_buf(),
-                                name: format!("{}.{}", schema_name, val_str),
-                                kind: NodeKind::Const,
-                            },
-                            language: "openapi".to_string(),
-                            line_start: 0,
-                            line_end: 0,
-                            signature: format!("{} enum: {}", schema_name, val_str),
-                            body: val_str,
-                            metadata: const_metadata,
-                            source: ExtractionSource::Schema,
-                        });
-                    }
-                }
-            }
-
-        // Extract properties as fields
-        if let Some(properties) = schema_def.get("properties")
-            && let Some(props_map) = properties.as_mapping() {
-                for (prop_key, prop_def) in props_map {
-                    let prop_name = match prop_key.as_str() {
-                        Some(s) => s.to_string(),
-                        None => continue,
-                    };
-
-                    let prop_type = prop_def
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-
-                    let field_node_id = NodeId {
-                        root: String::new(),
-                        file: file_path.to_path_buf(),
-                        name: format!("{}.{}", schema_name, prop_name),
-                        kind: NodeKind::Other("schema_field".to_string()),
-                    };
-
-                    let mut field_metadata = BTreeMap::new();
-                    field_metadata.insert("field_type".to_string(), prop_type);
-                    field_metadata.insert("schema".to_string(), schema_name.clone());
-
+            && let Some(enum_seq) = enum_values.as_sequence()
+        {
+            for enum_val in enum_seq {
+                let val_str = match enum_val {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    _ => continue,
+                };
+                if !val_str.is_empty() {
+                    let mut const_metadata = BTreeMap::new();
+                    const_metadata.insert("value".to_string(), val_str.clone());
+                    const_metadata.insert("synthetic".to_string(), "true".to_string());
                     nodes.push(Node {
-                        id: field_node_id.clone(),
+                        id: NodeId {
+                            root: String::new(),
+                            file: file_path.to_path_buf(),
+                            name: format!("{}.{}", schema_name, val_str),
+                            kind: NodeKind::Const,
+                        },
                         language: "openapi".to_string(),
                         line_start: 0,
                         line_end: 0,
-                        signature: format!("{}.{}", schema_name, prop_name),
-                        body: serde_yaml::to_string(prop_def).unwrap_or_default(),
-                        metadata: field_metadata,
+                        signature: format!("{} enum: {}", schema_name, val_str),
+                        body: val_str,
+                        metadata: const_metadata,
                         source: ExtractionSource::Schema,
                     });
+                }
+            }
+        }
 
+        // Extract properties as fields
+        if let Some(properties) = schema_def.get("properties")
+            && let Some(props_map) = properties.as_mapping()
+        {
+            for (prop_key, prop_def) in props_map {
+                let prop_name = match prop_key.as_str() {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+
+                let prop_type = prop_def
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                let field_node_id = NodeId {
+                    root: String::new(),
+                    file: file_path.to_path_buf(),
+                    name: format!("{}.{}", schema_name, prop_name),
+                    kind: NodeKind::Other("schema_field".to_string()),
+                };
+
+                let mut field_metadata = BTreeMap::new();
+                field_metadata.insert("field_type".to_string(), prop_type);
+                field_metadata.insert("schema".to_string(), schema_name.clone());
+
+                nodes.push(Node {
+                    id: field_node_id.clone(),
+                    language: "openapi".to_string(),
+                    line_start: 0,
+                    line_end: 0,
+                    signature: format!("{}.{}", schema_name, prop_name),
+                    body: serde_yaml::to_string(prop_def).unwrap_or_default(),
+                    metadata: field_metadata,
+                    source: ExtractionSource::Schema,
+                });
+
+                edges.push(Edge {
+                    from: schema_node_id.clone(),
+                    to: field_node_id,
+                    kind: EdgeKind::HasField,
+                    source: ExtractionSource::Schema,
+                    confidence: Confidence::Detected,
+                });
+
+                // If property has a $ref, create a DependsOn edge
+                if let Some(ref_val) = prop_def.get("$ref").and_then(|v| v.as_str()) {
+                    let ref_schema = ref_val.rsplit('/').next().unwrap_or(ref_val).to_string();
                     edges.push(Edge {
                         from: schema_node_id.clone(),
-                        to: field_node_id,
-                        kind: EdgeKind::HasField,
+                        to: NodeId {
+                            root: String::new(),
+                            file: file_path.to_path_buf(),
+                            name: ref_schema,
+                            kind: NodeKind::Struct,
+                        },
+                        kind: EdgeKind::DependsOn,
                         source: ExtractionSource::Schema,
                         confidence: Confidence::Detected,
                     });
-
-                    // If property has a $ref, create a DependsOn edge
-                    if let Some(ref_val) = prop_def.get("$ref").and_then(|v| v.as_str()) {
-                        let ref_schema = ref_val
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(ref_val)
-                            .to_string();
-                        edges.push(Edge {
-                            from: schema_node_id.clone(),
-                            to: NodeId {
-                                root: String::new(),
-                                file: file_path.to_path_buf(),
-                                name: ref_schema,
-                                kind: NodeKind::Struct,
-                            },
-                            kind: EdgeKind::DependsOn,
-                            source: ExtractionSource::Schema,
-                            confidence: Confidence::Detected,
-                        });
-                    }
                 }
             }
+        }
     }
 }
 
@@ -374,14 +362,8 @@ mod tests {
             Path::new("api.yaml"),
             "openapi: 3.0.0\ninfo:\n  title: Test\n"
         ));
-        assert!(extractor.can_handle(
-            Path::new("api.json"),
-            "{\"openapi\": \"3.0.0\"}"
-        ));
-        assert!(!extractor.can_handle(
-            Path::new("config.yaml"),
-            "database:\n  host: localhost\n"
-        ));
+        assert!(extractor.can_handle(Path::new("api.json"), "{\"openapi\": \"3.0.0\"}"));
+        assert!(!extractor.can_handle(Path::new("config.yaml"), "database:\n  host: localhost\n"));
     }
 
     #[test]
@@ -445,9 +427,7 @@ components:
         email:
           type: string
 "#;
-        let result = extractor
-            .extract(Path::new("api.yaml"), content)
-            .unwrap();
+        let result = extractor.extract(Path::new("api.yaml"), content).unwrap();
 
         // Endpoint nodes
         let endpoints: Vec<_> = result
@@ -492,7 +472,10 @@ components:
             .iter()
             .filter(|e| e.kind == EdgeKind::DependsOn)
             .collect();
-        assert!(dep_edges.len() >= 2, "Should have DependsOn edges from $ref");
+        assert!(
+            dep_edges.len() >= 2,
+            "Should have DependsOn edges from $ref"
+        );
     }
 
     #[test]
@@ -516,9 +499,7 @@ definitions:
       name:
         type: string
 "#;
-        let result = extractor
-            .extract(Path::new("api.yaml"), content)
-            .unwrap();
+        let result = extractor.extract(Path::new("api.yaml"), content).unwrap();
 
         let endpoints: Vec<_> = result
             .nodes
@@ -550,9 +531,7 @@ definitions:
     }
   }
 }"#;
-        let result = extractor
-            .extract(Path::new("api.json"), content)
-            .unwrap();
+        let result = extractor.extract(Path::new("api.json"), content).unwrap();
 
         let endpoints: Vec<_> = result
             .nodes

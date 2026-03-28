@@ -99,7 +99,8 @@ pub fn directory_module_pass(all_nodes: &[Node]) -> DirectoryModuleResult {
         }
         // Virtual structural nodes (subsystems, frameworks, channels, events, diagnostics)
         // have no meaningful directory hierarchy and must not get module edges.
-        if matches!(&node.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "diagnostic" | "subsystem" | "framework" | "channel" | "event")) {
+        if matches!(&node.id.kind, NodeKind::Other(s) if matches!(s.as_str(), "diagnostic" | "subsystem" | "framework" | "channel" | "event"))
+        {
             continue;
         }
         // Skip virtual / external nodes that have no real file (empty path).
@@ -120,7 +121,11 @@ pub fn directory_module_pass(all_nodes: &[Node]) -> DirectoryModuleResult {
             _ => continue, // cannot derive a name — skip
         };
 
-        let key = (node.id.root.clone(), module_path.clone(), module_name.clone());
+        let key = (
+            node.id.root.clone(),
+            module_path.clone(),
+            module_name.clone(),
+        );
 
         // Create the module node if we haven't seen this directory yet.
         let module_node_id = module_nodes
@@ -185,13 +190,9 @@ pub fn directory_module_pass(all_nodes: &[Node]) -> DirectoryModuleResult {
 /// The `module_name` is the directory name if a parent exists, otherwise the
 /// file stem.
 fn derive_module(file: &std::path::Path) -> (Option<String>, PathBuf) {
-    let parent = file
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty());
+    let parent = file.parent().filter(|p| !p.as_os_str().is_empty());
 
-    let module_path = parent
-        .map(|p| p.to_path_buf())
-        .unwrap_or_default();
+    let module_path = parent.map(|p| p.to_path_buf()).unwrap_or_default();
 
     let module_name = if let Some(p) = parent {
         // Use the immediate parent directory name
@@ -243,9 +244,12 @@ mod tests {
 
     #[test]
     fn test_function_in_subdir_gets_belongs_to_edge() {
-        let nodes = vec![
-            make_node("repo", "src/payments.rs", "process_payment", NodeKind::Function),
-        ];
+        let nodes = vec![make_node(
+            "repo",
+            "src/payments.rs",
+            "process_payment",
+            NodeKind::Function,
+        )];
         let result = directory_module_pass(&nodes);
 
         assert_eq!(result.edges.len(), 1, "expected one BelongsTo edge");
@@ -262,9 +266,12 @@ mod tests {
     #[test]
     fn test_nested_dir_uses_immediate_parent() {
         // src/extract/foo.rs → module "extract", path "src/extract"
-        let nodes = vec![
-            make_node("repo", "src/extract/foo.rs", "bar", NodeKind::Function),
-        ];
+        let nodes = vec![make_node(
+            "repo",
+            "src/extract/foo.rs",
+            "bar",
+            NodeKind::Function,
+        )];
         let result = directory_module_pass(&nodes);
 
         assert_eq!(result.edges.len(), 1);
@@ -276,9 +283,7 @@ mod tests {
     #[test]
     fn test_root_level_file_uses_file_stem() {
         // main.rs at root → module "main"
-        let nodes = vec![
-            make_node("repo", "main.rs", "run", NodeKind::Function),
-        ];
+        let nodes = vec![make_node("repo", "main.rs", "run", NodeKind::Function)];
         let result = directory_module_pass(&nodes);
 
         assert_eq!(result.edges.len(), 1);
@@ -297,7 +302,11 @@ mod tests {
         let result = directory_module_pass(&nodes);
 
         // All three nodes are in "src/" → one module node, three edges
-        assert_eq!(result.nodes.len(), 1, "all three share the same module node");
+        assert_eq!(
+            result.nodes.len(),
+            1,
+            "all three share the same module node"
+        );
         assert_eq!(result.edges.len(), 3);
         for e in &result.edges {
             assert_eq!(e.to.name, "src");
@@ -308,11 +317,20 @@ mod tests {
     fn test_different_dirs_produce_separate_module_nodes() {
         let nodes = vec![
             make_node("repo", "src/handler.rs", "handle", NodeKind::Function),
-            make_node("repo", "tests/integration.rs", "test_handle", NodeKind::Function),
+            make_node(
+                "repo",
+                "tests/integration.rs",
+                "test_handle",
+                NodeKind::Function,
+            ),
         ];
         let result = directory_module_pass(&nodes);
 
-        assert_eq!(result.nodes.len(), 2, "two different dirs → two module nodes");
+        assert_eq!(
+            result.nodes.len(),
+            2,
+            "two different dirs → two module nodes"
+        );
         assert_eq!(result.edges.len(), 2);
         let names: std::collections::HashSet<&str> =
             result.nodes.iter().map(|n| n.id.name.as_str()).collect();
@@ -340,7 +358,10 @@ mod tests {
     fn test_external_root_nodes_are_skipped() {
         let node = make_node("external", "some/path.rs", "ext_fn", NodeKind::Function);
         let result = directory_module_pass(&[node]);
-        assert!(result.edges.is_empty(), "external root nodes must be skipped");
+        assert!(
+            result.edges.is_empty(),
+            "external root nodes must be skipped"
+        );
     }
 
     #[test]
@@ -360,9 +381,7 @@ mod tests {
 
     #[test]
     fn test_edge_source_is_tree_sitter() {
-        let nodes = vec![
-            make_node("repo", "src/lib.rs", "foo", NodeKind::Function),
-        ];
+        let nodes = vec![make_node("repo", "src/lib.rs", "foo", NodeKind::Function)];
         let result = directory_module_pass(&nodes);
         assert_eq!(
             result.edges[0].source,
@@ -390,10 +409,16 @@ mod tests {
         ];
         let result1 = directory_module_pass(&nodes);
         let result2 = directory_module_pass(&nodes);
-        assert_eq!(result1.edges.len(), result2.edges.len(),
-            "repeated calls must produce the same number of edges");
-        assert_eq!(result1.nodes.len(), result2.nodes.len(),
-            "repeated calls must produce the same number of module nodes");
+        assert_eq!(
+            result1.edges.len(),
+            result2.edges.len(),
+            "repeated calls must produce the same number of edges"
+        );
+        assert_eq!(
+            result1.nodes.len(),
+            result2.nodes.len(),
+            "repeated calls must produce the same number of module nodes"
+        );
     }
 
     #[test]
@@ -414,22 +439,29 @@ mod tests {
 
         // Each edge points to its own root's module node
         for edge in &result.edges {
-            assert_eq!(edge.from.root, edge.to.root,
-                "BelongsTo edge must stay within the same root");
+            assert_eq!(
+                edge.from.root, edge.to.root,
+                "BelongsTo edge must stay within the same root"
+            );
         }
     }
 
     #[test]
     fn adversarial_deep_nesting_uses_immediate_parent() {
         // a/b/c/d/file.rs → module name "d", path "a/b/c/d"
-        let nodes = vec![
-            make_node("repo", "a/b/c/d/file.rs", "deep_fn", NodeKind::Function),
-        ];
+        let nodes = vec![make_node(
+            "repo",
+            "a/b/c/d/file.rs",
+            "deep_fn",
+            NodeKind::Function,
+        )];
         let result = directory_module_pass(&nodes);
 
         assert_eq!(result.edges.len(), 1);
-        assert_eq!(result.edges[0].to.name, "d",
-            "must use immediate parent dir name, not root-level");
+        assert_eq!(
+            result.edges[0].to.name, "d",
+            "must use immediate parent dir name, not root-level"
+        );
         assert_eq!(result.edges[0].to.file, PathBuf::from("a/b/c/d"));
     }
 
@@ -443,8 +475,11 @@ mod tests {
         ];
         let result = directory_module_pass(&nodes);
 
-        assert_eq!(result.edges.len(), 3,
-            "BelongsTo should apply to all symbol kinds, not just functions");
+        assert_eq!(
+            result.edges.len(),
+            3,
+            "BelongsTo should apply to all symbol kinds, not just functions"
+        );
         assert_eq!(result.nodes.len(), 1, "all share the same module node");
     }
 
@@ -499,7 +534,8 @@ mod tests {
 
         // Each root-level file must produce its OWN module node.
         assert_eq!(
-            result.nodes.len(), 3,
+            result.nodes.len(),
+            3,
             "main.rs, build.rs, lib.rs must each get a distinct module node, not share one"
         );
 

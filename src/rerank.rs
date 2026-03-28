@@ -11,7 +11,7 @@
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use fastembed::{RerankerModel, RerankResult, TextRerank};
+use fastembed::{RerankResult, RerankerModel, TextRerank};
 
 /// Global reranker instance behind a Mutex. Only caches successful
 /// initialization; if model loading fails, subsequent calls will retry.
@@ -22,11 +22,17 @@ static RERANKER: Mutex<Option<TextRerank>> = Mutex::new(None);
 /// Return the model cache directory.
 /// Precedence: `FASTEMBED_CACHE_DIR` env var > `~/.cache/rna/models/` > fastembed default.
 fn rna_cache_dir() -> std::path::PathBuf {
-    if let Some(explicit) = std::env::var("FASTEMBED_CACHE_DIR").ok().filter(|v| !v.is_empty()) {
+    if let Some(explicit) = std::env::var("FASTEMBED_CACHE_DIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
         return std::path::PathBuf::from(explicit);
     }
     if let Ok(home) = std::env::var("HOME") {
-        std::path::PathBuf::from(home).join(".cache").join("rna").join("models")
+        std::path::PathBuf::from(home)
+            .join(".cache")
+            .join("rna")
+            .join("models")
     } else {
         std::path::PathBuf::from(fastembed::get_cache_dir())
     }
@@ -66,28 +72,31 @@ pub struct RerankedResult {
 ///
 /// # Returns
 /// Reranked results sorted by relevance score (descending).
-pub fn rerank_results(
-    query: &str,
-    candidates: &[RerankCandidate],
-) -> Result<Vec<RerankedResult>> {
+pub fn rerank_results(query: &str, candidates: &[RerankCandidate]) -> Result<Vec<RerankedResult>> {
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut guard = RERANKER.lock().map_err(|e| anyhow::anyhow!("Reranker lock poisoned: {}", e))?;
+    let mut guard = RERANKER
+        .lock()
+        .map_err(|e| anyhow::anyhow!("Reranker lock poisoned: {}", e))?;
 
     // Lazy-initialize on first use; retry on failure (don't cache errors).
     if guard.is_none() {
         let start = std::time::Instant::now();
-        tracing::info!("Reranker: loading {:?} (first use, one-time cost)", DEFAULT_MODEL);
+        tracing::info!(
+            "Reranker: loading {:?} (first use, one-time cost)",
+            DEFAULT_MODEL
+        );
 
         let cache_dir = rna_cache_dir();
-        std::fs::create_dir_all(&cache_dir)
-            .context(format!("Failed to create reranker cache dir: {}", cache_dir.display()))?;
+        std::fs::create_dir_all(&cache_dir).context(format!(
+            "Failed to create reranker cache dir: {}",
+            cache_dir.display()
+        ))?;
         tracing::info!("Reranker: cache dir = {}", cache_dir.display());
 
-        let init_opts = fastembed::RerankInitOptions::new(DEFAULT_MODEL)
-            .with_cache_dir(cache_dir);
+        let init_opts = fastembed::RerankInitOptions::new(DEFAULT_MODEL).with_cache_dir(cache_dir);
         match TextRerank::try_new(init_opts) {
             Ok(reranker) => {
                 tracing::info!("Reranker: ready in {:?}", start.elapsed());
@@ -135,7 +144,11 @@ pub fn rerank_results(
     }
 
     // Sort by score descending (fastembed may already do this, but be explicit).
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     Ok(results)
 }
@@ -156,8 +169,16 @@ mod tests {
         let dir_str = dir.to_string_lossy();
         // When HOME is set (typical in tests), cache dir should be under ~/.cache/rna/models
         if std::env::var("HOME").is_ok() {
-            assert!(dir_str.contains(".cache/rna/models"), "Expected ~/.cache/rna/models, got: {}", dir_str);
-            assert!(!dir_str.contains(".fastembed_cache"), "Should not use .fastembed_cache: {}", dir_str);
+            assert!(
+                dir_str.contains(".cache/rna/models"),
+                "Expected ~/.cache/rna/models, got: {}",
+                dir_str
+            );
+            assert!(
+                !dir_str.contains(".fastembed_cache"),
+                "Should not use .fastembed_cache: {}",
+                dir_str
+            );
         }
     }
 
@@ -231,9 +252,18 @@ mod tests {
     #[test]
     fn test_rerank_non_contiguous_indices() {
         let candidates = vec![
-            RerankCandidate { text: "first".to_string(), original_index: 5 },
-            RerankCandidate { text: "second".to_string(), original_index: 42 },
-            RerankCandidate { text: "third".to_string(), original_index: 100 },
+            RerankCandidate {
+                text: "first".to_string(),
+                original_index: 5,
+            },
+            RerankCandidate {
+                text: "second".to_string(),
+                original_index: 42,
+            },
+            RerankCandidate {
+                text: "third".to_string(),
+                original_index: 100,
+            },
         ];
         // Verify non-contiguous indices are preserved in structures
         assert_eq!(candidates[0].original_index, 5);
@@ -246,8 +276,14 @@ mod tests {
     #[test]
     fn test_rerank_duplicate_indices_structure() {
         let candidates = vec![
-            RerankCandidate { text: "doc A".to_string(), original_index: 0 },
-            RerankCandidate { text: "doc B".to_string(), original_index: 0 },
+            RerankCandidate {
+                text: "doc A".to_string(),
+                original_index: 0,
+            },
+            RerankCandidate {
+                text: "doc B".to_string(),
+                original_index: 0,
+            },
         ];
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].original_index, candidates[1].original_index);
@@ -258,11 +294,24 @@ mod tests {
     #[test]
     fn test_reranked_result_sort_order() {
         let mut results = vec![
-            RerankedResult { original_index: 0, score: 0.3 },
-            RerankedResult { original_index: 1, score: 0.9 },
-            RerankedResult { original_index: 2, score: 0.5 },
+            RerankedResult {
+                original_index: 0,
+                score: 0.3,
+            },
+            RerankedResult {
+                original_index: 1,
+                score: 0.9,
+            },
+            RerankedResult {
+                original_index: 2,
+                score: 0.5,
+            },
         ];
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         assert_eq!(results[0].original_index, 1); // 0.9
         assert_eq!(results[1].original_index, 2); // 0.5
         assert_eq!(results[2].original_index, 0); // 0.3
@@ -273,11 +322,21 @@ mod tests {
     #[test]
     fn test_reranked_result_nan_score_sort() {
         let mut results = vec![
-            RerankedResult { original_index: 0, score: f32::NAN },
-            RerankedResult { original_index: 1, score: 0.5 },
+            RerankedResult {
+                original_index: 0,
+                score: f32::NAN,
+            },
+            RerankedResult {
+                original_index: 1,
+                score: 0.5,
+            },
         ];
         // Should not panic -- NaN comparison falls through to Equal
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         assert_eq!(results.len(), 2);
     }
 
@@ -288,7 +347,8 @@ mod tests {
     fn test_rerank_integration() {
         let candidates = vec![
             RerankCandidate {
-                text: "The embedding cache stores computed vectors to avoid re-computation".to_string(),
+                text: "The embedding cache stores computed vectors to avoid re-computation"
+                    .to_string(),
                 original_index: 0,
             },
             RerankCandidate {

@@ -66,7 +66,9 @@ class UserRepository {
   }
 }
 "#;
-        let result = extractor.extract(Path::new("lib/user_repository.dart"), code).unwrap();
+        let result = extractor
+            .extract(Path::new("lib/user_repository.dart"), code)
+            .unwrap();
         let classes: Vec<_> = result
             .nodes
             .iter()

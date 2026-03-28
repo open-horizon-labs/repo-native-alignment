@@ -8,57 +8,57 @@
 //! for fine-grained checks. Multiple extractors can handle the same file.
 
 pub mod api_link;
-pub mod cache;
-pub mod fastapi_router_prefix;
-pub mod consumers;
-pub mod directory_module;
-pub mod event_bus;
-pub mod scan_stats;
-pub mod openapi_sdk_link;
-pub mod sdk_path_inference;
-pub mod extractor_config;
-pub mod framework_detection;
-pub mod grpc;
-pub mod import_calls;
-pub mod manifest;
-pub mod naming_convention;
-pub mod nextjs_routing;
-pub mod pubsub;
-pub mod subsystem_pass;
-pub mod websocket;
 pub mod bash;
 pub mod c;
+pub mod cache;
 pub mod configs;
+pub mod consumers;
 pub mod cpp;
+pub mod csharp;
 pub mod dart;
+pub mod directory_module;
 pub mod dockerfile;
 pub mod elixir;
+pub mod event_bus;
+pub mod extractor_config;
+pub mod fastapi_router_prefix;
+pub mod framework_detection;
 pub mod generic;
-pub mod graphql;
-pub mod html;
-pub mod query;
-pub mod csharp;
-pub mod php;
-pub mod scala;
-pub mod string_literals;
 pub mod go;
+pub mod graphql;
+pub mod grpc;
 pub mod hcl;
+pub mod html;
+pub mod import_calls;
 pub mod java;
 pub mod javascript;
 pub mod json_extractor;
 pub mod kotlin;
 pub mod lsp;
 pub mod lua;
+pub mod manifest;
 pub mod markdown;
+pub mod naming_convention;
+pub mod nextjs_routing;
 pub mod openapi;
+pub mod openapi_sdk_link;
+pub mod php;
 pub mod proto;
+pub mod pubsub;
 pub mod python;
+pub mod query;
 pub mod ruby;
 pub mod rust;
+pub mod scala;
+pub mod scan_stats;
+pub mod sdk_path_inference;
 pub mod sql;
+pub mod string_literals;
+pub mod subsystem_pass;
 pub mod swift;
 pub mod toml_extractor;
 pub mod typescript;
+pub mod websocket;
 pub mod yaml_extractor;
 pub mod zig;
 
@@ -69,8 +69,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::Result;
 use rayon::prelude::*;
 
-use crate::graph::{Edge, Node};
 use crate::graph::index::GraphIndex;
+use crate::graph::{Edge, Node};
 
 // ---------------------------------------------------------------------------
 // Content sniffing: distinguish binary from text-with-wrong-encoding
@@ -231,7 +231,12 @@ pub trait Enricher: Send + Sync {
     /// Receives the current nodes, the graph index for lookup, and the actual
     /// repo root (from `--repo`, not `std::env::current_dir()`).
     /// Returns new edges and node metadata patches.
-    async fn enrich(&self, nodes: &[Node], index: &GraphIndex, repo_root: &Path) -> Result<EnrichmentResult>;
+    async fn enrich(
+        &self,
+        nodes: &[Node],
+        index: &GraphIndex,
+        repo_root: &Path,
+    ) -> Result<EnrichmentResult>;
 
     /// Human-readable name for this enricher (for diagnostics).
     fn name(&self) -> &str;
@@ -256,7 +261,9 @@ pub trait Enricher: Send + Sync {
     /// (it will fall back to the node-count heuristic).
     ///
     /// Default: `None` (no preference).
-    fn config_file_hint(&self) -> Option<&str> { None }
+    fn config_file_hint(&self) -> Option<&str> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -330,10 +337,7 @@ impl ExtractorRegistry {
     /// Finds all extractors matching the file's extension and `can_handle()`,
     /// runs them all, and merges results.
     pub fn extract_file(&self, path: &Path, content: &str) -> ExtractionResult {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         let mut result = ExtractionResult::default();
 
@@ -370,7 +374,8 @@ impl ExtractorRegistry {
         repo_root: &Path,
         scan_result: &ScanResult,
     ) -> ExtractionResult {
-        self.extract_scan_result_with_stats(repo_root, scan_result).0
+        self.extract_scan_result_with_stats(repo_root, scan_result)
+            .0
     }
 
     /// Extract from all files in a scan result, returning both the extraction
@@ -431,10 +436,7 @@ impl ExtractorRegistry {
                     Ok(s) => s,
                     Err(e) => {
                         let bytes = e.into_bytes();
-                        tracing::info!(
-                            "Lossy-decoding non-UTF-8 text file {}",
-                            abs_path.display()
-                        );
+                        tracing::info!("Lossy-decoding non-UTF-8 text file {}", abs_path.display());
                         lossy_decoded.fetch_add(1, Ordering::Relaxed);
                         String::from_utf8_lossy(&bytes).into_owned()
                     }
@@ -623,46 +625,90 @@ impl EnricherRegistry {
         // Ordered by popularity. All are optional — only used if installed.
         let servers: &[(&str, &str, &[&str], &[&str])] = &[
             // Tier 1: most common
-            ("rust",         "rust-analyzer",              &[],         &["rs"]),
-            ("python",       "pyright-langserver",         &["--stdio"], &["py"]),
-            ("typescript",   "typescript-language-server",  &["--stdio"], &["ts", "tsx", "js", "jsx"]),
-            ("go",           "gopls",                      &["serve"],  &["go"]),
-            ("markdown",     "marksman",                   &["server"], &["md"]),
+            ("rust", "rust-analyzer", &[], &["rs"]),
+            ("python", "pyright-langserver", &["--stdio"], &["py"]),
+            (
+                "typescript",
+                "typescript-language-server",
+                &["--stdio"],
+                &["ts", "tsx", "js", "jsx"],
+            ),
+            ("go", "gopls", &["serve"], &["go"]),
+            ("markdown", "marksman", &["server"], &["md"]),
             // Tier 2: widely used
-            ("c-cpp",        "clangd",                     &[],         &["c", "cc", "cpp", "cxx", "h", "hpp"]),
-            ("java",         "jdtls",                      &[],         &["java"]),
-            ("ruby",         "solargraph",                 &["stdio"],  &["rb"]),
-            ("csharp",       "omnisharp",                  &["-lsp"],   &["cs"]),
-            ("swift",        "sourcekit-lsp",              &[],         &["swift"]),
-            ("kotlin",       "kotlin-language-server",     &[],         &["kt", "kts"]),
-            ("lua",          "lua-language-server",        &[],         &["lua"]),
-            ("zig",          "zls",                        &[],         &["zig"]),
-            ("elixir",       "elixir-ls",                  &[],         &["ex", "exs"]),
-            ("haskell",      "haskell-language-server",    &["--lsp"],  &["hs"]),
-            ("ocaml",        "ocamllsp",                   &[],         &["ml", "mli"]),
-            ("scala",        "metals",                     &[],         &["scala", "sc"]),
+            (
+                "c-cpp",
+                "clangd",
+                &[],
+                &["c", "cc", "cpp", "cxx", "h", "hpp"],
+            ),
+            ("java", "jdtls", &[], &["java"]),
+            ("ruby", "solargraph", &["stdio"], &["rb"]),
+            ("csharp", "omnisharp", &["-lsp"], &["cs"]),
+            ("swift", "sourcekit-lsp", &[], &["swift"]),
+            ("kotlin", "kotlin-language-server", &[], &["kt", "kts"]),
+            ("lua", "lua-language-server", &[], &["lua"]),
+            ("zig", "zls", &[], &["zig"]),
+            ("elixir", "elixir-ls", &[], &["ex", "exs"]),
+            ("haskell", "haskell-language-server", &["--lsp"], &["hs"]),
+            ("ocaml", "ocamllsp", &[], &["ml", "mli"]),
+            ("scala", "metals", &[], &["scala", "sc"]),
             // Tier 3: common in specific ecosystems
-            ("dart",         "dart",                       &["language-server"], &["dart"]),
-            ("r",            "R",                          &["--no-echo", "-e", "languageserver::run()"], &["r", "R"]),
-            ("julia",        "julia",                      &["--startup-file=no", "-e", "using LanguageServer; runserver()"], &["jl"]),
-            ("php",          "intelephense",               &["--stdio"], &["php"]),
-            ("css",          "vscode-css-languageserver",  &["--stdio"], &["css", "scss", "less"]),
-            ("html",         "vscode-html-languageserver", &["--stdio"], &["html", "htm"]),
-            ("yaml",         "yaml-language-server",       &["--stdio"], &["yaml", "yml"]),
-            ("json",         "vscode-json-languageserver", &["--stdio"], &["json"]),
-            ("toml",         "taplo",                      &["lsp", "stdio"], &["toml"]),
-            ("terraform",    "terraform-ls",               &["serve"],  &["tf", "tfvars"]),
-            ("nix",          "nil",                        &[],         &["nix"]),
-            ("vue",          "vue-language-server",        &["--stdio"], &["vue"]),
-            ("svelte",       "svelteserver",               &["--stdio"], &["svelte"]),
-            ("erlang",       "erlang_ls",                  &[],         &["erl", "hrl"]),
-            ("gleam",        "gleam",                      &["lsp"],    &["gleam"]),
-            ("nim",          "nimlsp",                     &[],         &["nim"]),
-            ("clojure",      "clojure-lsp",               &[],         &["clj", "cljs", "cljc"]),
-            ("deno",         "deno",                       &["lsp"],    &["ts", "tsx", "js", "jsx"]),
-            ("protobuf",     "buf",                        &["lsp"],    &["proto"]),
-            ("latex",        "texlab",                     &[],         &["tex", "bib"]),
-            ("typst",        "tinymist",                   &[],         &["typ"]),
+            ("dart", "dart", &["language-server"], &["dart"]),
+            (
+                "r",
+                "R",
+                &["--no-echo", "-e", "languageserver::run()"],
+                &["r", "R"],
+            ),
+            (
+                "julia",
+                "julia",
+                &[
+                    "--startup-file=no",
+                    "-e",
+                    "using LanguageServer; runserver()",
+                ],
+                &["jl"],
+            ),
+            ("php", "intelephense", &["--stdio"], &["php"]),
+            (
+                "css",
+                "vscode-css-languageserver",
+                &["--stdio"],
+                &["css", "scss", "less"],
+            ),
+            (
+                "html",
+                "vscode-html-languageserver",
+                &["--stdio"],
+                &["html", "htm"],
+            ),
+            (
+                "yaml",
+                "yaml-language-server",
+                &["--stdio"],
+                &["yaml", "yml"],
+            ),
+            (
+                "json",
+                "vscode-json-languageserver",
+                &["--stdio"],
+                &["json"],
+            ),
+            ("toml", "taplo", &["lsp", "stdio"], &["toml"]),
+            ("terraform", "terraform-ls", &["serve"], &["tf", "tfvars"]),
+            ("nix", "nil", &[], &["nix"]),
+            ("vue", "vue-language-server", &["--stdio"], &["vue"]),
+            ("svelte", "svelteserver", &["--stdio"], &["svelte"]),
+            ("erlang", "erlang_ls", &[], &["erl", "hrl"]),
+            ("gleam", "gleam", &["lsp"], &["gleam"]),
+            ("nim", "nimlsp", &[], &["nim"]),
+            ("clojure", "clojure-lsp", &[], &["clj", "cljs", "cljc"]),
+            ("deno", "deno", &["lsp"], &["ts", "tsx", "js", "jsx"]),
+            ("protobuf", "buf", &["lsp"], &["proto"]),
+            ("latex", "texlab", &[], &["tex", "bib"]),
+            ("typst", "tinymist", &[], &["typ"]),
         ];
 
         for &(lang, cmd, args, exts) in servers {
@@ -680,12 +726,12 @@ impl EnricherRegistry {
             // the root that contains this file over the raw node-count heuristic.
             let enricher = match lang {
                 "typescript" | "deno" => enricher.with_config_file("tsconfig.json"),
-                "python"              => enricher.with_config_file("pyproject.toml"),
-                "go"                  => enricher.with_config_file("go.mod"),
-                "rust"                => enricher.with_config_file("Cargo.toml"),
-                "java"                => enricher.with_config_file("pom.xml"),
-                "kotlin"              => enricher.with_config_file("build.gradle.kts"),
-                _                     => enricher,
+                "python" => enricher.with_config_file("pyproject.toml"),
+                "go" => enricher.with_config_file("go.mod"),
+                "rust" => enricher.with_config_file("Cargo.toml"),
+                "java" => enricher.with_config_file("pom.xml"),
+                "kotlin" => enricher.with_config_file("build.gradle.kts"),
+                _ => enricher,
             };
             registry.register(Box::new(enricher));
         }
@@ -733,44 +779,89 @@ impl EnricherRegistry {
                 continue; // silently skip — too many servers to log each one
             }
 
-            let lang = enricher.languages().first().copied().unwrap_or("unknown").to_string();
+            let lang = enricher
+                .languages()
+                .first()
+                .copied()
+                .unwrap_or("unknown")
+                .to_string();
             let server = enricher.name().to_string();
             let root_hint = if !lsp_roots.is_empty() {
-                let best = pick_lsp_root_for_nodes(nodes, repo_root, lsp_roots, enricher.config_file_hint());
+                let best = pick_lsp_root_for_nodes(
+                    nodes,
+                    repo_root,
+                    lsp_roots,
+                    enricher.config_file_hint(),
+                );
                 if best != repo_root {
                     enricher.set_startup_root(best.to_path_buf());
-                    best.strip_prefix(repo_root).ok().map(|p| p.display().to_string())
-                } else { None }
-            } else { None };
+                    best.strip_prefix(repo_root)
+                        .ok()
+                        .map(|p| p.display().to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let t_enricher = std::time::Instant::now();
             match enricher.enrich(nodes, index, repo_root).await {
                 Ok(enrichment) => {
                     let dur = t_enricher.elapsed();
                     result.any_enricher_ran = true;
-                    tracing::info!("Enricher {}: {} edges, {} node patches, {} virtual nodes",
-                        enricher.name(), enrichment.added_edges.len(), enrichment.updated_nodes.len(), enrichment.new_nodes.len());
+                    tracing::info!(
+                        "Enricher {}: {} edges, {} node patches, {} virtual nodes",
+                        enricher.name(),
+                        enrichment.added_edges.len(),
+                        enrichment.updated_nodes.len(),
+                        enrichment.new_nodes.len()
+                    );
                     let edge_count = enrichment.added_edges.len();
                     let node_count = enrichment.new_nodes.len();
                     let error_count = enrichment.error_count;
-                    let status = if enrichment.aborted { scan_stats::LspStatus::Aborted }
-                        else { scan_stats::LspStatus::Ok };
+                    let status = if enrichment.aborted {
+                        scan_stats::LspStatus::Aborted
+                    } else {
+                        scan_stats::LspStatus::Ok
+                    };
                     result.added_edges.extend(enrichment.added_edges);
                     result.updated_nodes.extend(enrichment.updated_nodes);
                     result.new_nodes.extend(enrichment.new_nodes);
                     result.lsp_entries.push(scan_stats::LspEnrichmentEntry {
-                        language: lang, server_name: server, root_hint, edge_count, node_count,
-                        error_count, duration: dur, status });
+                        language: lang,
+                        server_name: server,
+                        root_hint,
+                        edge_count,
+                        node_count,
+                        error_count,
+                        duration: dur,
+                        status,
+                    });
                 }
                 Err(e) => {
                     let dur = t_enricher.elapsed();
                     tracing::warn!("Enricher {} failed: {}", enricher.name(), e);
                     let err_msg = e.to_string();
-                    let status = if err_msg.contains("not found") || err_msg.contains("No such file") || err_msg.contains("command not found") { scan_stats::LspStatus::NotFound }
-                        else if err_msg.contains("abort") || err_msg.contains("zero-edge") { scan_stats::LspStatus::Aborted }
-                        else { scan_stats::LspStatus::Failed };
+                    let status = if err_msg.contains("not found")
+                        || err_msg.contains("No such file")
+                        || err_msg.contains("command not found")
+                    {
+                        scan_stats::LspStatus::NotFound
+                    } else if err_msg.contains("abort") || err_msg.contains("zero-edge") {
+                        scan_stats::LspStatus::Aborted
+                    } else {
+                        scan_stats::LspStatus::Failed
+                    };
                     result.lsp_entries.push(scan_stats::LspEnrichmentEntry {
-                        language: lang, server_name: server, root_hint, edge_count: 0, node_count: 0,
-                        error_count: 1, duration: dur, status });
+                        language: lang,
+                        server_name: server,
+                        root_hint,
+                        edge_count: 0,
+                        node_count: 0,
+                        error_count: 1,
+                        duration: dur,
+                        status,
+                    });
                 }
             }
         }
@@ -802,8 +893,8 @@ impl Default for EnricherRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use crate::scanner::ScanResult;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     // ---------------------------------------------------------------------------
@@ -824,7 +915,8 @@ mod tests {
             std::fs::write(
                 tmp.path().join(&name),
                 format!("pub fn func_{i}() -> u32 {{ {i} }}\n"),
-            ).unwrap();
+            )
+            .unwrap();
             new_files.push(PathBuf::from(&name));
         }
         for i in 0..10 {
@@ -832,7 +924,8 @@ mod tests {
             std::fs::write(
                 tmp.path().join(&name),
                 format!("def func_{i}():\n    return {i}\n"),
-            ).unwrap();
+            )
+            .unwrap();
             new_files.push(PathBuf::from(&name));
         }
 
@@ -865,16 +958,16 @@ mod tests {
 
         let scan = ScanResult {
             changed_files: vec![],
-            new_files: vec![
-                PathBuf::from("src/lib.rs"),
-                PathBuf::from("src/binary.rs"),
-            ],
+            new_files: vec![PathBuf::from("src/lib.rs"), PathBuf::from("src/binary.rs")],
             deleted_files: vec![],
             scan_duration: Duration::ZERO,
         };
 
         let result = registry.extract_scan_result(tmp.path(), &scan);
-        assert!(!result.nodes.is_empty(), "Should extract from valid Rust file");
+        assert!(
+            !result.nodes.is_empty(),
+            "Should extract from valid Rust file"
+        );
     }
 
     /// Adversarial: empty scan must return empty result.
@@ -930,22 +1023,34 @@ mod tests {
         // Rust file should produce nodes
         let rust_code = "pub fn hello() {}\npub struct Foo {}\n";
         let result = registry.extract_file(Path::new("src/lib.rs"), rust_code);
-        assert!(!result.nodes.is_empty(), "Rust extractor should produce nodes");
+        assert!(
+            !result.nodes.is_empty(),
+            "Rust extractor should produce nodes"
+        );
 
         // Python file should produce nodes
         let py_code = "def hello():\n    pass\n\nclass Foo:\n    pass\n";
         let result = registry.extract_file(Path::new("lib.py"), py_code);
-        assert!(!result.nodes.is_empty(), "Python extractor should produce nodes");
+        assert!(
+            !result.nodes.is_empty(),
+            "Python extractor should produce nodes"
+        );
 
         // TypeScript file should produce nodes
         let ts_code = "function hello() {}\nclass Foo {}\n";
         let result = registry.extract_file(Path::new("lib.ts"), ts_code);
-        assert!(!result.nodes.is_empty(), "TypeScript extractor should produce nodes");
+        assert!(
+            !result.nodes.is_empty(),
+            "TypeScript extractor should produce nodes"
+        );
 
         // Go file should produce nodes
         let go_code = "package main\n\nfunc hello() {}\n\ntype Foo struct {}\n";
         let result = registry.extract_file(Path::new("main.go"), go_code);
-        assert!(!result.nodes.is_empty(), "Go extractor should produce nodes");
+        assert!(
+            !result.nodes.is_empty(),
+            "Go extractor should produce nodes"
+        );
     }
 
     #[test]
@@ -1035,8 +1140,11 @@ mod tests {
             "def handle():\n    ct = \"application/json\"\n",
         );
         assert!(
-            py_result.nodes.iter().any(|n| n.id.kind == crate::graph::NodeKind::Const
-                && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("true")),
+            py_result
+                .nodes
+                .iter()
+                .any(|n| n.id.kind == crate::graph::NodeKind::Const
+                    && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("true")),
             "Python should capture string literals"
         );
         // TypeScript
@@ -1045,8 +1153,11 @@ mod tests {
             "function handle() {\n    const ct = \"application/json\";\n}\n",
         );
         assert!(
-            ts_result.nodes.iter().any(|n| n.id.kind == crate::graph::NodeKind::Const
-                && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("true")),
+            ts_result
+                .nodes
+                .iter()
+                .any(|n| n.id.kind == crate::graph::NodeKind::Const
+                    && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("true")),
             "TypeScript should capture string literals"
         );
         // Go
@@ -1055,8 +1166,11 @@ mod tests {
             "package main\nfunc handle() {\n    ct := \"application/json\"\n}\n",
         );
         assert!(
-            go_result.nodes.iter().any(|n| n.id.kind == crate::graph::NodeKind::Const
-                && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("true")),
+            go_result
+                .nodes
+                .iter()
+                .any(|n| n.id.kind == crate::graph::NodeKind::Const
+                    && n.metadata.get("synthetic").map(|s| s.as_str()) == Some("true")),
             "Go should capture string literals"
         );
     }
@@ -1097,10 +1211,16 @@ mod tests {
         // Make ai_service have MORE TypeScript nodes (dissent scenario)
         let mut nodes: Vec<crate::graph::Node> = Vec::new();
         for i in 0..100 {
-            nodes.push(make_test_node(&format!("ai_service/test_{}.ts", i), "typescript"));
+            nodes.push(make_test_node(
+                &format!("ai_service/test_{}.ts", i),
+                "typescript",
+            ));
         }
         for i in 0..50 {
-            nodes.push(make_test_node(&format!("client/src/component_{}.tsx", i), "typescript"));
+            nodes.push(make_test_node(
+                &format!("client/src/component_{}.tsx", i),
+                "typescript",
+            ));
         }
 
         let lsp_roots = vec![
@@ -1111,14 +1231,17 @@ mod tests {
         // Without config file hint: ai_service wins by count
         let result_no_hint = pick_lsp_root_for_nodes(&nodes, &primary, &lsp_roots, None);
         assert_eq!(
-            result_no_hint, ai_service_dir.as_path(),
+            result_no_hint,
+            ai_service_dir.as_path(),
             "Without hint, node-count picks ai_service (100 > 50 nodes)"
         );
 
         // With tsconfig.json hint: client wins by config file presence
-        let result_with_hint = pick_lsp_root_for_nodes(&nodes, &primary, &lsp_roots, Some("tsconfig.json"));
+        let result_with_hint =
+            pick_lsp_root_for_nodes(&nodes, &primary, &lsp_roots, Some("tsconfig.json"));
         assert_eq!(
-            result_with_hint, client_dir.as_path(),
+            result_with_hint,
+            client_dir.as_path(),
             "With tsconfig.json hint, client/ wins even with fewer nodes"
         );
     }
@@ -1137,10 +1260,16 @@ mod tests {
 
         let mut nodes: Vec<crate::graph::Node> = Vec::new();
         for i in 0..20 {
-            nodes.push(make_test_node(&format!("client/src/component_{}.tsx", i), "typescript"));
+            nodes.push(make_test_node(
+                &format!("client/src/component_{}.tsx", i),
+                "typescript",
+            ));
         }
         for i in 0..5 {
-            nodes.push(make_test_node(&format!("ai_service/test_{}.ts", i), "typescript"));
+            nodes.push(make_test_node(
+                &format!("ai_service/test_{}.ts", i),
+                "typescript",
+            ));
         }
 
         let lsp_roots = vec![
@@ -1151,7 +1280,8 @@ mod tests {
         // Config file not found in any root → fallback to count
         let result = pick_lsp_root_for_nodes(&nodes, &primary, &lsp_roots, Some("tsconfig.json"));
         assert_eq!(
-            result, client_dir.as_path(),
+            result,
+            client_dir.as_path(),
             "When no root has tsconfig.json, node-count fallback picks client (20 > 5 nodes)"
         );
     }
@@ -1164,17 +1294,14 @@ mod tests {
         let unrelated_dir = primary.join("unrelated");
         std::fs::create_dir_all(&unrelated_dir).unwrap();
 
-        let nodes = vec![
-            make_test_node("client/src/App.tsx", "typescript"),
-        ];
-        let lsp_roots = vec![
-            ("unrelated".to_string(), unrelated_dir.clone()),
-        ];
+        let nodes = vec![make_test_node("client/src/App.tsx", "typescript")];
+        let lsp_roots = vec![("unrelated".to_string(), unrelated_dir.clone())];
 
         // Node is in client/ but lsp_root is unrelated/ → no match → primary root
         let result = pick_lsp_root_for_nodes(&nodes, &primary, &lsp_roots, Some("tsconfig.json"));
         assert_eq!(
-            result, primary.as_path(),
+            result,
+            primary.as_path(),
             "When no root matches any node, primary root is returned"
         );
     }
@@ -1203,7 +1330,8 @@ mod tests {
         // Both have tsconfig.json and matching nodes — first wins
         let result = pick_lsp_root_for_nodes(&nodes, &primary, &lsp_roots, Some("tsconfig.json"));
         assert_eq!(
-            result, client_dir.as_path(),
+            result,
+            client_dir.as_path(),
             "When both roots have tsconfig.json, first in list wins"
         );
     }
@@ -1234,7 +1362,9 @@ mod tests {
     #[test]
     fn test_is_binary_valid_utf8_text() {
         assert!(!is_binary_content(b"fn hello() {}\n"));
-        assert!(!is_binary_content("pub fn greet() -> &str { \"hello\" }\n".as_bytes()));
+        assert!(!is_binary_content(
+            "pub fn greet() -> &str { \"hello\" }\n".as_bytes()
+        ));
     }
 
     #[test]
@@ -1242,14 +1372,20 @@ mod tests {
         // Latin-1 encoded text: "caf\xe9" (cafe with accent).
         // No null bytes, low control char ratio → should be classified as text.
         let latin1 = b"// caf\xe9 au lait\nfn order() {}\n";
-        assert!(!is_binary_content(latin1), "Latin-1 text should not be classified as binary");
+        assert!(
+            !is_binary_content(latin1),
+            "Latin-1 text should not be classified as binary"
+        );
     }
 
     #[test]
     fn test_is_binary_windows_1252_is_text() {
         // Windows-1252 with smart quotes and em-dash: non-UTF-8 but clearly text.
         let win1252 = b"// \x93smart quotes\x94 and \x97em dash\n";
-        assert!(!is_binary_content(win1252), "Windows-1252 text should not be classified as binary");
+        assert!(
+            !is_binary_content(win1252),
+            "Windows-1252 text should not be classified as binary"
+        );
     }
 
     #[test]
@@ -1324,17 +1460,12 @@ mod tests {
         std::fs::write(
             tmp.path().join("latin1.js"),
             b"// caf\xe9\nfunction greet() {}\n",
-        ).unwrap();
+        )
+        .unwrap();
         // Binary file (null bytes)
-        std::fs::write(
-            tmp.path().join("binary.rs"),
-            b"\x00\x01\x02\x03",
-        ).unwrap();
+        std::fs::write(tmp.path().join("binary.rs"), b"\x00\x01\x02\x03").unwrap();
         // Valid UTF-8 file
-        std::fs::write(
-            tmp.path().join("valid.rs"),
-            "pub fn valid() {}\n",
-        ).unwrap();
+        std::fs::write(tmp.path().join("valid.rs"), "pub fn valid() {}\n").unwrap();
 
         let scan = ScanResult {
             changed_files: vec![],
@@ -1348,7 +1479,10 @@ mod tests {
         };
 
         let (result, stats) = registry.extract_scan_result_with_stats(tmp.path(), &scan);
-        assert!(!result.nodes.is_empty(), "Should have nodes from valid + lossy files");
+        assert!(
+            !result.nodes.is_empty(),
+            "Should have nodes from valid + lossy files"
+        );
         assert_eq!(stats.binary_skipped, 1, "Should skip 1 binary file");
         assert_eq!(stats.lossy_decoded, 1, "Should lossy-decode 1 Latin-1 file");
     }
@@ -1376,7 +1510,10 @@ mod tests {
             "UTF-8 BOM file should be extracted"
         );
         assert_eq!(stats.binary_skipped, 0);
-        assert_eq!(stats.lossy_decoded, 0, "BOM-prefixed UTF-8 is valid, should not be lossy-decoded");
+        assert_eq!(
+            stats.lossy_decoded, 0,
+            "BOM-prefixed UTF-8 is valid, should not be lossy-decoded"
+        );
     }
 
     #[test]
@@ -1400,7 +1537,10 @@ mod tests {
             result.nodes.iter().any(|n| n.id.name == "valid_fn"),
             "Function should be extracted from mixed-encoding file"
         );
-        assert_eq!(stats.lossy_decoded, 1, "Mixed encoding should be lossy-decoded");
+        assert_eq!(
+            stats.lossy_decoded, 1,
+            "Mixed encoding should be lossy-decoded"
+        );
         assert_eq!(stats.binary_skipped, 0);
     }
 }

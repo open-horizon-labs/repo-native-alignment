@@ -10,8 +10,7 @@ use crate::types::GitCommitInfo;
 /// Opens the git repo at `repo_root`, walks commit history from HEAD,
 /// and returns up to `max_count` commits with their changed files.
 pub fn load_commits(repo_root: &Path, max_count: usize) -> Result<Vec<GitCommitInfo>> {
-    let repo =
-        Repository::open(repo_root).context("Failed to open git repository")?;
+    let repo = Repository::open(repo_root).context("Failed to open git repository")?;
 
     let mut revwalk = repo.revwalk().context("Failed to create revwalk")?;
     revwalk
@@ -26,9 +25,7 @@ pub fn load_commits(repo_root: &Path, max_count: usize) -> Result<Vec<GitCommitI
             break;
         }
         let oid = oid_result.context("Failed to get commit oid from revwalk")?;
-        let commit = repo
-            .find_commit(oid)
-            .context("Failed to find commit")?;
+        let commit = repo.find_commit(oid).context("Failed to find commit")?;
 
         let info = commit_to_info(&repo, &commit)?;
         commits.push(info);
@@ -44,8 +41,7 @@ pub fn search_commits(
     query: &str,
     max_count: usize,
 ) -> Result<Vec<GitCommitInfo>> {
-    let repo =
-        Repository::open(repo_root).context("Failed to open git repository")?;
+    let repo = Repository::open(repo_root).context("Failed to open git repository")?;
 
     let mut revwalk = repo.revwalk().context("Failed to create revwalk")?;
     revwalk
@@ -61,9 +57,7 @@ pub fn search_commits(
             break;
         }
         let oid = oid_result.context("Failed to get commit oid from revwalk")?;
-        let commit = repo
-            .find_commit(oid)
-            .context("Failed to find commit")?;
+        let commit = repo.find_commit(oid).context("Failed to find commit")?;
 
         let message = commit.message().unwrap_or("");
         if message.to_lowercase().contains(&query_lower) {
@@ -82,8 +76,7 @@ pub fn file_history(
     file_path: &Path,
     max_count: usize,
 ) -> Result<Vec<GitCommitInfo>> {
-    let repo =
-        Repository::open(repo_root).context("Failed to open git repository")?;
+    let repo = Repository::open(repo_root).context("Failed to open git repository")?;
 
     let mut revwalk = repo.revwalk().context("Failed to create revwalk")?;
     revwalk
@@ -98,9 +91,7 @@ pub fn file_history(
             break;
         }
         let oid = oid_result.context("Failed to get commit oid from revwalk")?;
-        let commit = repo
-            .find_commit(oid)
-            .context("Failed to find commit")?;
+        let commit = repo.find_commit(oid).context("Failed to find commit")?;
 
         let changed = changed_files_for_commit(&repo, &commit)?;
         if changed.iter().any(|p| p == file_path) {
@@ -163,7 +154,9 @@ pub fn commits_touching_patterns(
     let repo = Repository::open(repo_root).context("Failed to open git repository")?;
 
     let mut revwalk = repo.revwalk().context("Failed to create revwalk")?;
-    revwalk.push_head().context("Failed to push HEAD to revwalk")?;
+    revwalk
+        .push_head()
+        .context("Failed to push HEAD to revwalk")?;
     revwalk.set_sorting(git2::Sort::TIME)?;
 
     let mut commits = Vec::new();
@@ -225,16 +218,11 @@ pub fn head_oid(repo_root: &Path) -> Option<String> {
 
 /// Extracts changed files for a single commit by diffing against its first parent
 /// (or against an empty tree for the root commit).
-fn changed_files_for_commit(
-    repo: &Repository,
-    commit: &git2::Commit,
-) -> Result<Vec<PathBuf>> {
+fn changed_files_for_commit(repo: &Repository, commit: &git2::Commit) -> Result<Vec<PathBuf>> {
     let new_tree = commit.tree().context("Failed to get commit tree")?;
 
     let parent_tree = if commit.parent_count() > 0 {
-        let parent = commit
-            .parent(0)
-            .context("Failed to get first parent")?;
+        let parent = commit.parent(0).context("Failed to get first parent")?;
         Some(parent.tree().context("Failed to get parent tree")?)
     } else {
         None
@@ -248,11 +236,7 @@ fn changed_files_for_commit(
 fn build_commit_info(commit: &git2::Commit, changed_files: Vec<PathBuf>) -> GitCommitInfo {
     let hash = commit.id().to_string();
     let short_hash = hash[..7.min(hash.len())].to_string();
-    let message = commit
-        .message()
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let message = commit.message().unwrap_or("").trim().to_string();
     let author = commit.author().name().unwrap_or("unknown").to_string();
     let timestamp = commit.time().seconds();
 

@@ -24,7 +24,11 @@ use crate::types::{OhArtifactKind, QueryResult};
 /// 4. Deduplicate commits
 /// 5. For changed files in those commits, find code symbols defined there
 /// 6. Find markdown sections mentioning the outcome ID
-pub fn outcome_progress(repo_root: &Path, outcome_id: &str, graph_nodes: &[Node]) -> Result<QueryResult> {
+pub fn outcome_progress(
+    repo_root: &Path,
+    outcome_id: &str,
+    graph_nodes: &[Node],
+) -> Result<QueryResult> {
     // 1. Find the outcome
     let all_artifacts = oh::load_oh_artifacts(repo_root)?;
     let outcome = all_artifacts
@@ -49,21 +53,22 @@ pub fn outcome_progress(repo_root: &Path, outcome_id: &str, graph_nodes: &[Node]
         .unwrap_or_default();
 
     // 2. Find commits tagged with this outcome
-    let tagged_commits = git::search_by_outcome_tag(repo_root, outcome_id, 100)
-        .unwrap_or_default();
+    let tagged_commits = git::search_by_outcome_tag(repo_root, outcome_id, 100).unwrap_or_default();
 
     // 3. Find commits touching outcome's declared files
     let pattern_commits = if file_patterns.is_empty() {
         Vec::new()
     } else {
-        git::commits_touching_patterns(repo_root, &file_patterns, 100)
-            .unwrap_or_default()
+        git::commits_touching_patterns(repo_root, &file_patterns, 100).unwrap_or_default()
     };
 
     // 4. Deduplicate commits by hash, preserving order (tagged first)
     let mut seen_hashes = HashSet::new();
     let mut commits = Vec::new();
-    for c in tagged_commits.into_iter().chain(pattern_commits.into_iter()) {
+    for c in tagged_commits
+        .into_iter()
+        .chain(pattern_commits.into_iter())
+    {
         if seen_hashes.insert(c.hash.clone()) {
             commits.push(c);
         }
@@ -80,7 +85,11 @@ pub fn outcome_progress(repo_root: &Path, outcome_id: &str, graph_nodes: &[Node]
         graph_nodes
             .iter()
             .filter(|node| {
-                let node_rel = node.id.file.strip_prefix(repo_root).unwrap_or(&node.id.file);
+                let node_rel = node
+                    .id
+                    .file
+                    .strip_prefix(repo_root)
+                    .unwrap_or(&node.id.file);
                 changed_files.contains(node_rel)
             })
             .filter(|node| node.id.kind != NodeKind::Import)
@@ -142,16 +151,17 @@ pub fn find_pr_merges_for_outcome<'a>(
                 continue;
             }
             if let Some(files_json) = node.metadata.get("files_changed")
-                && let Ok(files) = serde_json::from_str::<Vec<String>>(files_json) {
-                    let matches = files.iter().any(|f| {
-                        file_patterns
-                            .iter()
-                            .any(|pat| git::glob_match_public(pat, f))
-                    });
-                    if matches {
-                        matched_stable_ids.insert(stable_id);
-                    }
+                && let Ok(files) = serde_json::from_str::<Vec<String>>(files_json)
+            {
+                let matches = files.iter().any(|f| {
+                    file_patterns
+                        .iter()
+                        .any(|pat| git::glob_match_public(pat, f))
+                });
+                if matches {
+                    matched_stable_ids.insert(stable_id);
                 }
+            }
         }
     }
 
@@ -172,9 +182,21 @@ pub fn format_pr_merges_markdown(pr_nodes: &[&Node]) -> String {
 
     for node in pr_nodes {
         let title = &node.signature;
-        let author = node.metadata.get("author").map(|s| s.as_str()).unwrap_or("unknown");
-        let branch = node.metadata.get("branch_name").map(|s| s.as_str()).unwrap_or("unknown");
-        let commit_count = node.metadata.get("commit_count").map(|s| s.as_str()).unwrap_or("?");
+        let author = node
+            .metadata
+            .get("author")
+            .map(|s| s.as_str())
+            .unwrap_or("unknown");
+        let branch = node
+            .metadata
+            .get("branch_name")
+            .map(|s| s.as_str())
+            .unwrap_or("unknown");
+        let commit_count = node
+            .metadata
+            .get("commit_count")
+            .map(|s| s.as_str())
+            .unwrap_or("?");
         let merged_at = node
             .metadata
             .get("merged_at")
@@ -246,16 +268,11 @@ pub fn compute_impact_risk(
     max_hops: usize,
 ) -> Vec<ImpactedSymbol> {
     // Build a lookup from stable_id -> &Node for all graph nodes
-    let node_by_id: BTreeMap<String, &Node> = all_nodes
-        .iter()
-        .map(|n| (n.stable_id(), n))
-        .collect();
+    let node_by_id: BTreeMap<String, &Node> =
+        all_nodes.iter().map(|n| (n.stable_id(), n)).collect();
 
     // Collect stable IDs of the changed symbols themselves (to exclude from impact)
-    let changed_ids: HashSet<String> = changed_symbols
-        .iter()
-        .map(|n| n.stable_id())
-        .collect();
+    let changed_ids: HashSet<String> = changed_symbols.iter().map(|n| n.stable_id()).collect();
 
     // Only follow code-dependency edges for impact traversal.
     // Metadata edges (Modified, Serves, Affected) link PrMerge nodes to
@@ -342,26 +359,19 @@ fn classify_risk(node: &Node, index: &GraphIndex) -> (RiskTier, String) {
         return (RiskTier::Critical, "entry point".to_string());
     }
     if let Some(pr) = pagerank
-        && pr > 0.7 {
-            return (
-                RiskTier::Critical,
-                format!("high PageRank ({:.2})", pr),
-            );
-        }
+        && pr > 0.7
+    {
+        return (RiskTier::Critical, format!("high PageRank ({:.2})", pr));
+    }
 
     // HIGH: high-degree hub symbols (many incoming edges) or moderate PageRank
     if let Some(pr) = pagerank
-        && pr > 0.4 {
-            return (
-                RiskTier::High,
-                format!("moderate PageRank ({:.2})", pr),
-            );
-        }
+        && pr > 0.4
+    {
+        return (RiskTier::High, format!("moderate PageRank ({:.2})", pr));
+    }
     if in_degree >= 5 {
-        return (
-            RiskTier::High,
-            format!("hub ({} dependents)", in_degree),
-        );
+        return (RiskTier::High, format!("hub ({} dependents)", in_degree));
     }
 
     // MEDIUM: production symbols with some connectivity (primary definitions with edges)
@@ -426,12 +436,15 @@ pub fn format_impact_markdown(impacted: &[ImpactedSymbol]) -> String {
     ));
 
     // Group by tier, show up to 10 per tier
-    let tiers = [RiskTier::Critical, RiskTier::High, RiskTier::Medium, RiskTier::Low];
+    let tiers = [
+        RiskTier::Critical,
+        RiskTier::High,
+        RiskTier::Medium,
+        RiskTier::Low,
+    ];
     for tier in &tiers {
-        let tier_symbols: Vec<&ImpactedSymbol> = impacted
-            .iter()
-            .filter(|s| s.risk == *tier)
-            .collect();
+        let tier_symbols: Vec<&ImpactedSymbol> =
+            impacted.iter().filter(|s| s.risk == *tier).collect();
         if tier_symbols.is_empty() {
             continue;
         }
@@ -550,10 +563,7 @@ mod tests {
         let impacted = compute_impact_risk(&changed, &all_nodes, &index, 3);
 
         // Should find hub, handler, test_fn, and leaf (2 hops)
-        assert!(
-            !impacted.is_empty(),
-            "Should find impacted symbols"
-        );
+        assert!(!impacted.is_empty(), "Should find impacted symbols");
 
         // handler should be CRITICAL (entry point pattern)
         let handler = impacted.iter().find(|s| s.name == "handle_request");
@@ -625,7 +635,11 @@ mod tests {
         let impacted = compute_impact_risk(&changed_symbols, &all_nodes, &index, 3);
 
         // Should find caller but NOT pr_merge
-        assert_eq!(impacted.len(), 1, "Should find exactly 1 impacted symbol (the caller)");
+        assert_eq!(
+            impacted.len(),
+            1,
+            "Should find exactly 1 impacted symbol (the caller)"
+        );
         assert_eq!(impacted[0].name, "caller");
         assert!(
             impacted.iter().all(|s| s.kind != NodeKind::PrMerge),
@@ -689,7 +703,8 @@ mod tests {
     #[test]
     fn test_classify_risk_test_file_always_low() {
         // Even with high PageRank, test files are LOW
-        let node = make_node_with_pagerank("test_fn", NodeKind::Function, "tests/test_core.rs", 0.9);
+        let node =
+            make_node_with_pagerank("test_fn", NodeKind::Function, "tests/test_core.rs", 0.9);
         let index = GraphIndex::new();
         let (risk, reason) = classify_risk(&node, &index);
         assert_eq!(risk, RiskTier::Low);
@@ -765,7 +780,8 @@ mod tests {
             assert!(
                 sym.risk >= last_risk,
                 "Results should be sorted by risk tier, got {:?} after {:?}",
-                sym.risk, last_risk
+                sym.risk,
+                last_risk
             );
             last_risk = sym.risk;
         }
@@ -828,27 +844,41 @@ mod tests {
         let index = GraphIndex::new();
         let (risk, _) = classify_risk(&python_handler, &index);
         // Not detected as entry point, falls through to LOW (leaf, no dependents)
-        assert_ne!(risk, RiskTier::Critical, "Non-conventional entry point should not be CRITICAL");
+        assert_ne!(
+            risk,
+            RiskTier::Critical,
+            "Non-conventional entry point should not be CRITICAL"
+        );
     }
 
     /// Dissent #2: PageRank boundary values -- test exact thresholds.
     #[test]
     fn test_pagerank_boundary_0_7() {
         // Exactly 0.7 should NOT be CRITICAL (threshold is >0.7)
-        let at_boundary = make_node_with_pagerank("boundary", NodeKind::Function, "src/lib.rs", 0.7);
+        let at_boundary =
+            make_node_with_pagerank("boundary", NodeKind::Function, "src/lib.rs", 0.7);
         let index = GraphIndex::new();
         let (risk, _) = classify_risk(&at_boundary, &index);
-        assert_ne!(risk, RiskTier::Critical, "PageRank exactly 0.7 should not be CRITICAL");
+        assert_ne!(
+            risk,
+            RiskTier::Critical,
+            "PageRank exactly 0.7 should not be CRITICAL"
+        );
         assert_eq!(risk, RiskTier::High, "PageRank 0.7 should be HIGH (>0.4)");
     }
 
     #[test]
     fn test_pagerank_boundary_0_4() {
         // Exactly 0.4 should NOT be HIGH (threshold is >0.4)
-        let at_boundary = make_node_with_pagerank("boundary", NodeKind::Function, "src/lib.rs", 0.4);
+        let at_boundary =
+            make_node_with_pagerank("boundary", NodeKind::Function, "src/lib.rs", 0.4);
         let index = GraphIndex::new();
         let (risk, _) = classify_risk(&at_boundary, &index);
-        assert_ne!(risk, RiskTier::High, "PageRank exactly 0.4 should not be HIGH");
+        assert_ne!(
+            risk,
+            RiskTier::High,
+            "PageRank exactly 0.4 should not be HIGH"
+        );
     }
 
     /// Dissent #3: Many changed symbols -- verify output is capped.

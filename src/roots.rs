@@ -28,7 +28,6 @@ pub enum RootType {
     Custom,
 }
 
-
 impl std::fmt::Display for RootType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -228,7 +227,11 @@ impl WorkspaceConfig {
             }
 
             // Skip if already present (e.g. from user's roots.toml).
-            if self.roots.iter().any(|r| r.resolved_path() == worktree_path) {
+            if self
+                .roots
+                .iter()
+                .any(|r| r.resolved_path() == worktree_path)
+            {
                 continue;
             }
 
@@ -327,7 +330,8 @@ impl WorkspaceConfig {
         let declared = load_declared_roots(repo_root);
 
         // Canonicalize the primary root once for subdirectory detection.
-        let canonical_primary = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+        let canonical_primary =
+            std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
 
         // Build seen-paths and seen-slugs sets once (O(N) up-front rather than O(N²)
         // per-entry). Canonicalize existing roots once so we don't redo it per iteration.
@@ -335,8 +339,8 @@ impl WorkspaceConfig {
             .roots
             .iter()
             .map(|r| {
-                let canonical = std::fs::canonicalize(r.resolved_path())
-                    .unwrap_or_else(|_| r.resolved_path());
+                let canonical =
+                    std::fs::canonicalize(r.resolved_path()).unwrap_or_else(|_| r.resolved_path());
                 (canonical, r.slug())
             })
             .collect();
@@ -346,7 +350,9 @@ impl WorkspaceConfig {
             // Sanitize the slug to prevent path-traversal via cache_state_path().
             let slug = sanitize_slug(&slug);
             if slug.is_empty() {
-                tracing::warn!("Declared workspace root has empty slug after sanitization — skipping");
+                tracing::warn!(
+                    "Declared workspace root has empty slug after sanitization — skipping"
+                );
                 continue;
             }
 
@@ -400,7 +406,8 @@ impl WorkspaceConfig {
             // covered by the primary root's tree-sitter extraction, so we only need them
             // as an LSP working directory (e.g. so typescript-language-server can find
             // `client/tsconfig.json` by starting from `client/` instead of the repo root).
-            let is_subdir = canonical.starts_with(&canonical_primary) && canonical != canonical_primary;
+            let is_subdir =
+                canonical.starts_with(&canonical_primary) && canonical != canonical_primary;
             if is_subdir {
                 tracing::info!(
                     "Registering declared subdirectory root '{}' at '{}' as lsp-only (files covered by primary root)",
@@ -518,9 +525,10 @@ fn dirs_path(app: &str, file: &str) -> PathBuf {
 fn expand_tilde(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if (s.starts_with("~/") || s == "~")
-        && let Some(home) = home_dir() {
-            return home.join(s.strip_prefix("~/").unwrap_or(""));
-        }
+        && let Some(home) = home_dir()
+    {
+        return home.join(s.strip_prefix("~/").unwrap_or(""));
+    }
     path.to_path_buf()
 }
 
@@ -581,10 +589,21 @@ pub fn claude_memory_dir(repo_root: &Path) -> Option<PathBuf> {
         .to_string_lossy()
         .trim_start_matches('/')
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let key = format!("-{}", encoded);
-    Some(home.join(".claude").join("projects").join(key).join("memory"))
+    Some(
+        home.join(".claude")
+            .join("projects")
+            .join(key)
+            .join("memory"),
+    )
 }
 
 /// Path for per-root scan state cache.
@@ -747,9 +766,18 @@ excludes = ["*.iso", "*.dmg"]
     #[test]
     fn test_path_to_slug() {
         // Uses basename only — portable (no /Users/muness/ prefix)
-        assert_eq!(path_to_slug(Path::new("/Users/foo/src/my-project")), "my-project");
-        assert_eq!(path_to_slug(Path::new("/home/user/zettelkasten")), "zettelkasten");
-        assert_eq!(path_to_slug(Path::new("/tmp/My Project Name")), "my-project-name");
+        assert_eq!(
+            path_to_slug(Path::new("/Users/foo/src/my-project")),
+            "my-project"
+        );
+        assert_eq!(
+            path_to_slug(Path::new("/home/user/zettelkasten")),
+            "zettelkasten"
+        );
+        assert_eq!(
+            path_to_slug(Path::new("/tmp/My Project Name")),
+            "my-project-name"
+        );
     }
 
     #[test]
@@ -770,18 +798,11 @@ excludes = ["*.iso", "*.dmg"]
         // Create a fake .git/worktrees/<name>/gitdir pointing at a nonexistent path
         let wt_admin = repo_root.join(".git").join("worktrees").join("stale");
         std::fs::create_dir_all(&wt_admin).unwrap();
-        std::fs::write(
-            wt_admin.join("gitdir"),
-            "/definitely/does/not/exist/.git",
-        )
-        .unwrap();
+        std::fs::write(wt_admin.join("gitdir"), "/definitely/does/not/exist/.git").unwrap();
 
         let config = WorkspaceConfig::default().with_worktrees(&repo_root);
         // Stale entry should not appear in roots.
-        assert!(
-            config.roots.is_empty(),
-            "Stale worktree must be skipped"
-        );
+        assert!(config.roots.is_empty(), "Stale worktree must be skipped");
     }
 
     #[test]
@@ -863,7 +884,11 @@ excludes = ["*.iso", "*.dmg"]
         // Populate notes root
         let notes_root = notes_dir.path();
         fs::create_dir_all(notes_root.join("journal")).unwrap();
-        fs::write(notes_root.join("journal/2024-01-01.md"), "# Today\nDid stuff.").unwrap();
+        fs::write(
+            notes_root.join("journal/2024-01-01.md"),
+            "# Today\nDid stuff.",
+        )
+        .unwrap();
 
         // Scan code root with default scanner
         let mut code_scanner = Scanner::new(code_root.to_path_buf()).unwrap();
@@ -893,7 +918,10 @@ excludes = ["*.iso", "*.dmg"]
         notes_scanner.commit_state().unwrap();
 
         // Verify state was persisted at the custom path
-        assert!(notes_state.exists(), "Notes scan state should be persisted at custom path");
+        assert!(
+            notes_state.exists(),
+            "Notes scan state should be persisted at custom path"
+        );
     }
 
     #[test]
@@ -912,11 +940,12 @@ excludes = ["*.iso", "*.dmg"]
     #[test]
     fn test_claude_memory_dir_replaces_dots() {
         // Claude Code replaces '.' with '-' in the project key
-        let dir = claude_memory_dir(Path::new("/Users/foo/Downloads/improve-deployments.md"))
-            .unwrap();
+        let dir =
+            claude_memory_dir(Path::new("/Users/foo/Downloads/improve-deployments.md")).unwrap();
         let dir_str = dir.to_string_lossy();
         assert!(
-            dir_str.ends_with("/.claude/projects/-Users-foo-Downloads-improve-deployments-md/memory"),
+            dir_str
+                .ends_with("/.claude/projects/-Users-foo-Downloads-improve-deployments-md/memory"),
             "Dots should become dashes. Got: {}",
             dir_str
         );
@@ -940,7 +969,11 @@ excludes = ["*.iso", "*.dmg"]
                 .with_claude_memory(&cwd);
             // Memory root added but resolved_roots filters non-existent
             let resolved = config.resolved_roots();
-            assert_eq!(resolved.len(), 1, "Only primary root when memory dir missing");
+            assert_eq!(
+                resolved.len(),
+                1,
+                "Only primary root when memory dir missing"
+            );
             return;
         }
 
@@ -951,7 +984,10 @@ excludes = ["*.iso", "*.dmg"]
         let resolved = config.resolved_roots();
         assert!(resolved.len() >= 2, "Expected primary + memory root");
         let memory_root = resolved.iter().find(|r| r.path == memory_dir);
-        assert!(memory_root.is_some(), "Memory root should be in resolved roots");
+        assert!(
+            memory_root.is_some(),
+            "Memory root should be in resolved roots"
+        );
         assert_eq!(memory_root.unwrap().config.root_type, RootType::Notes);
     }
 
@@ -1043,7 +1079,10 @@ excludes = ["*.iso", "*.dmg"]
         // Primary + declared "infra" root
         assert_eq!(resolved.len(), 2, "Expected primary + declared root");
         let infra = resolved.iter().find(|r| r.slug == "infra");
-        assert!(infra.is_some(), "Declared root 'infra' should appear in resolved roots");
+        assert!(
+            infra.is_some(),
+            "Declared root 'infra' should appear in resolved roots"
+        );
         // Canonicalize both sides to handle macOS symlinks (/var -> /private/var)
         let expected = std::fs::canonicalize(declared_dir.path())
             .unwrap_or_else(|_| declared_dir.path().to_path_buf());
@@ -1098,9 +1137,16 @@ excludes = ["*.iso", "*.dmg"]
             .with_declared_roots(&repo_dir);
 
         let resolved = config.resolved_roots();
-        assert_eq!(resolved.len(), 2, "Expected primary + resolved relative root");
+        assert_eq!(
+            resolved.len(),
+            2,
+            "Expected primary + resolved relative root"
+        );
         let infra = resolved.iter().find(|r| r.slug == "infra");
-        assert!(infra.is_some(), "Declared relative root 'infra' should resolve");
+        assert!(
+            infra.is_some(),
+            "Declared relative root 'infra' should resolve"
+        );
         // Canonicalize both sides to handle macOS symlinks (/var -> /private/var)
         let expected = std::fs::canonicalize(&sibling_dir).unwrap_or(sibling_dir);
         assert_eq!(infra.unwrap().path, expected);
@@ -1197,13 +1243,22 @@ excludes = ["*.iso", "*.dmg"]
 
         let resolved = config.resolved_roots();
         // Primary + first declared root; second is a duplicate and must be skipped
-        assert_eq!(resolved.len(), 2, "Second slug for same path must be deduped");
+        assert_eq!(
+            resolved.len(),
+            2,
+            "Second slug for same path must be deduped"
+        );
         // The one that IS present should be one of the two declared slugs
-        let declared: Vec<&str> = resolved.iter()
+        let declared: Vec<&str> = resolved
+            .iter()
             .map(|r| r.slug.as_str())
             .filter(|s| *s == "alias1" || *s == "alias2")
             .collect();
-        assert_eq!(declared.len(), 1, "Exactly one of the two slugs should be registered");
+        assert_eq!(
+            declared.len(),
+            1,
+            "Exactly one of the two slugs should be registered"
+        );
     }
 
     #[test]
@@ -1235,7 +1290,11 @@ excludes = ["*.iso", "*.dmg"]
 
         let resolved = config.resolved_roots();
         // Primary + sibling (already present); declared "my-alias" is deduped
-        assert_eq!(resolved.len(), 2, "Declared root that duplicates worktree path must be skipped");
+        assert_eq!(
+            resolved.len(),
+            2,
+            "Declared root that duplicates worktree path must be skipped"
+        );
         // The slug used is the auto-discovered path-derived slug (not the declared slug)
         assert!(
             resolved.iter().all(|r| r.slug != "my-alias"),
@@ -1359,7 +1418,11 @@ excludes = ["*.iso", "*.dmg"]
 
         let resolved = config.resolved_roots();
         let my_slug_roots: Vec<_> = resolved.iter().filter(|r| r.slug == "my-slug").collect();
-        assert_eq!(my_slug_roots.len(), 1, "Duplicate sanitized slug must register exactly 1 root");
+        assert_eq!(
+            my_slug_roots.len(),
+            1,
+            "Duplicate sanitized slug must register exactly 1 root"
+        );
     }
 
     // ── Subdirectory (lsp_only) root tests ──────────────────────────
@@ -1386,8 +1449,14 @@ excludes = ["*.iso", "*.dmg"]
             .with_declared_roots(repo_root.path());
 
         // The declared root should be present and marked lsp_only
-        let client_root = config.roots.iter().find(|r| r.slug_override.as_deref() == Some("client"));
-        assert!(client_root.is_some(), "Declared subdirectory root 'client' must be registered");
+        let client_root = config
+            .roots
+            .iter()
+            .find(|r| r.slug_override.as_deref() == Some("client"));
+        assert!(
+            client_root.is_some(),
+            "Declared subdirectory root 'client' must be registered"
+        );
         assert!(
             client_root.unwrap().lsp_only,
             "Subdirectory root 'client' must be marked lsp_only"
@@ -1416,8 +1485,14 @@ excludes = ["*.iso", "*.dmg"]
             .with_primary_root(repo_dir.clone())
             .with_declared_roots(&repo_dir);
 
-        let infra_root = config.roots.iter().find(|r| r.slug_override.as_deref() == Some("infra"));
-        assert!(infra_root.is_some(), "Declared sibling root 'infra' must be registered");
+        let infra_root = config
+            .roots
+            .iter()
+            .find(|r| r.slug_override.as_deref() == Some("infra"));
+        assert!(
+            infra_root.is_some(),
+            "Declared sibling root 'infra' must be registered"
+        );
         assert!(
             !infra_root.unwrap().lsp_only,
             "Sibling root 'infra' must NOT be marked lsp_only"
@@ -1445,10 +1520,20 @@ excludes = ["*.iso", "*.dmg"]
             .with_declared_roots(repo_root.path());
 
         let lsp_roots = config.lsp_only_roots();
-        assert_eq!(lsp_roots.len(), 2, "Both subdirectory roots should be lsp_only");
+        assert_eq!(
+            lsp_roots.len(),
+            2,
+            "Both subdirectory roots should be lsp_only"
+        );
         let slugs: Vec<&str> = lsp_roots.iter().map(|(s, _)| s.as_str()).collect();
-        assert!(slugs.contains(&"client"), "client should be in lsp_only_roots");
-        assert!(slugs.contains(&"ai-service"), "ai_service (sanitized) should be in lsp_only_roots");
+        assert!(
+            slugs.contains(&"client"),
+            "client should be in lsp_only_roots"
+        );
+        assert!(
+            slugs.contains(&"ai-service"),
+            "ai_service (sanitized) should be in lsp_only_roots"
+        );
     }
 
     // ── with_worktrees RNA-cache skip tests ────────────────────────────────
@@ -1463,16 +1548,24 @@ excludes = ["*.iso", "*.dmg"]
         // Create a worktree checkout with .git file + own RNA cache
         let wt_path = tmp.path().join("wt-with-cache");
         std::fs::create_dir_all(&wt_path).unwrap();
-        std::fs::write(wt_path.join(".git"), "gitdir: ../.git/worktrees/wt-with-cache\n").unwrap();
+        std::fs::write(
+            wt_path.join(".git"),
+            "gitdir: ../.git/worktrees/wt-with-cache\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(wt_path.join(".oh").join(".cache").join("lance")).unwrap();
 
         // Register it in .git/worktrees/<name>/gitdir
-        let wt_admin = repo_root.join(".git").join("worktrees").join("wt-with-cache");
+        let wt_admin = repo_root
+            .join(".git")
+            .join("worktrees")
+            .join("wt-with-cache");
         std::fs::create_dir_all(&wt_admin).unwrap();
         std::fs::write(
             wt_admin.join("gitdir"),
             format!("{}/.git", wt_path.display()),
-        ).unwrap();
+        )
+        .unwrap();
 
         let config = WorkspaceConfig::default().with_worktrees(repo_root);
         assert!(
@@ -1491,7 +1584,11 @@ excludes = ["*.iso", "*.dmg"]
         // Create a worktree checkout with .git file but NO cache
         let wt_path = tmp.path().join("wt-no-cache");
         std::fs::create_dir_all(&wt_path).unwrap();
-        std::fs::write(wt_path.join(".git"), "gitdir: ../.git/worktrees/wt-no-cache\n").unwrap();
+        std::fs::write(
+            wt_path.join(".git"),
+            "gitdir: ../.git/worktrees/wt-no-cache\n",
+        )
+        .unwrap();
         // Note: no .oh/.cache/lance/ created
 
         // Register it in .git/worktrees/<name>/gitdir
@@ -1500,15 +1597,16 @@ excludes = ["*.iso", "*.dmg"]
         std::fs::write(
             wt_admin.join("gitdir"),
             format!("{}/.git", wt_path.display()),
-        ).unwrap();
+        )
+        .unwrap();
 
         let config = WorkspaceConfig::default().with_worktrees(repo_root);
         assert_eq!(
-            config.roots.len(), 1,
+            config.roots.len(),
+            1,
             "Worktree WITHOUT its own cache must be added as a root; got: {:?}",
             config.roots
         );
         assert_eq!(config.roots[0].resolved_path(), wt_path);
     }
 }
-

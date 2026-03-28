@@ -1,13 +1,19 @@
 //! Arrow RecordBatch builders for symbols (nodes) and edges tables.
 
-use arrow_array::{RecordBatch, StringArray, UInt32Array, UInt64Array, Int32Array, Int64Array, Float64Array, BooleanArray};
 use arrow_array::builder::BooleanBuilder;
+use arrow_array::{
+    BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
+    UInt64Array,
+};
 
-use crate::graph::{Node, Edge};
-use crate::graph::store::{symbols_schema, edges_schema};
+use crate::graph::store::{edges_schema, symbols_schema};
+use crate::graph::{Edge, Node};
 
 /// Build a symbols `RecordBatch` for `nodes` tagged with `scan_version`.
-pub(super) fn build_symbols_batch(nodes: &[Node], scan_version: u64) -> anyhow::Result<RecordBatch> {
+pub(super) fn build_symbols_batch(
+    nodes: &[Node],
+    scan_version: u64,
+) -> anyhow::Result<RecordBatch> {
     use std::sync::Arc;
     let schema = Arc::new(symbols_schema());
     let now = std::time::SystemTime::now()
@@ -17,23 +23,42 @@ pub(super) fn build_symbols_batch(nodes: &[Node], scan_version: u64) -> anyhow::
 
     let ids: Vec<String> = nodes.iter().map(|n| n.stable_id()).collect();
     let root_ids: Vec<String> = nodes.iter().map(|n| n.id.root.clone()).collect();
-    let file_paths: Vec<String> = nodes.iter().map(|n| n.id.file.display().to_string()).collect();
+    let file_paths: Vec<String> = nodes
+        .iter()
+        .map(|n| n.id.file.display().to_string())
+        .collect();
     let names: Vec<String> = nodes.iter().map(|n| n.id.name.clone()).collect();
     let kinds: Vec<String> = nodes.iter().map(|n| n.id.kind.to_string()).collect();
     let line_starts: Vec<u32> = nodes.iter().map(|n| n.line_start as u32).collect();
     let line_ends: Vec<u32> = nodes.iter().map(|n| n.line_end as u32).collect();
     let signatures: Vec<String> = nodes.iter().map(|n| n.signature.clone()).collect();
     let bodies: Vec<String> = nodes.iter().map(|n| n.body.clone()).collect();
-    let meta_virtuals: Vec<Option<bool>> = nodes.iter()
-        .map(|n| if n.metadata.get("virtual").map(|v| v.as_str()) == Some("true") { Some(true) } else { None })
+    let meta_virtuals: Vec<Option<bool>> = nodes
+        .iter()
+        .map(|n| {
+            if n.metadata.get("virtual").map(|v| v.as_str()) == Some("true") {
+                Some(true)
+            } else {
+                None
+            }
+        })
         .collect();
-    let meta_packages: Vec<Option<String>> = nodes.iter()
+    let meta_packages: Vec<Option<String>> = nodes
+        .iter()
         .map(|n| n.metadata.get("package").cloned())
         .collect();
-    let meta_name_cols: Vec<Option<i32>> = nodes.iter()
-        .map(|n| n.metadata.get("name_col").and_then(|s| s.parse::<i32>().ok()))
+    let meta_name_cols: Vec<Option<i32>> = nodes
+        .iter()
+        .map(|n| {
+            n.metadata
+                .get("name_col")
+                .and_then(|s| s.parse::<i32>().ok())
+        })
         .collect();
-    let values: Vec<Option<String>> = nodes.iter().map(|n| n.metadata.get("value").cloned()).collect();
+    let values: Vec<Option<String>> = nodes
+        .iter()
+        .map(|n| n.metadata.get("value").cloned())
+        .collect();
     let mut synthetic_builder = BooleanBuilder::new();
     for n in nodes.iter() {
         match n.metadata.get("synthetic") {
@@ -41,13 +66,24 @@ pub(super) fn build_symbols_batch(nodes: &[Node], scan_version: u64) -> anyhow::
             None => synthetic_builder.append_null(),
         }
     }
-    let cyclomatics: Vec<Option<i32>> = nodes.iter()
-        .map(|n| n.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok()))
+    let cyclomatics: Vec<Option<i32>> = nodes
+        .iter()
+        .map(|n| {
+            n.metadata
+                .get("cyclomatic")
+                .and_then(|s| s.parse::<i32>().ok())
+        })
         .collect();
-    let importances: Vec<Option<f64>> = nodes.iter()
-        .map(|n| n.metadata.get("importance").and_then(|s| s.parse::<f64>().ok()))
+    let importances: Vec<Option<f64>> = nodes
+        .iter()
+        .map(|n| {
+            n.metadata
+                .get("importance")
+                .and_then(|s| s.parse::<f64>().ok())
+        })
         .collect();
-    let storages: Vec<Option<String>> = nodes.iter()
+    let storages: Vec<Option<String>> = nodes
+        .iter()
         .map(|n| n.metadata.get("storage").cloned())
         .collect();
     let mut mutable_builder = BooleanBuilder::new();
@@ -57,13 +93,16 @@ pub(super) fn build_symbols_batch(nodes: &[Node], scan_version: u64) -> anyhow::
             None => mutable_builder.append_null(),
         }
     }
-    let decorators_col: Vec<Option<String>> = nodes.iter()
+    let decorators_col: Vec<Option<String>> = nodes
+        .iter()
         .map(|n| n.metadata.get("decorators").cloned())
         .collect();
-    let type_params_col: Vec<Option<String>> = nodes.iter()
+    let type_params_col: Vec<Option<String>> = nodes
+        .iter()
         .map(|n| n.metadata.get("type_params").cloned())
         .collect();
-    let pattern_hints: Vec<Option<String>> = nodes.iter()
+    let pattern_hints: Vec<Option<String>> = nodes
+        .iter()
         .map(|n| n.metadata.get("pattern_hint").cloned())
         .collect();
     let mut is_static_builder = BooleanBuilder::new();
@@ -87,7 +126,8 @@ pub(super) fn build_symbols_batch(nodes: &[Node], scan_version: u64) -> anyhow::
             None => is_test_builder.append_null(),
         }
     }
-    let visibilities: Vec<Option<String>> = nodes.iter()
+    let visibilities: Vec<Option<String>> = nodes
+        .iter()
         .map(|n| n.metadata.get("visibility").cloned())
         .collect();
     let mut exported_builder = BooleanBuilder::new();
@@ -98,40 +138,51 @@ pub(super) fn build_symbols_batch(nodes: &[Node], scan_version: u64) -> anyhow::
         }
     }
     // Diagnostic metadata columns
-    let diag_severities: Vec<Option<String>> = nodes.iter()
+    let diag_severities: Vec<Option<String>> = nodes
+        .iter()
         .map(|n| n.metadata.get("diagnostic_severity").cloned())
         .collect();
-    let diag_sources: Vec<Option<String>> = nodes.iter()
+    let diag_sources: Vec<Option<String>> = nodes
+        .iter()
         .map(|n| n.metadata.get("diagnostic_source").cloned())
         .collect();
-    let diag_messages: Vec<Option<String>> = nodes.iter()
+    let diag_messages: Vec<Option<String>> = nodes
+        .iter()
         .map(|n| n.metadata.get("diagnostic_message").cloned())
         .collect();
-    let diag_ranges: Vec<Option<String>> = nodes.iter()
+    let diag_ranges: Vec<Option<String>> = nodes
+        .iter()
         .map(|n| n.metadata.get("diagnostic_range").cloned())
         .collect();
-    let diag_timestamps: Vec<Option<String>> = nodes.iter()
+    let diag_timestamps: Vec<Option<String>> = nodes
+        .iter()
         .map(|n| n.metadata.get("diagnostic_timestamp").cloned())
         .collect();
     // ApiEndpoint metadata columns
-    let http_methods: Vec<Option<String>> = nodes.iter()
+    let http_methods: Vec<Option<String>> = nodes
+        .iter()
         .map(|n| n.metadata.get("http_method").cloned())
         .collect();
-    let http_paths: Vec<Option<String>> = nodes.iter()
+    let http_paths: Vec<Option<String>> = nodes
+        .iter()
         .map(|n| n.metadata.get("http_path").cloned())
         .collect();
     // doc_comment column -- persisted for LSP reindex round-trip (#416)
-    let doc_comments: Vec<Option<String>> = nodes.iter()
+    let doc_comments: Vec<Option<String>> = nodes
+        .iter()
         .map(|n| n.metadata.get("doc_comment").cloned())
         .collect();
     // gRPC / proto columns -- populated for proto RPC Function nodes (#466)
-    let parent_services: Vec<Option<String>> = nodes.iter()
+    let parent_services: Vec<Option<String>> = nodes
+        .iter()
         .map(|n| n.metadata.get("parent_service").cloned())
         .collect();
-    let rpc_request_types: Vec<Option<String>> = nodes.iter()
+    let rpc_request_types: Vec<Option<String>> = nodes
+        .iter()
         .map(|n| n.metadata.get("request_type").cloned())
         .collect();
-    let rpc_response_types: Vec<Option<String>> = nodes.iter()
+    let rpc_response_types: Vec<Option<String>> = nodes
+        .iter()
         .map(|n| n.metadata.get("response_type").cloned())
         .collect();
     let updated_ats: Vec<i64> = vec![now; nodes.len()];
@@ -180,7 +231,8 @@ pub(super) fn build_symbols_batch(nodes: &[Node], scan_version: u64) -> anyhow::
             Arc::new(Int64Array::from(updated_ats)),
             Arc::new(UInt64Array::from(scan_versions)),
         ],
-    ).map_err(anyhow::Error::from)
+    )
+    .map_err(anyhow::Error::from)
 }
 
 /// Build an edges `RecordBatch` for `edges` tagged with `scan_version`.
@@ -219,5 +271,6 @@ pub(super) fn build_edges_batch(edges: &[Edge], scan_version: u64) -> anyhow::Re
             Arc::new(Int64Array::from(updated_ats)),
             Arc::new(UInt64Array::from(scan_versions)),
         ],
-    ).map_err(anyhow::Error::from)
+    )
+    .map_err(anyhow::Error::from)
 }

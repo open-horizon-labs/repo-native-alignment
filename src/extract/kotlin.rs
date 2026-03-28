@@ -8,9 +8,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::graph::{
-    Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
-};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 use super::configs::KOTLIN_CONFIG;
 use super::generic::GenericExtractor;
@@ -80,17 +78,24 @@ fn collect_kotlin_specials(
                 nodes.retain(|n| !(n.id.kind == NodeKind::Field && n.line_start == line));
 
                 if let Some(name_node) = node.child_by_field_name("name") {
-                    let name = name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
+                    let name = name_node
+                        .utf8_text(source)
+                        .unwrap_or("unknown")
+                        .trim()
+                        .to_string();
                     let sig = decl_text.lines().next().unwrap_or("").trim().to_string();
                     // Value is after the `=` sign
-                    let value_str = decl_text.find('=')
-                        .map(|pos| decl_text[pos+1..].trim().to_string())
+                    let value_str = decl_text
+                        .find('=')
+                        .map(|pos| decl_text[pos + 1..].trim().to_string())
                         .filter(|s| !s.is_empty());
                     let mut metadata = BTreeMap::new();
                     if let Some(ref v) = value_str {
-                        let is_scalar = v.starts_with('"') || v.starts_with('\'')
+                        let is_scalar = v.starts_with('"')
+                            || v.starts_with('\'')
                             || v.parse::<f64>().is_ok()
-                            || v == "true" || v == "false";
+                            || v == "true"
+                            || v == "false";
                         if is_scalar {
                             let stripped = v.trim_matches('"').trim_matches('\'');
                             metadata.insert("value".to_string(), stripped.to_string());

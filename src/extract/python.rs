@@ -44,7 +44,12 @@ impl Extractor for PythonExtractor {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_python::LANGUAGE.into())?;
         if let Some(tree) = parser.parse(content, None) {
-            collect_allcaps_consts(tree.root_node(), path, content.as_bytes(), &mut result.nodes);
+            collect_allcaps_consts(
+                tree.root_node(),
+                path,
+                content.as_bytes(),
+                &mut result.nodes,
+            );
         }
 
         Ok(result)
@@ -62,41 +67,51 @@ fn collect_allcaps_consts(
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i as u32)
                 && child.kind() == "assignment"
-                    && let Some(lhs) = child.child_by_field_name("left") {
-                        let name_str = lhs.utf8_text(source).unwrap_or("").trim().to_string();
-                        if !name_str.is_empty()
-                            && name_str.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
-                            && name_str.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-                        {
-                            let value_str = child
-                                .child_by_field_name("right")
-                                .and_then(|v| v.utf8_text(source).ok())
-                                .map(|s| s.trim().to_string());
-                            let body = child.utf8_text(source).unwrap_or("").to_string();
-                            let signature = body.lines().next().unwrap_or("").trim().to_string();
-                            let mut metadata = BTreeMap::new();
-                            if let Some(ref v) = value_str
-                                && !v.starts_with('[') && !v.starts_with('{') && !v.starts_with('(') {
-                                    metadata.insert("value".to_string(), v.clone());
-                                }
-                            metadata.insert("synthetic".to_string(), "false".to_string());
-                            nodes.push(Node {
-                                id: NodeId {
-                                    root: String::new(),
-                                    file: path.to_path_buf(),
-                                    name: name_str,
-                                    kind: NodeKind::Const,
-                                },
-                                language: "python".to_string(),
-                                line_start: child.start_position().row + 1,
-                                line_end: child.end_position().row + 1,
-                                signature,
-                                body,
-                                metadata,
-                                source: ExtractionSource::TreeSitter,
-                            });
-                        }
+                && let Some(lhs) = child.child_by_field_name("left")
+            {
+                let name_str = lhs.utf8_text(source).unwrap_or("").trim().to_string();
+                if !name_str.is_empty()
+                    && name_str
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_uppercase())
+                        .unwrap_or(false)
+                    && name_str
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                {
+                    let value_str = child
+                        .child_by_field_name("right")
+                        .and_then(|v| v.utf8_text(source).ok())
+                        .map(|s| s.trim().to_string());
+                    let body = child.utf8_text(source).unwrap_or("").to_string();
+                    let signature = body.lines().next().unwrap_or("").trim().to_string();
+                    let mut metadata = BTreeMap::new();
+                    if let Some(ref v) = value_str
+                        && !v.starts_with('[')
+                        && !v.starts_with('{')
+                        && !v.starts_with('(')
+                    {
+                        metadata.insert("value".to_string(), v.clone());
                     }
+                    metadata.insert("synthetic".to_string(), "false".to_string());
+                    nodes.push(Node {
+                        id: NodeId {
+                            root: String::new(),
+                            file: path.to_path_buf(),
+                            name: name_str,
+                            kind: NodeKind::Const,
+                        },
+                        language: "python".to_string(),
+                        line_start: child.start_position().row + 1,
+                        line_end: child.end_position().row + 1,
+                        signature,
+                        body,
+                        metadata,
+                        source: ExtractionSource::TreeSitter,
+                    });
+                }
+            }
         }
     }
 
@@ -145,11 +160,27 @@ from typing import Optional
 "#;
         let result = extractor.extract(Path::new("app.py"), code).unwrap();
 
-        let imports: Vec<_> = result.nodes.iter().filter(|n| n.id.kind == NodeKind::Import).collect();
-        assert!(imports.len() >= 3, "Should find at least 3 imports, got {}", imports.len());
+        let imports: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Import)
+            .collect();
+        assert!(
+            imports.len() >= 3,
+            "Should find at least 3 imports, got {}",
+            imports.len()
+        );
 
-        let dep_edges: Vec<_> = result.edges.iter().filter(|e| e.kind == EdgeKind::DependsOn).collect();
-        assert!(dep_edges.len() >= 3, "Should produce at least 3 DependsOn edges, got {}", dep_edges.len());
+        let dep_edges: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::DependsOn)
+            .collect();
+        assert!(
+            dep_edges.len() >= 3,
+            "Should produce at least 3 DependsOn edges, got {}",
+            dep_edges.len()
+        );
     }
 
     #[test]
@@ -165,7 +196,11 @@ from typing import Optional
         let extractor = PythonExtractor::new();
         let code = "class Foo:\n    pass\n";
         let result = extractor.extract(Path::new("app.py"), code).unwrap();
-        let class_node = result.nodes.iter().find(|n| n.id.name == "Foo").expect("Should find Foo");
+        let class_node = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Foo")
+            .expect("Should find Foo");
         assert_eq!(class_node.id.kind, NodeKind::Struct);
     }
 
@@ -179,15 +214,35 @@ not_a_constant = 42
 CamelCase = "also not a constant"
 "#;
         let result = extractor.extract(Path::new("config.py"), code).unwrap();
-        let consts: Vec<_> = result.nodes.iter().filter(|n| n.id.kind == NodeKind::Const).collect();
-        let declared: Vec<_> = consts.iter().filter(|n| n.metadata.get("synthetic").map(|s| s.as_str()) == Some("false")).collect();
-        assert_eq!(declared.len(), 2, "Should find 2 declared ALL_CAPS constants");
+        let consts: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Const)
+            .collect();
+        let declared: Vec<_> = consts
+            .iter()
+            .filter(|n| n.metadata.get("synthetic").map(|s| s.as_str()) == Some("false"))
+            .collect();
+        assert_eq!(
+            declared.len(),
+            2,
+            "Should find 2 declared ALL_CAPS constants"
+        );
         let names: Vec<&str> = declared.iter().map(|n| n.id.name.as_str()).collect();
         assert!(names.contains(&"MAX_RETRIES"), "Should find MAX_RETRIES");
         assert!(names.contains(&"API_URL"), "Should find API_URL");
-        let max_retries = declared.iter().find(|n| n.id.name == "MAX_RETRIES").unwrap();
-        assert_eq!(max_retries.metadata.get("value").map(|s| s.as_str()), Some("5"));
-        assert_eq!(max_retries.metadata.get("synthetic").map(|s| s.as_str()), Some("false"));
+        let max_retries = declared
+            .iter()
+            .find(|n| n.id.name == "MAX_RETRIES")
+            .unwrap();
+        assert_eq!(
+            max_retries.metadata.get("value").map(|s| s.as_str()),
+            Some("5")
+        );
+        assert_eq!(
+            max_retries.metadata.get("synthetic").map(|s| s.as_str()),
+            Some("false")
+        );
     }
 
     #[test]
@@ -208,14 +263,38 @@ class MyService:
 "#;
         let result = extractor.extract(Path::new("service.py"), code).unwrap();
 
-        let instance = result.nodes.iter().find(|n| n.id.name == "instance_method" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(instance.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "instance_method(self) should be instance");
+        let instance = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "instance_method" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            instance.metadata.get("is_static").map(|s| s.as_str()),
+            Some("false"),
+            "instance_method(self) should be instance"
+        );
 
-        let from_config = result.nodes.iter().find(|n| n.id.name == "from_config" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(from_config.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "@classmethod should be instance (not static)");
+        let from_config = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "from_config" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            from_config.metadata.get("is_static").map(|s| s.as_str()),
+            Some("false"),
+            "@classmethod should be instance (not static)"
+        );
 
-        let utility = result.nodes.iter().find(|n| n.id.name == "utility" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(utility.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "@staticmethod should be static");
+        let utility = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "utility" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            utility.metadata.get("is_static").map(|s| s.as_str()),
+            Some("true"),
+            "@staticmethod should be static"
+        );
     }
 
     #[test]
@@ -224,7 +303,14 @@ class MyService:
         let code = "def top_level():\n    pass\n";
         let result = extractor.extract(Path::new("app.py"), code).unwrap();
 
-        let func = result.nodes.iter().find(|n| n.id.name == "top_level").unwrap();
-        assert!(func.metadata.get("is_static").is_none(), "Top-level function should NOT have is_static");
+        let func = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "top_level")
+            .unwrap();
+        assert!(
+            func.metadata.get("is_static").is_none(),
+            "Top-level function should NOT have is_static"
+        );
     }
 }

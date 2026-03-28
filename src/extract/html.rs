@@ -54,49 +54,45 @@ impl Extractor for HtmlExtractor {
         let mut nodes = Vec::new();
         collect_html_nodes(tree.root_node(), path, content.as_bytes(), &mut nodes);
 
-        Ok(ExtractionResult { nodes, edges: vec![] })
+        Ok(ExtractionResult {
+            nodes,
+            edges: vec![],
+        })
     }
 }
 
 /// Walk the HTML AST to collect script blocks, template elements, and ID anchors.
-fn collect_html_nodes(
-    node: tree_sitter::Node,
-    path: &Path,
-    source: &[u8],
-    nodes: &mut Vec<Node>,
-) {
+fn collect_html_nodes(node: tree_sitter::Node, path: &Path, source: &[u8], nodes: &mut Vec<Node>) {
     match node.kind() {
         "script_element" => {
             // Extract <script> blocks as embedded JS nodes.
             // Find the raw_text child which contains the actual JS content.
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i as u32)
-                    && child.kind() == "raw_text" {
-                        let body = child.utf8_text(source).unwrap_or("").to_string();
-                        if !body.trim().is_empty() {
-                            nodes.push(Node {
-                                id: NodeId {
-                                    root: String::new(),
-                                    file: path.to_path_buf(),
-                                    name: format!(
-                                        "script@{}",
-                                        node.start_position().row + 1
-                                    ),
-                                    kind: NodeKind::Other("html_script".to_string()),
-                                },
-                                language: "html".to_string(),
-                                line_start: node.start_position().row + 1,
-                                line_end: node.end_position().row + 1,
-                                signature: format!(
-                                    "<script> at line {}",
-                                    node.start_position().row + 1
-                                ),
-                                body,
-                                metadata: BTreeMap::new(),
-                                source: ExtractionSource::TreeSitter,
-                            });
-                        }
+                    && child.kind() == "raw_text"
+                {
+                    let body = child.utf8_text(source).unwrap_or("").to_string();
+                    if !body.trim().is_empty() {
+                        nodes.push(Node {
+                            id: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: format!("script@{}", node.start_position().row + 1),
+                                kind: NodeKind::Other("html_script".to_string()),
+                            },
+                            language: "html".to_string(),
+                            line_start: node.start_position().row + 1,
+                            line_end: node.end_position().row + 1,
+                            signature: format!(
+                                "<script> at line {}",
+                                node.start_position().row + 1
+                            ),
+                            body,
+                            metadata: BTreeMap::new(),
+                            source: ExtractionSource::TreeSitter,
+                        });
                     }
+                }
             }
         }
         "element" => {
@@ -106,39 +102,46 @@ fn collect_html_nodes(
 
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i as u32)
-                    && child.kind() == "start_tag" {
-                        // Get tag name
-                        if let Some(tag_node) = child.child_by_field_name("name") {
-                            tag_name = tag_node.utf8_text(source).ok().map(|s| s.to_string());
-                        } else {
-                            // Try first child of start_tag
-                            for j in 0..child.child_count() {
-                                if let Some(tag_child) = child.child(j as u32)
-                                    && tag_child.kind() == "tag_name" {
-                                        tag_name = tag_child.utf8_text(source).ok().map(|s| s.to_string());
-                                        break;
-                                    }
+                    && child.kind() == "start_tag"
+                {
+                    // Get tag name
+                    if let Some(tag_node) = child.child_by_field_name("name") {
+                        tag_name = tag_node.utf8_text(source).ok().map(|s| s.to_string());
+                    } else {
+                        // Try first child of start_tag
+                        for j in 0..child.child_count() {
+                            if let Some(tag_child) = child.child(j as u32)
+                                && tag_child.kind() == "tag_name"
+                            {
+                                tag_name = tag_child.utf8_text(source).ok().map(|s| s.to_string());
+                                break;
                             }
                         }
+                    }
 
-                        // Look for id attribute
-                        for j in 0..child.child_count() {
-                            if let Some(attr) = child.child(j as u32)
-                                && attr.kind() == "attribute" {
-                                    let attr_text = attr.utf8_text(source).unwrap_or("");
-                                    if attr_text.starts_with("id=") || attr_text.starts_with("id =") {
-                                        // Extract the value
-                                        for k in 0..attr.child_count() {
-                                            if let Some(val_node) = attr.child(k as u32)
-                                                && (val_node.kind() == "attribute_value" || val_node.kind() == "quoted_attribute_value") {
-                                                    let raw = val_node.utf8_text(source).unwrap_or("");
-                                                    id_value = Some(raw.trim_matches('"').trim_matches('\'').to_string());
-                                                }
-                                        }
+                    // Look for id attribute
+                    for j in 0..child.child_count() {
+                        if let Some(attr) = child.child(j as u32)
+                            && attr.kind() == "attribute"
+                        {
+                            let attr_text = attr.utf8_text(source).unwrap_or("");
+                            if attr_text.starts_with("id=") || attr_text.starts_with("id =") {
+                                // Extract the value
+                                for k in 0..attr.child_count() {
+                                    if let Some(val_node) = attr.child(k as u32)
+                                        && (val_node.kind() == "attribute_value"
+                                            || val_node.kind() == "quoted_attribute_value")
+                                    {
+                                        let raw = val_node.utf8_text(source).unwrap_or("");
+                                        id_value = Some(
+                                            raw.trim_matches('"').trim_matches('\'').to_string(),
+                                        );
                                     }
                                 }
+                            }
                         }
                     }
+                }
             }
 
             // Emit <template> as a template node
@@ -163,31 +166,28 @@ fn collect_html_nodes(
 
             // Emit id="..." as anchor node
             if let Some(id) = id_value
-                && !id.is_empty() {
-                    let mut metadata = BTreeMap::new();
-                    if let Some(ref tag) = tag_name {
-                        metadata.insert("tag".to_string(), tag.clone());
-                    }
-                    nodes.push(Node {
-                        id: NodeId {
-                            root: String::new(),
-                            file: path.to_path_buf(),
-                            name: id.clone(),
-                            kind: NodeKind::Other("html_id".to_string()),
-                        },
-                        language: "html".to_string(),
-                        line_start: node.start_position().row + 1,
-                        line_end: node.start_position().row + 1,
-                        signature: format!(
-                            "#{} ({})",
-                            id,
-                            tag_name.as_deref().unwrap_or("element")
-                        ),
-                        body: String::new(),
-                        metadata,
-                        source: ExtractionSource::TreeSitter,
-                    });
+                && !id.is_empty()
+            {
+                let mut metadata = BTreeMap::new();
+                if let Some(ref tag) = tag_name {
+                    metadata.insert("tag".to_string(), tag.clone());
                 }
+                nodes.push(Node {
+                    id: NodeId {
+                        root: String::new(),
+                        file: path.to_path_buf(),
+                        name: id.clone(),
+                        kind: NodeKind::Other("html_id".to_string()),
+                    },
+                    language: "html".to_string(),
+                    line_start: node.start_position().row + 1,
+                    line_end: node.start_position().row + 1,
+                    signature: format!("#{} ({})", id, tag_name.as_deref().unwrap_or("element")),
+                    body: String::new(),
+                    metadata,
+                    source: ExtractionSource::TreeSitter,
+                });
+            }
         }
         _ => {}
     }
@@ -229,7 +229,10 @@ function greet() {
             .filter(|n| n.id.kind == NodeKind::Other("html_script".to_string()))
             .collect();
         assert!(!scripts.is_empty(), "Should extract script blocks");
-        assert!(scripts[0].body.contains("greet"), "Script body should contain JS");
+        assert!(
+            scripts[0].body.contains("greet"),
+            "Script body should contain JS"
+        );
     }
 
     #[test]

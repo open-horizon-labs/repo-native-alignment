@@ -50,7 +50,13 @@ impl Extractor for CppExtractor {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_cpp::LANGUAGE.into())?;
         if let Some(tree) = parser.parse(content, None) {
-            collect_cpp_specials(tree.root_node(), path, content.as_bytes(), None, &mut result.nodes);
+            collect_cpp_specials(
+                tree.root_node(),
+                path,
+                content.as_bytes(),
+                None,
+                &mut result.nodes,
+            );
         }
 
         Ok(result)
@@ -64,20 +70,19 @@ fn extract_cpp_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
         "identifier" | "field_identifier" | "destructor_name" => {
             Some(node.utf8_text(source).unwrap_or("unknown").to_string())
         }
-        "qualified_identifier" => {
-            node.child_by_field_name("name")
-                .and_then(|n| extract_cpp_name(n, source))
-        }
-        "function_declarator" => {
-            node.child_by_field_name("declarator")
-                .and_then(|n| extract_cpp_name(n, source))
-        }
+        "qualified_identifier" => node
+            .child_by_field_name("name")
+            .and_then(|n| extract_cpp_name(n, source)),
+        "function_declarator" => node
+            .child_by_field_name("declarator")
+            .and_then(|n| extract_cpp_name(n, source)),
         "pointer_declarator" | "reference_declarator" => {
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i as u32)
-                    && let Some(name) = extract_cpp_name(child, source) {
-                        return Some(name);
-                    }
+                    && let Some(name) = extract_cpp_name(child, source)
+                {
+                    return Some(name);
+                }
             }
             None
         }
@@ -96,30 +101,31 @@ fn collect_cpp_specials(
     match node.kind() {
         "function_definition" => {
             if let Some(declarator) = node.child_by_field_name("declarator")
-                && let Some(name) = extract_cpp_name(declarator, source) {
-                    let qualified = match scope {
-                        Some(s) => format!("{}::{}", s, name),
-                        None => name.clone(),
-                    };
-                    let body = node.utf8_text(source).unwrap_or("").to_string();
-                    let sig = body.lines().next().unwrap_or("").trim().to_string();
+                && let Some(name) = extract_cpp_name(declarator, source)
+            {
+                let qualified = match scope {
+                    Some(s) => format!("{}::{}", s, name),
+                    None => name.clone(),
+                };
+                let body = node.utf8_text(source).unwrap_or("").to_string();
+                let sig = body.lines().next().unwrap_or("").trim().to_string();
 
-                    nodes.push(Node {
-                        id: NodeId {
-                            root: String::new(),
-                            file: path.to_path_buf(),
-                            name: qualified,
-                            kind: NodeKind::Function,
-                        },
-                        language: "cpp".to_string(),
-                        line_start: node.start_position().row + 1,
-                        line_end: node.end_position().row + 1,
-                        signature: sig,
-                        body,
-                        metadata: BTreeMap::new(),
-                        source: ExtractionSource::TreeSitter,
-                    });
-                }
+                nodes.push(Node {
+                    id: NodeId {
+                        root: String::new(),
+                        file: path.to_path_buf(),
+                        name: qualified,
+                        kind: NodeKind::Function,
+                    },
+                    language: "cpp".to_string(),
+                    line_start: node.start_position().row + 1,
+                    line_end: node.end_position().row + 1,
+                    signature: sig,
+                    body,
+                    metadata: BTreeMap::new(),
+                    source: ExtractionSource::TreeSitter,
+                });
+            }
         }
         "namespace_definition" => {
             if let Some(name_node) = node.child_by_field_name("name") {
@@ -159,41 +165,50 @@ fn collect_cpp_specials(
                 || (decl_text.contains("static") && decl_text.contains("const "));
             if is_const
                 && let Some(declarator) = node.child_by_field_name("declarator")
-                    && let Some(name) = extract_cpp_name(declarator, source) {
-                        let qualified = match scope {
-                            Some(s) => format!("{}::{}", s, name),
-                            None => name,
-                        };
-                        let sig = decl_text.lines().next().unwrap_or("").trim().to_string();
-                        let value_str = decl_text.find('=')
-                            .map(|pos| decl_text[pos+1..].trim_end_matches(';').trim().to_string())
-                            .filter(|s| !s.is_empty());
-                        let mut metadata = BTreeMap::new();
-                        if let Some(ref v) = value_str {
-                            let is_scalar = v.starts_with('"') || v.parse::<f64>().is_ok()
-                                || v == "true" || v == "false";
-                            if is_scalar {
-                                let stripped = v.trim_matches('"');
-                                metadata.insert("value".to_string(), stripped.to_string());
-                            }
-                        }
-                        metadata.insert("synthetic".to_string(), "false".to_string());
-                        nodes.push(Node {
-                            id: NodeId {
-                                root: String::new(),
-                                file: path.to_path_buf(),
-                                name: qualified,
-                                kind: NodeKind::Const,
-                            },
-                            language: "cpp".to_string(),
-                            line_start: node.start_position().row + 1,
-                            line_end: node.end_position().row + 1,
-                            signature: sig,
-                            body: decl_text,
-                            metadata,
-                            source: ExtractionSource::TreeSitter,
-                        });
+                && let Some(name) = extract_cpp_name(declarator, source)
+            {
+                let qualified = match scope {
+                    Some(s) => format!("{}::{}", s, name),
+                    None => name,
+                };
+                let sig = decl_text.lines().next().unwrap_or("").trim().to_string();
+                let value_str = decl_text
+                    .find('=')
+                    .map(|pos| {
+                        decl_text[pos + 1..]
+                            .trim_end_matches(';')
+                            .trim()
+                            .to_string()
+                    })
+                    .filter(|s| !s.is_empty());
+                let mut metadata = BTreeMap::new();
+                if let Some(ref v) = value_str {
+                    let is_scalar = v.starts_with('"')
+                        || v.parse::<f64>().is_ok()
+                        || v == "true"
+                        || v == "false";
+                    if is_scalar {
+                        let stripped = v.trim_matches('"');
+                        metadata.insert("value".to_string(), stripped.to_string());
                     }
+                }
+                metadata.insert("synthetic".to_string(), "false".to_string());
+                nodes.push(Node {
+                    id: NodeId {
+                        root: String::new(),
+                        file: path.to_path_buf(),
+                        name: qualified,
+                        kind: NodeKind::Const,
+                    },
+                    language: "cpp".to_string(),
+                    line_start: node.start_position().row + 1,
+                    line_end: node.end_position().row + 1,
+                    signature: sig,
+                    body: decl_text,
+                    metadata,
+                    source: ExtractionSource::TreeSitter,
+                });
+            }
         }
         _ => {}
     }
@@ -221,18 +236,27 @@ mod tests {
 #define MAX_BUFFER_SIZE 1024
 #define VERSION "1.0.0"
 "#;
-        let result = extractor.extract(Path::new("src/config.hpp"), code).unwrap();
+        let result = extractor
+            .extract(Path::new("src/config.hpp"), code)
+            .unwrap();
 
         let macros: Vec<_> = result
             .nodes
             .iter()
             .filter(|n| n.id.kind == NodeKind::Macro)
             .collect();
-        assert_eq!(macros.len(), 2, "Should find 2 object-like macros, got: {:?}",
-            macros.iter().map(|n| &n.id.name).collect::<Vec<_>>());
+        assert_eq!(
+            macros.len(),
+            2,
+            "Should find 2 object-like macros, got: {:?}",
+            macros.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+        );
 
         let names: Vec<&str> = macros.iter().map(|n| n.id.name.as_str()).collect();
-        assert!(names.contains(&"MAX_BUFFER_SIZE"), "Should find MAX_BUFFER_SIZE macro");
+        assert!(
+            names.contains(&"MAX_BUFFER_SIZE"),
+            "Should find MAX_BUFFER_SIZE macro"
+        );
         assert!(names.contains(&"VERSION"), "Should find VERSION macro");
     }
 
@@ -250,8 +274,12 @@ mod tests {
             .iter()
             .filter(|n| n.id.kind == NodeKind::Macro)
             .collect();
-        assert_eq!(macros.len(), 2, "Should find 2 function-like macros, got: {:?}",
-            macros.iter().map(|n| &n.id.name).collect::<Vec<_>>());
+        assert_eq!(
+            macros.len(),
+            2,
+            "Should find 2 function-like macros, got: {:?}",
+            macros.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+        );
 
         let names: Vec<&str> = macros.iter().map(|n| n.id.name.as_str()).collect();
         assert!(names.contains(&"MIN"), "Should find MIN macro");
@@ -260,7 +288,10 @@ mod tests {
 
     #[test]
     fn test_cpp_macro_is_embeddable() {
-        assert!(NodeKind::Macro.is_embeddable(), "Macro should be embeddable");
+        assert!(
+            NodeKind::Macro.is_embeddable(),
+            "Macro should be embeddable"
+        );
     }
 
     #[test]
@@ -306,7 +337,9 @@ int useful_function(int x);
 
 #endif
 "#;
-        let result = extractor.extract(Path::new("src/my_header.hpp"), code).unwrap();
+        let result = extractor
+            .extract(Path::new("src/my_header.hpp"), code)
+            .unwrap();
 
         let macros: Vec<_> = result
             .nodes
@@ -356,7 +389,9 @@ int compute(int x) {
     fn test_cpp_empty_define() {
         let extractor = CppExtractor;
         let code = "#define FEATURE_ENABLED\n";
-        let result = extractor.extract(Path::new("src/config.hpp"), code).unwrap();
+        let result = extractor
+            .extract(Path::new("src/config.hpp"), code)
+            .unwrap();
 
         let macros: Vec<_> = result
             .nodes

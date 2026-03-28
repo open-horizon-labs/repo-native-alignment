@@ -47,15 +47,12 @@ impl Extractor for ElixirExtractor {
         };
 
         let mut nodes = Vec::new();
-        collect_elixir_nodes(
-            tree.root_node(),
-            path,
-            content.as_bytes(),
-            None,
-            &mut nodes,
-        );
+        collect_elixir_nodes(tree.root_node(), path, content.as_bytes(), None, &mut nodes);
 
-        Ok(ExtractionResult { nodes, edges: vec![] })
+        Ok(ExtractionResult {
+            nodes,
+            edges: vec![],
+        })
     }
 }
 
@@ -110,58 +107,60 @@ fn collect_elixir_nodes(
                 "def" | "defp" => {
                     // def function_name(args) do ... end
                     if let Some(args) = node.child(1)
-                        && let Some(fn_name) = extract_elixir_function_name(args, source) {
-                            let qualified = match scope {
-                                Some(s) => format!("{}.{}", s, fn_name),
-                                None => fn_name.clone(),
-                            };
-                            let body = node.utf8_text(source).unwrap_or("").to_string();
-                            let sig = body.lines().next().unwrap_or("").trim().to_string();
+                        && let Some(fn_name) = extract_elixir_function_name(args, source)
+                    {
+                        let qualified = match scope {
+                            Some(s) => format!("{}.{}", s, fn_name),
+                            None => fn_name.clone(),
+                        };
+                        let body = node.utf8_text(source).unwrap_or("").to_string();
+                        let sig = body.lines().next().unwrap_or("").trim().to_string();
 
-                            nodes.push(Node {
-                                id: NodeId {
-                                    root: String::new(),
-                                    file: path.to_path_buf(),
-                                    name: qualified,
-                                    kind: NodeKind::Function,
-                                },
-                                language: "elixir".to_string(),
-                                line_start: node.start_position().row + 1,
-                                line_end: node.end_position().row + 1,
-                                signature: sig,
-                                body,
-                                metadata: BTreeMap::new(),
-                                source: ExtractionSource::TreeSitter,
-                            });
-                        }
+                        nodes.push(Node {
+                            id: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: qualified,
+                                kind: NodeKind::Function,
+                            },
+                            language: "elixir".to_string(),
+                            line_start: node.start_position().row + 1,
+                            line_end: node.end_position().row + 1,
+                            signature: sig,
+                            body,
+                            metadata: BTreeMap::new(),
+                            source: ExtractionSource::TreeSitter,
+                        });
+                    }
                 }
                 "defmacro" | "defmacrop" => {
                     // defmacro macro_name(args) do ... end
                     if let Some(args) = node.child(1)
-                        && let Some(macro_fn_name) = extract_elixir_function_name(args, source) {
-                            let qualified = match scope {
-                                Some(s) => format!("{}.{}", s, macro_fn_name),
-                                None => macro_fn_name.clone(),
-                            };
-                            let body = node.utf8_text(source).unwrap_or("").to_string();
-                            let sig = body.lines().next().unwrap_or("").trim().to_string();
+                        && let Some(macro_fn_name) = extract_elixir_function_name(args, source)
+                    {
+                        let qualified = match scope {
+                            Some(s) => format!("{}.{}", s, macro_fn_name),
+                            None => macro_fn_name.clone(),
+                        };
+                        let body = node.utf8_text(source).unwrap_or("").to_string();
+                        let sig = body.lines().next().unwrap_or("").trim().to_string();
 
-                            nodes.push(Node {
-                                id: NodeId {
-                                    root: String::new(),
-                                    file: path.to_path_buf(),
-                                    name: qualified,
-                                    kind: NodeKind::Macro,
-                                },
-                                language: "elixir".to_string(),
-                                line_start: node.start_position().row + 1,
-                                line_end: node.end_position().row + 1,
-                                signature: sig,
-                                body,
-                                metadata: BTreeMap::new(),
-                                source: ExtractionSource::TreeSitter,
-                            });
-                        }
+                        nodes.push(Node {
+                            id: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: qualified,
+                                kind: NodeKind::Macro,
+                            },
+                            language: "elixir".to_string(),
+                            line_start: node.start_position().row + 1,
+                            line_end: node.end_position().row + 1,
+                            signature: sig,
+                            body,
+                            metadata: BTreeMap::new(),
+                            source: ExtractionSource::TreeSitter,
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -179,12 +178,11 @@ fn collect_elixir_nodes(
 /// The module name is typically an alias node (e.g., MyApp.UserRepository).
 fn extract_elixir_module_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
     match node.kind() {
-        "alias" | "identifier" => {
-            Some(node.utf8_text(source).unwrap_or("Unknown").to_string())
-        }
+        "alias" | "identifier" => Some(node.utf8_text(source).unwrap_or("Unknown").to_string()),
         "arguments" => {
             // First child of arguments is the module name
-            node.child(0).and_then(|c| extract_elixir_module_name(c, source))
+            node.child(0)
+                .and_then(|c| extract_elixir_module_name(c, source))
         }
         _ => {
             // Try reading the full text as fallback
@@ -205,20 +203,22 @@ fn extract_elixir_function_name(node: tree_sitter::Node, source: &[u8]) -> Optio
         "identifier" => Some(node.utf8_text(source).unwrap_or("").to_string()),
         "call" => {
             // def call(args) — the function name is the first child
-            node.child(0)
-                .and_then(|n| {
-                    let text = n.utf8_text(source).unwrap_or("").to_string();
-                    if !text.is_empty() { Some(text) } else { None }
-                })
+            node.child(0).and_then(|n| {
+                let text = n.utf8_text(source).unwrap_or("").to_string();
+                if !text.is_empty() { Some(text) } else { None }
+            })
         }
         "arguments" => {
             // arguments wrapping the call
-            node.child(0).and_then(|c| extract_elixir_function_name(c, source))
+            node.child(0)
+                .and_then(|c| extract_elixir_function_name(c, source))
         }
         _ => {
             let text = node.utf8_text(source).unwrap_or("").trim().to_string();
             // Take just the first token (before any whitespace/paren)
-            let first_token = text.split(|c: char| !c.is_alphanumeric() && c != '_').next();
+            let first_token = text
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next();
             first_token.filter(|s| !s.is_empty()).map(|s| s.to_string())
         }
     }
@@ -246,22 +246,38 @@ defmodule MyApp.UserRepository do
   end
 end
 "#;
-        let result = extractor.extract(Path::new("lib/user_repository.ex"), code).unwrap();
+        let result = extractor
+            .extract(Path::new("lib/user_repository.ex"), code)
+            .unwrap();
         let modules: Vec<_> = result
             .nodes
             .iter()
             .filter(|n| n.id.kind == NodeKind::Module)
             .collect();
-        assert!(!modules.is_empty(), "Should extract Elixir modules, got: {:?}",
-            result.nodes.iter().map(|n| (&n.id.name, &n.id.kind)).collect::<Vec<_>>());
+        assert!(
+            !modules.is_empty(),
+            "Should extract Elixir modules, got: {:?}",
+            result
+                .nodes
+                .iter()
+                .map(|n| (&n.id.name, &n.id.kind))
+                .collect::<Vec<_>>()
+        );
 
         let funcs: Vec<_> = result
             .nodes
             .iter()
             .filter(|n| n.id.kind == NodeKind::Function)
             .collect();
-        assert!(!funcs.is_empty(), "Should extract Elixir functions (def/defp), got: {:?}",
-            result.nodes.iter().map(|n| (&n.id.name, &n.id.kind)).collect::<Vec<_>>());
+        assert!(
+            !funcs.is_empty(),
+            "Should extract Elixir functions (def/defp), got: {:?}",
+            result
+                .nodes
+                .iter()
+                .map(|n| (&n.id.name, &n.id.kind))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -276,14 +292,23 @@ defmodule MyMacros do
   end
 end
 "#;
-        let result = extractor.extract(Path::new("lib/my_macros.ex"), code).unwrap();
+        let result = extractor
+            .extract(Path::new("lib/my_macros.ex"), code)
+            .unwrap();
         let macros: Vec<_> = result
             .nodes
             .iter()
             .filter(|n| n.id.kind == NodeKind::Macro)
             .collect();
-        assert!(!macros.is_empty(), "Should extract Elixir defmacro, got: {:?}",
-            result.nodes.iter().map(|n| (&n.id.name, &n.id.kind)).collect::<Vec<_>>());
+        assert!(
+            !macros.is_empty(),
+            "Should extract Elixir defmacro, got: {:?}",
+            result
+                .nodes
+                .iter()
+                .map(|n| (&n.id.name, &n.id.kind))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -304,12 +329,17 @@ defmodule Calculator do
   def multiply(a, b), do: a * b
 end
 "#;
-        let result = extractor.extract(Path::new("lib/calculator.ex"), code).unwrap();
+        let result = extractor
+            .extract(Path::new("lib/calculator.ex"), code)
+            .unwrap();
         let funcs: Vec<_> = result
             .nodes
             .iter()
             .filter(|n| n.id.kind == NodeKind::Function)
             .collect();
-        assert!(!funcs.is_empty(), "Should extract multiple Elixir functions");
+        assert!(
+            !funcs.is_empty(),
+            "Should extract multiple Elixir functions"
+        );
     }
 }

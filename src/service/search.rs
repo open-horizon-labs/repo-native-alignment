@@ -9,15 +9,17 @@ use std::collections::HashSet;
 use crate::embed::{SearchFilters, SearchMode, SearchOutcome};
 use crate::graph::{Node, NodeKind};
 use crate::ranking;
-use crate::server::helpers::{
-    format_freshness_full, format_neighbors_grouped_with_root,
-    format_node_entry_with_root, strip_root_prefix,
-};
 use crate::server::handlers::parse_search_mode;
+use crate::server::helpers::{
+    format_freshness_full, format_neighbors_grouped_with_root, format_node_entry_with_root,
+    strip_root_prefix,
+};
 use crate::server::state::GraphState;
 use crate::server::store::parse_edge_kind;
 
-use super::{SearchContext, SearchParams, node_passes_root_filter, search_result_passes_root_filter};
+use super::{
+    SearchContext, SearchParams, node_passes_root_filter, search_result_passes_root_filter,
+};
 
 /// When impact results exceed this node-count threshold, render a
 /// subsystem-grouped summary instead of listing every node.
@@ -29,14 +31,25 @@ const IMPACT_SUMMARY_NODE_THRESHOLD: usize = 30;
 /// compact mode) still produce huge responses (e.g., 157K chars for ~80 nodes).
 const IMPACT_SUMMARY_CHAR_THRESHOLD: usize = 40_000;
 
-
 /// Unified search entry point. Returns formatted markdown.
 pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
-    let query = params.query.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let node = params.node.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let query = params
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let node = params
+        .node
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     if let Some(ref node_ids) = params.nodes {
-        let node_ids: Vec<&str> = node_ids.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        let node_ids: Vec<&str> = node_ids
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
         if node_ids.is_empty() {
             return "Empty nodes list. Provide at least one stable node ID.".to_string();
         }
@@ -58,7 +71,11 @@ pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
     }
 }
 
-async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchContext<'_>) -> String {
+async fn search_flat(
+    params: &SearchParams,
+    query: Option<&str>,
+    ctx: &SearchContext<'_>,
+) -> String {
     let sort_by_complexity = params.sort_by.as_deref() == Some("complexity");
     let sort_by_importance = params.sort_by.as_deref() == Some("importance");
     let complexity_search = params.min_complexity.is_some() || sort_by_complexity;
@@ -66,7 +83,8 @@ async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchCon
     let has_file_filter = params.file.is_some();
     let has_synthetic_filter = params.synthetic.is_some();
     let has_subsystem_filter = params.subsystem.is_some();
-    let has_browse_filter = has_kind_filter || has_file_filter || has_synthetic_filter || has_subsystem_filter;
+    let has_browse_filter =
+        has_kind_filter || has_file_filter || has_synthetic_filter || has_subsystem_filter;
 
     let query_str = query.unwrap_or("");
     if query_str.is_empty() && !complexity_search && !sort_by_importance && !has_browse_filter {
@@ -80,51 +98,144 @@ async fn search_flat(params: &SearchParams, query: Option<&str>, ctx: &SearchCon
 
     // Try embedding-ranked code symbol search first; fall back to name/signature matching.
     let matches: Vec<&Node> = flat_code_symbol_search(
-        query_str, search_mode, limit, params, graph_state, ctx,
-        sort_by_complexity, sort_by_importance,
-    ).await;
+        query_str,
+        search_mode,
+        limit,
+        params,
+        graph_state,
+        ctx,
+        sort_by_complexity,
+        sort_by_importance,
+    )
+    .await;
 
     if !matches.is_empty() {
         let strip = ctx.root_filter.as_deref();
-        let md: String = matches.iter().map(|n| format_node_entry_with_root(n, &graph_state.index, params.compact, strip)).collect::<Vec<_>>().join("\n\n");
-        sections.push(format!("### Code symbols ({} result(s))\n\n{}", matches.len(), md));
+        let md: String = matches
+            .iter()
+            .map(|n| {
+                format_node_entry_with_root(
+                    n,
+                    &graph_state.index,
+                    params.compact,
+                    strip,
+                    false,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        sections.push(format!(
+            "### Code symbols ({} result(s))\n\n{}",
+            matches.len(),
+            md
+        ));
     }
 
-    if params.include_artifacts && !query_str.is_empty()
-        && let Some(embed_idx) = ctx.embed_index {
-            match embed_idx.search_with_mode(query_str, params.artifact_types.as_deref(), limit, search_mode).await {
-                Ok(SearchOutcome::Results(results)) => {
-                    let filtered: Vec<_> = results.into_iter()
-                        .filter(|r| !r.kind.starts_with("code:"))
-                        .filter(|r| search_result_passes_root_filter(r, &ctx.root_filter, &ctx.non_code_slugs))
-                        .collect();
-                    if !filtered.is_empty() {
-                        let md: String = filtered.iter().map(|r| r.to_markdown()).collect::<Vec<_>>().join("\n");
-                        sections.push(format!("### Artifacts ({} result(s))\n\n{}", filtered.len(), md));
-                    }
+    if params.include_artifacts
+        && !query_str.is_empty()
+        && let Some(embed_idx) = ctx.embed_index
+    {
+        match embed_idx
+            .search_with_mode(
+                query_str,
+                params.artifact_types.as_deref(),
+                limit,
+                search_mode,
+            )
+            .await
+        {
+            Ok(SearchOutcome::Results(results)) => {
+                let filtered: Vec<_> = results
+                    .into_iter()
+                    .filter(|r| !r.kind.starts_with("code:"))
+                    .filter(|r| {
+                        search_result_passes_root_filter(r, &ctx.root_filter, &ctx.non_code_slugs)
+                    })
+                    .collect();
+                if !filtered.is_empty() {
+                    let md: String = filtered
+                        .iter()
+                        .map(|r| r.to_markdown())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    sections.push(format!(
+                        "### Artifacts ({} result(s))\n\n{}",
+                        filtered.len(),
+                        md
+                    ));
                 }
-                Ok(SearchOutcome::NotReady) => { sections.push("Embedding index: building -- artifact results will appear shortly. Retry in a few seconds.".to_string()); }
-                Err(e) => sections.push(format!("Artifact search error: {}", e)),
             }
-        }
-
-    if params.include_markdown && !query_str.is_empty()
-        && let Ok(chunks) = crate::markdown::extract_markdown_chunks(ctx.repo_root) {
-            let filtered_chunks: Vec<_> = if let Some(ref slug) = ctx.root_filter {
-                let workspace = crate::roots::WorkspaceConfig::load().with_primary_root(ctx.repo_root.to_path_buf()).with_worktrees(ctx.repo_root).with_claude_memory(ctx.repo_root).with_agent_memories(ctx.repo_root).with_declared_roots(ctx.repo_root);
-                let root_path = workspace.resolved_roots().into_iter().find(|r| r.slug.eq_ignore_ascii_case(slug)).map(|r| r.path);
-                if let Some(rp) = root_path { chunks.into_iter().filter(|c| c.file_path.starts_with(&rp)).collect() } else { Vec::new() }
-            } else { chunks };
-            let scored = crate::markdown::search_chunks_ranked(&filtered_chunks, query_str);
-            if !scored.is_empty() {
-                let md = scored.iter().take(limit).map(|sc| format!("- (score: {:.2}) {}", sc.score, sc.chunk.to_markdown())).collect::<Vec<_>>().join("\n\n---\n\n");
-                sections.push(format!("### Markdown ({} result(s))\n\n{}", scored.len().min(limit), md));
+            Ok(SearchOutcome::NotReady) => {
+                sections.push("Embedding index: building -- artifact results will appear shortly. Retry in a few seconds.".to_string());
             }
+            Err(e) => sections.push(format!("Artifact search error: {}", e)),
         }
+    }
 
-    let freshness = format_freshness_full(graph_state.nodes.len(), graph_state.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
-    if sections.is_empty() { format!("No results matching \"{}\".{}", query_str, freshness) }
-    else { format!("## Search: \"{}\"\n\n{}{}", query_str, sections.join("\n\n"), freshness) }
+    if params.include_markdown
+        && !query_str.is_empty()
+        && let Ok(chunks) = crate::markdown::extract_markdown_chunks(ctx.repo_root)
+    {
+        let filtered_chunks: Vec<_> = if let Some(ref slug) = ctx.root_filter {
+            let workspace = crate::roots::WorkspaceConfig::load()
+                .with_primary_root(ctx.repo_root.to_path_buf())
+                .with_worktrees(ctx.repo_root)
+                .with_claude_memory(ctx.repo_root)
+                .with_agent_memories(ctx.repo_root)
+                .with_declared_roots(ctx.repo_root);
+            let root_path = workspace
+                .resolved_roots()
+                .into_iter()
+                .find(|r| r.slug.eq_ignore_ascii_case(slug))
+                .map(|r| r.path);
+            if let Some(rp) = root_path {
+                chunks
+                    .into_iter()
+                    .filter(|c| c.file_path.starts_with(&rp))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            chunks
+        };
+        let scored = crate::markdown::search_chunks_ranked(&filtered_chunks, query_str);
+        if !scored.is_empty() {
+            let md = scored
+                .iter()
+                .take(limit)
+                .map(|sc| format!("- (score: {:.2}) {}", sc.score, sc.chunk.to_markdown()))
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n");
+            sections.push(format!(
+                "### Markdown ({} result(s))\n\n{}",
+                scored.len().min(limit),
+                md
+            ));
+        }
+    }
+
+    let freshness = if params.verbose {
+        format_freshness_full(
+            graph_state.nodes.len(),
+            graph_state.last_scan_completed_at,
+            ctx.lsp_status,
+            ctx.embed_status,
+        )
+    } else {
+        String::new()
+    };
+    if sections.is_empty() {
+        format!("No results matching \"{}\".{}", query_str, freshness)
+    } else {
+        format!(
+            "## Search: \"{}\"\n\n{}{}",
+            query_str,
+            sections.join("\n\n"),
+            freshness
+        )
+    }
 }
 
 /// Find code symbols for flat search, using embedding index when available.
@@ -169,26 +280,71 @@ async fn flat_code_symbol_search<'a>(
 
     // Closure: does a node pass path/name + all active filters?
     let node_passes_filters = |n: &Node| -> bool {
-        if complexity_search && n.id.kind != NodeKind::Function { return false; }
-        if let Some(ref kf) = params.kind && n.id.kind.to_string().to_lowercase() != kf.to_lowercase() { return false; }
-        if let Some(ref lf) = params.language && n.language.to_lowercase() != lf.to_lowercase() { return false; }
-        if let Some(ref ff) = params.file && !n.id.file.to_string_lossy().contains(ff.as_str()) { return false; }
-        if !node_passes_root_filter(&n.id.root, &ctx.root_filter, &ctx.non_code_slugs) { return false; }
-        if let Some(sf) = params.synthetic && (n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false)) != sf { return false; }
+        if complexity_search && n.id.kind != NodeKind::Function {
+            return false;
+        }
+        if let Some(ref kf) = params.kind
+            && n.id.kind.to_string().to_lowercase() != kf.to_lowercase()
+        {
+            return false;
+        }
+        if let Some(ref lf) = params.language
+            && n.language.to_lowercase() != lf.to_lowercase()
+        {
+            return false;
+        }
+        if let Some(ref ff) = params.file
+            && !n.id.file.to_string_lossy().contains(ff.as_str())
+        {
+            return false;
+        }
+        if !node_passes_root_filter(&n.id.root, &ctx.root_filter, &ctx.non_code_slugs) {
+            return false;
+        }
+        if let Some(sf) = params.synthetic
+            && (n
+                .metadata
+                .get("synthetic")
+                .map(|s| s == "true")
+                .unwrap_or(false))
+                != sf
+        {
+            return false;
+        }
         if let Some(min_cc) = params.min_complexity {
-            let Some(cc) = n.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()) else { return false; };
-            if cc < min_cc { return false; }
+            let Some(cc) = n
+                .metadata
+                .get("cyclomatic")
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                return false;
+            };
+            if cc < min_cc {
+                return false;
+            }
         }
         if let Some(ref sub) = params.subsystem {
-            let node_sub = n.metadata.get(crate::server::SUBSYSTEM_KEY).map(|s| s.as_str()).unwrap_or("");
-            if !subsystem_matches(node_sub, sub) { return false; }
+            let node_sub = n
+                .metadata
+                .get(crate::server::SUBSYSTEM_KEY)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if !subsystem_matches(node_sub, sub) {
+                return false;
+            }
         }
         // Path/name split filter: when query contained `/`, require both file-path
         // and name to match their respective parts.
         if let (Some(pf), Some(nf)) = (&path_filter_lower, &name_filter_lower) {
-            let file_match = n.id.file.to_string_lossy().to_lowercase().contains(pf.as_str());
+            let file_match =
+                n.id.file
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(pf.as_str());
             let name_match = n.id.name.to_lowercase().contains(nf.as_str());
-            if !file_match || !name_match { return false; }
+            if !file_match || !name_match {
+                return false;
+            }
         }
         true
     };
@@ -219,15 +375,29 @@ async fn flat_code_symbol_search<'a>(
             // only matching rows are scored, so no over-fetch needed.
             // Without filters, keep the 3x over-fetch to allow for graph-side
             // filtering (root filter, synthetic, kind filter) and reranking.
-            let over_fetch = if has_embed_filters { rerank_over_fetch } else { rerank_over_fetch * 3 };
-            match embed_idx.search_with_filters(embed_query_str, None, over_fetch, search_mode, &embed_filters).await {
+            let over_fetch = if has_embed_filters {
+                rerank_over_fetch
+            } else {
+                rerank_over_fetch * 3
+            };
+            match embed_idx
+                .search_with_filters(
+                    embed_query_str,
+                    None,
+                    over_fetch,
+                    search_mode,
+                    &embed_filters,
+                )
+                .await
+            {
                 Ok(SearchOutcome::Results(results)) => {
                     used_embed = true;
                     // Keep only code results, resolve to graph nodes via HashMap (O(1)), apply filters.
                     // node_passes_filters already handles the path/name split check.
-                    results.iter()
+                    results
+                        .iter()
                         .filter(|r| r.kind.starts_with("code:"))
-                        .filter_map(|r| graph_state.node_by_stable_id(&r.id, &node_index_map))
+                        .filter_map(|r| graph_state.node_by_stable_id(&r.id, node_index_map))
                         .filter(|n| node_passes_filters(n))
                         .take(rerank_over_fetch)
                         .collect()
@@ -254,16 +424,25 @@ async fn flat_code_symbol_search<'a>(
     // When embed search was NOT used (unavailable, not ready, or empty query),
     // name/signature matching is the sole source of results.
     if !used_embed {
-        matches = graph_state.nodes.iter().filter(|n| {
-            if complexity_search && n.id.kind != NodeKind::Function { return false; }
-            if !query_lower.is_empty() && path_name.is_none() {
-                // Plain query: check name/signature directly here for early exit.
-                // Path/name queries are handled inside node_passes_filters.
-                let name_match = n.id.name.to_lowercase().contains(&query_lower) || n.signature.to_lowercase().contains(&query_lower);
-                if !name_match { return false; }
-            }
-            node_passes_filters(n)
-        }).collect();
+        matches = graph_state
+            .nodes
+            .iter()
+            .filter(|n| {
+                if complexity_search && n.id.kind != NodeKind::Function {
+                    return false;
+                }
+                if !query_lower.is_empty() && path_name.is_none() {
+                    // Plain query: check name/signature directly here for early exit.
+                    // Path/name queries are handled inside node_passes_filters.
+                    let name_match = n.id.name.to_lowercase().contains(&query_lower)
+                        || n.signature.to_lowercase().contains(&query_lower);
+                    if !name_match {
+                        return false;
+                    }
+                }
+                node_passes_filters(n)
+            })
+            .collect();
     } else if !query_lower.is_empty() {
         // Embed search was used -- supplement with name/signature matches
         // that the embedding missed. Deduplicate by stable_id so embed-ranked
@@ -272,20 +451,27 @@ async fn flat_code_symbol_search<'a>(
         // Cap supplements to avoid blowing up the reranker candidate pool
         // and reserve slots so supplements survive the downstream truncate.
         let supplement_budget = limit.min(10);
-        let seen: std::collections::HashSet<String> = matches.iter()
-            .map(|n| n.stable_id())
+        let seen: std::collections::HashSet<String> =
+            matches.iter().map(|n| n.stable_id()).collect();
+        let name_supplements: Vec<&Node> = graph_state
+            .nodes
+            .iter()
+            .filter(|n| {
+                if seen.contains(&n.stable_id()) {
+                    return false;
+                }
+                if path_name.is_none() {
+                    // Plain query: check name/signature for early exit.
+                    // Path/name queries are handled inside node_passes_filters.
+                    let name_match = n.id.name.to_lowercase().contains(&query_lower)
+                        || n.signature.to_lowercase().contains(&query_lower);
+                    if !name_match {
+                        return false;
+                    }
+                }
+                node_passes_filters(n)
+            })
             .collect();
-        let name_supplements: Vec<&Node> = graph_state.nodes.iter().filter(|n| {
-            if seen.contains(&n.stable_id()) { return false; }
-            if path_name.is_none() {
-                // Plain query: check name/signature for early exit.
-                // Path/name queries are handled inside node_passes_filters.
-                let name_match = n.id.name.to_lowercase().contains(&query_lower)
-                    || n.signature.to_lowercase().contains(&query_lower);
-                if !name_match { return false; }
-            }
-            node_passes_filters(n)
-        }).collect();
         if !name_supplements.is_empty() {
             // Sort supplements by name-match quality, then cap to budget.
             // For path/name queries use only the name part for ranking.
@@ -305,16 +491,35 @@ async fn flat_code_symbol_search<'a>(
 
     // Apply sort overrides or default ranking.
     if sort_by_complexity {
-        matches.retain(|n| n.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).is_some());
+        matches.retain(|n| {
+            n.metadata
+                .get("cyclomatic")
+                .and_then(|s| s.parse::<u32>().ok())
+                .is_some()
+        });
         matches.sort_by(|a, b| {
-            let ca = a.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-            let cb = b.metadata.get("cyclomatic").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+            let ca = a
+                .metadata
+                .get("cyclomatic")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            let cb = b
+                .metadata
+                .get("cyclomatic")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
             cb.cmp(&ca)
         });
     } else if sort_by_importance {
         matches.sort_by(|a, b| {
-            let ia = a.metadata.get("importance").and_then(|s| s.parse::<f64>().ok());
-            let ib = b.metadata.get("importance").and_then(|s| s.parse::<f64>().ok());
+            let ia = a
+                .metadata
+                .get("importance")
+                .and_then(|s| s.parse::<f64>().ok());
+            let ib = b
+                .metadata
+                .get("importance")
+                .and_then(|s| s.parse::<f64>().ok());
             match (ia, ib) {
                 (Some(a), Some(b)) => b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal),
                 (Some(_), None) => std::cmp::Ordering::Less,
@@ -361,9 +566,8 @@ async fn flat_code_symbol_search<'a>(
         // executor during ONNX model inference (and possible first-time
         // model download/initialization).
         let query_owned = query_str.to_string();
-        let rerank_result = tokio::task::spawn_blocking(move || {
-            rerank_results(&query_owned, &candidates)
-        }).await;
+        let rerank_result =
+            tokio::task::spawn_blocking(move || rerank_results(&query_owned, &candidates)).await;
 
         match rerank_result {
             Ok(Ok(reranked)) => {
@@ -386,10 +590,7 @@ async fn flat_code_symbol_search<'a>(
                 // Fall through with original ordering -- reranking is best-effort.
             }
             Err(e) => {
-                tracing::warn!(
-                    "Reranking task panicked, using original order: {}",
-                    e
-                );
+                tracing::warn!("Reranking task panicked, using original order: {}", e);
             }
         }
     }
@@ -398,7 +599,12 @@ async fn flat_code_symbol_search<'a>(
     matches
 }
 
-async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Option<&str>, ctx: &SearchContext<'_>) -> String {
+async fn search_traversal(
+    params: &SearchParams,
+    query: Option<&str>,
+    node: Option<&str>,
+    ctx: &SearchContext<'_>,
+) -> String {
     let mode = params.mode.as_deref().unwrap_or("neighbors");
     let top_k = params.limit.unwrap_or(1).clamp(1, 50);
 
@@ -409,10 +615,22 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
     if mode == "cycles" {
         let gs = ctx.graph_state;
         let edge_filter = params.edge_types.as_ref().map(|types| {
-            types.iter().filter_map(|t| parse_edge_kind(t)).collect::<Vec<_>>()
+            types
+                .iter()
+                .filter_map(|t| parse_edge_kind(t))
+                .collect::<Vec<_>>()
         });
         let edge_filter_slice = edge_filter.as_deref();
-        let freshness = format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
+        let freshness = if params.verbose {
+            format_freshness_full(
+                gs.nodes.len(),
+                gs.last_scan_completed_at,
+                ctx.lsp_status,
+                ctx.embed_status,
+            )
+        } else {
+            String::new()
+        };
         let strip = ctx.root_filter.as_deref();
 
         if let Some(node_id) = node {
@@ -425,7 +643,8 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
             }
             return match gs.index.cycle_for_node(&resolved, edge_filter_slice) {
                 Some(ring) => {
-                    let labels: Vec<String> = ring.iter()
+                    let labels: Vec<String> = ring
+                        .iter()
                         .map(|id| format!("`{}`", strip_root_prefix(id, strip)))
                         .collect();
                     format!(
@@ -452,14 +671,25 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
                 }
                 _ => "default coupling graph (Calls + DependsOn)".to_string(),
             };
-            return format!("## Circular dependency analysis\n\nNo cycles detected in the {scope}.{freshness}");
+            return format!(
+                "## Circular dependency analysis\n\nNo cycles detected in the {scope}.{freshness}"
+            );
         }
-        let mut out = format!("## Circular dependency analysis\n\n{} ring(s) detected\n\n", rings.len());
+        let mut out = format!(
+            "## Circular dependency analysis\n\n{} ring(s) detected\n\n",
+            rings.len()
+        );
         for (i, ring) in rings.iter().enumerate() {
-            let labels: Vec<String> = ring.iter()
+            let labels: Vec<String> = ring
+                .iter()
                 .map(|id| format!("`{}`", strip_root_prefix(id, strip)))
                 .collect();
-            out.push_str(&format!("### Ring {}: {} nodes\n{}\n\n", i + 1, ring.len(), labels.join(" → ") + " → ..."));
+            out.push_str(&format!(
+                "### Ring {}: {} nodes\n{}\n\n",
+                i + 1,
+                ring.len(),
+                labels.join(" → ") + " → ..."
+            ));
         }
         out.push_str(&freshness);
         return out;
@@ -475,14 +705,26 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         }
         let gs = ctx.graph_state;
         let from_raw = node.unwrap();
-        let to_raw   = query.unwrap();
-        let from_id  = gs.resolve_node_id(from_raw);
-        let to_id    = gs.resolve_node_id(to_raw);
+        let to_raw = query.unwrap();
+        let from_id = gs.resolve_node_id(from_raw);
+        let to_id = gs.resolve_node_id(to_raw);
         let edge_filter = params.edge_types.as_ref().map(|types| {
-            types.iter().filter_map(|t| parse_edge_kind(t)).collect::<Vec<_>>()
+            types
+                .iter()
+                .filter_map(|t| parse_edge_kind(t))
+                .collect::<Vec<_>>()
         });
         let edge_filter_slice = edge_filter.as_deref();
-        let freshness = format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
+        let freshness = if params.verbose {
+            format_freshness_full(
+                gs.nodes.len(),
+                gs.last_scan_completed_at,
+                ctx.lsp_status,
+                ctx.embed_status,
+            )
+        } else {
+            String::new()
+        };
         let strip = ctx.root_filter.as_deref();
 
         if gs.index.get_node(&from_id).is_none() {
@@ -514,7 +756,8 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
                 let all_nodes: Vec<String> = std::iter::once(from_id.clone())
                     .chain(hops.iter().cloned())
                     .collect();
-                let labels: Vec<String> = all_nodes.iter()
+                let labels: Vec<String> = all_nodes
+                    .iter()
                     .map(|id| format!("`{}`", strip_root_prefix(id, strip)))
                     .collect();
                 format!(
@@ -529,7 +772,8 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
     }
 
     if node.is_none() && query.is_none() {
-        return "Either query or node is required. Provide a search query or a stable node ID.".to_string();
+        return "Either query or node is required. Provide a search query or a stable node ID."
+            .to_string();
     }
 
     let search_mode = parse_search_mode(params.search_mode.as_deref());
@@ -545,14 +789,21 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         {
             let name_matches = resolve_entry_points_by_name(node_id, top_k, params, ctx);
             if !name_matches.is_empty() {
-                let mut header = format!("### Matched entry nodes for \"{}\" (path/name match)\n\n", node_id);
+                let mut header = format!(
+                    "### Matched entry nodes for \"{}\" (path/name match)\n\n",
+                    node_id
+                );
                 let strip = ctx.root_filter.as_deref();
-                let ids: Vec<String> = name_matches.iter().map(|n| {
-                    let stable_id = n.id.to_stable_id();
-                    let display = strip_root_prefix(&stable_id, strip);
-                    header.push_str(&format!("- `{}` -- {} {}\n", display, n.id.kind, n.id.name));
-                    stable_id
-                }).collect();
+                let ids: Vec<String> = name_matches
+                    .iter()
+                    .map(|n| {
+                        let stable_id = n.id.to_stable_id();
+                        let display = strip_root_prefix(&stable_id, strip);
+                        header
+                            .push_str(&format!("- `{}` -- {} {}\n", display, n.id.kind, n.id.name));
+                        stable_id
+                    })
+                    .collect();
                 header.push('\n');
                 (ids, header)
             } else {
@@ -567,14 +818,20 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         // finds the struct by name, not by semantic similarity to random markdown.
         let name_matches = resolve_entry_points_by_name(query_text, top_k, params, ctx);
         if !name_matches.is_empty() {
-            let mut header = format!("### Matched entry nodes for \"{}\" (name match)\n\n", query_text);
+            let mut header = format!(
+                "### Matched entry nodes for \"{}\" (name match)\n\n",
+                query_text
+            );
             let strip = ctx.root_filter.as_deref();
-            let ids: Vec<String> = name_matches.iter().map(|n| {
-                let stable_id = n.id.to_stable_id();
-                let display = strip_root_prefix(&stable_id, strip);
-                header.push_str(&format!("- `{}` -- {} {}\n", display, n.id.kind, n.id.name));
-                stable_id
-            }).collect();
+            let ids: Vec<String> = name_matches
+                .iter()
+                .map(|n| {
+                    let stable_id = n.id.to_stable_id();
+                    let display = strip_root_prefix(&stable_id, strip);
+                    header.push_str(&format!("- `{}` -- {} {}\n", display, n.id.kind, n.id.name));
+                    stable_id
+                })
+                .collect();
             header.push('\n');
             (ids, header)
         } else if let Some(embed_idx) = ctx.embed_index {
@@ -588,7 +845,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
                         .filter(|r| search_result_passes_root_filter(r, &ctx.root_filter, &ctx.non_code_slugs))
                         .filter(|r| {
                             if let Some(ref sub) = params.subsystem {
-                                ctx.graph_state.node_by_stable_id(&r.id, &node_index_map_for_entry)
+                                ctx.graph_state.node_by_stable_id(&r.id, node_index_map_for_entry)
                                     .and_then(|n| n.metadata.get(crate::server::SUBSYSTEM_KEY))
                                     .map(|s| subsystem_matches(s, sub))
                                     .unwrap_or(false)
@@ -611,31 +868,54 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         } else {
             return "No matching graph nodes found and embedding index not available. Use node parameter instead.".to_string();
         }
-    } else { unreachable!() };
+    } else {
+        unreachable!()
+    };
 
     let gs = ctx.graph_state;
-    let valid_entry_ids: Vec<&String> = entry_node_ids.iter().filter(|id| gs.index.get_node(id).is_some()).collect();
+    let valid_entry_ids: Vec<&String> = entry_node_ids
+        .iter()
+        .filter(|id| gs.index.get_node(id).is_some())
+        .collect();
     if valid_entry_ids.is_empty() {
-        let id_list = entry_node_ids.iter().map(|id| format!("`{}`", id)).collect::<Vec<_>>().join(", ");
-        return format!("{}No graph nodes found for {}. The node(s) may not have edges in the graph. Try search to find valid node IDs.", entry_header, id_list);
+        let id_list = entry_node_ids
+            .iter()
+            .map(|id| format!("`{}`", id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!(
+            "{}No graph nodes found for {}. The node(s) may not have edges in the graph. Try search to find valid node IDs.",
+            entry_header, id_list
+        );
     }
 
-    let edge_filter = params.edge_types.as_ref().map(|types| types.iter().filter_map(|t| parse_edge_kind(t)).collect::<Vec<_>>());
+    let edge_filter = params.edge_types.as_ref().map(|types| {
+        types
+            .iter()
+            .filter_map(|t| parse_edge_kind(t))
+            .collect::<Vec<_>>()
+    });
     let edge_filter_slice = edge_filter.as_deref();
 
     // Collect grouped results across all entry nodes.
     // Deduplication is per-edge-kind: the same node may legitimately appear
     // under multiple relationship kinds, so we only deduplicate within a kind.
     use crate::server::handlers::run_traversal_grouped;
-    let mut merged_groups: std::collections::BTreeMap<crate::graph::EdgeKind, Vec<String>> = std::collections::BTreeMap::new();
+    let mut merged_groups: std::collections::BTreeMap<crate::graph::EdgeKind, Vec<String>> =
+        std::collections::BTreeMap::new();
     // Per-kind seen sets for O(1) membership checks (avoids O(N²) Vec.contains in hot path).
-    let mut merged_seen: std::collections::BTreeMap<crate::graph::EdgeKind, HashSet<String>> = std::collections::BTreeMap::new();
+    let mut merged_seen: std::collections::BTreeMap<crate::graph::EdgeKind, HashSet<String>> =
+        std::collections::BTreeMap::new();
     let entry_set: HashSet<&str> = valid_entry_ids.iter().map(|s| s.as_str()).collect();
 
     // depth > 1 in neighbors mode: iterative BFS walking N levels deep.
     // Each level uses the previous level's results as the new frontier.
     // Nodes seen at earlier levels are not revisited (dedup across levels).
-    let traversal_depth = if mode == "neighbors" { params.depth.unwrap_or(1).max(1) } else { 1 };
+    let traversal_depth = if mode == "neighbors" {
+        params.depth.unwrap_or(1).max(1)
+    } else {
+        1
+    };
 
     if traversal_depth > 1 {
         // BFS: track visited nodes to avoid revisiting across levels.
@@ -644,10 +924,19 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         let mut frontier: Vec<String> = valid_entry_ids.iter().map(|s| (*s).clone()).collect();
 
         for _ in 0..traversal_depth {
-            if frontier.is_empty() { break; }
+            if frontier.is_empty() {
+                break;
+            }
             let mut next_frontier: Vec<String> = Vec::new();
             for node_id in &frontier {
-                match run_traversal_grouped(&gs.index, node_id, mode, Some(1), params.direction.as_deref(), edge_filter_slice) {
+                match run_traversal_grouped(
+                    &gs.index,
+                    node_id,
+                    mode,
+                    Some(1),
+                    params.direction.as_deref(),
+                    edge_filter_slice,
+                ) {
                     Ok(groups) => {
                         for (kind, ids) in groups {
                             let seen = merged_seen.entry(kind.clone()).or_default();
@@ -672,7 +961,14 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
         }
     } else {
         for node_id in &valid_entry_ids {
-            match run_traversal_grouped(&gs.index, node_id, mode, params.hops, params.direction.as_deref(), edge_filter_slice) {
+            match run_traversal_grouped(
+                &gs.index,
+                node_id,
+                mode,
+                params.hops,
+                params.direction.as_deref(),
+                edge_filter_slice,
+            ) {
                 Ok(groups) => {
                     for (kind, ids) in groups {
                         let seen = merged_seen.entry(kind.clone()).or_default();
@@ -695,7 +991,11 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
     // Apply tests_for filtering
     if mode == "tests_for" {
         for ids in merged_groups.values_mut() {
-            ids.retain(|id| gs.node_by_stable_id(id, &node_index_map).map(ranking::is_test_file).unwrap_or(false));
+            ids.retain(|id| {
+                gs.node_by_stable_id(id, node_index_map)
+                    .map(ranking::is_test_file)
+                    .unwrap_or(false)
+            });
         }
     }
     // Apply subsystem filter to traversal results (within-subsystem query).
@@ -703,7 +1003,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
     if let Some(ref sub) = params.subsystem {
         for ids in merged_groups.values_mut() {
             ids.retain(|id| {
-                gs.node_by_stable_id(id, &node_index_map)
+                gs.node_by_stable_id(id, node_index_map)
                     .and_then(|n| n.metadata.get(crate::server::SUBSYSTEM_KEY))
                     .map(|s| subsystem_matches(s, sub))
                     .unwrap_or(false)
@@ -716,7 +1016,7 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
     if let Some(ref target_sub) = params.target_subsystem {
         for ids in merged_groups.values_mut() {
             ids.retain(|id| {
-                gs.node_by_stable_id(id, &node_index_map)
+                gs.node_by_stable_id(id, node_index_map)
                     .and_then(|n| n.metadata.get(crate::server::SUBSYSTEM_KEY))
                     .map(|s| subsystem_matches(s, target_sub))
                     .unwrap_or(false)
@@ -727,25 +1027,54 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
     merged_groups.retain(|_, ids| !ids.is_empty());
 
     // Count total displayable results
-    let total_count: usize = merged_groups.values().map(|ids| {
-        ids.iter().filter(|id| {
-            gs.node_by_stable_id(id, &node_index_map)
-                .map(|n| !crate::server::helpers::is_hidden_traversal_kind(&n.id.kind))
-                .unwrap_or(true)
-        }).count()
-    }).sum();
+    let total_count: usize = merged_groups
+        .values()
+        .map(|ids| {
+            ids.iter()
+                .filter(|id| {
+                    gs.node_by_stable_id(id, node_index_map)
+                        .map(|n| !crate::server::helpers::is_hidden_traversal_kind(&n.id.kind))
+                        .unwrap_or(true)
+                })
+                .count()
+        })
+        .sum();
 
     let strip = ctx.root_filter.as_deref();
-    let entry_label = if valid_entry_ids.len() == 1 { format!("`{}`", strip_root_prefix(valid_entry_ids[0], strip)) } else { format!("{} entry nodes", valid_entry_ids.len()) };
+    let entry_label = if valid_entry_ids.len() == 1 {
+        format!("`{}`", strip_root_prefix(valid_entry_ids[0], strip))
+    } else {
+        format!("{} entry nodes", valid_entry_ids.len())
+    };
     let direction = params.direction.as_deref().unwrap_or("outgoing");
-    let freshness = format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
+    let freshness = if params.verbose {
+        format_freshness_full(
+            gs.nodes.len(),
+            gs.last_scan_completed_at,
+            ctx.lsp_status,
+            ctx.embed_status,
+        )
+    } else {
+        String::new()
+    };
 
     if total_count == 0 {
         let mode_desc = match mode {
             "neighbors" => format!("No {} neighbors for {}.", direction, entry_label),
-            "impact" => format!("No dependents found for {} within {} hops.", entry_label, params.hops.unwrap_or(3)),
-            "reachable" => format!("No reachable nodes from {} within {} hops.", entry_label, params.hops.unwrap_or(3)),
-            "tests_for" => format!("No test functions found calling {}. Either no tests exist for this symbol, or the call edges haven't been extracted (check LSP status).", entry_label),
+            "impact" => format!(
+                "No dependents found for {} within {} hops.",
+                entry_label,
+                params.hops.unwrap_or(3)
+            ),
+            "reachable" => format!(
+                "No reachable nodes from {} within {} hops.",
+                entry_label,
+                params.hops.unwrap_or(3)
+            ),
+            "tests_for" => format!(
+                "No test functions found calling {}. Either no tests exist for this symbol, or the call edges haven't been extracted (check LSP status).",
+                entry_label
+            ),
             _ => format!("No results for {}.", entry_label),
         };
         format!("{}{}{}", entry_header, mode_desc, freshness)
@@ -759,22 +1088,25 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
             let mut seen: HashSet<&str> = HashSet::new();
             for ids in merged_groups.values() {
                 for id in ids {
-                    if let Some(node) = gs.node_by_stable_id(id, &node_index_map)
-                        && !crate::server::helpers::is_hidden_traversal_kind(&node.id.kind) {
-                            seen.insert(id.as_str());
-                        }
+                    if let Some(node) = gs.node_by_stable_id(id, node_index_map)
+                        && !crate::server::helpers::is_hidden_traversal_kind(&node.id.kind)
+                    {
+                        seen.insert(id.as_str());
+                    }
                 }
             }
             seen.len()
         } else {
             0
         };
-        let large_by_count = mode == "impact" && unique_impact_count > IMPACT_SUMMARY_NODE_THRESHOLD;
+        let large_by_count =
+            mode == "impact" && unique_impact_count > IMPACT_SUMMARY_NODE_THRESHOLD;
 
         // Helper: build the summary-only response for large impact results.
         let build_summary = |entry_header: &str, entry_label: &str, freshness: &str| -> String {
-            let subsystem_breakdown = format_impact_subsystem_breakdown(&merged_groups, gs, &node_index_map, strip);
-            let subsystem_count = count_affected_subsystems(&merged_groups, gs, &node_index_map);
+            let subsystem_breakdown =
+                format_impact_subsystem_breakdown(&merged_groups, gs, node_index_map, strip);
+            let subsystem_count = count_affected_subsystems(&merged_groups, gs, node_index_map);
             let heading = if subsystem_count == 0 {
                 format!(
                     "## Impact of {}\n\n{} dependent(s) within {} hop(s) (result summarized — use `subsystem` filter to drill down)\n\n",
@@ -800,24 +1132,51 @@ async fn search_traversal(params: &SearchParams, query: Option<&str>, node: Opti
             build_summary(&entry_header, &entry_label, &freshness)
         } else {
             let heading = match mode {
-                "neighbors" => format!("## Graph neighbors ({}) of {}\n\n{} result(s)\n\n", direction, entry_label, total_count),
-                "impact" => format!("## Impact analysis for {}\n\n{} dependent(s) within {} hop(s)\n\n", entry_label, total_count, params.hops.unwrap_or(3)),
-                "reachable" => format!("## Reachable from {}\n\n{} node(s) within {} hop(s)\n\n", entry_label, total_count, params.hops.unwrap_or(3)),
-                "tests_for" => format!("## Test coverage for {}\n\n{} test function(s)\n\n", entry_label, total_count),
+                "neighbors" => format!(
+                    "## Graph neighbors ({}) of {}\n\n{} result(s)\n\n",
+                    direction, entry_label, total_count
+                ),
+                "impact" => format!(
+                    "## Impact analysis for {}\n\n{} dependent(s) within {} hop(s)\n\n",
+                    entry_label,
+                    total_count,
+                    params.hops.unwrap_or(3)
+                ),
+                "reachable" => format!(
+                    "## Reachable from {}\n\n{} node(s) within {} hop(s)\n\n",
+                    entry_label,
+                    total_count,
+                    params.hops.unwrap_or(3)
+                ),
+                "tests_for" => format!(
+                    "## Test coverage for {}\n\n{} test function(s)\n\n",
+                    entry_label, total_count
+                ),
                 _ => String::new(),
             };
 
-            let md = format_neighbors_grouped_with_root(&gs.nodes, &merged_groups, &gs.index, params.compact, strip);
+            let md = format_neighbors_grouped_with_root(
+                &gs.nodes,
+                &merged_groups,
+                &gs.index,
+                params.compact,
+                strip,
+                params.include_body,
+                params.minify_body,
+            );
 
             // For impact mode, append a subsystem breakdown showing which subsystems
             // are affected and through which interface function the impact propagates.
             let subsystem_section = if mode == "impact" {
-                format_impact_subsystem_breakdown(&merged_groups, gs, &node_index_map, strip)
+                format_impact_subsystem_breakdown(&merged_groups, gs, node_index_map, strip)
             } else {
                 String::new()
             };
 
-            let full_output = format!("{}{}{}{}{}", entry_header, heading, md, subsystem_section, freshness);
+            let full_output = format!(
+                "{}{}{}{}{}",
+                entry_header, heading, md, subsystem_section, freshness
+            );
 
             // Safety net: if the rendered output exceeds the character threshold,
             // retroactively switch to the summary view. This catches cases where
@@ -888,10 +1247,7 @@ fn format_impact_subsystem_breakdown(
         ));
     }
 
-    format!(
-        "\n\n### Affected subsystems\n\n{}\n",
-        lines.join("\n")
-    )
+    format!("\n\n### Affected subsystems\n\n{}\n", lines.join("\n"))
 }
 
 /// Count the number of distinct subsystems affected by impact results.
@@ -923,22 +1279,46 @@ fn count_affected_subsystems(
 fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_>) -> String {
     use crate::server::handlers::run_traversal_grouped;
     let gs = ctx.graph_state;
-    let freshness = format_freshness_full(gs.nodes.len(), gs.last_scan_completed_at, ctx.lsp_status, ctx.embed_status);
+    let freshness = if params.verbose {
+        format_freshness_full(
+            gs.nodes.len(),
+            gs.last_scan_completed_at,
+            ctx.lsp_status,
+            ctx.embed_status,
+        )
+    } else {
+        String::new()
+    };
     // Build O(1) lookup map and root slugs once for the entire batch.
     let node_index_map = gs.node_index_map();
-    let roots = GraphState::root_slugs_from_index_map(&node_index_map);
+    let roots = GraphState::root_slugs_from_index_map(node_index_map);
     if params.mode.is_some() {
         let mode = params.mode.as_deref().unwrap_or("neighbors");
-        let edge_filter = params.edge_types.as_ref().map(|types| types.iter().filter_map(|t| parse_edge_kind(t)).collect::<Vec<_>>());
+        let edge_filter = params.edge_types.as_ref().map(|types| {
+            types
+                .iter()
+                .filter_map(|t| parse_edge_kind(t))
+                .collect::<Vec<_>>()
+        });
         let edge_filter_slice = edge_filter.as_deref();
         let mut sections: Vec<String> = Vec::new();
         let strip = ctx.root_filter.as_deref();
         for &nid in node_ids {
             // Resolve short IDs (without root prefix) to full stable IDs.
-            let resolved_nid = GraphState::resolve_node_id_fast(nid, &node_index_map, &roots);
+            let resolved_nid = GraphState::resolve_node_id_fast(nid, node_index_map, &roots);
             let display_nid = strip_root_prefix(&resolved_nid, strip);
-            if gs.index.get_node(&resolved_nid).is_none() { sections.push(format!("### `{}`\n\nNode not found in graph.", display_nid)); continue; }
-            match run_traversal_grouped(&gs.index, &resolved_nid, mode, params.hops, params.direction.as_deref(), edge_filter_slice) {
+            if gs.index.get_node(&resolved_nid).is_none() {
+                sections.push(format!("### `{}`\n\nNode not found in graph.", display_nid));
+                continue;
+            }
+            match run_traversal_grouped(
+                &gs.index,
+                &resolved_nid,
+                mode,
+                params.hops,
+                params.direction.as_deref(),
+                edge_filter_slice,
+            ) {
                 Ok(mut groups) => {
                     // Remove self-references
                     for ids in groups.values_mut() {
@@ -946,41 +1326,110 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
                     }
                     if mode == "tests_for" {
                         for ids in groups.values_mut() {
-                            ids.retain(|id| gs.node_by_stable_id(id, &node_index_map).map(ranking::is_test_file).unwrap_or(false));
+                            ids.retain(|id| {
+                                gs.node_by_stable_id(id, node_index_map)
+                                    .map(ranking::is_test_file)
+                                    .unwrap_or(false)
+                            });
                         }
                     }
                     groups.retain(|_, ids| !ids.is_empty());
-                    let total: usize = groups.values().map(|ids| {
-                        ids.iter().filter(|id| {
-                            gs.node_by_stable_id(id, &node_index_map)
-                                .map(|n| !crate::server::helpers::is_hidden_traversal_kind(&n.id.kind))
-                                .unwrap_or(true)
-                        }).count()
-                    }).sum();
-                    if total == 0 { sections.push(format!("### `{}`\n\nNo {} results.", display_nid, mode)); }
-                    else { let md = format_neighbors_grouped_with_root(&gs.nodes, &groups, &gs.index, params.compact, strip); sections.push(format!("### `{}`\n\n{} result(s)\n\n{}", display_nid, total, md)); }
+                    let total: usize = groups
+                        .values()
+                        .map(|ids| {
+                            ids.iter()
+                                .filter(|id| {
+                                    gs.node_by_stable_id(id, node_index_map)
+                                        .map(|n| {
+                                            !crate::server::helpers::is_hidden_traversal_kind(
+                                                &n.id.kind,
+                                            )
+                                        })
+                                        .unwrap_or(true)
+                                })
+                                .count()
+                        })
+                        .sum();
+                    if total == 0 {
+                        sections.push(format!("### `{}`\n\nNo {} results.", display_nid, mode));
+                    } else {
+                        let md = format_neighbors_grouped_with_root(
+                            &gs.nodes,
+                            &groups,
+                            &gs.index,
+                            params.compact,
+                            strip,
+                            params.include_body,
+                            params.minify_body,
+                        );
+                        sections.push(format!(
+                            "### `{}`\n\n{} result(s)\n\n{}",
+                            display_nid, total, md
+                        ));
+                    }
                 }
                 Err(msg) => sections.push(format!("### `{}`\n\n{}", display_nid, msg)),
             }
         }
-        format!("## Batch {} for {} node(s)\n\n{}{}", mode, node_ids.len(), sections.join("\n\n"), freshness)
+        format!(
+            "## Batch {} for {} node(s)\n\n{}{}",
+            mode,
+            node_ids.len(),
+            sections.join("\n\n"),
+            freshness
+        )
     } else {
         let mut found = Vec::new();
         let mut missing = Vec::new();
         for &nid in node_ids {
-            let resolved = GraphState::resolve_node_id_fast(nid, &node_index_map, &roots);
-            if let Some(node) = gs.node_by_stable_id(&resolved, &node_index_map) { found.push(node); } else { missing.push(nid); }
+            let resolved = GraphState::resolve_node_id_fast(nid, node_index_map, &roots);
+            if let Some(node) = gs.node_by_stable_id(&resolved, node_index_map) {
+                found.push(node);
+            } else {
+                missing.push(nid);
+            }
         }
         let strip = ctx.root_filter.as_deref();
-        if found.is_empty() { return format!("No nodes found for {}. Try search to find valid node IDs.{}", node_ids.iter().map(|id| format!("`{}`", strip_root_prefix(id, strip))).collect::<Vec<_>>().join(", "), freshness); }
-        let md: String = found.iter().map(|n| format_node_entry_with_root(n, &gs.index, params.compact, strip)).collect::<Vec<_>>().join("\n\n");
+        if found.is_empty() {
+            return format!(
+                "No nodes found for {}. Try search to find valid node IDs.{}",
+                node_ids
+                    .iter()
+                    .map(|id| format!("`{}`", strip_root_prefix(id, strip)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                freshness
+            );
+        }
+        let md: String = found
+            .iter()
+            .map(|n| {
+                format_node_entry_with_root(
+                    n,
+                    &gs.index,
+                    params.compact,
+                    strip,
+                    params.include_body,
+                    params.minify_body,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
         let mut result = format!("## Batch retrieve: {} found\n\n{}", found.len(), md);
-        if !missing.is_empty() { result.push_str(&format!("\n\n**Missing:** {}", missing.iter().map(|id| format!("`{}`", strip_root_prefix(id, strip))).collect::<Vec<_>>().join(", "))); }
+        if !missing.is_empty() {
+            result.push_str(&format!(
+                "\n\n**Missing:** {}",
+                missing
+                    .iter()
+                    .map(|id| format!("`{}`", strip_root_prefix(id, strip)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         result.push_str(&freshness);
         result
     }
 }
-
 
 /// Parse a path/name query like `"auth/handlers/validate"` into
 /// `Some(("auth/handlers", "validate"))`. Returns `None` if the query
@@ -1020,47 +1469,77 @@ fn resolve_entry_points_by_name<'a>(
 
     // Detect path/name split query (e.g. "auth/handlers/validate").
     let path_name = parse_path_name_query(query);
-    let (query_lower, path_filter_lower, name_filter_lower): (String, Option<String>, Option<String>) =
-        if let Some((path_part, name_part)) = path_name {
-            (
-                query.to_lowercase(),
-                Some(path_part.to_lowercase()),
-                Some(name_part.to_lowercase()),
-            )
-        } else {
-            (query.to_lowercase(), None, None)
-        };
+    let (query_lower, path_filter_lower, name_filter_lower): (
+        String,
+        Option<String>,
+        Option<String>,
+    ) = if let Some((path_part, name_part)) = path_name {
+        (
+            query.to_lowercase(),
+            Some(path_part.to_lowercase()),
+            Some(name_part.to_lowercase()),
+        )
+    } else {
+        (query.to_lowercase(), None, None)
+    };
 
-    let mut matches: Vec<&Node> = gs.nodes.iter().filter(|n| {
-        // Name/file matching: path/name split vs. plain.
-        if let (Some(pf), Some(nf)) = (&path_filter_lower, &name_filter_lower) {
-            // Both file path and name must match.
-            let file_match = n.id.file.to_string_lossy().to_lowercase().contains(pf.as_str());
-            let name_match = n.id.name.to_lowercase().contains(nf.as_str());
-            if !file_match || !name_match { return false; }
-        } else {
-            // Plain name or signature match.
-            let name_match = n.id.name.to_lowercase().contains(&query_lower)
-                || n.signature.to_lowercase().contains(&query_lower);
-            if !name_match { return false; }
-        }
+    let mut matches: Vec<&Node> = gs
+        .nodes
+        .iter()
+        .filter(|n| {
+            // Name/file matching: path/name split vs. plain.
+            if let (Some(pf), Some(nf)) = (&path_filter_lower, &name_filter_lower) {
+                // Both file path and name must match.
+                let file_match =
+                    n.id.file
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(pf.as_str());
+                let name_match = n.id.name.to_lowercase().contains(nf.as_str());
+                if !file_match || !name_match {
+                    return false;
+                }
+            } else {
+                // Plain name or signature match.
+                let name_match = n.id.name.to_lowercase().contains(&query_lower)
+                    || n.signature.to_lowercase().contains(&query_lower);
+                if !name_match {
+                    return false;
+                }
+            }
 
-        // Apply filters (kind, language, file, root).
-        if let Some(ref kf) = params.kind
-            && n.id.kind.to_string().to_lowercase() != kf.to_lowercase() { return false; }
-        if let Some(ref lf) = params.language
-            && n.language.to_lowercase() != lf.to_lowercase() { return false; }
-        if let Some(ref ff) = params.file
-            && !n.id.file.to_string_lossy().contains(ff.as_str()) { return false; }
-        if !node_passes_root_filter(&n.id.root, &ctx.root_filter, &ctx.non_code_slugs) {
-            return false;
-        }
-        if let Some(ref sub) = params.subsystem {
-            let node_sub = n.metadata.get(crate::server::SUBSYSTEM_KEY).map(|s| s.as_str()).unwrap_or("");
-            if !subsystem_matches(node_sub, sub) { return false; }
-        }
-        true
-    }).collect();
+            // Apply filters (kind, language, file, root).
+            if let Some(ref kf) = params.kind
+                && n.id.kind.to_string().to_lowercase() != kf.to_lowercase()
+            {
+                return false;
+            }
+            if let Some(ref lf) = params.language
+                && n.language.to_lowercase() != lf.to_lowercase()
+            {
+                return false;
+            }
+            if let Some(ref ff) = params.file
+                && !n.id.file.to_string_lossy().contains(ff.as_str())
+            {
+                return false;
+            }
+            if !node_passes_root_filter(&n.id.root, &ctx.root_filter, &ctx.non_code_slugs) {
+                return false;
+            }
+            if let Some(ref sub) = params.subsystem {
+                let node_sub = n
+                    .metadata
+                    .get(crate::server::SUBSYSTEM_KEY)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                if !subsystem_matches(node_sub, sub) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
 
     // Sort: exact name match first, then contains.
     // For path/name queries use the name part for exact-match comparison.
@@ -1101,17 +1580,26 @@ fn subsystem_matches(node_subsystem: &str, filter: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::index::GraphIndex;
+    use crate::graph::{ExtractionSource, NodeId};
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
-    use crate::graph::{NodeId, ExtractionSource};
-    use crate::graph::index::GraphIndex;
 
     fn make_node(name: &str, kind: NodeKind, file: &str) -> Node {
         Node {
-            id: NodeId { kind, name: name.to_string(), file: PathBuf::from(file), root: "local".to_string() },
-            language: "rust".to_string(), signature: format!("fn {}", name),
-            line_start: 0, line_end: 10, body: String::new(),
-            metadata: BTreeMap::new(), source: ExtractionSource::TreeSitter,
+            id: NodeId {
+                kind,
+                name: name.to_string(),
+                file: PathBuf::from(file),
+                root: "local".to_string(),
+            },
+            language: "rust".to_string(),
+            signature: format!("fn {}", name),
+            line_start: 0,
+            line_end: 10,
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::TreeSitter,
         }
     }
 
@@ -1139,18 +1627,56 @@ mod tests {
         }
     }
 
-    fn make_search_context<'a>(graph_state: &'a GraphState, repo_root: &'a Path) -> SearchContext<'a> {
+    fn make_search_context<'a>(
+        graph_state: &'a GraphState,
+        repo_root: &'a Path,
+    ) -> SearchContext<'a> {
         SearchContext {
-            graph_state, embed_index: None, repo_root,
-            lsp_status: None, embed_status: None, root_filter: None, non_code_slugs: HashSet::new(),
+            graph_state,
+            embed_index: None,
+            repo_root,
+            lsp_status: None,
+            embed_status: None,
+            root_filter: None,
+            non_code_slugs: HashSet::new(),
         }
     }
 
-    #[test] fn test_search_params_default() { let p = SearchParams::default(); assert!(p.query.is_none()); assert!(!p.compact); assert!(!p.rerank); }
-    #[test] fn test_node_passes_root_filter_all() { assert!(node_passes_root_filter("any", &None, &HashSet::new())); }
-    #[test] fn test_node_passes_root_filter_match() { assert!(node_passes_root_filter("my-root", &Some("my-root".into()), &HashSet::new())); }
-    #[test] fn test_node_passes_root_filter_external() { assert!(node_passes_root_filter("external", &Some("my-root".into()), &HashSet::new())); }
-    #[test] fn test_node_passes_root_filter_reject() { assert!(!node_passes_root_filter("other", &Some("my-root".into()), &HashSet::new())); }
+    #[test]
+    fn test_search_params_default() {
+        let p = SearchParams::default();
+        assert!(p.query.is_none());
+        assert!(!p.compact);
+        assert!(!p.rerank);
+    }
+    #[test]
+    fn test_node_passes_root_filter_all() {
+        assert!(node_passes_root_filter("any", &None, &HashSet::new()));
+    }
+    #[test]
+    fn test_node_passes_root_filter_match() {
+        assert!(node_passes_root_filter(
+            "my-root",
+            &Some("my-root".into()),
+            &HashSet::new()
+        ));
+    }
+    #[test]
+    fn test_node_passes_root_filter_external() {
+        assert!(node_passes_root_filter(
+            "external",
+            &Some("my-root".into()),
+            &HashSet::new()
+        ));
+    }
+    #[test]
+    fn test_node_passes_root_filter_reject() {
+        assert!(!node_passes_root_filter(
+            "other",
+            &Some("my-root".into()),
+            &HashSet::new()
+        ));
+    }
 
     // ── flat_code_symbol_search tests ──────────────────────────────────
 
@@ -1164,11 +1690,22 @@ mod tests {
         let gs = make_graph_state(nodes);
         let repo_root = PathBuf::from("/tmp/test");
         let ctx = make_search_context(&gs, &repo_root);
-        let params = SearchParams { query: Some("auth".into()), ..Default::default() };
+        let params = SearchParams {
+            query: Some("auth".into()),
+            ..Default::default()
+        };
 
         let results = flat_code_symbol_search(
-            "auth", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
-        ).await;
+            "auth",
+            SearchMode::Hybrid,
+            10,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id.name, "auth_handler");
@@ -1182,11 +1719,22 @@ mod tests {
         let gs = make_graph_state(vec![node]);
         let repo_root = PathBuf::from("/tmp/test");
         let ctx = make_search_context(&gs, &repo_root);
-        let params = SearchParams { query: Some("auth_token".into()), ..Default::default() };
+        let params = SearchParams {
+            query: Some("auth_token".into()),
+            ..Default::default()
+        };
 
         let results = flat_code_symbol_search(
-            "auth_token", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
-        ).await;
+            "auth_token",
+            SearchMode::Hybrid,
+            10,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id.name, "process");
@@ -1209,8 +1757,16 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "config", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
-        ).await;
+            "config",
+            SearchMode::Hybrid,
+            10,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id.name, "Config");
@@ -1220,7 +1776,11 @@ mod tests {
     #[tokio::test]
     async fn test_flat_search_empty_query_kind_framework() {
         let func_node = make_node("main", NodeKind::Function, "src/main.rs");
-        let mut fw_node = make_node("tokio", NodeKind::Other("framework".to_string()), "frameworks/tokio");
+        let mut fw_node = make_node(
+            "tokio",
+            NodeKind::Other("framework".to_string()),
+            "frameworks/tokio",
+        );
         fw_node.language = String::new();
         fw_node.signature = "framework tokio".to_string();
         let gs = make_graph_state(vec![func_node, fw_node]);
@@ -1231,11 +1791,16 @@ mod tests {
             ..Default::default()
         };
 
-        let results = flat_code_symbol_search(
-            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
-        ).await;
+        let results =
+            flat_code_symbol_search("", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false)
+                .await;
 
-        assert_eq!(results.len(), 1, "Expected 1 framework node, got {}", results.len());
+        assert_eq!(
+            results.len(),
+            1,
+            "Expected 1 framework node, got {}",
+            results.len()
+        );
         assert_eq!(results[0].id.name, "tokio");
     }
 
@@ -1255,8 +1820,16 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
-        ).await;
+            "handler",
+            SearchMode::Hybrid,
+            10,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].language, "python");
@@ -1279,8 +1852,16 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "parse", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
-        ).await;
+            "parse",
+            SearchMode::Hybrid,
+            10,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
 
         assert_eq!(results.len(), 1);
         assert!(results[0].id.file.to_string_lossy().contains("parser"));
@@ -1302,9 +1883,9 @@ mod tests {
             ..Default::default()
         };
 
-        let results = flat_code_symbol_search(
-            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, true, false,
-        ).await;
+        let results =
+            flat_code_symbol_search("", SearchMode::Hybrid, 10, &params, &gs, &ctx, true, false)
+                .await;
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id.name, "complex");
@@ -1328,9 +1909,9 @@ mod tests {
             ..Default::default()
         };
 
-        let results = flat_code_symbol_search(
-            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, true,
-        ).await;
+        let results =
+            flat_code_symbol_search("", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, true)
+                .await;
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id.name, "hub");
@@ -1340,11 +1921,26 @@ mod tests {
     #[test]
     fn test_search_mode_parsing_coverage() {
         assert!(matches!(parse_search_mode(None), SearchMode::Hybrid));
-        assert!(matches!(parse_search_mode(Some("hybrid")), SearchMode::Hybrid));
-        assert!(matches!(parse_search_mode(Some("keyword")), SearchMode::Keyword));
-        assert!(matches!(parse_search_mode(Some("semantic")), SearchMode::Semantic));
-        assert!(matches!(parse_search_mode(Some("SEMANTIC")), SearchMode::Semantic));
-        assert!(matches!(parse_search_mode(Some("unknown")), SearchMode::Hybrid));
+        assert!(matches!(
+            parse_search_mode(Some("hybrid")),
+            SearchMode::Hybrid
+        ));
+        assert!(matches!(
+            parse_search_mode(Some("keyword")),
+            SearchMode::Keyword
+        ));
+        assert!(matches!(
+            parse_search_mode(Some("semantic")),
+            SearchMode::Semantic
+        ));
+        assert!(matches!(
+            parse_search_mode(Some("SEMANTIC")),
+            SearchMode::Semantic
+        ));
+        assert!(matches!(
+            parse_search_mode(Some("unknown")),
+            SearchMode::Hybrid
+        ));
     }
 
     /// Empty query with no filters returns empty results (via the search function).
@@ -1356,7 +1952,10 @@ mod tests {
         let params = SearchParams::default();
 
         let result = search(&params, &ctx).await;
-        assert!(result.contains("Empty query"), "Should reject empty query without filters");
+        assert!(
+            result.contains("Empty query"),
+            "Should reject empty query without filters"
+        );
     }
 
     /// Verify full search function respects search_mode parameter in output
@@ -1376,8 +1975,14 @@ mod tests {
         };
 
         let result = search(&params, &ctx).await;
-        assert!(result.contains("auth_handler"), "Fallback should find by name even with search_mode=semantic");
-        assert!(result.contains("Code symbols"), "Should have code symbols section");
+        assert!(
+            result.contains("auth_handler"),
+            "Fallback should find by name even with search_mode=semantic"
+        );
+        assert!(
+            result.contains("Code symbols"),
+            "Should have code symbols section"
+        );
     }
 
     /// min_complexity filter works with the new code path.
@@ -1396,9 +2001,9 @@ mod tests {
             ..Default::default()
         };
 
-        let results = flat_code_symbol_search(
-            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
-        ).await;
+        let results =
+            flat_code_symbol_search("", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false)
+                .await;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id.name, "complex");
@@ -1429,10 +2034,22 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
-        ).await;
+            "handler",
+            SearchMode::Hybrid,
+            10,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
 
-        assert_eq!(results.len(), 1, "Only one node should pass all three filters");
+        assert_eq!(
+            results.len(),
+            1,
+            "Only one node should pass all three filters"
+        );
         assert_eq!(results[0].id.name, "handler");
         assert!(results[0].id.file.to_string_lossy().contains("api"));
     }
@@ -1452,10 +2069,22 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "fn", SearchMode::Hybrid, 5, &params, &gs, &ctx, false, false,
-        ).await;
+            "fn",
+            SearchMode::Hybrid,
+            5,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
 
-        assert_eq!(results.len(), 5, "Should respect limit of 5 even with 20 matches");
+        assert_eq!(
+            results.len(),
+            5,
+            "Should respect limit of 5 even with 20 matches"
+        );
     }
 
     /// Dissent #3: Root filter rejects non-matching roots in fallback.
@@ -1468,8 +2097,12 @@ mod tests {
         let gs = make_graph_state(vec![local, other]);
         let repo_root = PathBuf::from("/tmp/test");
         let ctx = SearchContext {
-            graph_state: &gs, embed_index: None, repo_root: &repo_root,
-            lsp_status: None, embed_status: None, root_filter: Some("my-project".into()),
+            graph_state: &gs,
+            embed_index: None,
+            repo_root: &repo_root,
+            lsp_status: None,
+            embed_status: None,
+            root_filter: Some("my-project".into()),
             non_code_slugs: HashSet::new(),
         };
         let params = SearchParams {
@@ -1478,10 +2111,22 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
-        ).await;
+            "handler",
+            SearchMode::Hybrid,
+            10,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
 
-        assert_eq!(results.len(), 1, "Should only return nodes from matching root");
+        assert_eq!(
+            results.len(),
+            1,
+            "Should only return nodes from matching root"
+        );
         assert_eq!(results[0].id.root, "my-project");
     }
 
@@ -1501,9 +2146,9 @@ mod tests {
             synthetic: Some(true),
             ..Default::default()
         };
-        let results = flat_code_symbol_search(
-            "", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
-        ).await;
+        let results =
+            flat_code_symbol_search("", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false)
+                .await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id.name, "CONSTANT");
 
@@ -1514,8 +2159,16 @@ mod tests {
             ..Default::default()
         };
         let results2 = flat_code_symbol_search(
-            "", SearchMode::Hybrid, 10, &params2, &gs, &ctx, false, false,
-        ).await;
+            "",
+            SearchMode::Hybrid,
+            10,
+            &params2,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
         assert_eq!(results2.len(), 1);
         assert_eq!(results2[0].id.name, "real_fn");
     }
@@ -1528,9 +2181,7 @@ mod tests {
     /// This validates the over-fetch logic and parameter plumbing.
     #[tokio::test]
     async fn test_flat_search_rerank_true_no_embed() {
-        let nodes = vec![
-            make_node("auth_handler", NodeKind::Function, "src/auth.rs"),
-        ];
+        let nodes = vec![make_node("auth_handler", NodeKind::Function, "src/auth.rs")];
         let gs = make_graph_state(nodes);
         let repo_root = PathBuf::from("/tmp/test");
         let ctx = make_search_context(&gs, &repo_root);
@@ -1544,9 +2195,20 @@ mod tests {
         // Single match means reranking block is skipped (len() > 1 guard),
         // so no model loading occurs.
         let results = flat_code_symbol_search(
-            "auth", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
-        ).await;
-        assert!(!results.is_empty(), "Rerank=true should not prevent results from appearing");
+            "auth",
+            SearchMode::Hybrid,
+            10,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
+        assert!(
+            !results.is_empty(),
+            "Rerank=true should not prevent results from appearing"
+        );
     }
 
     /// Rerank=false should not trigger any reranking code path.
@@ -1563,8 +2225,16 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "foo", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
-        ).await;
+            "foo",
+            SearchMode::Hybrid,
+            10,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id.name, "foo");
     }
@@ -1589,8 +2259,14 @@ mod tests {
         };
 
         let result = search(&params, &ctx).await;
-        assert!(!result.contains("Empty query"), "File filter should bypass empty query guard");
-        assert!(result.contains("parse"), "Should find symbols in the filtered file");
+        assert!(
+            !result.contains("Empty query"),
+            "File filter should bypass empty query guard"
+        );
+        assert!(
+            result.contains("parse"),
+            "Should find symbols in the filtered file"
+        );
     }
 
     /// Empty query with synthetic filter should be allowed.
@@ -1610,11 +2286,19 @@ mod tests {
         };
 
         let result = search(&params, &ctx).await;
-        assert!(!result.contains("Empty query"), "Synthetic filter should bypass empty query guard");
-        assert!(result.contains("real_fn"), "Should include non-synthetic symbol when synthetic=false");
-        assert!(!result.contains("MAGIC"), "Should exclude synthetic symbol when synthetic=false");
+        assert!(
+            !result.contains("Empty query"),
+            "Synthetic filter should bypass empty query guard"
+        );
+        assert!(
+            result.contains("real_fn"),
+            "Should include non-synthetic symbol when synthetic=false"
+        );
+        assert!(
+            !result.contains("MAGIC"),
+            "Should exclude synthetic symbol when synthetic=false"
+        );
     }
-
 
     // ── resolve_entry_points_by_name tests (#290) ─────────────────────
 
@@ -1628,7 +2312,10 @@ mod tests {
         let gs = make_graph_state(nodes);
         let repo_root = PathBuf::from("/tmp/test");
         let ctx = make_search_context(&gs, &repo_root);
-        let params = SearchParams { kind: Some("struct".into()), ..Default::default() };
+        let params = SearchParams {
+            kind: Some("struct".into()),
+            ..Default::default()
+        };
 
         let results = resolve_entry_points_by_name("SearchParams", 10, &params, &ctx);
         assert_eq!(results.len(), 1);
@@ -1658,7 +2345,10 @@ mod tests {
         let gs = make_graph_state(nodes);
         let repo_root = PathBuf::from("/tmp/test");
         let ctx = make_search_context(&gs, &repo_root);
-        let params = SearchParams { kind: Some("function".into()), ..Default::default() };
+        let params = SearchParams {
+            kind: Some("function".into()),
+            ..Default::default()
+        };
 
         let results = resolve_entry_points_by_name("config", 10, &params, &ctx);
         assert_eq!(results.len(), 1);
@@ -1679,7 +2369,10 @@ mod tests {
 
         let results = resolve_entry_points_by_name("search", 10, &params, &ctx);
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].id.name, "search", "exact match should come first");
+        assert_eq!(
+            results[0].id.name, "search",
+            "exact match should come first"
+        );
     }
 
     /// Exact signature match sorts before substring-only matches with limit=1.
@@ -1697,9 +2390,13 @@ mod tests {
 
         // Query matches node_a by signature ("fn foo(config: &SearchParams)")
         // but not node_b. With limit=1, node_a must survive.
-        let results = resolve_entry_points_by_name("fn foo(config: &SearchParams)", 1, &params, &ctx);
+        let results =
+            resolve_entry_points_by_name("fn foo(config: &SearchParams)", 1, &params, &ctx);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id.name, "foo", "exact signature match should be kept with limit=1");
+        assert_eq!(
+            results[0].id.name, "foo",
+            "exact signature match should be kept with limit=1"
+        );
     }
 
     // ── parse_path_name_query tests ────────────────────────────────────
@@ -1754,7 +2451,13 @@ mod tests {
         let results = resolve_entry_points_by_name("auth/handlers/validate", 10, &params, &ctx);
         assert_eq!(results.len(), 1, "Only auth/handlers validate should match");
         assert_eq!(results[0].id.name, "validate");
-        assert!(results[0].id.file.to_string_lossy().contains("auth/handlers"));
+        assert!(
+            results[0]
+                .id
+                .file
+                .to_string_lossy()
+                .contains("auth/handlers")
+        );
     }
 
     /// Plain queries (no `/`) still work identically to today.
@@ -1770,15 +2473,21 @@ mod tests {
         let params = SearchParams::default();
 
         let results = resolve_entry_points_by_name("validate", 10, &params, &ctx);
-        assert_eq!(results.len(), 2, "Plain query should return all matching nodes");
+        assert_eq!(
+            results.len(),
+            2,
+            "Plain query should return all matching nodes"
+        );
     }
 
     /// Path/name query with no matches returns empty.
     #[test]
     fn test_resolve_entry_points_path_name_no_match() {
-        let nodes = vec![
-            make_node("validate", NodeKind::Function, "src/auth/handlers/mod.rs"),
-        ];
+        let nodes = vec![make_node(
+            "validate",
+            NodeKind::Function,
+            "src/auth/handlers/mod.rs",
+        )];
         let gs = make_graph_state(nodes);
         let repo_root = PathBuf::from("/tmp/test");
         let ctx = make_search_context(&gs, &repo_root);
@@ -1802,15 +2511,32 @@ mod tests {
         let gs = make_graph_state(nodes);
         let repo_root = PathBuf::from("/tmp/test");
         let ctx = make_search_context(&gs, &repo_root);
-        let params = SearchParams { query: Some("auth/handlers/validate".into()), ..Default::default() };
+        let params = SearchParams {
+            query: Some("auth/handlers/validate".into()),
+            ..Default::default()
+        };
 
         let results = flat_code_symbol_search(
-            "auth/handlers/validate", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
-        ).await;
+            "auth/handlers/validate",
+            SearchMode::Hybrid,
+            10,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
 
         assert_eq!(results.len(), 1, "Only auth/handlers validate should match");
         assert_eq!(results[0].id.name, "validate");
-        assert!(results[0].id.file.to_string_lossy().contains("auth/handlers"));
+        assert!(
+            results[0]
+                .id
+                .file
+                .to_string_lossy()
+                .contains("auth/handlers")
+        );
     }
 
     /// Plain queries (no `/`) remain unchanged in flat search.
@@ -1823,11 +2549,22 @@ mod tests {
         let gs = make_graph_state(nodes);
         let repo_root = PathBuf::from("/tmp/test");
         let ctx = make_search_context(&gs, &repo_root);
-        let params = SearchParams { query: Some("validate".into()), ..Default::default() };
+        let params = SearchParams {
+            query: Some("validate".into()),
+            ..Default::default()
+        };
 
         let results = flat_code_symbol_search(
-            "validate", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
-        ).await;
+            "validate",
+            SearchMode::Hybrid,
+            10,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
 
         assert_eq!(results.len(), 2, "Plain query returns all matches");
     }
@@ -1864,7 +2601,10 @@ mod tests {
         // "auth/handlers/validate" → path="auth/handlers", name="validate"
         // Neither node is in auth/handlers → should return empty, not fall back to plain
         let results = resolve_entry_points_by_name("auth/handlers/validate", 10, &params, &ctx);
-        assert!(results.is_empty(), "Must not fall back to plain name matching");
+        assert!(
+            results.is_empty(),
+            "Must not fall back to plain name matching"
+        );
     }
 
     /// Adversarial: path/name where name part partially matches many nodes.
@@ -1882,10 +2622,22 @@ mod tests {
         let params = SearchParams::default();
 
         let results = flat_code_symbol_search(
-            "auth/new", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
-        ).await;
+            "auth/new",
+            SearchMode::Hybrid,
+            10,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
 
-        assert_eq!(results.len(), 1, "Path filter should discriminate to only auth node");
+        assert_eq!(
+            results.len(),
+            1,
+            "Path filter should discriminate to only auth node"
+        );
         assert!(results[0].id.file.to_string_lossy().contains("auth"));
     }
 
@@ -1894,9 +2646,15 @@ mod tests {
     #[tokio::test]
     async fn test_flat_search_subsystem_filter() {
         let mut node_a = make_node("scan_files", NodeKind::Function, "src/scanner.rs");
-        node_a.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "scanner".to_string());
+        node_a.metadata.insert(
+            crate::server::SUBSYSTEM_KEY.to_owned(),
+            "scanner".to_string(),
+        );
         let mut node_b = make_node("scan_config", NodeKind::Function, "src/config.rs");
-        node_b.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "config".to_string());
+        node_b.metadata.insert(
+            crate::server::SUBSYSTEM_KEY.to_owned(),
+            "config".to_string(),
+        );
         let node_c = make_node("scan_other", NodeKind::Function, "src/other.rs");
         // node_c has no subsystem metadata
 
@@ -1910,8 +2668,16 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "scan", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
-        ).await;
+            "scan",
+            SearchMode::Hybrid,
+            10,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
 
         assert_eq!(results.len(), 1, "Only scanner-subsystem node should match");
         assert_eq!(results[0].id.name, "scan_files");
@@ -1920,7 +2686,10 @@ mod tests {
     #[tokio::test]
     async fn test_flat_search_subsystem_filter_case_insensitive() {
         let mut node = make_node("handler", NodeKind::Function, "src/server.rs");
-        node.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "Server".to_string());
+        node.metadata.insert(
+            crate::server::SUBSYSTEM_KEY.to_owned(),
+            "Server".to_string(),
+        );
 
         let gs = make_graph_state(vec![node]);
         let repo_root = PathBuf::from("/tmp/test");
@@ -1932,16 +2701,31 @@ mod tests {
         };
 
         let results = flat_code_symbol_search(
-            "handler", SearchMode::Hybrid, 10, &params, &gs, &ctx, false, false,
-        ).await;
+            "handler",
+            SearchMode::Hybrid,
+            10,
+            &params,
+            &gs,
+            &ctx,
+            false,
+            false,
+        )
+        .await;
 
-        assert_eq!(results.len(), 1, "Case-insensitive subsystem match should work");
+        assert_eq!(
+            results.len(),
+            1,
+            "Case-insensitive subsystem match should work"
+        );
     }
 
     #[tokio::test]
     async fn test_flat_search_subsystem_allows_empty_query_browse() {
         let mut node = make_node("extract", NodeKind::Function, "src/extract.rs");
-        node.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "extractor".to_string());
+        node.metadata.insert(
+            crate::server::SUBSYSTEM_KEY.to_owned(),
+            "extractor".to_string(),
+        );
         let gs = make_graph_state(vec![node]);
         let repo_root = PathBuf::from("/tmp/test");
         let ctx = make_search_context(&gs, &repo_root);
@@ -1952,7 +2736,10 @@ mod tests {
 
         // Empty query with subsystem filter should be allowed (not rejected)
         let result = search(&params, &ctx).await;
-        assert!(!result.contains("Empty query"), "Subsystem filter should act as browse filter");
+        assert!(
+            !result.contains("Empty query"),
+            "Subsystem filter should act as browse filter"
+        );
     }
 
     #[test]
@@ -1986,11 +2773,19 @@ mod tests {
     #[tokio::test]
     async fn test_flat_search_subsystem_parent_matches_children() {
         let mut node_a = make_node("enrich", NodeKind::Function, "src/extract/enrich.rs");
-        node_a.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "extract/enrich".to_string());
+        node_a.metadata.insert(
+            crate::server::SUBSYSTEM_KEY.to_owned(),
+            "extract/enrich".to_string(),
+        );
         let mut node_b = make_node("NodeId", NodeKind::Struct, "src/extract/mod.rs");
-        node_b.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "extract/Node".to_string());
+        node_b.metadata.insert(
+            crate::server::SUBSYSTEM_KEY.to_owned(),
+            "extract/Node".to_string(),
+        );
         let mut node_c = make_node("embed_texts", NodeKind::Function, "src/embed.rs");
-        node_c.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "embed".to_string());
+        node_c
+            .metadata
+            .insert(crate::server::SUBSYSTEM_KEY.to_owned(), "embed".to_string());
         let gs = make_graph_state(vec![node_a, node_b, node_c]);
         let repo_root = PathBuf::from("/tmp/test");
         let ctx = make_search_context(&gs, &repo_root);
@@ -2000,9 +2795,18 @@ mod tests {
         };
         let result = search(&params, &ctx).await;
         // Both extract/enrich and extract/Node should match, but not embed
-        assert!(result.contains("enrich"), "Should include extract/enrich child");
-        assert!(result.contains("NodeId"), "Should include extract/Node child");
-        assert!(!result.contains("embed_texts"), "Should NOT include embed subsystem");
+        assert!(
+            result.contains("enrich"),
+            "Should include extract/enrich child"
+        );
+        assert!(
+            result.contains("NodeId"),
+            "Should include extract/Node child"
+        );
+        assert!(
+            !result.contains("embed_texts"),
+            "Should NOT include embed subsystem"
+        );
     }
 
     // ── Cross-subsystem traversal tests ───────────────────────────────
@@ -2013,11 +2817,19 @@ mod tests {
 
         // Create nodes in different subsystems
         let mut node_a = make_node("handler", NodeKind::Function, "src/server.rs");
-        node_a.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "server".to_string());
+        node_a.metadata.insert(
+            crate::server::SUBSYSTEM_KEY.to_owned(),
+            "server".to_string(),
+        );
         let mut node_b = make_node("embed_text", NodeKind::Function, "src/embed.rs");
-        node_b.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "embed".to_string());
+        node_b
+            .metadata
+            .insert(crate::server::SUBSYSTEM_KEY.to_owned(), "embed".to_string());
         let mut node_c = make_node("scan_file", NodeKind::Function, "src/scanner.rs");
-        node_c.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "scanner".to_string());
+        node_c.metadata.insert(
+            crate::server::SUBSYSTEM_KEY.to_owned(),
+            "scanner".to_string(),
+        );
 
         // handler calls embed_text and scan_file
         let edge1 = make_edge(&node_a, &node_b, EdgeKind::Calls);
@@ -2038,8 +2850,14 @@ mod tests {
             ..Default::default()
         };
         let result = search(&params, &ctx).await;
-        assert!(result.contains("embed_text"), "Should include embed neighbor");
-        assert!(!result.contains("scan_file"), "Should NOT include scanner neighbor");
+        assert!(
+            result.contains("embed_text"),
+            "Should include embed neighbor"
+        );
+        assert!(
+            !result.contains("scan_file"),
+            "Should NOT include scanner neighbor"
+        );
     }
 
     #[tokio::test]
@@ -2047,15 +2865,17 @@ mod tests {
         use crate::graph::EdgeKind;
 
         let mut node_a = make_node("handler", NodeKind::Function, "src/server.rs");
-        node_a.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "server".to_string());
+        node_a.metadata.insert(
+            crate::server::SUBSYSTEM_KEY.to_owned(),
+            "server".to_string(),
+        );
         let mut node_b = make_node("embed_text", NodeKind::Function, "src/embed.rs");
-        node_b.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "embed".to_string());
+        node_b
+            .metadata
+            .insert(crate::server::SUBSYSTEM_KEY.to_owned(), "embed".to_string());
 
         let edge = make_edge(&node_a, &node_b, EdgeKind::Calls);
-        let gs = make_graph_state_with_edges(
-            vec![node_a.clone(), node_b.clone()],
-            vec![edge],
-        );
+        let gs = make_graph_state_with_edges(vec![node_a.clone(), node_b.clone()], vec![edge]);
         let repo_root = PathBuf::from("/tmp/test");
         let ctx = make_search_context(&gs, &repo_root);
 
@@ -2067,7 +2887,10 @@ mod tests {
             ..Default::default()
         };
         let result = search(&params, &ctx).await;
-        assert!(result.contains("No outgoing neighbors"), "Should report no neighbors when target_subsystem matches nothing");
+        assert!(
+            result.contains("No outgoing neighbors"),
+            "Should report no neighbors when target_subsystem matches nothing"
+        );
     }
 
     #[tokio::test]
@@ -2076,13 +2899,24 @@ mod tests {
 
         // node_a (server) -> node_b (embed), node_c (scanner), node_d (server)
         let mut node_a = make_node("handler", NodeKind::Function, "src/server.rs");
-        node_a.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "server".to_string());
+        node_a.metadata.insert(
+            crate::server::SUBSYSTEM_KEY.to_owned(),
+            "server".to_string(),
+        );
         let mut node_b = make_node("embed_text", NodeKind::Function, "src/embed.rs");
-        node_b.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "embed".to_string());
+        node_b
+            .metadata
+            .insert(crate::server::SUBSYSTEM_KEY.to_owned(), "embed".to_string());
         let mut node_c = make_node("scan_file", NodeKind::Function, "src/scanner.rs");
-        node_c.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "scanner".to_string());
+        node_c.metadata.insert(
+            crate::server::SUBSYSTEM_KEY.to_owned(),
+            "scanner".to_string(),
+        );
         let mut node_d = make_node("route", NodeKind::Function, "src/server/route.rs");
-        node_d.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "server".to_string());
+        node_d.metadata.insert(
+            crate::server::SUBSYSTEM_KEY.to_owned(),
+            "server".to_string(),
+        );
 
         let edges = vec![
             make_edge(&node_a, &node_b, EdgeKind::Calls),
@@ -2091,7 +2925,12 @@ mod tests {
         ];
 
         let gs = make_graph_state_with_edges(
-            vec![node_a.clone(), node_b.clone(), node_c.clone(), node_d.clone()],
+            vec![
+                node_a.clone(),
+                node_b.clone(),
+                node_c.clone(),
+                node_d.clone(),
+            ],
             edges,
         );
         let repo_root = PathBuf::from("/tmp/test");
@@ -2107,9 +2946,18 @@ mod tests {
             ..Default::default()
         };
         let result = search(&params, &ctx).await;
-        assert!(result.contains("embed_text"), "Should include embed neighbor");
-        assert!(!result.contains("scan_file"), "Should NOT include scanner neighbor");
-        assert!(!result.contains("route"), "Should NOT include server neighbor");
+        assert!(
+            result.contains("embed_text"),
+            "Should include embed neighbor"
+        );
+        assert!(
+            !result.contains("scan_file"),
+            "Should NOT include scanner neighbor"
+        );
+        assert!(
+            !result.contains("route"),
+            "Should NOT include server neighbor"
+        );
     }
 
     #[tokio::test]
@@ -2117,11 +2965,20 @@ mod tests {
         use crate::graph::EdgeKind;
 
         let mut node_a = make_node("handler", NodeKind::Function, "src/server.rs");
-        node_a.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "server".to_string());
+        node_a.metadata.insert(
+            crate::server::SUBSYSTEM_KEY.to_owned(),
+            "server".to_string(),
+        );
         let mut node_b = make_node("enrich_node", NodeKind::Function, "src/extract/enrich.rs");
-        node_b.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "extract/enrich".to_string());
+        node_b.metadata.insert(
+            crate::server::SUBSYSTEM_KEY.to_owned(),
+            "extract/enrich".to_string(),
+        );
         let mut node_c = make_node("parse_node", NodeKind::Function, "src/extract/parse.rs");
-        node_c.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "extract/parse".to_string());
+        node_c.metadata.insert(
+            crate::server::SUBSYSTEM_KEY.to_owned(),
+            "extract/parse".to_string(),
+        );
 
         let edges = vec![
             make_edge(&node_a, &node_b, EdgeKind::Calls),
@@ -2143,8 +3000,14 @@ mod tests {
             ..Default::default()
         };
         let result = search(&params, &ctx).await;
-        assert!(result.contains("enrich_node"), "Should include extract/enrich child");
-        assert!(result.contains("parse_node"), "Should include extract/parse child");
+        assert!(
+            result.contains("enrich_node"),
+            "Should include extract/enrich child"
+        );
+        assert!(
+            result.contains("parse_node"),
+            "Should include extract/parse child"
+        );
     }
 
     #[test]
@@ -2153,27 +3016,35 @@ mod tests {
         let gs = make_graph_state(vec![]);
         let node_index_map = gs.node_index_map();
         let result = format_impact_subsystem_breakdown(&groups, &gs, &node_index_map, None);
-        assert!(result.is_empty(), "No subsystem data should produce empty string");
+        assert!(
+            result.is_empty(),
+            "No subsystem data should produce empty string"
+        );
     }
 
     #[test]
     fn test_format_impact_subsystem_breakdown_groups_correctly() {
         use crate::graph::EdgeKind;
         let mut node_a = make_node("fn_a", NodeKind::Function, "src/alpha.rs");
-        node_a.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "alpha".to_string());
+        node_a
+            .metadata
+            .insert(crate::server::SUBSYSTEM_KEY.to_owned(), "alpha".to_string());
         let mut node_b = make_node("fn_b", NodeKind::Function, "src/beta.rs");
-        node_b.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "beta".to_string());
+        node_b
+            .metadata
+            .insert(crate::server::SUBSYSTEM_KEY.to_owned(), "beta".to_string());
         let mut node_c = make_node("fn_c", NodeKind::Function, "src/beta.rs");
-        node_c.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "beta".to_string());
+        node_c
+            .metadata
+            .insert(crate::server::SUBSYSTEM_KEY.to_owned(), "beta".to_string());
         let gs = make_graph_state(vec![node_a.clone(), node_b.clone(), node_c.clone()]);
         let node_index_map = gs.node_index_map();
 
         let mut groups = std::collections::BTreeMap::new();
-        groups.insert(EdgeKind::Calls, vec![
-            node_a.stable_id(),
-            node_b.stable_id(),
-            node_c.stable_id(),
-        ]);
+        groups.insert(
+            EdgeKind::Calls,
+            vec![node_a.stable_id(), node_b.stable_id(), node_c.stable_id()],
+        );
 
         let result = format_impact_subsystem_breakdown(&groups, &gs, &node_index_map, None);
         assert!(result.contains("alpha"), "Should contain alpha subsystem");
@@ -2186,20 +3057,25 @@ mod tests {
     fn test_count_affected_subsystems() {
         use crate::graph::EdgeKind;
         let mut node_a = make_node("fn_a", NodeKind::Function, "src/alpha.rs");
-        node_a.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "alpha".to_string());
+        node_a
+            .metadata
+            .insert(crate::server::SUBSYSTEM_KEY.to_owned(), "alpha".to_string());
         let mut node_b = make_node("fn_b", NodeKind::Function, "src/beta.rs");
-        node_b.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "beta".to_string());
+        node_b
+            .metadata
+            .insert(crate::server::SUBSYSTEM_KEY.to_owned(), "beta".to_string());
         let mut node_c = make_node("fn_c", NodeKind::Function, "src/beta.rs");
-        node_c.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "beta".to_string());
+        node_c
+            .metadata
+            .insert(crate::server::SUBSYSTEM_KEY.to_owned(), "beta".to_string());
         let gs = make_graph_state(vec![node_a.clone(), node_b.clone(), node_c.clone()]);
         let node_index_map = gs.node_index_map();
 
         let mut groups = std::collections::BTreeMap::new();
-        groups.insert(EdgeKind::Calls, vec![
-            node_a.stable_id(),
-            node_b.stable_id(),
-            node_c.stable_id(),
-        ]);
+        groups.insert(
+            EdgeKind::Calls,
+            vec![node_a.stable_id(), node_b.stable_id(), node_c.stable_id()],
+        );
 
         assert_eq!(count_affected_subsystems(&groups, &gs, &node_index_map), 2);
     }
@@ -2216,12 +3092,24 @@ mod tests {
     fn test_impact_summary_thresholds_are_reasonable() {
         // Node threshold: low enough to catch moderate-count-but-verbose-output cases.
         // The old threshold of 100 was too high — 80 non-compact nodes produced 157K chars.
-        assert!(IMPACT_SUMMARY_NODE_THRESHOLD >= 10, "Node threshold too low");
-        assert!(IMPACT_SUMMARY_NODE_THRESHOLD <= 60, "Node threshold too high");
+        assert!(
+            IMPACT_SUMMARY_NODE_THRESHOLD >= 10,
+            "Node threshold too low"
+        );
+        assert!(
+            IMPACT_SUMMARY_NODE_THRESHOLD <= 60,
+            "Node threshold too high"
+        );
         // Character threshold: safety net for when node count is below the node threshold
         // but the rendered output is still too large.
-        assert!(IMPACT_SUMMARY_CHAR_THRESHOLD >= 20_000, "Char threshold too low");
-        assert!(IMPACT_SUMMARY_CHAR_THRESHOLD <= 100_000, "Char threshold too high");
+        assert!(
+            IMPACT_SUMMARY_CHAR_THRESHOLD >= 20_000,
+            "Char threshold too low"
+        );
+        assert!(
+            IMPACT_SUMMARY_CHAR_THRESHOLD <= 100_000,
+            "Char threshold too high"
+        );
     }
 
     /// Adversarial: verify large impact results produce summary, not full listing.
@@ -2242,7 +3130,8 @@ mod tests {
             let sub = subsystems[i % 3];
             let file = format!("src/{}/mod.rs", sub);
             let mut node = make_node(&format!("fn_{}", i), NodeKind::Function, &file);
-            node.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), sub.to_string());
+            node.metadata
+                .insert(crate::server::SUBSYSTEM_KEY.to_owned(), sub.to_string());
             all_edges.push(make_edge(&node, &root_node, EdgeKind::Calls));
             all_nodes.push(node);
         }
@@ -2259,17 +3148,31 @@ mod tests {
         let result = search(&params, &ctx).await;
 
         // Should contain subsystem summary, not individual node listings
-        assert!(result.contains("subsystems affected"), "Should show subsystem count in heading, got: {}", &result[..result.len().min(500)]);
+        assert!(
+            result.contains("subsystems affected"),
+            "Should show subsystem count in heading, got: {}",
+            &result[..result.len().min(500)]
+        );
         assert!(result.contains("alpha"), "Should list alpha subsystem");
         assert!(result.contains("beta"), "Should list beta subsystem");
         assert!(result.contains("gamma"), "Should list gamma subsystem");
-        assert!(result.contains("50 symbol(s)"), "Each subsystem should have 50 nodes");
+        assert!(
+            result.contains("50 symbol(s)"),
+            "Each subsystem should have 50 nodes"
+        );
 
         // Should NOT contain full node listings (edge-kind grouped sections)
-        assert!(!result.contains("#### Calls"), "Should NOT have edge-kind grouped sections in summary mode");
+        assert!(
+            !result.contains("#### Calls"),
+            "Should NOT have edge-kind grouped sections in summary mode"
+        );
 
         // Output should be compact -- well under 10K chars for 150 nodes
-        assert!(result.len() < 5000, "Summary should be compact, got {} chars", result.len());
+        assert!(
+            result.len() < 5000,
+            "Summary should be compact, got {} chars",
+            result.len()
+        );
     }
 
     /// Adversarial: verify small impact results still show full listing.
@@ -2279,7 +3182,8 @@ mod tests {
 
         let root_node = make_node("SmallRoot", NodeKind::Struct, "src/root.rs");
         let mut dep = make_node("one_dep", NodeKind::Function, "src/dep.rs");
-        dep.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), "dep".to_string());
+        dep.metadata
+            .insert(crate::server::SUBSYSTEM_KEY.to_owned(), "dep".to_string());
         let edge = make_edge(&dep, &root_node, EdgeKind::Calls);
 
         let gs = make_graph_state_with_edges(vec![root_node.clone(), dep.clone()], vec![edge]);
@@ -2294,10 +3198,17 @@ mod tests {
         let result = search(&params, &ctx).await;
 
         // Should show full listing with edge-kind groups
-        assert!(result.contains("Impact analysis for"), "Should use standard heading for small results, got: {}", &result[..result.len().min(500)]);
+        assert!(
+            result.contains("Impact analysis for"),
+            "Should use standard heading for small results, got: {}",
+            &result[..result.len().min(500)]
+        );
         assert!(result.contains("one_dep"), "Should list individual nodes");
         // Should also have subsystem breakdown appended
-        assert!(result.contains("Affected subsystems"), "Should still have subsystem breakdown");
+        assert!(
+            result.contains("Affected subsystems"),
+            "Should still have subsystem breakdown"
+        );
     }
 
     /// Adversarial: moderate node count (below node threshold) but verbose output
@@ -2320,7 +3231,8 @@ mod tests {
             let mut node = make_node(&format!("verbose_fn_{}", i), NodeKind::Function, &file);
             // A 2000-char signature makes each node ~2KB+ in non-compact mode
             node.signature = format!("fn verbose_fn_{}({})", i, "x: SomeLongType, ".repeat(100));
-            node.metadata.insert(crate::server::SUBSYSTEM_KEY.to_owned(), sub.to_string());
+            node.metadata
+                .insert(crate::server::SUBSYSTEM_KEY.to_owned(), sub.to_string());
             all_edges.push(make_edge(&node, &root_node, EdgeKind::Calls));
             all_nodes.push(node);
         }
@@ -2361,7 +3273,11 @@ mod tests {
 
         // 150 nodes with NO subsystem metadata
         for i in 0..150 {
-            let node = make_node(&format!("orphan_{}", i), NodeKind::Function, "src/orphan.rs");
+            let node = make_node(
+                &format!("orphan_{}", i),
+                NodeKind::Function,
+                "src/orphan.rs",
+            );
             all_edges.push(make_edge(&node, &root_node, EdgeKind::Calls));
             all_nodes.push(node);
         }
@@ -2378,9 +3294,19 @@ mod tests {
         let result = search(&params, &ctx).await;
 
         // Should fall back to count-only summary
-        assert!(result.contains("150 dependent(s)"), "Should show total count, got: {}", &result[..result.len().min(500)]);
-        assert!(result.contains("result summarized"), "Should indicate summarized output");
-        assert!(result.contains("subsystem"), "Should hint to use subsystem filter");
+        assert!(
+            result.contains("150 dependent(s)"),
+            "Should show total count, got: {}",
+            &result[..result.len().min(500)]
+        );
+        assert!(
+            result.contains("result summarized"),
+            "Should indicate summarized output"
+        );
+        assert!(
+            result.contains("subsystem"),
+            "Should hint to use subsystem filter"
+        );
         // Should NOT crash or produce empty output
         assert!(result.len() > 50, "Should produce meaningful output");
     }
@@ -2415,8 +3341,14 @@ mod tests {
             ..Default::default()
         };
         let result = search(&params, &ctx).await;
-        assert!(result.contains("my_struct"), "depth=2 should include direct member");
-        assert!(result.contains("my_field"), "depth=2 should include sub-member");
+        assert!(
+            result.contains("my_struct"),
+            "depth=2 should include direct member"
+        );
+        assert!(
+            result.contains("my_field"),
+            "depth=2 should include sub-member"
+        );
         // Entry node name appears in the header ("Graph neighbors of my_module") but should NOT
         // appear as a neighbor result (i.e., not as a backreference to itself in the result list).
         // Check that my_struct and my_field are present (they are the actual results).
@@ -2459,9 +3391,18 @@ mod tests {
         let result_default = search(&params_default, &ctx).await;
 
         // Both should contain fn_b but not fn_c (only 1 hop)
-        assert!(result_d1.contains("fn_b"), "depth=1 should include direct member");
-        assert!(!result_d1.contains("fn_c"), "depth=1 should NOT include sub-member");
-        assert_eq!(result_d1, result_default, "depth=1 output should match default behavior");
+        assert!(
+            result_d1.contains("fn_b"),
+            "depth=1 should include direct member"
+        );
+        assert!(
+            !result_d1.contains("fn_c"),
+            "depth=1 should NOT include sub-member"
+        );
+        assert_eq!(
+            result_d1, result_default,
+            "depth=1 output should match default behavior"
+        );
     }
 
     #[tokio::test]
@@ -2482,7 +3423,12 @@ mod tests {
             make_edge(&node_b, &node_c, EdgeKind::Defines),
         ];
         let gs = make_graph_state_with_edges(
-            vec![module.clone(), node_a.clone(), node_b.clone(), node_c.clone()],
+            vec![
+                module.clone(),
+                node_a.clone(),
+                node_b.clone(),
+                node_c.clone(),
+            ],
             edges,
         );
         let repo_root = PathBuf::from("/tmp/test");
@@ -2501,7 +3447,13 @@ mod tests {
         // Count stable ID occurrences (e.g., "local:src/diamond.rs:shared_leaf:function")
         // to avoid false positives from name appearing multiple times on one result line.
         let stable_id_occurrences = result.matches(":shared_leaf:").count();
-        assert_eq!(stable_id_occurrences, 1, "shared_leaf stable ID should appear exactly once (dedup failed), got {} occurrences: {}", stable_id_occurrences, &result[..result.len().min(500)]);
+        assert_eq!(
+            stable_id_occurrences,
+            1,
+            "shared_leaf stable ID should appear exactly once (dedup failed), got {} occurrences: {}",
+            stable_id_occurrences,
+            &result[..result.len().min(500)]
+        );
         // branch_a and branch_b should both appear
         assert!(result.contains("branch_a"), "branch_a should be in results");
         assert!(result.contains("branch_b"), "branch_b should be in results");
@@ -2526,7 +3478,11 @@ mod tests {
             ..Default::default()
         };
         let result = search(&params, &ctx).await;
-        assert!(result.contains("depth > 1 is not supported"), "Should return error for nodes+depth>1: {}", result);
+        assert!(
+            result.contains("depth > 1 is not supported"),
+            "Should return error for nodes+depth>1: {}",
+            result
+        );
     }
 
     // ── Adversarial depth traversal tests ────────────────────────────
@@ -2544,10 +3500,7 @@ mod tests {
             make_edge(&node_a, &node_b, EdgeKind::Calls),
             make_edge(&node_b, &node_a, EdgeKind::Calls), // back-edge creating cycle
         ];
-        let gs = make_graph_state_with_edges(
-            vec![node_a.clone(), node_b.clone()],
-            edges,
-        );
+        let gs = make_graph_state_with_edges(vec![node_a.clone(), node_b.clone()], edges);
         let repo_root = PathBuf::from("/tmp/test");
         let ctx = make_search_context(&gs, &repo_root);
 
@@ -2560,9 +3513,15 @@ mod tests {
         };
         let result = search(&params, &ctx).await;
         // cycle_b should appear (level 1); cycle_a should NOT re-appear (it's in visited)
-        assert!(result.contains("cycle_b"), "cycle_b should appear in results");
+        assert!(
+            result.contains("cycle_b"),
+            "cycle_b should appear in results"
+        );
         // Result should be finite and not crash
-        assert!(result.len() < 100_000, "Output should be bounded even with cycles");
+        assert!(
+            result.len() < 100_000,
+            "Output should be bounded even with cycles"
+        );
     }
 
     #[tokio::test]
@@ -2581,13 +3540,19 @@ mod tests {
         let params = SearchParams {
             node: Some(node_b.stable_id()),
             mode: Some("impact".into()),
-            depth: Some(2),  // Should be ignored for impact mode
+            depth: Some(2), // Should be ignored for impact mode
             ..Default::default()
         };
         let result = search(&params, &ctx).await;
         // Should still find the impact (caller_fn) — just verifying no crash/silent error
-        assert!(!result.is_empty(), "impact mode with depth param should still produce output");
-        assert!(result.contains("Impact analysis"), "should be impact analysis output");
+        assert!(
+            !result.is_empty(),
+            "impact mode with depth param should still produce output"
+        );
+        assert!(
+            result.contains("Impact analysis"),
+            "should be impact analysis output"
+        );
     }
 
     #[tokio::test]
@@ -2605,10 +3570,8 @@ mod tests {
             make_edge(&node_mod, &fn_a, EdgeKind::Defines),
             make_edge(&fn_a, &fn_b, EdgeKind::Calls), // not Defines
         ];
-        let gs = make_graph_state_with_edges(
-            vec![node_mod.clone(), fn_a.clone(), fn_b.clone()],
-            edges,
-        );
+        let gs =
+            make_graph_state_with_edges(vec![node_mod.clone(), fn_a.clone(), fn_b.clone()], edges);
         let repo_root = PathBuf::from("/tmp/test");
         let ctx = make_search_context(&gs, &repo_root);
 
@@ -2621,9 +3584,14 @@ mod tests {
         };
         let result = search(&params, &ctx).await;
         // fn_a should appear (Defines edge at level 1)
-        assert!(result.contains("filtered_fn_a"), "fn_a should appear (Defines edge at level 1)");
+        assert!(
+            result.contains("filtered_fn_a"),
+            "fn_a should appear (Defines edge at level 1)"
+        );
         // fn_b should NOT appear (Calls edge at level 2 is filtered by edge_types=["defines"])
-        assert!(!result.contains("filtered_fn_b"), "fn_b should NOT appear (Calls edge is filtered)");
+        assert!(
+            !result.contains("filtered_fn_b"),
+            "fn_b should NOT appear (Calls edge is filtered)"
+        );
     }
-
 }

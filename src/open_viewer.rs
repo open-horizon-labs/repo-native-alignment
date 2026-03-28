@@ -77,17 +77,10 @@ async fn serve_index() -> Html<&'static str> {
     Html(VIEWER_HTML)
 }
 
-async fn handle_mcp(
-    State(state): State<Arc<ViewerState>>,
-    Json(call): Json<McpCall>,
-) -> Response {
+async fn handle_mcp(State(state): State<Arc<ViewerState>>, Json(call): Json<McpCall>) -> Response {
     match dispatch_tool(&state, &call).await {
         Ok(text) => Json(McpResponse { result: text }).into_response(),
-        Err(msg) => (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: msg }),
-        )
-            .into_response(),
+        Err(msg) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: msg })).into_response(),
     }
 }
 
@@ -97,10 +90,16 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
 
     match call.tool.as_str() {
         "repo_map" => {
-            let top_n = call.params.get("top_n")
+            let top_n = call
+                .params
+                .get("top_n")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(15) as usize;
-            let params = RepoMapParams { top_n, root_filter, non_code_slugs };
+            let params = RepoMapParams {
+                top_n,
+                root_filter,
+                non_code_slugs,
+            };
             let ctx = RepoMapContext {
                 graph_state: &state.graph,
                 repo_root: &state.repo_root,
@@ -111,16 +110,56 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
         }
 
         "search" => {
-            let query = call.params.get("query").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let node = call.params.get("node").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let mode = call.params.get("mode").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let direction = call.params.get("direction").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let depth = call.params.get("depth").and_then(|v| v.as_u64()).map(|v| v as u32);
-            let hops = call.params.get("hops").and_then(|v| v.as_u64()).map(|v| v as u32);
-            let kind = call.params.get("kind").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let limit = call.params.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
-            let compact = call.params.get("compact").and_then(|v| v.as_bool()).unwrap_or(false);
-            let subsystem = call.params.get("subsystem").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let query = call
+                .params
+                .get("query")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let node = call
+                .params
+                .get("node")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let mode = call
+                .params
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let direction = call
+                .params
+                .get("direction")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let depth = call
+                .params
+                .get("depth")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let hops = call
+                .params
+                .get("hops")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let kind = call
+                .params
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let limit = call
+                .params
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let compact = call
+                .params
+                .get("compact")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let subsystem = call
+                .params
+                .get("subsystem")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             let params = SearchParams {
                 query,
@@ -146,6 +185,9 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
                 subsystem,
                 target_subsystem: None,
                 edge_types: None,
+                include_body: false,
+                minify_body: false,
+                verbose: false,
             };
             let ctx = SearchContext {
                 graph_state: &state.graph,
@@ -161,7 +203,7 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
 
         "list_roots" => {
             let index_map = state.graph.node_index_map();
-            let slugs: HashSet<String> = GraphState::root_slugs_from_index_map(&index_map)
+            let slugs: HashSet<String> = GraphState::root_slugs_from_index_map(index_map)
                 .into_iter()
                 .collect();
             Ok(list_roots_from_slugs(
@@ -174,20 +216,42 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
         }
 
         "graph_query" => {
-            let node = call.params.get("node").and_then(|v| v.as_str())
+            let node = call
+                .params
+                .get("node")
+                .and_then(|v| v.as_str())
                 .ok_or_else(|| "graph_query requires 'node'".to_string())?
                 .to_string();
-            let mode = call.params.get("mode").and_then(|v| v.as_str())
+            let mode = call
+                .params
+                .get("mode")
+                .and_then(|v| v.as_str())
                 .unwrap_or("neighbors")
                 .to_string();
-            let direction = call.params.get("direction").and_then(|v| v.as_str())
+            let direction = call
+                .params
+                .get("direction")
+                .and_then(|v| v.as_str())
                 .unwrap_or("outgoing")
                 .to_string();
-            let max_hops = call.params.get("max_hops").and_then(|v| v.as_u64()).map(|v| v as usize);
-            let edge_types = call.params.get("edge_types").and_then(|v| v.as_str())
+            let max_hops = call
+                .params
+                .get("max_hops")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let edge_types = call
+                .params
+                .get("edge_types")
+                .and_then(|v| v.as_str())
                 .map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
 
-            let gp = GraphParams { node, mode, direction, edge_types, max_hops };
+            let gp = GraphParams {
+                node,
+                mode,
+                direction,
+                edge_types,
+                max_hops,
+            };
             match crate::service::graph_query(&gp, &state.graph) {
                 Ok(out) => Ok(out),
                 Err(msg) => Err(msg),
@@ -215,7 +279,8 @@ async fn bind_random_port() -> anyhow::Result<TcpListener> {
 /// 3. Opens the browser.
 /// 4. Blocks until Ctrl-C.
 pub async fn run(repo: PathBuf) -> anyhow::Result<()> {
-    let repo_root = repo.canonicalize()
+    let repo_root = repo
+        .canonicalize()
         .map_err(|e| anyhow::anyhow!("Cannot resolve repo path {}: {}", repo.display(), e))?;
 
     // Load graph from LanceDB cache.
@@ -228,9 +293,14 @@ pub async fn run(repo: PathBuf) -> anyhow::Result<()> {
     }
 
     eprintln!("Loading graph from cache...");
-    let graph = crate::server::load_graph_from_lance(&repo_root).await
+    let graph = crate::server::load_graph_from_lance(&repo_root)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to load graph: {}", e))?;
-    eprintln!("  {} symbols, {} edges", graph.nodes.len(), graph.edges.len());
+    eprintln!(
+        "  {} symbols, {} edges",
+        graph.nodes.len(),
+        graph.edges.len()
+    );
 
     // Load embedding index (optional — semantic search in the viewer).
     let embed_index = match EmbeddingIndex::new(&repo_root).await {
@@ -280,12 +350,22 @@ pub async fn run(repo: PathBuf) -> anyhow::Result<()> {
 
 fn open_browser(url: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
-    { let _ = std::process::Command::new("open").arg(url).spawn()?; }
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn()?;
+    }
     #[cfg(target_os = "linux")]
-    { let _ = std::process::Command::new("xdg-open").arg(url).spawn()?; }
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn()?;
+    }
     #[cfg(target_os = "windows")]
-    { let _ = std::process::Command::new("cmd").args(["/c", "start", url]).spawn()?; }
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", url])
+            .spawn()?;
+    }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    { eprintln!("Automatic browser open not supported on this platform. Open: {url}"); }
+    {
+        eprintln!("Automatic browser open not supported on this platform. Open: {url}");
+    }
     Ok(())
 }

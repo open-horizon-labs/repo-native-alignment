@@ -432,18 +432,20 @@ fn install_oh_skills() -> Result<()> {
 
 fn installed_binary_path() -> Result<PathBuf> {
     if let Ok(root) = std::env::var("CARGO_INSTALL_ROOT")
-        && !root.is_empty() {
-            return Ok(PathBuf::from(root)
-                .join("bin")
-                .join("repo-native-alignment"));
-        }
+        && !root.is_empty()
+    {
+        return Ok(PathBuf::from(root)
+            .join("bin")
+            .join("repo-native-alignment"));
+    }
 
     if let Ok(home) = std::env::var("CARGO_HOME")
-        && !home.is_empty() {
-            return Ok(PathBuf::from(home)
-                .join("bin")
-                .join("repo-native-alignment"));
-        }
+        && !home.is_empty()
+    {
+        return Ok(PathBuf::from(home)
+            .join("bin")
+            .join("repo-native-alignment"));
+    }
 
     let home = std::env::var("HOME").context(
         "Cannot determine installed binary path; set CARGO_INSTALL_ROOT, CARGO_HOME, or HOME",
@@ -861,7 +863,10 @@ mod tests {
         );
         assert_eq!(v["mcpServers"]["rna-server"]["args"][0], "--repo");
         assert_eq!(v["mcpServers"]["rna-server"]["args"][1], "/my/project");
-        assert_eq!(v["mcpServers"]["rna-server"]["timeout"], DEFAULT_MCP_TIMEOUT_MS);
+        assert_eq!(
+            v["mcpServers"]["rna-server"]["timeout"],
+            DEFAULT_MCP_TIMEOUT_MS
+        );
     }
 
     // ── merge preserves other servers ────────────────────────────────────────
@@ -928,7 +933,10 @@ mod tests {
             "/new/bin/repo-native-alignment"
         );
         assert_eq!(v["mcpServers"]["rna-server"]["args"][1], "/new/project");
-        assert_eq!(v["mcpServers"]["rna-server"]["timeout"], DEFAULT_MCP_TIMEOUT_MS);
+        assert_eq!(
+            v["mcpServers"]["rna-server"]["timeout"],
+            DEFAULT_MCP_TIMEOUT_MS
+        );
     }
 
     // ── idempotent merge ─────────────────────────────────────────────────────

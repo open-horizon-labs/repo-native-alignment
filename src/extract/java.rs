@@ -8,9 +8,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::graph::{
-    Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind,
-};
+use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
 use super::configs::JAVA_CONFIG;
 use super::generic::GenericExtractor;
@@ -84,41 +82,51 @@ fn collect_java_specials(
                 for i in 0..node.child_count() {
                     if let Some(decl) = node.child(i as u32)
                         && decl.kind() == "variable_declarator"
-                            && let Some(name_node) = decl.child_by_field_name("name") {
-                                let name = name_node.utf8_text(source).unwrap_or("unknown").trim().to_string();
-                                let sig = decl_text.lines().next().unwrap_or("").trim().to_string();
-                                let value_str = decl
-                                    .child_by_field_name("value")
-                                    .and_then(|v| v.utf8_text(source).ok())
-                                    .map(|s| s.trim().to_string());
-                                let mut metadata = BTreeMap::new();
-                                metadata.insert("name_col".to_string(), name_node.start_position().column.to_string());
-                                if let Some(ref v) = value_str {
-                                    let is_scalar = v.starts_with('"') || v.starts_with('\'')
-                                        || v.parse::<f64>().is_ok()
-                                        || v == "true" || v == "false";
-                                    if is_scalar {
-                                        let stripped = v.trim_matches('"').trim_matches('\'');
-                                        metadata.insert("value".to_string(), stripped.to_string());
-                                    }
-                                }
-                                metadata.insert("synthetic".to_string(), "false".to_string());
-                                nodes.push(Node {
-                                    id: NodeId {
-                                        root: String::new(),
-                                        file: path.to_path_buf(),
-                                        name,
-                                        kind: NodeKind::Const,
-                                    },
-                                    language: "java".to_string(),
-                                    line_start: node.start_position().row + 1,
-                                    line_end: node.end_position().row + 1,
-                                    signature: sig,
-                                    body: decl_text.clone(),
-                                    metadata,
-                                    source: ExtractionSource::TreeSitter,
-                                });
+                        && let Some(name_node) = decl.child_by_field_name("name")
+                    {
+                        let name = name_node
+                            .utf8_text(source)
+                            .unwrap_or("unknown")
+                            .trim()
+                            .to_string();
+                        let sig = decl_text.lines().next().unwrap_or("").trim().to_string();
+                        let value_str = decl
+                            .child_by_field_name("value")
+                            .and_then(|v| v.utf8_text(source).ok())
+                            .map(|s| s.trim().to_string());
+                        let mut metadata = BTreeMap::new();
+                        metadata.insert(
+                            "name_col".to_string(),
+                            name_node.start_position().column.to_string(),
+                        );
+                        if let Some(ref v) = value_str {
+                            let is_scalar = v.starts_with('"')
+                                || v.starts_with('\'')
+                                || v.parse::<f64>().is_ok()
+                                || v == "true"
+                                || v == "false";
+                            if is_scalar {
+                                let stripped = v.trim_matches('"').trim_matches('\'');
+                                metadata.insert("value".to_string(), stripped.to_string());
                             }
+                        }
+                        metadata.insert("synthetic".to_string(), "false".to_string());
+                        nodes.push(Node {
+                            id: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name,
+                                kind: NodeKind::Const,
+                            },
+                            language: "java".to_string(),
+                            line_start: node.start_position().row + 1,
+                            line_end: node.end_position().row + 1,
+                            signature: sig,
+                            body: decl_text.clone(),
+                            metadata,
+                            source: ExtractionSource::TreeSitter,
+                        });
+                    }
                 }
             }
         }
@@ -192,14 +200,23 @@ public interface Service {
         let result = extractor.extract(Path::new("Service.java"), code).unwrap();
 
         // Interface itself should be found as Trait
-        let service = result.nodes.iter().find(|n| n.id.name == "Service" && n.id.kind == NodeKind::Trait);
+        let service = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Service" && n.id.kind == NodeKind::Trait);
         assert!(service.is_some(), "Should find interface Service");
 
         // Interface methods should be indexed as Function nodes
-        let serve = result.nodes.iter().find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function);
+        let serve = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function);
         assert!(serve.is_some(), "Should find interface method serve");
 
-        let get_name = result.nodes.iter().find(|n| n.id.name == "getName" && n.id.kind == NodeKind::Function);
+        let get_name = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "getName" && n.id.kind == NodeKind::Function);
         assert!(get_name.is_some(), "Should find interface method getName");
 
         // Methods should have parent_scope pointing to the interface
@@ -233,16 +250,42 @@ public class MyService {
     }
 }
 "#;
-        let result = extractor.extract(Path::new("MyService.java"), code).unwrap();
+        let result = extractor
+            .extract(Path::new("MyService.java"), code)
+            .unwrap();
 
-        let create = result.nodes.iter().find(|n| n.id.name == "create" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(create.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "static create() should be static");
+        let create = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "create" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            create.metadata.get("is_static").map(|s| s.as_str()),
+            Some("true"),
+            "static create() should be static"
+        );
 
-        let serve = result.nodes.iter().find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(serve.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "serve() should be instance");
+        let serve = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "serve" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            serve.metadata.get("is_static").map(|s| s.as_str()),
+            Some("false"),
+            "serve() should be instance"
+        );
 
-        let count = result.nodes.iter().find(|n| n.id.name == "count" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(count.metadata.get("is_static").map(|s| s.as_str()), Some("true"), "static count() should be static");
+        let count = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "count" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            count.metadata.get("is_static").map(|s| s.as_str()),
+            Some("true"),
+            "static count() should be static"
+        );
     }
 
     #[test]
@@ -257,7 +300,15 @@ public class Foo {
 "#;
         let result = extractor.extract(Path::new("Foo.java"), code).unwrap();
 
-        let ctor = result.nodes.iter().find(|n| n.id.name == "Foo" && n.id.kind == NodeKind::Function).unwrap();
-        assert_eq!(ctor.metadata.get("is_static").map(|s| s.as_str()), Some("false"), "Constructor should be instance (no static keyword)");
+        let ctor = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "Foo" && n.id.kind == NodeKind::Function)
+            .unwrap();
+        assert_eq!(
+            ctor.metadata.get("is_static").map(|s| s.as_str()),
+            Some("false"),
+            "Constructor should be instance (no static keyword)"
+        );
     }
 }

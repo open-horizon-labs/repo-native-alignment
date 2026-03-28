@@ -6,10 +6,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
+use petgraph::Direction;
 use petgraph::algo::{dijkstra, tarjan_scc};
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef as PetgraphEdgeRef;
-use petgraph::Direction;
 
 use super::{Edge, EdgeKind};
 use crate::ranking::is_test_path;
@@ -165,9 +165,7 @@ impl GraphIndex {
 
     /// Get the NodeRef for a given node ID, if it exists.
     pub fn get_node(&self, id: &str) -> Option<&NodeRef> {
-        self.node_lookup
-            .get(id)
-            .map(|&idx| &self.graph[idx])
+        self.node_lookup.get(id).map(|&idx| &self.graph[idx])
     }
 
     /// 1-hop filtered neighbors of a node.
@@ -192,9 +190,10 @@ impl GraphIndex {
         for edge_ref in edges {
             // Filter by edge type if specified
             if let Some(types) = edge_types
-                && !types.contains(&edge_ref.weight().edge_type) {
-                    continue;
-                }
+                && !types.contains(&edge_ref.weight().edge_type)
+            {
+                continue;
+            }
 
             let neighbor_idx = match direction {
                 Direction::Outgoing => edge_ref.target(),
@@ -228,9 +227,10 @@ impl GraphIndex {
         for edge_ref in edges {
             let kind = &edge_ref.weight().edge_type;
             if let Some(types) = edge_types
-                && !types.contains(kind) {
-                    continue;
-                }
+                && !types.contains(kind)
+            {
+                continue;
+            }
 
             let neighbor_idx = match direction {
                 Direction::Outgoing => edge_ref.target(),
@@ -274,9 +274,10 @@ impl GraphIndex {
 
             for edge_ref in self.graph.edges_directed(current, Direction::Outgoing) {
                 if let Some(types) = edge_types
-                    && !types.contains(&edge_ref.weight().edge_type) {
-                        continue;
-                    }
+                    && !types.contains(&edge_ref.weight().edge_type)
+                {
+                    continue;
+                }
 
                 let neighbor = edge_ref.target();
                 if visited.insert(neighbor) {
@@ -323,9 +324,10 @@ impl GraphIndex {
 
             for edge_ref in self.graph.edges_directed(current, Direction::Incoming) {
                 if let Some(types) = edge_types
-                    && !types.contains(&edge_ref.weight().edge_type) {
-                        continue;
-                    }
+                    && !types.contains(&edge_ref.weight().edge_type)
+                {
+                    continue;
+                }
 
                 let neighbor = edge_ref.source();
                 if visited.insert(neighbor) {
@@ -366,8 +368,8 @@ impl GraphIndex {
         let mut sub_lookup: HashMap<String, NodeIndex> = HashMap::new();
 
         let ensure_sub_node = |g: &mut DiGraph<String, ()>,
-                                lk: &mut HashMap<String, NodeIndex>,
-                                id: &str|
+                               lk: &mut HashMap<String, NodeIndex>,
+                               id: &str|
          -> NodeIndex {
             if let Some(&idx) = lk.get(id) {
                 idx
@@ -405,7 +407,11 @@ impl GraphIndex {
     /// Return the SCC ring that contains `node_id`, if any.
     ///
     /// Returns `None` if the node has no cycle membership.
-    pub fn cycle_for_node(&self, node_id: &str, edge_types: Option<&[EdgeKind]>) -> Option<Vec<String>> {
+    pub fn cycle_for_node(
+        &self,
+        node_id: &str,
+        edge_types: Option<&[EdgeKind]>,
+    ) -> Option<Vec<String>> {
         self.detect_cycles(edge_types)
             .into_iter()
             .find(|ring| ring.contains(&node_id.to_string()))
@@ -449,9 +455,9 @@ impl GraphIndex {
         let mut orig_to_sub: HashMap<NodeIndex, NodeIndex> = HashMap::new();
 
         let ensure_sub = |g: &mut DiGraph<String, ()>,
-                           map: &mut HashMap<NodeIndex, NodeIndex>,
-                           orig: NodeIndex,
-                           label: &str|
+                          map: &mut HashMap<NodeIndex, NodeIndex>,
+                          orig: NodeIndex,
+                          label: &str|
          -> NodeIndex {
             if let Some(&s) = map.get(&orig) {
                 s
@@ -476,7 +482,7 @@ impl GraphIndex {
         }
 
         let sub_from = *orig_to_sub.get(&from_idx)?;
-        let sub_to   = *orig_to_sub.get(&to_idx)?;
+        let sub_to = *orig_to_sub.get(&to_idx)?;
 
         // Dijkstra with uniform edge weight 1. Returns distances from sub_from.
         let distances = dijkstra(&sub, sub_from, Some(sub_to), |_| 1u32);
@@ -586,10 +592,7 @@ impl GraphIndex {
         }
 
         // Max-normalize to [0, 1]
-        let max_score = scores
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
+        let max_score = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
         let mut result = HashMap::new();
         if max_score <= 0.0 {
@@ -603,7 +606,6 @@ impl GraphIndex {
         }
         result
     }
-
 
     /// Detect subsystems via Louvain community detection on coupling edges.
     ///
@@ -842,9 +844,10 @@ impl GraphIndex {
                     if nr.node_type == "module" {
                         // Extract the node name from the stable ID: "root:file:name:kind"
                         if let Some(before_kind) = nr.id.rsplit_once(':')
-                            && let Some((_, name)) = before_kind.0.rsplit_once(':') {
-                                module_names.push(name.to_string());
-                            }
+                            && let Some((_, name)) = before_kind.0.rsplit_once(':')
+                        {
+                            module_names.push(name.to_string());
+                        }
                     }
                 }
             }
@@ -944,8 +947,7 @@ fn louvain_phase1(
 
             // Modularity gain from removing node from its current community.
             // The gamma factor scales the expected-edges penalty term.
-            let remove_delta =
-                -w_to_current / m2 + gamma * ki * (sigma_current - ki) / (m2 * m2);
+            let remove_delta = -w_to_current / m2 + gamma * ki * (sigma_current - ki) / (m2 * m2);
 
             let mut best_comm = current_comm;
             let mut best_gain = 0.0;
@@ -954,10 +956,8 @@ fn louvain_phase1(
                 if candidate_comm == current_comm {
                     continue;
                 }
-                let sigma_candidate =
-                    sigma_tot.get(&candidate_comm).copied().unwrap_or(0.0);
-                let insert_delta =
-                    w_to_candidate / m2 - gamma * ki * sigma_candidate / (m2 * m2);
+                let sigma_candidate = sigma_tot.get(&candidate_comm).copied().unwrap_or(0.0);
+                let insert_delta = w_to_candidate / m2 - gamma * ki * sigma_candidate / (m2 * m2);
                 let gain = remove_delta + insert_delta;
                 if gain > best_gain {
                     best_gain = gain;
@@ -1125,7 +1125,10 @@ fn louvain_phase2(
             }
             let to_size = comm_sizes[&to];
             let from_size = from_members.len();
-            community_members.entry(to).or_default().extend(from_members);
+            community_members
+                .entry(to)
+                .or_default()
+                .extend(from_members);
             *comm_sizes.get_mut(&to).unwrap() = to_size + from_size;
             comm_sizes.remove(&from);
 
@@ -1145,7 +1148,11 @@ fn louvain_phase2(
                     nbrs.remove(&from);
                 }
                 // Get the weight of the (from, other) cross-edge and remove it.
-                let key = if from < other { (from, other) } else { (other, from) };
+                let key = if from < other {
+                    (from, other)
+                } else {
+                    (other, from)
+                };
                 let w = cross_weights.remove(&key).unwrap_or(0.0);
                 if other == to {
                     // The (from, to) edge is now intra-community — drop it.
@@ -1765,8 +1772,7 @@ mod tests {
         }
 
         // Strip entry nodes from results (matches handler behavior)
-        let entry_set: std::collections::HashSet<&str> =
-            entry_ids.iter().copied().collect();
+        let entry_set: std::collections::HashSet<&str> = entry_ids.iter().copied().collect();
         all_ids.retain(|id| !entry_set.contains(id.as_str()));
         all_ids
     }
@@ -1850,7 +1856,8 @@ mod tests {
     fn test_multi_entry_nonexistent_entry_nodes_produce_empty() {
         let index = GraphIndex::new();
         // No nodes in graph at all
-        let result = multi_entry_neighbors(&index, &["ghost1", "ghost2"], None, Direction::Outgoing);
+        let result =
+            multi_entry_neighbors(&index, &["ghost1", "ghost2"], None, Direction::Outgoing);
         assert!(result.is_empty());
     }
 
@@ -1898,7 +1905,10 @@ mod tests {
         let scores = index.compute_pagerank(0.85, 20);
         assert_eq!(scores.len(), 3);
         // c receives more incoming flow than a
-        assert!(scores["c"] > scores["a"], "sink should rank higher than source");
+        assert!(
+            scores["c"] > scores["a"],
+            "sink should rank higher than source"
+        );
     }
 
     #[test]
@@ -1913,7 +1923,10 @@ mod tests {
 
         let scores = index.compute_pagerank(0.85, 20);
         // d should have higher importance than f (3 callers vs 1 caller)
-        assert!(scores["d"] > scores["f"], "hub should rank higher than leaf");
+        assert!(
+            scores["d"] > scores["f"],
+            "hub should rank higher than leaf"
+        );
     }
 
     #[test]
@@ -1926,11 +1939,19 @@ mod tests {
         let scores = index.compute_pagerank(0.85, 20);
         // Scores should be in [0, 1] range
         for &score in scores.values() {
-            assert!(score >= 0.0 && score <= 1.0, "score {} out of [0,1] range", score);
+            assert!(
+                score >= 0.0 && score <= 1.0,
+                "score {} out of [0,1] range",
+                score
+            );
         }
         // At least one node should have max score of 1.0
         let max = scores.values().copied().fold(f64::NEG_INFINITY, f64::max);
-        assert!((max - 1.0).abs() < 0.01, "max score should be ~1.0, got {}", max);
+        assert!(
+            (max - 1.0).abs() < 0.01,
+            "max score should be ~1.0, got {}",
+            max
+        );
     }
 
     // ==================== Adversarial PageRank tests ====================
@@ -1951,12 +1972,20 @@ mod tests {
         let scores = index.compute_pagerank(0.85, 20);
         assert_eq!(scores.len(), 5, "all 5 nodes should have scores");
         for (id, &score) in &scores {
-            assert!(score >= 0.0 && score <= 1.0,
-                "node {} has out-of-range score {}", id, score);
+            assert!(
+                score >= 0.0 && score <= 1.0,
+                "node {} has out-of-range score {}",
+                id,
+                score
+            );
             assert!(!score.is_nan(), "node {} has NaN score", id);
         }
         let max = scores.values().copied().fold(f64::NEG_INFINITY, f64::max);
-        assert!((max - 1.0).abs() < 0.01, "max score should be ~1.0, got {}", max);
+        assert!(
+            (max - 1.0).abs() < 0.01,
+            "max score should be ~1.0, got {}",
+            max
+        );
     }
 
     /// Dissent finding: near-uniform distribution on small symmetric graphs.
@@ -1980,7 +2009,11 @@ mod tests {
         let max = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         // After max-normalization, max is 1.0 and min should be very close
         assert!((max - 1.0).abs() < 0.01);
-        assert!(min > 0.9, "in a clique, min should be near max, got {}", min);
+        assert!(
+            min > 0.9,
+            "in a clique, min should be near max, got {}",
+            min
+        );
     }
 
     /// Dissent finding: 20 iterations may not converge on deep chains.
@@ -1991,8 +2024,10 @@ mod tests {
         let mut index = GraphIndex::new();
         for i in 0..49 {
             index.add_edge(
-                &format!("a{}", i), "fn",
-                &format!("a{}", i + 1), "fn",
+                &format!("a{}", i),
+                "fn",
+                &format!("a{}", i + 1),
+                "fn",
                 EdgeKind::Calls,
             );
         }
@@ -2002,15 +2037,23 @@ mod tests {
 
         // All scores valid
         for (id, &score) in &scores {
-            assert!(score >= 0.0 && score <= 1.0 && !score.is_nan(),
-                "node {} has invalid score {}", id, score);
+            assert!(
+                score >= 0.0 && score <= 1.0 && !score.is_nan(),
+                "node {} has invalid score {}",
+                id,
+                score
+            );
         }
 
         // Sink (a49) should have the highest score
         let sink_score = scores[&format!("a49")];
         let source_score = scores[&format!("a0")];
-        assert!(sink_score > source_score,
-            "sink should rank higher than source: {} vs {}", sink_score, source_score);
+        assert!(
+            sink_score > source_score,
+            "sink should rank higher than source: {} vs {}",
+            sink_score,
+            source_score
+        );
     }
 
     // ==================== Edge-type weighted PageRank tests ====================
@@ -2050,9 +2093,27 @@ mod tests {
         index.add_edge("impl_b", "impl", "trait_hub", "trait", EdgeKind::Implements);
         index.add_edge("impl_c", "impl", "trait_hub", "trait", EdgeKind::Implements);
         // "struct_hub" receives 3 HasField edges
-        index.add_edge("struct_a", "struct", "struct_hub", "field", EdgeKind::HasField);
-        index.add_edge("struct_b", "struct", "struct_hub", "field", EdgeKind::HasField);
-        index.add_edge("struct_c", "struct", "struct_hub", "field", EdgeKind::HasField);
+        index.add_edge(
+            "struct_a",
+            "struct",
+            "struct_hub",
+            "field",
+            EdgeKind::HasField,
+        );
+        index.add_edge(
+            "struct_b",
+            "struct",
+            "struct_hub",
+            "field",
+            EdgeKind::HasField,
+        );
+        index.add_edge(
+            "struct_c",
+            "struct",
+            "struct_hub",
+            "field",
+            EdgeKind::HasField,
+        );
 
         let scores = index.compute_pagerank(0.85, 20);
         assert!(
@@ -2073,8 +2134,10 @@ mod tests {
         // "defined_many" gets 5 Defines edges
         for i in 0..5 {
             index.add_edge(
-                &format!("definer_{}", i), "struct",
-                "defined_many", "field",
+                &format!("definer_{}", i),
+                "struct",
+                "defined_many",
+                "field",
                 EdgeKind::Defines,
             );
         }
@@ -2119,8 +2182,16 @@ mod tests {
 
         let groups = index.neighbors_grouped("a", None, Direction::Outgoing);
         assert_eq!(groups.len(), 2, "should have 2 edge types");
-        assert_eq!(groups[&EdgeKind::Calls].len(), 2, "should have 2 Calls neighbors");
-        assert_eq!(groups[&EdgeKind::DependsOn].len(), 1, "should have 1 DependsOn neighbor");
+        assert_eq!(
+            groups[&EdgeKind::Calls].len(),
+            2,
+            "should have 2 Calls neighbors"
+        );
+        assert_eq!(
+            groups[&EdgeKind::DependsOn].len(),
+            1,
+            "should have 1 DependsOn neighbor"
+        );
         assert!(groups[&EdgeKind::Calls].contains(&"b".to_string()));
         assert!(groups[&EdgeKind::Calls].contains(&"d".to_string()));
         assert!(groups[&EdgeKind::DependsOn].contains(&"c".to_string()));
@@ -2140,7 +2211,11 @@ mod tests {
         index.add_edge("a", "fn", "c", "struct", EdgeKind::DependsOn);
         index.add_edge("a", "fn", "d", "fn", EdgeKind::Implements);
 
-        let groups = index.neighbors_grouped("a", Some(&[EdgeKind::Calls, EdgeKind::Implements]), Direction::Outgoing);
+        let groups = index.neighbors_grouped(
+            "a",
+            Some(&[EdgeKind::Calls, EdgeKind::Implements]),
+            Direction::Outgoing,
+        );
         assert_eq!(groups.len(), 2, "should only have filtered edge types");
         assert!(!groups.contains_key(&EdgeKind::DependsOn));
         assert_eq!(groups[&EdgeKind::Calls].len(), 1);
@@ -2547,11 +2622,8 @@ mod tests {
             ("a", "src/server/handlers/auth.rs"),
             ("b", "src/server/handlers/user.rs"),
         ]);
-        let name = compute_cluster_name(
-            &["a".to_string(), "b".to_string()],
-            &file_map,
-            &no_modules,
-        );
+        let name =
+            compute_cluster_name(&["a".to_string(), "b".to_string()], &file_map, &no_modules);
         assert_eq!(name, "server/handlers");
 
         // Mixed nested paths -> common prefix is "server"
@@ -2559,11 +2631,8 @@ mod tests {
             ("a", "src/server/handlers/auth.rs"),
             ("b", "src/server/routes.rs"),
         ]);
-        let name = compute_cluster_name(
-            &["a".to_string(), "b".to_string()],
-            &file_map,
-            &no_modules,
-        );
+        let name =
+            compute_cluster_name(&["a".to_string(), "b".to_string()], &file_map, &no_modules);
         assert_eq!(name, "server");
     }
 
@@ -2714,13 +2783,7 @@ mod tests {
         for i in 0..prod_nodes.len() {
             for j in 0..prod_nodes.len() {
                 if i != j {
-                    index.add_edge(
-                        &prod_nodes[i],
-                        "fn",
-                        &prod_nodes[j],
-                        "fn",
-                        EdgeKind::Calls,
-                    );
+                    index.add_edge(&prod_nodes[i], "fn", &prod_nodes[j], "fn", EdgeKind::Calls);
                 }
             }
         }
@@ -2730,13 +2793,7 @@ mod tests {
         for i in 0..test_nodes.len() {
             for j in 0..test_nodes.len() {
                 if i != j {
-                    index.add_edge(
-                        &test_nodes[i],
-                        "fn",
-                        &test_nodes[j],
-                        "fn",
-                        EdgeKind::Calls,
-                    );
+                    index.add_edge(&test_nodes[i], "fn", &test_nodes[j], "fn", EdgeKind::Calls);
                 }
             }
         }
@@ -2848,7 +2905,7 @@ mod tests {
 
     #[test]
     fn test_group_subsystems_by_prefix_groups_shared_prefix() {
-        use super::{group_subsystems_by_prefix, Subsystem};
+        use super::{Subsystem, group_subsystems_by_prefix};
         let subsystems = vec![
             Subsystem {
                 name: "extract/Node".into(),
@@ -2888,7 +2945,7 @@ mod tests {
 
     #[test]
     fn test_group_subsystems_by_prefix_single_child_no_group() {
-        use super::{group_subsystems_by_prefix, Subsystem};
+        use super::{Subsystem, group_subsystems_by_prefix};
         let subsystems = vec![Subsystem {
             name: "embed/model".into(),
             symbol_count: 30,
@@ -2918,7 +2975,10 @@ mod tests {
             .map(String::from)
             .collect();
         let name = child_name_from_files(&member_ids, &node_file_map, "server");
-        assert_eq!(name, "graph", "Should use most-common second-level dir component");
+        assert_eq!(
+            name, "graph",
+            "Should use most-common second-level dir component"
+        );
     }
 
     #[test]
@@ -2928,10 +2988,7 @@ mod tests {
         node_file_map.insert("id1".to_string(), "src/extract/lsp/mod.rs".to_string());
         node_file_map.insert("id2".to_string(), "src/extract/lsp/enricher.rs".to_string());
 
-        let member_ids: Vec<String> = vec!["id1", "id2"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let member_ids: Vec<String> = vec!["id1", "id2"].into_iter().map(String::from).collect();
         let name = child_name_from_files(&member_ids, &node_file_map, "extract");
         assert_eq!(name, "lsp", "Should use second-level directory name");
     }
@@ -2943,17 +3000,14 @@ mod tests {
         node_file_map.insert("id1".to_string(), "src/embed.rs".to_string());
         node_file_map.insert("id2".to_string(), "src/embed.rs".to_string());
 
-        let member_ids: Vec<String> = vec!["id1", "id2"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let member_ids: Vec<String> = vec!["id1", "id2"].into_iter().map(String::from).collect();
         let name = child_name_from_files(&member_ids, &node_file_map, "server");
         assert_eq!(name, "embed", "Should use file stem for flat src/ files");
     }
 
     #[test]
     fn test_group_subsystems_weighted_cohesion() {
-        use super::{group_subsystems_by_prefix, Subsystem};
+        use super::{Subsystem, group_subsystems_by_prefix};
         let subsystems = vec![
             Subsystem {
                 name: "md/parse".into(),
@@ -3005,7 +3059,11 @@ mod tests {
         assert_eq!(rings[0].len(), 3);
         // All three nodes are in the ring
         for node in &["a", "b", "c"] {
-            assert!(rings[0].contains(&node.to_string()), "{} should be in ring", node);
+            assert!(
+                rings[0].contains(&node.to_string()),
+                "{} should be in ring",
+                node
+            );
         }
     }
 
@@ -3098,7 +3156,10 @@ mod tests {
         index.add_edge("c", "fn", "d", "fn", EdgeKind::Calls);
 
         let path = index.shortest_path("a", "d", None);
-        assert_eq!(path, Some(vec!["b".to_string(), "c".to_string(), "d".to_string()]));
+        assert_eq!(
+            path,
+            Some(vec!["b".to_string(), "c".to_string(), "d".to_string()])
+        );
     }
 
     #[test]
@@ -3210,7 +3271,7 @@ mod tests {
         let mut index = GraphIndex::new();
         for i in 0..n {
             let from = format!("n{}", i);
-            let to   = format!("n{}", (i + 1) % n);
+            let to = format!("n{}", (i + 1) % n);
             index.add_edge(&from, "fn", &to, "fn", EdgeKind::Calls);
         }
 
@@ -3218,7 +3279,11 @@ mod tests {
         assert_eq!(rings.len(), 1);
         assert_eq!(rings[0].len(), n);
         for i in 0..n {
-            assert!(rings[0].contains(&format!("n{}", i)), "n{} missing from ring", i);
+            assert!(
+                rings[0].contains(&format!("n{}", i)),
+                "n{} missing from ring",
+                i
+            );
         }
     }
 
@@ -3235,7 +3300,9 @@ mod tests {
         index.add_edge("y", "fn", "z", "fn", EdgeKind::Calls);
         index.add_edge("z", "fn", "x", "fn", EdgeKind::Calls);
 
-        let ring = index.cycle_for_node("z", None).expect("z should be in a ring");
+        let ring = index
+            .cycle_for_node("z", None)
+            .expect("z should be in a ring");
         assert_eq!(ring.len(), 3);
         assert!(ring.contains(&"x".to_string()));
         assert!(ring.contains(&"y".to_string()));
@@ -3435,9 +3502,15 @@ mod tests {
 
         let pagerank = index.compute_pagerank(0.85, 20);
         let mut file_map: HashMap<String, String> = HashMap::new();
-        for n in a.iter() { file_map.insert(n.clone(), "src/alpha/mod.rs".to_string()); }
-        for n in b.iter() { file_map.insert(n.clone(), "src/beta/mod.rs".to_string()); }
-        for n in c.iter() { file_map.insert(n.clone(), "src/gamma/mod.rs".to_string()); }
+        for n in a.iter() {
+            file_map.insert(n.clone(), "src/alpha/mod.rs".to_string());
+        }
+        for n in b.iter() {
+            file_map.insert(n.clone(), "src/beta/mod.rs".to_string());
+        }
+        for n in c.iter() {
+            file_map.insert(n.clone(), "src/gamma/mod.rs".to_string());
+        }
 
         let subsystems = index.detect_communities(&pagerank, &file_map);
         // The chain A-B-C with strong bridges should merge into 1-2 subsystems.
@@ -3447,7 +3520,10 @@ mod tests {
             subsystems.len()
         );
         // But never collapse to 0 (there should be at least one subsystem)
-        assert!(!subsystems.is_empty(), "Should detect at least one subsystem");
+        assert!(
+            !subsystems.is_empty(),
+            "Should detect at least one subsystem"
+        );
     }
 
     /// Adversarial: cross_weights correctness when `to` already has an entry
@@ -3508,17 +3584,20 @@ mod tests {
 
         let pagerank = index.compute_pagerank(0.85, 20);
         let mut file_map: HashMap<String, String> = HashMap::new();
-        for n in a.iter() { file_map.insert(n.clone(), "src/ma/mod.rs".to_string()); }
-        for n in b.iter() { file_map.insert(n.clone(), "src/mb/mod.rs".to_string()); }
-        for n in c.iter() { file_map.insert(n.clone(), "src/mc/mod.rs".to_string()); }
+        for n in a.iter() {
+            file_map.insert(n.clone(), "src/ma/mod.rs".to_string());
+        }
+        for n in b.iter() {
+            file_map.insert(n.clone(), "src/mb/mod.rs".to_string());
+        }
+        for n in c.iter() {
+            file_map.insert(n.clone(), "src/mc/mod.rs".to_string());
+        }
 
         let subsystems = index.detect_communities(&pagerank, &file_map);
         // A and B should merge, then possibly merge with C.
         // The key correctness check: no crash and subsystem count is sensible.
-        assert!(
-            !subsystems.is_empty(),
-            "Should detect at least 1 subsystem"
-        );
+        assert!(!subsystems.is_empty(), "Should detect at least 1 subsystem");
         assert!(
             subsystems.len() <= 3,
             "Expected merging of 3 cliques with cross-edges, got {}",

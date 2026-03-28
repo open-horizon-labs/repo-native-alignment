@@ -50,6 +50,35 @@ function extractText(result) {
     .join("\n");
 }
 
+async function callSearchWithRetry(args) {
+  const maxAttempts = 12;
+  const delayMs = 500;
+  let text = "";
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const result = await client.callTool({
+      name: "search",
+      arguments: args,
+    });
+    text = extractText(result);
+
+    if (!text.includes("Index building")) {
+      return text;
+    }
+
+    if (attempt < maxAttempts) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  if (text.includes("Index building")) {
+    throw new Error(
+      `search remained in "Index building" state after ${maxAttempts} attempts`
+    );
+  }
+  return text;
+}
+
 // ── connect ───────────────────────────────────────────────────────────────
 
 const client = new Client(
@@ -96,11 +125,12 @@ try {
 
   // ── 2. search (with artifacts) ──────────────────────────────────────────
   console.log("\n── search (artifacts) ──");
-  const searchCtxResult = await client.callTool({
-    name: "search",
-    arguments: { query: "agent alignment", include_artifacts: true, include_markdown: false, top_k: 3 },
+  const searchCtxText = await callSearchWithRetry({
+    query: "agent alignment",
+    include_artifacts: true,
+    include_markdown: false,
+    top_k: 3,
   });
-  const searchCtxText = extractText(searchCtxResult);
   // At least one result section should appear; accept empty gracefully only if
   // the repo has no .oh/ artifacts at all.
   if (searchCtxText.includes("No results matching")) {
@@ -116,11 +146,12 @@ try {
 
   // ── 4. search (code symbols) ────────────────────────────────────────────
   console.log("\n── search (code) ──");
-  const searchSymResult = await client.callTool({
-    name: "search",
-    arguments: { query: "main", include_artifacts: false, include_markdown: false, top_k: 5 },
+  const searchSymText = await callSearchWithRetry({
+    query: "main",
+    include_artifacts: false,
+    include_markdown: false,
+    top_k: 5,
   });
-  const searchSymText = extractText(searchSymResult);
   if (searchSymText.startsWith("No results matching")) {
     fail("search('main') returns results", "Got 'No results matching'");
   } else {
@@ -152,19 +183,15 @@ try {
   // MCP protocol. We check for error conditions only — valid output may vary
   // based on fixture content (the node may have no neighbors in minimal fixtures).
   console.log("\n── search (neighbors depth=2) ──");
-  const depthSearchResult = await client.callTool({
-    name: "search",
-    arguments: {
-      query: "main",
-      mode: "neighbors",
-      depth: 2,
-      compact: true,
-      include_artifacts: false,
-      include_markdown: false,
-      top_k: 1,
-    },
+  const depthSearchText = await callSearchWithRetry({
+    query: "main",
+    mode: "neighbors",
+    depth: 2,
+    compact: true,
+    include_artifacts: false,
+    include_markdown: false,
+    top_k: 1,
   });
-  const depthSearchText = extractText(depthSearchResult);
   if (depthSearchText.includes("depth > 1 is not supported")) {
     fail("search (depth=2): depth parameter rejected unexpectedly", depthSearchText);
   } else if (depthSearchText.includes("No repository data") || depthSearchText.length === 0) {

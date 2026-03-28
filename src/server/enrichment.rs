@@ -18,9 +18,7 @@ use crate::roots::{RootConfig, WorkspaceConfig};
 use crate::scanner::Scanner;
 
 use super::state::GraphState;
-use super::store::{
-    check_and_migrate_extraction_version, persist_graph_to_lance,
-};
+use super::store::{check_and_migrate_extraction_version, persist_graph_to_lance};
 use super::{PipelineResult, RnaHandler};
 
 /// Check if a cached graph is missing enrichment passes output that should exist.
@@ -33,13 +31,15 @@ use super::{PipelineResult, RnaHandler};
 /// When this returns `true`, the caller should re-run the enrichment pipeline
 /// instead of serving the stale cache.
 pub(crate) fn cache_needs_enrichment(nodes: &[Node]) -> bool {
-    let has_imports = nodes.iter().any(|n| n.id.kind == crate::graph::NodeKind::Import);
+    let has_imports = nodes
+        .iter()
+        .any(|n| n.id.kind == crate::graph::NodeKind::Import);
     if !has_imports {
         return false; // No imports => no framework detection possible, cache is fine.
     }
-    let has_framework_nodes = nodes.iter().any(|n| {
-        matches!(&n.id.kind, crate::graph::NodeKind::Other(s) if s == "framework")
-    });
+    let has_framework_nodes = nodes
+        .iter()
+        .any(|n| matches!(&n.id.kind, crate::graph::NodeKind::Other(s) if s == "framework"));
     // If there are imports but no framework nodes, AND the imports match at least one
     // framework rule, the cache is missing enrichment output.
     if has_framework_nodes {
@@ -101,8 +101,7 @@ impl RnaHandler {
                     let fetch_head_path = repo_root.join(".git").join("FETCH_HEAD");
                     match std::fs::metadata(&fetch_head_path).and_then(|m| m.modified()) {
                         Ok(mtime) => {
-                            let changed =
-                                last_fetch_head_mtime.is_some_and(|prev| prev != mtime);
+                            let changed = last_fetch_head_mtime.is_some_and(|prev| prev != mtime);
                             last_fetch_head_mtime = Some(mtime);
                             changed
                         }
@@ -113,9 +112,7 @@ impl RnaHandler {
                 if head_changed {
                     tracing::info!("HEAD changed -- triggering immediate background scan");
                 } else if fetch_head_changed {
-                    tracing::info!(
-                        "FETCH_HEAD changed -- triggering immediate background scan"
-                    );
+                    tracing::info!("FETCH_HEAD changed -- triggering immediate background scan");
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_secs(900)).await;
                 }
@@ -138,7 +135,8 @@ impl RnaHandler {
                         &mut scan_result,
                         &repo_root,
                         &scan_stats,
-                    ).await;
+                    )
+                    .await;
 
                     // Atomic swap: publish the new graph state.
                     graph.store(Arc::new(Some(Arc::new(graph_state))));
@@ -151,13 +149,16 @@ impl RnaHandler {
                         &repo_root,
                         &graph,
                         &lance_write_lock,
-                    ).await;
+                    )
+                    .await;
                 }
 
                 prev_root_slugs = scan_result.current_root_slugs;
             }
         });
-        tracing::info!("Background scanner started (event-driven + 15min heartbeat, worktree-aware)");
+        tracing::info!(
+            "Background scanner started (event-driven + 15min heartbeat, worktree-aware)"
+        );
     }
 
     /// Spawn background LSP enrichment after the initial graph build returns (#574).
@@ -186,7 +187,8 @@ impl RnaHandler {
             let t0 = std::time::Instant::now();
             tracing::info!(
                 "[background-lsp] Starting LSP enrichment: {} nodes, {} edges",
-                nodes.len(), edges.len()
+                nodes.len(),
+                edges.len()
             );
 
             // Build root pairs for the enrichment pipeline
@@ -215,15 +217,18 @@ impl RnaHandler {
                     skip_lsp: false, // this time LSP runs
                 },
                 Some(dirty_slugs),
-            ).await;
+            )
+            .await;
 
             match result {
                 Ok((mut enriched_nodes, mut enriched_edges, enriched_frameworks)) => {
                     // Update LSP status
-                    let lsp_edge_count = enriched_edges.iter()
+                    let lsp_edge_count = enriched_edges
+                        .iter()
                         .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
                         .count();
-                    let lsp_call_edge_count = enriched_edges.iter()
+                    let lsp_call_edge_count = enriched_edges
+                        .iter()
                         .filter(|e| {
                             e.source == crate::graph::ExtractionSource::Lsp
                                 && matches!(e.kind, crate::graph::EdgeKind::Calls)
@@ -233,7 +238,9 @@ impl RnaHandler {
                         lsp_status.set_complete(lsp_call_edge_count);
                         tracing::info!(
                             "[background-lsp] LSP enrichment complete: {} LSP call edges, {} total LSP edges in {:.2}s",
-                            lsp_call_edge_count, lsp_edge_count, t0.elapsed().as_secs_f64()
+                            lsp_call_edge_count,
+                            lsp_edge_count,
+                            t0.elapsed().as_secs_f64()
                         );
                     } else {
                         lsp_status.set_unavailable();
@@ -264,18 +271,21 @@ impl RnaHandler {
                     let pagerank_scores = index.compute_pagerank(0.85, 20);
                     for node in &mut enriched_nodes {
                         if let Some(&score) = pagerank_scores.get(&node.stable_id()) {
-                            node.metadata.insert("importance".to_string(), format!("{:.6}", score));
+                            node.metadata
+                                .insert("importance".to_string(), format!("{:.6}", score));
                         }
                     }
 
                     // Re-run subsystem detection with updated PageRank
                     {
-                        let node_file_map: std::collections::HashMap<String, String> = enriched_nodes
-                            .iter()
-                            .filter(|n| n.id.root != "external")
-                            .map(|n| (n.stable_id(), n.id.file.display().to_string()))
-                            .collect();
-                        let mut subsystems = index.detect_communities(&pagerank_scores, &node_file_map);
+                        let node_file_map: std::collections::HashMap<String, String> =
+                            enriched_nodes
+                                .iter()
+                                .filter(|n| n.id.root != "external")
+                                .map(|n| (n.stable_id(), n.id.file.display().to_string()))
+                                .collect();
+                        let mut subsystems =
+                            index.detect_communities(&pagerank_scores, &node_file_map);
                         // Dedup subsystem names
                         {
                             let mut name_counts: std::collections::HashMap<String, usize> =
@@ -285,15 +295,16 @@ impl RnaHandler {
                             }
                             for s in &mut subsystems {
                                 if name_counts.get(&s.name).copied().unwrap_or(0) > 1
-                                    && let Some(iface) = s.interfaces.first() {
-                                        let short = iface
-                                            .node_id
-                                            .split(':')
-                                            .rev()
-                                            .nth(1)
-                                            .unwrap_or(&iface.node_id);
-                                        s.name = format!("{}/{}", s.name, short);
-                                    }
+                                    && let Some(iface) = s.interfaces.first()
+                                {
+                                    let short = iface
+                                        .node_id
+                                        .split(':')
+                                        .rev()
+                                        .nth(1)
+                                        .unwrap_or(&iface.node_id);
+                                    s.name = format!("{}/{}", s.name, short);
+                                }
                             }
                         }
                         let mut node_subsystem: std::collections::HashMap<String, String> =
@@ -327,8 +338,13 @@ impl RnaHandler {
                                 primary_slug,
                                 subsystems,
                                 enriched_nodes.clone(),
-                            ).await.unwrap_or_else(|e| {
-                                tracing::warn!("[background-lsp] Subsystem promotion failed: {}", e);
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(
+                                    "[background-lsp] Subsystem promotion failed: {}",
+                                    e
+                                );
                                 (vec![], vec![])
                             });
                         enriched_nodes.extend(sub_added_nodes);
@@ -336,12 +352,14 @@ impl RnaHandler {
 
                         // Re-add virtual nodes to index
                         for node in &enriched_nodes {
-                            if matches!(&node.id.kind, crate::graph::NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+                            if matches!(&node.id.kind, crate::graph::NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event"))
+                            {
                                 index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
                             }
                         }
                         for edge in &enriched_edges {
-                            if matches!(&edge.to.kind, crate::graph::NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event")) {
+                            if matches!(&edge.to.kind, crate::graph::NodeKind::Other(s) if matches!(s.as_str(), "subsystem" | "framework" | "channel" | "event"))
+                            {
                                 index.add_edge(
                                     &edge.from.to_stable_id(),
                                     &edge.from.kind.to_string(),
@@ -363,29 +381,42 @@ impl RnaHandler {
                     {
                         let _lance_guard = lance_write_lock.lock().await;
                         if let Err(e) = super::store::persist_graph_to_lance(
-                            &repo_root, &enriched_nodes, &enriched_edges
-                        ).await {
+                            &repo_root,
+                            &enriched_nodes,
+                            &enriched_edges,
+                        )
+                        .await
+                        {
                             tracing::error!("[background-lsp] LanceDB persist failed: {}", e);
                         } else {
                             super::sentinel::write_extract_sentinel(
-                                &repo_root, enriched_nodes.len(), enriched_edges.len()
+                                &repo_root,
+                                enriched_nodes.len(),
+                                enriched_edges.len(),
                             );
-                            let has_lsp_edges = enriched_edges.iter()
+                            let has_lsp_edges = enriched_edges
+                                .iter()
                                 .any(|e| e.source == crate::graph::ExtractionSource::Lsp);
                             if has_lsp_edges {
                                 super::sentinel::write_lsp_sentinel(
-                                    &repo_root, enriched_nodes.len(), enriched_edges.len()
+                                    &repo_root,
+                                    enriched_nodes.len(),
+                                    enriched_edges.len(),
                                 );
                             }
                             tracing::info!(
                                 "[background-lsp] LanceDB re-persisted with LSP edges: {} nodes, {} edges",
-                                enriched_nodes.len(), enriched_edges.len()
+                                enriched_nodes.len(),
+                                enriched_edges.len()
                             );
                         }
                     }
 
                     // ArcSwap the fully enriched graph
-                    let all_frameworks = detected_frameworks.union(&enriched_frameworks).cloned().collect();
+                    let all_frameworks = detected_frameworks
+                        .union(&enriched_frameworks)
+                        .cloned()
+                        .collect();
                     let new_state = super::state::GraphState::new(
                         enriched_nodes,
                         enriched_edges,
@@ -423,7 +454,8 @@ impl RnaHandler {
         let bg_nodes = all_nodes.to_vec();
 
         tokio::spawn(async move {
-            let embeddable_nodes: Vec<Node> = bg_nodes.iter()
+            let embeddable_nodes: Vec<Node> = bg_nodes
+                .iter()
                 .filter(|n| n.id.root != "external")
                 .cloned()
                 .collect();
@@ -431,7 +463,8 @@ impl RnaHandler {
             let embed_repo_root = bg_repo_root.clone();
             let embed_index_ref = bg_embed_index.clone();
             let embed_status = bg_embed_status;
-            let embeddable_count = embeddable_nodes.iter()
+            let embeddable_count = embeddable_nodes
+                .iter()
                 .filter(|n| n.id.kind.is_embeddable())
                 .count();
             embed_status.set_building(embeddable_count);
@@ -449,7 +482,8 @@ impl RnaHandler {
                             }
                             Ok(false) => {
                                 // Table missing -- full build needed
-                                idx.index_all_with_symbols(&embed_repo_root, &embeddable_nodes).await
+                                idx.index_all_with_symbols(&embed_repo_root, &embeddable_nodes)
+                                    .await
                             }
                             Err(e) => {
                                 tracing::warn!("[background] Embedding table check failed: {}", e);
@@ -550,7 +584,8 @@ impl RnaHandler {
                     skip_lsp: false,
                 },
                 None,
-            ).await;
+            )
+            .await;
 
             let (mut enriched_nodes, mut enriched_edges, _detected_frameworks) = match result {
                 Ok(r) => r,
@@ -575,19 +610,23 @@ impl RnaHandler {
             }
 
             // Count LSP-sourced edges to determine enrichment status.
-            let lsp_call_edge_count = enriched_edges.iter()
+            let lsp_call_edge_count = enriched_edges
+                .iter()
                 .filter(|e| {
                     e.source == crate::graph::ExtractionSource::Lsp
                         && matches!(e.kind, crate::graph::EdgeKind::Calls)
                 })
                 .count();
-            let lsp_edge_count = enriched_edges.iter()
+            let lsp_edge_count = enriched_edges
+                .iter()
                 .filter(|e| e.source == crate::graph::ExtractionSource::Lsp)
                 .count();
 
             tracing::info!(
                 "[cache-hit bus] LSP enrichment complete: {} LSP call edges, {} total LSP edges, {} total nodes",
-                lsp_call_edge_count, lsp_edge_count, enriched_nodes.len()
+                lsp_call_edge_count,
+                lsp_edge_count,
+                enriched_nodes.len()
             );
 
             // Build updated index from enriched edges.
@@ -615,9 +654,14 @@ impl RnaHandler {
             // so no concurrent writer can interleave between persist and sentinel write.
             let persist_result = {
                 let _lance_guard = bg_lance_write_lock.lock().await;
-                let result = persist_graph_to_lance(&bg_repo_root, &enriched_nodes, &enriched_edges).await;
+                let result =
+                    persist_graph_to_lance(&bg_repo_root, &enriched_nodes, &enriched_edges).await;
                 if result.is_ok() {
-                    super::sentinel::write_lsp_sentinel(&bg_repo_root, enriched_nodes.len(), enriched_edges.len());
+                    super::sentinel::write_lsp_sentinel(
+                        &bg_repo_root,
+                        enriched_nodes.len(),
+                        enriched_edges.len(),
+                    );
                 }
                 result
             };
@@ -626,7 +670,8 @@ impl RnaHandler {
                 Ok(()) => {
                     tracing::info!(
                         "[cache-hit bus] LSP persist complete: {} nodes, {} edges",
-                        enriched_nodes.len(), enriched_edges.len()
+                        enriched_nodes.len(),
+                        enriched_edges.len()
                     );
                     // Mirror other LSP paths: set_complete(0) when no edges (enricher ran but found
                     // nothing), not set_unavailable(). The sentinel is written to prevent repeated
@@ -669,10 +714,7 @@ impl RnaHandler {
     /// full rebuild when no cache exists.
     ///
     /// The `on_progress` callback receives structured status messages.
-    pub async fn run_pipeline_foreground<F>(
-        &self,
-        on_progress: F,
-    ) -> anyhow::Result<PipelineResult>
+    pub async fn run_pipeline_foreground<F>(&self, on_progress: F) -> anyhow::Result<PipelineResult>
     where
         F: Fn(&str) + Send + Sync,
     {
@@ -691,7 +733,10 @@ impl RnaHandler {
                     Some(state)
                 }
                 Err(e) => {
-                    tracing::debug!("Could not load cached graph, falling back to full rebuild: {}", e);
+                    tracing::debug!(
+                        "Could not load cached graph, falling back to full rebuild: {}",
+                        e
+                    );
                     None
                 }
             }
@@ -700,11 +745,14 @@ impl RnaHandler {
         };
 
         if let Some(cached_state) = cached {
-            return self.run_pipeline_foreground_incremental(cached_state, on_progress, pipeline_start).await;
+            return self
+                .run_pipeline_foreground_incremental(cached_state, on_progress, pipeline_start)
+                .await;
         }
 
         // No cache -- full rebuild path.
-        self.run_pipeline_foreground_full(on_progress, pipeline_start).await
+        self.run_pipeline_foreground_full(on_progress, pipeline_start)
+            .await
     }
 
     /// Incremental foreground pipeline: load from cache, extract only changed files,
@@ -723,11 +771,15 @@ impl RnaHandler {
         // full rebuild by returning an error that the caller can catch.
         let db_path = super::store::graph_lance_path(&self.repo_root);
         if super::store::check_and_migrate_schema(&db_path).await? {
-            tracing::info!("Schema migrated during incremental pre-flight -- falling back to full rebuild");
+            tracing::info!(
+                "Schema migrated during incremental pre-flight -- falling back to full rebuild"
+            );
             on_progress("Schema migration detected -- rebuilding from scratch.");
             // Clear sentinels -- they reference the old schema version and are now stale.
             super::sentinel::clear_sentinels(&self.repo_root);
-            return self.run_pipeline_foreground_full(on_progress, pipeline_start).await;
+            return self
+                .run_pipeline_foreground_full(on_progress, pipeline_start)
+                .await;
         }
 
         // Pre-flight: check extraction version. If it changed (e.g., EXTRACTION_VERSION
@@ -755,7 +807,9 @@ impl RnaHandler {
                 on_progress("Extraction version upgrade detected -- rebuilding from scratch.");
                 // Clear sentinels -- they reference the old extraction version and are now stale.
                 super::sentinel::clear_sentinels(&self.repo_root);
-                return self.run_pipeline_foreground_full(on_progress, pipeline_start).await;
+                return self
+                    .run_pipeline_foreground_full(on_progress, pipeline_start)
+                    .await;
             }
         }
 
@@ -765,7 +819,8 @@ impl RnaHandler {
         let scan = scanner.scan()?;
         let scan_time = t0.elapsed();
 
-        let change_count = scan.changed_files.len() + scan.new_files.len() + scan.deleted_files.len();
+        let change_count =
+            scan.changed_files.len() + scan.new_files.len() + scan.deleted_files.len();
 
         on_progress(&format!(
             "Scan: {} changed, {} new, {} deleted in {:.1}s",
@@ -783,7 +838,9 @@ impl RnaHandler {
             // sentinels and re-run the full enrichment pipeline.
             let stale_enrichment = cache_needs_enrichment(&cached_state.nodes);
             if stale_enrichment {
-                on_progress("No file changes but cached graph missing enrichment output -- re-enriching...");
+                on_progress(
+                    "No file changes but cached graph missing enrichment output -- re-enriching...",
+                );
                 super::sentinel::clear_sentinels(&self.repo_root);
             } else {
                 on_progress("No changes detected -- reusing cached graph.");
@@ -794,10 +851,11 @@ impl RnaHandler {
 
             // Reuse existing embedding index.
             if let Ok(idx) = EmbeddingIndex::new(&self.repo_root).await
-                && let Ok(true) = idx.has_table().await {
-                    idx.ensure_fts_index().await;
-                    self.embed_index.store(Arc::new(Some(idx)));
-                }
+                && let Ok(true) = idx.has_table().await
+            {
+                idx.ensure_fts_index().await;
+                self.embed_index.store(Arc::new(Some(idx)));
+            }
 
             // Check if LSP enrichment has been durably persisted via the completion
             // sentinel. This replaces the `has_call_edges` heuristic, which fails
@@ -809,12 +867,19 @@ impl RnaHandler {
             let lsp_edge_count = if lsp_sentinel.is_some() && !stale_enrichment {
                 let call_count = {
                     let snap = self.graph.load_full();
-                    snap.as_ref().as_ref().unwrap().edges.iter()
+                    snap.as_ref()
+                        .as_ref()
+                        .unwrap()
+                        .edges
+                        .iter()
                         .filter(|e| matches!(e.kind, crate::graph::EdgeKind::Calls))
                         .count()
                 };
                 self.lsp_status.set_complete(call_count);
-                on_progress(&format!("LSP: {} cached call edges (sentinel present)", call_count));
+                on_progress(&format!(
+                    "LSP: {} cached call edges (sentinel present)",
+                    call_count
+                ));
                 call_count
             } else {
                 // LSP sentinel absent or stale enrichment -- run full enrichment.
@@ -832,8 +897,14 @@ impl RnaHandler {
             };
 
             let total_time = pipeline_start.elapsed();
-            on_progress(&format!("Graph: {} nodes, {} edges", total_node_count, total_edge_count));
-            on_progress(&format!("Done in {:.1}s (incremental, no changes)", total_time.as_secs_f64()));
+            on_progress(&format!(
+                "Graph: {} nodes, {} edges",
+                total_node_count, total_edge_count
+            ));
+            on_progress(&format!(
+                "Done in {:.1}s (incremental, no changes)",
+                total_time.as_secs_f64()
+            ));
 
             return Ok(PipelineResult {
                 node_count: total_node_count,
@@ -851,7 +922,9 @@ impl RnaHandler {
         let t1 = std::time::Instant::now();
 
         // Track changed file paths for LSP scoping.
-        let changed_file_set: std::collections::HashSet<PathBuf> = scan.changed_files.iter()
+        let changed_file_set: std::collections::HashSet<PathBuf> = scan
+            .changed_files
+            .iter()
             .chain(scan.new_files.iter())
             .cloned()
             .collect();
@@ -860,12 +933,15 @@ impl RnaHandler {
         cached_state.index = crate::graph::index::GraphIndex::new();
         cached_state.index.rebuild_from_edges(&cached_state.edges);
         for node in &cached_state.nodes {
-            cached_state.index.ensure_node(&node.stable_id(), &node.id.kind.to_string());
+            cached_state
+                .index
+                .ensure_node(&node.stable_id(), &node.id.kind.to_string());
         }
 
         // Run incremental update on the local cached_state, then store atomically.
         // LSP spawning is disabled (spawn_lsp=false) -- we handle it synchronously below.
-        self.update_graph_with_scan(&mut cached_state, Some(scan), false).await?;
+        self.update_graph_with_scan(&mut cached_state, Some(scan), false)
+            .await?;
         self.graph.store(Arc::new(Some(Arc::new(cached_state))));
 
         let extract_time = t1.elapsed();
@@ -873,7 +949,9 @@ impl RnaHandler {
         let (node_count, file_count) = {
             let snap = self.graph.load_full();
             let gs = snap.as_ref().as_ref().unwrap();
-            let files: std::collections::HashSet<_> = gs.nodes.iter()
+            let files: std::collections::HashSet<_> = gs
+                .nodes
+                .iter()
                 .map(|n| n.id.file.to_string_lossy().to_string())
                 .collect();
             (gs.nodes.len(), files.len())
@@ -927,7 +1005,8 @@ impl RnaHandler {
                 skip_lsp: false,
             },
             dirty_slugs,
-        ).await;
+        )
+        .await;
         let bus_time = t2.elapsed();
 
         let lsp_edge_count;
@@ -944,7 +1023,8 @@ impl RnaHandler {
                     enriched_edges.retain(|e| seen_edges.insert(e.stable_id()));
                 }
 
-                lsp_edge_count = enriched_edges.iter()
+                lsp_edge_count = enriched_edges
+                    .iter()
                     .filter(|e| {
                         e.source == crate::graph::ExtractionSource::Lsp
                             && matches!(e.kind, crate::graph::EdgeKind::Calls)
@@ -995,7 +1075,8 @@ impl RnaHandler {
         {
             let snapshot = {
                 let snap = self.graph.load_full();
-                snap.as_ref().as_ref()
+                snap.as_ref()
+                    .as_ref()
                     .map(|gs| (gs.nodes.clone(), gs.edges.clone()))
             };
             if let Some((nodes, edges)) = snapshot {
@@ -1007,7 +1088,9 @@ impl RnaHandler {
                 );
                 if let Err(e) = persist_graph_to_lance(&self.repo_root, &nodes, &edges).await {
                     tracing::error!("Foreground incremental persist failed: {}", e);
-                    return Err(e.context("Full persist failed during incremental foreground pipeline"));
+                    return Err(
+                        e.context("Full persist failed during incremental foreground pipeline")
+                    );
                 }
                 // Persist succeeded -- write both sentinels. Incremental path rewrites
                 // the full graph, so extraction is also complete after this persist.
@@ -1023,19 +1106,33 @@ impl RnaHandler {
         let (total_node_count, total_edge_count, file_count) = {
             let snap = self.graph.load_full();
             let gs = snap.as_ref().as_ref().unwrap();
-            let fc = gs.nodes.iter().map(|n| n.id.file.to_string_lossy().to_string()).collect::<std::collections::HashSet<_>>().len();
+            let fc = gs
+                .nodes
+                .iter()
+                .map(|n| n.id.file.to_string_lossy().to_string())
+                .collect::<std::collections::HashSet<_>>()
+                .len();
             (gs.nodes.len(), gs.edges.len(), fc)
         };
         let encoding_stats = {
             let ss = self.scan_stats.read().unwrap_or_else(|e| e.into_inner());
             let mut agg = crate::extract::EncodingStats::default();
-            for es in ss.encoding_stats.values() { agg.merge(es); }
+            for es in ss.encoding_stats.values() {
+                agg.merge(es);
+            }
             agg
         };
         let total_time = pipeline_start.elapsed();
-        let result = PipelineResult { node_count: total_node_count, edge_count: total_edge_count,
-            file_count, lsp_edge_count, embed_count: 0, total_time,
-            lsp_entries: vec![], encoding_stats };
+        let result = PipelineResult {
+            node_count: total_node_count,
+            edge_count: total_edge_count,
+            file_count,
+            lsp_edge_count,
+            embed_count: 0,
+            total_time,
+            lsp_entries: vec![],
+            encoding_stats,
+        };
         on_progress(&result.format_summary());
         Ok(result)
     }
@@ -1054,7 +1151,9 @@ impl RnaHandler {
         let graph_state = self.build_full_graph_inner(false).await?;
         let scan_extract_time = t0.elapsed();
 
-        let file_count = graph_state.nodes.iter()
+        let file_count = graph_state
+            .nodes
+            .iter()
             .map(|n| n.id.file.to_string_lossy().to_string())
             .collect::<std::collections::HashSet<_>>()
             .len();
@@ -1083,7 +1182,9 @@ impl RnaHandler {
         }
 
         // Phase 2: Embed + LSP enrichment (parallel -- they use independent data stores)
-        let embeddable_nodes: Vec<Node> = graph_state.nodes.iter()
+        let embeddable_nodes: Vec<Node> = graph_state
+            .nodes
+            .iter()
             .filter(|n| n.id.root != "external")
             .cloned()
             .collect();
@@ -1100,7 +1201,10 @@ impl RnaHandler {
             let t1 = std::time::Instant::now();
             let count = match EmbeddingIndex::new(&embed_repo_root).await {
                 Ok(idx) => {
-                    match idx.index_all_with_symbols(&embed_repo_root, &embeddable_nodes).await {
+                    match idx
+                        .index_all_with_symbols(&embed_repo_root, &embeddable_nodes)
+                        .await
+                    {
                         Ok(count) => {
                             embed_index_ref.store(Arc::new(Some(idx)));
                             count
@@ -1142,13 +1246,13 @@ impl RnaHandler {
                     skip_lsp: false,
                 },
                 None, // full rebuild: all roots dirty
-            ).await;
+            )
+            .await;
             let elapsed = t2.elapsed();
             (result, elapsed)
         };
 
-        let ((embed_count, embed_time), (bus_result, bus_time)) =
-            tokio::join!(embed_fut, bus_fut);
+        let ((embed_count, embed_time), (bus_result, bus_time)) = tokio::join!(embed_fut, bus_fut);
 
         on_progress(&format!(
             "Embed: {} items in {:.1}s",
@@ -1171,7 +1275,8 @@ impl RnaHandler {
                     enriched_edges.retain(|e| seen_edges.insert(e.stable_id()));
                 }
 
-                lsp_edge_count = enriched_edges.iter()
+                lsp_edge_count = enriched_edges
+                    .iter()
                     .filter(|e| {
                         e.source == crate::graph::ExtractionSource::Lsp
                             && matches!(e.kind, crate::graph::EdgeKind::Calls)
@@ -1224,7 +1329,8 @@ impl RnaHandler {
         {
             let snapshot = {
                 let snap = self.graph.load_full();
-                snap.as_ref().as_ref()
+                snap.as_ref()
+                    .as_ref()
                     .map(|gs| (gs.nodes.clone(), gs.edges.clone()))
             };
             if let Some((nodes, edges)) = snapshot {
@@ -1256,13 +1362,22 @@ impl RnaHandler {
         let encoding_stats = {
             let ss = self.scan_stats.read().unwrap_or_else(|e| e.into_inner());
             let mut agg = crate::extract::EncodingStats::default();
-            for es in ss.encoding_stats.values() { agg.merge(es); }
+            for es in ss.encoding_stats.values() {
+                agg.merge(es);
+            }
             agg
         };
         let total_time = pipeline_start.elapsed();
-        let result = PipelineResult { node_count: total_node_count, edge_count: total_edge_count,
-            file_count, lsp_edge_count, embed_count, total_time,
-            lsp_entries: vec![], encoding_stats };
+        let result = PipelineResult {
+            node_count: total_node_count,
+            edge_count: total_edge_count,
+            file_count,
+            lsp_edge_count,
+            embed_count,
+            total_time,
+            lsp_entries: vec![],
+            encoding_stats,
+        };
         on_progress(&result.format_summary());
         Ok(result)
     }
@@ -1271,10 +1386,7 @@ impl RnaHandler {
     /// Used when the cached graph has no LSP sentinel and needs enrichment.
     /// Routes through `emit_enrichment_pipeline` per ADR-001 (#583).
     /// Returns the number of LSP call edges added.
-    async fn run_foreground_lsp_and_persist<F>(
-        &self,
-        on_progress: &F,
-    ) -> anyhow::Result<usize>
+    async fn run_foreground_lsp_and_persist<F>(&self, on_progress: &F) -> anyhow::Result<usize>
     where
         F: Fn(&str) + Send + Sync,
     {
@@ -1306,7 +1418,8 @@ impl RnaHandler {
                 skip_lsp: false,
             },
             None, // no sentinel means all roots need enrichment
-        ).await;
+        )
+        .await;
 
         match bus_result {
             Ok((mut enriched_nodes, mut enriched_edges, detected_frameworks)) => {
@@ -1321,14 +1434,18 @@ impl RnaHandler {
                     enriched_edges.retain(|e| seen_edges.insert(e.stable_id()));
                 }
 
-                let lsp_edge_count = enriched_edges.iter()
+                let lsp_edge_count = enriched_edges
+                    .iter()
                     .filter(|e| {
                         e.source == crate::graph::ExtractionSource::Lsp
                             && matches!(e.kind, crate::graph::EdgeKind::Calls)
                     })
                     .count();
 
-                on_progress(&format!("Enrichment: {} LSP call edges via bus", lsp_edge_count));
+                on_progress(&format!(
+                    "Enrichment: {} LSP call edges via bus",
+                    lsp_edge_count
+                ));
 
                 // Build updated index and apply enriched graph via atomic swap.
                 let mut new_index = crate::graph::index::GraphIndex::new();
@@ -1351,13 +1468,19 @@ impl RnaHandler {
                 self.lsp_status.set_complete(lsp_edge_count);
 
                 // Persist with enriched edges.
-                if let Err(e) = persist_graph_to_lance(&self.repo_root, &enriched_nodes, &enriched_edges).await {
+                if let Err(e) =
+                    persist_graph_to_lance(&self.repo_root, &enriched_nodes, &enriched_edges).await
+                {
                     tracing::error!("Foreground LSP persist failed: {}", e);
                     return Err(e.context("LSP persist failed during foreground pipeline"));
                 }
                 // Persist succeeded -- write LSP sentinel so future startups know
                 // LSP enrichment is durable and can skip re-enrichment (#477).
-                super::sentinel::write_lsp_sentinel(&self.repo_root, enriched_nodes.len(), enriched_edges.len());
+                super::sentinel::write_lsp_sentinel(
+                    &self.repo_root,
+                    enriched_nodes.len(),
+                    enriched_edges.len(),
+                );
 
                 Ok(lsp_edge_count)
             }
@@ -1377,9 +1500,9 @@ impl RnaHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{NodeId, NodeKind, ExtractionSource};
-    use std::path::PathBuf;
+    use crate::graph::{ExtractionSource, NodeId, NodeKind};
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     fn make_node(name: &str, kind: NodeKind) -> Node {
         Node {
@@ -1406,9 +1529,7 @@ mod tests {
 
     #[test]
     fn test_cache_needs_enrichment_no_imports() {
-        let nodes = vec![
-            make_node("Config", NodeKind::Function),
-        ];
+        let nodes = vec![make_node("Config", NodeKind::Function)];
         assert!(!cache_needs_enrichment(&nodes));
     }
 

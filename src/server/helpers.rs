@@ -2,11 +2,11 @@
 // EXTRACTION_VERSION is deprecated (#526) but still used in the freshness footer.
 #![allow(deprecated)]
 
+use super::state::{EmbeddingStatus, LspEnrichmentStatus};
 use crate::graph;
 use crate::graph::index::GraphIndex;
 use petgraph::Direction;
 use rust_mcp_sdk::schema::{CallToolError, CallToolResult, TextContent};
-use super::state::{EmbeddingStatus, LspEnrichmentStatus};
 
 /// Minimum importance score to display in tool output.
 /// Scores at or below this threshold are suppressed as noise.
@@ -99,18 +99,11 @@ pub(crate) fn resolve_edge_target_by_suffix(
     }
     // Suffix match: find a scanned file that ends with the target path
     let suffix = format!("/{}", target);
-    let matches: Vec<&String> = file_index
-        .iter()
-        .filter(|f| f.ends_with(&suffix))
-        .collect();
+    let matches: Vec<&String> = file_index.iter().filter(|f| f.ends_with(&suffix)).collect();
     if matches.len() == 1 {
         edge.to.file = std::path::PathBuf::from(matches[0]);
         edge.confidence = graph::Confidence::Confirmed;
-        tracing::debug!(
-            "Resolved import edge target: {} → {}",
-            target,
-            matches[0]
-        );
+        tracing::debug!("Resolved import edge target: {} → {}", target, matches[0]);
     }
     // If 0 or 2+ matches, leave as-is (ambiguous or truly dangling)
 }
@@ -183,15 +176,39 @@ fn format_inline_code(s: &str) -> String {
     format!("{fence}{s}{fence}")
 }
 
+/// Wrap content in a CommonMark fenced code block using a fence long enough
+/// to safely contain any backticks in the content (e.g. template literals).
+fn format_fenced_code_block(content: &str, lang_hint: &str) -> String {
+    let mut max_run = 0usize;
+    let mut run = 0usize;
+    for ch in content.chars() {
+        if ch == '`' {
+            run += 1;
+            max_run = max_run.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let fence = "`".repeat(max_run.max(2) + 1); // at least 3 backticks
+    format!("\n  {}{}\n{}\n  {}", fence, lang_hint, content, fence)
+}
+
 pub(crate) fn format_node_entry(n: &graph::Node, index: &GraphIndex, compact: bool) -> String {
-    format_node_entry_with_root(n, index, compact, None)
+    format_node_entry_with_root(n, index, compact, None, false, false)
 }
 
 /// Format a single node, optionally stripping the root slug prefix from
 /// displayed stable IDs. When `strip_root` is `Some(slug)`, the `slug:`
 /// prefix is removed from the ID display -- used in single-root mode
 /// where the prefix is noise.
-pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, compact: bool, strip_root: Option<&str>) -> String {
+pub(crate) fn format_node_entry_with_root(
+    n: &graph::Node,
+    index: &GraphIndex,
+    compact: bool,
+    strip_root: Option<&str>,
+    include_body: bool,
+    minify_body: bool,
+) -> String {
     let stable_id = n.stable_id();
     let display_id = strip_root_prefix(&stable_id, strip_root);
 
@@ -199,9 +216,11 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
         // Compact: one-line summary for broad exploration
         let mut entry = format!(
             "- **{}** `{}` `{}`:{}-{}",
-            n.id.kind, n.id.name,
+            n.id.kind,
+            n.id.name,
             n.id.file.display(),
-            n.line_start, n.line_end,
+            n.line_start,
+            n.line_end,
         );
         if !n.signature.is_empty() {
             // Truncate signature to first line for compact
@@ -215,19 +234,39 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
         if let Some(hint) = n.metadata.get("pattern_hint") {
             entry.push_str(&format!(" ~{}", hint));
         }
-        if n.metadata.get("is_static").map(|s| s == "true").unwrap_or(false) {
+        if n.metadata
+            .get("is_static")
+            .map(|s| s == "true")
+            .unwrap_or(false)
+        {
             entry.push_str(" static");
         }
-        if n.metadata.get("is_async").map(|s| s == "true").unwrap_or(false) {
+        if n.metadata
+            .get("is_async")
+            .map(|s| s == "true")
+            .unwrap_or(false)
+        {
             entry.push_str(" async");
         }
-        if n.metadata.get("is_test").map(|s| s == "true").unwrap_or(false) {
+        if n.metadata
+            .get("is_test")
+            .map(|s| s == "true")
+            .unwrap_or(false)
+        {
             entry.push_str(" test");
         }
-        if n.metadata.get("visibility").map(|s| s == "pub").unwrap_or(false) {
+        if n.metadata
+            .get("visibility")
+            .map(|s| s == "pub")
+            .unwrap_or(false)
+        {
             entry.push_str(" pub");
         }
-        if n.metadata.get("exported").map(|s| s == "true").unwrap_or(false) {
+        if n.metadata
+            .get("exported")
+            .map(|s| s == "true")
+            .unwrap_or(false)
+        {
             entry.push_str(" __all__");
         }
         if let Some(decorators) = n.metadata.get("decorators") {
@@ -235,7 +274,11 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
         }
         if let Some(storage) = n.metadata.get("storage") {
             entry.push_str(&format!(" [{}]", storage));
-            if n.metadata.get("mutable").map(|s| s == "true").unwrap_or(false) {
+            if n.metadata
+                .get("mutable")
+                .map(|s| s == "true")
+                .unwrap_or(false)
+            {
                 entry.push_str(" mut");
             }
         }
@@ -244,15 +287,31 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
         }
         if let Some(imp) = n.metadata.get("importance")
             && let Ok(score) = imp.parse::<f64>()
-                && score > IMPORTANCE_THRESHOLD {
-                    entry.push_str(&format!(" imp:{:.3}", score));
-                }
+            && score > IMPORTANCE_THRESHOLD
+        {
+            entry.push_str(&format!(" imp:{:.3}", score));
+        }
         let edge_count = index.neighbors(&stable_id, None, Direction::Outgoing).len()
             + index.neighbors(&stable_id, None, Direction::Incoming).len();
         if edge_count > 0 {
             entry.push_str(&format!(" edges:{}", edge_count));
         }
         entry.push_str(&format!("\n  `{}`", display_id));
+        if include_body && !n.body.is_empty() {
+            let body_text = if minify_body {
+                crate::code::minify::minify_body(&n.body, &n.language)
+            } else {
+                n.body.clone()
+            };
+            let lang_hint = match n.language.as_str() {
+                "typescript" => "typescript",
+                "rust" => "rust",
+                "python" => "python",
+                "go" => "go",
+                _ => "",
+            };
+            entry.push_str(&format_fenced_code_block(&body_text, lang_hint));
+        }
         entry
     } else {
         // Full detail (existing format)
@@ -260,9 +319,12 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
         let incoming = index.neighbors(&stable_id, None, Direction::Incoming);
         let mut entry = format!(
             "- **{}** `{}` ({}) `{}`:{}-{}\n  ID: `{}`",
-            n.id.kind, n.id.name, n.language,
+            n.id.kind,
+            n.id.name,
+            n.language,
             n.id.file.display(),
-            n.line_start, n.line_end,
+            n.line_start,
+            n.line_end,
             display_id,
         );
         if !n.signature.is_empty() {
@@ -275,18 +337,33 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
             entry.push_str(&format!("\n  Pattern: {}", hint));
         }
         if let Some(is_static) = n.metadata.get("is_static") {
-            entry.push_str(&format!("\n  Static: {}", if is_static == "true" { "yes" } else { "no" }));
+            entry.push_str(&format!(
+                "\n  Static: {}",
+                if is_static == "true" { "yes" } else { "no" }
+            ));
         }
-        if n.metadata.get("is_async").map(|s| s == "true").unwrap_or(false) {
+        if n.metadata
+            .get("is_async")
+            .map(|s| s == "true")
+            .unwrap_or(false)
+        {
             entry.push_str("\n  Async: yes");
         }
-        if n.metadata.get("is_test").map(|s| s == "true").unwrap_or(false) {
+        if n.metadata
+            .get("is_test")
+            .map(|s| s == "true")
+            .unwrap_or(false)
+        {
             entry.push_str("\n  Test: yes");
         }
         if let Some(vis) = n.metadata.get("visibility") {
             entry.push_str(&format!("\n  Visibility: {}", vis));
         }
-        if n.metadata.get("exported").map(|s| s == "true").unwrap_or(false) {
+        if n.metadata
+            .get("exported")
+            .map(|s| s == "true")
+            .unwrap_or(false)
+        {
             entry.push_str("\n  Exported: yes (__all__)");
         }
         if let Some(decorators) = n.metadata.get("decorators") {
@@ -295,11 +372,20 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
         if let Some(val) = n.metadata.get("value") {
             entry.push_str(&format!("\n  Value: `{}`", val));
         }
-        if n.metadata.get("synthetic").map(|s| s == "true").unwrap_or(false) {
+        if n.metadata
+            .get("synthetic")
+            .map(|s| s == "true")
+            .unwrap_or(false)
+        {
             entry.push_str(" *(literal)*");
         }
         if let Some(storage) = n.metadata.get("storage") {
-            let mut_label = if n.metadata.get("mutable").map(|s| s == "true").unwrap_or(false) {
+            let mut_label = if n
+                .metadata
+                .get("mutable")
+                .map(|s| s == "true")
+                .unwrap_or(false)
+            {
                 " (mutable)"
             } else {
                 ""
@@ -311,9 +397,10 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
         }
         if let Some(imp) = n.metadata.get("importance")
             && let Ok(score) = imp.parse::<f64>()
-                && score > IMPORTANCE_THRESHOLD {
-                    entry.push_str(&format!("\n  Importance: {:.3}", score));
-                }
+            && score > IMPORTANCE_THRESHOLD
+        {
+            entry.push_str(&format!("\n  Importance: {:.3}", score));
+        }
         // Diagnostic-specific metadata (only present on NodeKind::Other("diagnostic") nodes)
         if let Some(severity) = n.metadata.get("diagnostic_severity") {
             entry.push_str(&format!("\n  Severity: {}", severity));
@@ -343,6 +430,21 @@ pub(crate) fn format_node_entry_with_root(n: &graph::Node, index: &GraphIndex, c
         if !incoming.is_empty() {
             entry.push_str(&format!("\n  In: {} edge(s)", incoming.len()));
         }
+        if include_body && !n.body.is_empty() {
+            let body_text = if minify_body {
+                crate::code::minify::minify_body(&n.body, &n.language)
+            } else {
+                n.body.clone()
+            };
+            let lang_hint = match n.language.as_str() {
+                "typescript" => "typescript",
+                "rust" => "rust",
+                "python" => "python",
+                "go" => "go",
+                _ => "",
+            };
+            entry.push_str(&format_fenced_code_block(&body_text, lang_hint));
+        }
         entry
     }
 }
@@ -359,14 +461,14 @@ pub(crate) fn is_hidden_traversal_kind(kind: &graph::NodeKind) -> bool {
 /// Each edge type gets a section header (e.g., `#### Calls (3)`) followed by
 /// the node entries. Edge types with zero results after hidden-kind filtering
 /// are omitted.
-#[allow(dead_code)]  // used by tests
+#[allow(dead_code)] // used by tests
 pub(crate) fn format_neighbors_grouped(
     nodes: &[graph::Node],
     groups: &std::collections::BTreeMap<graph::EdgeKind, Vec<String>>,
     index: &GraphIndex,
     compact: bool,
 ) -> String {
-    format_neighbors_grouped_with_root(nodes, groups, index, compact, None)
+    format_neighbors_grouped_with_root(nodes, groups, index, compact, None, false, false)
 }
 
 /// Format traversal results grouped by edge type, with optional root slug stripping.
@@ -380,6 +482,8 @@ pub(crate) fn format_neighbors_grouped_with_root(
     index: &GraphIndex,
     compact: bool,
     strip_root: Option<&str>,
+    include_body: bool,
+    minify_body: bool,
 ) -> String {
     // Build O(1) lookup map: stable_id -> index into nodes vec.
     let node_map: std::collections::HashMap<String, usize> = nodes
@@ -395,7 +499,8 @@ pub(crate) fn format_neighbors_grouped_with_root(
         let displayable_ids: Vec<&String> = ids
             .iter()
             .filter(|id| {
-                node_map.get(id.as_str())
+                node_map
+                    .get(id.as_str())
                     .map(|&i| !is_hidden_traversal_kind(&nodes[i].id.kind))
                     .unwrap_or(true)
             })
@@ -409,7 +514,14 @@ pub(crate) fn format_neighbors_grouped_with_root(
             .iter()
             .map(|id| {
                 if let Some(&i) = node_map.get(id.as_str()) {
-                    format_node_entry_with_root(&nodes[i], index, compact, strip_root)
+                    format_node_entry_with_root(
+                        &nodes[i],
+                        index,
+                        compact,
+                        strip_root,
+                        include_body,
+                        minify_body,
+                    )
                 } else {
                     format_unresolved_id(id, strip_root)
                 }
@@ -446,7 +558,12 @@ fn capitalize_first(s: &str) -> String {
 /// Format neighbor nodes as a flat list (non-grouped). Available for contexts
 /// where edge-type grouping is not needed (e.g., outcome_progress display).
 #[allow(dead_code)]
-pub(crate) fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String], index: &GraphIndex, compact: bool) -> String {
+pub(crate) fn format_neighbor_nodes(
+    nodes: &[graph::Node],
+    ids: &[String],
+    index: &GraphIndex,
+    compact: bool,
+) -> String {
     // Build O(1) lookup map: stable_id -> index into nodes vec.
     let node_map: std::collections::HashMap<String, usize> = nodes
         .iter()
@@ -472,8 +589,8 @@ pub(crate) fn format_neighbor_nodes(nodes: &[graph::Node], ids: &[String], index
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
     use std::collections::BTreeMap;
-    use crate::graph::{Node, NodeId, NodeKind, ExtractionSource};
 
     #[test]
     fn test_format_freshness_without_lsp_status() {
@@ -487,7 +604,11 @@ mod tests {
         let status = LspEnrichmentStatus::default();
         status.set_running();
         let result = format_freshness(50, Some(std::time::Instant::now()), Some(&status));
-        assert!(result.contains("LSP: enriching"), "expected 'LSP: enriching' in: {}", result);
+        assert!(
+            result.contains("LSP: enriching"),
+            "expected 'LSP: enriching' in: {}",
+            result
+        );
     }
 
     #[test]
@@ -495,18 +616,18 @@ mod tests {
         let status = LspEnrichmentStatus::default();
         status.set_complete(10);
         let result = format_freshness(50, Some(std::time::Instant::now()), Some(&status));
-        assert!(result.contains("10 edges"), "expected '10 edges' in: {}", result);
+        assert!(
+            result.contains("10 edges"),
+            "expected '10 edges' in: {}",
+            result
+        );
     }
 
     #[test]
     fn test_format_freshness_with_unavailable_lsp() {
         let status = LspEnrichmentStatus::default();
         status.set_unavailable();
-        let result = format_freshness(
-            50,
-            Some(std::time::Instant::now()),
-            Some(&status),
-        );
+        let result = format_freshness(50, Some(std::time::Instant::now()), Some(&status));
         assert!(result.contains("LSP: no server detected"));
     }
 
@@ -537,7 +658,10 @@ mod tests {
             name: Option<String>,
         }
         let mut map = serde_json::Map::new();
-        map.insert("name".to_string(), serde_json::Value::String("test".to_string()));
+        map.insert(
+            "name".to_string(),
+            serde_json::Value::String("test".to_string()),
+        );
         map.insert("extra".to_string(), serde_json::Value::Number(42.into()));
         let result: Result<Minimal, _> = parse_args(Some(map));
         assert!(result.is_ok());
@@ -597,26 +721,54 @@ mod tests {
 
         // Static method: is_static = "true"
         let mut static_node = make_test_node("create");
-        static_node.metadata.insert("is_static".to_string(), "true".to_string());
+        static_node
+            .metadata
+            .insert("is_static".to_string(), "true".to_string());
         let compact = format_node_entry(&static_node, &index, true);
         let full = format_node_entry(&static_node, &index, false);
-        assert!(compact.contains(" static"), "compact should show 'static' tag, got: {}", compact);
-        assert!(full.contains("Static: yes"), "full should show 'Static: yes', got: {}", full);
+        assert!(
+            compact.contains(" static"),
+            "compact should show 'static' tag, got: {}",
+            compact
+        );
+        assert!(
+            full.contains("Static: yes"),
+            "full should show 'Static: yes', got: {}",
+            full
+        );
 
         // Instance method: is_static = "false"
         let mut instance_node = make_test_node("serve");
-        instance_node.metadata.insert("is_static".to_string(), "false".to_string());
+        instance_node
+            .metadata
+            .insert("is_static".to_string(), "false".to_string());
         let compact = format_node_entry(&instance_node, &index, true);
         let full = format_node_entry(&instance_node, &index, false);
-        assert!(!compact.contains(" static"), "compact should NOT show 'static' for instance method, got: {}", compact);
-        assert!(full.contains("Static: no"), "full should show 'Static: no', got: {}", full);
+        assert!(
+            !compact.contains(" static"),
+            "compact should NOT show 'static' for instance method, got: {}",
+            compact
+        );
+        assert!(
+            full.contains("Static: no"),
+            "full should show 'Static: no', got: {}",
+            full
+        );
 
         // Top-level function: no is_static metadata
         let top_level = make_test_node("main");
         let compact = format_node_entry(&top_level, &index, true);
         let full = format_node_entry(&top_level, &index, false);
-        assert!(!compact.contains("static"), "compact should NOT show 'static' for top-level function, got: {}", compact);
-        assert!(!full.contains("Static:"), "full should NOT show 'Static:' for top-level function, got: {}", full);
+        assert!(
+            !compact.contains("static"),
+            "compact should NOT show 'static' for top-level function, got: {}",
+            compact
+        );
+        assert!(
+            !full.contains("Static:"),
+            "full should NOT show 'Static:' for top-level function, got: {}",
+            full
+        );
     }
 
     #[test]
@@ -634,13 +786,24 @@ mod tests {
         index.ensure_node(&node_c.stable_id(), "function");
 
         let mut groups = std::collections::BTreeMap::new();
-        groups.insert(EdgeKind::Calls, vec![node_a.stable_id(), node_b.stable_id()]);
+        groups.insert(
+            EdgeKind::Calls,
+            vec![node_a.stable_id(), node_b.stable_id()],
+        );
         groups.insert(EdgeKind::DependsOn, vec![node_c.stable_id()]);
 
         let result = format_neighbors_grouped(&nodes, &groups, &index, true);
 
-        assert!(result.contains("#### Calls (2)"), "should have Calls header, got: {}", result);
-        assert!(result.contains("#### Depends on (1)"), "should have DependsOn header, got: {}", result);
+        assert!(
+            result.contains("#### Calls (2)"),
+            "should have Calls header, got: {}",
+            result
+        );
+        assert!(
+            result.contains("#### Depends on (1)"),
+            "should have DependsOn header, got: {}",
+            result
+        );
         assert!(result.contains("callee_a"), "should contain callee_a");
         assert!(result.contains("callee_b"), "should contain callee_b");
         assert!(result.contains("dep_c"), "should contain dep_c");
@@ -663,8 +826,14 @@ mod tests {
 
         let result = format_neighbors_grouped(&nodes, &groups, &index, true);
 
-        assert!(result.contains("#### Calls (1)"), "should have Calls header");
-        assert!(!result.contains("Depends on"), "should not have empty DependsOn section");
+        assert!(
+            result.contains("#### Calls (1)"),
+            "should have Calls header"
+        );
+        assert!(
+            !result.contains("Depends on"),
+            "should not have empty DependsOn section"
+        );
     }
 
     #[test]
@@ -681,14 +850,24 @@ mod tests {
         index.ensure_node(&func_node.stable_id(), "function");
 
         let mut groups = std::collections::BTreeMap::new();
-        groups.insert(EdgeKind::Defines, vec![module_node.stable_id(), func_node.stable_id()]);
+        groups.insert(
+            EdgeKind::Defines,
+            vec![module_node.stable_id(), func_node.stable_id()],
+        );
 
         let result = format_neighbors_grouped(&nodes, &groups, &index, true);
 
         // Module node should be hidden; only func_node counted
-        assert!(result.contains("#### Defines (1)"), "should count only displayable nodes, got: {}", result);
+        assert!(
+            result.contains("#### Defines (1)"),
+            "should count only displayable nodes, got: {}",
+            result
+        );
         assert!(result.contains("my_func"), "should contain my_func");
-        assert!(!result.contains("my_module"), "should not contain hidden module node");
+        assert!(
+            !result.contains("my_module"),
+            "should not contain hidden module node"
+        );
     }
 
     #[test]
@@ -711,7 +890,10 @@ mod tests {
         assert!(compact.contains("#### Calls (1)"));
         assert!(full.contains("#### Calls (1)"));
         // Full should be longer (more detail per node)
-        assert!(full.len() > compact.len(), "full should be more detailed than compact");
+        assert!(
+            full.len() > compact.len(),
+            "full should be more detailed than compact"
+        );
     }
 
     // ── strip_root_prefix tests ─────────────────────────────────────
@@ -744,7 +926,10 @@ mod tests {
     fn test_strip_root_prefix_long_slug() {
         let id = "users-muness1-src-open-horizon-labs-repo-native-alignment:src/scanner.rs:scan:function";
         assert_eq!(
-            strip_root_prefix(id, Some("users-muness1-src-open-horizon-labs-repo-native-alignment")),
+            strip_root_prefix(
+                id,
+                Some("users-muness1-src-open-horizon-labs-repo-native-alignment")
+            ),
             "src/scanner.rs:scan:function"
         );
     }
@@ -755,7 +940,10 @@ mod tests {
     fn test_format_unresolved_id_with_strip() {
         let id = "my-root:.oh/guardrails/dogfood.md:dogfood-rna-tools:markdown_section";
         let result = format_unresolved_id(id, Some("my-root"));
-        assert_eq!(result, "- **dogfood-rna-tools** (.oh/guardrails/dogfood.md)");
+        assert_eq!(
+            result,
+            "- **dogfood-rna-tools** (.oh/guardrails/dogfood.md)"
+        );
     }
 
     #[test]
@@ -763,9 +951,17 @@ mod tests {
         // Without stripping, the full root:file prefix is preserved for disambiguation
         let id = "my-root:.oh/guardrails/dogfood.md:dogfood-rna-tools:markdown_section";
         let result = format_unresolved_id(id, None);
-        assert!(result.contains("dogfood-rna-tools"), "should contain name, got: {}", result);
+        assert!(
+            result.contains("dogfood-rna-tools"),
+            "should contain name, got: {}",
+            result
+        );
         // Without strip_root, the root prefix is preserved in the file path
-        assert!(result.contains("my-root:.oh/guardrails/dogfood.md"), "should contain root:file for disambiguation, got: {}", result);
+        assert!(
+            result.contains("my-root:.oh/guardrails/dogfood.md"),
+            "should contain root:file for disambiguation, got: {}",
+            result
+        );
     }
 
     #[test]
@@ -789,19 +985,44 @@ mod tests {
     fn test_format_node_entry_with_root_strips_prefix() {
         let node = make_test_node("my_func");
         let index = GraphIndex::new();
-        let full = format_node_entry_with_root(&node, &index, false, Some("test"));
+        let full = format_node_entry_with_root(&node, &index, false, Some("test"), false, false);
         // The stable ID should NOT start with "test:" in the display
-        assert!(full.contains("ID: `src/test.rs:my_func:function`"), "got: {}", full);
+        assert!(
+            full.contains("ID: `src/test.rs:my_func:function`"),
+            "got: {}",
+            full
+        );
     }
 
     #[test]
     fn test_format_node_entry_with_root_compact_strips_prefix() {
         let node = make_test_node("my_func");
         let index = GraphIndex::new();
-        let compact = format_node_entry_with_root(&node, &index, true, Some("test"));
+        let compact = format_node_entry_with_root(&node, &index, true, Some("test"), false, false);
         // The trailing stable ID line should not have the root prefix
-        assert!(compact.contains("`src/test.rs:my_func:function`"), "got: {}", compact);
-        assert!(!compact.contains("`test:src/"), "root prefix should be stripped, got: {}", compact);
+        assert!(
+            compact.contains("`src/test.rs:my_func:function`"),
+            "got: {}",
+            compact
+        );
+        assert!(
+            !compact.contains("`test:src/"),
+            "root prefix should be stripped, got: {}",
+            compact
+        );
+    }
+
+    #[test]
+    fn test_format_node_entry_with_root_includes_body_with_safe_fence() {
+        let mut node = make_test_node("template_fn");
+        node.language = "typescript".to_string();
+        node.body = "const fenced = \"```\";\nconst inline = `value`;".to_string();
+        let index = GraphIndex::new();
+        let full = format_node_entry_with_root(&node, &index, false, Some("test"), true, false);
+
+        assert!(full.contains("````typescript"));
+        assert!(full.contains("const fenced = \"```\";"));
+        assert!(full.contains("const inline = `value`;"));
     }
 
     // ── format_freshness_full with embedding status ─────────────────
@@ -812,7 +1033,11 @@ mod tests {
         embed_status.set_building(5000);
         embed_status.set_progress(1200);
         let result = format_freshness_full(100, None, None, Some(&embed_status));
-        assert!(result.contains("embedding... (1200/5000)"), "got: {}", result);
+        assert!(
+            result.contains("embedding... (1200/5000)"),
+            "got: {}",
+            result
+        );
     }
 
     #[test]

@@ -1,8 +1,10 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result};
-use arrow_array::{Array as ArrowArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{
+    Array as ArrowArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
+};
 use arrow_schema::{DataType, Field, Schema};
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -51,10 +53,10 @@ impl SearchFilters {
             // character). '!' is safe since it does not appear in typical file paths.
             // Escape order matters: escape '!' first to avoid double-escaping.
             let escaped = file
-                .replace('\'', "''")   // SQL single-quote escaping
-                .replace('!', "!!")    // Escape the ESCAPE character itself
-                .replace('%', "!%")    // Escape LIKE wildcard %
-                .replace('_', "!_");   // Escape LIKE single-char wildcard _
+                .replace('\'', "''") // SQL single-quote escaping
+                .replace('!', "!!") // Escape the ESCAPE character itself
+                .replace('%', "!%") // Escape LIKE wildcard %
+                .replace('_', "!_"); // Escape LIKE single-char wildcard _
             parts.push(format!("file_path LIKE '%{}%' ESCAPE '!'", escaped));
         }
 
@@ -136,9 +138,9 @@ fn embedding_schema(dim: usize) -> Schema {
         // Scalar filter columns — enable .only_if() pre-filtering before vector ranking.
         // Eliminates the 3x over-fetch hack: search(file='src/embed.rs') now filters
         // within LanceDB before scoring rather than post-filtering Rust results.
-        Field::new("file_path", DataType::Utf8, true),  // file path for path-based filtering
-        Field::new("language", DataType::Utf8, true),   // programming language
-        Field::new("subsystem", DataType::Utf8, true),  // detected subsystem cluster
+        Field::new("file_path", DataType::Utf8, true), // file path for path-based filtering
+        Field::new("language", DataType::Utf8, true),  // programming language
+        Field::new("subsystem", DataType::Utf8, true), // detected subsystem cluster
         Field::new("cyclomatic", DataType::Int32, true), // cyclomatic complexity (functions only)
         Field::new(
             "vector",
@@ -184,7 +186,9 @@ fn build_code_embedding_text(
         .filter(|(k, _)| k.as_str() != "doc_comment" && k.as_str() != "inferred_types")
         .map(|(k, v)| k.chars().count() + v.chars().count() + 3) // " key: value"
         .sum();
-    let meta_budget = after_name.saturating_sub(min_body_budget).min(meta_estimate);
+    let meta_budget = after_name
+        .saturating_sub(min_body_budget)
+        .min(meta_estimate);
 
     // Truncate metadata entries to fit within meta_budget (exclude doc_comment and inferred_types)
     let mut meta_parts: Vec<String> = Vec::new();
@@ -210,8 +214,14 @@ fn build_code_embedding_text(
     if body_budget > 0 {
         // Build combined doc + body + inferred_types text.
         // Budget allocation: doc_comment up to 1/3, body up to 1/2, inferred_types up to 1/6.
-        let doc_comment = metadata.get("doc_comment").map(|s| s.as_str()).unwrap_or("");
-        let inferred_types = metadata.get("inferred_types").map(|s| s.as_str()).unwrap_or("");
+        let doc_comment = metadata
+            .get("doc_comment")
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let inferred_types = metadata
+            .get("inferred_types")
+            .map(|s| s.as_str())
+            .unwrap_or("");
 
         let types_budget = if !inferred_types.is_empty() {
             (body_budget / 6).min(inferred_types.chars().count())
@@ -222,9 +232,8 @@ fn build_code_embedding_text(
 
         if !doc_comment.is_empty() {
             let doc_budget = remaining_for_doc_and_body / 2;
-            let remaining_body_budget = remaining_for_doc_and_body.saturating_sub(
-                doc_budget.min(doc_comment.chars().count()) + 1
-            );
+            let remaining_body_budget = remaining_for_doc_and_body
+                .saturating_sub(doc_budget.min(doc_comment.chars().count()) + 1);
             let doc_truncated = truncate_chars(doc_comment, doc_budget);
             t.push(' ');
             t.push_str(doc_truncated);
@@ -259,7 +268,10 @@ fn build_artifact_embedding_text(
     metadata: &std::collections::BTreeMap<String, String>,
 ) -> String {
     let mut text = String::with_capacity(500);
-    let id = metadata.get("frontmatter.id").map(|s| s.as_str()).unwrap_or(name);
+    let id = metadata
+        .get("frontmatter.id")
+        .map(|s| s.as_str())
+        .unwrap_or(name);
     text.push_str(id);
     text.push(' ');
     for (key, value) in metadata {
@@ -288,9 +300,7 @@ fn node_embedding_text(node: &crate::graph::Node) -> String {
         build_artifact_embedding_text(&node.id.name, &node.body, &node.metadata)
     } else {
         match &node.id.kind {
-            crate::graph::NodeKind::MarkdownSection => {
-                truncate_chars(&node.body, 500).to_string()
-            }
+            crate::graph::NodeKind::MarkdownSection => truncate_chars(&node.body, 500).to_string(),
             _ => build_code_embedding_text(&node.id.name, &node.body, &node.metadata),
         }
     }
@@ -316,7 +326,8 @@ fn node_embedding_title(node: &crate::graph::Node) -> String {
         k => format!("{}", k),
     };
     if node.metadata.contains_key("oh_kind") {
-        node.metadata.get("frontmatter.title")
+        node.metadata
+            .get("frontmatter.title")
             .or(node.metadata.get("frontmatter.statement"))
             .cloned()
             .unwrap_or_else(|| format!("{} {} ({})", kind_str, node.id.name, node.language))
@@ -331,17 +342,30 @@ fn node_embedding_title(node: &crate::graph::Node) -> String {
 /// Artifact nodes (those with `oh_kind` metadata) return `(None, None, None, None)`.
 /// Non-artifact nodes include `file_path` and `language`; `subsystem` and
 /// `cyclomatic` are populated when present in metadata.
-fn node_scalar_filters(node: &crate::graph::Node) -> (Option<String>, Option<String>, Option<String>, Option<i32>) {
+fn node_scalar_filters(
+    node: &crate::graph::Node,
+) -> (Option<String>, Option<String>, Option<String>, Option<i32>) {
     if node.metadata.contains_key("oh_kind") {
         (None, None, None, None)
     } else {
         let fp = Some(node.id.file.to_string_lossy().to_string());
-        let lang = if node.language.is_empty() { None } else { Some(node.language.clone()) };
+        let lang = if node.language.is_empty() {
+            None
+        } else {
+            Some(node.language.clone())
+        };
         let sub = node.metadata.get(crate::server::SUBSYSTEM_KEY).cloned();
-        let cc = node.metadata.get("cyclomatic").and_then(|s| s.parse::<i32>().ok());
+        let cc = node
+            .metadata
+            .get("cyclomatic")
+            .and_then(|s| s.parse::<i32>().ok());
         (fp, lang, sub, cc)
     }
 }
+
+// Serialize embedding model initialization within this process to avoid
+// HuggingFace cache lock contention when tests call `new_model()` in parallel.
+static MODEL_LOAD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
     let start = std::time::Instant::now();
@@ -355,9 +379,14 @@ fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
     let device = candle_core::Device::Cpu;
 
     #[cfg(feature = "metal")]
-    let device_name = if matches!(device, candle_core::Device::Metal(_)) { "Metal GPU" } else { "CPU" };
+    let device_name = if matches!(device, candle_core::Device::Metal(_)) {
+        "Metal GPU"
+    } else {
+        "CPU"
+    };
     #[cfg(not(feature = "metal"))]
     let device_name = "CPU";
+    let _model_load_guard = MODEL_LOAD_LOCK.lock().expect("model load lock poisoned");
 
     let model = metal_candle::embeddings::EmbeddingModel::from_pretrained(
         metal_candle::embeddings::EmbeddingModelType::AllMiniLmL6V2,
@@ -368,11 +397,14 @@ fn new_model() -> Result<metal_candle::embeddings::EmbeddingModel> {
     match &model {
         Ok(m) => tracing::info!(
             "EmbeddingIndex: MiniLM-L6-v2 ready on {} (dim={}) in {:?}",
-            device_name, m.dimension(), start.elapsed()
+            device_name,
+            m.dimension(),
+            start.elapsed()
         ),
         Err(err) => tracing::warn!(
             "EmbeddingIndex: model load failed in {:?}: {}",
-            start.elapsed(), err
+            start.elapsed(),
+            err
         ),
     }
     model
@@ -398,7 +430,10 @@ async fn embed_texts_with_model(
     let overall_start = std::time::Instant::now();
     tracing::info!(
         "EmbeddingIndex: embedding {} text(s) ({} chars total, adaptive batch {}..{})",
-        total, total_chars, BATCH_FLOOR, BATCH_CEILING
+        total,
+        total_chars,
+        BATCH_FLOOR,
+        BATCH_CEILING
     );
 
     let mut remaining = texts;
@@ -415,9 +450,11 @@ async fn embed_texts_with_model(
         let batch_start = std::time::Instant::now();
 
         let refs: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
-        let tensor = model.encode(&refs)
+        let tensor = model
+            .encode(&refs)
             .map_err(|e| anyhow::anyhow!("Embedding failed: {}", e))?;
-        let batch_embeddings: Vec<Vec<f32>> = tensor.to_vec2::<f32>()
+        let batch_embeddings: Vec<Vec<f32>> = tensor
+            .to_vec2::<f32>()
             .map_err(|e| anyhow::anyhow!("Tensor conversion failed: {}", e))?;
 
         let elapsed_secs = batch_start.elapsed().as_secs_f64();
@@ -437,7 +474,9 @@ async fn embed_texts_with_model(
                     current_batch_size = (current_batch_size / 2).max(BATCH_FLOOR);
                     tracing::debug!(
                         "EmbeddingIndex: backoff batch_size -> {} (per_item {:.4}s > {:.4}s threshold)",
-                        current_batch_size, per_item, BACKOFF_THRESHOLD * avg
+                        current_batch_size,
+                        per_item,
+                        BACKOFF_THRESHOLD * avg
                     );
                 } else {
                     // Steady — grow batch size
@@ -452,7 +491,11 @@ async fn embed_texts_with_model(
         batch_idx += 1;
         tracing::info!(
             "EmbeddingIndex: batch {} done in {:?} (bs={}, {}/{})",
-            batch_idx, batch_start.elapsed(), bs, processed, total
+            batch_idx,
+            batch_start.elapsed(),
+            bs,
+            processed,
+            total
         );
         all_embeddings.extend(batch_embeddings);
 
@@ -464,11 +507,11 @@ async fn embed_texts_with_model(
 
     tracing::info!(
         "EmbeddingIndex: embedded {} text(s) in {:?}",
-        processed, overall_start.elapsed()
+        processed,
+        overall_start.elapsed()
     );
     Ok(all_embeddings)
 }
-
 
 /// The embedding index: wraps LanceDB with fastembed for semantic search over .oh/ artifacts.
 #[derive(Clone)]
@@ -567,10 +610,7 @@ impl EmbeddingIndex {
         let fts_start = std::time::Instant::now();
         // Title index: symbol names, kind labels, language — best for exact keyword matches.
         if let Err(e) = table
-            .create_index(
-                &["title"],
-                lancedb::index::Index::FTS(Default::default()),
-            )
+            .create_index(&["title"], lancedb::index::Index::FTS(Default::default()))
             .replace(true)
             .execute()
             .await
@@ -580,10 +620,7 @@ impl EmbeddingIndex {
         }
         // Body index: signatures, file paths, commit messages — broader keyword coverage.
         if let Err(e) = table
-            .create_index(
-                &["body"],
-                lancedb::index::Index::FTS(Default::default()),
-            )
+            .create_index(&["body"], lancedb::index::Index::FTS(Default::default()))
             .replace(true)
             .execute()
             .await
@@ -717,7 +754,12 @@ impl EmbeddingIndex {
 
         // Query existing text_hash values to skip unchanged nodes.
         // If the column doesn't exist (old schema), embed everything.
-        let existing_hashes = self.query_text_hashes(&table, &candidates.iter().map(|c| c.id.as_str()).collect::<Vec<_>>()).await;
+        let existing_hashes = self
+            .query_text_hashes(
+                &table,
+                &candidates.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            )
+            .await;
 
         let (to_embed, skipped): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
             match &existing_hashes {
@@ -775,11 +817,15 @@ impl EmbeddingIndex {
         let kind_array = Arc::new(StringArray::from(kinds)) as Arc<dyn arrow_array::Array>;
         let title_array = Arc::new(StringArray::from(titles)) as Arc<dyn arrow_array::Array>;
         let body_array = Arc::new(StringArray::from(bodies)) as Arc<dyn arrow_array::Array>;
-        let text_hash_array = Arc::new(StringArray::from(text_hashes)) as Arc<dyn arrow_array::Array>;
-        let file_path_array = Arc::new(StringArray::from(file_paths)) as Arc<dyn arrow_array::Array>;
+        let text_hash_array =
+            Arc::new(StringArray::from(text_hashes)) as Arc<dyn arrow_array::Array>;
+        let file_path_array =
+            Arc::new(StringArray::from(file_paths)) as Arc<dyn arrow_array::Array>;
         let language_array = Arc::new(StringArray::from(languages)) as Arc<dyn arrow_array::Array>;
-        let subsystem_array = Arc::new(StringArray::from(subsystems)) as Arc<dyn arrow_array::Array>;
-        let cyclomatic_array = Arc::new(Int32Array::from(cyclomatics)) as Arc<dyn arrow_array::Array>;
+        let subsystem_array =
+            Arc::new(StringArray::from(subsystems)) as Arc<dyn arrow_array::Array>;
+        let cyclomatic_array =
+            Arc::new(Int32Array::from(cyclomatics)) as Arc<dyn arrow_array::Array>;
         let values = Arc::new(Float32Array::from(flat_embeddings));
         let list_field = Arc::new(Field::new("item", DataType::Float32, true));
         let vector_array = Arc::new(arrow_array::FixedSizeListArray::try_new(
@@ -788,9 +834,18 @@ impl EmbeddingIndex {
 
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![id_array, kind_array, title_array, body_array, text_hash_array,
-                 file_path_array, language_array, subsystem_array, cyclomatic_array,
-                 vector_array],
+            vec![
+                id_array,
+                kind_array,
+                title_array,
+                body_array,
+                text_hash_array,
+                file_path_array,
+                language_array,
+                subsystem_array,
+                cyclomatic_array,
+                vector_array,
+            ],
         )?;
 
         // Delete existing rows for these IDs, then add() fresh.
@@ -819,15 +874,17 @@ impl EmbeddingIndex {
     // (markdown_section with oh_kind metadata) and flow through
     // reindex_nodes() like everything else.
 
-
     /// Delete rows by ID in batches of 500. Used before add() to avoid merge_insert (#332).
     async fn delete_rows_by_ids(&self, table: &lancedb::Table, ids: &[&str]) -> Result<()> {
         for chunk in ids.chunks(500) {
-            let quoted: Vec<String> = chunk.iter()
+            let quoted: Vec<String> = chunk
+                .iter()
                 .map(|id| format!("'{}'", id.replace('\'', "''")))
                 .collect();
             let filter = format!("id IN ({})", quoted.join(", "));
-            table.delete(&filter).await
+            table
+                .delete(&filter)
+                .await
                 .context("Failed to delete rows by ID")?;
         }
         Ok(())
@@ -847,7 +904,10 @@ impl EmbeddingIndex {
         }
 
         // Build filter: id IN ('id1', 'id2', ...)
-        let quoted: Vec<String> = node_ids.iter().map(|id| format!("'{}'", id.replace('\'', "''"))).collect();
+        let quoted: Vec<String> = node_ids
+            .iter()
+            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .collect();
         let filter = format!("id IN ({})", quoted.join(", "));
 
         let result = table
@@ -895,7 +955,11 @@ impl EmbeddingIndex {
         Some(map)
     }
 
-    async fn index_all_inner(&self, repo_root: &Path, symbols: &[crate::graph::Node]) -> Result<usize> {
+    async fn index_all_inner(
+        &self,
+        repo_root: &Path,
+        symbols: &[crate::graph::Node],
+    ) -> Result<usize> {
         let index_start = std::time::Instant::now();
         tracing::info!(
             "EmbeddingIndex: rebuilding full index for {}",
@@ -974,8 +1038,16 @@ impl EmbeddingIndex {
                     }
                     seen_merge_shas.insert(short.clone());
 
-                    let branch = node.metadata.get("branch_name").cloned().unwrap_or_default();
-                    let files = node.metadata.get("files_changed").cloned().unwrap_or_default();
+                    let branch = node
+                        .metadata
+                        .get("branch_name")
+                        .cloned()
+                        .unwrap_or_default();
+                    let files = node
+                        .metadata
+                        .get("files_changed")
+                        .cloned()
+                        .unwrap_or_default();
                     let body = format!("{}\n\nBranch: {}\nFiles: {}", node.body, branch, files);
                     let text_hash = blake3::hash(body.as_bytes()).to_hex().to_string();
 
@@ -998,11 +1070,13 @@ impl EmbeddingIndex {
         };
 
         // Filter to embeddable node kinds before counting/indexing
-        let embeddable: Vec<&crate::graph::Node> = symbols.iter()
+        let embeddable: Vec<&crate::graph::Node> = symbols
+            .iter()
             .filter(|n| n.id.kind.is_embeddable())
             .collect();
         let skipped = symbols.len() - embeddable.len();
-        let oh_artifact_count = embeddable.iter()
+        let oh_artifact_count = embeddable
+            .iter()
             .filter(|n| n.metadata.contains_key("oh_kind"))
             .count();
         tracing::info!(
@@ -1048,7 +1122,10 @@ impl EmbeddingIndex {
         }
 
         if candidates.is_empty() {
-            tracing::info!("EmbeddingIndex: no texts collected for {}", repo_root.display());
+            tracing::info!(
+                "EmbeddingIndex: no texts collected for {}",
+                repo_root.display()
+            );
             return Ok(0);
         }
 
@@ -1064,19 +1141,27 @@ impl EmbeddingIndex {
         // If the table exists, query existing hashes and partition candidates
         // into changed vs unchanged. This avoids re-embedding the entire corpus
         // on every full rebuild.
-        let table_exists = self.has_table().await
+        let table_exists = self
+            .has_table()
+            .await
             .context("Failed to check embedding table before full reindex")?;
 
         // If the table exists but has an old schema (missing text_hash or file_path columns),
         // drop it and treat as fresh. LanceDB does not support adding nullable columns
         // to existing tables via add() — a schema mismatch is a fatal error at write time.
         let (table_exists, to_embed) = if table_exists {
-            let table = self.db.open_table(&self.table_name).execute().await
+            let table = self
+                .db
+                .open_table(&self.table_name)
+                .execute()
+                .await
                 .context("Failed to open embedding table for hash check")?;
 
             // Check for file_path column (added in #400/schema v2 of embedding table).
             // If missing, force a full rebuild to pick up scalar filter columns.
-            let has_file_path_col = table.schema().await
+            let has_file_path_col = table
+                .schema()
+                .await
                 .map(|s| s.column_with_name("file_path").is_some())
                 .unwrap_or(false);
 
@@ -1091,16 +1176,20 @@ impl EmbeddingIndex {
                     has_file_path_col,
                 );
                 if let Err(e) = self.db.drop_table(&self.table_name, &[]).await {
-                    tracing::debug!("EmbeddingIndex: drop_table failed (proceeding with create): {}", e);
+                    tracing::debug!(
+                        "EmbeddingIndex: drop_table failed (proceeding with create): {}",
+                        e
+                    );
                 }
                 (false, candidates)
             } else {
-                let (to_embed, unchanged): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
-                    match &existing_hashes {
-                        Some(map) => map.get(&c.id).is_none_or(|h| *h != c.text_hash),
-                        None => true,
-                    }
-                });
+                let (to_embed, unchanged): (Vec<_>, Vec<_>) =
+                    candidates
+                        .into_iter()
+                        .partition(|c| match &existing_hashes {
+                            Some(map) => map.get(&c.id).is_none_or(|h| *h != c.text_hash),
+                            None => true,
+                        });
                 let unchanged_count = unchanged.len();
 
                 if unchanged_count > 0 {
@@ -1136,7 +1225,11 @@ impl EmbeddingIndex {
             // here: the BLAKE3 hash check already partitioned candidates into
             // changed (to_embed) vs unchanged (kept in-place).
             if table_exists {
-                let table = self.db.open_table(&self.table_name).execute().await
+                let table = self
+                    .db
+                    .open_table(&self.table_name)
+                    .execute()
+                    .await
                     .context("Failed to open table to delete stale rows before re-embed")?;
                 let ids_to_delete: Vec<&str> = to_embed.iter().map(|c| c.id.as_str()).collect();
                 self.delete_rows_by_ids(&table, &ids_to_delete).await?;
@@ -1156,7 +1249,8 @@ impl EmbeddingIndex {
                 let bs = remaining.len().min(WRITE_BATCH_SIZE);
                 let batch_candidates: Vec<Candidate> = remaining.drain(..bs).collect();
 
-                let batch_texts: Vec<String> = batch_candidates.iter().map(|c| c.text.clone()).collect();
+                let batch_texts: Vec<String> =
+                    batch_candidates.iter().map(|c| c.text.clone()).collect();
                 let embeddings = embed_texts_with_model(&model, batch_texts).await?;
 
                 if embeddings.is_empty() {
@@ -1166,27 +1260,53 @@ impl EmbeddingIndex {
                 let dim = embeddings[0].len();
                 let flat_embeddings: Vec<f32> = embeddings.into_iter().flatten().collect();
 
-                let batch_ids: Vec<String> = batch_candidates.iter().map(|c| c.id.clone()).collect();
-                let batch_kinds: Vec<String> = batch_candidates.iter().map(|c| c.kind.clone()).collect();
-                let batch_titles: Vec<String> = batch_candidates.iter().map(|c| c.title.clone()).collect();
-                let batch_bodies: Vec<String> = batch_candidates.iter().map(|c| c.body.clone()).collect();
-                let batch_text_hashes: Vec<String> = batch_candidates.iter().map(|c| c.text_hash.clone()).collect();
-                let batch_file_paths: Vec<Option<String>> = batch_candidates.iter().map(|c| c.file_path.clone()).collect();
-                let batch_languages: Vec<Option<String>> = batch_candidates.iter().map(|c| c.language.clone()).collect();
-                let batch_subsystems: Vec<Option<String>> = batch_candidates.iter().map(|c| c.subsystem.clone()).collect();
-                let batch_cyclomatics: Vec<Option<i32>> = batch_candidates.iter().map(|c| c.cyclomatic).collect();
+                let batch_ids: Vec<String> =
+                    batch_candidates.iter().map(|c| c.id.clone()).collect();
+                let batch_kinds: Vec<String> =
+                    batch_candidates.iter().map(|c| c.kind.clone()).collect();
+                let batch_titles: Vec<String> =
+                    batch_candidates.iter().map(|c| c.title.clone()).collect();
+                let batch_bodies: Vec<String> =
+                    batch_candidates.iter().map(|c| c.body.clone()).collect();
+                let batch_text_hashes: Vec<String> = batch_candidates
+                    .iter()
+                    .map(|c| c.text_hash.clone())
+                    .collect();
+                let batch_file_paths: Vec<Option<String>> = batch_candidates
+                    .iter()
+                    .map(|c| c.file_path.clone())
+                    .collect();
+                let batch_languages: Vec<Option<String>> = batch_candidates
+                    .iter()
+                    .map(|c| c.language.clone())
+                    .collect();
+                let batch_subsystems: Vec<Option<String>> = batch_candidates
+                    .iter()
+                    .map(|c| c.subsystem.clone())
+                    .collect();
+                let batch_cyclomatics: Vec<Option<i32>> =
+                    batch_candidates.iter().map(|c| c.cyclomatic).collect();
 
                 let schema = Arc::new(embedding_schema(dim));
 
-                let id_array = Arc::new(StringArray::from(batch_ids)) as Arc<dyn arrow_array::Array>;
-                let kind_array = Arc::new(StringArray::from(batch_kinds)) as Arc<dyn arrow_array::Array>;
-                let title_array = Arc::new(StringArray::from(batch_titles)) as Arc<dyn arrow_array::Array>;
-                let body_array = Arc::new(StringArray::from(batch_bodies)) as Arc<dyn arrow_array::Array>;
-                let text_hash_array = Arc::new(StringArray::from(batch_text_hashes)) as Arc<dyn arrow_array::Array>;
-                let file_path_array = Arc::new(StringArray::from(batch_file_paths)) as Arc<dyn arrow_array::Array>;
-                let language_array = Arc::new(StringArray::from(batch_languages)) as Arc<dyn arrow_array::Array>;
-                let subsystem_array = Arc::new(StringArray::from(batch_subsystems)) as Arc<dyn arrow_array::Array>;
-                let cyclomatic_array = Arc::new(Int32Array::from(batch_cyclomatics)) as Arc<dyn arrow_array::Array>;
+                let id_array =
+                    Arc::new(StringArray::from(batch_ids)) as Arc<dyn arrow_array::Array>;
+                let kind_array =
+                    Arc::new(StringArray::from(batch_kinds)) as Arc<dyn arrow_array::Array>;
+                let title_array =
+                    Arc::new(StringArray::from(batch_titles)) as Arc<dyn arrow_array::Array>;
+                let body_array =
+                    Arc::new(StringArray::from(batch_bodies)) as Arc<dyn arrow_array::Array>;
+                let text_hash_array =
+                    Arc::new(StringArray::from(batch_text_hashes)) as Arc<dyn arrow_array::Array>;
+                let file_path_array =
+                    Arc::new(StringArray::from(batch_file_paths)) as Arc<dyn arrow_array::Array>;
+                let language_array =
+                    Arc::new(StringArray::from(batch_languages)) as Arc<dyn arrow_array::Array>;
+                let subsystem_array =
+                    Arc::new(StringArray::from(batch_subsystems)) as Arc<dyn arrow_array::Array>;
+                let cyclomatic_array =
+                    Arc::new(Int32Array::from(batch_cyclomatics)) as Arc<dyn arrow_array::Array>;
                 let values = Arc::new(Float32Array::from(flat_embeddings));
                 let list_field = Arc::new(Field::new("item", DataType::Float32, true));
                 let vector_array = Arc::new(arrow_array::FixedSizeListArray::try_new(
@@ -1195,9 +1315,18 @@ impl EmbeddingIndex {
 
                 let batch = RecordBatch::try_new(
                     schema.clone(),
-                    vec![id_array, kind_array, title_array, body_array, text_hash_array,
-                         file_path_array, language_array, subsystem_array, cyclomatic_array,
-                         vector_array],
+                    vec![
+                        id_array,
+                        kind_array,
+                        title_array,
+                        body_array,
+                        text_hash_array,
+                        file_path_array,
+                        language_array,
+                        subsystem_array,
+                        cyclomatic_array,
+                        vector_array,
+                    ],
                 )?;
 
                 if !table_exists && batch_idx == 0 {
@@ -1213,7 +1342,11 @@ impl EmbeddingIndex {
                     // For fresh tables, no duplicates are possible.
                     // For existing tables, rows to re-embed were already deleted
                     // above (#332).
-                    let table = self.db.open_table(&self.table_name).execute().await
+                    let table = self
+                        .db
+                        .open_table(&self.table_name)
+                        .execute()
+                        .await
                         .context("Failed to open table for add")?;
                     let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
                     table
@@ -1227,7 +1360,9 @@ impl EmbeddingIndex {
                 batch_idx += 1;
                 tracing::info!(
                     "EmbeddingIndex: embedded+persisted batch {} ({}/{} rows)",
-                    batch_idx, embedded_count, embedded_count + remaining.len()
+                    batch_idx,
+                    embedded_count,
+                    embedded_count + remaining.len()
                 );
             }
         }
@@ -1244,10 +1379,9 @@ impl EmbeddingIndex {
         // longer exist in the graph. Delete them.
         // Uses current_ids captured before partitioning to avoid re-loading
         // commits/merges from git.
-        if table_exists
-            && let Err(e) = self.delete_stale_rows_with_ids(&current_ids).await {
-                tracing::warn!("EmbeddingIndex: failed to delete stale rows: {}", e);
-            }
+        if table_exists && let Err(e) = self.delete_stale_rows_with_ids(&current_ids).await {
+            tracing::warn!("EmbeddingIndex: failed to delete stale rows: {}", e);
+        }
 
         // --- Compact lance to reclaim space (#298) ---
         if let Ok(table) = self.db.open_table(&self.table_name).execute().await {
@@ -1270,7 +1404,9 @@ impl EmbeddingIndex {
         if let Ok(table) = self.db.open_table(&self.table_name).execute().await {
             self.create_fts_index(&table).await;
         } else {
-            tracing::warn!("Could not open table for FTS index creation; hybrid search will use vector-only");
+            tracing::warn!(
+                "Could not open table for FTS index creation; hybrid search will use vector-only"
+            );
         }
 
         Ok(embedded_count)
@@ -1278,10 +1414,17 @@ impl EmbeddingIndex {
 
     /// Delete embedding rows for IDs that are no longer in the current graph.
     /// Called after rebuild to clean up stale entries from previous builds.
-    async fn delete_stale_rows_with_ids(&self, current_ids: &std::collections::HashSet<String>) -> Result<()> {
+    async fn delete_stale_rows_with_ids(
+        &self,
+        current_ids: &std::collections::HashSet<String>,
+    ) -> Result<()> {
         use futures::TryStreamExt;
 
-        let table = self.db.open_table(&self.table_name).execute().await
+        let table = self
+            .db
+            .open_table(&self.table_name)
+            .execute()
+            .await
             .context("Failed to open table for stale row deletion")?;
 
         // Query all IDs currently in the table
@@ -1291,12 +1434,15 @@ impl EmbeddingIndex {
             .execute()
             .await
             .context("Failed to query IDs for stale detection")?;
-        let batches: Vec<RecordBatch> = stream.try_collect().await
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
             .context("Failed to collect ID batches")?;
 
         let mut stale_ids: Vec<String> = Vec::new();
         for batch in &batches {
-            if let Some(id_col) = batch.column_by_name("id")
+            if let Some(id_col) = batch
+                .column_by_name("id")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>())
             {
                 for i in 0..id_col.len() {
@@ -1341,7 +1487,8 @@ impl EmbeddingIndex {
         artifact_types: Option<&[String]>,
         limit: usize,
     ) -> Result<SearchOutcome> {
-        self.search_with_mode(query, artifact_types, limit, SearchMode::default()).await
+        self.search_with_mode(query, artifact_types, limit, SearchMode::default())
+            .await
     }
 
     /// Search with an explicit [`SearchMode`].
@@ -1352,7 +1499,14 @@ impl EmbeddingIndex {
         limit: usize,
         mode: SearchMode,
     ) -> Result<SearchOutcome> {
-        self.search_with_filters(query, artifact_types, limit, mode, &SearchFilters::default()).await
+        self.search_with_filters(
+            query,
+            artifact_types,
+            limit,
+            mode,
+            &SearchFilters::default(),
+        )
+        .await
     }
 
     /// Search with an explicit [`SearchMode`] and scalar pre-filters (#400).
@@ -1368,16 +1522,14 @@ impl EmbeddingIndex {
         mode: SearchMode,
         filters: &SearchFilters,
     ) -> Result<SearchOutcome> {
-        let table = match self
-            .db
-            .open_table(&self.table_name)
-            .execute()
-            .await
-        {
+        let table = match self.db.open_table(&self.table_name).execute().await {
             Ok(t) => t,
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("was not found") || msg.contains("does not exist") || msg.contains("not found") {
+                if msg.contains("was not found")
+                    || msg.contains("does not exist")
+                    || msg.contains("not found")
+                {
                     return Ok(SearchOutcome::NotReady);
                 }
                 return Err(e).context("Failed to open embedding table");
@@ -1400,9 +1552,9 @@ impl EmbeddingIndex {
         let has_scalar_filters = pre_filter_sql.is_some();
         let has_post_filter = artifact_types.is_some_and(|t| !t.is_empty());
         let over_fetch = match (has_scalar_filters, has_post_filter) {
-            (true, false) => limit,       // scalar-only: exact fetch
-            (true, true)  => limit * 2,  // scalar + artifact_type: 2x for post-filter loss
-            _             => limit * 3,  // no scalar filters: baseline 3x
+            (true, false) => limit,    // scalar-only: exact fetch
+            (true, true) => limit * 2, // scalar + artifact_type: 2x for post-filter loss
+            _ => limit * 3,            // no scalar filters: baseline 3x
         };
 
         use futures::TryStreamExt;
@@ -1411,16 +1563,11 @@ impl EmbeddingIndex {
             SearchMode::Keyword => {
                 // Pure BM25 full-text search — no embedding needed.
                 let fts_query = FullTextSearchQuery::new(query.to_string());
-                let mut q = table
-                    .query()
-                    .full_text_search(fts_query)
-                    .limit(over_fetch);
+                let mut q = table.query().full_text_search(fts_query).limit(over_fetch);
                 if let Some(ref sql) = pre_filter_sql {
                     q = q.only_if(sql.clone());
                 }
-                let results = q.execute()
-                    .await
-                    .context("FTS keyword search failed")?;
+                let results = q.execute().await.context("FTS keyword search failed")?;
                 results.try_collect().await?
             }
             SearchMode::Semantic => {
@@ -1444,10 +1591,7 @@ impl EmbeddingIndex {
                 let query_embedding = embed_texts(vec![query.to_string()]).await?;
                 let fts_query = FullTextSearchQuery::new(query.to_string());
 
-                let mut q = table
-                    .query()
-                    .full_text_search(fts_query)
-                    .limit(over_fetch);
+                let mut q = table.query().full_text_search(fts_query).limit(over_fetch);
                 if let Some(ref sql) = pre_filter_sql {
                     q = q.only_if(sql.clone());
                 }
@@ -1463,10 +1607,7 @@ impl EmbeddingIndex {
                     Err(e) => {
                         // FTS index may not exist yet (first run before index_all
                         // completes, or old cache). Fall back to pure vector search.
-                        tracing::warn!(
-                            "Hybrid search failed ({}), falling back to vector-only",
-                            e
-                        );
+                        tracing::warn!("Hybrid search failed ({}), falling back to vector-only", e);
                         let mut search = table
                             .vector_search(query_embedding[0].clone())
                             .context("Failed to create fallback vector search")?
@@ -1475,7 +1616,10 @@ impl EmbeddingIndex {
                         if let Some(ref sql) = pre_filter_sql {
                             search = search.only_if(sql.clone());
                         }
-                        let results = search.execute().await.context("Fallback vector search failed")?;
+                        let results = search
+                            .execute()
+                            .await
+                            .context("Fallback vector search failed")?;
                         results.try_collect().await?
                     }
                 }
@@ -1489,8 +1633,7 @@ impl EmbeddingIndex {
         // The first batch may be skipped (missing required columns) when hybrid search
         // with a pre-filter returns a partial schema, so checking only the first batch
         // could misdetect the score column. (#400)
-        let has_score_col = batches.iter()
-            .any(|b| b.column_by_name("_score").is_some());
+        let has_score_col = batches.iter().any(|b| b.column_by_name("_score").is_some());
 
         for batch in &batches {
             // LanceDB hybrid search with a pre-filter (.only_if()) can return
@@ -1544,9 +1687,10 @@ impl EmbeddingIndex {
 
                 // Filter by artifact type if specified
                 if let Some(types) = artifact_types
-                    && !types.iter().any(|t| t == &kind) {
-                        continue;
-                    }
+                    && !types.iter().any(|t| t == &kind)
+                {
+                    continue;
+                }
 
                 let raw_score = if has_score_col {
                     // RRF / BM25 `_score` — higher is better.
@@ -1594,7 +1738,11 @@ impl EmbeddingIndex {
         }
 
         // Re-sort by adjusted score (descending) and truncate.
-        search_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        search_results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         search_results.truncate(limit);
 
         Ok(SearchOutcome::Results(search_results))
@@ -1604,11 +1752,10 @@ impl EmbeddingIndex {
 #[cfg(test)]
 mod tests {
     use super::{
-        truncate_chars, build_code_embedding_text, build_artifact_embedding_text,
-        node_embedding_text, node_embedding_kind, node_embedding_title, node_scalar_filters,
-        CODE_EMBED_CHAR_BUDGET,
-        BATCH_FLOOR, BATCH_CEILING, BATCH_YIELD_MS, BACKOFF_THRESHOLD,
-        EmbeddingIndex, SearchFilters,
+        BACKOFF_THRESHOLD, BATCH_CEILING, BATCH_FLOOR, BATCH_YIELD_MS, CODE_EMBED_CHAR_BUDGET,
+        EmbeddingIndex, SearchFilters, build_artifact_embedding_text, build_code_embedding_text,
+        node_embedding_kind, node_embedding_text, node_embedding_title, node_scalar_filters,
+        truncate_chars,
     };
     use std::collections::BTreeMap;
 
@@ -1620,12 +1767,15 @@ mod tests {
         let repo_root = tmp.path().to_path_buf();
         let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
         // Fresh DB with no table should return Ok(false)
-        assert!(!idx.has_table().await.unwrap(), "has_table should be false on fresh DB");
+        assert!(
+            !idx.has_table().await.unwrap(),
+            "has_table should be false on fresh DB"
+        );
     }
 
     #[tokio::test]
     async fn has_table_returns_true_after_index_build() {
-        use crate::graph::{Node, NodeId, NodeKind, ExtractionSource};
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
         use std::path::PathBuf;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1633,7 +1783,10 @@ mod tests {
         // Create .oh directory structure that index_all_with_symbols expects
         std::fs::create_dir_all(repo_root.join(".oh")).unwrap();
         let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
-        assert!(!idx.has_table().await.unwrap(), "precondition: no table yet");
+        assert!(
+            !idx.has_table().await.unwrap(),
+            "precondition: no table yet"
+        );
 
         // Provide a real node so the table gets created (empty texts = no table)
         let node = Node {
@@ -1651,10 +1804,16 @@ mod tests {
             metadata: BTreeMap::new(),
             source: ExtractionSource::TreeSitter,
         };
-        let count = idx.index_all_with_symbols(&repo_root, &[node]).await.unwrap();
+        let count = idx
+            .index_all_with_symbols(&repo_root, &[node])
+            .await
+            .unwrap();
         assert!(count > 0, "should have indexed at least 1 item");
         // Table should now exist
-        assert!(idx.has_table().await.unwrap(), "has_table should be true after build");
+        assert!(
+            idx.has_table().await.unwrap(),
+            "has_table should be true after build"
+        );
     }
 
     #[test]
@@ -1717,9 +1876,15 @@ mod tests {
             CODE_EMBED_CHAR_BUDGET,
         );
         // Name should be present
-        assert!(text.starts_with(name), "text should start with the function name");
+        assert!(
+            text.starts_with(name),
+            "text should start with the function name"
+        );
         // Body content (signature) should be present -- but NOT duplicated
-        assert!(text.contains("handle_timeout_error"), "text should contain function name");
+        assert!(
+            text.contains("handle_timeout_error"),
+            "text should contain function name"
+        );
         let sig_occurrences = text.matches("handle_timeout_error").count();
         // name appears once at start, once inside the body's signature line = 2 max
         assert!(
@@ -1764,7 +1929,10 @@ mod tests {
             CODE_EMBED_CHAR_BUDGET,
         );
         // Should contain the metadata
-        assert!(text.contains("return_type: i32"), "metadata should be in text");
+        assert!(
+            text.contains("return_type: i32"),
+            "metadata should be in text"
+        );
     }
 
     #[test]
@@ -1773,10 +1941,7 @@ mod tests {
         // We should NOT see name + signature + body (which would duplicate).
         let name = "search";
         let signature = "pub fn search(&self, query: &str) -> Vec<Result>";
-        let body = format!(
-            "{} {{\n    self.db.query(query).collect()\n}}",
-            signature
-        );
+        let body = format!("{} {{\n    self.db.query(query).collect()\n}}", signature);
         let metadata = BTreeMap::new();
         let text = build_code_embedding_text(name, &body, &metadata);
 
@@ -1810,14 +1975,21 @@ mod tests {
         let text = build_code_embedding_text("foo", "", &BTreeMap::new());
         assert!(text.contains("foo"), "must contain name");
         // Should not be just whitespace or have excessive padding
-        assert_eq!(text.trim(), "foo", "empty body should produce just name (trimmed)");
+        assert_eq!(
+            text.trim(),
+            "foo",
+            "empty body should produce just name (trimmed)"
+        );
     }
 
     /// Empty name: the function must not panic and body should still appear.
     #[test]
     fn empty_name_no_panic() {
         let text = build_code_embedding_text("", "fn () { 42 }", &BTreeMap::new());
-        assert!(text.contains("fn () { 42 }"), "body must be present even with empty name");
+        assert!(
+            text.contains("fn () { 42 }"),
+            "body must be present even with empty name"
+        );
     }
 
     /// Both name and body empty: should produce an empty or near-empty string.
@@ -1853,9 +2025,12 @@ mod tests {
         //
         // Verify the body content is still present (it's short enough
         // to fit even with the overcounting)
-        assert!(text.contains(&"x".repeat(50)),
+        assert!(
+            text.contains(&"x".repeat(50)),
             "body should contain at least 50 x's, but meta byte overcounting \
-             may have stolen body budget. Text: {}", text);
+             may have stolen body budget. Text: {}",
+            text
+        );
     }
 
     /// Attack: enormous name that exceeds CODE_EMBED_CHAR_BUDGET.
@@ -1869,7 +2044,9 @@ mod tests {
         assert!(
             text.chars().count() <= CODE_EMBED_CHAR_BUDGET,
             "enormous name ({} chars) must be truncated to budget ({}), got {}",
-            name.len(), CODE_EMBED_CHAR_BUDGET, text.chars().count()
+            name.len(),
+            CODE_EMBED_CHAR_BUDGET,
+            text.chars().count()
         );
     }
 
@@ -1884,7 +2061,10 @@ mod tests {
         for i in 0..50 {
             metadata.insert(
                 format!("type_ref_{:03}", i),
-                format!("some::deeply::nested::module::Type{}<Generic{}, Another{}>", i, i, i),
+                format!(
+                    "some::deeply::nested::module::Type{}<Generic{}, Another{}>",
+                    i, i, i
+                ),
             );
         }
 
@@ -1909,7 +2089,10 @@ mod tests {
         for i in 0..15 {
             metadata.insert(
                 format!("param_type_{}", i),
-                format!("std::collections::HashMap<String, Vec<Arc<Mutex<Type{}>>>>", i),
+                format!(
+                    "std::collections::HashMap<String, Vec<Arc<Mutex<Type{}>>>>",
+                    i
+                ),
             );
         }
 
@@ -1953,7 +2136,10 @@ mod tests {
             "fn \u{1f600}_handler() { let \u{03b1} = \u{03b2} + \u{03b3}; }",
             &BTreeMap::new(),
         );
-        assert!(std::str::from_utf8(text.as_bytes()).is_ok(), "must be valid UTF-8");
+        assert!(
+            std::str::from_utf8(text.as_bytes()).is_ok(),
+            "must be valid UTF-8"
+        );
         assert!(text.contains("\u{1f600}"), "emoji must survive");
     }
 
@@ -2063,7 +2249,8 @@ mod tests {
         assert!(
             text.chars().count() <= CODE_EMBED_CHAR_BUDGET,
             "text {} chars exceeds budget {}",
-            text.chars().count(), CODE_EMBED_CHAR_BUDGET
+            text.chars().count(),
+            CODE_EMBED_CHAR_BUDGET
         );
         // Body should be fully included (not truncated)
         assert!(
@@ -2084,7 +2271,8 @@ mod tests {
         assert!(
             BATCH_FLOOR < BATCH_CEILING,
             "BATCH_FLOOR ({}) must be less than BATCH_CEILING ({})",
-            BATCH_FLOOR, BATCH_CEILING
+            BATCH_FLOOR,
+            BATCH_CEILING
         );
         assert!(
             BATCH_FLOOR > 0,
@@ -2384,7 +2572,7 @@ mod tests {
 
     #[tokio::test]
     async fn oh_artifact_node_gets_artifact_kind_in_embedding() {
-        use crate::graph::{Node, NodeId, NodeKind, ExtractionSource};
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
         use std::path::PathBuf;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -2414,7 +2602,10 @@ mod tests {
             source: ExtractionSource::Markdown,
         };
 
-        let count = idx.index_all_with_symbols(&repo_root, &[node]).await.unwrap();
+        let count = idx
+            .index_all_with_symbols(&repo_root, &[node])
+            .await
+            .unwrap();
         assert!(count > 0, "should have indexed the .oh/ artifact node");
     }
 
@@ -2422,7 +2613,7 @@ mod tests {
     async fn blake3_hash_skips_unchanged_on_second_rebuild() {
         // Adversarial test: second index_all_with_symbols call should skip
         // embedding for unchanged nodes (BLAKE3 hash hit).
-        use crate::graph::{Node, NodeId, NodeKind, ExtractionSource};
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
         use std::path::PathBuf;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -2454,20 +2645,32 @@ mod tests {
         let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
 
         // First build: creates table
-        let count1 = idx.index_all_with_symbols(&repo_root, &[node.clone()]).await.unwrap();
+        let count1 = idx
+            .index_all_with_symbols(&repo_root, &[node.clone()])
+            .await
+            .unwrap();
         assert!(count1 > 0, "first build should index items");
-        assert!(idx.has_table().await.unwrap(), "table should exist after first build");
+        assert!(
+            idx.has_table().await.unwrap(),
+            "table should exist after first build"
+        );
 
         // Second build with same node: BLAKE3 hash skip means 0 newly embedded
-        let count2 = idx.index_all_with_symbols(&repo_root, &[node]).await.unwrap();
-        assert_eq!(count2, 0, "second build should skip all unchanged nodes via BLAKE3 hash");
+        let count2 = idx
+            .index_all_with_symbols(&repo_root, &[node])
+            .await
+            .unwrap();
+        assert_eq!(
+            count2, 0,
+            "second build should skip all unchanged nodes via BLAKE3 hash"
+        );
     }
 
     #[tokio::test]
     async fn stale_rows_deleted_when_node_removed() {
         // Adversarial test: if a node is removed between rebuilds,
         // its embedding row should be deleted.
-        use crate::graph::{Node, NodeId, NodeKind, ExtractionSource};
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
         use std::path::PathBuf;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -2514,12 +2717,18 @@ mod tests {
         let node_b_id = node_b.stable_id();
 
         // Build with both nodes
-        let count1 = idx.index_all_with_symbols(&repo_root, &[node_a.clone(), node_b]).await.unwrap();
+        let count1 = idx
+            .index_all_with_symbols(&repo_root, &[node_a.clone(), node_b])
+            .await
+            .unwrap();
         assert!(count1 > 0);
 
         // Rebuild with only node_a -- node_b should be cleaned up.
         // count2 is 0 because node_a is unchanged (BLAKE3 hash hit).
-        let count2 = idx.index_all_with_symbols(&repo_root, &[node_a]).await.unwrap();
+        let count2 = idx
+            .index_all_with_symbols(&repo_root, &[node_a])
+            .await
+            .unwrap();
         assert_eq!(count2, 0, "node_a unchanged, should skip via BLAKE3 hash");
 
         // Verify stale row is truly gone by querying text hashes for node_b
@@ -2527,8 +2736,11 @@ mod tests {
         let hashes = idx.query_text_hashes(&table, &[&node_b_id]).await;
         match hashes {
             Some(map) => {
-                assert!(!map.contains_key(&node_b_id),
-                    "stale row for removed node should be deleted, but found id: {}", node_b_id);
+                assert!(
+                    !map.contains_key(&node_b_id),
+                    "stale row for removed node should be deleted, but found id: {}",
+                    node_b_id
+                );
             }
             None => {
                 // text_hash column missing = old schema, acceptable
@@ -2541,7 +2753,7 @@ mod tests {
         // Regression test for #332: second index_all_with_symbols call on an
         // existing table (simulating post-enrichment re-embed) should succeed.
         // The node body changes between calls, forcing a re-embed (BLAKE3 miss).
-        use crate::graph::{Node, NodeId, NodeKind, ExtractionSource};
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
         use std::path::PathBuf;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -2577,14 +2789,26 @@ mod tests {
         let idx = EmbeddingIndex::new(&repo_root).await.unwrap();
 
         // First build: creates table
-        let count1 = idx.index_all_with_symbols(&repo_root, &[node_v1]).await.unwrap();
+        let count1 = idx
+            .index_all_with_symbols(&repo_root, &[node_v1])
+            .await
+            .unwrap();
         assert!(count1 > 0, "first build should index items");
-        assert!(idx.has_table().await.unwrap(), "table should exist after first build");
+        assert!(
+            idx.has_table().await.unwrap(),
+            "table should exist after first build"
+        );
 
         // Second build with enriched node: body changed so BLAKE3 hash differs,
         // must re-embed. Before fix #332 this failed with merge_insert error.
-        let count2 = idx.index_all_with_symbols(&repo_root, &[node_v2]).await.unwrap();
-        assert!(count2 > 0, "enrichment re-embed should re-index changed node");
+        let count2 = idx
+            .index_all_with_symbols(&repo_root, &[node_v2])
+            .await
+            .unwrap();
+        assert!(
+            count2 > 0,
+            "enrichment re-embed should re-index changed node"
+        );
     }
 
     #[test]
@@ -2595,8 +2819,15 @@ mod tests {
         metadata.insert("frontmatter.status".to_string(), "active".to_string());
 
         let text = build_artifact_embedding_text("My Outcome", "Body text here.", &metadata);
-        assert!(text.starts_with("ctx-assembly"), "should start with frontmatter id, got: {}", text);
-        assert!(text.contains("status: active"), "should contain frontmatter fields");
+        assert!(
+            text.starts_with("ctx-assembly"),
+            "should start with frontmatter id, got: {}",
+            text
+        );
+        assert!(
+            text.contains("status: active"),
+            "should contain frontmatter fields"
+        );
         assert!(text.contains("Body text here."), "should contain body text");
     }
 
@@ -2610,11 +2841,16 @@ mod tests {
             "Charges the card and records the transaction in the audit log.".to_string(),
         );
 
-        let text = build_code_embedding_text("process_payment", "fn process_payment() {}", &metadata);
+        let text =
+            build_code_embedding_text("process_payment", "fn process_payment() {}", &metadata);
 
         // Doc comment should appear before the function body
-        let doc_pos = text.find("Charges the card").expect("doc comment should be present");
-        let body_pos = text.find("fn process_payment").expect("body should be present");
+        let doc_pos = text
+            .find("Charges the card")
+            .expect("doc comment should be present");
+        let body_pos = text
+            .find("fn process_payment")
+            .expect("body should be present");
         assert!(
             doc_pos < body_pos,
             "doc comment (pos {}) should appear before body (pos {}): {}",
@@ -2627,19 +2863,28 @@ mod tests {
     #[test]
     fn doc_comment_not_duplicated_in_metadata_section() {
         let mut metadata = BTreeMap::new();
-        metadata.insert("doc_comment".to_string(), "Returns the computed value.".to_string());
+        metadata.insert(
+            "doc_comment".to_string(),
+            "Returns the computed value.".to_string(),
+        );
         metadata.insert("cyclomatic".to_string(), "3".to_string());
 
         let text = build_code_embedding_text("compute_result", "fn compute_result() {}", &metadata);
 
         // doc_comment should appear once (as body prefix), not twice (not in metadata section)
         let count = text.matches("Returns the computed value").count();
-        assert_eq!(count, 1, "doc_comment should appear exactly once, found {} times in: {}", count, text);
+        assert_eq!(
+            count, 1,
+            "doc_comment should appear exactly once, found {} times in: {}",
+            count, text
+        );
     }
 
     #[test]
     fn doc_comment_within_budget() {
-        let doc = "This is a very long doc comment describing the function's purpose in great detail.".repeat(10);
+        let doc =
+            "This is a very long doc comment describing the function's purpose in great detail."
+                .repeat(10);
         let mut metadata = BTreeMap::new();
         metadata.insert("doc_comment".to_string(), doc);
 
@@ -2655,9 +2900,13 @@ mod tests {
     fn embedding_without_doc_comment_unchanged() {
         // When no doc_comment key, behavior should be identical to the original
         let metadata = BTreeMap::new();
-        let text = build_code_embedding_text("process_payment", "fn process_payment() {}", &metadata);
+        let text =
+            build_code_embedding_text("process_payment", "fn process_payment() {}", &metadata);
         // Name should be first, body should follow
-        assert!(text.starts_with("process_payment"), "should start with name");
+        assert!(
+            text.starts_with("process_payment"),
+            "should start with name"
+        );
         assert!(text.contains("fn process_payment"), "should contain body");
     }
 
@@ -2666,51 +2915,102 @@ mod tests {
     #[test]
     fn search_filters_empty_returns_none() {
         let filters = SearchFilters::default();
-        assert!(filters.to_sql().is_none(), "empty filters should produce None");
+        assert!(
+            filters.to_sql().is_none(),
+            "empty filters should produce None"
+        );
     }
 
     #[test]
     fn search_filters_subsystem_only() {
-        let filters = SearchFilters { subsystem: Some("server".to_string()), ..Default::default() };
-        let sql = filters.to_sql().expect("subsystem filter should produce SQL");
+        let filters = SearchFilters {
+            subsystem: Some("server".to_string()),
+            ..Default::default()
+        };
+        let sql = filters
+            .to_sql()
+            .expect("subsystem filter should produce SQL");
         assert_eq!(sql, "subsystem = 'server'");
     }
 
     #[test]
     fn search_filters_file_only() {
-        let filters = SearchFilters { file: Some("src/embed.rs".to_string()), ..Default::default() };
+        let filters = SearchFilters {
+            file: Some("src/embed.rs".to_string()),
+            ..Default::default()
+        };
         let sql = filters.to_sql().expect("file filter should produce SQL");
-        assert!(sql.contains("file_path LIKE"), "should use LIKE for file: {}", sql);
-        assert!(sql.contains("src/embed.rs"), "should contain file pattern: {}", sql);
-        assert!(sql.contains("ESCAPE '!'"), "should include explicit ESCAPE clause for DataFusion: {}", sql);
+        assert!(
+            sql.contains("file_path LIKE"),
+            "should use LIKE for file: {}",
+            sql
+        );
+        assert!(
+            sql.contains("src/embed.rs"),
+            "should contain file pattern: {}",
+            sql
+        );
+        assert!(
+            sql.contains("ESCAPE '!'"),
+            "should include explicit ESCAPE clause for DataFusion: {}",
+            sql
+        );
     }
 
     #[test]
     fn search_filters_file_wildcards_escaped() {
         // Verify LIKE special characters are escaped with the '!' escape character
-        let filters = SearchFilters { file: Some("src%embed_rs".to_string()), ..Default::default() };
+        let filters = SearchFilters {
+            file: Some("src%embed_rs".to_string()),
+            ..Default::default()
+        };
         let sql = filters.to_sql().expect("should produce SQL");
         // % should be escaped as !%
-        assert!(sql.contains("!%"), "% in file path should be escaped as !%: {}", sql);
+        assert!(
+            sql.contains("!%"),
+            "% in file path should be escaped as !%: {}",
+            sql
+        );
         // _ should be escaped as !_
-        assert!(sql.contains("!_"), "_ in file path should be escaped as !_: {}", sql);
+        assert!(
+            sql.contains("!_"),
+            "_ in file path should be escaped as !_: {}",
+            sql
+        );
         // The escape character itself should be escaped as !!
-        let filters2 = SearchFilters { file: Some("src!embed.rs".to_string()), ..Default::default() };
+        let filters2 = SearchFilters {
+            file: Some("src!embed.rs".to_string()),
+            ..Default::default()
+        };
         let sql2 = filters2.to_sql().expect("should produce SQL");
-        assert!(sql2.contains("!!"), "! in file path should be escaped as !!: {}", sql2);
+        assert!(
+            sql2.contains("!!"),
+            "! in file path should be escaped as !!: {}",
+            sql2
+        );
     }
 
     #[test]
     fn search_filters_language_only() {
-        let filters = SearchFilters { language: Some("rust".to_string()), ..Default::default() };
-        let sql = filters.to_sql().expect("language filter should produce SQL");
+        let filters = SearchFilters {
+            language: Some("rust".to_string()),
+            ..Default::default()
+        };
+        let sql = filters
+            .to_sql()
+            .expect("language filter should produce SQL");
         assert_eq!(sql, "language = 'rust'");
     }
 
     #[test]
     fn search_filters_min_complexity_only() {
-        let filters = SearchFilters { min_complexity: Some(5), ..Default::default() };
-        let sql = filters.to_sql().expect("min_complexity filter should produce SQL");
+        let filters = SearchFilters {
+            min_complexity: Some(5),
+            ..Default::default()
+        };
+        let sql = filters
+            .to_sql()
+            .expect("min_complexity filter should produce SQL");
         assert_eq!(sql, "cyclomatic >= 5");
     }
 
@@ -2722,11 +3022,25 @@ mod tests {
             language: Some("rust".to_string()),
             min_complexity: Some(3),
         };
-        let sql = filters.to_sql().expect("combined filters should produce SQL");
-        assert!(sql.contains("subsystem = 'embed'"), "missing subsystem: {}", sql);
+        let sql = filters
+            .to_sql()
+            .expect("combined filters should produce SQL");
+        assert!(
+            sql.contains("subsystem = 'embed'"),
+            "missing subsystem: {}",
+            sql
+        );
         assert!(sql.contains("file_path LIKE"), "missing file_path: {}", sql);
-        assert!(sql.contains("language = 'rust'"), "missing language: {}", sql);
-        assert!(sql.contains("cyclomatic >= 3"), "missing cyclomatic: {}", sql);
+        assert!(
+            sql.contains("language = 'rust'"),
+            "missing language: {}",
+            sql
+        );
+        assert!(
+            sql.contains("cyclomatic >= 3"),
+            "missing cyclomatic: {}",
+            sql
+        );
         // Should be joined with AND
         assert!(sql.contains(" AND "), "should use AND: {}", sql);
     }
@@ -2739,8 +3053,16 @@ mod tests {
             ..Default::default()
         };
         let sql = filters.to_sql().expect("should produce SQL");
-        assert!(sql.contains("server''s module"), "single quotes should be doubled: {}", sql);
-        assert!(!sql.contains("server's module"), "raw single quote should not appear: {}", sql);
+        assert!(
+            sql.contains("server''s module"),
+            "single quotes should be doubled: {}",
+            sql
+        );
+        assert!(
+            !sql.contains("server's module"),
+            "raw single quote should not appear: {}",
+            sql
+        );
     }
 
     // ── #400: batch column guard (hybrid search panic regression) ─────────
@@ -2842,9 +3164,7 @@ mod tests {
 
         // Batch 0: missing required columns (simulates skipped FTS-only batch from pre-filter).
         // No _score column either.
-        let schema_incomplete = Schema::new(vec![
-            Field::new("title", DataType::Utf8, false),
-        ]);
+        let schema_incomplete = Schema::new(vec![Field::new("title", DataType::Utf8, false)]);
         let batch_incomplete = RecordBatch::try_new(
             Arc::new(schema_incomplete),
             vec![Arc::new(StringArray::from(vec!["stub"]))],
@@ -2875,7 +3195,8 @@ mod tests {
 
         // Simulate the has_score_col detection from the fix (any batch, not just first).
         let has_score_col_any = batches.iter().any(|b| b.column_by_name("_score").is_some());
-        let has_score_col_first = batches.first()
+        let has_score_col_first = batches
+            .first()
             .is_some_and(|b| b.column_by_name("_score").is_some());
 
         assert!(
@@ -2896,7 +3217,7 @@ mod tests {
         body: &str,
         metadata: BTreeMap<String, String>,
     ) -> crate::graph::Node {
-        use crate::graph::{Node, NodeId, ExtractionSource};
+        use crate::graph::{ExtractionSource, Node, NodeId};
         use std::path::PathBuf;
         Node {
             id: NodeId {
@@ -2919,13 +3240,23 @@ mod tests {
     fn node_embedding_kind_uses_oh_kind_when_present() {
         let mut meta = BTreeMap::new();
         meta.insert("oh_kind".to_string(), "outcome".to_string());
-        let node = make_test_node("my-outcome", crate::graph::NodeKind::MarkdownSection, "body", meta);
+        let node = make_test_node(
+            "my-outcome",
+            crate::graph::NodeKind::MarkdownSection,
+            "body",
+            meta,
+        );
         assert_eq!(node_embedding_kind(&node), "outcome");
     }
 
     #[test]
     fn node_embedding_kind_prefixes_code_for_regular_nodes() {
-        let node = make_test_node("foo", crate::graph::NodeKind::Function, "fn foo() {}", BTreeMap::new());
+        let node = make_test_node(
+            "foo",
+            crate::graph::NodeKind::Function,
+            "fn foo() {}",
+            BTreeMap::new(),
+        );
         assert_eq!(node_embedding_kind(&node), "code:function");
     }
 
@@ -2933,7 +3264,10 @@ mod tests {
     fn node_embedding_title_uses_frontmatter_for_artifacts() {
         let mut meta = BTreeMap::new();
         meta.insert("oh_kind".to_string(), "outcome".to_string());
-        meta.insert("frontmatter.title".to_string(), "Context Assembly".to_string());
+        meta.insert(
+            "frontmatter.title".to_string(),
+            "Context Assembly".to_string(),
+        );
         let node = make_test_node("ctx", crate::graph::NodeKind::MarkdownSection, "body", meta);
         assert_eq!(node_embedding_title(&node), "Context Assembly");
     }
@@ -2942,14 +3276,24 @@ mod tests {
     fn node_embedding_title_falls_back_for_artifacts_without_frontmatter() {
         let mut meta = BTreeMap::new();
         meta.insert("oh_kind".to_string(), "metis".to_string());
-        let node = make_test_node("learning", crate::graph::NodeKind::MarkdownSection, "body", meta);
+        let node = make_test_node(
+            "learning",
+            crate::graph::NodeKind::MarkdownSection,
+            "body",
+            meta,
+        );
         let title = node_embedding_title(&node);
         assert!(title.contains("learning"), "should contain name: {}", title);
     }
 
     #[test]
     fn node_embedding_title_for_code_node() {
-        let node = make_test_node("process", crate::graph::NodeKind::Function, "fn process() {}", BTreeMap::new());
+        let node = make_test_node(
+            "process",
+            crate::graph::NodeKind::Function,
+            "fn process() {}",
+            BTreeMap::new(),
+        );
         let title = node_embedding_title(&node);
         assert_eq!(title, "function process (rust)");
     }
@@ -2984,26 +3328,50 @@ mod tests {
         meta.insert("oh_kind".to_string(), "outcome".to_string());
         meta.insert("frontmatter.id".to_string(), "ctx-assembly".to_string());
         meta.insert("frontmatter.status".to_string(), "active".to_string());
-        let node = make_test_node("ctx", crate::graph::NodeKind::MarkdownSection, "Body text.", meta.clone());
+        let node = make_test_node(
+            "ctx",
+            crate::graph::NodeKind::MarkdownSection,
+            "Body text.",
+            meta.clone(),
+        );
         let via_node = node_embedding_text(&node);
         let via_direct = build_artifact_embedding_text("ctx", "Body text.", &meta);
-        assert_eq!(via_node, via_direct, "unified helper should match direct artifact builder");
+        assert_eq!(
+            via_node, via_direct,
+            "unified helper should match direct artifact builder"
+        );
     }
 
     #[test]
     fn node_embedding_text_code_matches_direct_call() {
         let meta = BTreeMap::new();
-        let node = make_test_node("foo", crate::graph::NodeKind::Function, "fn foo() {}", meta.clone());
+        let node = make_test_node(
+            "foo",
+            crate::graph::NodeKind::Function,
+            "fn foo() {}",
+            meta.clone(),
+        );
         let via_node = node_embedding_text(&node);
         let via_direct = build_code_embedding_text("foo", "fn foo() {}", &meta);
-        assert_eq!(via_node, via_direct, "unified helper should match direct code builder");
+        assert_eq!(
+            via_node, via_direct,
+            "unified helper should match direct code builder"
+        );
     }
 
     #[test]
     fn node_embedding_text_markdown_section_truncates() {
         let long_body = "x".repeat(1000);
-        let node = make_test_node("section", crate::graph::NodeKind::MarkdownSection, &long_body, BTreeMap::new());
+        let node = make_test_node(
+            "section",
+            crate::graph::NodeKind::MarkdownSection,
+            &long_body,
+            BTreeMap::new(),
+        );
         let text = node_embedding_text(&node);
-        assert!(text.chars().count() <= 500, "markdown section should be truncated to 500 chars");
+        assert!(
+            text.chars().count() <= 500,
+            "markdown section should be truncated to 500 chars"
+        );
     }
 }

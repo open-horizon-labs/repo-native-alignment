@@ -46,30 +46,25 @@ impl Extractor for YamlExtractor {
 
         extract_documents(tree.root_node(), path, source, &mut nodes);
 
-        Ok(ExtractionResult { nodes, edges: Vec::new() })
+        Ok(ExtractionResult {
+            nodes,
+            edges: Vec::new(),
+        })
     }
 }
 
-fn extract_documents(
-    root: tree_sitter::Node,
-    path: &Path,
-    source: &[u8],
-    nodes: &mut Vec<Node>,
-) {
+fn extract_documents(root: tree_sitter::Node, path: &Path, source: &[u8], nodes: &mut Vec<Node>) {
     for i in 0..root.child_count() {
-        let Some(child) = root.child(i as u32) else { continue };
+        let Some(child) = root.child(i as u32) else {
+            continue;
+        };
         if child.kind() == "document" {
             extract_document(child, path, source, nodes);
         }
     }
 }
 
-fn extract_document(
-    doc: tree_sitter::Node,
-    path: &Path,
-    source: &[u8],
-    nodes: &mut Vec<Node>,
-) {
+fn extract_document(doc: tree_sitter::Node, path: &Path, source: &[u8], nodes: &mut Vec<Node>) {
     // Find the root mapping of the document
     let mapping = find_block_mapping(doc);
     let Some(mapping) = mapping else { return };
@@ -116,12 +111,16 @@ fn extract_document(
 
     // Generic YAML: extract top-level keys
     for i in 0..mapping.child_count() {
-        let Some(pair) = mapping.child(i as u32) else { continue };
+        let Some(pair) = mapping.child(i as u32) else {
+            continue;
+        };
         if pair.kind() != "block_mapping_pair" {
             continue;
         }
 
-        let Some(key_node) = pair.child_by_field_name("key") else { continue };
+        let Some(key_node) = pair.child_by_field_name("key") else {
+            continue;
+        };
         let key = key_text(key_node, source);
         if key.is_empty() {
             continue;
@@ -140,9 +139,14 @@ fn extract_document(
         };
 
         // Check if the value is a scalar (not a mapping or sequence)
-        let is_scalar = value_node.map(|v| {
-            !matches!(v.kind(), "block_mapping" | "flow_mapping" | "block_sequence" | "flow_sequence")
-        }).unwrap_or(false);
+        let is_scalar = value_node
+            .map(|v| {
+                !matches!(
+                    v.kind(),
+                    "block_mapping" | "flow_mapping" | "block_sequence" | "flow_sequence"
+                )
+            })
+            .unwrap_or(false);
 
         let (kind, metadata) = if is_scalar && !value_text.trim().is_empty() {
             let mut m = BTreeMap::new();
@@ -177,9 +181,10 @@ fn find_block_mapping(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
     }
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32)
-            && let Some(found) = find_block_mapping(child) {
-                return Some(found);
-            }
+            && let Some(found) = find_block_mapping(child)
+        {
+            return Some(found);
+        }
     }
     None
 }
@@ -192,11 +197,15 @@ fn get_mapping_value<'a>(
     for i in 0..mapping.child_count() {
         // Use `let..else` to skip None children (punctuation/anonymous nodes)
         // rather than `?` which would return None from the entire function.
-        let Some(pair) = mapping.child(i as u32) else { continue };
+        let Some(pair) = mapping.child(i as u32) else {
+            continue;
+        };
         if pair.kind() != "block_mapping_pair" {
             continue;
         }
-        let Some(key_node) = pair.child_by_field_name("key") else { continue };
+        let Some(key_node) = pair.child_by_field_name("key") else {
+            continue;
+        };
         if key_text(key_node, source) == target_key {
             let val = pair
                 .child_by_field_name("value")
@@ -213,15 +222,21 @@ fn get_mapping_value<'a>(
 fn get_metadata_name(mapping: tree_sitter::Node, source: &[u8]) -> Option<String> {
     // Find the 'metadata' key, then get 'name' from its mapping
     for i in 0..mapping.child_count() {
-        let Some(pair) = mapping.child(i as u32) else { continue };
+        let Some(pair) = mapping.child(i as u32) else {
+            continue;
+        };
         if pair.kind() != "block_mapping_pair" {
             continue;
         }
-        let Some(key_node) = pair.child_by_field_name("key") else { continue };
+        let Some(key_node) = pair.child_by_field_name("key") else {
+            continue;
+        };
         if key_text(key_node, source) != "metadata" {
             continue;
         }
-        let Some(val_node) = pair.child_by_field_name("value") else { continue };
+        let Some(val_node) = pair.child_by_field_name("value") else {
+            continue;
+        };
         if let Some(nested) = find_block_mapping(val_node) {
             return get_mapping_value(nested, source, "name");
         }
@@ -251,9 +266,23 @@ mod tests {
         let extractor = YamlExtractor::new();
         let code = "version: \"1.0.0\"\nmax_connections: 100\n";
         let result = extractor.extract(Path::new("config.yaml"), code).unwrap();
-        let consts: Vec<_> = result.nodes.iter().filter(|n| n.id.kind == NodeKind::Const).collect();
-        assert!(!consts.is_empty(), "Should find Const nodes for scalar YAML values");
-        let c = consts.iter().find(|n| n.id.name == "version").expect("Should find version");
-        assert_eq!(c.metadata.get("synthetic").map(|s| s.as_str()), Some("true"), "YAML scalars should be synthetic");
+        let consts: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Const)
+            .collect();
+        assert!(
+            !consts.is_empty(),
+            "Should find Const nodes for scalar YAML values"
+        );
+        let c = consts
+            .iter()
+            .find(|n| n.id.name == "version")
+            .expect("Should find version");
+        assert_eq!(
+            c.metadata.get("synthetic").map(|s| s.as_str()),
+            Some("true"),
+            "YAML scalars should be synthetic"
+        );
     }
 }

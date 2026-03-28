@@ -62,11 +62,17 @@ impl SentinelData {
 }
 
 fn extract_sentinel_path(repo_root: &Path) -> PathBuf {
-    repo_root.join(".oh").join(".cache").join("extract_completed.json")
+    repo_root
+        .join(".oh")
+        .join(".cache")
+        .join("extract_completed.json")
 }
 
 fn lsp_sentinel_path(repo_root: &Path) -> PathBuf {
-    repo_root.join(".oh").join(".cache").join("lsp_completed.json")
+    repo_root
+        .join(".oh")
+        .join(".cache")
+        .join("lsp_completed.json")
 }
 
 /// Write the extraction sentinel after tree-sitter extraction + initial persist succeed.
@@ -190,7 +196,11 @@ fn read_sentinel(path: &Path, name: &str) -> Option<SentinelData> {
             }
         }
         Err(e) => {
-            tracing::warn!("Failed to parse {} sentinel (treating as absent): {}", name, e);
+            tracing::warn!(
+                "Failed to parse {} sentinel (treating as absent): {}",
+                name,
+                e
+            );
             None
         }
     }
@@ -250,10 +260,17 @@ mod tests {
             node_count: 50,
             edge_count: 80,
         };
-        let path = tmp.path().join(".oh").join(".cache").join("lsp_completed.json");
+        let path = tmp
+            .path()
+            .join(".oh")
+            .join(".cache")
+            .join("lsp_completed.json");
         std::fs::write(&path, serde_json::to_string(&stale).unwrap()).unwrap();
 
-        assert!(read_lsp_sentinel(tmp.path()).is_none(), "stale sentinel should return None");
+        assert!(
+            read_lsp_sentinel(tmp.path()).is_none(),
+            "stale sentinel should return None"
+        );
     }
 
     #[test]
@@ -278,7 +295,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         setup_repo(&tmp);
 
-        let path = tmp.path().join(".oh").join(".cache").join("extract_completed.json");
+        let path = tmp
+            .path()
+            .join(".oh")
+            .join(".cache")
+            .join("extract_completed.json");
         std::fs::write(&path, b"not valid json!!!").unwrap();
 
         assert!(read_extract_sentinel(tmp.path()).is_none());

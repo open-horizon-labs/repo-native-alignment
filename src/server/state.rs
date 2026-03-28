@@ -3,9 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-use crate::graph::{Node, Edge};
 use crate::graph::index::GraphIndex;
-
+use crate::graph::{Edge, Node};
 
 // ── Graph state ─────────────────────────────────────────────────────
 
@@ -103,8 +102,8 @@ impl GraphState {
     /// Returns the full stable ID if found, or the original ID if not.
     pub fn resolve_node_id(&self, id: &str) -> String {
         let index_map = self.node_index_map();
-        let roots = Self::root_slugs_from_index_map(&index_map);
-        Self::resolve_node_id_fast(id, &index_map, &roots)
+        let roots = Self::root_slugs_from_index_map(index_map);
+        Self::resolve_node_id_fast(id, index_map, &roots)
     }
 
     /// Extract sorted, deterministic root slugs from a pre-built index map.
@@ -125,7 +124,11 @@ impl GraphState {
     /// O(1) for exact match, O(roots) for short-ID resolution.
     /// Precompute `roots` with `root_slugs_from_index_map` to avoid
     /// rebuilding per call in batch loops.
-    pub fn resolve_node_id_fast(id: &str, index_map: &std::collections::HashMap<String, usize>, roots: &[String]) -> String {
+    pub fn resolve_node_id_fast(
+        id: &str,
+        index_map: &std::collections::HashMap<String, usize>,
+        roots: &[String],
+    ) -> String {
         if index_map.contains_key(id) {
             return id.to_string();
         }
@@ -147,7 +150,6 @@ impl GraphState {
         index_map.get(id).and_then(|&i| self.nodes.get(i))
     }
 }
-
 
 // ── Graph build status ───────────────────────────────────────────────
 
@@ -199,19 +201,29 @@ impl GraphBuildStatus {
     }
 
     pub fn set_building(&self, file_count: usize) {
-        self.file_count.store(file_count, std::sync::atomic::Ordering::Release);
+        self.file_count
+            .store(file_count, std::sync::atomic::Ordering::Release);
         *self.started_at.lock().unwrap() = Some(std::time::Instant::now());
         *self.last_error.lock().unwrap() = None;
-        self.state.store(GraphBuildState::Building as u8, std::sync::atomic::Ordering::Release);
+        self.state.store(
+            GraphBuildState::Building as u8,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     pub fn set_ready(&self) {
-        self.state.store(GraphBuildState::Ready as u8, std::sync::atomic::Ordering::Release);
+        self.state.store(
+            GraphBuildState::Ready as u8,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     pub fn set_failed(&self, error: String) {
         *self.last_error.lock().unwrap() = Some(error);
-        self.state.store(GraphBuildState::Failed as u8, std::sync::atomic::Ordering::Release);
+        self.state.store(
+            GraphBuildState::Failed as u8,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     pub fn elapsed(&self) -> Option<std::time::Duration> {
@@ -225,9 +237,15 @@ impl GraphBuildStatus {
                 let files = self.file_count.load(std::sync::atomic::Ordering::Acquire);
                 let elapsed = self.elapsed().map(|d| d.as_secs()).unwrap_or(0);
                 if files > 0 {
-                    Some(format!("Index building ({} files, {}s elapsed)... retry in a few seconds", files, elapsed))
+                    Some(format!(
+                        "Index building ({} files, {}s elapsed)... retry in a few seconds",
+                        files, elapsed
+                    ))
                 } else {
-                    Some(format!("Index building ({}s elapsed)... retry in a few seconds", elapsed))
+                    Some(format!(
+                        "Index building ({}s elapsed)... retry in a few seconds",
+                        elapsed
+                    ))
                 }
             }
             GraphBuildState::Failed => {
@@ -283,7 +301,8 @@ impl Default for EmbeddingStatus {
 impl EmbeddingStatus {
     /// Mark embedding as building with a known total.
     pub fn set_building(&self, total: usize) {
-        self.total.store(total, std::sync::atomic::Ordering::Release);
+        self.total
+            .store(total, std::sync::atomic::Ordering::Release);
         self.current.store(0, std::sync::atomic::Ordering::Release);
         *self.last_error.lock().unwrap() = None;
         self.state.store(1, std::sync::atomic::Ordering::Release);
@@ -291,12 +310,14 @@ impl EmbeddingStatus {
 
     /// Update progress during embedding.
     pub fn set_progress(&self, current: usize) {
-        self.current.store(current, std::sync::atomic::Ordering::Release);
+        self.current
+            .store(current, std::sync::atomic::Ordering::Release);
     }
 
     /// Mark embedding as complete with a final count.
     pub fn set_complete(&self, count: usize) {
-        self.completed_count.store(count, std::sync::atomic::Ordering::Release);
+        self.completed_count
+            .store(count, std::sync::atomic::Ordering::Release);
         self.state.store(2, std::sync::atomic::Ordering::Release);
     }
 
@@ -314,7 +335,9 @@ impl EmbeddingStatus {
                 Some(format!("embedding... ({}/{})", cur, tot))
             }
             2 => {
-                let count = self.completed_count.load(std::sync::atomic::Ordering::Acquire);
+                let count = self
+                    .completed_count
+                    .load(std::sync::atomic::Ordering::Acquire);
                 Some(format!("{} embedded", count))
             }
             3 => {
@@ -439,14 +462,17 @@ impl LspEnrichmentStatus {
         if detail.is_empty() {
             tracing::info!(
                 "LSP state: {} -> {} (step: {:.1}s, total: {:.1}s)",
-                from, to,
+                from,
+                to,
                 since_last.as_secs_f64(),
                 since_created.as_secs_f64(),
             );
         } else {
             tracing::info!(
                 "LSP state: {} -> {} — {} (step: {:.1}s, total: {:.1}s)",
-                from, to, detail,
+                from,
+                to,
+                detail,
                 since_last.as_secs_f64(),
                 since_created.as_secs_f64(),
             );
@@ -470,17 +496,21 @@ impl LspEnrichmentStatus {
 
     pub fn set_running(&self) {
         let prev = LspState::from_u8(
-            self.state.swap(Self::RUNNING, std::sync::atomic::Ordering::AcqRel)
+            self.state
+                .swap(Self::RUNNING, std::sync::atomic::Ordering::AcqRel),
         );
         self.log_transition(prev, LspState::Running, "");
     }
 
     pub fn set_complete(&self, edge_count: usize) {
-        self.edge_count.store(edge_count, std::sync::atomic::Ordering::Release);
-        self.persist_failed.store(false, std::sync::atomic::Ordering::Release);
+        self.edge_count
+            .store(edge_count, std::sync::atomic::Ordering::Release);
+        self.persist_failed
+            .store(false, std::sync::atomic::Ordering::Release);
         *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
         let prev = LspState::from_u8(
-            self.state.swap(Self::COMPLETE, std::sync::atomic::Ordering::AcqRel)
+            self.state
+                .swap(Self::COMPLETE, std::sync::atomic::Ordering::AcqRel),
         );
         self.log_transition(prev, LspState::Complete, &format!("{} edges", edge_count));
     }
@@ -491,11 +521,14 @@ impl LspEnrichmentStatus {
     /// them to LanceDB failed. The footer will show "persist failed" so agents
     /// know the data may not survive a restart.
     pub fn set_complete_persist_failed(&self, edge_count: usize) {
-        self.edge_count.store(edge_count, std::sync::atomic::Ordering::Release);
-        self.persist_failed.store(true, std::sync::atomic::Ordering::Release);
+        self.edge_count
+            .store(edge_count, std::sync::atomic::Ordering::Release);
+        self.persist_failed
+            .store(true, std::sync::atomic::Ordering::Release);
         *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
         let prev = LspState::from_u8(
-            self.state.swap(Self::COMPLETE, std::sync::atomic::Ordering::AcqRel)
+            self.state
+                .swap(Self::COMPLETE, std::sync::atomic::Ordering::AcqRel),
         );
         self.log_transition(
             prev,
@@ -508,14 +541,18 @@ impl LspEnrichmentStatus {
     pub fn set_unavailable(&self) {
         *self.completed_at.lock().unwrap() = Some(std::time::Instant::now());
         let prev = LspState::from_u8(
-            self.state.swap(Self::UNAVAILABLE, std::sync::atomic::Ordering::AcqRel)
+            self.state
+                .swap(Self::UNAVAILABLE, std::sync::atomic::Ordering::AcqRel),
         );
         self.log_transition(prev, LspState::Unavailable, "no server detected");
     }
 
     pub fn set_failed(&self, error: &str) {
         *self.last_error.lock().unwrap() = Some(error.to_string());
-        let prev = LspState::from_u8(self.state.swap(Self::FAILED, std::sync::atomic::Ordering::AcqRel));
+        let prev = LspState::from_u8(
+            self.state
+                .swap(Self::FAILED, std::sync::atomic::Ordering::AcqRel),
+        );
         self.log_transition(prev, LspState::Failed, error);
     }
 
@@ -670,7 +707,9 @@ impl LspEnrichmentStatus {
             Self::COMPLETE => {
                 let guard = self.completed_at.lock().unwrap();
                 if let Some(t) = *guard {
-                    let persist_failed = self.persist_failed.load(std::sync::atomic::Ordering::Acquire);
+                    let persist_failed = self
+                        .persist_failed
+                        .load(std::sync::atomic::Ordering::Acquire);
                     // Always show persist failures (no auto-hide) so agents know
                     // enrichment data may not survive a restart.
                     if persist_failed || t.elapsed().as_secs() < 30 {
@@ -696,9 +735,7 @@ impl LspEnrichmentStatus {
                     None
                 }
             }
-            Self::UNAVAILABLE => {
-                Some("LSP: no server detected".to_string())
-            }
+            Self::UNAVAILABLE => Some("LSP: no server detected".to_string()),
             Self::FAILED => {
                 let err = self.last_error.lock().unwrap();
                 match err.as_deref() {
@@ -750,7 +787,11 @@ mod tests {
         let status = LspEnrichmentStatus::default();
         status.set_server_found();
         let footer = status.footer_segment().unwrap();
-        assert!(footer.contains("found, waiting to start"), "got: {}", footer);
+        assert!(
+            footer.contains("found, waiting to start"),
+            "got: {}",
+            footer
+        );
     }
 
     #[test]
@@ -831,7 +872,10 @@ mod tests {
     fn test_lsp_status_unavailable_then_running_then_complete() {
         let status = LspEnrichmentStatus::default();
         status.set_unavailable();
-        assert_eq!(status.footer_segment(), Some("LSP: no server detected".to_string()));
+        assert_eq!(
+            status.footer_segment(),
+            Some("LSP: no server detected".to_string())
+        );
         // If a server becomes available later
         status.set_running();
         let footer = status.footer_segment().unwrap();
@@ -950,7 +994,9 @@ mod tests {
                         0 => s.set_server_found(),
                         1 => s.set_running(),
                         2 => s.set_complete(i * 10),
-                        3 => { let _ = s.check_server_found_timeout(); }
+                        3 => {
+                            let _ = s.check_server_found_timeout();
+                        }
                         _ => unreachable!(),
                     }
                     // All reads must produce a valid state
@@ -995,7 +1041,10 @@ mod tests {
             Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
         // persist_failed footer should still be shown after the normal auto-hide window
         let footer = status.footer_segment();
-        assert!(footer.is_some(), "persist_failed footer should not auto-hide");
+        assert!(
+            footer.is_some(),
+            "persist_failed footer should not auto-hide"
+        );
         assert!(
             footer.unwrap().contains("persist failed"),
             "footer should indicate persist failure"
@@ -1036,7 +1085,12 @@ mod tests {
 
     // ── resolve_node_id / resolve_node_id_fast tests ────────────────
 
-    fn make_test_node(root: &str, file: &str, name: &str, kind: crate::graph::NodeKind) -> crate::graph::Node {
+    fn make_test_node(
+        root: &str,
+        file: &str,
+        name: &str,
+        kind: crate::graph::NodeKind,
+    ) -> crate::graph::Node {
         use crate::graph::*;
         use std::collections::BTreeMap;
         Node {
@@ -1066,7 +1120,12 @@ mod tests {
 
     #[test]
     fn test_resolve_node_id_exact_match() {
-        let node = make_test_node("myroot", "src/scanner.rs", "scan", crate::graph::NodeKind::Function);
+        let node = make_test_node(
+            "myroot",
+            "src/scanner.rs",
+            "scan",
+            crate::graph::NodeKind::Function,
+        );
         let gs = make_test_graph_state(vec![node]);
         // Full stable ID should resolve to itself
         let full = "myroot:src/scanner.rs:scan:function";
@@ -1075,16 +1134,29 @@ mod tests {
 
     #[test]
     fn test_resolve_node_id_short_id() {
-        let node = make_test_node("myroot", "src/scanner.rs", "scan", crate::graph::NodeKind::Function);
+        let node = make_test_node(
+            "myroot",
+            "src/scanner.rs",
+            "scan",
+            crate::graph::NodeKind::Function,
+        );
         let gs = make_test_graph_state(vec![node]);
         // Short ID (without root prefix) should resolve to full
         let short = "src/scanner.rs:scan:function";
-        assert_eq!(gs.resolve_node_id(short), "myroot:src/scanner.rs:scan:function");
+        assert_eq!(
+            gs.resolve_node_id(short),
+            "myroot:src/scanner.rs:scan:function"
+        );
     }
 
     #[test]
     fn test_resolve_node_id_unknown_passes_through() {
-        let node = make_test_node("myroot", "src/scanner.rs", "scan", crate::graph::NodeKind::Function);
+        let node = make_test_node(
+            "myroot",
+            "src/scanner.rs",
+            "scan",
+            crate::graph::NodeKind::Function,
+        );
         let gs = make_test_graph_state(vec![node]);
         let unknown = "nonexistent:file.rs:foo:function";
         assert_eq!(gs.resolve_node_id(unknown), unknown);
@@ -1092,53 +1164,100 @@ mod tests {
 
     #[test]
     fn test_resolve_node_id_fast_exact_match() {
-        let node = make_test_node("myroot", "src/embed.rs", "EmbeddingIndex", crate::graph::NodeKind::Struct);
+        let node = make_test_node(
+            "myroot",
+            "src/embed.rs",
+            "EmbeddingIndex",
+            crate::graph::NodeKind::Struct,
+        );
         let gs = make_test_graph_state(vec![node]);
         let index_map = gs.node_index_map();
         let roots = GraphState::root_slugs_from_index_map(&index_map);
         let full = "myroot:src/embed.rs:EmbeddingIndex:struct";
-        assert_eq!(GraphState::resolve_node_id_fast(full, &index_map, &roots), full);
+        assert_eq!(
+            GraphState::resolve_node_id_fast(full, &index_map, &roots),
+            full
+        );
     }
 
     #[test]
     fn test_resolve_node_id_fast_short_id() {
-        let node = make_test_node("myroot", "src/embed.rs", "EmbeddingIndex", crate::graph::NodeKind::Struct);
+        let node = make_test_node(
+            "myroot",
+            "src/embed.rs",
+            "EmbeddingIndex",
+            crate::graph::NodeKind::Struct,
+        );
         let gs = make_test_graph_state(vec![node]);
         let index_map = gs.node_index_map();
         let roots = GraphState::root_slugs_from_index_map(&index_map);
         let short = "src/embed.rs:EmbeddingIndex:struct";
-        assert_eq!(GraphState::resolve_node_id_fast(short, &index_map, &roots), "myroot:src/embed.rs:EmbeddingIndex:struct");
+        assert_eq!(
+            GraphState::resolve_node_id_fast(short, &index_map, &roots),
+            "myroot:src/embed.rs:EmbeddingIndex:struct"
+        );
     }
 
     #[test]
     fn test_resolve_node_id_fast_unknown_passes_through() {
-        let node = make_test_node("myroot", "src/embed.rs", "EmbeddingIndex", crate::graph::NodeKind::Struct);
+        let node = make_test_node(
+            "myroot",
+            "src/embed.rs",
+            "EmbeddingIndex",
+            crate::graph::NodeKind::Struct,
+        );
         let gs = make_test_graph_state(vec![node]);
         let index_map = gs.node_index_map();
         let roots = GraphState::root_slugs_from_index_map(&index_map);
         let unknown = "totally:bogus:id";
-        assert_eq!(GraphState::resolve_node_id_fast(unknown, &index_map, &roots), unknown);
+        assert_eq!(
+            GraphState::resolve_node_id_fast(unknown, &index_map, &roots),
+            unknown
+        );
     }
 
     #[test]
     fn test_resolve_node_id_multiple_roots() {
-        let node1 = make_test_node("root-a", "src/lib.rs", "foo", crate::graph::NodeKind::Function);
-        let node2 = make_test_node("root-b", "src/lib.rs", "foo", crate::graph::NodeKind::Function);
+        let node1 = make_test_node(
+            "root-a",
+            "src/lib.rs",
+            "foo",
+            crate::graph::NodeKind::Function,
+        );
+        let node2 = make_test_node(
+            "root-b",
+            "src/lib.rs",
+            "foo",
+            crate::graph::NodeKind::Function,
+        );
         let gs = make_test_graph_state(vec![node1, node2]);
         // Both full IDs should resolve exactly
-        assert_eq!(gs.resolve_node_id("root-a:src/lib.rs:foo:function"), "root-a:src/lib.rs:foo:function");
-        assert_eq!(gs.resolve_node_id("root-b:src/lib.rs:foo:function"), "root-b:src/lib.rs:foo:function");
+        assert_eq!(
+            gs.resolve_node_id("root-a:src/lib.rs:foo:function"),
+            "root-a:src/lib.rs:foo:function"
+        );
+        assert_eq!(
+            gs.resolve_node_id("root-b:src/lib.rs:foo:function"),
+            "root-b:src/lib.rs:foo:function"
+        );
         // Short ID should resolve to one of them (either is valid since both exist)
         let resolved = gs.resolve_node_id("src/lib.rs:foo:function");
         assert!(
-            resolved == "root-a:src/lib.rs:foo:function" || resolved == "root-b:src/lib.rs:foo:function",
-            "expected one of the full IDs, got: {}", resolved
+            resolved == "root-a:src/lib.rs:foo:function"
+                || resolved == "root-b:src/lib.rs:foo:function",
+            "expected one of the full IDs, got: {}",
+            resolved
         );
     }
 
     #[test]
     fn test_resolve_node_id_empty_string() {
-        let node = make_test_node("myroot", "src/lib.rs", "bar", crate::graph::NodeKind::Function);
+        let node = make_test_node(
+            "myroot",
+            "src/lib.rs",
+            "bar",
+            crate::graph::NodeKind::Function,
+        );
         let gs = make_test_graph_state(vec![node]);
         // Empty string should pass through unchanged
         assert_eq!(gs.resolve_node_id(""), "");
@@ -1217,7 +1336,10 @@ mod tests {
         }
         // After all threads finish, footer_segment must still return valid output
         let seg = status.footer_segment();
-        assert!(seg.is_some() || seg.is_none(), "footer_segment returned something");
+        assert!(
+            seg.is_some() || seg.is_none(),
+            "footer_segment returned something"
+        );
     }
 
     /// Edge case: set_complete without set_building (skip straight to done).

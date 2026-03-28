@@ -2,28 +2,29 @@
 // EXTRACTION_VERSION is deprecated (#526) but still used in tests and log messages.
 #![allow(deprecated)]
 
-pub mod tools;
-pub mod store;
-pub mod state;
+mod bg_scanner;
+mod enrichment;
+mod graph;
 pub mod handlers;
 pub mod helpers;
 pub mod sentinel;
-mod graph;
-mod bg_scanner;
-mod enrichment;
+pub mod state;
+pub mod store;
+pub mod tools;
 
 // Re-export subsystem metadata key for service layer filtering.
 pub(crate) use graph::SUBSYSTEM_KEY;
 
 // Re-export public API so external `use crate::server::X` still works.
-pub use tools::*;
-pub use store::{load_graph_from_lance, parse_edge_kind};
-pub(crate) use store::{
-    check_and_migrate_schema, graph_lance_path,
-    persist_graph_incremental, persist_graph_to_lance,
-};
-pub use state::{EmbeddingStatus, GraphBuildState, GraphBuildStatus, GraphState, LspEnrichmentStatus, LspState};
 pub use helpers::format_freshness;
+pub use state::{
+    EmbeddingStatus, GraphBuildState, GraphBuildStatus, GraphState, LspEnrichmentStatus, LspState,
+};
+pub(crate) use store::{
+    check_and_migrate_schema, graph_lance_path, persist_graph_incremental, persist_graph_to_lance,
+};
+pub use store::{load_graph_from_lance, parse_edge_kind};
+pub use tools::*;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,15 +32,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rust_mcp_sdk::McpServer;
 use rust_mcp_sdk::schema::{
-    CallToolError, CallToolRequestParams, CallToolResult, ListToolsResult,
-    PaginatedRequestParams, RpcError, TextContent,
+    CallToolError, CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams,
+    RpcError, TextContent,
 };
 
 use crate::embed::EmbeddingIndex;
 #[cfg(test)]
 use crate::graph::NodeKind;
-use crate::types::OhArtifactKind;
 use crate::oh;
+use crate::types::OhArtifactKind;
 use arc_swap::ArcSwap;
 
 use helpers::parse_args;
@@ -62,17 +63,26 @@ impl PipelineResult {
     /// Format a structured scan summary for display.
     pub fn format_summary(&self) -> String {
         let mut lines = Vec::new();
-        lines.push(format!("Scan complete: {} symbols, {} edges, {} files in {:.1}s",
-            self.node_count, self.edge_count, self.file_count, self.total_time.as_secs_f64()));
+        lines.push(format!(
+            "Scan complete: {} symbols, {} edges, {} files in {:.1}s",
+            self.node_count,
+            self.edge_count,
+            self.file_count,
+            self.total_time.as_secs_f64()
+        ));
         if !self.lsp_entries.is_empty() {
             lines.push(String::new());
             lines.push("LSP enrichment:".to_string());
-            for entry in &self.lsp_entries { lines.push(entry.summary_line()); }
+            for entry in &self.lsp_entries {
+                lines.push(entry.summary_line());
+            }
         }
         if !self.encoding_stats.is_empty() {
             lines.push(String::new());
-            lines.push(format!("Encoding: {} lossy-decoded, {} binary-skipped",
-                self.encoding_stats.lossy_decoded, self.encoding_stats.binary_skipped));
+            lines.push(format!(
+                "Encoding: {} lossy-decoded, {} binary-skipped",
+                self.encoding_stats.lossy_decoded, self.encoding_stats.binary_skipped
+            ));
         }
         lines.join("\n")
     }
@@ -200,7 +210,8 @@ impl RnaHandler {
     /// pipeline in the background.  Either way, `get_graph()` will find
     /// the graph populated when the first tool call arrives.
     fn start_prewarm(&self) {
-        self.prewarm_started.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.prewarm_started
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.graph_build_status.set_building(0);
         let handler = self.clone_shared();
         let notify = Arc::clone(&self.prewarm_notify);
@@ -219,7 +230,10 @@ impl RnaHandler {
                     // Update cooldown so the first tool call skips re-scanning.
                     *handler.last_scan.lock().unwrap() = std::time::Instant::now();
                     // Start the background scanner to keep the index warm.
-                    if !handler.background_scanner_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    if !handler
+                        .background_scanner_started
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
                         handler.spawn_background_scanner();
                     }
                     build_status.set_ready();
@@ -233,7 +247,10 @@ impl RnaHandler {
                 }
                 Err(e) => {
                     build_status.set_failed(format!("{}", e));
-                    tracing::warn!("Graph pre-warm failed (will retry on first tool call): {}", e);
+                    tracing::warn!(
+                        "Graph pre-warm failed (will retry on first tool call): {}",
+                        e
+                    );
                 }
             }
             // Wake any tool calls waiting for pre-warm to finish.
@@ -288,7 +305,9 @@ impl RnaHandler {
 
     pub(crate) fn cold_start_building_message(&self) -> Option<String> {
         let current = self.graph.load_full();
-        if current.is_some() { return None; }
+        if current.is_some() {
+            return None;
+        }
         self.graph_build_status.status_message()
     }
 
@@ -350,11 +369,16 @@ fn build_context_preamble(root: &Path) -> String {
     let mut parts = Vec::new();
 
     // Active outcomes (just names + status)
-    let outcomes: Vec<_> = artifacts.iter().filter(|a| a.kind == OhArtifactKind::Outcome).collect();
+    let outcomes: Vec<_> = artifacts
+        .iter()
+        .filter(|a| a.kind == OhArtifactKind::Outcome)
+        .collect();
     if !outcomes.is_empty() {
         let mut section = String::from("**Active outcomes:**\n");
         for o in &outcomes {
-            let status = o.frontmatter.get("status")
+            let status = o
+                .frontmatter
+                .get("status")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             section.push_str(&format!("- {} ({})\n", o.id(), status));
@@ -363,15 +387,22 @@ fn build_context_preamble(root: &Path) -> String {
     }
 
     // Hard/soft guardrails (just statements, no full body)
-    let guardrails: Vec<_> = artifacts.iter().filter(|a| a.kind == OhArtifactKind::Guardrail).collect();
+    let guardrails: Vec<_> = artifacts
+        .iter()
+        .filter(|a| a.kind == OhArtifactKind::Guardrail)
+        .collect();
     if !guardrails.is_empty() {
         let mut section = String::from("**Guardrails:**\n");
         for g in &guardrails {
-            let severity = g.frontmatter.get("severity")
+            let severity = g
+                .frontmatter
+                .get("severity")
                 .and_then(|v| v.as_str())
                 .unwrap_or("candidate");
             let id = g.id();
-            let statement = g.frontmatter.get("statement")
+            let statement = g
+                .frontmatter
+                .get("statement")
                 .and_then(|v| v.as_str())
                 .unwrap_or(&id);
             section.push_str(&format!("- [{}] {}\n", severity, statement));
@@ -380,12 +411,17 @@ fn build_context_preamble(root: &Path) -> String {
     }
 
     // Recent metis (last 3 titles only)
-    let metis: Vec<_> = artifacts.iter().filter(|a| a.kind == OhArtifactKind::Metis).collect();
+    let metis: Vec<_> = artifacts
+        .iter()
+        .filter(|a| a.kind == OhArtifactKind::Metis)
+        .collect();
     if !metis.is_empty() {
         let mut section = String::from("**Recent learnings:**\n");
         for m in metis.iter().rev().take(3) {
             let id = m.id();
-            let title = m.frontmatter.get("title")
+            let title = m
+                .frontmatter
+                .get("title")
                 .and_then(|v| v.as_str())
                 .unwrap_or(&id);
             section.push_str(&format!("- {}\n", title));
@@ -393,7 +429,10 @@ fn build_context_preamble(root: &Path) -> String {
         parts.push(section);
     }
 
-    let mut out = format!("---\n# Business Context (auto-injected on first tool call)\n\n{}\n", parts.join("\n"));
+    let mut out = format!(
+        "---\n# Business Context (auto-injected on first tool call)\n\n{}\n",
+        parts.join("\n")
+    );
     out.push_str("**Code exploration:** use `search` (not Grep/Read) for code symbols, artifacts, commits, and markdown in one call. Use `search(node: \"<id>\", mode: \"neighbors\")` for graph traversal.\n");
     out.push_str("---\n\n");
     out
@@ -437,24 +476,28 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
         // the preamble eagerly, then only store(true) after successfully
         // inserting it into the response — avoiding a false-positive flag if
         // the tool call itself errors before we can prepend.
-        let preamble = if !self.context_injected.load(std::sync::atomic::Ordering::Relaxed) {
+        let preamble = if !self
+            .context_injected
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             let ctx = build_context_preamble(root);
             if !ctx.is_empty() {
                 tracing::info!("Injecting business context preamble on first tool call");
                 Some(ctx)
             } else {
                 // Empty preamble — mark as injected so we don't retry.
-                self.context_injected.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.context_injected
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 None
             }
         } else {
             None
         };
 
-        if params.name != "list_roots" {
-            if let Some(building_msg) = self.cold_start_building_message() {
-                return Ok(helpers::text_result(building_msg));
-            }
+        if params.name != "list_roots"
+            && let Some(building_msg) = self.cold_start_building_message()
+        {
+            return Ok(helpers::text_result(building_msg));
         }
 
         let mut result = match params.name.as_str() {
@@ -485,21 +528,24 @@ impl rust_mcp_sdk::mcp_server::ServerHandler for RnaHandler {
         // Only mark as injected after the insert succeeds (compare_exchange
         // guards against concurrent tool calls both injecting).
         if let (Some(preamble), Ok(tool_result)) = (preamble, &mut result)
-            && self.context_injected.compare_exchange(
-                false, true,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Relaxed,
-            ).is_ok() {
-                tool_result.content.insert(
-                    0,
-                    TextContent::new(preamble, None, None).into(),
-                );
-            }
+            && self
+                .context_injected
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            tool_result
+                .content
+                .insert(0, TextContent::new(preamble, None, None).into());
+        }
 
         result
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -514,11 +560,7 @@ mod tests {
 
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
-        std::fs::write(
-            root.join("src/lib.rs"),
-            "pub fn original_function() {}\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn original_function() {}\n").unwrap();
 
         let handler = RnaHandler {
             repo_root: root.to_path_buf(),
@@ -564,19 +606,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_incremental_update_preserves_root_slug() {
-        use tempfile::TempDir;
         use crate::roots::RootConfig;
+        use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
 
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
-        std::fs::write(
-            root.join("src/lib.rs"),
-            "pub fn initial_func() {}\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn initial_func() {}\n").unwrap();
 
         let handler = RnaHandler {
             repo_root: root.to_path_buf(),
@@ -588,18 +626,17 @@ mod tests {
 
         {
             let gs = handler.get_graph().await.unwrap();
-            let node = gs.nodes.iter().find(|n| n.id.name == "initial_func")
+            let node = gs
+                .nodes
+                .iter()
+                .find(|n| n.id.name == "initial_func")
                 .expect("initial_func should be in graph");
             assert_eq!(node.id.root, expected_slug);
         }
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
-        std::fs::write(
-            root.join("src/lib.rs"),
-            "pub fn updated_func() {}\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn updated_func() {}\n").unwrap();
 
         {
             let mut last = handler.last_scan.lock().unwrap();
@@ -609,7 +646,10 @@ mod tests {
         {
             let gs = handler.get_graph().await.unwrap();
 
-            let node = gs.nodes.iter().find(|n| n.id.name == "updated_func")
+            let node = gs
+                .nodes
+                .iter()
+                .find(|n| n.id.name == "updated_func")
                 .expect("updated_func should be in graph after edit");
             assert_eq!(node.id.root, expected_slug);
 
@@ -625,8 +665,8 @@ mod tests {
     /// Seeded from dissent: verify changed files are detected and old symbols removed.
     #[tokio::test]
     async fn test_foreground_pipeline_incremental_on_second_run() {
-        use tempfile::TempDir;
         use std::sync::Mutex;
+        use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
@@ -697,7 +737,10 @@ mod tests {
             .await
             .expect("second foreground pipeline should succeed");
 
-        assert!(result2.node_count > 0, "should have nodes after incremental");
+        assert!(
+            result2.node_count > 0,
+            "should have nodes after incremental"
+        );
 
         // Verify the second run used the incremental path.
         let msgs2 = progress2.lock().unwrap();
@@ -734,19 +777,15 @@ mod tests {
     /// the scan reported "incremental, no changes".
     #[tokio::test]
     async fn test_extraction_version_bump_forces_full_rebuild_on_incremental_path() {
-        use tempfile::TempDir;
         use std::sync::Mutex;
+        use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
 
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
-        std::fs::write(
-            root.join("src/lib.rs"),
-            "pub fn stable_function() {}\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn stable_function() {}\n").unwrap();
 
         let handler = RnaHandler {
             repo_root: root.to_path_buf(),
@@ -758,11 +797,21 @@ mod tests {
             .run_pipeline_foreground(|_| {})
             .await
             .expect("first run should succeed");
-        assert!(result1.node_count > 0, "should have extracted nodes on first run");
+        assert!(
+            result1.node_count > 0,
+            "should have extracted nodes on first run"
+        );
 
         // Verify the extraction_version file was written.
-        let version_file = root.join(".oh").join(".cache").join("lance").join("extraction_version");
-        assert!(version_file.exists(), "extraction_version file should exist after first run");
+        let version_file = root
+            .join(".oh")
+            .join(".cache")
+            .join("lance")
+            .join("extraction_version");
+        assert!(
+            version_file.exists(),
+            "extraction_version file should exist after first run"
+        );
 
         // Simulate a version bump: overwrite the stored version with a stale value.
         // This mimics what happens when a new binary with a higher EXTRACTION_VERSION
@@ -784,7 +833,10 @@ mod tests {
             .await
             .expect("second run should succeed after extraction version migration");
 
-        assert!(result2.node_count > 0, "should have nodes after version bump rebuild");
+        assert!(
+            result2.node_count > 0,
+            "should have nodes after version bump rebuild"
+        );
 
         let msgs = progress2.lock().unwrap();
 
@@ -804,7 +856,8 @@ mod tests {
 
         // Must report the extraction version upgrade message.
         assert!(
-            msgs.iter().any(|m| m.contains("Extraction version upgrade detected")),
+            msgs.iter()
+                .any(|m| m.contains("Extraction version upgrade detected")),
             "should report extraction version upgrade. Messages: {:?}",
             *msgs
         );
@@ -834,19 +887,15 @@ mod tests {
     /// which covers the EXTRACTION_VERSION case (#452).
     #[tokio::test]
     async fn test_schema_version_bump_forces_full_rebuild_on_incremental_path() {
-        use tempfile::TempDir;
         use std::sync::Mutex;
+        use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
 
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
-        std::fs::write(
-            root.join("src/lib.rs"),
-            "pub fn stable_function() {}\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn stable_function() {}\n").unwrap();
 
         let handler = RnaHandler {
             repo_root: root.to_path_buf(),
@@ -858,11 +907,21 @@ mod tests {
             .run_pipeline_foreground(|_| {})
             .await
             .expect("first run should succeed");
-        assert!(result1.node_count > 0, "should have extracted nodes on first run");
+        assert!(
+            result1.node_count > 0,
+            "should have extracted nodes on first run"
+        );
 
         // Verify the schema_version file was written.
-        let schema_version_file = root.join(".oh").join(".cache").join("lance").join("schema_version");
-        assert!(schema_version_file.exists(), "schema_version file should exist after first run");
+        let schema_version_file = root
+            .join(".oh")
+            .join(".cache")
+            .join("lance")
+            .join("schema_version");
+        assert!(
+            schema_version_file.exists(),
+            "schema_version file should exist after first run"
+        );
 
         // Simulate a schema version bump: overwrite the stored version with a stale value.
         // This mimics what happens when a new binary with a higher SCHEMA_VERSION is run
@@ -885,7 +944,10 @@ mod tests {
             .await
             .expect("second run should succeed after schema version migration");
 
-        assert!(result2.node_count > 0, "should have nodes after schema version bump rebuild");
+        assert!(
+            result2.node_count > 0,
+            "should have nodes after schema version bump rebuild"
+        );
 
         let msgs = progress2.lock().unwrap();
 
@@ -1027,7 +1089,9 @@ mod tests {
             body: String::new(),
             score: 1.0,
         };
-        assert!(crate::service::search_result_passes_root_filter(&result, &filter, &non_code));
+        assert!(crate::service::search_result_passes_root_filter(
+            &result, &filter, &non_code
+        ));
     }
 
     #[test]
@@ -1041,7 +1105,9 @@ mod tests {
             body: String::new(),
             score: 1.0,
         };
-        assert!(!crate::service::search_result_passes_root_filter(&result, &filter, &non_code));
+        assert!(!crate::service::search_result_passes_root_filter(
+            &result, &filter, &non_code
+        ));
     }
 
     #[test]
@@ -1055,7 +1121,9 @@ mod tests {
             body: String::new(),
             score: 0.8,
         };
-        assert!(crate::service::search_result_passes_root_filter(&result, &filter, &non_code));
+        assert!(crate::service::search_result_passes_root_filter(
+            &result, &filter, &non_code
+        ));
     }
 
     #[test]
@@ -1069,7 +1137,9 @@ mod tests {
             body: String::new(),
             score: 1.0,
         };
-        assert!(crate::service::search_result_passes_root_filter(&result, &filter, &non_code));
+        assert!(crate::service::search_result_passes_root_filter(
+            &result, &filter, &non_code
+        ));
     }
 
     #[test]
@@ -1084,7 +1154,9 @@ mod tests {
             body: String::new(),
             score: 0.7,
         };
-        assert!(crate::service::search_result_passes_root_filter(&result, &filter, &non_code));
+        assert!(crate::service::search_result_passes_root_filter(
+            &result, &filter, &non_code
+        ));
     }
 
     // ── Stale root pruning tests (#198) ────────────────────────────────
@@ -1108,13 +1180,23 @@ mod tests {
     #[test]
     fn test_parse_node_kind_all_variants_round_trip() {
         let variants = vec![
-            NodeKind::Function, NodeKind::Struct, NodeKind::Trait,
-            NodeKind::Enum, NodeKind::TypeAlias, NodeKind::Module,
-            NodeKind::Import, NodeKind::Const, NodeKind::Impl,
-            NodeKind::ProtoMessage, NodeKind::SqlTable,
-            NodeKind::ApiEndpoint, NodeKind::Macro,
-            NodeKind::Field, NodeKind::PrMerge,
-            NodeKind::EnumVariant, NodeKind::MarkdownSection,
+            NodeKind::Function,
+            NodeKind::Struct,
+            NodeKind::Trait,
+            NodeKind::Enum,
+            NodeKind::TypeAlias,
+            NodeKind::Module,
+            NodeKind::Import,
+            NodeKind::Const,
+            NodeKind::Impl,
+            NodeKind::ProtoMessage,
+            NodeKind::SqlTable,
+            NodeKind::ApiEndpoint,
+            NodeKind::Macro,
+            NodeKind::Field,
+            NodeKind::PrMerge,
+            NodeKind::EnumVariant,
+            NodeKind::MarkdownSection,
         ];
         for variant in variants {
             let s = format!("{}", variant);
@@ -1202,7 +1284,10 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
             config_dir.join("config.toml"),
-            format!("[workspace.roots]\nsecondary = \"{}\"\n", secondary.path().display()),
+            format!(
+                "[workspace.roots]\nsecondary = \"{}\"\n",
+                secondary.path().display()
+            ),
         )
         .unwrap();
 
@@ -1227,12 +1312,18 @@ mod tests {
         );
 
         // Step 5: Verify LanceDB was updated: load fresh from lance and check
-        let persisted = crate::server::load_graph_from_lance(primary.path()).await.unwrap();
+        let persisted = crate::server::load_graph_from_lance(primary.path())
+            .await
+            .unwrap();
         assert!(
             persisted.nodes.iter().any(|n| n.id.name == "secondary_fn"),
             "secondary_fn must be in LanceDB after second build. \
             Stored nodes: {:?}",
-            persisted.nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+            persisted
+                .nodes
+                .iter()
+                .map(|n| &n.id.name)
+                .collect::<Vec<_>>()
         );
 
         // Cleanup: remove scanner state we wrote so other tests aren't affected
@@ -1261,14 +1352,16 @@ mod tests {
         std::fs::write(
             primary.path().join("src/lib.rs"),
             "pub fn primary_fn() {}\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         // Secondary root: one Rust file
         std::fs::create_dir_all(secondary.path().join("src")).unwrap();
         std::fs::write(
             secondary.path().join("src/lib.rs"),
             "pub fn secondary_fn() {}\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         // Step 1: First build with fresh handler #1 -- no secondary declared.
         {
@@ -1288,7 +1381,9 @@ mod tests {
         // Ensure cleanup runs even if the test panics.
         struct CleanupFile(std::path::PathBuf);
         impl Drop for CleanupFile {
-            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
         }
         let _cleanup = CleanupFile(state_path.clone());
         if let Some(parent) = state_path.parent() {
@@ -1299,7 +1394,8 @@ mod tests {
                 secondary.path().to_path_buf(),
                 vec![],
                 state_path.clone(),
-            ).unwrap();
+            )
+            .unwrap();
             let _ = scanner.scan().unwrap();
             scanner.commit_state().unwrap();
         }
@@ -1309,8 +1405,12 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
             config_dir.join("config.toml"),
-            format!("[workspace.roots]\nsecondary-fresh = \"{}\"\n", secondary.path().display()),
-        ).unwrap();
+            format!(
+                "[workspace.roots]\nsecondary-fresh = \"{}\"\n",
+                secondary.path().display()
+            ),
+        )
+        .unwrap();
 
         // Step 4: Second build with fresh handler #2 -- should persist secondary.
         {
@@ -1327,12 +1427,18 @@ mod tests {
         // Handler #2 dropped -- simulates CLI process exit.
 
         // Verify LanceDB was updated.
-        let persisted2 = crate::server::load_graph_from_lance(primary.path()).await.unwrap();
+        let persisted2 = crate::server::load_graph_from_lance(primary.path())
+            .await
+            .unwrap();
         assert!(
             persisted2.nodes.iter().any(|n| n.id.name == "secondary_fn"),
             "secondary_fn must be in LanceDB after second build (fresh handler). \
              Stored: {:?}",
-            persisted2.nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+            persisted2
+                .nodes
+                .iter()
+                .map(|n| &n.id.name)
+                .collect::<Vec<_>>()
         );
 
         // Step 5: Third build with fresh handler #3 -- simulates "every scan" scenario.
@@ -1351,12 +1457,18 @@ mod tests {
         }
 
         // Verify LanceDB still has secondary after the third build.
-        let persisted3 = crate::server::load_graph_from_lance(primary.path()).await.unwrap();
+        let persisted3 = crate::server::load_graph_from_lance(primary.path())
+            .await
+            .unwrap();
         assert!(
             persisted3.nodes.iter().any(|n| n.id.name == "secondary_fn"),
             "secondary_fn must remain in LanceDB after third build. \
              Stored: {:?}",
-            persisted3.nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+            persisted3
+                .nodes
+                .iter()
+                .map(|n| &n.id.name)
+                .collect::<Vec<_>>()
         );
 
         // Cleanup runs automatically when _cleanup is dropped (end of test scope).
@@ -1407,10 +1519,7 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
             config_dir.join("config.toml"),
-            format!(
-                "[workspace.roots]\nclient = \"{}\"\n",
-                client_dir.display()
-            ),
+            format!("[workspace.roots]\nclient = \"{}\"\n", client_dir.display()),
         )
         .unwrap();
 
@@ -1500,10 +1609,7 @@ mod tests {
         let config_path = config_dir.join("config.toml");
         std::fs::write(
             &config_path,
-            format!(
-                "[workspace.roots]\nclient = \"{}\"\n",
-                client_dir.display()
-            ),
+            format!("[workspace.roots]\nclient = \"{}\"\n", client_dir.display()),
         )
         .unwrap();
 
@@ -1531,19 +1637,12 @@ mod tests {
         let gs2 = handler.build_full_graph().await.unwrap();
 
         // The client root is no longer declared — its nodes should be pruned
-        let client_nodes: Vec<_> = gs2
-            .nodes
-            .iter()
-            .filter(|n| n.id.root == "client")
-            .collect();
+        let client_nodes: Vec<_> = gs2.nodes.iter().filter(|n| n.id.root == "client").collect();
         assert!(
             client_nodes.is_empty(),
             "After removing lsp_only root from config, its nodes must be pruned. \
             Remaining client nodes: {:?}",
-            client_nodes
-                .iter()
-                .map(|n| &n.id.name)
-                .collect::<Vec<_>>()
+            client_nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
         );
     }
 
@@ -1637,11 +1736,7 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
-        std::fs::write(
-            root.join("src/lib.rs"),
-            "pub fn prewarm_test_fn() {}\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn prewarm_test_fn() {}\n").unwrap();
 
         let handler = RnaHandler {
             repo_root: root.to_path_buf(),
@@ -1656,7 +1751,10 @@ mod tests {
 
         // Graph should now be populated without calling get_graph.
         let snap = handler.graph.load_full();
-        let gs = snap.as_ref().as_ref().expect("pre-warm should have populated the graph");
+        let gs = snap
+            .as_ref()
+            .as_ref()
+            .expect("pre-warm should have populated the graph");
         assert!(
             gs.nodes.iter().any(|n| n.id.name == "prewarm_test_fn"),
             "prewarm_test_fn should be in graph after pre-warm. Nodes: {:?}",
@@ -1674,11 +1772,7 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join(".oh/.cache")).unwrap();
-        std::fs::write(
-            root.join("src/lib.rs"),
-            "pub fn wait_test_fn() {}\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn wait_test_fn() {}\n").unwrap();
 
         let handler = RnaHandler {
             repo_root: root.to_path_buf(),
@@ -1723,15 +1817,17 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..5 {
             let h = handler.clone();
-            handles.push(tokio::spawn(async move {
-                h.get_graph().await
-            }));
+            handles.push(tokio::spawn(async move { h.get_graph().await }));
         }
 
         let mut node_counts = Vec::new();
         for handle in handles {
             let result = handle.await.unwrap();
-            assert!(result.is_ok(), "get_graph should succeed: {:?}", result.err());
+            assert!(
+                result.is_ok(),
+                "get_graph should succeed: {:?}",
+                result.err()
+            );
             let gs = result.unwrap();
             assert!(
                 gs.nodes.iter().any(|n| n.id.name == "concurrent_fn"),
@@ -1743,7 +1839,11 @@ mod tests {
         // All calls should see the same graph (same node count).
         let first = node_counts[0];
         for (i, count) in node_counts.iter().enumerate() {
-            assert_eq!(*count, first, "Call {} got different node count: {} vs {}", i, count, first);
+            assert_eq!(
+                *count, first,
+                "Call {} got different node count: {} vs {}",
+                i, count, first
+            );
         }
     }
 
@@ -1843,7 +1943,11 @@ mod tests {
         handler.graph.store(Arc::new(None));
 
         // The Arc<GraphState> we hold should still be valid and unchanged.
-        assert_eq!(gs1.nodes.len(), node_count_1, "Arc should keep the snapshot alive");
+        assert_eq!(
+            gs1.nodes.len(),
+            node_count_1,
+            "Arc should keep the snapshot alive"
+        );
         assert!(
             gs1.nodes.iter().any(|n| n.id.name == "outlive_fn"),
             "outlive_fn should still be accessible in the held Arc"

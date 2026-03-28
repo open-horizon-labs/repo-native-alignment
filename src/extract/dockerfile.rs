@@ -41,10 +41,7 @@ impl Extractor for DockerfileExtractor {
     }
 
     fn can_handle(&self, path: &Path, _content: &str) -> bool {
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         file_name == "Dockerfile" || file_name.starts_with("Dockerfile.")
     }
 
@@ -70,7 +67,9 @@ impl Extractor for DockerfileExtractor {
 
         // Walk top-level instructions
         for i in 0..root.child_count() {
-            let Some(child) = root.child(i as u32) else { continue };
+            let Some(child) = root.child(i as u32) else {
+                continue;
+            };
 
             match child.kind() {
                 "from_instruction" => {
@@ -218,21 +217,12 @@ fn extract_from(
 ///   (expose_port)+
 /// )
 /// ```
-fn extract_expose(
-    node: &tree_sitter::Node,
-    path: &Path,
-    source: &[u8],
-    nodes: &mut Vec<Node>,
-) {
+fn extract_expose(node: &tree_sitter::Node, path: &Path, source: &[u8], nodes: &mut Vec<Node>) {
     for port_node in node.children(&mut node.walk()) {
         if port_node.kind() != "expose_port" {
             continue;
         }
-        let port = port_node
-            .utf8_text(source)
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let port = port_node.utf8_text(source).unwrap_or("").trim().to_string();
         if port.is_empty() {
             continue;
         }
@@ -286,7 +276,10 @@ mod tests {
         assert_eq!(result.nodes.len(), 2); // stage node + external image node
         let stage = &result.nodes[0];
         assert_eq!(stage.id.name, "nginx:alpine");
-        assert_eq!(stage.id.kind, NodeKind::Other("dockerfile_from".to_string()));
+        assert_eq!(
+            stage.id.kind,
+            NodeKind::Other("dockerfile_from".to_string())
+        );
         assert_eq!(stage.language, "dockerfile");
         assert_eq!(stage.metadata["image"], "nginx:alpine");
         assert_eq!(result.edges.len(), 1);
@@ -305,7 +298,8 @@ mod tests {
 
     #[test]
     fn test_multistage_depends_on() {
-        let content = "FROM rust:1.70 AS builder\nFROM debian:slim AS runtime\nFROM builder AS final\n";
+        let content =
+            "FROM rust:1.70 AS builder\nFROM debian:slim AS runtime\nFROM builder AS final\n";
         let result = extract(content);
         // Nodes: builder stage, rust:1.70 ext, runtime stage, debian:slim ext, final stage
         // (builder is already in stage_map, so no new ext node for final->builder)
@@ -329,7 +323,10 @@ mod tests {
             .expect("edge from final missing");
         assert_eq!(dep_edge.to.name, "builder");
         // target should be the local stage (root = ""), not external (root = "external")
-        assert_eq!(dep_edge.to.root, "", "final->builder edge should point to local stage");
+        assert_eq!(
+            dep_edge.to.root, "",
+            "final->builder edge should point to local stage"
+        );
         let _ = final_node;
     }
 

@@ -131,11 +131,7 @@ pub fn load_extractor_configs(repo_root: &Path) -> Vec<ExtractorConfig> {
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(
-                "extractor_config: failed to read {}: {}",
-                dir.display(),
-                e
-            );
+            tracing::warn!("extractor_config: failed to read {}: {}", dir.display(), e);
             return Vec::new();
         }
     };
@@ -165,11 +161,7 @@ pub fn load_extractor_configs(repo_root: &Path) -> Vec<ExtractorConfig> {
                 }
             },
             Err(e) => {
-                tracing::warn!(
-                    "extractor_config: failed to read {}: {}",
-                    path.display(),
-                    e
-                );
+                tracing::warn!("extractor_config: failed to read {}: {}", path.display(), e);
             }
         }
     }
@@ -339,7 +331,10 @@ pub fn extractor_config_pass_with_configs(
                 } else {
                     // For globs: check that at least the literal portions appear in body.
                     let literal_parts: Vec<&str> = pattern_lower.split('*').collect();
-                    if !literal_parts.iter().all(|p| p.is_empty() || body_lower.contains(p)) {
+                    if !literal_parts
+                        .iter()
+                        .all(|p| p.is_empty() || body_lower.contains(p))
+                    {
                         continue;
                     }
                 }
@@ -350,7 +345,8 @@ pub fn extractor_config_pass_with_configs(
                     .chars()
                     .map(|c| match c {
                         '*' => "[a-zA-Z0-9_$.]*".to_string(),
-                        '.' | '(' | ')' | '[' | ']' | '{' | '}' | '+' | '?' | '^' | '$' | '|' | '\\' => {
+                        '.' | '(' | ')' | '[' | ']' | '{' | '}' | '+' | '?' | '^' | '$' | '|'
+                        | '\\' => {
                             format!("\\{}", c)
                         }
                         _ => c.to_string(),
@@ -398,10 +394,8 @@ pub fn extractor_config_pass_with_configs(
                         .entry(channel_key)
                         .or_insert_with(|| {
                             let mut metadata = BTreeMap::new();
-                            metadata.insert(
-                                "extractor_config".to_string(),
-                                config.meta.name.clone(),
-                            );
+                            metadata
+                                .insert("extractor_config".to_string(), config.meta.name.clone());
                             Node {
                                 id: NodeId {
                                     root: root_id.to_string(),
@@ -425,11 +419,7 @@ pub fn extractor_config_pass_with_configs(
                         .clone();
 
                     // Dedup: (from_stable_id, topic_name, edge_kind).
-                    let dedup_key = (
-                        node.stable_id(),
-                        topic_name.clone(),
-                        edge_kind.to_string(),
-                    );
+                    let dedup_key = (node.stable_id(), topic_name.clone(), edge_kind.to_string());
                     if !seen_edges.insert(dedup_key) {
                         continue;
                     }
@@ -775,10 +765,7 @@ edge_kind = "Consumes"
         let cfg = pubsub_fixture_config();
         assert_eq!(cfg.meta.name, "google-pubsub");
         assert_eq!(cfg.meta.applies_when.language, "python");
-        assert_eq!(
-            cfg.meta.applies_when.imports_contain,
-            "google.cloud.pubsub"
-        );
+        assert_eq!(cfg.meta.applies_when.imports_contain, "google.cloud.pubsub");
     }
 
     #[test]
@@ -826,7 +813,11 @@ decorator = true
 "#,
         );
         assert_eq!(cfg.boundaries.len(), 2);
-        assert_eq!(cfg.boundaries[0].topic_arg, Some(0), "arg_position alias must map to topic_arg");
+        assert_eq!(
+            cfg.boundaries[0].topic_arg,
+            Some(0),
+            "arg_position alias must map to topic_arg"
+        );
         assert!(!cfg.boundaries[0].decorator);
         assert!(cfg.boundaries[1].decorator);
     }
@@ -863,8 +854,7 @@ decorator = true
             "publish_message",
             "publisher.publish(\"my-topic\", data)",
         );
-        let result =
-            extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
+        let result = extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
         assert!(
             result.edges.is_empty(),
             "Wrong import → no edges (got {:?})",
@@ -889,8 +879,7 @@ decorator = true
             "PublishMessage",
             r#"publisher.publish("my-topic", data)"#,
         );
-        let result =
-            extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
+        let result = extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
         assert!(
             result.edges.is_empty(),
             "Language mismatch → no edges (got {:?})",
@@ -938,7 +927,10 @@ decorator = true
     #[test]
     fn test_synthesize_star_import_skipped() {
         let result = synthesize_from_import_paths("from os import *");
-        assert!(result.is_empty(), "star imports should produce no synthetic paths");
+        assert!(
+            result.is_empty(),
+            "star imports should produce no synthetic paths"
+        );
     }
 
     #[test]
@@ -1038,14 +1030,14 @@ decorator = true
             r#"def publish_message(topic, data):
     publisher.publish("projects/my-project/topics/orders", data.encode())"#,
         );
-        let result =
-            extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
-        assert_eq!(result.edges.len(), 1, "Should emit exactly one Produces edge");
-        assert_eq!(result.edges[0].kind, EdgeKind::Produces);
+        let result = extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
         assert_eq!(
-            result.edges[0].to.name,
-            "projects/my-project/topics/orders"
+            result.edges.len(),
+            1,
+            "Should emit exactly one Produces edge"
         );
+        assert_eq!(result.edges[0].kind, EdgeKind::Produces);
+        assert_eq!(result.edges[0].to.name, "projects/my-project/topics/orders");
         assert_eq!(result.nodes.len(), 1, "Should emit one channel node");
         assert!(matches!(&result.nodes[0].id.kind, NodeKind::Other(s) if s == "channel"));
     }
@@ -1067,9 +1059,12 @@ decorator = true
             r#"def subscribe_handler():
     subscriber.subscribe("projects/my-project/subscriptions/my-sub", callback=handle)"#,
         );
-        let result =
-            extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
-        assert_eq!(result.edges.len(), 1, "Should emit exactly one Consumes edge");
+        let result = extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
+        assert_eq!(
+            result.edges.len(),
+            1,
+            "Should emit exactly one Consumes edge"
+        );
         assert_eq!(result.edges[0].kind, EdgeKind::Consumes);
         assert_eq!(
             result.edges[0].to.name,
@@ -1093,8 +1088,7 @@ decorator = true
             "other_function",
             "def other_function(): return 42",
         );
-        let result =
-            extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
+        let result = extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
         assert!(result.edges.is_empty(), "Pattern absent → no edges");
     }
 
@@ -1125,8 +1119,7 @@ decorator = true
             "fn_b",
             r#"publisher.publish("orders", data_b)"#,
         );
-        let result =
-            extractor_config_pass_with_configs(&[import, fn_a, fn_b], "repo", &[cfg]);
+        let result = extractor_config_pass_with_configs(&[import, fn_a, fn_b], "repo", &[cfg]);
         let order_nodes: Vec<_> = result
             .nodes
             .iter()
@@ -1145,7 +1138,12 @@ decorator = true
         // A function body that calls the same pattern twice on the same topic
         // should produce only one edge.
         let cfg = pubsub_fixture_config();
-        let import = make_import("repo", "python", "google.cloud.pubsub", "google.cloud.pubsub");
+        let import = make_import(
+            "repo",
+            "python",
+            "google.cloud.pubsub",
+            "google.cloud.pubsub",
+        );
         let fn_node = make_fn(
             "repo",
             "python",
@@ -1155,8 +1153,7 @@ decorator = true
     publisher.publish("orders", msg1)
     publisher.publish("orders", msg2)"#,
         );
-        let result =
-            extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
+        let result = extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
         // Both calls resolve to "orders" → same (from_stable_id, topic, edge_kind)
         // dedup key → only one edge emitted despite two call sites.
         assert_eq!(
@@ -1171,7 +1168,12 @@ decorator = true
         // A function that publishes to two different topics must emit two edges.
         // This tests the multi-occurrence iteration fix (CodeRabbit Major finding).
         let cfg = pubsub_fixture_config();
-        let import = make_import("repo", "python", "google.cloud.pubsub_v1", "google.cloud.pubsub_v1");
+        let import = make_import(
+            "repo",
+            "python",
+            "google.cloud.pubsub_v1",
+            "google.cloud.pubsub_v1",
+        );
         let fn_node = make_fn(
             "repo",
             "python",
@@ -1181,8 +1183,7 @@ decorator = true
     publisher.publish("orders", order_data)
     publisher.publish("payments", payment_data)"#,
         );
-        let result =
-            extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
+        let result = extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
         assert_eq!(
             result.edges.len(),
             2,
@@ -1210,7 +1211,12 @@ decorator = true
     #[test]
     fn test_external_root_skipped() {
         let cfg = pubsub_fixture_config();
-        let import = make_import("external", "python", "google.cloud.pubsub", "google.cloud.pubsub");
+        let import = make_import(
+            "external",
+            "python",
+            "google.cloud.pubsub",
+            "google.cloud.pubsub",
+        );
         let fn_node = make_fn(
             "external",
             "python",
@@ -1218,8 +1224,7 @@ decorator = true
             "publish",
             r#"publisher.publish("orders", data)"#,
         );
-        let result =
-            extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
+        let result = extractor_config_pass_with_configs(&[import, fn_node], "repo", &[cfg]);
         assert!(
             result.edges.is_empty(),
             "External root nodes must not produce edges"
@@ -1289,7 +1294,12 @@ decorator = true
     #[test]
     fn test_adversarial_function_pattern_no_false_positive_on_different_method() {
         let cfg = pubsub_fixture_config();
-        let import = make_import("repo", "python", "google.cloud.pubsub_v1", "google.cloud.pubsub_v1");
+        let import = make_import(
+            "repo",
+            "python",
+            "google.cloud.pubsub_v1",
+            "google.cloud.pubsub_v1",
+        );
         // body calls publisher.publish_to_dlq — different method, different call signature
         let fn_node = make_fn(
             "repo",
@@ -1316,7 +1326,12 @@ decorator = true
     #[test]
     fn test_adversarial_variable_topic_produces_no_edge() {
         let cfg = pubsub_fixture_config();
-        let import = make_import("repo", "python", "google.cloud.pubsub_v1", "google.cloud.pubsub_v1");
+        let import = make_import(
+            "repo",
+            "python",
+            "google.cloud.pubsub_v1",
+            "google.cloud.pubsub_v1",
+        );
         let fn_node = make_fn(
             "repo",
             "python",
@@ -1377,7 +1392,12 @@ edge_kind = "Produces"
 "#,
         );
 
-        let py_import = make_import("repo", "python", "google.cloud.pubsub_v1", "google.cloud.pubsub_v1");
+        let py_import = make_import(
+            "repo",
+            "python",
+            "google.cloud.pubsub_v1",
+            "google.cloud.pubsub_v1",
+        );
         let py_fn = make_fn(
             "repo",
             "python",
@@ -1417,7 +1437,12 @@ edge_kind = "Produces"
     #[test]
     fn test_preserves_topic_casing() {
         let cfg = pubsub_fixture_config();
-        let import = make_import("repo", "python", "google.cloud.pubsub_v1", "google.cloud.pubsub_v1");
+        let import = make_import(
+            "repo",
+            "python",
+            "google.cloud.pubsub_v1",
+            "google.cloud.pubsub_v1",
+        );
         let fn_node = make_fn(
             "repo",
             "python",
@@ -1473,8 +1498,15 @@ edge_kind = "Produces"
         );
         // Dynamic topic (with ${}) must produce no edge.
         // Static backtick topic must produce one edge.
-        assert_eq!(result.edges.len(), 1, "Only static template literal produces an edge");
-        assert!(result.nodes.iter().any(|n| n.id.name == "orders-prod"), "Static topic present");
+        assert_eq!(
+            result.edges.len(),
+            1,
+            "Only static template literal produces an edge"
+        );
+        assert!(
+            result.nodes.iter().any(|n| n.id.name == "orders-prod"),
+            "Static topic present"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1554,11 +1586,10 @@ edge_kind = "Produces"
             .join("fixtures")
             .join("oh_extractors")
             .join("google-pubsub.toml");
-        let fixture_content = std::fs::read_to_string(&fixture_path)
-            .unwrap_or_else(|_| {
-                // Fallback: embed the fixture inline so the test never fails due to
-                // working directory differences.
-                r#"
+        let fixture_content = std::fs::read_to_string(&fixture_path).unwrap_or_else(|_| {
+            // Fallback: embed the fixture inline so the test never fails due to
+            // working directory differences.
+            r#"
 [meta]
 name = "google-pubsub"
 applies_when = { language = "python", imports_contain = "google.cloud.pubsub" }
@@ -1573,8 +1604,8 @@ function_pattern = "subscriber.subscribe"
 topic_arg = 0
 edge_kind = "Consumes"
 "#
-                .to_string()
-            });
+            .to_string()
+        });
         std::fs::write(dir.join("google-pubsub.toml"), &fixture_content).unwrap();
 
         let configs = load_extractor_configs(tmp.path());

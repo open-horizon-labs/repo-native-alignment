@@ -78,8 +78,8 @@
 //!
 //! [`fastapi_router_prefix_pass`]: super::fastapi_router_prefix::fastapi_router_prefix_pass
 
-use crate::graph::{Node, NodeKind};
 use crate::extract::openapi_sdk_link::is_generated_sdk_file_pub;
+use crate::graph::{Node, NodeKind};
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -262,7 +262,8 @@ fn apply_full_path(node: &mut Node, full_path: &str) {
         .cloned()
         .unwrap_or_else(|| "GET".to_string());
 
-    node.metadata.insert("http_path".to_string(), full_path.to_string());
+    node.metadata
+        .insert("http_path".to_string(), full_path.to_string());
     node.id.name = format!("{} {}", method, full_path);
     node.signature = format!("[route_decorator] {} {}", method, full_path);
 }
@@ -288,7 +289,10 @@ mod tests {
 
     #[test]
     fn test_segment_boundary_suffix() {
-        assert!(is_proper_suffix("/workspaces/{id}/expertunities", "/expertunities"));
+        assert!(is_proper_suffix(
+            "/workspaces/{id}/expertunities",
+            "/expertunities"
+        ));
     }
 
     #[test]
@@ -300,7 +304,10 @@ mod tests {
     #[test]
     fn test_partial_segment_not_suffix() {
         // "/expertunities" does not end with "/unities" (it ends with "unities" not "/unities").
-        assert!(!is_proper_suffix("/workspaces/{id}/expertunities", "/unities"));
+        assert!(!is_proper_suffix(
+            "/workspaces/{id}/expertunities",
+            "/unities"
+        ));
     }
 
     #[test]
@@ -310,7 +317,10 @@ mod tests {
 
     #[test]
     fn test_multi_segment_suffix() {
-        assert!(is_proper_suffix("/workspaces/{id}/comment/{comment_id}/accept", "/comment/{comment_id}/accept"));
+        assert!(is_proper_suffix(
+            "/workspaces/{id}/comment/{comment_id}/accept",
+            "/comment/{comment_id}/accept"
+        ));
     }
 
     #[test]
@@ -380,14 +390,20 @@ mod tests {
 
         sdk_path_inference_pass(&mut nodes);
 
-        let ep = nodes.iter().find(|n| n.id.kind == NodeKind::ApiEndpoint).unwrap();
+        let ep = nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .unwrap();
         assert_eq!(
             ep.metadata.get("http_path").map(|s| s.as_str()),
             Some("/workspaces/{id}/expertunities"),
             "full path must be inferred from SDK"
         );
         assert_eq!(ep.id.name, "GET /workspaces/{id}/expertunities");
-        assert_eq!(ep.signature, "[route_decorator] GET /workspaces/{id}/expertunities");
+        assert_eq!(
+            ep.signature,
+            "[route_decorator] GET /workspaces/{id}/expertunities"
+        );
         assert_eq!(
             ep.metadata.get("http_path_local").map(|s| s.as_str()),
             Some("/expertunities"),
@@ -405,7 +421,10 @@ mod tests {
 
         sdk_path_inference_pass(&mut nodes);
 
-        let ep = nodes.iter().find(|n| n.id.kind == NodeKind::ApiEndpoint).unwrap();
+        let ep = nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .unwrap();
         // Should remain as-is (already had full path set by prefix pass).
         assert_eq!(
             ep.metadata.get("http_path").map(|s| s.as_str()),
@@ -429,7 +448,10 @@ mod tests {
 
         sdk_path_inference_pass(&mut nodes);
 
-        let ep = nodes.iter().find(|n| n.id.kind == NodeKind::ApiEndpoint).unwrap();
+        let ep = nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .unwrap();
         assert_eq!(
             ep.metadata.get("http_path").map(|s| s.as_str()),
             Some("/items"),
@@ -451,7 +473,10 @@ mod tests {
 
         sdk_path_inference_pass(&mut nodes);
 
-        let ep = nodes.iter().find(|n| n.id.kind == NodeKind::ApiEndpoint).unwrap();
+        let ep = nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .unwrap();
         assert_eq!(
             ep.metadata.get("http_path").map(|s| s.as_str()),
             Some("/expertunities"),
@@ -468,7 +493,10 @@ mod tests {
 
         sdk_path_inference_pass(&mut nodes);
 
-        let ep = nodes.iter().find(|n| n.id.kind == NodeKind::ApiEndpoint).unwrap();
+        let ep = nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .unwrap();
         // Path stays the same, no http_path_local written (no prefix was applied).
         assert_eq!(
             ep.metadata.get("http_path").map(|s| s.as_str()),
@@ -490,7 +518,10 @@ mod tests {
 
         sdk_path_inference_pass(&mut nodes);
 
-        let ep = nodes.iter().find(|n| n.id.kind == NodeKind::ApiEndpoint).unwrap();
+        let ep = nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .unwrap();
         assert_eq!(
             ep.metadata.get("http_path").map(|s| s.as_str()),
             Some("/expertunities"),
@@ -501,12 +532,13 @@ mod tests {
     /// No SDK Const nodes → fast return, no changes.
     #[test]
     fn test_no_sdk_consts_is_noop() {
-        let mut nodes = vec![
-            make_api_endpoint("/expertunities", "GET", false),
-        ];
+        let mut nodes = vec![make_api_endpoint("/expertunities", "GET", false)];
         sdk_path_inference_pass(&mut nodes);
         let ep = &nodes[0];
-        assert_eq!(ep.metadata.get("http_path").map(|s| s.as_str()), Some("/expertunities"));
+        assert_eq!(
+            ep.metadata.get("http_path").map(|s| s.as_str()),
+            Some("/expertunities")
+        );
     }
 
     /// Non-Python endpoints are not modified even if a matching SDK path exists.
@@ -515,14 +547,14 @@ mod tests {
         let mut non_python = make_api_endpoint("/items", "GET", false);
         non_python.language = "typescript".to_string();
 
-        let mut nodes = vec![
-            make_sdk_const("/workspaces/{id}/items"),
-            non_python,
-        ];
+        let mut nodes = vec![make_sdk_const("/workspaces/{id}/items"), non_python];
 
         sdk_path_inference_pass(&mut nodes);
 
-        let ep = nodes.iter().find(|n| n.id.kind == NodeKind::ApiEndpoint).unwrap();
+        let ep = nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .unwrap();
         assert_eq!(
             ep.metadata.get("http_path").map(|s| s.as_str()),
             Some("/items"),
@@ -540,7 +572,10 @@ mod tests {
 
         sdk_path_inference_pass(&mut nodes);
 
-        let ep = nodes.iter().find(|n| n.id.kind == NodeKind::ApiEndpoint).unwrap();
+        let ep = nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .unwrap();
         assert_eq!(
             ep.metadata.get("http_path").map(|s| s.as_str()),
             Some("/foo"),
@@ -560,15 +595,20 @@ mod tests {
 
         sdk_path_inference_pass(&mut nodes);
 
-        let expertunities_ep = nodes.iter().find(|n| {
-            n.id.kind == NodeKind::ApiEndpoint && n.id.name.contains("expertunities")
-        }).unwrap();
-        let activities_ep = nodes.iter().find(|n| {
-            n.id.kind == NodeKind::ApiEndpoint && n.id.name.contains("activities")
-        }).unwrap();
+        let expertunities_ep = nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::ApiEndpoint && n.id.name.contains("expertunities"))
+            .unwrap();
+        let activities_ep = nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::ApiEndpoint && n.id.name.contains("activities"))
+            .unwrap();
 
         assert_eq!(
-            expertunities_ep.metadata.get("http_path").map(|s| s.as_str()),
+            expertunities_ep
+                .metadata
+                .get("http_path")
+                .map(|s| s.as_str()),
             Some("/workspaces/{id}/expertunities"),
         );
         assert_eq!(
@@ -580,7 +620,9 @@ mod tests {
     /// Verify that the SDK file detection function works for sdk.gen.ts.
     #[test]
     fn test_sdk_gen_ts_recognized() {
-        assert!(is_generated_sdk_file_pub(&PathBuf::from("src/api/sdk.gen.ts")));
+        assert!(is_generated_sdk_file_pub(&PathBuf::from(
+            "src/api/sdk.gen.ts"
+        )));
     }
 
     // --- adversarial edge cases (dissent-seeded) ---
@@ -592,13 +634,16 @@ mod tests {
     #[test]
     fn test_trailing_slash_mismatch_no_match() {
         let mut nodes = vec![
-            make_sdk_const("/workspaces/{id}/expertunities/"),  // trailing slash in SDK
-            make_api_endpoint("/expertunities", "GET", false),   // no trailing slash
+            make_sdk_const("/workspaces/{id}/expertunities/"), // trailing slash in SDK
+            make_api_endpoint("/expertunities", "GET", false), // no trailing slash
         ];
 
         sdk_path_inference_pass(&mut nodes);
 
-        let ep = nodes.iter().find(|n| n.id.kind == NodeKind::ApiEndpoint).unwrap();
+        let ep = nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .unwrap();
         // "/workspaces/{id}/expertunities/" does not end with "/expertunities" (no trailing slash)
         // so no match → path unchanged.
         assert_eq!(
@@ -618,7 +663,10 @@ mod tests {
 
         sdk_path_inference_pass(&mut nodes);
 
-        let ep = nodes.iter().find(|n| n.id.kind == NodeKind::ApiEndpoint).unwrap();
+        let ep = nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .unwrap();
         assert_eq!(
             ep.metadata.get("http_path").map(|s| s.as_str()),
             Some("/workspaces/{id}/expertunities/"),
@@ -640,7 +688,10 @@ mod tests {
 
         sdk_path_inference_pass(&mut nodes);
 
-        let ep = nodes.iter().find(|n| n.id.kind == NodeKind::ApiEndpoint).unwrap();
+        let ep = nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .unwrap();
         assert_eq!(
             ep.metadata.get("http_path").map(|s| s.as_str()),
             Some("/expertunities"),
@@ -677,7 +728,10 @@ mod tests {
 
         sdk_path_inference_pass(&mut nodes);
 
-        let ep = nodes.iter().find(|n| n.id.kind == NodeKind::ApiEndpoint).unwrap();
+        let ep = nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .unwrap();
         // service-A endpoint must use only service-A's SDK → /workspaces/{id}/items
         // service-B's /admin/items must NOT contaminate it.
         assert_eq!(
@@ -708,12 +762,14 @@ mod tests {
 
         sdk_path_inference_pass(&mut nodes);
 
-        let ep_a_result = nodes.iter().find(|n| {
-            n.id.kind == NodeKind::ApiEndpoint && n.id.root == "service-a"
-        }).unwrap();
-        let ep_b_result = nodes.iter().find(|n| {
-            n.id.kind == NodeKind::ApiEndpoint && n.id.root == "service-b"
-        }).unwrap();
+        let ep_a_result = nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::ApiEndpoint && n.id.root == "service-a")
+            .unwrap();
+        let ep_b_result = nodes
+            .iter()
+            .find(|n| n.id.kind == NodeKind::ApiEndpoint && n.id.root == "service-b")
+            .unwrap();
 
         assert_eq!(
             ep_a_result.metadata.get("http_path").map(|s| s.as_str()),

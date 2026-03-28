@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::types::{OhArtifact, OhArtifactKind};
 
@@ -27,8 +27,8 @@ pub fn load_oh_artifacts(repo_root: &Path) -> Result<Vec<OhArtifact>> {
             continue;
         }
 
-        let entries = fs::read_dir(&dir)
-            .with_context(|| format!("reading directory {}", dir.display()))?;
+        let entries =
+            fs::read_dir(&dir).with_context(|| format!("reading directory {}", dir.display()))?;
 
         for entry in entries {
             let entry = entry?;
@@ -53,8 +53,7 @@ pub fn load_oh_artifacts(repo_root: &Path) -> Result<Vec<OhArtifact>> {
 /// then the markdown body. Files without frontmatter are treated as having an empty
 /// frontmatter map.
 pub fn parse_artifact(path: &Path, kind: OhArtifactKind) -> Result<OhArtifact> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let raw = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
     let (frontmatter, body) = split_frontmatter(&raw);
 
@@ -84,11 +83,7 @@ pub fn write_artifact(
     frontmatter: &BTreeMap<String, serde_yaml::Value>,
     body: &str,
 ) -> Result<PathBuf> {
-    if slug.contains('/')
-        || slug.contains('\\')
-        || slug.contains("..")
-        || slug.is_empty()
-    {
+    if slug.contains('/') || slug.contains('\\') || slug.contains("..") || slug.is_empty() {
         bail!(
             "invalid slug {:?}: must not be empty or contain '/', '\\', or '..'",
             slug
@@ -96,8 +91,7 @@ pub fn write_artifact(
     }
 
     let dir = repo_root.join(".oh").join(subdir);
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("creating directory {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("creating directory {}", dir.display()))?;
 
     let file_path = dir.join(format!("{}.md", slug));
 
@@ -113,14 +107,12 @@ pub fn write_artifact(
         );
     }
 
-    let yaml = serde_yaml::to_string(frontmatter)
-        .context("serializing frontmatter to YAML")?;
+    let yaml = serde_yaml::to_string(frontmatter).context("serializing frontmatter to YAML")?;
     let yaml = yaml.trim_end();
 
     let content = format!("---\n{}\n---\n\n{}\n", yaml, body);
 
-    fs::write(&file_path, &content)
-        .with_context(|| format!("writing {}", file_path.display()))?;
+    fs::write(&file_path, &content).with_context(|| format!("writing {}", file_path.display()))?;
 
     Ok(file_path)
 }
@@ -156,7 +148,13 @@ pub fn update_artifact(
         artifact.frontmatter.insert(k.clone(), v.clone());
     }
 
-    write_artifact(repo_root, subdir, slug, &artifact.frontmatter, &artifact.body)
+    write_artifact(
+        repo_root,
+        subdir,
+        slug,
+        &artifact.frontmatter,
+        &artifact.body,
+    )
 }
 
 fn kind_for_subdir(subdir: &str) -> OhArtifactKind {
@@ -278,17 +276,19 @@ mod tests {
             OhArtifact {
                 kind: OhArtifactKind::Outcome,
                 file_path: PathBuf::from("test.md"),
-                frontmatter: BTreeMap::from([
-                    ("id".to_string(), serde_yaml::Value::String("o1".to_string())),
-                ]),
+                frontmatter: BTreeMap::from([(
+                    "id".to_string(),
+                    serde_yaml::Value::String("o1".to_string()),
+                )]),
                 body: "Outcome body".to_string(),
             },
             OhArtifact {
                 kind: OhArtifactKind::Guardrail,
                 file_path: PathBuf::from("g.md"),
-                frontmatter: BTreeMap::from([
-                    ("id".to_string(), serde_yaml::Value::String("g1".to_string())),
-                ]),
+                frontmatter: BTreeMap::from([(
+                    "id".to_string(),
+                    serde_yaml::Value::String("g1".to_string()),
+                )]),
                 body: "Guardrail body".to_string(),
             },
         ];
@@ -305,15 +305,29 @@ mod tests {
         let root = dir.path();
 
         let mut fm = BTreeMap::new();
-        fm.insert("id".to_string(), serde_yaml::Value::String("test-entry".to_string()));
-        fm.insert("outcome".to_string(), serde_yaml::Value::String("agent-alignment".to_string()));
+        fm.insert(
+            "id".to_string(),
+            serde_yaml::Value::String("test-entry".to_string()),
+        );
+        fm.insert(
+            "outcome".to_string(),
+            serde_yaml::Value::String("agent-alignment".to_string()),
+        );
 
         let path = write_metis(root, "test-entry", &fm, "We learned something important.").unwrap();
         assert!(path.exists());
 
         let artifact = parse_artifact(&path, OhArtifactKind::Metis).unwrap();
         assert_eq!(artifact.id(), "test-entry");
-        assert_eq!(artifact.frontmatter.get("outcome").unwrap().as_str().unwrap(), "agent-alignment");
+        assert_eq!(
+            artifact
+                .frontmatter
+                .get("outcome")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "agent-alignment"
+        );
         assert!(artifact.body.contains("We learned something important."));
     }
 }
