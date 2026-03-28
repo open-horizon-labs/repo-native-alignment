@@ -7,7 +7,7 @@
 //! triggered only when `detected_frameworks` contains `"aspnet"`.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
 
@@ -74,7 +74,7 @@ pub fn aspnet_endpoint_pass(
 /// Parse a C# source file for `MapGet("/path", ...)` etc. patterns.
 fn extract_endpoints_from_source(
     content: &str,
-    file_path: &PathBuf,
+    file_path: &Path,
     root_slug: &str,
     result: &mut ExtractionResult,
 ) {
@@ -106,7 +106,7 @@ fn extract_endpoints_from_source(
             let endpoint_name = format!("{} {}", http_method, route);
             let node_id = NodeId {
                 root: root_slug.to_string(),
-                file: file_path.clone(),
+                file: file_path.to_path_buf(),
                 name: endpoint_name.clone(),
                 kind: NodeKind::ApiEndpoint,
             };
