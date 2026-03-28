@@ -101,8 +101,9 @@ pub fn read_lsp_sentinel(repo_root: &Path) -> Option<SentinelData> {
     read_sentinel(&lsp_sentinel_path(repo_root), "lsp")
 }
 
-/// Delete both sentinels. Called when a full rebuild is triggered (schema migration
-/// or explicit `--full` with cache invalidation).
+/// Delete both sentinels. Called when a full rebuild is triggered: schema migration,
+/// explicit `--full` with cache invalidation, or when cached graph enrichment output
+/// is stale/missing (via `cache_needs_enrichment` paths in `enrichment.rs` and `graph.rs`).
 pub fn clear_sentinels(repo_root: &Path) {
     clear_sentinel(&extract_sentinel_path(repo_root), "extract");
     clear_sentinel(&lsp_sentinel_path(repo_root), "lsp");
