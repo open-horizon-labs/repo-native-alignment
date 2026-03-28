@@ -396,6 +396,19 @@ async fn async_main() -> anyhow::Result<()> {
                     None
                 }
             };
+            // Validate: --include-body requires --node or --nodes
+            if args.include_body
+                && args.node.is_none()
+                && args
+                    .nodes
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .is_none()
+            {
+                anyhow::bail!("--include-body requires --node or --nodes");
+            }
+
             let embed_ref = embed_idx.as_ref();
             let params = SearchParams {
                 query: if args.query.is_empty() {

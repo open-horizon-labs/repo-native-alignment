@@ -71,6 +71,11 @@ async function callSearchWithRetry(args) {
     }
   }
 
+  if (text.includes("Index building")) {
+    throw new Error(
+      `search remained in "Index building" state after ${maxAttempts} attempts`
+    );
+  }
   return text;
 }
 

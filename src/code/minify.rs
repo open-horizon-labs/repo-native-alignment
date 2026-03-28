@@ -15,13 +15,26 @@ pub fn minify_body(body: &str, language: &str) -> String {
         return String::new();
     }
 
-    match language {
+    // Normalize language aliases/casing so callers don't silently fall through
+    // to the text-only path for common variants like "ts", "py", "rs", "golang".
+    let lang = match language.trim().to_ascii_lowercase().as_str() {
+        "typescript" | "ts" => "typescript",
+        "tsx" => "tsx",
+        "javascript" | "js" => "javascript",
+        "jsx" => "jsx",
+        "rust" | "rs" => "rust",
+        "python" | "py" => "python",
+        "go" | "golang" => "go",
+        _ => language,
+    };
+
+    match lang {
         "typescript" | "tsx" => minify_ts(body),
         "javascript" | "jsx" => minify_javascript(body),
         "rust" => minify_rust(body),
         "python" => minify_python(body),
         "go" => minify_go(body),
-        _ => minify_text(body, language),
+        _ => minify_text(body, lang),
     }
 }
 
@@ -203,8 +216,8 @@ fn make_short_name(original: &str, used: &mut std::collections::HashSet<String>)
             return candidate;
         }
     }
-    // Extremely unlikely fallback
-    let fb = format!("{:03}", used.len() % 1000);
+    // Extremely unlikely fallback — prefix with letter to ensure valid identifier
+    let fb = format!("z{:02}", used.len() % 100);
     used.insert(fb.clone());
     fb
 }
@@ -370,16 +383,16 @@ fn minify_with_ast(
         result = format!("{}{}{}", &result[..*start], short, &result[*end..]);
     }
 
-    let inner = if is_wrapped {
+    let inner: String = if is_wrapped {
         match language {
             "python" => extract_python_wrapper_body(&result),
-            _ => extract_wrapper_body(&result),
+            _ => extract_wrapper_body(&result).to_string(),
         }
     } else {
-        result.as_str()
+        result
     };
 
-    let cleaned = minify_text(inner, language);
+    let cleaned = minify_text(&inner, language);
     let legend = build_legend(&locals);
     if legend.is_empty() {
         cleaned
@@ -501,10 +514,62 @@ fn collect_references(
             if config.scope_boundaries.contains(&kind) {
                 continue;
             }
-            // Descend into closures for references (they capture outer scope)
-            // but NOT for local declarations
-            // (closures fall through here and get recursed into, which is correct)
+            // Closures capture outer scope but may also introduce their own
+            // parameters that shadow outer names.  Build a derived locals map
+            // that removes any names re-bound by the closure's parameters so
+            // we don't incorrectly rename them as if they were captures.
+            if config.closures.contains(&kind) {
+                let mut closure_locals = locals.clone();
+                // Remove any outer binding that is shadowed by a closure param.
+                // Closure params live under a "parameters"/"formal_parameters" child.
+                if let Some(params_node) = child
+                    .child_by_field_name("parameters")
+                    .or_else(|| child.child_by_field_name("parameter"))
+                {
+                    remove_param_bindings(params_node, source, &mut closure_locals);
+                }
+                collect_references(child, source, &closure_locals, ranges, config);
+                continue;
+            }
             collect_references(child, source, locals, ranges, config);
+        }
+    }
+}
+
+/// Remove outer bindings that are shadowed by closure/arrow-function parameters.
+/// Walks the parameter list node and removes any identifier names from `locals`
+/// so they won't be renamed as if they were captures of the outer scope.
+fn remove_param_bindings(
+    params_node: tree_sitter::Node,
+    source: &[u8],
+    locals: &mut HashMap<String, String>,
+) {
+    // For a single identifier parameter (e.g., `count => ...`)
+    if params_node.kind() == "identifier" {
+        if let Ok(name) = params_node.utf8_text(source) {
+            locals.remove(name);
+        }
+        return;
+    }
+    // Walk children for formal_parameters / destructuring patterns
+    for i in 0..params_node.child_count() {
+        if let Some(child) = params_node.child(i as u32) {
+            if child.kind() == "identifier" || child.kind() == "required_parameter" {
+                // required_parameter has a "pattern" child that is the identifier
+                let ident = if child.kind() == "required_parameter" {
+                    child.child_by_field_name("pattern").unwrap_or(child)
+                } else {
+                    child
+                };
+                if ident.kind() == "identifier" {
+                    if let Ok(name) = ident.utf8_text(source) {
+                        locals.remove(name);
+                    }
+                }
+            } else {
+                // Recurse for nested patterns (destructuring, rest params, etc.)
+                remove_param_bindings(child, source, locals);
+            }
         }
     }
 }
@@ -538,13 +603,17 @@ fn indent_body(body: &str, indent: &str) -> String {
         .join("\n")
 }
 
-/// Extract body from Python `def __wrapper__():` wrapper.
-fn extract_python_wrapper_body(wrapped: &str) -> &str {
-    // Skip first line (def __wrapper__():) and unindent
+/// Extract body from Python `def __wrapper__():` wrapper, removing the
+/// 4-space indentation that `indent_body` added during wrapping.
+fn extract_python_wrapper_body(wrapped: &str) -> String {
     if let Some(pos) = wrapped.find('\n') {
-        &wrapped[pos + 1..]
+        let body = &wrapped[pos + 1..];
+        body.lines()
+            .map(|l| l.strip_prefix("    ").unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n")
     } else {
-        wrapped
+        wrapped.to_string()
     }
 }
 
@@ -857,9 +926,13 @@ fn minify_text(body: &str, language: &str) -> String {
             }
         }
 
-        while let Some(start) = line.find("/*") {
-            if let Some(end) = line[start..].find("*/") {
-                line = format!("{}{}", &line[..start], &line[start + end + 2..]);
+        // String-aware block comment removal: skip `/* */` inside string literals.
+        loop {
+            let Some(start) = find_outside_strings(&line, "/*") else {
+                break;
+            };
+            if let Some(rel_end) = line[start..].find("*/") {
+                line = format!("{}{}", &line[..start], &line[start + rel_end + 2..]);
             } else {
                 line = line[..start].to_string();
                 in_block_comment = true;
@@ -905,6 +978,42 @@ fn minify_text(body: &str, language: &str) -> String {
 }
 
 /// Find position of a line comment, avoiding false positives in strings and URLs.
+/// Find position of `needle` in `line`, skipping occurrences inside string literals.
+fn find_outside_strings(line: &str, needle: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    let mut string_char: u8 = 0;
+
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == string_char {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'"' || bytes[i] == b'\'' || bytes[i] == b'`' {
+            in_string = true;
+            string_char = bytes[i];
+            i += 1;
+            continue;
+        }
+        if i + needle_bytes.len() <= bytes.len()
+            && &bytes[i..i + needle_bytes.len()] == needle_bytes
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 fn find_line_comment(line: &str, prefix: &str) -> Option<usize> {
     let bytes = line.as_bytes();
     let prefix_bytes = prefix.as_bytes();
