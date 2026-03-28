@@ -1,3 +1,8 @@
+---
+name: arch-diagram
+description: Generate an architecture diagram from RNA data. Queries frameworks, endpoints, entry points, and external service calls, then renders in the user's preferred format (d2, mermaid, plantuml, etc.).
+---
+
 # /arch-diagram
 
 Generate an architecture diagram from RNA data. Teaches the traversal — the user picks the output format.
