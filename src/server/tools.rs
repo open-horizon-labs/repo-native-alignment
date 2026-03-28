@@ -89,7 +89,7 @@ pub struct Search {
     /// Ranking: "hybrid" (default), "keyword", "semantic"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_mode: Option<String>,
-    /// Cross-encoder reranking for precision (~100-300ms); default: false
+    /// Cross-encoder reranking (~100-300ms). Defaults: MCP=true, CLI=false
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank: Option<bool>,
     /// Search .oh/ artifacts and commits (default: true)
@@ -620,7 +620,7 @@ mod tests {
             "Compact output: signature + location only (~25x fewer tokens)",
             "Batch-retrieve multiple node IDs in one call",
             r#"Ranking: "hybrid" (default), "keyword", "semantic""#,
-            "Cross-encoder reranking for precision (~100-300ms); default: false",
+            "Cross-encoder reranking (~100-300ms). Defaults: MCP=true, CLI=false",
             "Search .oh/ artifacts and commits (default: true)",
             "Search markdown sections (default: true)",
             "Artifact filter: outcome, signal, guardrail, metis, commit",
