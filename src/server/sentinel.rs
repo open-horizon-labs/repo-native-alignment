@@ -1,6 +1,4 @@
 //! Write-ahead log sentinels for scan pipeline phases.
-// EXTRACTION_VERSION is deprecated (#526) but still used for backward-compat sentinel reads.
-#![allow(deprecated)]
 //!
 //! After each major pipeline phase completes and its data is durably persisted,
 //! a sentinel file is written to `.oh/.cache/`. On startup, the server checks
@@ -15,15 +13,15 @@
 //! - `.oh/.cache/lsp_completed.json`     — LSP enrichment + persist done
 //!
 //! ## Schema invalidation
-//! Sentinels embed `schema_version` and `extraction_version`. If either changes
-//! (new binary deployed), the sentinel is treated as absent and the phase re-runs.
+//! Sentinels embed `schema_version`. If it changes (new binary deployed),
+//! the sentinel is treated as absent and the phase re-runs.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph::store::{EXTRACTION_VERSION, SCHEMA_VERSION};
+use crate::graph::store::SCHEMA_VERSION;
 
 /// Data stored in each sentinel file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,8 +30,6 @@ pub struct SentinelData {
     pub timestamp: u64,
     /// LanceDB schema version at time of write.
     pub schema_version: u32,
-    /// Extraction logic version at time of write.
-    pub extraction_version: u32,
     /// Node count after the phase completed.
     pub node_count: usize,
     /// Edge count after the phase completed.
@@ -49,15 +45,14 @@ impl SentinelData {
         Self {
             timestamp,
             schema_version: SCHEMA_VERSION,
-            extraction_version: EXTRACTION_VERSION,
             node_count,
             edge_count,
         }
     }
 
-    /// Returns true if this sentinel is valid for the current binary versions.
+    /// Returns true if this sentinel is valid for the current binary version.
     pub fn is_current(&self) -> bool {
-        self.schema_version == SCHEMA_VERSION && self.extraction_version == EXTRACTION_VERSION
+        self.schema_version == SCHEMA_VERSION
     }
 }
 
@@ -185,12 +180,10 @@ fn read_sentinel(path: &Path, name: &str) -> Option<SentinelData> {
                 Some(data)
             } else {
                 tracing::debug!(
-                    "{} sentinel is stale (schema {}/{} vs current {}/{})",
+                    "{} sentinel is stale (schema {} vs current {})",
                     name,
                     data.schema_version,
-                    data.extraction_version,
                     SCHEMA_VERSION,
-                    EXTRACTION_VERSION,
                 );
                 None
             }
@@ -228,7 +221,6 @@ mod tests {
         assert_eq!(sentinel.node_count, 100);
         assert_eq!(sentinel.edge_count, 200);
         assert_eq!(sentinel.schema_version, SCHEMA_VERSION);
-        assert_eq!(sentinel.extraction_version, EXTRACTION_VERSION);
         assert!(sentinel.is_current());
     }
 
@@ -256,7 +248,6 @@ mod tests {
         let stale = SentinelData {
             timestamp: 0,
             schema_version: SCHEMA_VERSION.wrapping_sub(1),
-            extraction_version: EXTRACTION_VERSION,
             node_count: 50,
             edge_count: 80,
         };

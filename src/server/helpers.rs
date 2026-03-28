@@ -1,6 +1,4 @@
 //! Formatting utilities, argument parsing, and display helpers.
-// EXTRACTION_VERSION is deprecated (#526) but still used in the freshness footer.
-#![allow(deprecated)]
 
 use super::state::{EmbeddingStatus, LspEnrichmentStatus};
 use crate::graph;
@@ -73,11 +71,10 @@ pub fn format_freshness_full(
         .unwrap_or_default();
 
     format!(
-        "\n\n*Index: {} symbols · last scan {} · schema v{} · extract v{}{}{}*",
+        "\n\n*Index: {} symbols · last scan {} · schema v{}{}{}*",
         node_count,
         age,
         crate::graph::store::SCHEMA_VERSION,
-        crate::graph::store::EXTRACTION_VERSION,
         embed_part,
         lsp_part,
     )

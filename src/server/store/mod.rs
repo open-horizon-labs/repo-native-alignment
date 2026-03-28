@@ -2,12 +2,10 @@
 //!
 //! ## Module structure
 //!
-//! - `migrate` -- schema and extraction version migration, error classification
+//! - `migrate` -- schema migration and error classification
 //! - `batch` -- Arrow RecordBatch builders for symbols and edges tables
 //! - `persist` -- full persist, incremental upsert, compaction, root pruning
 //! - `load` -- graph loading from LanceDB tables
-// EXTRACTION_VERSION is deprecated (#526) but still used for backward-compat sentinel reads.
-#![allow(deprecated)]
 
 mod batch;
 pub(crate) mod load;
@@ -18,10 +16,10 @@ use std::path::{Path, PathBuf};
 
 use crate::graph::{Confidence, EdgeKind, ExtractionSource, NodeId, NodeKind};
 
-// ── Re-exports for backward compatibility ────────────────────────────
+// ── Re-exports ────────────────────────────────────────────────────────
 
 // From migrate
-pub(crate) use migrate::{check_and_migrate_extraction_version, check_and_migrate_schema};
+pub(crate) use migrate::check_and_migrate_schema;
 
 // From persist
 pub(crate) use persist::{
