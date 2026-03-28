@@ -15,41 +15,49 @@ When the user asks for an architecture diagram, system overview, service map, or
 
 Execute these in order. Each step builds on the previous.
 
-### Step 1: Workspace and Languages
+### Step 1: Orientation (entry points, hotspots, outcomes)
 
-```
-list_roots(repo="<path>")
-```
-
-Extract: root names, languages detected, framework counts. This tells you the language mix and workspace boundaries.
-
-### Step 2: Frameworks (Infrastructure Stack)
-
-```
-search(query="", kind="framework", repo="<path>", limit=30, compact=true)
-```
-
-Each framework node has a language context. Group them: "this is a C#/ASP.NET service with npgsql" vs "this is a TypeScript/React frontend." LLMs know what each framework does — use that knowledge to identify infrastructure dependencies (databases, caches, message brokers, external APIs).
-
-### Step 3: API Surface
-
-```
-search(query="", kind="api_endpoint", repo="<path>", limit=30, compact=true)
-```
-
-API endpoints reveal the contract between services. Group by file path to identify which deployment unit owns which routes.
-
-### Step 4: Entry Points and Hotspots
-
-```
+```text
 repo_map(repo="<path>")
 ```
 
 Entry points reveal deployment units (each entry point = a runnable service/script). Hotspot files reveal where complexity concentrates. Active outcomes reveal what the system is for.
 
-### Step 5: External Service Calls (Optional — for deeper diagrams)
+### Step 2: API Surface
 
+```text
+search(query="", kind="api_endpoint", repo="<path>", limit=30, compact=true)
 ```
+
+API endpoints reveal the contract between services. Group by file path to identify which deployment unit owns which routes.
+
+### Step 3: Frameworks (Infrastructure Stack)
+
+```text
+search(query="", kind="framework", repo="<path>", limit=30, compact=true)
+```
+
+Each framework node has a language context. Group them: "this is a C#/ASP.NET service with npgsql" vs "this is a TypeScript/React frontend." LLMs know what each framework does — use that knowledge to identify infrastructure dependencies (databases, caches, message brokers, external APIs).
+
+### Step 4: Workspace and Languages
+
+```text
+list_roots(repo="<path>")
+```
+
+Extract: root names, languages detected, framework counts. This confirms the language mix and workspace boundaries.
+
+### Step 5: Business Context
+
+```text
+outcome_progress(repo="<path>")
+```
+
+If outcomes are declared, this reveals what the system is trying to achieve — annotate the diagram with business purpose, not just technical structure.
+
+### Step 6: External Service Calls (Optional — for deeper diagrams)
+
+```text
 search(query="https://api.", repo="<path>", limit=20)
 search(query="connection", kind="const", repo="<path>", limit=10)
 ```
@@ -74,7 +82,7 @@ Every component should show:
 ### Edges Between Components
 - **Frontend → API**: inferred from framework combo (React + ASP.NET = SPA calling API)
 - **Service → Database**: inferred from database frameworks (npgsql, mongoose, sqlalchemy)
-- **Service → External API**: inferred from URL constants (Step 5)
+- **Service → External API**: inferred from URL constants (Step 6)
 - **Service → Object Store**: inferred from storage frameworks (minio, boto3, aws-sdk)
 
 ### Infrastructure Nodes
@@ -88,6 +96,6 @@ The diagram should show:
 1. **Deployment units** with language + framework labels
 2. **Infrastructure** (databases, caches, queues, external APIs)
 3. **Edges** with protocol/method annotations (HTTP, SQL, gRPC, etc.)
-4. **Business context** if outcomes are available (what the system does, not just what it's built with)
+4. **Business context** from outcomes (what the system does, not just what it's built with)
 
 Keep it high-level — this is architecture, not a class diagram. Collapse internal details. One box per deployable, not one box per file.
