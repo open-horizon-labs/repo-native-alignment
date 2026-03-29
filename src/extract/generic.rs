@@ -128,12 +128,13 @@ pub struct LangConfig {
     /// When `true`, `collect_doc_comment()` also checks the first string
     /// literal in the node's `body` field child.
     pub docstring_in_body: bool,
-    /// Optional prefix that distinguishes doc comments from regular comments.
-    /// When `Some("///")`, only comment lines starting with `///` are collected
-    /// as documentation. When `None`, all preceding comments are collected.
+    /// Optional prefixes that distinguish doc comments from regular comments.
+    /// When `Some(&["///", "//!", "/**"])`, only comment lines starting with
+    /// one of these prefixes are collected as documentation.
+    /// When `None`, all preceding comments are collected (the default).
     ///
-    /// Examples: `Some("///")` (Rust), `Some("##")` (GDScript), `None` (Go, JS).
-    pub doc_comment_prefix: Option<&'static str>,
+    /// Examples: `Some(&["///", "//!", "/**"])` (Rust), `Some(&["##"])` (GDScript), `None` (Go, JS).
+    pub doc_comment_prefix: Option<&'static [&'static str]>,
     /// Optional tree-sitter query patterns for route decorator detection.
     ///
     /// Each entry is a [`RouteQueryConfig`] describing one query that matches
@@ -1180,8 +1181,8 @@ fn collect_doc_comment(node: tree_sitter::Node, source: &[u8], config: &LangConf
             // If a doc_comment_prefix is configured, only collect comments
             // that start with it (e.g. only `///` in Rust, only `##` in GDScript).
             // This prevents regular `//` or `#` comments from being treated as docs.
-            if let Some(prefix) = config.doc_comment_prefix
-                && !raw.starts_with(prefix)
+            if let Some(prefixes) = config.doc_comment_prefix
+                && !prefixes.iter().any(|p| raw.starts_with(p))
             {
                 break; // Non-doc comment breaks the chain
             }

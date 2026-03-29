@@ -1122,7 +1122,7 @@ pub static GDSCRIPT_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &["annotation"],
     type_param_node_kind: None,
     docstring_in_body: false,
-    doc_comment_prefix: Some("##"),
+    doc_comment_prefix: Some(&["##"]),
     route_queries: &[],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: Some(("call", "function")),

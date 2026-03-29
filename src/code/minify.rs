@@ -364,7 +364,7 @@ fn minify_with_ast(
                 let wrapper = match language {
                     "rust" => format!("fn __wrapper__() {{\n{}\n}}", body),
                     "python" => format!("def __wrapper__():\n{}", indent_body(body, "    ")),
-                    "gdscript" => format!("func __wrapper__():\n{}", indent_body(body, "\t")),
+                    "gdscript" => format!("func __wrapper__():\n{}", indent_body(body, "    ")),
                     "go" => format!("func __wrapper__() {{\n{}\n}}", body),
                     "csharp" => format!("class __W__ {{\n{}\n}}", body),
                     _ => format!("function __wrapper__() {{\n{}\n}}", body),
@@ -1083,7 +1083,6 @@ fn collect_gdscript_locals(
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Text-based fallback (phase 1 logic, retained)
 // ---------------------------------------------------------------------------
@@ -1095,7 +1094,7 @@ fn minify_text(body: &str, language: &str) -> String {
     let mut prev_blank = false;
 
     let line_comment_prefix = match language {
-        "python" => "#",
+        "python" | "gdscript" => "#",
         _ => "//",
     };
 

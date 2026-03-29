@@ -141,6 +141,7 @@ fn collect_gdscript_nodes(
                         metadata,
                         source: ExtractionSource::TreeSitter,
                     });
+                    collect_resource_refs(&child, path, source, edges);
                 }
             }
             "onready_variable_statement" => {
@@ -164,6 +165,7 @@ fn collect_gdscript_nodes(
                         metadata,
                         source: ExtractionSource::TreeSitter,
                     });
+                    collect_resource_refs(&child, path, source, edges);
                 }
             }
             "class_name_statement" => {
@@ -261,7 +263,7 @@ fn collect_resource_refs(
                                 root: String::new(),
                                 file: path.to_path_buf(),
                                 name: path
-                                    .file_name()
+                                    .file_stem()
                                     .unwrap_or_default()
                                     .to_string_lossy()
                                     .to_string(),
