@@ -356,7 +356,10 @@ pub static GO_CONFIG: LangConfig = LangConfig {
     scope_parent_kinds: &[],
     const_value_field: None,
     full_text_name_kinds: &[],
-    string_literal_kinds: &[],
+    string_literal_kinds: &[
+        ("interpreted_string_literal", None),
+        ("raw_string_literal", None),
+    ],
     param_container_field: Some("parameters"),
     param_type_field: Some("type"),
     return_type_field: Some("result"),

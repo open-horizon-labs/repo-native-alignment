@@ -206,7 +206,13 @@ fn collect_gdscript_nodes(
             "class_definition" => {
                 if let Some(body) = child.child_by_field_name("body") {
                     collect_gdscript_nodes(
-                        body, path, source, nodes, edges, extends_type, class_name_idx,
+                        body,
+                        path,
+                        source,
+                        nodes,
+                        edges,
+                        extends_type,
+                        class_name_idx,
                     );
                 }
             }
@@ -226,58 +232,55 @@ fn collect_resource_refs(
     source: &[u8],
     edges: &mut Vec<Edge>,
 ) {
-    if node.kind() == "call" {
-        if let Some(func_node) = node.child_by_field_name("function") {
-            let func_name = func_node.utf8_text(source).unwrap_or("");
-            if func_name == "preload" || func_name == "load" {
-                // Extract the string argument
-                if let Some(args) = node.child_by_field_name("arguments") {
-                    for j in 0..args.child_count() {
-                        if let Some(arg) = args.child(j as u32) {
-                            if arg.kind() == "string" {
-                                let raw =
-                                    arg.utf8_text(source).unwrap_or("").trim().to_string();
-                                let value = raw
-                                    .trim_start_matches('"')
-                                    .trim_end_matches('"')
-                                    .trim_start_matches('\'')
-                                    .trim_end_matches('\'')
-                                    .to_string();
-                                if value.starts_with("res://") || value.starts_with("user://")
-                                {
-                                    // Strip res:// prefix, normalize to relative path
-                                    let rel_path = value
-                                        .strip_prefix("res://")
-                                        .or_else(|| value.strip_prefix("user://"))
-                                        .unwrap_or(&value);
-                                    edges.push(Edge {
-                                        from: NodeId {
-                                            root: String::new(),
-                                            file: path.to_path_buf(),
-                                            name: path
-                                                .file_name()
-                                                .unwrap_or_default()
-                                                .to_string_lossy()
-                                                .to_string(),
-                                            kind: NodeKind::Module,
-                                        },
-                                        to: NodeId {
-                                            root: String::new(),
-                                            file: std::path::PathBuf::from(rel_path),
-                                            name: rel_path
-                                                .split('/')
-                                                .last()
-                                                .unwrap_or(rel_path)
-                                                .to_string(),
-                                            kind: NodeKind::Module,
-                                        },
-                                        kind: EdgeKind::DependsOn,
-                                        source: ExtractionSource::TreeSitter,
-                                        confidence: Confidence::Detected,
-                                    });
-                                }
-                            }
-                        }
+    if node.kind() == "call"
+        && let Some(func_node) = node.child_by_field_name("function")
+    {
+        let func_name = func_node.utf8_text(source).unwrap_or("");
+        if (func_name == "preload" || func_name == "load")
+            && let Some(args) = node.child_by_field_name("arguments")
+        {
+            for j in 0..args.child_count() {
+                if let Some(arg) = args.child(j as u32)
+                    && arg.kind() == "string"
+                {
+                    let raw = arg.utf8_text(source).unwrap_or("").trim().to_string();
+                    let value = raw
+                        .trim_start_matches('"')
+                        .trim_end_matches('"')
+                        .trim_start_matches('\'')
+                        .trim_end_matches('\'')
+                        .to_string();
+                    if value.starts_with("res://") || value.starts_with("user://") {
+                        // Strip res:// prefix, normalize to relative path
+                        let rel_path = value
+                            .strip_prefix("res://")
+                            .or_else(|| value.strip_prefix("user://"))
+                            .unwrap_or(&value);
+                        edges.push(Edge {
+                            from: NodeId {
+                                root: String::new(),
+                                file: path.to_path_buf(),
+                                name: path
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string(),
+                                kind: NodeKind::Module,
+                            },
+                            to: NodeId {
+                                root: String::new(),
+                                file: std::path::PathBuf::from(rel_path),
+                                name: rel_path
+                                    .split('/')
+                                    .next_back()
+                                    .unwrap_or(rel_path)
+                                    .to_string(),
+                                kind: NodeKind::Module,
+                            },
+                            kind: EdgeKind::DependsOn,
+                            source: ExtractionSource::TreeSitter,
+                            confidence: Confidence::Detected,
+                        });
                     }
                 }
             }

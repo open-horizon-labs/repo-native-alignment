@@ -1074,7 +1074,7 @@ mod tests {
     #[test]
     fn test_registry_with_builtins_has_extractors() {
         let registry = ExtractorRegistry::with_builtins();
-        assert_eq!(registry.len(), 30); // rust, python, typescript, javascript, go, java, bash, ruby, cpp, c, csharp, kotlin, zig, lua, swift, php, html, scala, dart, elixir, dockerfile, hcl, json, toml, yaml, markdown, proto, sql, openapi, graphql
+        assert_eq!(registry.len(), 31); // + gdscript
     }
 
     #[test]

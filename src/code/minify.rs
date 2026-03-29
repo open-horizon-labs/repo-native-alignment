@@ -1064,11 +1064,11 @@ fn collect_gdscript_locals(
         }
         "for_statement" => {
             // for x in expr:
-            if let Some(left) = node.child_by_field_name("left") {
-                if left.kind() == "identifier" {
-                    let name = left.utf8_text(source).unwrap_or("");
-                    register_local(name, left, locals, ranges, used);
-                }
+            if let Some(left) = node.child_by_field_name("left")
+                && left.kind() == "identifier"
+            {
+                let name = left.utf8_text(source).unwrap_or("");
+                register_local(name, left, locals, ranges, used);
             }
         }
         _ => {}

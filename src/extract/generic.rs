@@ -1180,10 +1180,10 @@ fn collect_doc_comment(node: tree_sitter::Node, source: &[u8], config: &LangConf
             // If a doc_comment_prefix is configured, only collect comments
             // that start with it (e.g. only `///` in Rust, only `##` in GDScript).
             // This prevents regular `//` or `#` comments from being treated as docs.
-            if let Some(prefix) = config.doc_comment_prefix {
-                if !raw.starts_with(prefix) {
-                    break; // Non-doc comment breaks the chain
-                }
+            if let Some(prefix) = config.doc_comment_prefix
+                && !raw.starts_with(prefix)
+            {
+                break; // Non-doc comment breaks the chain
             }
             let cleaned = strip_comment_markers(raw, language_name);
             if !cleaned.is_empty() {
