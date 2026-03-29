@@ -237,7 +237,7 @@ fn collect_gdscript_nodes(
 fn enrich_annotations(
     root: tree_sitter::Node,
     source: &[u8],
-    nodes: &mut Vec<Node>,
+    nodes: &mut [Node],
     path: &Path,
 ) {
     fn walk(n: tree_sitter::Node, source: &[u8], nodes: &mut [Node], path: &Path) {
