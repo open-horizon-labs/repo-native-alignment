@@ -25,6 +25,7 @@ pub mod extractor_config;
 pub mod fastapi_router_prefix;
 pub mod framework_detection;
 pub mod generic;
+pub mod gdscript;
 pub mod go;
 pub mod graphql;
 pub mod grpc;
@@ -291,6 +292,7 @@ impl ExtractorRegistry {
         // Code
         registry.register(Box::new(rust::RustExtractor::new()));
         registry.register(Box::new(python::PythonExtractor::new()));
+        registry.register(Box::new(gdscript::GDScriptExtractor::new()));
         registry.register(Box::new(typescript::TypeScriptExtractor::new()));
         registry.register(Box::new(javascript::JavaScriptExtractor::new()));
         registry.register(Box::new(go::GoExtractor::new()));

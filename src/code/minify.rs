@@ -26,6 +26,7 @@ pub fn minify_body(body: &str, language: &str) -> String {
         "python" | "py" => "python",
         "go" | "golang" => "go",
         "csharp" | "c#" | "cs" => "csharp",
+        "gdscript" | "gd" => "gdscript",
         _ => language,
     };
 
@@ -36,6 +37,7 @@ pub fn minify_body(body: &str, language: &str) -> String {
         "python" => minify_python(body),
         "go" => minify_go(body),
         "csharp" => minify_csharp(body),
+        "gdscript" => minify_gdscript(body),
         _ => minify_text(body, lang),
     }
 }
@@ -324,6 +326,14 @@ const CSHARP_CONFIG: LangConfig = LangConfig {
     comment_prefix: "//",
 };
 
+const GDSCRIPT_CONFIG: LangConfig = LangConfig {
+    scope_boundaries: &["function_definition", "class_definition", "lambda"],
+    closures: &[],
+    member_expr: "attribute",
+    shorthand_prop: "",
+    comment_prefix: "#",
+};
+
 fn lang_config(language: &str) -> &'static LangConfig {
     match language {
         "typescript" | "tsx" | "javascript" | "jsx" => &TS_CONFIG,
@@ -331,6 +341,7 @@ fn lang_config(language: &str) -> &'static LangConfig {
         "python" => &PYTHON_CONFIG,
         "go" => &GO_CONFIG,
         "csharp" => &CSHARP_CONFIG,
+        "gdscript" => &GDSCRIPT_CONFIG,
         _ => &TS_CONFIG,
     }
 }
@@ -353,6 +364,7 @@ fn minify_with_ast(
                 let wrapper = match language {
                     "rust" => format!("fn __wrapper__() {{\n{}\n}}", body),
                     "python" => format!("def __wrapper__():\n{}", indent_body(body, "    ")),
+                    "gdscript" => format!("func __wrapper__():\n{}", indent_body(body, "\t")),
                     "go" => format!("func __wrapper__() {{\n{}\n}}", body),
                     "csharp" => format!("class __W__ {{\n{}\n}}", body),
                     _ => format!("function __wrapper__() {{\n{}\n}}", body),
@@ -397,7 +409,7 @@ fn minify_with_ast(
 
     let inner: String = if is_wrapped {
         match language {
-            "python" => extract_python_wrapper_body(&result),
+            "python" | "gdscript" => extract_python_wrapper_body(&result),
             _ => extract_wrapper_body(&result).to_string(),
         }
     } else {
@@ -443,6 +455,7 @@ fn find_function_body_generic<'a>(
     let fn_kinds: &[&str] = match language {
         "rust" => &["function_item"],
         "python" => &["function_definition"],
+        "gdscript" => &["function_definition"],
         "go" => &["function_declaration", "method_declaration"],
         "csharp" => &[
             "method_declaration",
@@ -1018,6 +1031,58 @@ fn collect_csharp_locals(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// GDScript minification
+// ---------------------------------------------------------------------------
+
+fn minify_gdscript(body: &str) -> String {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_gdscript::LANGUAGE.into())
+        .is_err()
+    {
+        return minify_text(body, "gdscript");
+    }
+    minify_with_ast(&mut parser, body, "gdscript", collect_gdscript_locals)
+}
+
+/// GDScript: var statements, for loops (Python-like but with explicit `var` keyword).
+fn collect_gdscript_locals(
+    node: tree_sitter::Node,
+    source: &[u8],
+    locals: &mut HashMap<String, String>,
+    ranges: &mut Vec<(usize, usize, String)>,
+    used: &mut std::collections::HashSet<String>,
+) {
+    match node.kind() {
+        "variable_statement" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = name_node.utf8_text(source).unwrap_or("");
+                register_local(name, name_node, locals, ranges, used);
+            }
+        }
+        "for_statement" => {
+            // for x in expr:
+            if let Some(left) = node.child_by_field_name("left") {
+                if left.kind() == "identifier" {
+                    let name = left.utf8_text(source).unwrap_or("");
+                    register_local(name, left, locals, ranges, used);
+                }
+            }
+        }
+        _ => {}
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            if child.kind() == "function_definition" || child.kind() == "class_definition" || child.kind() == "lambda" {
+                continue;
+            }
+            collect_gdscript_locals(child, source, locals, ranges, used);
+        }
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Text-based fallback (phase 1 logic, retained)

@@ -114,6 +114,7 @@ gray_matter = "0.3.2"
 
 # Multi-pattern substring search (tested_by_pass naming-convention pass)
 aho-corasick = "1"
+tree-sitter-gdscript = "6.1"
 
 [features]
 default = ["metal"]

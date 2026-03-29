@@ -1072,3 +1072,47 @@ pub static DART_CONFIG: LangConfig = LangConfig {
     has_all_export: false,
     test_name_prefix: false,
 };
+
+// ── GDScript ─────────────────────────────────────────────────────────────────
+
+pub static GDSCRIPT_CONFIG: LangConfig = LangConfig {
+    language_fn: || tree_sitter_gdscript::LANGUAGE.into(),
+    language_name: "gdscript",
+    extensions: &["gd"],
+    node_kinds: &[
+        ("function_definition", NodeKind::Function),
+        ("class_definition", NodeKind::Struct),
+        ("variable_statement", NodeKind::Field),
+        ("const_statement", NodeKind::Const),
+        ("enum_definition", NodeKind::Enum),
+    ],
+    scope_parent_kinds: &["class_definition"],
+    const_value_field: Some("value"),
+    full_text_name_kinds: &[],
+    string_literal_kinds: &[("string", None)],
+    param_container_field: Some("parameters"),
+    param_type_field: Some("type"),
+    return_type_field: Some("return_type"),
+    type_requires_uppercase: false,
+    branch_node_types: &[
+        "if_statement",
+        "elif_clause",
+        "else_clause",
+        "for_statement",
+        "while_statement",
+        "match_statement",
+        "match_branch",
+        "conditional_expression",
+        "boolean_operator",
+    ],
+    decorator_node_kinds: &["annotation"],
+    type_param_node_kind: None,
+    docstring_in_body: false,
+    route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
+    call_expr_kinds: Some(("call", "function")),
+    pub_visibility_modifier: None,
+    has_all_export: false,
+    test_name_prefix: false,
+};
+
