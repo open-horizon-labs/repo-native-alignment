@@ -1089,7 +1089,7 @@ pub static GDSCRIPT_CONFIG: LangConfig = LangConfig {
     scope_parent_kinds: &["class_definition"],
     const_value_field: Some("value"),
     full_text_name_kinds: &[],
-    string_literal_kinds: &[("string", None)],
+    string_literal_kinds: &[],
     param_container_field: Some("parameters"),
     param_type_field: Some("type"),
     return_type_field: Some("return_type"),
