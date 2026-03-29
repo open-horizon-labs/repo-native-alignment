@@ -54,84 +54,93 @@ Before starting:
      repo-native-alignment scan --repo . --full 2>&1 | tail -2
    fi
    ```
-   You CANNOT do code review, dissent analysis, or adversarial testing without an indexed worktree. Any Grep/Read for code navigation after this point is a friction event and must be logged to `.oh/friction-logs/<pr-number>-ship.md`.
+   You CANNOT do code review or regression testing without an indexed worktree. Any Grep/Read for code navigation after this point is a friction event and must be logged to `.oh/friction-logs/<pr-number>-ship.md`.
 
 ## The 12 Steps
 
-### 1. /review
+### 1. RNA-Grounded Code Review
 
-Check implementation against acceptance criteria, AGENTS.md patterns, and guardrails.
+Check the diff against externally-encoded knowledge: metis, guardrails, graph impact, and acceptance criteria.
 
-**How:** Invoke the `/review` skill (or apply its process directly):
-- **List every acceptance criterion** from the linked issue. Check each one against the implementation. If any are unmet, they become fix items for step 3.
-- Restate the original aim
-- Check: still necessary? still aligned? still sufficient? mechanism clear? changes complete?
-- Detect drift (scope, solution, goal)
-- Verdict: Continue / Adjust / Pause / Salvage
+**How:**
 
-**Use RNA tools:** `search(query, artifact_types=["guardrail"])` to check against relevant guardrails.
+1. **Read the diff:**
+   ```bash
+   gh pr diff <PR>
+   ```
+2. **Query RNA for relevant metis** on changed files:
+   ```
+   search(query="<changed-file-paths>", artifact_types=["metis"])
+   ```
+3. **Query RNA for relevant guardrails** on changed areas:
+   ```
+   search(query="<changed-areas>", artifact_types=["guardrail"])
+   ```
+4. **Graph impact analysis** — for each changed symbol, find callers:
+   ```
+   search(node="<changed-symbol-id>", mode="neighbors", direction="incoming", compact=true)
+   ```
+5. **Metis check:** For each relevant metis entry, state the metis and whether the diff honors or violates the hard-won wisdom.
+6. **Guardrail check:** For each relevant guardrail, state whether the diff violates it. Binary — violated or not.
+7. **Caller check:** For each changed function with incoming callers, verify callers aren't broken by the change.
+8. **Acceptance criteria:** List every acceptance criterion from the linked issue. Check each one against the implementation. Unmet criteria become fix items for step 3.
+9. **Forcing function: MUST identify at least 3 concrete concerns** (any severity — nits count). Zero-finding reviews are failed reviews, not perfect code. If you genuinely cannot find 3 after thorough analysis, you must explicitly state what you checked and why it's clean.
+10. **Verdict:** CONTINUE / ADJUST / PAUSE / SALVAGE
 
 **Post findings as PR comment:**
 ```bash
 gh pr comment <PR> --body "$(cat <<'EOF'
-## Ship Step 1: Review
+## Ship Step 1: RNA-Grounded Code Review
 **Verdict:** [CONTINUE/ADJUST/PAUSE/SALVAGE]
+
+### Metis Checked
+| Metis | Honored/Violated | Notes |
+|-------|-----------------|-------|
+| ... | ... | ... |
+
+### Guardrails Checked
+| Guardrail | Pass/Violated |
+|-----------|--------------|
+| ... | ... |
+
+### Graph Impact
+[callers/dependents of changed symbols and whether they're affected]
 
 ### Acceptance Criteria
 - [x/blank] criterion 1
 - [x/blank] criterion 2
 
-### Alignment Check
-[findings]
+### Findings (minimum 3 required)
+1. [severity] finding
+2. [severity] finding
+3. [severity] finding
 EOF
 )"
 ```
 
-### 2. /dissent
+### 2. Independent Code Review
 
-Seek contrary evidence. Devil's advocate pass.
+Spawn an independent `code-reviewer` agent that sees ONLY the diff and RNA artifacts — NOT the session file or implementation reasoning. The reviewer forms its own assessment with genuine adversarial pressure.
 
-**How:** Invoke the `/dissent` skill (or apply its process directly):
-- Steel-man the current approach
-- Seek contrary evidence (3+ points)
-- Pre-mortem (3 failure scenarios)
-- Surface hidden assumptions
-- Verdict: PROCEED / ADJUST / RECONSIDER
-
-**Use RNA tools:** `search("risks constraints", artifact_types=["guardrail", "metis"])` to ground the dissent.
-
-**Post findings as PR comment:**
-```bash
-gh pr comment <PR> --body "$(cat <<'EOF'
-## Ship Step 2: Dissent
-**Verdict:** [PROCEED/ADJUST/RECONSIDER]
-
-### Contrary Evidence
-1. ...
-
-### Pre-Mortem
-1. ...
-
-### Hidden Assumptions
-| Assumption | Risk if Wrong |
-|------------|---------------|
-| ... | ... |
-EOF
-)"
+**How:** Spawn the code-reviewer agent with the diff and RNA context gathered in step 1:
 ```
+Agent(subagent_type="code-reviewer", prompt="Review PR #<number>\n\nDIFF:\n<gh pr diff output or reference>\n\nACCEPTANCE CRITERIA:\n<from issue>\n\nGUARDRAILS:\n<relevant guardrails from step 1>\n\nMETIS:\n<relevant metis from step 1>\n\nGRAPH IMPACT:\n<callers/dependents of changed symbols>\n\nPost your findings as a PR comment.")
+```
+
+**Critical:** The reviewer gets the diff + RNA artifacts but NOT the session file or implementation reasoning. It must form its own independent assessment.
+
+The reviewer posts its own PR comment titled `## Ship Step 2: Independent Code Review`.
+
+Reviewer verdict: APPROVE / REQUEST CHANGES / COMMENT
 
 ### 3. Fix
 
-Address and plausibly fix ALL findings from review, dissent, AND CodeRabbit. No deferred items.
+Address and plausibly fix ALL findings from RNA-grounded review, independent code review, AND CodeRabbit. No deferred items.
 
 **Sources to check:**
-- Step 1 review findings
-- Step 2 dissent findings — **every Hidden Assumption must be explicitly resolved:**
-  - If the assumption is valid and acceptable: document WHY it's acceptable (scope decision, not an oversight)
-  - If the assumption is wrong or risky: FIX IT before proceeding
-  - "No risk" or "acceptable" verdicts from dissent are NOT automatic passes — they require explicit reasoning in the fix step
-  - **Scope limitations are NOT acceptable when the issue promises broader coverage.** If the feature is supposed to work for all languages, "we only implemented 2 languages" is a blocker, not an assumption.
-- **CodeRabbit PR review** — read all CodeRabbit comments with `gh pr view <PR> --comments` or `gh api repos/{owner}/{repo}/pulls/<PR>/comments`. CodeRabbit posts automated code review comments on every push. Treat these the same as review/dissent findings: fix, or explicitly mark N/A with reasoning.
+- Step 1 RNA-grounded review findings — every metis violation, guardrail violation, and concern
+- Step 2 independent code reviewer findings — every REQUEST CHANGES item must be addressed
+- **CodeRabbit PR review** — read all CodeRabbit comments with `gh pr view <PR> --comments` or `gh api repos/{owner}/{repo}/pulls/<PR>/comments`. CodeRabbit posts automated code review comments on every push. Treat these the same as review findings: fix, or explicitly mark N/A with reasoning.
 
 If nothing to fix across all three sources, skip. Otherwise commit with descriptive messages.
 
@@ -145,17 +154,29 @@ gh pr ready <PR>
 
 Wait briefly for CodeRabbit to start its review, then continue with the remaining steps. CodeRabbit findings will be addressed in step 6 (Resolve TODOs) if any arrive during the pipeline run.
 
-### 4. Adversarial test
+### 4. Regression Oracle
 
-Dissent-seeded tests that try to break the implementation.
+Write tests seeded from acceptance criteria and concrete review findings — NOT from dismissed abstract concerns.
 
-**Seed from dissent findings** — the dissent tells you where the implementation was already challenged. Write tests that attack those specific weaknesses. Prioritize: functional > integration > unit.
+**How:**
+
+1. **Seed from acceptance criteria:** For each acceptance criterion, write at least one test that verifies it holds.
+2. **Seed from review findings:** For each concrete finding from steps 1 and 2, write a test that:
+   - Exercises the boundary condition identified in the review, OR
+   - Verifies the finding was addressed (or that the concern doesn't manifest)
+3. **Changed function coverage:** For each changed function, write at least one test that exercises boundary conditions identified in the reviews.
+4. **Tests must be runnable and pass.** If a test fails, that's a real bug — go back to step 3.
+
+Prioritize: functional > integration > unit.
 
 **Post test results as PR comment:**
 ```bash
 gh pr comment <PR> --body "$(cat <<'EOF'
-## Ship Step 4: Adversarial Test
-[test results, seeded from dissent finding X]
+## Ship Step 4: Regression Oracle
+**Tests written:** N
+**Seeded from:** acceptance criteria (N), step 1 findings (N), step 2 findings (N)
+
+[test descriptions and results]
 EOF
 )"
 ```
@@ -327,9 +348,10 @@ git worktree prune
 
 | Step | Question |
 |------|----------|
-| Review + Dissent | Is the code correct? |
+| RNA-grounded review | Does the code respect metis, guardrails, and callers? |
+| Independent code review | What does a fresh pair of eyes find? |
 | Mark ready | Trigger smoke tests + CodeRabbit review |
-| Adversarial test | What breaks under pressure? |
+| Regression oracle | Do tests from acceptance criteria + findings pass? |
 | Merit assessment | Does this deliver outcome value? |
 | Resolve TODOs | Is everything accounted for? |
 | Manual verification | Does the computation work with real data? |
@@ -341,8 +363,8 @@ git worktree prune
 ## Automation Rules
 
 - **Do not wait** for user prompts between steps. The whole point of having a pipeline is that it runs autonomously.
-- **Post to PR** after each substantive step (review, dissent, adversarial, merit, manual verify, delivery verify).
-- **Stop and ask** only if: a step produces ABANDON/RECONSIDER/SALVAGE verdict, or CI fails after 2 fix attempts.
+- **Post to PR** after each substantive step (RNA-grounded review, independent review, regression oracle, merit, manual verify, delivery verify).
+- **Stop and ask** only if: a step produces ABANDON/RECONSIDER/SALVAGE verdict, or the independent reviewer returns REQUEST CHANGES with critical findings, or CI fails after 2 fix attempts.
 - **Record metis** if the pipeline surfaces a new learning: write to `.oh/metis/<slug>.md`.
 
 ## Session Persistence
@@ -353,13 +375,15 @@ Write pipeline progress to `.oh/sessions/<pr-number>-ship.md`:
 ## Ship Pipeline — PR #<number>
 **Started:** <timestamp>
 
-### Step 1: Review
+### Step 1: RNA-Grounded Review
 **Verdict:** [CONTINUE/ADJUST/PAUSE/SALVAGE]
-[findings]
+**Metis checked:** N entries
+**Guardrails checked:** N entries
+**Findings:** N (minimum 3 required)
 
-### Step 2: Dissent
-**Verdict:** [PROCEED/ADJUST/RECONSIDER]
-[findings]
+### Step 2: Independent Code Review
+**Verdict:** [APPROVE/REQUEST CHANGES/COMMENT]
+[findings from code-reviewer agent]
 
 ...
 ```
