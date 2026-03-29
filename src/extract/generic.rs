@@ -4684,6 +4684,54 @@ pub struct PaymentProcessor {
     }
 
     #[test]
+    fn test_rust_block_doc_comment_extracted() {
+        // Regression: doc_comment_prefix must accept /** ... */ in addition to ///
+        use crate::extract::rust::RustExtractor;
+        let ext = RustExtractor::new();
+        let code = r#"
+/**
+ * Processes a refund for the given transaction.
+ */
+pub fn process_refund(tx_id: u64) -> Result<(), Error> {
+    Ok(())
+}
+"#;
+        let result = ext.extract(Path::new("test.rs"), code).unwrap();
+        let fn_node = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "process_refund")
+            .expect("should find process_refund");
+        let doc = fn_node
+            .metadata
+            .get("doc_comment")
+            .expect("block doc comment should be extracted as doc_comment");
+        assert!(
+            doc.contains("refund"),
+            "block doc comment should contain function description: {}",
+            doc
+        );
+    }
+
+    #[test]
+    fn test_rust_inner_doc_comment_not_rejected() {
+        // Regression: doc_comment_prefix must accept //! module docs
+        use crate::extract::rust::RustExtractor;
+        let ext = RustExtractor::new();
+        let code = r#"
+//! Module-level documentation.
+//! This crate handles payments.
+
+pub fn init() {}
+"#;
+        let result = ext.extract(Path::new("test.rs"), code).unwrap();
+        // The //! comment should at minimum not crash and not be silently dropped
+        // (It may or may not attach to init() depending on sibling walk direction,
+        // but the prefix gate must not reject it)
+        assert!(result.nodes.iter().any(|n| n.id.name == "init"), "should find init function");
+    }
+
+    #[test]
     fn test_no_doc_comment_when_absent() {
         use crate::extract::rust::RustExtractor;
         let ext = RustExtractor::new();

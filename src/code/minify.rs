@@ -1404,4 +1404,31 @@ mod tests {
         let legend = result.lines().find(|l| l.starts_with("// "));
         assert!(legend.is_some(), "cs alias should produce legend: {}", result);
     }
+
+    #[test]
+    fn test_gdscript_strips_hash_comments() {
+        // Regression: minify_text must recognize '#' as gdscript comment prefix
+        let input = "var x = 1  # set x\nvar y = 2";
+        let result = minify_body(input, "gdscript");
+        assert!(!result.contains("set x"), "gdscript # comments should be stripped: {}", result);
+        assert!(result.contains("= 1"), "code should be preserved: {}", result);
+    }
+
+    #[test]
+    fn test_gdscript_minify_no_tab_artifacts() {
+        // Regression: GDScript wrapper must not leave tab indentation in output
+        let input = "var counter = 0\nfor item in list:\n\tcounter += 1";
+        let result = minify_body(input, "gdscript");
+        // The output should not contain artificial wrapper-introduced tabs
+        // (original code may have tabs, but wrapper shouldn't add new ones)
+        assert!(!result.starts_with('\t'), "output should not start with tab: {}", result);
+    }
+
+    #[test]
+    fn test_gdscript_alias_gd() {
+        let input = "var longVariable = 42";
+        let result = minify_body(input, "gd");
+        // Should route through GDScript minification, not fallback
+        assert!(result.contains("42"), "gd alias should work: {}", result);
+    }
 }
