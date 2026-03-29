@@ -219,7 +219,8 @@ pub static PYTHON_CONFIG: LangConfig = LangConfig {
     ],
     decorator_node_kinds: &["decorator"],
     type_param_node_kind: None, // Python uses runtime generics (typing.Generic), not tree-sitter type_parameters
-    docstring_in_body: true, // Python uses triple-quoted strings as docstrings inside the function body
+    docstring_in_body: true,
+    doc_comment_prefix: None, // Python uses triple-quoted strings as docstrings inside the function body
     route_queries: &[PYTHON_ROUTE_QUERY],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: Some(("call", "function")),
@@ -280,6 +281,7 @@ pub static TYPESCRIPT_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &["decorator"],
     type_param_node_kind: Some("type_parameters"),
     docstring_in_body: false,
+    doc_comment_prefix: None,
     route_queries: &[TYPESCRIPT_ROUTE_QUERY],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: Some(("call_expression", "function")),
@@ -329,6 +331,7 @@ pub static JAVASCRIPT_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &["decorator"],
     type_param_node_kind: None, // JavaScript has no generics
     docstring_in_body: false,
+    doc_comment_prefix: None,
     route_queries: &[JAVASCRIPT_ROUTE_QUERY],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: Some(("call_expression", "function")),
@@ -376,6 +379,7 @@ pub static GO_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &[], // Go has no decorators/attributes
     type_param_node_kind: Some("type_parameter_list"),
     docstring_in_body: false,
+    doc_comment_prefix: None,
     route_queries: &[GO_ROUTE_QUERY],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: Some(("call_expression", "function")),
@@ -437,6 +441,7 @@ pub static JAVA_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &["annotation", "marker_annotation"],
     type_param_node_kind: Some("type_parameters"),
     docstring_in_body: false,
+    doc_comment_prefix: None,
     route_queries: &[JAVA_ROUTE_QUERY],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: Some(("method_invocation", "name")),
@@ -489,6 +494,7 @@ pub static KOTLIN_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &["annotation"],
     type_param_node_kind: Some("type_parameters"),
     docstring_in_body: false,
+    doc_comment_prefix: None,
     route_queries: &[],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: Some(("call_expression", "calleeExpression")),
@@ -550,6 +556,7 @@ pub static CSHARP_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &["attribute_list"],
     type_param_node_kind: Some("type_parameter_list"),
     docstring_in_body: false,
+    doc_comment_prefix: None,
     route_queries: &[],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: Some(("invocation_expression", "function")),
@@ -584,7 +591,7 @@ pub static SWIFT_CONFIG: LangConfig = LangConfig {
     ],
     const_value_field: None,
     full_text_name_kinds: &["import_declaration"],
-    string_literal_kinds: &[("string_literal", Some("string_literal_segment"))],
+    string_literal_kinds: &[],
     // Swift tree-sitter: parameters are direct children (no container field),
     // and type/return_type use the overloaded "name" field.
     // DependsOn skipped for now -- needs per-language extractor logic.
@@ -606,6 +613,7 @@ pub static SWIFT_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &[], // Swift attributes handled via @attribute syntax but tree-sitter-swift uses attribute nodes as children, not siblings
     type_param_node_kind: Some("type_parameters"),
     docstring_in_body: false,
+    doc_comment_prefix: None,
     route_queries: &[],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: Some(("call_expression", "function")),
@@ -631,7 +639,7 @@ pub static ZIG_CONFIG: LangConfig = LangConfig {
     scope_parent_kinds: &["struct_declaration", "enum_declaration"],
     const_value_field: None,
     full_text_name_kinds: &[],
-    string_literal_kinds: &[("string_literal", None)],
+    string_literal_kinds: &[],
     // Zig: "parameters" is NOT a field name on function_declaration (it's a
     // child node kind). But param type is field "type" and return type is
     // field "type" on the function_declaration node.
@@ -652,6 +660,7 @@ pub static ZIG_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &[],  // Zig has no decorators/attributes
     type_param_node_kind: None, // Zig uses comptime generics, not tree-sitter type_parameters
     docstring_in_body: false,
+    doc_comment_prefix: None,
     route_queries: &[],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: None,
@@ -685,7 +694,7 @@ pub static CPP_CONFIG: LangConfig = LangConfig {
     scope_parent_kinds: &["class_specifier", "struct_specifier", "enum_specifier"],
     const_value_field: None,
     full_text_name_kinds: &[],
-    string_literal_kinds: &[("string_literal", Some("string_content"))],
+    string_literal_kinds: &[],
     // C++: parameters are on function_declarator (child of function_definition),
     // not directly on function_definition. Return type IS field "type" on
     // function_definition. DependsOn for params needs per-language logic.
@@ -710,6 +719,7 @@ pub static CPP_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &[], // C/C++ has no decorators (attributes like [[nodiscard]] are different)
     type_param_node_kind: Some("template_parameter_list"),
     docstring_in_body: false,
+    doc_comment_prefix: None,
     route_queries: &[],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: Some(("call_expression", "function")),
@@ -733,7 +743,7 @@ pub static LUA_CONFIG: LangConfig = LangConfig {
     scope_parent_kinds: &[],
     const_value_field: None,
     full_text_name_kinds: &[],
-    string_literal_kinds: &[("string", None)],
+    string_literal_kinds: &[],
     param_container_field: None,
     param_type_field: None,
     return_type_field: None,
@@ -750,6 +760,7 @@ pub static LUA_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &[],  // Lua has no decorators
     type_param_node_kind: None, // Lua has no generics
     docstring_in_body: false,
+    doc_comment_prefix: None,
     route_queries: &[],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: None,
@@ -800,6 +811,7 @@ pub static RUBY_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &[], // Ruby has no decorators (uses method calls instead)
     type_param_node_kind: None, // Ruby has no generics
     docstring_in_body: false,
+    doc_comment_prefix: None,
     route_queries: &[RUBY_ROUTE_QUERY],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: Some(("call", "method")),
@@ -823,7 +835,7 @@ pub static BASH_CONFIG: LangConfig = LangConfig {
     scope_parent_kinds: &[],
     const_value_field: None,
     full_text_name_kinds: &[],
-    string_literal_kinds: &[("string", None)],
+    string_literal_kinds: &[],
     param_container_field: None,
     param_type_field: None,
     return_type_field: None,
@@ -842,6 +854,7 @@ pub static BASH_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &[],  // Bash has no decorators
     type_param_node_kind: None, // Bash has no generics
     docstring_in_body: false,
+    doc_comment_prefix: None,
     route_queries: &[],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: None,
@@ -872,7 +885,7 @@ pub static C_CONFIG: LangConfig = LangConfig {
     scope_parent_kinds: &["struct_specifier", "union_specifier", "enum_specifier"],
     const_value_field: None,
     full_text_name_kinds: &[],
-    string_literal_kinds: &[("string_literal", Some("string_content"))],
+    string_literal_kinds: &[],
     param_container_field: None,
     param_type_field: None,
     return_type_field: Some("type"),
@@ -891,6 +904,7 @@ pub static C_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &[],
     type_param_node_kind: None,
     docstring_in_body: false,
+    doc_comment_prefix: None,
     route_queries: &[],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: Some(("call_expression", "function")),
@@ -952,6 +966,7 @@ pub static PHP_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &["attribute_list"],
     type_param_node_kind: None,
     docstring_in_body: false,
+    doc_comment_prefix: None,
     route_queries: &[],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: Some(("function_call_expression", "function")),
@@ -988,7 +1003,7 @@ pub static SCALA_CONFIG: LangConfig = LangConfig {
     ],
     const_value_field: None,
     full_text_name_kinds: &[],
-    string_literal_kinds: &[("string", None), ("interpolated_string", None)],
+    string_literal_kinds: &[],
     param_container_field: None,
     param_type_field: None,
     return_type_field: None,
@@ -1008,6 +1023,7 @@ pub static SCALA_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &["annotation"],
     type_param_node_kind: Some("type_parameters"),
     docstring_in_body: false,
+    doc_comment_prefix: None,
     route_queries: &[],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: Some(("call_expression", "function")),
@@ -1042,10 +1058,7 @@ pub static DART_CONFIG: LangConfig = LangConfig {
     ],
     const_value_field: None,
     full_text_name_kinds: &[],
-    string_literal_kinds: &[
-        ("string_literal_double_quotes", None),
-        ("string_literal_single_quotes", None),
-    ],
+    string_literal_kinds: &[],
     param_container_field: None,
     param_type_field: None,
     return_type_field: None,
@@ -1065,6 +1078,7 @@ pub static DART_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &["annotation"],
     type_param_node_kind: Some("type_parameters"),
     docstring_in_body: false,
+    doc_comment_prefix: None,
     route_queries: &[],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: None,
@@ -1072,3 +1086,48 @@ pub static DART_CONFIG: LangConfig = LangConfig {
     has_all_export: false,
     test_name_prefix: false,
 };
+
+// ── GDScript ─────────────────────────────────────────────────────────────────
+
+pub static GDSCRIPT_CONFIG: LangConfig = LangConfig {
+    language_fn: || tree_sitter_gdscript::LANGUAGE.into(),
+    language_name: "gdscript",
+    extensions: &["gd"],
+    node_kinds: &[
+        ("function_definition", NodeKind::Function),
+        ("class_definition", NodeKind::Struct),
+        ("variable_statement", NodeKind::Field),
+        ("const_statement", NodeKind::Const),
+        ("enum_definition", NodeKind::Enum),
+    ],
+    scope_parent_kinds: &["class_definition"],
+    const_value_field: Some("value"),
+    full_text_name_kinds: &[],
+    string_literal_kinds: &[],
+    param_container_field: Some("parameters"),
+    param_type_field: Some("type"),
+    return_type_field: Some("return_type"),
+    type_requires_uppercase: false,
+    branch_node_types: &[
+        "if_statement",
+        "elif_clause",
+        "else_clause",
+        "for_statement",
+        "while_statement",
+        "match_statement",
+        "match_branch",
+        "conditional_expression",
+        "boolean_operator",
+    ],
+    decorator_node_kinds: &["annotation"],
+    type_param_node_kind: None,
+    docstring_in_body: false,
+    doc_comment_prefix: Some(&["##"]),
+    route_queries: &[],
+    compiled_route_queries: std::sync::OnceLock::new(),
+    call_expr_kinds: Some(("call", "function")),
+    pub_visibility_modifier: None,
+    has_all_export: false,
+    test_name_prefix: false,
+};
+

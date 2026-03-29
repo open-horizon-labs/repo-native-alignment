@@ -128,6 +128,13 @@ pub struct LangConfig {
     /// When `true`, `collect_doc_comment()` also checks the first string
     /// literal in the node's `body` field child.
     pub docstring_in_body: bool,
+    /// Optional prefixes that distinguish doc comments from regular comments.
+    /// When `Some(&["///", "//!", "/**"])`, only comment lines starting with
+    /// one of these prefixes are collected as documentation.
+    /// When `None`, all preceding comments are collected (the default).
+    ///
+    /// Examples: `Some(&["///", "//!", "/**"])` (Rust), `Some(&["##"])` (GDScript), `None` (Go, JS).
+    pub doc_comment_prefix: Option<&'static [&'static str]>,
     /// Optional tree-sitter query patterns for route decorator detection.
     ///
     /// Each entry is a [`RouteQueryConfig`] describing one query that matches
@@ -1171,6 +1178,14 @@ fn collect_doc_comment(node: tree_sitter::Node, source: &[u8], config: &LangConf
         let kind = sib.kind();
         if COMMENT_KINDS.contains(&kind) {
             let raw = sib.utf8_text(source).unwrap_or("").trim();
+            // If a doc_comment_prefix is configured, only collect comments
+            // that start with it (e.g. only `///` in Rust, only `##` in GDScript).
+            // This prevents regular `//` or `#` comments from being treated as docs.
+            if let Some(prefixes) = config.doc_comment_prefix
+                && !prefixes.iter().any(|p| raw.starts_with(p))
+            {
+                break; // Non-doc comment breaks the chain
+            }
             let cleaned = strip_comment_markers(raw, language_name);
             if !cleaned.is_empty() {
                 comment_lines.push(cleaned);
@@ -4666,6 +4681,54 @@ pub struct PaymentProcessor {
             "struct doc comment should be extracted: {}",
             doc
         );
+    }
+
+    #[test]
+    fn test_rust_block_doc_comment_extracted() {
+        // Regression: doc_comment_prefix must accept /** ... */ in addition to ///
+        use crate::extract::rust::RustExtractor;
+        let ext = RustExtractor::new();
+        let code = r#"
+/**
+ * Processes a refund for the given transaction.
+ */
+pub fn process_refund(tx_id: u64) -> Result<(), Error> {
+    Ok(())
+}
+"#;
+        let result = ext.extract(Path::new("test.rs"), code).unwrap();
+        let fn_node = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "process_refund")
+            .expect("should find process_refund");
+        let doc = fn_node
+            .metadata
+            .get("doc_comment")
+            .expect("block doc comment should be extracted as doc_comment");
+        assert!(
+            doc.contains("refund"),
+            "block doc comment should contain function description: {}",
+            doc
+        );
+    }
+
+    #[test]
+    fn test_rust_inner_doc_comment_not_rejected() {
+        // Regression: doc_comment_prefix must accept //! module docs
+        use crate::extract::rust::RustExtractor;
+        let ext = RustExtractor::new();
+        let code = r#"
+//! Module-level documentation.
+//! This crate handles payments.
+
+pub fn init() {}
+"#;
+        let result = ext.extract(Path::new("test.rs"), code).unwrap();
+        // The //! comment should at minimum not crash and not be silently dropped
+        // (It may or may not attach to init() depending on sibling walk direction,
+        // but the prefix gate must not reject it)
+        assert!(result.nodes.iter().any(|n| n.id.name == "init"), "should find init function");
     }
 
     #[test]

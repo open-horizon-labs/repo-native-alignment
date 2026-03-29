@@ -187,6 +187,7 @@ pub(crate) fn infer_language_from_path(path: &Path) -> String {
         Some("swift") => "swift".to_string(),
         Some("zig") => "zig".to_string(),
         Some("lua") => "lua".to_string(),
+        Some("gd") => "gdscript".to_string(),
         Some("sh") | Some("bash") => "bash".to_string(),
         Some("tf") | Some("hcl") | Some("tfvars") => "hcl".to_string(),
         Some("json") | Some("jsonc") => "json".to_string(),

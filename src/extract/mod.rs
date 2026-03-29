@@ -25,6 +25,7 @@ pub mod extractor_config;
 pub mod fastapi_router_prefix;
 pub mod framework_detection;
 pub mod generic;
+pub mod gdscript;
 pub mod go;
 pub mod graphql;
 pub mod grpc;
@@ -291,6 +292,7 @@ impl ExtractorRegistry {
         // Code
         registry.register(Box::new(rust::RustExtractor::new()));
         registry.register(Box::new(python::PythonExtractor::new()));
+        registry.register(Box::new(gdscript::GDScriptExtractor::new()));
         registry.register(Box::new(typescript::TypeScriptExtractor::new()));
         registry.register(Box::new(javascript::JavaScriptExtractor::new()));
         registry.register(Box::new(go::GoExtractor::new()));
@@ -1072,7 +1074,7 @@ mod tests {
     #[test]
     fn test_registry_with_builtins_has_extractors() {
         let registry = ExtractorRegistry::with_builtins();
-        assert_eq!(registry.len(), 30); // rust, python, typescript, javascript, go, java, bash, ruby, cpp, c, csharp, kotlin, zig, lua, swift, php, html, scala, dart, elixir, dockerfile, hcl, json, toml, yaml, markdown, proto, sql, openapi, graphql
+        assert_eq!(registry.len(), 31); // + gdscript
     }
 
     #[test]
