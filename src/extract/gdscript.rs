@@ -66,9 +66,6 @@ impl Extractor for GDScriptExtractor {
                     .metadata
                     .insert("extends".to_string(), ext.clone());
             }
-
-            // Attach ## doc comments to the nodes they precede.
-            attach_doc_comments(&tree, source, &mut result.nodes);
         }
 
         Ok(result)
@@ -291,80 +288,6 @@ fn collect_resource_refs(
     for j in 0..node.child_count() {
         if let Some(child) = node.child(j as u32) {
             collect_resource_refs(&child, path, source, edges);
-        }
-    }
-}
-
-/// Attach `##` doc comments to the declaration they precede.
-///
-/// GDScript uses `##` for doc comments. They appear as `comment` nodes
-/// immediately before a declaration (function_definition, variable_statement,
-/// signal_statement, etc.). We collect consecutive `##` comments and attach
-/// them as `docstring` metadata on the next sibling declaration's node.
-fn attach_doc_comments(tree: &tree_sitter::Tree, source: &[u8], nodes: &mut [Node]) {
-    let root = tree.root_node();
-    for i in 0..root.child_count() {
-        let Some(child) = root.child(i as u32) else {
-            continue;
-        };
-
-        // Skip non-declaration nodes
-        let decl_line = child.start_position().row + 1;
-        let decl_kinds = [
-            "function_definition",
-            "variable_statement",
-            "export_variable_statement",
-            "onready_variable_statement",
-            "signal_statement",
-            "const_statement",
-            "enum_definition",
-            "class_definition",
-        ];
-        if !decl_kinds.contains(&child.kind()) {
-            continue;
-        }
-
-        // Look backwards for consecutive ## comments immediately preceding this declaration
-        let mut doc_lines: Vec<String> = Vec::new();
-        let mut j = i;
-        while j > 0 {
-            j -= 1;
-            let Some(prev) = root.child(j as u32) else {
-                break;
-            };
-            if prev.kind() != "comment" {
-                break;
-            }
-            let text = prev.utf8_text(source).unwrap_or("").trim().to_string();
-            if text.starts_with("##") {
-                // Strip ## prefix and optional leading space
-                let doc = text
-                    .strip_prefix("##")
-                    .unwrap_or(&text)
-                    .strip_prefix(' ')
-                    .unwrap_or(text.strip_prefix("##").unwrap_or(&text))
-                    .to_string();
-                doc_lines.push(doc);
-            } else {
-                break; // Regular # comment, stop
-            }
-        }
-
-        if doc_lines.is_empty() {
-            continue;
-        }
-
-        // Reverse since we collected backwards
-        doc_lines.reverse();
-        let docstring = doc_lines.join("\n");
-
-        // Find the matching node by line number and attach docstring
-        if let Some(node) = nodes
-            .iter_mut()
-            .find(|n| n.line_start == decl_line)
-        {
-            node.metadata
-                .insert("docstring".to_string(), docstring);
         }
     }
 }

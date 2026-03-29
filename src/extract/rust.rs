@@ -66,7 +66,7 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
     const_value_field: Some("value"),
     // use_declaration: the name IS the full `use crate::foo::Bar;` text.
     full_text_name_kinds: &["use_declaration"],
-    string_literal_kinds: &[("string_literal", Some("string_content"))],
+    string_literal_kinds: &[],
     param_container_field: Some("parameters"),
     param_type_field: Some("type"),
     return_type_field: Some("return_type"),
@@ -85,6 +85,7 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
     decorator_node_kinds: &["attribute_item"],
     type_param_node_kind: Some("type_parameters"),
     docstring_in_body: false,
+    doc_comment_prefix: Some("///"),
     route_queries: &[RUST_ROUTE_QUERY],
     compiled_route_queries: std::sync::OnceLock::new(),
     call_expr_kinds: Some(("call_expression", "function")),
