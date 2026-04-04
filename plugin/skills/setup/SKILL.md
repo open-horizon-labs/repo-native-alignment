@@ -95,17 +95,18 @@ If AGENTS.md exists but lacks the marker, append this block:
 
 ```markdown
 <!-- RNA MCP tool guidance -->
-## Code Exploration (use RNA MCP tools, not grep/Read)
+## Code Exploration (RNA MCP)
 
-| Instead of... | Use this MCP tool |
+| Instead of... | Use this RNA MCP tool |
 |---|---|
-| `Grep` for symbol names | `search_symbols(query, kind, language, file)` |
-| `Read` to trace function calls | `graph_query(node_id, mode: "neighbors")` |
-| `Grep` for "who calls X" | `graph_query(node_id, mode: "impact")` |
-| `Read` to find .oh/ artifacts | `oh_search_context(query)` |
-| `Bash` with `grep -rn` | `search_symbols` or `oh_search_context` |
+| `Grep` for symbol names | `search(query, kind, language, file)` |
+| `Read` to trace function calls | `search(node, mode: "neighbors")` |
+| `Grep` for "who calls X" | `search(node, mode: "impact")` |
+| `Read` to find .oh/ artifacts | `search(query, include_artifacts=true)` |
+| `Bash` with `grep -rn` | `search(query)` — searches code, artifacts, and markdown |
+| Codebase orientation | `repo_map(top_n)` |
 | Recording learnings/signals | Write to `.oh/metis/`, `.oh/signals/`, `.oh/guardrails/` (YAML frontmatter + markdown) |
-| Searching git history | `oh_search_context(query)` -- returns hash; use `git show <hash>` via Bash for diffs |
+| Searching git history | `search(query)` — returns commits; use `git show <hash>` via Bash for diffs |
 <!-- end RNA MCP tool guidance -->
 ```
 
@@ -117,9 +118,7 @@ Tell the user:
 1. Setup is complete
 2. They may need to **restart their agent/IDE** for the MCP server to load
 3. After restart, RNA MCP tools will be available:
-   - `oh_get_context` - Business context in one call
-   - `oh_search_context` - Semantic search over outcomes, code, commits
-   - `search_symbols` - Multi-language symbol search with graph edges
-   - `graph_query` - Impact analysis, neighbor traversal, reachability
-   - `outcome_progress` - Structural outcome-to-code joins
+   - `search` - Symbol search, graph traversal (neighbors/impact/reachable/tests_for/cycles/path), artifact/commit/markdown search. Use `compact: true` to save tokens. Use `mode` + `node` for graph walks.
+   - `repo_map` - Codebase orientation: top symbols by importance, hotspot files, entry points, subsystem breakdown
+   - `outcome_progress` - Business outcome tracking against code changes
    - `list_roots` - Workspace root management
