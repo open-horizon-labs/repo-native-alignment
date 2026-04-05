@@ -34,8 +34,8 @@ use tokio::net::TcpListener;
 use crate::embed::EmbeddingIndex;
 use crate::server::state::GraphState;
 use crate::service::{
-    GraphParams, RepoMapContext, RepoMapParams, SearchContext, SearchParams, list_roots_from_slugs,
-    repo_map, search,
+    RepoMapContext, RepoMapParams, SearchContext, SearchParams, list_roots_from_slugs, repo_map,
+    search,
 };
 
 // ─── Viewer HTML (inline so the binary is self-contained) ────────────────────
@@ -213,49 +213,6 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
                 None,
                 None,
             ))
-        }
-
-        "graph_query" => {
-            let node = call
-                .params
-                .get("node")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "graph_query requires 'node'".to_string())?
-                .to_string();
-            let mode = call
-                .params
-                .get("mode")
-                .and_then(|v| v.as_str())
-                .unwrap_or("neighbors")
-                .to_string();
-            let direction = call
-                .params
-                .get("direction")
-                .and_then(|v| v.as_str())
-                .unwrap_or("outgoing")
-                .to_string();
-            let max_hops = call
-                .params
-                .get("max_hops")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize);
-            let edge_types = call
-                .params
-                .get("edge_types")
-                .and_then(|v| v.as_str())
-                .map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
-
-            let gp = GraphParams {
-                node,
-                mode,
-                direction,
-                edge_types,
-                max_hops,
-            };
-            match crate::service::graph_query(&gp, &state.graph) {
-                Ok(out) => Ok(out),
-                Err(msg) => Err(msg),
-            }
         }
 
         other => Err(format!("Unknown tool: {other}")),
