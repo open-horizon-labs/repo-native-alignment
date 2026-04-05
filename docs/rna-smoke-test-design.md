@@ -11,7 +11,7 @@ outcome: agent-alignment
 
 RNA has 153 unit and integration tests covering individual extractors, graph operations, query logic, and the `setup` subcommand. One end-to-end gap exists: no test verifies that the **full pipeline** — scan → extract → embed → index → query — works correctly when RNA runs as a live binary serving real MCP tool calls.
 
-The existing smoke test in `.github/scripts/mcp-smoke.mjs` uses the TypeScript MCP SDK but only checks that tools are *listed*. It does not call any tool, assert on returned content, or exercise the scan/query pipeline at all. A broken `oh_search_context` implementation, a LanceDB initialization failure, or a corrupted embedding store would all pass silently.
+The existing smoke test in `.github/scripts/mcp-smoke.mjs` uses the TypeScript MCP SDK but only checks that tools are *listed*. It does not call any tool, assert on returned content, or exercise the scan/query pipeline at all. A broken `search` implementation, a LanceDB initialization failure, or a corrupted embedding store would all pass silently.
 
 The guardrail `test-with-real-mcp-client` (severity: candidate) documents that raw curl/pipe tests miss protocol bugs that are fatal with real MCP clients — a 45-minute regression that would have been caught by exercising actual tool calls.
 
@@ -38,11 +38,11 @@ Extend `.github/scripts/mcp-smoke.mjs` beyond `listTools` to actually call each 
 
 **How it works:**
 1. Connect to the RNA binary via stdio using `@modelcontextprotocol/sdk`
-2. Call `oh_get_context` — assert response contains "Outcomes" or "Business Context"
-3. Call `oh_search_context` with query `"agent-alignment"` — assert ≥1 result with non-empty name
-4. Call `search_symbols` with query `"main"` — assert ≥1 symbol result
+2. Call `search` with `include_artifacts: true` — assert response contains artifact results
+3. Call `search` with query "agent-alignment" — assert ≥1 result with non-empty name
+4. Call `search` with query "main", `include_artifacts: false` — assert ≥1 symbol result
 5. Call `outcome_progress` for outcome `"agent-alignment"` — assert structured progress section
-6. Call `graph_query` with mode `"callers"` and a known symbol — assert edges or graceful empty
+6. Call `search` with `mode: "neighbors"` and a known symbol — assert edges or graceful empty
 7. Assert non-empty on all calls; assert non-zero exit on failure
 
 **Pro:**
@@ -63,7 +63,7 @@ Extend `.github/scripts/mcp-smoke.mjs` beyond `listTools` to actually call each 
 Add a `test` subcommand to the RNA binary. When invoked, it:
 1. Scans the current repo (or a temp fixture repo)
 2. Builds the graph and embeddings in-process
-3. Runs each query path (`oh_search_context`, `search_symbols`, `oh_get_context`, `outcome_progress`, `graph_query`, `list_roots`)
+3. Runs each query path (`search`, `outcome_progress`, `repo_map`, `list_roots`)
 4. Emits a structured JSON or human-readable report to stdout
 5. Exits non-zero if any pipeline stage fails or returns empty where content is expected
 
@@ -80,11 +80,9 @@ Output:
     { "stage": "extract", "status": "ok", "symbols": 312 },
     { "stage": "embed",   "status": "ok", "vectors": 312 },
     { "stage": "index",   "status": "ok" },
-    { "stage": "oh_get_context",    "status": "ok", "content_bytes": 1840 },
-    { "stage": "oh_search_context", "status": "ok", "results": 5 },
-    { "stage": "search_symbols",    "status": "ok", "results": 12 },
+    { "stage": "search",            "status": "ok", "results": 12 },
     { "stage": "outcome_progress",  "status": "ok", "outcomes": 2 },
-    { "stage": "graph_query",       "status": "ok", "edges": 7 },
+    { "stage": "repo_map",          "status": "ok", "symbols": 15 },
     { "stage": "list_roots",        "status": "ok", "roots": 1 }
   ]
 }
@@ -174,11 +172,11 @@ Both run without a Claude API key. Neither requires additional CI dependencies b
 | Symbol extraction | `symbols_extracted > 0` |
 | Embedding | `vectors_written == symbols_extracted` |
 | LanceDB index | Index opens and accepts queries |
-| `oh_get_context` path | Response contains "Business Context", `content_bytes > 0` |
-| `oh_search_context` path | Query `"main"` returns ≥1 result |
-| `search_symbols` path | Query `"main"` returns ≥1 symbol |
+| `search` path (artifacts) | Query `"main"` returns ≥1 result |
+| `search` path (code symbols) | Query `"main"` returns ≥1 symbol |
 | `outcome_progress` path | Returns structured output, no panic |
-| `graph_query` path | Returns without error (edges may be empty on minimal fixture) |
+| `search` path (graph traversal) | Returns without error (edges may be empty on minimal fixture) |
+| `repo_map` path | Returns top symbols and subsystems |
 | `list_roots` path | Returns ≥1 root |
 | Exit code | 0 on all-pass, non-zero on any failure |
 
@@ -187,10 +185,9 @@ Both run without a Claude API key. Neither requires additional CI dependencies b
 | Check | Assertion |
 |---|---|
 | Binary starts and connects | `client.connect()` succeeds |
-| `listTools` | Returns 8 tools including all required names |
-| `oh_get_context` tool call | Response text contains "Business Context" |
-| `oh_search_context("agent-alignment")` | ≥1 result with non-empty name field |
-| `search_symbols("main")` | ≥1 symbol with file path |
+| `listTools` | Returns 4 tools: search, repo_map, outcome_progress, list_roots |
+| `search("agent-alignment", include_artifacts: true)` | ≥1 result with non-empty name field |
+| `search("main", include_artifacts: false)` | ≥1 symbol with file path |
 | `outcome_progress("agent-alignment")` | Non-empty response, no RPC error |
 | Error on unknown tool | `call_tool("nonexistent_tool")` returns RPC error, not a hang |
 | Clean shutdown | `client.close()` completes without timeout |
@@ -203,14 +200,14 @@ Both run without a Claude API key. Neither requires additional CI dependencies b
 - [ ] `rna test` exits non-zero and prints a diagnostic when the pipeline is broken (e.g., LanceDB cannot initialize, embedder returns zero vectors, a query path panics)
 - [ ] `rna test` runs in CI with zero additional dependencies (no Node.js, no API keys, no network)
 - [ ] CI adds a `cargo run --release -- test --repo .` step that gates PRs
-- [ ] `mcp-smoke.mjs` is extended to call at least: `oh_get_context`, `oh_search_context`, `search_symbols`, `outcome_progress`
+- [ ] `mcp-smoke.mjs` is extended to call at least: `search`, `outcome_progress`, `repo_map`, `list_roots`
 - [ ] Each `mcp-smoke.mjs` tool call asserts on response content (not just absence of RPC error)
 - [ ] `mcp-smoke.mjs` asserts that an unknown tool name returns an error rather than hanging
 - [ ] Both smoke tests are runnable locally with a single command:
   - `./target/release/repo-native-alignment test --repo .`
   - `node .github/scripts/mcp-smoke.mjs ./target/release/repo-native-alignment .`
 - [ ] Smoke tests do not require a Claude API key
-- [ ] A broken `oh_search_context` implementation (e.g., always returns empty) causes `rna test` to fail with a clear diagnostic
+- [ ] A broken `search` implementation (e.g., always returns empty) causes `rna test` to fail with a clear diagnostic
 - [ ] A broken MCP dispatch (e.g., wrong tool name routing) causes `mcp-smoke.mjs` to fail with a non-zero exit
 - [ ] Both tests complete in under 60 seconds on a laptop-class machine
 
