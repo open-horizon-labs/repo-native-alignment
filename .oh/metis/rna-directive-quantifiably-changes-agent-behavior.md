@@ -8,7 +8,7 @@ title: 'RNA directive quantifiably changes agent behavior: 1-7 calls without vs 
 
 In this session's batch, sub-agents were spawned to fix LSP issues (#33–#37). Two groups:
 - **Without explicit RNA directive:** agents used 1-7 RNA/LSP calls, defaulted to grep/Read for most exploration
-- **With explicit RNA directive** (the "Tool usage requirements" block): agents used 27+ RNA calls — oh_search_context before file reads, search_symbols for navigation, LSP for type lookups
+- **With explicit RNA directive** (the "Tool usage requirements" block): agents used 27+ RNA calls — search (with include_artifacts) before file reads, search (with kind/language filters) for navigation, LSP for type lookups
 
 ## Why It Matters
 

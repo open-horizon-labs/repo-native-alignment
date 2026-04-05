@@ -6,7 +6,7 @@ title: Suffix match resolves cross-file imports without language-specific logic 
 
 ## The Problem
 
-Tree-sitter extracts import statements but can't resolve them to target files — it doesn't have `sys.path`, `tsconfig.json`, or module resolution context. Without cross-file edges, `graph_query` impact analysis returns only the containing module, not actual callers.
+Tree-sitter extracts import statements but can't resolve them to target files — it doesn't have `sys.path`, `tsconfig.json`, or module resolution context. Without cross-file edges, `search(mode: "impact")` analysis returns only the containing module, not actual callers.
 
 ## The Insight
 

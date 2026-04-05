@@ -51,7 +51,7 @@ Agents can't answer "what have we done towards this outcome?" because there's no
 | 4: Query Engine | Hybrid queries, natural language → multi-layer answer | 🔄 Current |
 | 5: OH Sync | Bidirectional `.oh/` ↔ OH graph, git push/pull semantics | ⬜ Future |
 
-**Current state (2026-03-08):** Background scanner (15min), persisted embeddings, incremental graph updates (RwLock + scan cooldown), commit hash surfaced in `oh_search_context`. `git_history` tool dropped — commit info available via search results directly.
+**Current state (2026-03-08):** Background scanner (15min), persisted embeddings, incremental graph updates (RwLock + scan cooldown), commit hash surfaced in `search`. `git_history` tool dropped — commit info available via search results directly.
 
 ---
 
