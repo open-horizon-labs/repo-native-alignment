@@ -71,6 +71,21 @@ struct ErrorResponse {
     error: String,
 }
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Tolerant extraction: accept both JSON integers and whole-number floats.
+fn value_as_u64_tolerant(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| {
+        v.as_f64().and_then(|f| {
+            if f >= 0.0 && f.fract() == 0.0 && f <= u64::MAX as f64 {
+                Some(f as u64)
+            } else {
+                None
+            }
+        })
+    })
+}
+
 // ─── Axum handlers ───────────────────────────────────────────────────────────
 
 async fn serve_index() -> Html<&'static str> {
@@ -93,7 +108,7 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
             let top_n = call
                 .params
                 .get("top_n")
-                .and_then(|v| v.as_u64())
+                .and_then(value_as_u64_tolerant)
                 .unwrap_or(15) as usize;
             let params = RepoMapParams {
                 top_n,
@@ -133,12 +148,12 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
             let depth = call
                 .params
                 .get("depth")
-                .and_then(|v| v.as_u64())
+                .and_then(value_as_u64_tolerant)
                 .map(|v| v as u32);
             let hops = call
                 .params
                 .get("hops")
-                .and_then(|v| v.as_u64())
+                .and_then(value_as_u64_tolerant)
                 .map(|v| v as u32);
             let kind = call
                 .params
@@ -148,7 +163,7 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
             let limit = call
                 .params
                 .get("limit")
-                .and_then(|v| v.as_u64())
+                .and_then(value_as_u64_tolerant)
                 .map(|v| v as usize);
             let compact = call
                 .params
@@ -325,4 +340,62 @@ fn open_browser(url: &str) -> anyhow::Result<()> {
         eprintln!("Automatic browser open not supported on this platform. Open: {url}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── value_as_u64_tolerant ────────────────────────────────────────────
+
+    #[test]
+    fn tolerant_accepts_integer() {
+        assert_eq!(value_as_u64_tolerant(&json!(15)), Some(15));
+    }
+
+    #[test]
+    fn tolerant_accepts_whole_float() {
+        assert_eq!(value_as_u64_tolerant(&json!(15.0)), Some(15));
+    }
+
+    #[test]
+    fn tolerant_accepts_zero_float() {
+        assert_eq!(value_as_u64_tolerant(&json!(0.0)), Some(0));
+    }
+
+    #[test]
+    fn tolerant_accepts_zero_int() {
+        assert_eq!(value_as_u64_tolerant(&json!(0)), Some(0));
+    }
+
+    #[test]
+    fn tolerant_rejects_fractional() {
+        assert_eq!(value_as_u64_tolerant(&json!(15.5)), None);
+    }
+
+    #[test]
+    fn tolerant_rejects_negative_float() {
+        assert_eq!(value_as_u64_tolerant(&json!(-1.0)), None);
+    }
+
+    #[test]
+    fn tolerant_rejects_negative_int() {
+        assert_eq!(value_as_u64_tolerant(&json!(-1)), None);
+    }
+
+    #[test]
+    fn tolerant_rejects_string() {
+        assert_eq!(value_as_u64_tolerant(&json!("15")), None);
+    }
+
+    #[test]
+    fn tolerant_rejects_bool() {
+        assert_eq!(value_as_u64_tolerant(&json!(true)), None);
+    }
+
+    #[test]
+    fn tolerant_rejects_null() {
+        assert_eq!(value_as_u64_tolerant(&json!(null)), None);
+    }
 }
