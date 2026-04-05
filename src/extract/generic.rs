@@ -1627,7 +1627,7 @@ fn run_route_queries(
 
             let http_path = capture
                 .get("path")
-                .map(|p| strip_quotes(&p.to_string()))
+                .map(strip_quotes)
                 .unwrap_or_default();
 
             let method = if let Some(m) = capture.get("method") {
