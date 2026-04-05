@@ -11,7 +11,7 @@ Tested on three repos with different shapes:
 2. **fspulse** (Rust CLI, personal project, cold start)
 3. **enterprise monorepo** (enterprise app, Python+TS monorepo, multi-contributor, Azure DevOps work items)
 
-All three: oh_init scaffolded .oh/, oh_search_context found relevant context, outcome_progress mapped commits to outcomes via file patterns.
+All three: oh_init scaffolded .oh/, search found relevant context, outcome_progress mapped commits to outcomes via file patterns.
 
 ## Key Findings
 

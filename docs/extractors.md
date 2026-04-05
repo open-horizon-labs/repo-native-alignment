@@ -430,7 +430,7 @@ Channel nodes appear as `NodeKind::Other("channel")` with the topic name. Framew
 Use graph traversal to confirm edges from a known function to its channel:
 
 ```
-graph_query --node "root:src/publisher.py:publish_order:Function" --mode neighbors
+search --node "root:src/publisher.py:publish_order:Function" --mode neighbors
 ```
 
 Expected output includes `Produces` edges to the channel node. The channel node's neighbours show `Consumes` edges inbound from subscriber functions.
@@ -527,7 +527,7 @@ RNA includes 30 extractors that run via tree-sitter to produce symbols, import g
 
 ### Constants and literals (cross-language)
 
-All 30 extractors index constants and literal values. `search_symbols` returns the value inline:
+All 30 extractors index constants and literal values. `search` returns the value inline:
 
 ```
 - const MAX_RETRIES (rust) src/config.rs:12  Value: `5`
@@ -539,7 +539,7 @@ Named constants are declared identifiers — `const MAX_RETRIES = 5`, static fin
 
 Synthetic constants are inferred from structure — YAML/TOML/JSON top-level scalar values, OpenAPI enum values, and single-token string literals (e.g. `"application/json"`, `"GET"`) found in function bodies. They appear with a `*(literal)*` badge.
 
-`search_symbols` accepts a `synthetic` filter to narrow results to declared constants, inferred literals, or both.
+`search` accepts a `synthetic` filter to narrow results to declared constants, inferred literals, or both.
 
 ### Language-to-constant mapping
 

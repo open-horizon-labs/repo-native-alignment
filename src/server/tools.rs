@@ -26,8 +26,6 @@ pub struct OutcomeProgress {
 
 // ── Unified search tool ─────────────────────────────────────────────
 // Unified search tool combining flat symbol search and graph traversal.
-// Deprecated aliases (`search_symbols`, `graph_query`) are kept below
-// and route here.
 
 #[macros::mcp_tool(
     name = "search",

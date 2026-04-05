@@ -9,7 +9,7 @@ RNA auto-discovers installed language servers and enriches the graph with cross-
 - **Who implements this trait/interface?** -- implementation edges across files
 - **Doc cross-references** -- links between markdown documents and code
 
-The result: `graph_query(mode: "impact", from: "my_fn")` shows the blast radius of a change, following call chains discovered by the language server.
+The result: `search(node: "my_fn", mode: "impact")` shows the blast radius of a change, following call chains discovered by the language server.
 
 ## Pipeline Integration
 
