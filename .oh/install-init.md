@@ -149,11 +149,12 @@ repo-native-alignment setup --project <PATH>  # default: .
 
 ### What Gets Installed (as of 2026-03-07)
 
-The installed binary provides 20 MCP tools:
+The installed binary provides 4 MCP tools:
 
-- **Business context:** 5 read + 4 write + 1 init + 1 semantic search + 1 structural join
-- **Code search:** search_code, search_markdown, search_commits, file_history, search_all
-- **Workspace graph (new):** search_symbols (multi-lang: Rust, Python, TS, Go, Markdown), graph_neighbors (traversal), graph_impact (reverse BFS)
+- **search** — unified symbol search, graph traversal (neighbors/impact/reachable/tests_for/cycles/path), artifact/commit/markdown search
+- **repo_map** — codebase orientation: top symbols by importance, hotspot files, entry points, subsystem breakdown
+- **outcome_progress** — business outcome tracking against code changes
+- **list_roots** — workspace root management
 
 The graph is built on first query by an incremental scanner (mtime + git optimization) + pluggable tree-sitter extractors. Scanner excludes are configurable via `.oh/config.toml`.
 

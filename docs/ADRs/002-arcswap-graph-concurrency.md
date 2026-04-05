@@ -6,7 +6,7 @@
 
 ## Context
 
-The RNA MCP server serves tool calls (search, graph_query, list_roots) from an in-memory graph while a background scanner continuously re-extracts and enriches it. The event bus pipeline (ADR-001) runs LSP enrichment, post-extraction passes, and PageRank — taking 10-30+ seconds on non-trivial codebases.
+The RNA MCP server serves tool calls (search, repo_map, list_roots, outcome_progress) from an in-memory graph while a background scanner continuously re-extracts and enriches it.
 
 The original implementation used `Arc<RwLock<Option<GraphState>>>`. The background scanner acquired a write lock for the entire enrichment pipeline, blocking all tool calls for its duration. On a repo like Innovation-Connector (87K nodes), tool calls hung for 2+ minutes. This caused v0.1.15 and v0.1.16 to be yanked.
 
