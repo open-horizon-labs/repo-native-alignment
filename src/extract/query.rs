@@ -155,9 +155,11 @@ impl QueryExtractor {
 /// Configuration for a single route-decorator query pattern.
 ///
 /// Each `RouteQueryConfig` describes one tree-sitter query that detects
-/// HTTP route decorators in a specific language/framework. The query must
-/// produce at least a `@path` capture containing the HTTP path string.
-/// An optional `@method` capture carries the HTTP method verb.
+/// HTTP route decorators in a specific language/framework. The query may
+/// contain multiple patterns: one that captures `@path` (the HTTP path string)
+/// and one for bare decorators (no path arg). When `@path` is absent, the
+/// extraction code defaults to an empty path. An optional `@method` capture
+/// carries the HTTP method verb.
 ///
 /// Used in [`LangConfig::route_queries`](super::generic::LangConfig).
 #[derive(Debug, Clone, Copy)]

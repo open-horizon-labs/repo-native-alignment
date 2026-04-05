@@ -36,6 +36,12 @@ static PYTHON_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
     arguments: (argument_list
       (string) @path))
   (#match? @name "route$|get$|post$|put$|delete$|patch$|head$|options$"))
+
+(decorator
+  (call
+    function: (_) @name
+    arguments: (argument_list))
+  (#match? @name "route$|get$|post$|put$|delete$|patch$|head$|options$"))
 "#,
     default_method: "GET",
 };
@@ -60,6 +66,12 @@ static TYPESCRIPT_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
     function: (identifier) @name
     arguments: (arguments
       (string) @path))
+  (#match? @name "^(Get|Post|Put|Delete|Patch|Head|Options|HttpGet|HttpPost|HttpPut|HttpDelete|HttpPatch)$"))
+
+(decorator
+  (call_expression
+    function: (identifier) @name
+    arguments: (arguments))
   (#match? @name "^(Get|Post|Put|Delete|Patch|Head|Options|HttpGet|HttpPost|HttpPut|HttpDelete|HttpPatch)$"))
 "#,
     default_method: "GET",
@@ -87,6 +99,15 @@ static JAVA_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
   name: (identifier) @name
   arguments: (annotation_argument_list
     (string_literal) @path)
+  (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)$"))
+
+(annotation
+  name: (identifier) @name
+  arguments: (annotation_argument_list)
+  (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)$"))
+
+(marker_annotation
+  name: (identifier) @name
   (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)$"))
 "#,
     default_method: "GET",
