@@ -1,7 +1,91 @@
 //! MCP tool input structs and deprecated aliases.
 
 use rust_mcp_sdk::macros::{self, JsonSchema};
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Unexpected, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
+
+fn u32_from_f64_tolerant<E>(value: f64) -> Result<u32, E>
+where
+    E: de::Error,
+{
+    if !value.is_finite() {
+        return Err(E::custom("expected a finite number for u32"));
+    }
+    if value < 0.0 {
+        return Err(E::custom(format!(
+            "expected a non-negative number for u32, got {value}"
+        )));
+    }
+    if value.fract() != 0.0 {
+        return Err(E::custom(format!(
+            "expected a whole number for u32, got {value}"
+        )));
+    }
+    if value > u32::MAX as f64 {
+        return Err(E::custom(format!("number out of range for u32: {value}")));
+    }
+    Ok(value as u32)
+}
+
+fn deserialize_u32_tolerant<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct U32TolerantVisitor;
+
+    impl<'de> Visitor<'de> for U32TolerantVisitor {
+        type Value = u32;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a non-negative whole number within u32 range")
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            u32::try_from(value).map_err(|_| E::invalid_value(Unexpected::Unsigned(value), &self))
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            if value < 0 {
+                return Err(E::invalid_value(Unexpected::Signed(value), &self));
+            }
+            u32::try_from(value as u64)
+                .map_err(|_| E::invalid_value(Unexpected::Signed(value), &self))
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            u32_from_f64_tolerant::<E>(value)
+        }
+
+        fn visit_f32<E>(self, value: f32) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            u32_from_f64_tolerant::<E>(f64::from(value))
+        }
+    }
+
+    deserializer.deserialize_any(U32TolerantVisitor)
+}
+
+fn deserialize_option_u32_tolerant<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct U32Tolerant(#[serde(deserialize_with = "deserialize_u32_tolerant")] u32);
+
+    Option::<U32Tolerant>::deserialize(deserializer).map(|value| value.map(|v| v.0))
+}
 
 // ── Tool input structs ──────────────────────────────────────────────
 
@@ -43,10 +127,18 @@ pub struct Search {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     /// Max reachability depth for impact/reachable modes (default: 3). Controls how far the graph walk reaches. Not used for neighbors mode — use depth instead.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_u32_tolerant",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub hops: Option<u32>,
     /// Multi-level neighbors traversal depth for neighbors mode (default: 1). Walk edges N levels deep, accumulating and deduplicating results per level. Only applies to neighbors mode; ignored for impact/reachable (use hops for those).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_u32_tolerant",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub depth: Option<u32>,
     /// Neighbors direction: "outgoing" (default), "incoming", "both"
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,13 +159,22 @@ pub struct Search {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
     /// Max results (flat default: 10, traversal default: 1)
-    #[serde(default, alias = "top_k", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "top_k",
+        deserialize_with = "deserialize_option_u32_tolerant",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub limit: Option<u32>,
     /// Sort: "relevance" (default), "complexity", "importance"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_by: Option<String>,
     /// Min cyclomatic complexity threshold
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_u32_tolerant",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub min_complexity: Option<u32>,
     /// Filter synthetic (inferred) constants: true=only, false=exclude
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -137,7 +238,11 @@ pub struct ListRoots {}
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct RepoMap {
     /// Number of top symbols (default: 15)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_u32_tolerant",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub top_n: Option<u32>,
     /// Workspace root slug; "all" for cross-root
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -688,5 +793,178 @@ mod tests {
         )
         .unwrap();
         assert_eq!(op.repo, Some("/path/to/worktree".to_string()));
+    }
+
+    // ── u32 float tolerance tests (#629) ─────────────────────────────────
+    // JSON has no integer type — 30 and 30.0 are both valid representations
+    // of 30. MCP clients routinely serialize integers as floats.
+
+    // -- Search.limit --
+
+    #[test]
+    fn test_limit_accepts_float_whole() {
+        let s = parse_search(json!({"query": "test", "limit": 30.0})).unwrap();
+        assert_eq!(s.limit, Some(30));
+    }
+
+    #[test]
+    fn test_limit_accepts_integer() {
+        let s = parse_search(json!({"query": "test", "limit": 30})).unwrap();
+        assert_eq!(s.limit, Some(30));
+    }
+
+    #[test]
+    fn test_limit_rejects_fractional_float() {
+        assert!(parse_search(json!({"query": "test", "limit": 30.5})).is_err());
+    }
+
+    #[test]
+    fn test_limit_null_is_none() {
+        let s = parse_search(json!({"query": "test", "limit": null})).unwrap();
+        assert!(s.limit.is_none());
+    }
+
+    #[test]
+    fn test_limit_absent_is_none() {
+        let s = parse_search(json!({"query": "test"})).unwrap();
+        assert!(s.limit.is_none());
+    }
+
+    #[test]
+    fn test_limit_rejects_negative_int() {
+        assert!(parse_search(json!({"query": "test", "limit": -1})).is_err());
+    }
+
+    #[test]
+    fn test_limit_rejects_negative_float() {
+        assert!(parse_search(json!({"query": "test", "limit": -1.0})).is_err());
+    }
+
+    #[test]
+    fn test_limit_rejects_string() {
+        assert!(parse_search(json!({"query": "test", "limit": "thirty"})).is_err());
+    }
+
+    #[test]
+    fn test_limit_rejects_bool() {
+        assert!(parse_search(json!({"query": "test", "limit": true})).is_err());
+    }
+
+    #[test]
+    fn test_limit_zero_float() {
+        let s = parse_search(json!({"query": "test", "limit": 0.0})).unwrap();
+        assert_eq!(s.limit, Some(0));
+    }
+
+    #[test]
+    fn test_limit_u32_max() {
+        let s = parse_search(json!({"query": "test", "limit": u32::MAX})).unwrap();
+        assert_eq!(s.limit, Some(u32::MAX));
+    }
+
+    #[test]
+    fn test_limit_overflow_u32() {
+        let over = (u32::MAX as f64) + 1.0;
+        assert!(parse_search(json!({"query": "test", "limit": over})).is_err());
+    }
+
+    // -- Search.limit via top_k alias --
+
+    #[test]
+    fn test_top_k_alias_accepts_float_whole() {
+        let s = parse_search(json!({"query": "test", "top_k": 30.0})).unwrap();
+        assert_eq!(s.limit, Some(30));
+    }
+
+    // -- Search.hops --
+
+    #[test]
+    fn test_hops_accepts_float_whole() {
+        let s = parse_search(json!({"node": "x", "mode": "impact", "hops": 5.0})).unwrap();
+        assert_eq!(s.hops, Some(5));
+    }
+
+    #[test]
+    fn test_hops_rejects_fractional() {
+        assert!(parse_search(json!({"node": "x", "mode": "impact", "hops": 3.7})).is_err());
+    }
+
+    // -- Search.depth --
+
+    #[test]
+    fn test_depth_accepts_float_whole() {
+        let s = parse_search(json!({"node": "x", "mode": "neighbors", "depth": 2.0})).unwrap();
+        assert_eq!(s.depth, Some(2));
+    }
+
+    #[test]
+    fn test_depth_rejects_fractional() {
+        assert!(parse_search(json!({"node": "x", "mode": "neighbors", "depth": 1.5})).is_err());
+    }
+
+    // -- Search.min_complexity --
+
+    #[test]
+    fn test_min_complexity_accepts_float_whole() {
+        let s = parse_search(json!({"query": "test", "min_complexity": 10.0})).unwrap();
+        assert_eq!(s.min_complexity, Some(10));
+    }
+
+    #[test]
+    fn test_min_complexity_rejects_fractional() {
+        assert!(parse_search(json!({"query": "test", "min_complexity": 5.5})).is_err());
+    }
+
+    // -- RepoMap.top_n --
+
+    fn parse_repo_map(v: serde_json::Value) -> Result<super::RepoMap, serde_json::Error> {
+        serde_json::from_value(v)
+    }
+
+    #[test]
+    fn test_repo_map_top_n_accepts_float_whole() {
+        let rm = parse_repo_map(json!({"top_n": 15.0})).unwrap();
+        assert_eq!(rm.top_n, Some(15));
+    }
+
+    #[test]
+    fn test_repo_map_top_n_accepts_integer() {
+        let rm = parse_repo_map(json!({"top_n": 15})).unwrap();
+        assert_eq!(rm.top_n, Some(15));
+    }
+
+    #[test]
+    fn test_repo_map_top_n_rejects_fractional() {
+        assert!(parse_repo_map(json!({"top_n": 15.5})).is_err());
+    }
+
+    #[test]
+    fn test_repo_map_top_n_null_is_none() {
+        let rm = parse_repo_map(json!({"top_n": null})).unwrap();
+        assert!(rm.top_n.is_none());
+    }
+
+    #[test]
+    fn test_repo_map_top_n_absent_is_none() {
+        let rm = parse_repo_map(json!({})).unwrap();
+        assert!(rm.top_n.is_none());
+    }
+
+    // -- Multi-field: all u32 fields as floats in one request --
+
+    #[test]
+    fn test_all_u32_fields_as_floats() {
+        let s = parse_search(json!({
+            "query": "test",
+            "limit": 10.0,
+            "hops": 3.0,
+            "depth": 2.0,
+            "min_complexity": 5.0
+        }))
+        .unwrap();
+        assert_eq!(s.limit, Some(10));
+        assert_eq!(s.hops, Some(3));
+        assert_eq!(s.depth, Some(2));
+        assert_eq!(s.min_complexity, Some(5));
     }
 }
