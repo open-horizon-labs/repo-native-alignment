@@ -149,12 +149,12 @@ async fn dispatch_tool(state: &ViewerState, call: &McpCall) -> Result<String, St
                 .params
                 .get("depth")
                 .and_then(value_as_u64_tolerant)
-                .map(|v| v as u32);
+                .and_then(|v| u32::try_from(v).ok());
             let hops = call
                 .params
                 .get("hops")
                 .and_then(value_as_u64_tolerant)
-                .map(|v| v as u32);
+                .and_then(|v| u32::try_from(v).ok());
             let kind = call
                 .params
                 .get("kind")
