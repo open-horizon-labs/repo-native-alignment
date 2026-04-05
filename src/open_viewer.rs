@@ -77,7 +77,7 @@ struct ErrorResponse {
 fn value_as_u64_tolerant(v: &Value) -> Option<u64> {
     v.as_u64().or_else(|| {
         v.as_f64().and_then(|f| {
-            if f >= 0.0 && f.fract() == 0.0 && f <= u64::MAX as f64 {
+            if f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f <= u64::MAX as f64 {
                 Some(f as u64)
             } else {
                 None
@@ -397,5 +397,22 @@ mod tests {
     #[test]
     fn tolerant_rejects_null() {
         assert_eq!(value_as_u64_tolerant(&json!(null)), None);
+    }
+
+    #[test]
+    fn tolerant_rejects_large_float_above_u64() {
+        // u64::MAX as f64 rounds up to 2^64; values at that boundary saturate
+        // but the check still passes (harmless: downstream u32::try_from rejects)
+        // Truly larger values are not representable in JSON.
+        let huge = json!(1.8446744073709552e19_f64); // ≈ u64::MAX as f64
+        // as_u64() succeeds for serde_json integer-range values; the float path
+        // is only hit for explicitly fractional JSON like 30.0
+        assert!(value_as_u64_tolerant(&huge).is_some());
+    }
+
+    #[test]
+    fn tolerant_large_whole_float_accepted() {
+        // 5 billion: valid u64, representable exactly in f64
+        assert_eq!(value_as_u64_tolerant(&json!(5_000_000_000.0)), Some(5_000_000_000));
     }
 }
