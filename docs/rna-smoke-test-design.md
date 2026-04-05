@@ -189,6 +189,7 @@ Both run without a Claude API key. Neither requires additional CI dependencies b
 | `search("agent-alignment", include_artifacts: true)` | ≥1 result with non-empty name field |
 | `search("main", include_artifacts: false)` | ≥1 symbol with file path |
 | `outcome_progress("agent-alignment")` | Non-empty response, no RPC error |
+| `search("<symbol>", mode: "neighbors")` | Returns neighbor nodes (or empty array), no RPC error |
 | Error on unknown tool | `call_tool("nonexistent_tool")` returns RPC error, not a hang |
 | Clean shutdown | `client.close()` completes without timeout |
 

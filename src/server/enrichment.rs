@@ -173,7 +173,7 @@ impl RnaHandler {
         edges: Vec<crate::graph::Edge>,
         dirty_slugs: std::collections::HashSet<String>,
         detected_frameworks: std::collections::HashSet<String>,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         let repo_root = self.repo_root.clone();
         let graph_arc = Arc::clone(&self.graph);
         let lsp_status = Arc::clone(&self.lsp_status);
@@ -432,7 +432,7 @@ impl RnaHandler {
                     lsp_status.set_unavailable();
                 }
             }
-        });
+        })
     }
 
     /// Spawn background embedding after a full graph build.

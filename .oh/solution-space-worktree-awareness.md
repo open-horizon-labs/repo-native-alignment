@@ -11,7 +11,7 @@ outcome: agent-alignment
 ## Problem
 
 RNA MCP server is a single process pointed at one repository path. When agents
-run in git worktrees, `search_symbols` returns main-branch symbols — not the
+run in git worktrees, `search` returns main-branch symbols — not the
 agent's in-progress edits. Business context queries (metis/guardrails) work
 correctly; code navigation is stale because the scanner only knows about the
 primary repo root.
@@ -152,11 +152,11 @@ short hash of the full absolute path) to guarantee uniqueness. The current
 `path_to_slug` only takes the final directory name — this must be addressed in
 Step 1.
 
-### `search_symbols` result presentation with multiple roots
+### `search` result presentation with multiple roots
 
 When both `main::src/foo.rs::handle` and `worktree-feat-x::src/foo.rs::handle`
 are returned for the same query, agents need to know which result is current
-for their working context. The MCP `search_symbols` response already surfaces
+for their working context. The MCP `search` response already surfaces
 the full node ID (which includes `root_id`); no schema change is required, but
 the tool description should be updated to note that `root` identifies the
 source (main vs. worktree).
@@ -177,5 +177,5 @@ call) will pick up new worktrees within one request cycle.
   are not needed because IDs are namespaced — no collision risk.
 - **No manual `rna root add` command.** Auto-detection via `.git/worktrees/`
   is sufficient.
-- **No changes to the MCP protocol.** `search_symbols` already accepts an
+- **No changes to the MCP protocol.** `search` already accepts an
   optional `root` filter parameter for callers who want to scope results.
