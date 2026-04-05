@@ -436,7 +436,7 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     // 19. Metadata round-trip -- persist node with metadata, reload, assert identical
     checks.push(run_metadata_roundtrip_check().await);
 
-    // 20. symbol extraction -- verifies function nodes and Const nodes are findable
+    // 20. symbol extraction -- verifies function nodes are extracted
     checks.push(run_symbol_extraction_check(&all_nodes));
 
     // 21. graph traversal -- verifies GraphIndex has edges and neighbors() is callable
@@ -669,7 +669,7 @@ pub fn rna_smoke_common_fn() -> u32 { 2 }\n\
 }
 
 /// Worktree-specific check: creates a temp git worktree, writes a unique function,
-/// scans, and verifies search finds it.
+/// scans, and verifies extraction output contains the symbol.
 ///
 /// NOTE: This test will initially fail if #46 (feat/rna-worktree-awareness) is not merged.
 /// It is guarded so CI does not block on it — a Skip is reported rather than a Fail
