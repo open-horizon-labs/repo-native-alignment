@@ -155,9 +155,11 @@ impl QueryExtractor {
 /// Configuration for a single route-decorator query pattern.
 ///
 /// Each `RouteQueryConfig` describes one tree-sitter query that detects
-/// HTTP route decorators in a specific language/framework. The query must
-/// produce at least a `@path` capture containing the HTTP path string.
-/// An optional `@method` capture carries the HTTP method verb.
+/// HTTP route decorators in a specific language/framework. The query may
+/// contain multiple patterns: one that captures `@path` (the HTTP path string)
+/// and one for bare decorators (no path arg). When `@path` is absent, the
+/// extraction code defaults to an empty path. An optional `@method` capture
+/// carries the HTTP method verb.
 ///
 /// Used in [`LangConfig::route_queries`](super::generic::LangConfig).
 #[derive(Debug, Clone, Copy)]
@@ -648,6 +650,137 @@ public class Foo {
 
         let captures = extractor.run(tree.root_node(), source.as_bytes());
         assert!(captures.is_empty(), "@Override should not be captured");
+    }
+
+    // ── Bare route decorator query tests (#626) ──────────────────────────
+
+    /// Verify `@GetMapping` (marker annotation, no parens) is captured.
+    #[test]
+    fn test_java_bare_marker_annotation_captured() {
+        let source = r#"
+public class ItemController {
+    @GetMapping
+    public List<Item> list() { return null; }
+}
+"#;
+        let query_source = r#"
+(marker_annotation
+  name: (identifier) @name
+  (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)$"))
+"#;
+        let language: Language = tree_sitter_java::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(
+            !captures.is_empty(),
+            "should detect @GetMapping marker annotation (no parens)"
+        );
+        // No @path capture — bare pattern
+        assert!(
+            captures[0].get("path").is_none(),
+            "bare marker annotation should not have @path capture"
+        );
+    }
+
+    /// Verify `@PostMapping()` (empty argument list) is captured.
+    #[test]
+    fn test_java_bare_empty_args_annotation_captured() {
+        let source = r#"
+public class ItemController {
+    @PostMapping()
+    public Item create() { return null; }
+}
+"#;
+        let query_source = r#"
+(annotation
+  name: (identifier) @name
+  arguments: (annotation_argument_list)
+  (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)$"))
+"#;
+        let language: Language = tree_sitter_java::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(
+            !captures.is_empty(),
+            "should detect @PostMapping() with empty argument list"
+        );
+        assert!(
+            captures[0].get("path").is_none(),
+            "bare empty-args annotation should not have @path capture"
+        );
+    }
+
+    /// Verify bare `@Get()` decorator (NestJS, no path) is captured.
+    #[test]
+    fn test_typescript_bare_decorator_captured() {
+        let source = r#"
+class ItemsController {
+  @Get()
+  findAll() {}
+}
+"#;
+        let query_source = r#"
+(decorator
+  (call_expression
+    function: (identifier) @name
+    arguments: (arguments))
+  (#match? @name "^(Get|Post|Put|Delete|Patch|Head|Options)$"))
+"#;
+        let language: Language = tree_sitter_typescript::LANGUAGE_TSX.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(
+            !captures.is_empty(),
+            "should detect bare @Get() decorator"
+        );
+        assert!(
+            captures[0].get("path").is_none(),
+            "bare decorator should not have @path capture"
+        );
+    }
+
+    /// Verify bare `@app.get()` decorator (Python FastAPI, no path) is captured.
+    #[test]
+    fn test_python_bare_decorator_captured() {
+        let source = r#"
+@app.get()
+def root():
+    pass
+"#;
+        let query_source = r#"
+(decorator
+  (call
+    function: (_) @name
+    arguments: (argument_list))
+  (#match? @name "route$|get$|post$|put$|delete$|patch$|head$|options$"))
+"#;
+        let language: Language = tree_sitter_python::LANGUAGE.into();
+        let extractor = QueryExtractor::new(&language, query_source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let captures = extractor.run(tree.root_node(), source.as_bytes());
+        assert!(
+            !captures.is_empty(),
+            "should detect bare @app.get() decorator"
+        );
+        assert!(
+            captures[0].get("path").is_none(),
+            "bare decorator should not have @path capture"
+        );
     }
 
     // ── Go gin route detection ────────────────────────────────────────────

@@ -1570,8 +1570,10 @@ fn infer_method_from_name(name: &str, default: &str) -> String {
 /// `compiled[i]` is `Some(extractor)` if the query at `configs[i]` compiled
 /// successfully, or `None` if compilation failed. The `None` slots are skipped.
 ///
-/// Each matched capture set must have at least a `@path` capture. An optional
-/// `@method` capture overrides `default_method` for the HTTP verb.
+/// When `@path` is captured, its text is stripped of quotes and used as the
+/// HTTP path. When `@path` is absent (bare decorator, e.g. `@Get()`), the
+/// path defaults to `""`. An optional `@method` capture overrides
+/// `default_method` for the HTTP verb.
 ///
 /// Called from [`GenericExtractor::run`] after normal manual traversal, so it
 /// is purely additive — existing extraction is unaffected.
@@ -1601,21 +1603,32 @@ fn run_route_queries(
         .map(|n| (n.line_start, n.id.clone()))
         .collect();
 
+    // Track emitted decorator positions to prevent double-counting when both
+    // the with-path and bare patterns in the same query match the same decorator.
+    // Key: start_byte of the @name capture (unique per decorator).
+    let mut emitted: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+
     for (cfg, maybe_extractor) in configs.iter().zip(compiled.iter()) {
         let extractor = match maybe_extractor {
             Some(e) => e,
             None => continue, // compile failed; warning already emitted at init
         };
         let captures: Vec<CaptureSet> = extractor.run(root, source);
-        for capture in captures {
-            let raw_path = match capture.get("path") {
-                Some(p) => p.to_string(),
-                None => continue,
-            };
-            let http_path = strip_quotes(&raw_path);
-            if http_path.is_empty() {
+        // Sort: with-path captures first so dedup prefers explicit paths over
+        // bare-pattern duplicates (both patterns match when a string arg is present).
+        let mut sorted: Vec<&CaptureSet> = captures.iter().collect();
+        sorted.sort_by_key(|c| c.get("path").is_none());
+        for capture in sorted {
+            // Deduplicate: if a with-path pattern already matched this decorator,
+            // skip the bare pattern's duplicate match.
+            if !emitted.insert(capture.start_byte) {
                 continue;
             }
+
+            let http_path = capture
+                .get("path")
+                .map(strip_quotes)
+                .unwrap_or_default();
 
             let method = if let Some(m) = capture.get("method") {
                 infer_method_from_name(m, cfg.default_method)
@@ -1625,7 +1638,11 @@ fn run_route_queries(
                 cfg.default_method.to_string()
             };
 
-            let name = format!("{} {}", method, http_path);
+            let name = if http_path.is_empty() {
+                method.clone()
+            } else {
+                format!("{} {}", method, http_path)
+            };
             let mut metadata = BTreeMap::new();
             metadata.insert("http_method".to_string(), method.clone());
             metadata.insert("http_path".to_string(), http_path.clone());
@@ -1685,7 +1702,11 @@ fn run_route_queries(
                 language: language_name.to_string(),
                 line_start: capture.start_row + 1,
                 line_end: capture.end_row + 1,
-                signature: format!("[route_decorator] {} {}", method, http_path),
+                signature: if http_path.is_empty() {
+                    format!("[route_decorator] {}", method)
+                } else {
+                    format!("[route_decorator] {} {}", method, http_path)
+                },
                 body: String::new(),
                 metadata,
                 source: ExtractionSource::TreeSitter,
@@ -5100,6 +5121,191 @@ public class ItemController {
                 .unwrap_or(false)
         });
         assert!(get_node.is_some(), "should infer GET for @GetMapping");
+    }
+
+    // -----------------------------------------------------------------------
+    // Bare route decorator tests (#626)
+    // -----------------------------------------------------------------------
+
+    /// NestJS: `@Get()` and `@Post()` with no path argument should emit
+    /// ApiEndpoint nodes with empty path.
+    #[test]
+    fn test_typescript_bare_route_decorators_emit_api_endpoint() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let ext = GenericExtractor::new(&TYPESCRIPT_CONFIG);
+        let code = r#"
+class ItemsController {
+  @Get()
+  findAll() {}
+
+  @Post()
+  create() {}
+
+  @Delete("/items/:id")
+  remove() {}
+}
+"#;
+        let result = ext.run(Path::new("items.controller.ts"), code).unwrap();
+        let api_nodes: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(
+            api_nodes.len(),
+            3,
+            "should emit 3 ApiEndpoint nodes (2 bare + 1 with path), got: {:?}",
+            api_nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+        );
+
+        // Bare @Get() should have empty http_path
+        let get_node = api_nodes.iter().find(|n| {
+            n.metadata.get("http_method").map(|m| m == "GET").unwrap_or(false)
+                && n.metadata.get("http_path").map(|p| p.is_empty()).unwrap_or(false)
+        });
+        assert!(get_node.is_some(), "should have GET endpoint with empty path");
+
+        // Bare @Post() should have empty http_path
+        let post_node = api_nodes.iter().find(|n| {
+            n.metadata.get("http_method").map(|m| m == "POST").unwrap_or(false)
+                && n.metadata.get("http_path").map(|p| p.is_empty()).unwrap_or(false)
+        });
+        assert!(post_node.is_some(), "should have POST endpoint with empty path");
+
+        // Explicit @Delete("/items/:id") should still work
+        let delete_node = api_nodes.iter().find(|n| {
+            n.metadata.get("http_method").map(|m| m == "DELETE").unwrap_or(false)
+                && n.metadata.get("http_path").map(|p| p == "/items/:id").unwrap_or(false)
+        });
+        assert!(
+            delete_node.is_some(),
+            "should have DELETE endpoint with explicit path"
+        );
+    }
+
+    /// Python FastAPI: `@app.get()` with no path argument should emit
+    /// ApiEndpoint node with empty path.
+    #[test]
+    fn test_python_bare_route_decorator_emits_api_endpoint() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let ext = GenericExtractor::new(&PYTHON_CONFIG);
+        let code = r#"
+@app.get()
+def root():
+    pass
+
+@app.post("/items")
+def create_item():
+    pass
+"#;
+        let result = ext.run(Path::new("routes.py"), code).unwrap();
+        let api_nodes: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(
+            api_nodes.len(),
+            2,
+            "should emit 2 ApiEndpoint nodes (1 bare + 1 with path), got: {:?}",
+            api_nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+        );
+
+        // Bare @app.get() should have empty http_path
+        let bare_node = api_nodes.iter().find(|n| {
+            n.metadata.get("http_path").map(|p| p.is_empty()).unwrap_or(false)
+        });
+        assert!(bare_node.is_some(), "should have endpoint with empty path");
+        assert_eq!(
+            bare_node.unwrap().metadata.get("http_method"),
+            Some(&"GET".to_string()),
+            "bare @app.get() should infer GET"
+        );
+    }
+
+    /// Java Spring: `@GetMapping` (marker annotation) and `@PostMapping()`
+    /// (empty args) should emit ApiEndpoint nodes with empty path.
+    #[test]
+    fn test_java_bare_route_annotations_emit_api_endpoint() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let ext = GenericExtractor::new(&JAVA_CONFIG);
+        let code = r#"
+public class ItemController {
+    @GetMapping
+    public List<Item> list() {
+        return null;
+    }
+
+    @PostMapping()
+    public Item create() {
+        return null;
+    }
+
+    @DeleteMapping("/items/{id}")
+    public void delete(@PathVariable Long id) {}
+}
+"#;
+        let result = ext.run(Path::new("ItemController.java"), code).unwrap();
+        let api_nodes: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(
+            api_nodes.len(),
+            3,
+            "should emit 3 ApiEndpoint nodes (2 bare + 1 with path), got: {:?}",
+            api_nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+        );
+
+        // @GetMapping (marker annotation, no parens) should have empty path
+        let get_node = api_nodes.iter().find(|n| {
+            n.metadata.get("http_method").map(|m| m == "GET").unwrap_or(false)
+                && n.metadata.get("http_path").map(|p| p.is_empty()).unwrap_or(false)
+        });
+        assert!(get_node.is_some(), "should have GET endpoint with empty path");
+
+        // @PostMapping() (empty args) should have empty path
+        let post_node = api_nodes.iter().find(|n| {
+            n.metadata.get("http_method").map(|m| m == "POST").unwrap_or(false)
+                && n.metadata.get("http_path").map(|p| p.is_empty()).unwrap_or(false)
+        });
+        assert!(post_node.is_some(), "should have POST endpoint with empty path");
+
+        // @DeleteMapping("/items/{id}") should still work
+        let delete_node = api_nodes.iter().find(|n| {
+            n.metadata.get("http_method").map(|m| m == "DELETE").unwrap_or(false)
+                && n.metadata.get("http_path").map(|p| p == "/items/{id}").unwrap_or(false)
+        });
+        assert!(
+            delete_node.is_some(),
+            "should have DELETE endpoint with explicit path"
+        );
+    }
+
+    /// Regression: TypeScript decorators with explicit paths must not be
+    /// double-counted by the bare pattern.
+    #[test]
+    fn test_typescript_explicit_path_not_double_counted() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let ext = GenericExtractor::new(&TYPESCRIPT_CONFIG);
+        let code = r#"
+class UserController {
+  @Get("/users")
+  findAll() {}
+}
+"#;
+        let result = ext.run(Path::new("user.controller.ts"), code).unwrap();
+        let api_nodes: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(
+            api_nodes.len(),
+            1,
+            "explicit @Get(\"/users\") must emit exactly 1 node, not 2 (no double-counting)"
+        );
     }
 
     // -----------------------------------------------------------------------
