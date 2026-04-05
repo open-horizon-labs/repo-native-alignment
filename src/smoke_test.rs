@@ -327,7 +327,7 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
         }
     }
 
-    // 8. search_symbols path — substring search on extracted nodes
+    // 8. search path — substring search on extracted nodes
     let query_lower = "main";
     let symbol_matches: Vec<_> = all_nodes
         .iter()
@@ -338,12 +338,12 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
         .collect();
     if !symbol_matches.is_empty() {
         checks.push(Check::pass(
-            "search_symbols",
+            "search",
             format!("{} symbols match \"{}\"", symbol_matches.len(), query_lower),
         ));
     } else {
         checks.push(Check::fail(
-            "search_symbols",
+            "search",
             format!("No symbols match \"{}\"", query_lower),
         ));
     }
@@ -436,11 +436,11 @@ pub async fn run(args: &TestArgs) -> Result<bool> {
     // 19. Metadata round-trip -- persist node with metadata, reload, assert identical
     checks.push(run_metadata_roundtrip_check().await);
 
-    // 20. search_symbols -- verifies function nodes and Const nodes are findable
-    checks.push(run_search_symbols_check(&all_nodes));
+    // 20. symbol extraction -- verifies function nodes and Const nodes are findable
+    checks.push(run_symbol_extraction_check(&all_nodes));
 
-    // 21. graph_query -- verifies GraphIndex has edges and neighbors() is callable
-    checks.push(run_graph_query_check(&index, &all_nodes));
+    // 21. graph traversal -- verifies GraphIndex has edges and neighbors() is callable
+    checks.push(run_graph_traversal_check(&index, &all_nodes));
 
     // 22. search (semantic/artifact) -- searches for "alignment" in embedding index
     checks.push(run_search_artifact_semantic_check(&embed_index).await);
@@ -669,7 +669,7 @@ pub fn rna_smoke_common_fn() -> u32 { 2 }\n\
 }
 
 /// Worktree-specific check: creates a temp git worktree, writes a unique function,
-/// scans, and verifies search_symbols finds it.
+/// scans, and verifies search finds it.
 ///
 /// NOTE: This test will initially fail if #46 (feat/rna-worktree-awareness) is not merged.
 /// It is guarded so CI does not block on it — a Skip is reported rather than a Fail
@@ -1281,12 +1281,12 @@ async fn run_metadata_roundtrip_check() -> Check {
     }
 }
 
-/// search_symbols check: verifies that the extracted nodes include function nodes
+/// symbol extraction check: verifies that the extracted nodes include function nodes
 /// and that they are findable by kind.
-fn run_search_symbols_check(nodes: &[crate::graph::Node]) -> Check {
+fn run_symbol_extraction_check(nodes: &[crate::graph::Node]) -> Check {
     if nodes.is_empty() {
         return Check::skip(
-            "search_symbols_check",
+            "symbol_extraction",
             "No nodes available (extraction may have failed)",
         );
     }
@@ -1303,12 +1303,12 @@ fn run_search_symbols_check(nodes: &[crate::graph::Node]) -> Check {
 
     if function_nodes.is_empty() {
         Check::fail(
-            "search_symbols_check",
+            "symbol_extraction",
             format!("No Function nodes found in {} total nodes", nodes.len()),
         )
     } else {
         Check::pass(
-            "search_symbols_check",
+            "symbol_extraction",
             format!(
                 "{} function node(s) found, {} other node(s) (total: {})",
                 function_nodes.len(),
@@ -1319,12 +1319,12 @@ fn run_search_symbols_check(nodes: &[crate::graph::Node]) -> Check {
     }
 }
 
-/// graph_query check: verifies the GraphIndex has been populated with edges and
+/// graph traversal check: verifies the GraphIndex has been populated with edges and
 /// that neighbors() is callable and returns sensible results.
-fn run_graph_query_check(index: &GraphIndex, nodes: &[crate::graph::Node]) -> Check {
+fn run_graph_traversal_check(index: &GraphIndex, nodes: &[crate::graph::Node]) -> Check {
     if nodes.is_empty() {
         return Check::skip(
-            "graph_query_check",
+            "graph_traversal",
             "No nodes available — skipping graph query",
         );
     }
@@ -1335,7 +1335,7 @@ fn run_graph_query_check(index: &GraphIndex, nodes: &[crate::graph::Node]) -> Ch
     // If no nodes in index, graph was likely not built from edges — skip gracefully
     if node_count == 0 {
         return Check::skip(
-            "graph_query_check",
+            "graph_traversal",
             "GraphIndex is empty (no edges extracted). This is expected for repos with no call edges yet.",
         );
     }
@@ -1347,7 +1347,7 @@ fn run_graph_query_check(index: &GraphIndex, nodes: &[crate::graph::Node]) -> Ch
     let incoming = index.neighbors(&node_id, None, Direction::Incoming);
 
     Check::pass(
-        "graph_query_check",
+        "graph_traversal",
         format!(
             "GraphIndex: {} nodes, {} edges. First node '{}': {} outgoing, {} incoming neighbors",
             node_count,

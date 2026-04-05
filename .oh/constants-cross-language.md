@@ -77,10 +77,10 @@ pub synthetic: bool,          // true = inferred literal, false = declared const
 - [x] Proto: enum values and `option` fields captured
 - [ ] Single-token string literals (len > 3) captured as `synthetic: true` in all code extractors (deferred — high noise, separate issue)
 - [x] `CodeSymbol::to_markdown` displays value inline; synthetics badged with `*(literal)*`
-- [x] `search_symbols` MCP tool returns cross-language constants with value visible in results
+- [x] `search` MCP tool returns cross-language constants with value visible in results
 - [x] README documents the constants/literals capture behavior
 - [x] Smoke test covers: `const_extraction` check verifies Const nodes with values
-- [x] No new MCP tools added; `search_symbols` remains the sole surface
+- [x] No new MCP tools added; `search` remains the sole surface
 
 ## Execute
 **Updated:** 2026-03-08
@@ -103,7 +103,7 @@ Test count: 155 → 159 (4 new tests added for Rust, Python, Go, YAML const extr
 **Status:** blocking issue found, comment posted to PR #50
 
 ### Blocker
-`value` and `synthetic` are stored in `graph::Node.metadata` (in-memory), but `symbols_schema` (`src/graph/store.rs:15`) has no `metadata` column. On server restart, `build_full_graph` short-circuits to LanceDB when no file changes are detected (`src/server.rs:1078-1092`). Nodes loaded from LanceDB have `metadata: BTreeMap::new()` (`src/server.rs:607`). The `search_symbols` display at `src/server.rs:1886-1891` finds nothing — `Value:` lines are silently absent after restart.
+`value` and `synthetic` are stored in `graph::Node.metadata` (in-memory), but `symbols_schema` (`src/graph/store.rs:15`) has no `metadata` column. On server restart, `build_full_graph` short-circuits to LanceDB when no file changes are detected (`src/server.rs:1078-1092`). Nodes loaded from LanceDB have `metadata: BTreeMap::new()` (`src/server.rs:607`). The `search` display at `src/server.rs:1886-1891` finds nothing — `Value:` lines are silently absent after restart.
 
 Fix: add `value` and `synthetic` columns to `symbols_schema` and populate/restore them in the persist/load paths.
 

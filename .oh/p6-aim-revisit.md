@@ -31,12 +31,12 @@ Both are lookup tools. What's needed is *discovery*.
 
 | Skill Phase | Needs | Search Query Pattern | Writes Back |
 |-------------|-------|---------------------|-------------|
-| `/aim` | Existing outcomes, related endeavors | `oh_search_context("outcomes related to [task]")` | New/updated outcome |
-| `/problem-space` | Metis (what we've tried), constraints | `oh_search_context("learnings about [domain]")` | — |
-| `/solution-space` | Metis, prior solution attempts | `oh_search_context("solutions tried for [problem]")` | Decision metis |
-| `/execute` | Outcome progress, what's been done | `oh_search_context("progress on [outcome]")` | Signal records |
-| `/review` | Guardrails, acceptance criteria | `oh_search_context("guardrails for [area]")` | — |
-| `/dissent` | Guardrails + metis (constraints + failures) | `oh_search_context("risks and failures in [area]")` | — |
+| `/aim` | Existing outcomes, related endeavors | `search("outcomes related to [task]", include_artifacts: true)` | New/updated outcome |
+| `/problem-space` | Metis (what we've tried), constraints | `search("learnings about [domain]", include_artifacts: true)` | — |
+| `/solution-space` | Metis, prior solution attempts | `search("solutions tried for [problem]", include_artifacts: true)` | Decision metis |
+| `/execute` | Outcome progress, what's been done | `search("progress on [outcome]", include_artifacts: true)` | Signal records |
+| `/review` | Guardrails, acceptance criteria | `search("guardrails for [area]", include_artifacts: true)` | — |
+| `/dissent` | Guardrails + metis (constraints + failures) | `search("risks and failures in [area]", include_artifacts: true)` | — |
 | `/salvage` | — (produces, doesn't consume much) | — | Metis + guardrail candidates |
 
 **Key pattern:** every read is a semantic search, not an ID lookup. The agent describes what it's doing; RNA MCP finds what's relevant.
@@ -52,10 +52,10 @@ LanceDB is already a Cargo dependency (commented out). We need:
 
 Embedding model: `fastembed-rs` (Rust-native, ONNX-based, local, no API key).
 
-### 2. `oh_search_context` Tool
+### 2. `search` Tool (with artifacts)
 
 ```
-oh_search_context(
+search(
   query: string,             // natural language
   artifact_types: [string],  // filter: ["outcomes", "guardrails", "metis", "signals"]
   limit: int                 // default 5
@@ -70,7 +70,7 @@ Existing write tools (`oh_record_metis`, `oh_update_outcome`, etc.) compute and 
 
 ### 4. What We Do NOT Need
 
-- **oh_init** — if `.oh/` is empty, `oh_search_context` returns empty. That's fine.
+- **oh_init** — if `.oh/` is empty, `search` returns empty. That's fine.
 - **resolve_references** — subsumed. Search for what you mean, not what you name.
 
 ## Guardrails
@@ -85,9 +85,9 @@ Existing write tools (`oh_record_metis`, `oh_update_outcome`, etc.) compute and 
 
 1. Add `fastembed-rs` — local embedding computation
 2. Index `.oh/` artifacts into LanceDB on server startup
-3. `oh_search_context` tool — semantic search, filtered by artifact type
+3. `search` tool — semantic search, filtered by artifact type
 4. Auto-embed on write — write tools update the index
-5. Update skill preambles — "call `oh_search_context` with your task description"
+5. Update skill preambles — "call `search` with your task description"
 6. Test on this repo — run skills, verify context quality
 
 Steps 1-3 are the minimum viable slice. Steps 4-5 close the loop.
@@ -122,7 +122,7 @@ Do we need neural embeddings for 15 files? LanceDB supports full-text search (BM
 
 ### Assumptions
 1. BM25 full-text is sufficient for small `.oh/` corpus — if false: add embeddings
-2. Agents will use `oh_search_context` — strong belief: preambles already say to
+2. Agents will use `search` — strong belief: preambles already say to
 3. One search tool replaces "list all then filter" — if false: keep existing list tools
 
 ### Ready for /solution-space?
@@ -136,19 +136,19 @@ Yes.
 **Selected:** `fastembed-rs` + LanceDB vector search
 **Level:** Local Optimum (right tool, not over-engineered)
 
-One new tool: `oh_search_context(query, artifact_types, limit)`. Agent describes what it needs in natural language, gets back the top-k relevant `.oh/` artifacts ranked by semantic similarity. `BAAI/bge-small-en-v1.5` model (~30MB, local ONNX, no API key).
+One new tool: `search(query, artifact_types, limit)`. Agent describes what it needs in natural language, gets back the top-k relevant `.oh/` artifacts ranked by semantic similarity. `BAAI/bge-small-en-v1.5` model (~30MB, local ONNX, no API key).
 
 ### Implementation
 1. Uncomment `lancedb`, add `fastembed` to Cargo.toml
 2. `src/embed.rs`: EmbeddingIndex wrapping LanceDB + fastembed
 3. Index `.oh/` artifacts on server startup
-4. `oh_search_context` tool in server.rs
+4. `search` tool in server.rs
 5. Auto-embed on write (record_metis, update_outcome, etc.)
-6. Update skill preambles: "call oh_search_context with task description"
+6. Update skill preambles: "call search with task description"
 
 ### What stays
 - Existing list tools (`oh_get_outcomes`, `oh_get_guardrails`) for exhaustive queries
 - `outcome_progress` for structural joins
-- `search_all` for grep-style search
+- `search` for grep-style search
 
-`oh_search_context` is additive — discovery layer on top of the existing exact-match tools.
+`search` is additive — discovery layer on top of the existing exact-match tools.
