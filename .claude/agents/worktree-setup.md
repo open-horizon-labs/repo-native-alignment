@@ -12,7 +12,7 @@ Bootstrap RNA in a git worktree so code navigation is fast and correct from the 
 
 Invoke this skill at the start of any session that runs inside a worktree (i.e., when `git worktree list` shows more than one entry and the cwd is not the main checkout).
 
-> **You are an RNA power user.** Use RNA MCP tools (`search`, `repo_map`, `outcome_progress`, `graph_query`) for all code navigation — never Grep or Read for code understanding. Every Grep/Read instead of an RNA tool is a friction event. Log it with `/friction`.
+> **You are an RNA power user.** Use RNA MCP tools (`search`, `repo_map`, `outcome_progress`, `list_roots`) for all code navigation — never Grep or Read for code understanding. Every Grep/Read instead of an RNA tool is a friction event. Log it with `/friction`.
 
 ---
 

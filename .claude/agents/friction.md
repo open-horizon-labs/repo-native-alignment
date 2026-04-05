@@ -54,7 +54,7 @@ Write friction to `.oh/friction-logs/<pipeline-or-context>.md` — one file per 
 
 | Phase/Step | Tool | What happened | Workaround | Severity |
 |------------|------|---------------|------------|----------|
-| Phase 3 | search_symbols (skipped) | Needed to find all functions in embed.rs | Used Grep for "fn " | skipped |
+| Phase 3 | search (skipped) | Needed to find all functions in embed.rs | Used Grep for "fn " | skipped |
 
 Also append to the active session file's `## RNA Tool Friction Log` table if one exists — this keeps friction visible in the session while the canonical log lives in `.oh/friction-logs/`.
 
@@ -97,11 +97,11 @@ The `skipped` count and adoption rate are the most important metrics. A pipeline
 | Need | RNA tool to try FIRST | Grep/Read is friction if... |
 |------|----------------------|---------------------------|
 | Find code by intent | `search(query)` | You Grep for keywords instead |
-| Find symbols by name/kind | `search_symbols(query, kind, ...)` | You Grep for `fn `, `struct `, `impl ` |
-| Trace dependencies | `graph_query(node, mode: "neighbors")` | You Read imports manually |
-| Assess blast radius | `graph_query(node, mode: "impact")` | You guess from file structure |
+| Find symbols by name/kind | `search(query, kind, ...)` | You Grep for `fn `, `struct `, `impl ` |
+| Trace dependencies | `search(node, mode: "neighbors")` | You Read imports manually |
+| Assess blast radius | `search(node, mode: "impact")` | You guess from file structure |
 | Check outcome alignment | `outcome_progress(outcome_id)` | You Read `.oh/outcomes/` manually |
 | Find guardrails | `search(query, artifact_types=["guardrail"])` | You Grep `.oh/guardrails/` |
-| Understand a function's role | `graph_query(node, mode: "neighbors")` | You Read the file and scan context |
+| Understand a function's role | `search(node, mode: "neighbors")` | You Read the file and scan context |
 
 **The rule:** Try the RNA tool first. If it doesn't work, use whatever does — but log why. If you don't try it, log why not.

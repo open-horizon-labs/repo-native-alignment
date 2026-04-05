@@ -13,7 +13,7 @@ The full quality gate for this project. 13 steps. Run sequentially — each step
 > **You are an RNA power user.** Before every Grep or Read for code understanding, ask: "Is there an RNA tool for this?"
 >
 > **Two RNA access paths — use the right one:**
-> - **MCP tools** (`search`, `repo_map`, `outcome_progress`, `search_symbols`, `graph_query`) — use for project-level context: guardrails, outcomes, metis, impact analysis. These query the main RNA repo index.
+> - **MCP tools** (`search`, `repo_map`, `outcome_progress`, `list_roots`) — use for project-level context: guardrails, outcomes, metis, impact analysis. These query the main RNA repo index.
 >   - **Worktree-aware queries:** use the `repo` parameter to scope to your worktree's graph:
 >     ```text
 >     mcp__rna-mcp__search(query="handle_search", repo="/path/to/worktree")
@@ -247,9 +247,8 @@ This step exists because PR #137 taught us: computing a value is not delivering 
 - [ ] **Write path:** Is the metadata written to the Arrow batch in BOTH construction sites in server.rs (initial + upsert)?
 - [ ] **Read path:** Is the metadata read back from Arrow into Node.metadata during load?
 - [ ] **Render:** Does the value appear in ALL relevant MCP tool outputs?
-  - `search_symbols` formatting
-  - `graph_query` / `format_neighbor_nodes` formatting
   - `search` code results formatting
+  - `search` graph traversal (neighbors/impact) formatting
 - [ ] **End-to-end (MCP server path):** Start the MCP server and verify through the MCP protocol — not just CLI. Run `.github/scripts/mcp-smoke.mjs ./target/release/repo-native-alignment .github/fixtures/smoke` and verify the specific feature being tested. If the feature isn't covered by the smoke script, add an assertion to it or test manually with `npx @modelcontextprotocol/inspector`. **Unit tests and CLI scans do not substitute for this — the MCP server has a different code path and has regressed multiple times when only the CLI was tested.**
 
 **If the PR doesn't add agent-visible data, mark this step N/A.**
@@ -263,9 +262,8 @@ gh pr comment <PR> --body "$(cat <<'EOF'
 - [x/blank] Write path: initial batch construction (server.rs)
 - [x/blank] Write path: upsert batch construction (server.rs)
 - [x/blank] Read path: Arrow → Node.metadata during load
-- [x/blank] Render: `search_symbols` formatting
-- [x/blank] Render: `graph_query` / `format_neighbor_nodes` formatting
 - [x/blank] Render: `search` code results formatting
+- [x/blank] Render: `search` graph traversal (neighbors/impact) formatting
 - [x/blank] End-to-end: value visible in tool output after `cargo install --path .` + restart + rescan
 - [x/blank] MCP server path: verified via `mcp-smoke.mjs` or `@modelcontextprotocol/inspector` (not just CLI)
 EOF
