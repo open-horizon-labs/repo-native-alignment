@@ -1568,12 +1568,13 @@ impl RnaHandler {
             // #574: spawn background LSP enrichment (restores v0.1.14 pattern).
             // The graph returned below has tree-sitter + non-LSP passes only.
             // This task runs LSP, re-computes PageRank/subsystems, and ArcSwaps.
-            self.spawn_background_lsp_enrichment(
+            let lsp_handle = self.spawn_background_lsp_enrichment(
                 all_nodes.clone(),
                 all_edges.clone(),
                 dirty_slugs_for_lsp,
                 all_detected_frameworks.clone(),
             );
+            *self.lsp_handle.lock().await = Some(lsp_handle);
 
             let handle = self.spawn_background_enrichment(&all_nodes);
             // Store the handle so CLI callers can await it before the runtime

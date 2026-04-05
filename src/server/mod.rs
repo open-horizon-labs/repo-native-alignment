@@ -126,6 +126,9 @@ pub struct RnaHandler {
     /// CLI callers can await this to ensure embeddings complete before the runtime shuts down.
     /// MCP server callers leave it as fire-and-forget (the handle is dropped on next scan).
     pub embed_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// JoinHandle for the background LSP enrichment task spawned by `spawn_background_lsp_enrichment`.
+    /// CLI callers can await this; MCP server callers treat as fire-and-forget.
+    pub lsp_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Notifies waiters when the pre-warm task completes (success or failure).
     /// `get_graph()` listens on this to avoid starting a duplicate build while
     /// pre-warm is in progress.
@@ -160,6 +163,7 @@ impl Default for RnaHandler {
                 crate::extract::scan_stats::ScanStats::default(),
             )),
             embed_handle: tokio::sync::Mutex::new(None),
+            lsp_handle: tokio::sync::Mutex::new(None),
             prewarm_notify: Arc::new(tokio::sync::Notify::new()),
             prewarm_started: std::sync::atomic::AtomicBool::new(false),
             graph_build_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -192,6 +196,7 @@ impl RnaHandler {
             lsp_only_roots: Arc::clone(&self.lsp_only_roots),
             scan_stats: Arc::clone(&self.scan_stats),
             embed_handle: tokio::sync::Mutex::new(None),
+            lsp_handle: tokio::sync::Mutex::new(None),
             prewarm_notify: Arc::clone(&self.prewarm_notify),
             prewarm_started: std::sync::atomic::AtomicBool::new(false),
             graph_build_lock: Arc::clone(&self.graph_build_lock),
@@ -1229,6 +1234,11 @@ mod tests {
     ///
     /// This ensures the fix works not just within a single server session but across
     /// repeated `scan` commands — the production scenario that triggered the re-open.
+    ///
+    /// Each build's background LSP enrichment handle is awaited before dropping
+    /// the handler. Without this, the detached background task can re-persist to
+    /// LanceDB with a new scan_version while the next handler reads, causing a
+    /// version mismatch (committed_version points to rows not yet visible).
     #[tokio::test]
     async fn test_declared_root_persists_across_fresh_handler_scans() {
         use tempfile::TempDir;
@@ -1313,8 +1323,15 @@ mod tests {
                 gs2.nodes.iter().any(|n| n.id.name == "secondary_fn"),
                 "secondary_fn must be in-memory after second build with fresh handler"
             );
+            // Await background LSP enrichment before dropping handler2.
+            // The background task re-persists to LanceDB with a new scan_version;
+            // if it runs concurrently with handler3's read, the version file and
+            // LanceDB table can be transiently inconsistent.
+            if let Some(h) = handler2.lsp_handle.lock().await.take() {
+                let _ = h.await;
+            }
         }
-        // Handler #2 dropped -- simulates CLI process exit.
+        // Handler #2 dropped -- background tasks already drained.
 
         // Verify LanceDB was updated.
         let persisted2 = crate::server::load_graph_from_lance(primary.path())
