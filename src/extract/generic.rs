@@ -1597,10 +1597,13 @@ fn run_route_queries(
     // Built once before the outer loop so it doesn't scale with O(routes × nodes).
     // Only includes nodes already in `nodes` (tree-sitter extracted Functions) —
     // ApiEndpoint nodes emitted during this pass are not yet present and need not be.
-    let fn_by_line: std::collections::HashMap<usize, NodeId> = nodes
+    let fn_by_line: std::collections::HashMap<usize, (NodeId, Option<String>)> = nodes
         .iter()
         .filter(|n| n.id.kind == NodeKind::Function && n.id.file == path)
-        .map(|n| (n.line_start, n.id.clone()))
+        .map(|n| {
+            let scope = n.metadata.get("parent_scope").cloned();
+            (n.line_start, (n.id.clone(), scope))
+        })
         .collect();
 
     // Track emitted decorator positions to prevent double-counting when both
@@ -1638,8 +1641,32 @@ fn run_route_queries(
                 cfg.default_method.to_string()
             };
 
+            // The decorator ends at `capture.end_row` (0-indexed). The handler
+            // function definition begins on the very next line or within a small
+            // window below (e.g., one blank line between decorator and `def`).
+            // `line_start` on Node is 1-indexed, so the expected range is
+            // [end_row+2 .. end_row+2+HANDLER_SEARCH_WINDOW].
+            let decorator_end_line = capture.end_row + 1; // convert to 1-indexed
+            let search_start = decorator_end_line + 1;
+            let search_end = decorator_end_line + 1 + HANDLER_SEARCH_WINDOW;
+
+            // Find the handler function in the pre-built index: scan the narrow
+            // window [search_start, search_end] instead of the entire node list.
+            let handler = (search_start..=search_end).find_map(|line| fn_by_line.get(&line));
+
+            // Build a unique name. When the path is empty (bare decorator), use
+            // the handler function name as discriminator so two @Get() in the same
+            // file don't collapse into one NodeId.
             let name = if http_path.is_empty() {
-                method.clone()
+                if let Some((handler_id, scope)) = &handler {
+                    if let Some(s) = scope {
+                        format!("{} {}::{}", method, s, handler_id.name)
+                    } else {
+                        format!("{} {}", method, handler_id.name)
+                    }
+                } else {
+                    format!("{} :L{}", method, capture.start_row + 1)
+                }
             } else {
                 format!("{} {}", method, http_path)
             };
@@ -1667,15 +1694,6 @@ fn run_route_queries(
                 }
             }
 
-            // The decorator ends at `capture.end_row` (0-indexed). The handler
-            // function definition begins on the very next line or within a small
-            // window below (e.g., one blank line between decorator and `def`).
-            // `line_start` on Node is 1-indexed, so the expected range is
-            // [end_row+2 .. end_row+2+HANDLER_SEARCH_WINDOW].
-            let decorator_end_line = capture.end_row + 1; // convert to 1-indexed
-            let search_start = decorator_end_line + 1;
-            let search_end = decorator_end_line + 1 + HANDLER_SEARCH_WINDOW;
-
             let endpoint_node_id = NodeId {
                 root: String::new(),
                 file: path.to_path_buf(),
@@ -1683,11 +1701,7 @@ fn run_route_queries(
                 kind: NodeKind::ApiEndpoint,
             };
 
-            // Find the handler function in the pre-built index: scan the narrow
-            // window [search_start, search_end] instead of the entire node list.
-            let handler = (search_start..=search_end).find_map(|line| fn_by_line.get(&line));
-
-            if let Some(handler_id) = handler {
+            if let Some((handler_id, _scope)) = handler {
                 edges.push(crate::graph::Edge {
                     from: endpoint_node_id.clone(),
                     to: handler_id.clone(),
@@ -1702,11 +1716,7 @@ fn run_route_queries(
                 language: language_name.to_string(),
                 line_start: capture.start_row + 1,
                 line_end: capture.end_row + 1,
-                signature: if http_path.is_empty() {
-                    format!("[route_decorator] {}", method)
-                } else {
-                    format!("[route_decorator] {} {}", method, http_path)
-                },
+                signature: format!("[route_decorator] {}", name),
                 body: String::new(),
                 metadata,
                 source: ExtractionSource::TreeSitter,
@@ -5280,6 +5290,138 @@ public class ItemController {
         assert!(
             delete_node.is_some(),
             "should have DELETE endpoint with explicit path"
+        );
+    }
+
+    /// Regression (#633 follow-up): Java named arguments like
+    /// `@GetMapping(path = "/users")` must extract the path, not emit empty.
+    #[test]
+    fn test_java_named_path_arg_extracts_path() {
+        use crate::extract::configs::JAVA_CONFIG;
+        let ext = GenericExtractor::new(&JAVA_CONFIG);
+        let code = r#"
+public class UserController {
+    @GetMapping(path = "/users")
+    public List<User> list() {
+        return null;
+    }
+
+    @PostMapping(value = "/items")
+    public Item create() {
+        return null;
+    }
+}
+"#;
+        let result = ext.run(Path::new("UserController.java"), code).unwrap();
+        let api_nodes: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(
+            api_nodes.len(),
+            2,
+            "should emit 2 ApiEndpoint nodes, got: {:?}",
+            api_nodes.iter().map(|n| (&n.id.name, n.metadata.get("http_path"))).collect::<Vec<_>>()
+        );
+
+        let get_node = api_nodes.iter().find(|n| {
+            n.metadata.get("http_method").map(|m| m == "GET").unwrap_or(false)
+        });
+        assert!(get_node.is_some(), "should have GET endpoint");
+        assert_eq!(
+            get_node.unwrap().metadata.get("http_path").map(|s| s.as_str()),
+            Some("/users"),
+            "GET endpoint path should be /users from named arg"
+        );
+
+        let post_node = api_nodes.iter().find(|n| {
+            n.metadata.get("http_method").map(|m| m == "POST").unwrap_or(false)
+        });
+        assert!(post_node.is_some(), "should have POST endpoint");
+        assert_eq!(
+            post_node.unwrap().metadata.get("http_path").map(|s| s.as_str()),
+            Some("/items"),
+            "POST endpoint path should be /items from value= arg"
+        );
+    }
+
+    /// Regression (#633 follow-up): two bare @Get() in the same file must
+    /// produce distinct NodeIds (not merge into one node).
+    #[test]
+    fn test_bare_decorators_produce_unique_node_ids() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let ext = GenericExtractor::new(&TYPESCRIPT_CONFIG);
+        let code = r#"
+class ItemsController {
+  @Get()
+  findAll() {}
+
+  @Get()
+  findOne() {}
+}
+"#;
+        let result = ext.run(Path::new("items.controller.ts"), code).unwrap();
+        let api_nodes: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(
+            api_nodes.len(),
+            2,
+            "should emit 2 distinct ApiEndpoint nodes for 2 bare @Get(), got: {:?}",
+            api_nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+        );
+        // NodeIds must differ
+        assert_ne!(
+            api_nodes[0].id.name, api_nodes[1].id.name,
+            "two bare @Get() must produce different NodeId names, got {:?} and {:?}",
+            api_nodes[0].id.name, api_nodes[1].id.name
+        );
+        // Both should have empty http_path in metadata
+        for node in &api_nodes {
+            assert_eq!(
+                node.metadata.get("http_path").map(|s| s.as_str()),
+                Some(""),
+                "bare decorator should have empty http_path"
+            );
+        }
+    }
+
+    /// Regression: two controllers with identically-named handlers in the same
+    /// file must produce unique NodeIds via scope qualification.
+    #[test]
+    fn test_multi_controller_bare_decorators_unique_via_scope() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let ext = GenericExtractor::new(&TYPESCRIPT_CONFIG);
+        let code = r#"
+class AdminController {
+  @Get()
+  list() {}
+}
+
+class PublicController {
+  @Get()
+  list() {}
+}
+"#;
+        let result = ext.run(Path::new("controllers.ts"), code).unwrap();
+        let api_nodes: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(
+            api_nodes.len(),
+            2,
+            "should emit 2 ApiEndpoint nodes, got: {:?}",
+            api_nodes.iter().map(|n| &n.id.name).collect::<Vec<_>>()
+        );
+        assert_ne!(
+            api_nodes[0].id.name, api_nodes[1].id.name,
+            "AdminController::list and PublicController::list must differ: {:?} vs {:?}",
+            api_nodes[0].id.name, api_nodes[1].id.name
         );
     }
 
