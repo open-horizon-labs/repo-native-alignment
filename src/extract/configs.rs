@@ -103,6 +103,15 @@ static JAVA_ROUTE_QUERY: RouteQueryConfig = RouteQueryConfig {
 
 (annotation
   name: (identifier) @name
+  arguments: (annotation_argument_list
+    (element_value_pair
+      key: (identifier) @_key
+      value: (string_literal) @path))
+  (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)$")
+  (#match? @_key "^(path|value)$"))
+
+(annotation
+  name: (identifier) @name
   arguments: (annotation_argument_list)
   (#match? @name "^(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)$"))
 
