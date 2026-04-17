@@ -132,8 +132,8 @@ fn extract_document(doc: tree_sitter::Node, path: &Path, source: &[u8], nodes: &
             .unwrap_or("")
             .to_string();
 
-        let body = if value_text.len() > 300 {
-            format!("{}...", &value_text[..300])
+        let body = if value_text.chars().count() > 300 {
+            format!("{}...", truncate_chars(&value_text, 300))
         } else {
             value_text.clone()
         };
@@ -253,6 +253,13 @@ fn key_text(node: tree_sitter::Node, source: &[u8]) -> String {
         .to_string()
 }
 
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -284,5 +291,22 @@ mod tests {
             Some("true"),
             "YAML scalars should be synthetic"
         );
+    }
+
+    #[test]
+    fn test_yaml_extract_unicode_scalar_is_not_byte_truncated() {
+        let extractor = YamlExtractor::new();
+        let long_value = "─".repeat(310);
+        let code = format!("url: {}\n", long_value);
+
+        let result = extractor.extract(Path::new("proxy.yaml"), &code).unwrap();
+        let node = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "url")
+            .expect("Should find url key");
+
+        assert!(node.body.ends_with("..."), "Long unicode values should be truncated with ellipsis");
+        assert_eq!(node.body.chars().count(), 303, "Truncation should keep exactly 300 unicode chars plus ellipsis");
     }
 }
