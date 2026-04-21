@@ -993,6 +993,7 @@ mod tests {
         );
     }
 
+    /// ADR-ID: 001-event-bus-extraction-pipeline
     #[tokio::test]
     async fn test_follow_on_events_are_routed() {
         // EmittingConsumer listens for RootDiscovered, emits RootExtracted.
@@ -1025,6 +1026,7 @@ mod tests {
         );
     }
 
+    /// ADR-ID: 001-event-bus-extraction-pipeline
     #[tokio::test]
     async fn test_depth_first_ordering() {
         // Emitter1 listens RootDiscovered → emits [RootExtracted, PassesComplete]
@@ -1150,6 +1152,7 @@ mod tests {
         assert_eq!(count_b.load(Ordering::Relaxed), 1);
     }
 
+    /// ADR-ID: 001-event-bus-extraction-pipeline
     /// Adversarial: a consumer registered BEFORE the emitter for a follow-on event
     /// must still receive that event (the bus routes ALL events including follow-ons).
     #[tokio::test]

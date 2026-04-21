@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "001-event-bus-extraction-pipeline",
+  "title": "RNA Event Bus Architecture",
+  "status": "implemented",
+  "source": "docs/ADRs/001-event-bus-extraction-pipeline.md",
+  "validate": {
+    "cargo_tests": [
+      "extract::event_bus::tests::test_follow_on_events_are_routed",
+      "extract::event_bus::tests::test_depth_first_ordering",
+      "extract::event_bus::tests::test_consumer_receives_follow_on_regardless_of_registration_order"
+    ],
+    "audits": [
+      "no_consumer_knows_other_consumers",
+      "static_registration_only",
+      "no_broker_logic_in_core"
+    ],
+    "scripts": [],
+    "smoke": []
+  }
+}

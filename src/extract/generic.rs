@@ -20,7 +20,7 @@
 //! full 300-line traversal reimplementations.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::Result;
@@ -451,6 +451,26 @@ fn collect_nodes(
                 }
             }
 
+            let adr_refs = if node_kind == NodeKind::Function
+                && metadata.get("is_test").map(|s| s.as_str()) == Some("true")
+            {
+                let refs = metadata
+                    .get("doc_comment")
+                    .map(|doc| parse_adr_refs(doc))
+                    .unwrap_or_default();
+                if !refs.is_empty() {
+                    let joined = refs
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    metadata.insert("adr_refs".to_string(), joined);
+                }
+                refs
+            } else {
+                Vec::new()
+            };
+
             // Generic type parameter extraction.
             if let Some(tp_kind) = config.type_param_node_kind {
                 for i in 0..node.child_count() {
@@ -559,13 +579,15 @@ fn collect_nodes(
                 None
             };
 
+            let node_id = NodeId {
+                root: String::new(),
+                file: path.to_path_buf(),
+                name: name.clone(),
+                kind: node_kind.clone(),
+            };
+
             nodes.push(Node {
-                id: NodeId {
-                    root: String::new(),
-                    file: path.to_path_buf(),
-                    name: name.clone(),
-                    kind: node_kind.clone(),
-                },
+                id: node_id.clone(),
                 language: config.language_name.to_string(),
                 line_start,
                 line_end,
@@ -577,6 +599,26 @@ fn collect_nodes(
 
             if let Some(edge) = import_edge {
                 edges.push(edge);
+            }
+
+            for adr_path in &adr_refs {
+                let adr_name = adr_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                edges.push(Edge {
+                    from: node_id.clone(),
+                    to: NodeId {
+                        root: String::new(),
+                        file: adr_path.clone(),
+                        name: adr_name,
+                        kind: NodeKind::MarkdownSection,
+                    },
+                    kind: EdgeKind::References,
+                    source: ExtractionSource::TreeSitter,
+                    confidence: Confidence::Detected,
+                });
             }
 
             // Function parameter/return type DependsOn edges (config-driven).
@@ -1238,6 +1280,68 @@ fn collect_doc_comment(node: tree_sitter::Node, source: &[u8], config: &LangConf
     comment_lines.join(" ")
 }
 
+fn parse_adr_refs(doc_comment: &str) -> Vec<PathBuf> {
+    let mut refs = Vec::new();
+    let tokens: Vec<&str> = doc_comment.split_whitespace().collect();
+
+    for (i, token) in tokens.iter().enumerate() {
+        if let Some(path) = token.strip_prefix("ADR:") {
+            if let Some(parsed) = normalize_adr_ref(path, false) {
+                refs.push(parsed);
+                continue;
+            }
+            if let Some(next) = tokens.get(i + 1)
+                && let Some(parsed) = normalize_adr_ref(next, false)
+            {
+                refs.push(parsed);
+            }
+            continue;
+        }
+
+        if let Some(id) = token.strip_prefix("ADR-ID:") {
+            if let Some(parsed) = normalize_adr_ref(id, true) {
+                refs.push(parsed);
+                continue;
+            }
+            if let Some(next) = tokens.get(i + 1)
+                && let Some(parsed) = normalize_adr_ref(next, true)
+            {
+                refs.push(parsed);
+            }
+        }
+    }
+
+    let mut deduped = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for path in refs {
+        if seen.insert(path.clone()) {
+            deduped.push(path);
+        }
+    }
+    deduped
+}
+
+fn normalize_adr_ref(raw: &str, is_id: bool) -> Option<PathBuf> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '(' | ')' | '[' | ']'))
+        .trim_end_matches([',', ';', '.']);
+
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if is_id {
+        return Some(PathBuf::from("docs/ADRs").join(format!("{}.md", trimmed)));
+    }
+
+    if !trimmed.ends_with(".md") {
+        return None;
+    }
+
+    Some(PathBuf::from(trimmed))
+}
+
 /// Strip comment markers from a raw comment string.
 ///
 /// Removes `///`, `//!`, `//`, `/**`, `*/`, `*`, `#` (Python/shell),
@@ -1628,11 +1732,7 @@ fn run_route_queries(
                 continue;
             }
 
-            let http_path = capture
-                .get("path")
-                .map(strip_quotes)
-                .unwrap_or_default();
-
+            let http_path = capture.get("path").map(strip_quotes).unwrap_or_default();
             let method = if let Some(m) = capture.get("method") {
                 infer_method_from_name(m, cfg.default_method)
             } else if let Some(n) = capture.get("name") {
@@ -4759,7 +4859,10 @@ pub fn init() {}
         // The //! comment should at minimum not crash and not be silently dropped
         // (It may or may not attach to init() depending on sibling walk direction,
         // but the prefix gate must not reject it)
-        assert!(result.nodes.iter().any(|n| n.id.name == "init"), "should find init function");
+        assert!(
+            result.nodes.iter().any(|n| n.id.name == "init"),
+            "should find init function"
+        );
     }
 
     #[test]
@@ -5170,22 +5273,46 @@ class ItemsController {
 
         // Bare @Get() should have empty http_path
         let get_node = api_nodes.iter().find(|n| {
-            n.metadata.get("http_method").map(|m| m == "GET").unwrap_or(false)
-                && n.metadata.get("http_path").map(|p| p.is_empty()).unwrap_or(false)
+            n.metadata
+                .get("http_method")
+                .map(|m| m == "GET")
+                .unwrap_or(false)
+                && n.metadata
+                    .get("http_path")
+                    .map(|p| p.is_empty())
+                    .unwrap_or(false)
         });
-        assert!(get_node.is_some(), "should have GET endpoint with empty path");
+        assert!(
+            get_node.is_some(),
+            "should have GET endpoint with empty path"
+        );
 
         // Bare @Post() should have empty http_path
         let post_node = api_nodes.iter().find(|n| {
-            n.metadata.get("http_method").map(|m| m == "POST").unwrap_or(false)
-                && n.metadata.get("http_path").map(|p| p.is_empty()).unwrap_or(false)
+            n.metadata
+                .get("http_method")
+                .map(|m| m == "POST")
+                .unwrap_or(false)
+                && n.metadata
+                    .get("http_path")
+                    .map(|p| p.is_empty())
+                    .unwrap_or(false)
         });
-        assert!(post_node.is_some(), "should have POST endpoint with empty path");
+        assert!(
+            post_node.is_some(),
+            "should have POST endpoint with empty path"
+        );
 
         // Explicit @Delete("/items/:id") should still work
         let delete_node = api_nodes.iter().find(|n| {
-            n.metadata.get("http_method").map(|m| m == "DELETE").unwrap_or(false)
-                && n.metadata.get("http_path").map(|p| p == "/items/:id").unwrap_or(false)
+            n.metadata
+                .get("http_method")
+                .map(|m| m == "DELETE")
+                .unwrap_or(false)
+                && n.metadata
+                    .get("http_path")
+                    .map(|p| p == "/items/:id")
+                    .unwrap_or(false)
         });
         assert!(
             delete_node.is_some(),
@@ -5223,7 +5350,10 @@ def create_item():
 
         // Bare @app.get() should have empty http_path
         let bare_node = api_nodes.iter().find(|n| {
-            n.metadata.get("http_path").map(|p| p.is_empty()).unwrap_or(false)
+            n.metadata
+                .get("http_path")
+                .map(|p| p.is_empty())
+                .unwrap_or(false)
         });
         assert!(bare_node.is_some(), "should have endpoint with empty path");
         assert_eq!(
@@ -5270,22 +5400,46 @@ public class ItemController {
 
         // @GetMapping (marker annotation, no parens) should have empty path
         let get_node = api_nodes.iter().find(|n| {
-            n.metadata.get("http_method").map(|m| m == "GET").unwrap_or(false)
-                && n.metadata.get("http_path").map(|p| p.is_empty()).unwrap_or(false)
+            n.metadata
+                .get("http_method")
+                .map(|m| m == "GET")
+                .unwrap_or(false)
+                && n.metadata
+                    .get("http_path")
+                    .map(|p| p.is_empty())
+                    .unwrap_or(false)
         });
-        assert!(get_node.is_some(), "should have GET endpoint with empty path");
+        assert!(
+            get_node.is_some(),
+            "should have GET endpoint with empty path"
+        );
 
         // @PostMapping() (empty args) should have empty path
         let post_node = api_nodes.iter().find(|n| {
-            n.metadata.get("http_method").map(|m| m == "POST").unwrap_or(false)
-                && n.metadata.get("http_path").map(|p| p.is_empty()).unwrap_or(false)
+            n.metadata
+                .get("http_method")
+                .map(|m| m == "POST")
+                .unwrap_or(false)
+                && n.metadata
+                    .get("http_path")
+                    .map(|p| p.is_empty())
+                    .unwrap_or(false)
         });
-        assert!(post_node.is_some(), "should have POST endpoint with empty path");
+        assert!(
+            post_node.is_some(),
+            "should have POST endpoint with empty path"
+        );
 
         // @DeleteMapping("/items/{id}") should still work
         let delete_node = api_nodes.iter().find(|n| {
-            n.metadata.get("http_method").map(|m| m == "DELETE").unwrap_or(false)
-                && n.metadata.get("http_path").map(|p| p == "/items/{id}").unwrap_or(false)
+            n.metadata
+                .get("http_method")
+                .map(|m| m == "DELETE")
+                .unwrap_or(false)
+                && n.metadata
+                    .get("http_path")
+                    .map(|p| p == "/items/{id}")
+                    .unwrap_or(false)
         });
         assert!(
             delete_node.is_some(),
@@ -5322,25 +5476,42 @@ public class UserController {
             api_nodes.len(),
             2,
             "should emit 2 ApiEndpoint nodes, got: {:?}",
-            api_nodes.iter().map(|n| (&n.id.name, n.metadata.get("http_path"))).collect::<Vec<_>>()
+            api_nodes
+                .iter()
+                .map(|n| (&n.id.name, n.metadata.get("http_path")))
+                .collect::<Vec<_>>()
         );
 
         let get_node = api_nodes.iter().find(|n| {
-            n.metadata.get("http_method").map(|m| m == "GET").unwrap_or(false)
+            n.metadata
+                .get("http_method")
+                .map(|m| m == "GET")
+                .unwrap_or(false)
         });
         assert!(get_node.is_some(), "should have GET endpoint");
         assert_eq!(
-            get_node.unwrap().metadata.get("http_path").map(|s| s.as_str()),
+            get_node
+                .unwrap()
+                .metadata
+                .get("http_path")
+                .map(|s| s.as_str()),
             Some("/users"),
             "GET endpoint path should be /users from named arg"
         );
 
         let post_node = api_nodes.iter().find(|n| {
-            n.metadata.get("http_method").map(|m| m == "POST").unwrap_or(false)
+            n.metadata
+                .get("http_method")
+                .map(|m| m == "POST")
+                .unwrap_or(false)
         });
         assert!(post_node.is_some(), "should have POST endpoint");
         assert_eq!(
-            post_node.unwrap().metadata.get("http_path").map(|s| s.as_str()),
+            post_node
+                .unwrap()
+                .metadata
+                .get("http_path")
+                .map(|s| s.as_str()),
             Some("/items"),
             "POST endpoint path should be /items from value= arg"
         );
@@ -5684,6 +5855,98 @@ fn not_a_test() {}
         assert!(
             not_test.metadata.get("is_test").is_none(),
             "production function should NOT have is_test metadata"
+        );
+    }
+
+    #[test]
+    fn test_test_function_doc_comment_references_adr_path() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+/// ADR: docs/ADRs/002-arcswap-graph-concurrency.md
+/// Validates consistent snapshots.
+#[test]
+fn my_test() {}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+
+        let test_fn = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "my_test")
+            .unwrap();
+        assert_eq!(
+            test_fn.metadata.get("adr_refs").map(|s| s.as_str()),
+            Some("docs/ADRs/002-arcswap-graph-concurrency.md")
+        );
+
+        let refs: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::References && e.from.name == "my_test")
+            .collect();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            refs[0].to.file,
+            PathBuf::from("docs/ADRs/002-arcswap-graph-concurrency.md")
+        );
+    }
+
+    #[test]
+    fn test_test_function_doc_comment_references_adr_id() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+/// ADR-ID: 001-event-bus-extraction-pipeline
+#[tokio::test]
+async fn my_async_test() {}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("test.rs"), code)
+            .unwrap();
+
+        let refs: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::References && e.from.name == "my_async_test")
+            .collect();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            refs[0].to.file,
+            PathBuf::from("docs/ADRs/001-event-bus-extraction-pipeline.md")
+        );
+    }
+
+    #[test]
+    fn test_non_test_function_doc_comment_does_not_emit_adr_reference() {
+        use crate::extract::rust::RUST_CONFIG;
+        let code = r#"
+/// ADR: docs/ADRs/002-arcswap-graph-concurrency.md
+fn helper() {}
+"#;
+        let result = GenericExtractor::new(&RUST_CONFIG)
+            .run(Path::new("lib.rs"), code)
+            .unwrap();
+
+        assert!(
+            !result
+                .edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::References && e.from.name == "helper")
+        );
+    }
+
+    #[test]
+    fn test_parse_adr_refs_supports_path_and_id() {
+        let refs = parse_adr_refs(
+            "ADR: docs/ADRs/002-arcswap-graph-concurrency.md ADR-ID: 001-event-bus-extraction-pipeline",
+        );
+        assert_eq!(
+            refs,
+            vec![
+                PathBuf::from("docs/ADRs/002-arcswap-graph-concurrency.md"),
+                PathBuf::from("docs/ADRs/001-event-bus-extraction-pipeline.md"),
+            ]
         );
     }
 

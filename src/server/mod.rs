@@ -1754,6 +1754,7 @@ mod tests {
         }
     }
 
+    /// ADR-ID: 002-arcswap-graph-concurrency
     /// Dissent finding: ArcSwap store() is atomic, so readers should always see
     /// a consistent snapshot -- never a partially-mutated state.
     #[tokio::test]
@@ -1824,6 +1825,7 @@ mod tests {
         assert_eq!(new_gs.nodes.len(), 3, "New snapshot should have 3 nodes");
     }
 
+    /// ADR-ID: 002-arcswap-graph-concurrency
     /// Dissent finding: get_graph returns Arc<GraphState> (not a lock guard).
     /// Verify that the returned value outlives any internal state changes.
     #[tokio::test]

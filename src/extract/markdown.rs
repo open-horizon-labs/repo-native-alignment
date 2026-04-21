@@ -3,10 +3,11 @@
 //! Reuses the existing `pulldown-cmark` parsing from `src/markdown/mod.rs`
 //! but produces graph `Node` types for the unified graph model.
 //!
-//! Emits three kinds of edges:
+//! Emits four kinds of edges:
 //! - **Hierarchy (Defines):** parent heading section -> child heading section
 //! - **Frontmatter refs (DependsOn):** .oh/ artifact -> referenced outcome/signal/guardrail
 //! - **Cross-file links (References):** section containing `[text](path)` -> target file
+//! - **ADR validation links (References):** ADR section -> exact test function declared in frontmatter
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -350,6 +351,89 @@ fn emit_link_edges(
     }
 }
 
+/// Emit `References` edges from ADR markdown to exact test functions declared in
+/// ADR frontmatter (`validate.cargo_tests`).
+///
+/// The frontmatter stores exact `cargo test -- --list` names, which include module
+/// paths. Extracted test nodes only store the leaf function name, so resolution uses
+/// the final `::segment` and only links when that leaf resolves unambiguously to a
+/// single test function node.
+pub fn adr_validation_pass(all_nodes: &[Node]) -> Vec<Edge> {
+    let mut test_nodes: BTreeMap<&str, Vec<&Node>> = BTreeMap::new();
+    for node in all_nodes {
+        if node.id.kind == NodeKind::Function
+            && node.metadata.get("is_test").map(|value| value.as_str()) == Some("true")
+        {
+            test_nodes
+                .entry(node.id.name.as_str())
+                .or_default()
+                .push(node);
+        }
+    }
+
+    let mut primary_markdown_nodes: BTreeMap<&Path, &NodeId> = BTreeMap::new();
+    let mut frontmatter_nodes = Vec::new();
+    for node in all_nodes {
+        if node.id.kind != NodeKind::MarkdownSection {
+            continue;
+        }
+        if node
+            .metadata
+            .get("is_frontmatter")
+            .map(|value| value.as_str())
+            == Some("true")
+        {
+            frontmatter_nodes.push(node);
+        } else {
+            primary_markdown_nodes
+                .entry(node.id.file.as_path())
+                .or_insert(&node.id);
+        }
+    }
+
+    let mut edges = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for node in frontmatter_nodes {
+        let frontmatter: crate::adr::AdrValidationRefs =
+            match serde_yaml::from_str::<serde_yaml::Value>(&node.body) {
+                Ok(value) => match value.get("validate") {
+                    Some(validate) => serde_yaml::from_value(validate.clone()).unwrap_or_default(),
+                    None => continue,
+                },
+                Err(_) => continue,
+            };
+
+        let source_id = primary_markdown_nodes
+            .get(node.id.file.as_path())
+            .copied()
+            .unwrap_or(&node.id);
+
+        for cargo_test in frontmatter.cargo_tests {
+            let leaf = cargo_test.rsplit("::").next().unwrap_or(&cargo_test);
+            let Some(matches) = test_nodes.get(leaf) else {
+                continue;
+            };
+            if matches.len() != 1 {
+                continue;
+            }
+            let target_id = &matches[0].id;
+            let edge_key = format!("{}->{}", source_id.to_stable_id(), target_id.to_stable_id());
+            if !seen.insert(edge_key) {
+                continue;
+            }
+            edges.push(Edge {
+                from: (*source_id).clone(),
+                to: target_id.clone(),
+                kind: EdgeKind::References,
+                source: ExtractionSource::Markdown,
+                confidence: Confidence::Confirmed,
+            });
+        }
+    }
+
+    edges
+}
+
 /// Normalize a path by resolving `.` and `..` components without filesystem access.
 /// Preserves leading `..` segments when there is nothing left to pop (out-of-repo links).
 /// Never pops past a root directory or prefix component.
@@ -502,6 +586,7 @@ fn parse_markdown_file_from_source(source: &str, path: &Path) -> Vec<crate::type
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
     use std::path::Path;
 
     #[test]
@@ -1240,6 +1325,130 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_adr_validation_pass_links_frontmatter_to_exact_test() {
+        let adr_frontmatter = Node {
+            id: NodeId {
+                root: String::new(),
+                file: PathBuf::from("docs/ADRs/002-arcswap-graph-concurrency.md"),
+                name: "frontmatter".to_string(),
+                kind: NodeKind::MarkdownSection,
+            },
+            language: "markdown".to_string(),
+            line_start: 1,
+            line_end: 6,
+            signature: "[frontmatter]".to_string(),
+            body: "id: 002-arcswap-graph-concurrency\nstatus: implementing\nvalidate:\n  cargo_tests:\n    - server::tests::test_arcswap_readers_see_consistent_snapshots\n".to_string(),
+            metadata: BTreeMap::from([("is_frontmatter".to_string(), "true".to_string())]),
+            source: ExtractionSource::Markdown,
+        };
+        let adr_section = Node {
+            id: NodeId {
+                root: String::new(),
+                file: PathBuf::from("docs/ADRs/002-arcswap-graph-concurrency.md"),
+                name: "ArcSwap for graph concurrency".to_string(),
+                kind: NodeKind::MarkdownSection,
+            },
+            language: "markdown".to_string(),
+            line_start: 8,
+            line_end: 20,
+            signature: "ArcSwap for graph concurrency".to_string(),
+            body: "# ArcSwap for graph concurrency".to_string(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Markdown,
+        };
+        let test_fn = Node {
+            id: NodeId {
+                root: String::new(),
+                file: PathBuf::from("src/server/mod.rs"),
+                name: "test_arcswap_readers_see_consistent_snapshots".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 10,
+            signature: "async fn test_arcswap_readers_see_consistent_snapshots()".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::from([("is_test".to_string(), "true".to_string())]),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let edges = adr_validation_pass(&[adr_frontmatter, adr_section.clone(), test_fn.clone()]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, adr_section.id);
+        assert_eq!(edges[0].to, test_fn.id);
+        assert_eq!(edges[0].kind, EdgeKind::References);
+    }
+
+    #[test]
+    fn test_adr_validation_pass_skips_ambiguous_test_leaf_names() {
+        let adr_frontmatter = Node {
+            id: NodeId {
+                root: String::new(),
+                file: PathBuf::from("docs/ADRs/001-event-bus-extraction-pipeline.md"),
+                name: "frontmatter".to_string(),
+                kind: NodeKind::MarkdownSection,
+            },
+            language: "markdown".to_string(),
+            line_start: 1,
+            line_end: 6,
+            signature: "[frontmatter]".to_string(),
+            body: "id: 001-event-bus-extraction-pipeline\nstatus: implemented\nvalidate:\n  cargo_tests:\n    - pkg::tests::duplicate_name\n".to_string(),
+            metadata: BTreeMap::from([("is_frontmatter".to_string(), "true".to_string())]),
+            source: ExtractionSource::Markdown,
+        };
+        let adr_section = Node {
+            id: NodeId {
+                root: String::new(),
+                file: PathBuf::from("docs/ADRs/001-event-bus-extraction-pipeline.md"),
+                name: "RNA Event Bus Architecture".to_string(),
+                kind: NodeKind::MarkdownSection,
+            },
+            language: "markdown".to_string(),
+            line_start: 8,
+            line_end: 20,
+            signature: "RNA Event Bus Architecture".to_string(),
+            body: "# RNA Event Bus Architecture".to_string(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Markdown,
+        };
+        let test_a = Node {
+            id: NodeId {
+                root: String::new(),
+                file: PathBuf::from("src/a.rs"),
+                name: "duplicate_name".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 10,
+            signature: "fn duplicate_name()".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::from([("is_test".to_string(), "true".to_string())]),
+            source: ExtractionSource::TreeSitter,
+        };
+        let test_b = Node {
+            id: NodeId {
+                root: String::new(),
+                file: PathBuf::from("src/b.rs"),
+                name: "duplicate_name".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 10,
+            signature: "fn duplicate_name()".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::from([("is_test".to_string(), "true".to_string())]),
+            source: ExtractionSource::TreeSitter,
+        };
+
+        let edges = adr_validation_pass(&[adr_frontmatter, adr_section, test_a, test_b]);
+        assert!(
+            edges.is_empty(),
+            "ambiguous cargo test leaf names must not link"
+        );
+    }
     // --- Adversarial: agent memory detection boundary conditions ---
 
     #[test]

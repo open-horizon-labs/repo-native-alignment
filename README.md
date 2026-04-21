@@ -190,9 +190,27 @@ CLI and MCP share the same index. Run `scan --full` from the CLI to build the co
 | `scan --repo <dir> --full` | Full pipeline including LSP enrichment. Incremental on repeat runs. |
 | `stats --repo <dir>` | Show repo stats from persisted index (no re-scan) |
 | `test --repo <dir>` | Run 29 pipeline checks end-to-end |
+| `adr compile --repo <dir>` | Compile ADR frontmatter into `.oh/adr-validation/*.json` and refresh `docs/ADRs/README.md` when present |
+| `adr validate --repo <dir>` | Execute compiled ADR validations (cargo tests, audits, smoke, scripts) and fail if an implemented ADR is not honestly backed by passing checks |
+| `adr audit <name> --repo <dir>` | Run one built-in ADR code-shape audit directly |
 | `open --repo <dir>` | Launch an interactive graph visualizer in the browser |
 | `setup --project <dir>` | Bootstrap RNA + OH MCP + skills for a project |
 
+
+### ADR validation primitive
+
+ADRs can declare direct executable references in YAML frontmatter:
+- `validate.cargo_tests` — exact names from `cargo test -- --list`
+- `validate.audits` — built-in code-shape audits run with `adr audit <name>`
+- `validate.smoke` — fixture paths for repo-native delivery checks
+- `validate.scripts` — exact repo-relative script paths as a last resort
+
+Compile declarations into derived manifests and validate them with the real executable surface:
+
+```bash
+repo-native-alignment adr compile --repo .
+repo-native-alignment adr validate --repo . --cargo-arg --no-default-features
+```
 ### Plugin Skills
 
 | Skill | What it does |
