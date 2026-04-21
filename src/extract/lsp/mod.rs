@@ -246,6 +246,112 @@ impl LspEnricher {
             .unwrap_or(false)
     }
 
+    /// Find a representative source file in `root` to open via didOpen.
+    /// Picks a short, non-test, non-generated file — we just need one file
+    /// to trigger project detection (tsserver) and import-graph indexing (pyright).
+    fn find_warmup_file(root: &Path, language: &str) -> Option<PathBuf> {
+        let extensions: &[&str] = match language {
+            "python" => &["py"],
+            "typescript" => &["ts", "tsx"],
+            "rust" => &["rs"],
+            "go" => &["go"],
+            _ => return None,
+        };
+
+        // Shallow recursive search (max 4 levels) using std::fs.
+        // We only need one file — stop as soon as we find a small source file.
+        fn walk(dir: &Path, extensions: &[&str], depth: u8) -> Option<PathBuf> {
+            if depth > 4 {
+                return None;
+            }
+            let entries = std::fs::read_dir(dir).ok()?;
+            let mut subdirs = Vec::new();
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with('.') || matches!(
+                    name_str.as_ref(),
+                    "node_modules" | "__pycache__" | "target" | ".venv" | "venv" | "env"
+                ) {
+                    continue;
+                }
+                let ft = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                if ft.is_dir() {
+                    subdirs.push(entry.path());
+                    continue;
+                }
+                if !ft.is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if !extensions.contains(&ext) {
+                    continue;
+                }
+                // Skip test and generated files
+                if name_str.starts_with("test_")
+                    || name_str.contains(".test.")
+                    || name_str.contains(".spec.")
+                    || name_str.contains(".gen.")
+                    || name_str.contains("_pb2")
+                    || name_str.starts_with("conftest")
+                {
+                    continue;
+                }
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+                if size > 0 && size < 50_000 {
+                    return Some(path);
+                }
+            }
+            // Recurse into subdirectories
+            for subdir in subdirs {
+                if let Some(found) = walk(&subdir, extensions, depth + 1) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        walk(root, extensions, 0)
+    }
+
+    /// Send textDocument/didOpen for the given file.
+    async fn send_did_open(
+        transport: &mut LspTransport,
+        path: &Path,
+    ) -> Result<()> {
+        let uri = path_to_uri(path)?;
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("reading warmup file {}", path.display()))?;
+        let language_id = match path.extension().and_then(|e| e.to_str()) {
+            Some("py") => "python",
+            Some("ts") => "typescript",
+            Some("tsx") => "typescriptreact",
+            Some("rs") => "rust",
+            Some("go") => "go",
+            _ => "plaintext",
+        };
+        transport
+            .notify(
+                "textDocument/didOpen",
+                serde_json::json!({
+                    "textDocument": {
+                        "uri": uri.to_string(),
+                        "languageId": language_id,
+                        "version": 1,
+                        "text": content
+                    }
+                }),
+            )
+            .await?;
+        // Give the server a moment to process the file
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        Ok(())
+    }
+
     /// Initialize the language server if not already running.
     async fn ensure_initialized(&self, repo_root: &Path) -> Result<()> {
         let mut state = self.state.lock().await;
@@ -483,6 +589,24 @@ impl LspEnricher {
         transport
             .notify("initialized", serde_json::json!({}))
             .await?;
+
+        // Send didOpen for a representative source file to create a project
+        // context. tsserver requires at least one open file before it creates
+        // a project; pyright uses it to trigger import-graph indexing.
+        if let Some(warmup_path) = Self::find_warmup_file(startup_root, &self.language) {
+            match Self::send_did_open(transport, &warmup_path).await {
+                Ok(()) => tracing::info!(
+                    "{} sent didOpen for '{}'",
+                    self.server_command,
+                    warmup_path.display()
+                ),
+                Err(e) => tracing::debug!(
+                    "{} didOpen warmup failed (non-fatal): {}",
+                    self.server_command,
+                    e
+                ),
+            }
+        }
 
         tracing::info!(
             "{} initialized, waiting for indexing...",
