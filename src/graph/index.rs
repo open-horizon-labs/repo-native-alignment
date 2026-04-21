@@ -893,7 +893,7 @@ impl GraphIndex {
         }
 
         // Sort by symbol count descending
-        subsystems.sort_by(|a, b| b.symbol_count.cmp(&a.symbol_count));
+        subsystems.sort_by_key(|subsystem| std::cmp::Reverse(subsystem.symbol_count));
         subsystems
     }
 }
@@ -1278,7 +1278,7 @@ pub fn group_subsystems_by_prefix(subsystems: Vec<Subsystem>) -> Vec<Subsystem> 
     }
 
     // Sort by symbol count descending (matching detect_communities output order)
-    result.sort_by(|a, b| b.symbol_count.cmp(&a.symbol_count));
+    result.sort_by_key(|subsystem| std::cmp::Reverse(subsystem.symbol_count));
     result
 }
 

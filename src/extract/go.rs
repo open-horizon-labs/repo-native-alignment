@@ -280,7 +280,7 @@ fn extract_go_const_spec(
             vec![None; names.len()]
         };
 
-    for (name_str, value_opt) in names.into_iter().zip(per_name_values.into_iter()) {
+    for (name_str, value_opt) in names.into_iter().zip(per_name_values) {
         let signature = format!("const {}", body.trim());
         let mut metadata = BTreeMap::new();
         if let Some(v) = value_opt {
@@ -358,7 +358,7 @@ fn extract_go_var_spec(node: tree_sitter::Node, path: &Path, source: &[u8], node
             vec![None; names.len()]
         };
 
-    for (name_str, value_opt) in names.into_iter().zip(per_name_values.into_iter()) {
+    for (name_str, value_opt) in names.into_iter().zip(per_name_values) {
         let signature = format!("var {}", body.trim());
         let mut metadata = BTreeMap::new();
         metadata.insert("storage".to_string(), "var".to_string());

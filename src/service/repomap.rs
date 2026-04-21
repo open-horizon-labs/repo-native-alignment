@@ -272,7 +272,7 @@ pub fn repo_map(params: &RepoMapParams, ctx: &RepoMapContext<'_>) -> String {
                 .or_default() += 1;
         }
         let mut sf: Vec<_> = fc.into_iter().collect();
-        sf.sort_by(|a, b| b.1.cmp(&a.1));
+        sf.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         sf.truncate(10);
         let single_root = params.root_filter.is_some();
         if !sf.is_empty() {

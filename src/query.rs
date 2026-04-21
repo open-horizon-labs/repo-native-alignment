@@ -65,10 +65,7 @@ pub fn outcome_progress(
     // 4. Deduplicate commits by hash, preserving order (tagged first)
     let mut seen_hashes = HashSet::new();
     let mut commits = Vec::new();
-    for c in tagged_commits
-        .into_iter()
-        .chain(pattern_commits.into_iter())
-    {
+    for c in tagged_commits.into_iter().chain(pattern_commits) {
         if seen_hashes.insert(c.hash.clone()) {
             commits.push(c);
         }
