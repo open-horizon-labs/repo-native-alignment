@@ -9,7 +9,7 @@
 //! - **Cross-file links (References):** section containing `[text](path)` -> target file
 //! - **ADR validation links (References):** ADR section -> exact test function declared in frontmatter
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -358,8 +358,8 @@ fn emit_link_edges(
 /// against Rust test nodes via `metadata["test_path"]`. No leaf-name fallback: if
 /// the exact Rust test path is not present, no edge is emitted.
 pub fn adr_validation_pass(all_nodes: &[Node]) -> Vec<Edge> {
-    let mut rust_tests: BTreeMap<&str, Vec<&Node>> = BTreeMap::new();
-    let mut primary_markdown_nodes: BTreeMap<&Path, &NodeId> = BTreeMap::new();
+    let mut rust_tests: HashMap<&str, Vec<&Node>> = HashMap::new();
+    let mut primary_markdown_nodes: HashMap<&Path, &NodeId> = HashMap::new();
     let mut frontmatter_nodes = Vec::new();
 
     for node in all_nodes {
@@ -433,7 +433,7 @@ pub fn adr_validation_pass(all_nodes: &[Node]) -> Vec<Edge> {
 /// Emit `References` edges from extracted test functions back to ADR markdown nodes
 /// using `metadata["adr_refs"]` captured during code extraction.
 pub fn adr_backreference_pass(all_nodes: &[Node]) -> Vec<Edge> {
-    let mut primary_markdown_nodes: BTreeMap<&Path, &NodeId> = BTreeMap::new();
+    let mut primary_markdown_nodes: HashMap<&Path, &NodeId> = HashMap::new();
     for node in all_nodes {
         if node.id.kind == NodeKind::MarkdownSection
             && node

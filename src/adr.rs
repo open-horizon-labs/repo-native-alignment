@@ -2,12 +2,13 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use gray_matter::{Matter, ParsedEntity, engine::YAML};
 use serde::{Deserialize, Serialize};
 
+const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const GENERATED_DIR: &str = ".oh/adr-validation";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -350,27 +351,30 @@ pub fn validate(
                 continue;
             }
 
-            let output = Command::new("cargo")
+            let mut command = Command::new("cargo");
+            command
                 .arg("test")
                 .args(cargo_args)
                 .arg(test_name)
                 .arg("--")
                 .arg("--exact")
-                .current_dir(repo_root)
-                .output()
+                .current_dir(repo_root);
+            let output = run_command_with_timeout(&mut command, COMMAND_TIMEOUT)
                 .with_context(|| format!("running cargo test {}", test_name))?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             let ran_exact_test =
                 stdout.contains("running 1 test") || stderr.contains("running 1 test");
-            let ok = output.status.success() && ran_exact_test;
+            let ok = output.success && ran_exact_test;
             checks.push(CheckExecution {
                 kind: "cargo_test".to_string(),
                 target: test_name.clone(),
                 ok,
                 details: if ok {
                     "passed".to_string()
-                } else if output.status.success() {
+                } else if output.timed_out {
+                    format!("timed out after {}s", COMMAND_TIMEOUT.as_secs())
+                } else if output.success {
                     "command succeeded but did not run exactly one test".to_string()
                 } else {
                     summarize_command_output(&stdout, &stderr)
@@ -473,6 +477,62 @@ pub fn validate(
         failed,
         results,
     })
+}
+
+#[derive(Debug)]
+struct TimedCommandOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    success: bool,
+    timed_out: bool,
+}
+
+fn run_command_with_timeout(
+    command: &mut Command,
+    timeout: std::time::Duration,
+) -> Result<TimedCommandOutput> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning child process")?;
+    let start = std::time::Instant::now();
+
+    loop {
+        if child.try_wait().context("polling child process")?.is_some() {
+            let output = child
+                .wait_with_output()
+                .context("collecting child process output")?;
+            return Ok(TimedCommandOutput {
+                stdout: output.stdout,
+                stderr: output.stderr,
+                success: output.status.success(),
+                timed_out: false,
+            });
+        }
+
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .context("collecting timed-out child output")?;
+            let mut stderr = output.stderr;
+            if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+                stderr.push(b'\n');
+            }
+            stderr.extend_from_slice(
+                format!("command timed out after {}s", timeout.as_secs()).as_bytes(),
+            );
+            return Ok(TimedCommandOutput {
+                stdout: output.stdout,
+                stderr,
+                success: false,
+                timed_out: true,
+            });
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 pub fn run_audit(repo_root: &Path, name: &str) -> Result<AuditReport> {
@@ -834,9 +894,16 @@ fn audit_graph_state_uses_arcswap(repo_root: &Path) -> Result<AuditReport> {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let uses_arcswap = non_comment.contains("pub graph: Arc<ArcSwap<Option<Arc<GraphState>>>>");
-    let still_has_rwlock = non_comment.contains("Arc<RwLock<Option<GraphState>>>")
-        || non_comment.contains("RwLock<Option<GraphState>>");
+    let uses_arcswap = regex::Regex::new(
+        r"pub\s+graph\s*:\s*Arc\s*<\s*ArcSwap\s*<\s*Option\s*<\s*Arc\s*<\s*GraphState\s*>\s*>\s*>\s*>",
+    )
+    .unwrap()
+    .is_match(&non_comment);
+    let still_has_rwlock = regex::Regex::new(
+        r"Arc\s*<\s*RwLock\s*<\s*Option\s*<\s*GraphState\s*>\s*>\s*>|RwLock\s*<\s*Option\s*<\s*GraphState\s*>\s*>",
+    )
+    .unwrap()
+    .is_match(&non_comment);
 
     Ok(AuditReport {
         name: "graph_state_uses_arcswap".to_string(),
