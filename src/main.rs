@@ -6,6 +6,7 @@ use rust_mcp_sdk::McpServer;
 use rust_mcp_sdk::ToMcpServerHandler;
 use rust_mcp_sdk::schema::{Implementation, InitializeResult, ServerCapabilities};
 
+use repo_native_alignment::adr::{self, ValidateSelection};
 use repo_native_alignment::roots::WorkspaceConfig;
 use repo_native_alignment::server::{self, RnaHandler};
 use repo_native_alignment::service::{
@@ -47,6 +48,8 @@ enum Commands {
     ListRoots(ListRootsCli),
     /// Show a high-level repository map
     RepoMap(RepoMapCli),
+    /// Compile or validate ADR executable declarations
+    Adr(AdrArgs),
     /// Open an interactive graph visualizer in the browser
     Open(OpenArgs),
 }
@@ -170,6 +173,57 @@ struct RepoMapCli {
     root: Option<String>,
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+struct AdrArgs {
+    #[command(subcommand)]
+    command: AdrCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum AdrCommand {
+    /// Compile ADR frontmatter into .oh/adr-validation manifests
+    Compile(AdrCompileArgs),
+    /// Execute compiled ADR validations and enforce status gating
+    Validate(AdrValidateArgs),
+    /// Run one built-in ADR audit by name
+    Audit(AdrAuditArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct AdrCompileArgs {
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    #[arg(long, default_value = "docs/ADRs")]
+    dir: PathBuf,
+    #[arg(long)]
+    check: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+struct AdrValidateArgs {
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    #[arg(long)]
+    id: Option<String>,
+    #[arg(long)]
+    path: Option<PathBuf>,
+    #[arg(long = "cargo-arg", allow_hyphen_values = true)]
+    cargo_args: Vec<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+struct AdrAuditArgs {
+    name: String,
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    #[arg(long)]
+    json: bool,
 }
 
 fn server_details() -> InitializeResult {
@@ -595,6 +649,56 @@ async fn async_main() -> anyhow::Result<()> {
             };
             println!("{}", service::repo_map(&params, &ctx));
             return Ok(());
+        }
+        Some(Commands::Adr(args)) => {
+            init_tracing("warn", log_path.as_deref());
+            match args.command {
+                AdrCommand::Compile(args) => {
+                    let repo_root = args.repo.canonicalize()?;
+                    let adr_dir = if args.dir.is_absolute() {
+                        args.dir.clone()
+                    } else {
+                        repo_root.join(&args.dir)
+                    };
+                    let report = adr::compile(&repo_root, &adr_dir, args.check)?;
+                    if args.json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        println!("{}", report.human_summary());
+                    }
+                    std::process::exit(if report.ok() { 0 } else { 2 });
+                }
+                AdrCommand::Validate(args) => {
+                    let repo_root = args.repo.canonicalize()?;
+                    let selection = ValidateSelection {
+                        id: args.id.clone(),
+                        source_path: args.path.clone().map(|path| {
+                            if path.is_absolute() {
+                                path
+                            } else {
+                                repo_root.join(path)
+                            }
+                        }),
+                    };
+                    let report = adr::validate(&repo_root, &selection, &args.cargo_args)?;
+                    if args.json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        println!("{}", report.human_summary());
+                    }
+                    std::process::exit(if report.ok() { 0 } else { 3 });
+                }
+                AdrCommand::Audit(args) => {
+                    let repo_root = args.repo.canonicalize()?;
+                    let report = adr::run_audit(&repo_root, &args.name)?;
+                    if args.json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        println!("{}", report.human_summary());
+                    }
+                    std::process::exit(if report.ok { 0 } else { 3 });
+                }
+            }
         }
         Some(Commands::Open(args)) => {
             init_tracing("warn", log_path.as_deref());

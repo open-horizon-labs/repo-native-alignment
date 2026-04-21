@@ -399,7 +399,7 @@ fn minify_with_ast(
     collect_references(body_node, source, &locals, &mut rename_ranges, config);
 
     // Sort descending by start, deduplicate
-    rename_ranges.sort_by(|a, b| b.0.cmp(&a.0));
+    rename_ranges.sort_by_key(|range| std::cmp::Reverse(range.0));
     rename_ranges.dedup_by_key(|r| r.0);
 
     let mut result = source_text.clone();
@@ -1075,7 +1075,10 @@ fn collect_gdscript_locals(
     }
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            if child.kind() == "function_definition" || child.kind() == "class_definition" || child.kind() == "lambda" {
+            if child.kind() == "function_definition"
+                || child.kind() == "class_definition"
+                || child.kind() == "lambda"
+            {
                 continue;
             }
             collect_gdscript_locals(child, source, locals, ranges, used);
@@ -1111,10 +1114,7 @@ fn minify_text(body: &str, language: &str) -> String {
         }
 
         // String-aware block comment removal: skip `/* */` inside string literals.
-        loop {
-            let Some(start) = find_outside_strings(&line, "/*") else {
-                break;
-            };
+        while let Some(start) = find_outside_strings(&line, "/*") {
             if let Some(rel_end) = line[start..].find("*/") {
                 line = format!("{}{}", &line[..start], &line[start + rel_end + 2..]);
             } else {
@@ -1372,8 +1372,15 @@ mod tests {
             "userCount should be renamed: {}",
             code
         );
-        let legend = result.lines().find(|l| l.starts_with("// ")).expect("should have legend");
-        assert!(legend.contains("userCount"), "legend should mention userCount: {}", legend);
+        let legend = result
+            .lines()
+            .find(|l| l.starts_with("// "))
+            .expect("should have legend");
+        assert!(
+            legend.contains("userCount"),
+            "legend should mention userCount: {}",
+            legend
+        );
     }
 
     #[test]
@@ -1387,14 +1394,22 @@ mod tests {
     fn test_csharp_preserves_member_access() {
         let input = "var result = obj.PropertyName;\nreturn result;";
         let result = minify_body(input, "csharp");
-        assert!(result.contains("PropertyName"), "property should be preserved: {}", result);
+        assert!(
+            result.contains("PropertyName"),
+            "property should be preserved: {}",
+            result
+        );
     }
 
     #[test]
     fn test_csharp_preserves_method_calls() {
         let input = "var data = FetchUserById(id);\nreturn data;";
         let result = minify_body(input, "csharp");
-        assert!(result.contains("FetchUserById"), "method name should be preserved: {}", result);
+        assert!(
+            result.contains("FetchUserById"),
+            "method name should be preserved: {}",
+            result
+        );
     }
 
     #[test]
@@ -1402,7 +1417,11 @@ mod tests {
         let input = "var longVariable = 42;\nConsole.WriteLine(longVariable);";
         let result = minify_body(input, "cs");
         let legend = result.lines().find(|l| l.starts_with("// "));
-        assert!(legend.is_some(), "cs alias should produce legend: {}", result);
+        assert!(
+            legend.is_some(),
+            "cs alias should produce legend: {}",
+            result
+        );
     }
 
     #[test]
@@ -1410,8 +1429,16 @@ mod tests {
         // Regression: minify_text must recognize '#' as gdscript comment prefix
         let input = "var x = 1  # set x\nvar y = 2";
         let result = minify_body(input, "gdscript");
-        assert!(!result.contains("set x"), "gdscript # comments should be stripped: {}", result);
-        assert!(result.contains("= 1"), "code should be preserved: {}", result);
+        assert!(
+            !result.contains("set x"),
+            "gdscript # comments should be stripped: {}",
+            result
+        );
+        assert!(
+            result.contains("= 1"),
+            "code should be preserved: {}",
+            result
+        );
     }
 
     #[test]
@@ -1421,7 +1448,11 @@ mod tests {
         let result = minify_body(input, "gdscript");
         // The output should not contain artificial wrapper-introduced tabs
         // (original code may have tabs, but wrapper shouldn't add new ones)
-        assert!(!result.starts_with('\t'), "output should not start with tab: {}", result);
+        assert!(
+            !result.starts_with('\t'),
+            "output should not start with tab: {}",
+            result
+        );
     }
 
     #[test]

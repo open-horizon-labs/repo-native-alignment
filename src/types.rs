@@ -328,7 +328,7 @@ impl QueryResult {
 
             // Top 5 files by symbol count, with up to 3 key symbols each
             let mut files_sorted: Vec<(&String, &Vec<&Node>)> = file_symbols.iter().collect();
-            files_sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+            files_sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1.len()));
 
             for (file, symbols) in files_sorted.iter().take(5) {
                 out.push_str(&format!("### {} ({} symbols)\n", file, symbols.len()));

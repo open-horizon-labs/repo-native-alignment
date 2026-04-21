@@ -1,8 +1,16 @@
-# ArcSwap for Graph Concurrency
-**Status:** Implementing (issue #574)
-**Date:** 2026-03-24
-
 ---
+id: 002-arcswap-graph-concurrency
+status: implementing
+validate:
+  cargo_tests:
+    - server::tests::test_arcswap_readers_see_consistent_snapshots
+    - server::tests::test_get_graph_result_outlives_subsequent_mutations
+  audits:
+    - graph_state_uses_arcswap
+---
+
+# ArcSwap for Graph Concurrency
+**Date:** 2026-03-24
 
 ## Context
 
@@ -36,6 +44,10 @@ The enrichment pipeline takes ownership of nodes/edges via `std::mem::take`, lea
 - Memory doubles briefly during enrichment (old + new graph) — acceptable on modern machines
 - `GraphState` must be wrapped in `Arc` for atomic swapping
 - ArcSwap was previously used in this codebase and proven to work
+
+## Validation Notes
+
+- The current executable coverage proves snapshot consistency and the live ArcSwap graph type. Additional delivery/performance checks can be added before this ADR moves from `implementing` to `implemented`.
 
 ## References
 

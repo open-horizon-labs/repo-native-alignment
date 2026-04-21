@@ -134,11 +134,9 @@ pub fn parse_markdown_source(source: &str, path: &Path) -> Vec<MarkdownChunk> {
                 current_link_text = String::new();
             }
 
-            Event::End(TagEnd::Link) => {
-                if in_link {
-                    current_links.push((current_link_text.clone(), current_link_dest.clone()));
-                    in_link = false;
-                }
+            Event::End(TagEnd::Link) if in_link => {
+                current_links.push((current_link_text.clone(), current_link_dest.clone()));
+                in_link = false;
             }
 
             Event::Text(text) => {
@@ -337,7 +335,7 @@ pub fn search_chunks<'a>(chunks: &'a [MarkdownChunk], query: &str) -> Vec<&'a Ma
         })
         .collect();
 
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     scored.into_iter().map(|(chunk, _)| chunk).collect()
 }
 

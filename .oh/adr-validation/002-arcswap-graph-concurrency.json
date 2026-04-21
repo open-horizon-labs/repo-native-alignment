@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "002-arcswap-graph-concurrency",
+  "title": "ArcSwap for Graph Concurrency",
+  "status": "implementing",
+  "source": "docs/ADRs/002-arcswap-graph-concurrency.md",
+  "validate": {
+    "cargo_tests": [
+      "server::tests::test_arcswap_readers_see_consistent_snapshots",
+      "server::tests::test_get_graph_result_outlives_subsequent_mutations"
+    ],
+    "audits": [
+      "graph_state_uses_arcswap"
+    ],
+    "scripts": [],
+    "smoke": []
+  }
+}

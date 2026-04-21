@@ -499,9 +499,10 @@ impl ExtractionConsumer for SdkPathInferenceConsumer {
 /// 6. `openapi_sdk_link_pass` — links SDK functions to OpenAPI spec operations
 /// 7. `manifest_pass` — package.json / Cargo.toml dependency nodes
 /// 8. `tested_by_pass` — naming-convention test edges
-/// 9. `import_calls_pass` — resolves bare function calls via import nodes
-/// 10. `directory_module_pass` — directory-level module nodes
-/// 11. Framework-gated passes: `pubsub_pass`, `websocket_pass`, `nextjs_routing_pass`,
+/// 9. `adr_validation_pass` — ADR frontmatter -> exact test function edges
+/// 10. `import_calls_pass` — resolves bare function calls via import nodes
+/// 11. `directory_module_pass` — directory-level module nodes
+/// 12. Framework-gated passes: `pubsub_pass`, `websocket_pass`, `nextjs_routing_pass`,
 ///     `grpc_client_calls_pass`, `extractor_config_pass` — gate on detected_frameworks
 ///
 /// **Why passes run here, not in individual consumers:**
@@ -671,7 +672,18 @@ impl EnrichmentFinalizer {
             }
         }
 
-        // Step 9: import_calls — resolves bare function calls via import nodes.
+        // Step 9: ADR validation links.
+        // - ADR frontmatter points directly at exact Rust cargo test names.
+        // - extracted test functions can reference ADRs back via doc comments.
+        {
+            let mut new_edges = crate::extract::markdown::adr_validation_pass(&all_nodes);
+            new_edges.extend(crate::extract::markdown::adr_backreference_pass(&all_nodes));
+            if !new_edges.is_empty() {
+                all_edges.extend(new_edges);
+            }
+        }
+
+        // Step 10: import_calls — resolves bare function calls via import nodes.
         {
             let new_edges = crate::extract::import_calls::import_calls_pass(&all_nodes);
             if !new_edges.is_empty() {
@@ -679,7 +691,7 @@ impl EnrichmentFinalizer {
             }
         }
 
-        // Step 10: directory_module — directory-level module nodes.
+        // Step 11: directory_module — directory-level module nodes.
         {
             let result = crate::extract::directory_module::directory_module_pass(&all_nodes);
             if !result.nodes.is_empty() || !result.edges.is_empty() {
@@ -688,7 +700,7 @@ impl EnrichmentFinalizer {
             }
         }
 
-        // Step 11: framework-gated passes — run only when the relevant framework is detected.
+        // Step 12: framework-gated passes — run only when the relevant framework is detected.
         // pubsub
         if crate::extract::pubsub::should_run(&detected_frameworks) {
             let result = crate::extract::pubsub::pubsub_pass(

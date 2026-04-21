@@ -1,10 +1,21 @@
+---
+id: 001-event-bus-extraction-pipeline
+status: implemented
+validate:
+  cargo_tests:
+    - extract::event_bus::tests::test_follow_on_events_are_routed
+    - extract::event_bus::tests::test_depth_first_ordering
+    - extract::event_bus::tests::test_consumer_receives_follow_on_regardless_of_registration_order
+  audits:
+    - no_consumer_knows_other_consumers
+    - static_registration_only
+    - no_broker_logic_in_core
+---
+
 # RNA Event Bus Architecture
-**Status:** Implemented — Phase 2b complete (v0.1.15)
 **Issues:** #478 (plugin arch — merged), #479 (event bus — merged), #454 (multi-tenant store — deferred to future release)
 **Date:** 2026-03-22
 **Implementation PRs:** #493 (PostExtractionRegistry), #500 (EventBus + ExtractionConsumer trait), #515 (wire build_full_graph_inner to EventBus), #519 (FastAPI router prefix), #526/#533 (content-addressed cache keys), #527 (ScanStatsConsumer), #528 (AllEnrichmentsGate / parallel LSP), #530 (EmbeddingIndexerConsumer + LanceDBConsumer promotion)
-
----
 
 ## Core Principle
 
@@ -192,6 +203,11 @@ After each implementation phase, an audit agent must verify the architectural co
 
 ### Constraint 5: Performance gate
 **Audit:** `time repo-native-alignment scan --repo . --full` must complete in < 120s on the main RNA repo with no active agent worktrees.
+
+## Validation Gaps
+
+- The `all_paths_go_through_event_bus` constraint is intentionally **not** declared in frontmatter yet: `src/server/enrichment.rs` still performs a direct `framework_detection_pass()` check for fast-path gating before the full bus run. Until that code is cut over, this ADR keeps the gap explicit instead of pretending the audit passes.
+- The performance gate (`repo-native-alignment scan --repo . --full` under 120s on the main RNA repo with no active agent worktrees) is still manual today. The architecture is shipped and the structural/event-flow checks above are executable, but the perf proof is not yet automated.
 
 ## References
 

@@ -1,3 +1,4 @@
+pub mod adr;
 pub mod bootstrap;
 pub mod bus;
 pub mod code;
