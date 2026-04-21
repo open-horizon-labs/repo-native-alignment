@@ -23,6 +23,26 @@ Examples:
 
 ## Procedure
 
+### Step 0: Check LSP enrichment health
+
+Before analyzing, verify the graph has call edges from LSP enrichment:
+
+```text
+search(query="Calls", kind="function", file="<scope>", limit=5)
+```
+
+Look for functions with `Calls` edges that have `source: Lsp`. If **no** function
+shows LSP-sourced edges, the LSP enrichment didn't run successfully for this repo.
+
+> ⚠️ **Warning:** Without LSP enrichment, the graph only has structural edges
+> (Defines, Contains) and import-resolution edges. Method calls (`obj.method()`),
+> property access, JSX component usage (`<Component />`), and callback patterns
+> are invisible. Results will have a **high false-positive rate** for Python and
+> TypeScript repos. Rust and Go repos are less affected (static dispatch).
+>
+> To fix: run `repo-native-alignment scan --repo <path> --full` and check the
+> LSP enrichment logs for errors.
+
 ### Step 1: Gather functions
 
 List all functions in scope. Use non-compact mode to see `In:` and `Out:` edge counts separately.
