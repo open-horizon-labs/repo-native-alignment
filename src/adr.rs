@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -408,19 +408,20 @@ pub fn validate(
             } else {
                 Command::new(&script_path)
             };
-            let output = command
-                .current_dir(repo_root)
-                .output()
+            command.current_dir(repo_root);
+            let output = run_command_with_timeout(&mut command, COMMAND_TIMEOUT)
                 .with_context(|| format!("running script {}", script))?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let ok = output.status.success();
+            let ok = output.success;
             checks.push(CheckExecution {
                 kind: "script".to_string(),
                 target: script.clone(),
                 ok,
                 details: if ok {
                     "passed".to_string()
+                } else if output.timed_out {
+                    format!("timed out after {}s", COMMAND_TIMEOUT.as_secs())
                 } else {
                     summarize_command_output(&stdout, &stderr)
                 },
@@ -433,22 +434,25 @@ pub fn validate(
         for fixture in &manifest.validate.smoke {
             let binary =
                 std::env::current_exe().context("resolving current executable for smoke run")?;
-            let output = Command::new(&binary)
+            let mut command = Command::new(&binary);
+            command
                 .arg("test")
                 .arg("--repo")
                 .arg(repo_root.join(fixture))
-                .current_dir(repo_root)
-                .output()
+                .current_dir(repo_root);
+            let output = run_command_with_timeout(&mut command, COMMAND_TIMEOUT)
                 .with_context(|| format!("running smoke fixture {}", fixture))?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let ok = output.status.success();
+            let ok = output.success;
             checks.push(CheckExecution {
                 kind: "smoke".to_string(),
                 target: fixture.clone(),
                 ok,
                 details: if ok {
                     "passed".to_string()
+                } else if output.timed_out {
+                    format!("timed out after {}s", COMMAND_TIMEOUT.as_secs())
                 } else {
                     summarize_command_output(&stdout, &stderr)
                 },
@@ -1054,86 +1058,9 @@ fn summarize_command_output(stdout: &str, stderr: &str) -> String {
     summary.to_string()
 }
 
-pub fn adr_edges_from_frontmatter(all_nodes: &[crate::graph::Node]) -> Vec<crate::graph::Edge> {
-    use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeKind};
-
-    let mut test_nodes: HashMap<&str, Vec<&Node>> = HashMap::new();
-    for node in all_nodes {
-        if node.id.kind == NodeKind::Function
-            && node.metadata.get("is_test").map(|value| value.as_str()) == Some("true")
-        {
-            test_nodes
-                .entry(node.id.name.as_str())
-                .or_default()
-                .push(node);
-        }
-    }
-
-    let mut file_primary_node: HashMap<&Path, &crate::graph::NodeId> = HashMap::new();
-    let mut file_frontmatter: Vec<&Node> = Vec::new();
-    for node in all_nodes {
-        if node.id.kind != NodeKind::MarkdownSection {
-            continue;
-        }
-        if node
-            .metadata
-            .get("is_frontmatter")
-            .map(|value| value.as_str())
-            == Some("true")
-        {
-            file_frontmatter.push(node);
-            continue;
-        }
-        file_primary_node
-            .entry(node.id.file.as_path())
-            .or_insert(&node.id);
-    }
-
-    let mut edges = Vec::new();
-    let mut seen = BTreeSet::new();
-    for frontmatter in file_frontmatter {
-        let refs: AdrFrontmatter = match serde_yaml::from_str(&frontmatter.body) {
-            Ok(frontmatter) => frontmatter,
-            Err(_) => continue,
-        };
-        let Some(source_id) = file_primary_node
-            .get(frontmatter.id.file.as_path())
-            .copied()
-            .or(Some(&frontmatter.id))
-        else {
-            continue;
-        };
-
-        for cargo_test in refs.validate.cargo_tests {
-            let leaf = cargo_test.rsplit("::").next().unwrap_or(&cargo_test);
-            let Some(targets) = test_nodes.get(leaf) else {
-                continue;
-            };
-            if targets.len() != 1 {
-                continue;
-            }
-            let target = targets[0];
-            let key = format!("{}->{}", source_id.to_stable_id(), target.id.to_stable_id());
-            if !seen.insert(key) {
-                continue;
-            }
-            edges.push(Edge {
-                from: source_id.clone(),
-                to: target.id.clone(),
-                kind: EdgeKind::References,
-                source: ExtractionSource::Markdown,
-                confidence: Confidence::Confirmed,
-            });
-        }
-    }
-    edges
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
-    use std::collections::BTreeMap;
     use tempfile::TempDir;
 
     fn write_adr(repo: &Path, file: &str, content: &str) {
@@ -1280,60 +1207,6 @@ mod tests {
         );
         assert!(tests.contains("server::tests::test_arcswap_readers_see_consistent_snapshots"));
         assert!(tests.contains("extract::event_bus::tests::test_depth_first_ordering"));
-    }
-
-    #[test]
-    fn test_adr_edges_from_frontmatter_link_to_unique_test_nodes() {
-        let frontmatter = Node {
-            id: NodeId {
-                root: String::new(),
-                file: PathBuf::from("docs/ADRs/002-arcswap-graph-concurrency.md"),
-                name: "frontmatter".to_string(),
-                kind: NodeKind::MarkdownSection,
-            },
-            language: "markdown".to_string(),
-            line_start: 1,
-            line_end: 6,
-            signature: "[frontmatter]".to_string(),
-            body: "id: 002-arcswap-graph-concurrency\nstatus: implementing\nvalidate:\n  cargo_tests:\n    - server::tests::test_arcswap_readers_see_consistent_snapshots\n".to_string(),
-            metadata: BTreeMap::from([("is_frontmatter".to_string(), "true".to_string())]),
-            source: ExtractionSource::Markdown,
-        };
-        let adr = Node {
-            id: NodeId {
-                root: String::new(),
-                file: PathBuf::from("docs/ADRs/002-arcswap-graph-concurrency.md"),
-                name: "ArcSwap for Graph Concurrency".to_string(),
-                kind: NodeKind::MarkdownSection,
-            },
-            language: "markdown".to_string(),
-            line_start: 8,
-            line_end: 20,
-            signature: "ArcSwap for Graph Concurrency".to_string(),
-            body: "# ArcSwap for Graph Concurrency".to_string(),
-            metadata: BTreeMap::new(),
-            source: ExtractionSource::Markdown,
-        };
-        let test = Node {
-            id: NodeId {
-                root: String::new(),
-                file: PathBuf::from("src/server/mod.rs"),
-                name: "test_arcswap_readers_see_consistent_snapshots".to_string(),
-                kind: NodeKind::Function,
-            },
-            language: "rust".to_string(),
-            line_start: 1,
-            line_end: 10,
-            signature: "async fn test_arcswap_readers_see_consistent_snapshots()".to_string(),
-            body: String::new(),
-            metadata: BTreeMap::from([("is_test".to_string(), "true".to_string())]),
-            source: ExtractionSource::TreeSitter,
-        };
-
-        let edges = adr_edges_from_frontmatter(&[frontmatter, adr.clone(), test.clone()]);
-        assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].from, adr.id);
-        assert_eq!(edges[0].to, test.id);
     }
 
     #[test]
