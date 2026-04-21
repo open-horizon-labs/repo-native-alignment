@@ -211,10 +211,59 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         }
     }
 
-    if !edges.is_empty() {
+    let calls_count = edges.len();
+
+    // ------------------------------------------------------------------
+    // 5. Emit ReferencedBy edges for imports that resolve to functions.
+    //    This catches references that aren't bare call sites (keyword args,
+    //    dict dispatch, decorator registration, re-exports). A function
+    //    imported by another file is referenced even if not called directly.
+    // ------------------------------------------------------------------
+    let mut ref_count = 0usize;
+    for import_node in all_nodes {
+        if import_node.id.kind != NodeKind::Import {
+            continue;
+        }
+        let text = &import_node.id.name;
+        let names = parse_imported_names(text);
+        let importer_lang = import_node.language.as_str();
+        for name in &names {
+            if name.len() < 4 {
+                continue;
+            }
+            let Some(candidates) = fn_by_name.get(name.as_str()) else {
+                continue;
+            };
+            for callee in candidates {
+                // Must be in a different file, same language family
+                if (callee.id.root == import_node.id.root
+                    && callee.id.file == import_node.id.file)
+                    || !languages_compatible(importer_lang, callee.language.as_str())
+                {
+                    continue;
+                }
+                let key = (import_node.id.to_stable_id(), callee.id.to_stable_id());
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.insert(key);
+                edges.push(Edge {
+                    from: import_node.id.clone(),
+                    to: callee.id.clone(),
+                    kind: EdgeKind::ReferencedBy,
+                    source: ExtractionSource::TreeSitter,
+                    confidence: Confidence::Detected,
+                });
+                ref_count += 1;
+            }
+        }
+    }
+
+    if calls_count > 0 || ref_count > 0 {
         tracing::info!(
-            "import_calls pass: {} cross-file Calls edge(s) via import resolution",
-            edges.len()
+            "import_calls pass: {} cross-file Calls edge(s), {} import ReferencedBy edge(s)",
+            calls_count,
+            ref_count
         );
     }
 
