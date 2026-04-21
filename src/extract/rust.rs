@@ -124,6 +124,10 @@ impl Extractor for RustExtractor {
         // Generic pass: function/struct/field/const/import/etc. + string literals.
         let mut result = GenericExtractor::new(&RUST_CONFIG).run(path, content)?;
 
+        // Rust-specific: enrich extracted test functions with exact `cargo test -- --list`
+        // style paths so ADR frontmatter can reference real tests unambiguously.
+        enrich_test_paths(path, &mut result.nodes);
+
         // Rust-specific: topology pattern detection (subprocess, network, async)
         // and static item metadata enrichment.
         let mut parser = tree_sitter::Parser::new();
@@ -140,6 +144,58 @@ impl Extractor for RustExtractor {
 
         Ok(result)
     }
+}
+
+fn enrich_test_paths(path: &Path, nodes: &mut [crate::graph::Node]) {
+    let base_segments = rust_module_segments(path);
+
+    for node in nodes.iter_mut() {
+        if node.id.kind != NodeKind::Function
+            || node.language != "rust"
+            || node.metadata.get("is_test").map(|value| value.as_str()) != Some("true")
+        {
+            continue;
+        }
+
+        let mut segments = base_segments.clone();
+        if let Some(scope) = node.metadata.get("parent_scope") {
+            let scope = scope.trim();
+            if !scope.is_empty()
+                && !scope.contains(" for ")
+                && segments.last().is_none_or(|last| last != scope)
+            {
+                segments.push(scope.to_string());
+            }
+        }
+        segments.push(node.id.name.clone());
+        node.metadata
+            .insert("test_path".to_string(), segments.join("::"));
+    }
+}
+
+fn rust_module_segments(path: &Path) -> Vec<String> {
+    let mut parts: Vec<String> = path
+        .iter()
+        .map(|part| part.to_string_lossy().to_string())
+        .collect();
+
+    if let Some(first) = parts.first()
+        && (first == "src" || first == "tests")
+    {
+        parts.remove(0);
+    }
+
+    if let Some(last) = parts.last_mut()
+        && last.ends_with(".rs")
+    {
+        *last = last.trim_end_matches(".rs").to_string();
+    }
+
+    if parts.last().is_some_and(|last| last == "mod") {
+        parts.pop();
+    }
+
+    parts.into_iter().filter(|part| !part.is_empty()).collect()
 }
 
 // ---------------------------------------------------------------------------

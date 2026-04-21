@@ -672,10 +672,12 @@ impl EnrichmentFinalizer {
             }
         }
 
-        // Step 9: ADR validation links — ADR frontmatter points directly at exact
-        // cargo test names, which resolve here to extracted test function nodes.
+        // Step 9: ADR validation links.
+        // - ADR frontmatter points directly at exact Rust cargo test names.
+        // - extracted test functions can reference ADRs back via doc comments.
         {
-            let new_edges = crate::extract::markdown::adr_validation_pass(&all_nodes);
+            let mut new_edges = crate::extract::markdown::adr_validation_pass(&all_nodes);
+            new_edges.extend(crate::extract::markdown::adr_backreference_pass(&all_nodes));
             if !new_edges.is_empty() {
                 all_edges.extend(new_edges);
             }

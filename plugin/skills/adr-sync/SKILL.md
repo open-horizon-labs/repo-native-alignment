@@ -99,6 +99,7 @@ For each ADR claim that should be executable but is not yet backed by a real che
 ### Compile / Check
 - `repo-native-alignment adr compile --repo .` → [pass/fail]
 - `repo-native-alignment adr compile --repo . --check` → [pass/fail]
+- `repo-native-alignment adr validate --repo .` → [pass/fail]
 
 ### Missing Real Checks
 - ADR 002: claim "tool calls never block" still needs a dedicated regression test

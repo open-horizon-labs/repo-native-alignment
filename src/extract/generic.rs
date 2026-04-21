@@ -451,7 +451,7 @@ fn collect_nodes(
                 }
             }
 
-            let adr_refs = if node_kind == NodeKind::Function
+            if node_kind == NodeKind::Function
                 && metadata.get("is_test").map(|s| s.as_str()) == Some("true")
             {
                 let refs = metadata
@@ -466,10 +466,7 @@ fn collect_nodes(
                         .join(", ");
                     metadata.insert("adr_refs".to_string(), joined);
                 }
-                refs
-            } else {
-                Vec::new()
-            };
+            }
 
             // Generic type parameter extraction.
             if let Some(tp_kind) = config.type_param_node_kind {
@@ -599,26 +596,6 @@ fn collect_nodes(
 
             if let Some(edge) = import_edge {
                 edges.push(edge);
-            }
-
-            for adr_path in &adr_refs {
-                let adr_name = adr_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                edges.push(Edge {
-                    from: node_id.clone(),
-                    to: NodeId {
-                        root: String::new(),
-                        file: adr_path.clone(),
-                        name: adr_name,
-                        kind: NodeKind::MarkdownSection,
-                    },
-                    kind: EdgeKind::References,
-                    source: ExtractionSource::TreeSitter,
-                    confidence: Confidence::Detected,
-                });
             }
 
             // Function parameter/return type DependsOn edges (config-driven).
@@ -5880,16 +5857,12 @@ fn my_test() {}
             test_fn.metadata.get("adr_refs").map(|s| s.as_str()),
             Some("docs/ADRs/002-arcswap-graph-concurrency.md")
         );
-
-        let refs: Vec<_> = result
-            .edges
-            .iter()
-            .filter(|e| e.kind == EdgeKind::References && e.from.name == "my_test")
-            .collect();
-        assert_eq!(refs.len(), 1);
-        assert_eq!(
-            refs[0].to.file,
-            PathBuf::from("docs/ADRs/002-arcswap-graph-concurrency.md")
+        assert!(
+            !result
+                .edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::References && e.from.name == "my_test"),
+            "generic extraction should record ADR refs but defer real markdown edges to the markdown pass"
         );
     }
 
@@ -5905,15 +5878,20 @@ async fn my_async_test() {}
             .run(Path::new("test.rs"), code)
             .unwrap();
 
-        let refs: Vec<_> = result
-            .edges
+        let test_fn = result
+            .nodes
             .iter()
-            .filter(|e| e.kind == EdgeKind::References && e.from.name == "my_async_test")
-            .collect();
-        assert_eq!(refs.len(), 1);
+            .find(|n| n.id.name == "my_async_test")
+            .unwrap();
         assert_eq!(
-            refs[0].to.file,
-            PathBuf::from("docs/ADRs/001-event-bus-extraction-pipeline.md")
+            test_fn.metadata.get("adr_refs").map(|s| s.as_str()),
+            Some("docs/ADRs/001-event-bus-extraction-pipeline.md")
+        );
+        assert!(
+            !result
+                .edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::References && e.from.name == "my_async_test")
         );
     }
 
