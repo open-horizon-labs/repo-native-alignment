@@ -291,13 +291,23 @@ impl LspEnricher {
                 if !extensions.contains(&ext) {
                     continue;
                 }
-                // Skip test and generated files
+                // Skip test, generated, and declaration files
                 if name_str.starts_with("test_")
                     || name_str.contains(".test.")
                     || name_str.contains(".spec.")
                     || name_str.contains(".gen.")
                     || name_str.contains("_pb2")
                     || name_str.starts_with("conftest")
+                    || name_str.ends_with(".d.ts")
+                {
+                    continue;
+                }
+                // Skip files inside test directories
+                let entry_path = entry.path();
+                let path_str = entry_path.to_string_lossy();
+                if path_str.contains("/tests/")
+                    || path_str.contains("/test/")
+                    || path_str.contains("/__tests__/")
                 {
                     continue;
                 }
@@ -1018,13 +1028,11 @@ impl LspEnricher {
                     }
                 }
 
-                // After 3 consecutive empty responses on different queries,
-                // the server is almost certainly not going to index this project.
-                // Mark it as "responsive but not indexed" early.
-                if consecutive_empty >= 3 && attempt >= 3 {
-                    // Check if ALL queries returned empty — not just a streak.
-                    // If every query we tried returned 0 symbols, the server
-                    // is responsive but not indexing this workspace.
+                // After consecutive empty responses on different queries,
+                // the server may not have finished indexing yet. Only bail
+                // early if we've waited at least 60s — large Python/TS projects
+                // (27k+ nodes) genuinely need this long for pyright to index.
+                if consecutive_empty >= 3 && attempt >= 3 && elapsed >= 60 {
                     tracing::warn!(
                         "{} indexing validation failed: {} consecutive empty responses across different queries — \
                          server is responsive but has not indexed the workspace ({}s elapsed)",
@@ -1032,10 +1040,6 @@ impl LspEnricher {
                         consecutive_empty,
                         elapsed
                     );
-                    // server_ready stays false, saw_quiescent stays false.
-                    // This means Pass 1 and Pass 3 will be skipped, which is
-                    // correct — sending requests to an unindexed server produces
-                    // 0 edges and wastes time.
                     break;
                 }
 
