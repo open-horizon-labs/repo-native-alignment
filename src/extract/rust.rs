@@ -92,6 +92,9 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: Some("visibility_modifier"),
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: true,
 };
 
 /// Rust tree-sitter extractor with topology pattern detection.

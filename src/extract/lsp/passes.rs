@@ -108,15 +108,13 @@ impl LspEnricher {
                 )
             })
             .filter(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "diagnostic"))
-            // For Python, only enrich functions (via callHierarchy).
-            // pyright's textDocument/references hangs on class/enum/const
-            // definitions (30s timeout per node), triggering the error-rate
-            // abort and killing the entire enrichment before any functions
-            // get processed.
+            // When lsp_enrichable_kinds is set, restrict to those kinds only.
+            // This is configured per-language via LangConfig (e.g., Python restricts
+            // to Function+Trait because pyright's textDocument/references hangs on
+            // class/enum/const lookups).
             .filter(|n| {
-                if language == "python" {
-                    return n.id.kind == NodeKind::Function
-                        || n.id.kind == NodeKind::Trait;
+                if let Some(ref kinds) = self.lsp_enrichable_kinds {
+                    return kinds.contains(&n.id.kind);
                 }
                 true
             })
@@ -948,10 +946,12 @@ impl LspEnricher {
             nodes_by_file.entry(n.id.file.clone()).or_default().push(n);
         }
 
-        let is_rust = self.language == "rust";
+        let has_parent_module = crate::extract::configs::config_for_language(&self.language)
+            .map(|c| c.has_parent_module_request)
+            .unwrap_or(false);
 
         for (rel_file, file_nodes) in &nodes_by_file {
-            Self::emit_belongs_to_edges(transport, file_nodes, rel_file, root, is_rust, result)
+            Self::emit_belongs_to_edges(transport, file_nodes, rel_file, root, has_parent_module, result)
                 .await;
         }
 

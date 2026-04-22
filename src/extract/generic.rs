@@ -182,6 +182,22 @@ pub struct LangConfig {
     /// Rust, Java, TypeScript use decorator/attribute patterns — their `test_helper()`
     /// functions are NOT tests by naming alone.
     pub test_name_prefix: bool,
+    /// Which node kinds to send to the LSP enricher for reference/callHierarchy lookups.
+    /// Defaults to `None` = all enrichable kinds (Function, Trait, Struct, Enum, TypeAlias, Const).
+    /// When `Some(&[...])`, only the listed kinds are enriched via LSP.
+    ///
+    /// Python sets this to `&[Function, Trait]` because pyright's textDocument/references
+    /// hangs on class/enum/const lookups (30s timeout per node), triggering the error-rate
+    /// abort and killing the entire enrichment pass before any functions get processed.
+    pub lsp_enrichable_kinds: Option<&'static [NodeKind]>,
+    /// Virtual environment directory names to look for in the startup root.
+    /// When found, these are passed to the LSP server as venvPath/venv in
+    /// initializationOptions so it can resolve installed packages.
+    /// `None` = no venv detection for this language.
+    pub venv_candidates: Option<&'static [&'static str]>,
+    /// Whether this language's LSP server supports a custom `parentModule`
+    /// request for more accurate module hierarchy (e.g., rust-analyzer).
+    pub has_parent_module_request: bool,
 }
 
 // ---------------------------------------------------------------------------

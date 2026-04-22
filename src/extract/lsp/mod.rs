@@ -82,6 +82,9 @@ pub struct LspEnricher {
     /// always uses `repo_root` (passed to `enrich()`), which ensures file URIs point to
     /// the correct absolute paths.
     startup_root_override: std::sync::OnceLock<PathBuf>,
+    /// Which node kinds to enrich via LSP. None = all enrichable kinds.
+    /// Configured per-language via LangConfig::lsp_enrichable_kinds.
+    lsp_enrichable_kinds: Option<Vec<NodeKind>>,
 }
 
 struct LspState {
@@ -183,6 +186,7 @@ impl LspEnricher {
                 diagnostics_sink: Arc::new(std::sync::Mutex::new(HashMap::new())),
             }),
             startup_root_override: std::sync::OnceLock::new(),
+            lsp_enrichable_kinds: None,
         }
     }
 
@@ -215,6 +219,13 @@ impl LspEnricher {
     /// prefer the root that contains this file (e.g., `tsconfig.json` for TypeScript).
     pub fn with_config_file(mut self, config_file: &'static str) -> Self {
         self.config_file = Some(config_file);
+        self
+    }
+
+    /// Restrict which node kinds are enriched via LSP.
+    /// When set, only nodes matching these kinds are sent for enrichment.
+    pub fn with_enrichable_kinds(mut self, kinds: &'static [NodeKind]) -> Self {
+        self.lsp_enrichable_kinds = Some(kinds.to_vec());
         self
     }
 
@@ -475,19 +486,16 @@ impl LspEnricher {
         //
         // Checks common venv directory names in priority order: .venv, venv, env.
         // Build effective initialization settings.
-        // For pyright, detect a virtual environment at startup_root and inject
-        // venvPath + venv so pyright can resolve installed packages.
-        // We materialize the full python.analysis structure even if init_settings
-        // doesn't have it, so venv config is always delivered when a venv exists.
-        let effective_settings = if self.language == "python" {
-            let venv_candidates = [".venv", "venv", "env"];
-            if let Some(venv_name) = venv_candidates
+        // If the LangConfig declares venv_candidates, detect a virtual environment
+        // at startup_root and inject venvPath + venv so the LSP server can resolve
+        // installed packages.
+        let lang_config = crate::extract::configs::config_for_language(&self.language);
+        let effective_settings = if let Some(venv_dirs) = lang_config.and_then(|c| c.venv_candidates) {
+            let found_venv = venv_dirs
                 .iter()
-                .find(|&&name| startup_root.join(name).is_dir())
-            {
+                .find(|&&name| startup_root.join(name).is_dir());
+            if let Some(venv_name) = found_venv {
                 let venv_path_str = startup_root.to_string_lossy().to_string();
-                // Start from existing settings or an empty object, then
-                // unconditionally materialize python.analysis.{venvPath,venv}.
                 let mut merged = self
                     .init_settings
                     .as_ref()
@@ -517,7 +525,8 @@ impl LspEnricher {
                     }
                 }
                 tracing::info!(
-                    "pyright: found {} at '{}', adding venvPath/venv to initializationOptions",
+                    "{}: found {} at '{}', adding venvPath/venv to initializationOptions",
+                    self.server_command,
                     venv_name,
                     startup_root.display()
                 );
@@ -1986,7 +1995,7 @@ impl LspEnricher {
         file_nodes: &[&Node],
         rel_file: &Path,
         root: &Path,
-        is_rust: bool,
+        has_parent_module: bool,
         result: &mut EnrichmentResult,
     ) {
         if file_nodes.is_empty() {
@@ -1994,8 +2003,8 @@ impl LspEnricher {
         }
 
         // Derive a module name for this file.
-        // Priority: (1) rust-analyzer/parentModule for Rust, (2) directory-based fallback.
-        let module_name: Option<String> = if is_rust {
+        // Priority: (1) LSP parentModule request if supported, (2) directory-based fallback.
+        let module_name: Option<String> = if has_parent_module {
             let abs_path = root.join(rel_file);
             if let Ok(file_uri) = path_to_uri(&abs_path) {
                 Self::ra_parent_module(transport, &file_uri)
