@@ -226,14 +226,13 @@ fn collect_attribute_names<'a>(
 ) {
     loop {
         let node = cursor.node();
-        if node.kind() == attr_kind {
-            if let Some(child) = node.child_by_field_name(attr_field) {
-                if let Ok(text) = child.utf8_text(source) {
-                    let text = text.trim();
-                    if text.len() >= 4 {
-                        out.push(text);
-                    }
-                }
+        if node.kind() == attr_kind
+            && let Some(child) = node.child_by_field_name(attr_field)
+            && let Ok(text) = child.utf8_text(source)
+        {
+            let text = text.trim();
+            if text.len() >= 4 {
+                out.push(text);
             }
         }
         if cursor.goto_first_child() {
@@ -582,16 +581,16 @@ fn collect_nodes(
             // Attribute access extraction — capture method/property names
             // used via dot access in function bodies. Stored as metadata
             // for import_calls_pass to match against defined function names.
-            if node_kind == NodeKind::Function {
-                if let Some((attr_kind, attr_field)) = config.attribute_access_node {
-                    let mut attr_names: Vec<&str> = Vec::new();
-                    let mut cursor = node.walk();
-                    collect_attribute_names(&mut cursor, source, attr_kind, attr_field, &mut attr_names);
-                    if !attr_names.is_empty() {
-                        attr_names.sort_unstable();
-                        attr_names.dedup();
-                        metadata.insert("attr_refs".to_string(), attr_names.join(","));
-                    }
+            if node_kind == NodeKind::Function
+                && let Some((attr_kind, attr_field)) = config.attribute_access_node
+            {
+                let mut attr_names: Vec<&str> = Vec::new();
+                let mut cursor = node.walk();
+                collect_attribute_names(&mut cursor, source, attr_kind, attr_field, &mut attr_names);
+                if !attr_names.is_empty() {
+                    attr_names.sort_unstable();
+                    attr_names.dedup();
+                    metadata.insert("attr_refs".to_string(), attr_names.join(","));
                 }
             }
 
