@@ -889,10 +889,14 @@ mod tests {
         let nodes = vec![caller.clone(), callee.clone(), import];
         let edges = import_calls_pass(&nodes);
 
-        assert_eq!(edges.len(), 1, "expected 1 Calls edge, got {:?}", edges);
-        assert_eq!(edges[0].from.name, "main");
-        assert_eq!(edges[0].to.name, "helper");
-        assert_eq!(edges[0].kind, EdgeKind::Calls);
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
+        assert_eq!(calls.len(), 1, "expected 1 Calls edge, got {:?}", edges);
+        assert_eq!(calls[0].from.name, "main");
+        assert_eq!(calls[0].to.name, "helper");
+        assert_eq!(calls[0].kind, EdgeKind::Calls);
+        // Also expect a ReferencedBy edge from the import
+        let refs: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::ReferencedBy).collect();
+        assert_eq!(refs.len(), 1, "expected 1 import ReferencedBy edge");
     }
 
     #[test]
@@ -935,12 +939,11 @@ mod tests {
 
         let nodes = vec![caller, callee, import];
         let edges = import_calls_pass(&nodes);
-
-        assert!(
-            edges.is_empty(),
-            "no call in body → no edge, got {:?}",
-            edges
-        );
+        // No Calls edge (helper not called in body), but import creates a ReferencedBy edge
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
+        assert!(calls.is_empty(), "no call in body → no Calls edge, got {:?}", calls);
+        let refs: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::ReferencedBy).collect();
+        assert_eq!(refs.len(), 1, "import creates ReferencedBy even without body call");
     }
 
     #[test]
@@ -994,15 +997,10 @@ mod tests {
         let nodes = vec![caller, callee, import_node];
         let edges = import_calls_pass(&nodes);
 
-        assert_eq!(
-            edges.len(),
-            1,
-            "expected 1 Python Calls edge, got {:?}",
-            edges
-        );
-        assert_eq!(edges[0].from.name, "get_workspace");
-        assert_eq!(edges[0].to.name, "fetch_data");
-        assert_eq!(edges[0].kind, EdgeKind::Calls);
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
+        assert_eq!(calls.len(), 1, "expected 1 Python Calls edge, got {:?}", edges);
+        assert_eq!(calls[0].from.name, "get_workspace");
+        assert_eq!(calls[0].to.name, "fetch_data");
     }
 
     #[test]
@@ -1051,11 +1049,12 @@ mod tests {
         let nodes = vec![caller, callee, import];
         let edges = import_calls_pass(&nodes);
 
-        assert!(
-            edges.is_empty(),
-            "method call `obj.helper()` must not emit Calls edge, got {:?}",
-            edges
-        );
+        // No Calls edge (method call, not bare call), but import ReferencedBy still emitted
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
+        assert!(calls.is_empty(), "method call `obj.helper()` must not emit Calls edge, got {:?}", calls);
+        // Import ReferencedBy is still emitted since helper is imported
+        let refs: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::ReferencedBy).collect();
+        assert_eq!(refs.len(), 1, "import ReferencedBy still emitted");
     }
 
     #[test]
@@ -1067,12 +1066,9 @@ mod tests {
         let nodes = vec![caller, callee, import];
         let edges = import_calls_pass(&nodes);
 
-        assert_eq!(edges.len(), 1);
-        assert_eq!(
-            edges[0].confidence,
-            Confidence::Detected,
-            "relative import should produce Detected confidence"
-        );
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].confidence, Confidence::Detected, "relative import should produce Detected confidence");
     }
 
     #[test]
@@ -1085,19 +1081,11 @@ mod tests {
         let nodes = vec![caller, callee, import];
         let edges = import_calls_pass(&nodes);
 
-        // Edge is emitted when a local function with matching name exists.
-        assert_eq!(
-            edges.len(),
-            1,
-            "expected 1 Calls edge for the non-relative import"
-        );
-        // All edges use Detected confidence.
+        // Calls edge + import ReferencedBy edge
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
+        assert_eq!(calls.len(), 1, "expected 1 Calls edge for the non-relative import");
         for e in &edges {
-            assert_eq!(
-                e.confidence,
-                Confidence::Detected,
-                "all import-calls edges use Detected confidence"
-            );
+            assert_eq!(e.confidence, Confidence::Detected, "all import-calls edges use Detected confidence");
         }
     }
 
@@ -1293,25 +1281,22 @@ mod tests {
         ];
         let edges = import_calls_pass(&nodes);
 
-        // Expected: 2 edges — mainA→helperA (root-a) and mainB→helperB (root-b).
-        // Without (root, file) keying: root-b's `helperB` import could leak into
-        // root-a, and vice versa, causing different counts.
+        // Expected: 2 Calls edges — mainA→helperA (root-a) and mainB→helperB (root-b).
+        // Plus 2 import ReferencedBy edges.
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
         assert_eq!(
-            edges.len(),
+            calls.len(),
             2,
-            "expected 2 isolated cross-file edges, got {:?}",
-            edges
-                .iter()
-                .map(|e| format!("{}->{}", e.from.name, e.to.name))
-                .collect::<Vec<_>>()
+            "expected 2 isolated cross-file Calls edges, got {:?}",
+            calls.iter().map(|e| format!("{}->{}", e.from.name, e.to.name)).collect::<Vec<_>>()
         );
 
-        let edge_a = edges.iter().find(|e| e.from.root == "root-a");
+        let edge_a = calls.iter().find(|e| e.from.root == "root-a");
         assert!(edge_a.is_some(), "missing root-a edge");
         assert_eq!(edge_a.unwrap().from.name, "mainA");
         assert_eq!(edge_a.unwrap().to.name, "helperA");
 
-        let edge_b = edges.iter().find(|e| e.from.root == "root-b");
+        let edge_b = calls.iter().find(|e| e.from.root == "root-b");
         assert!(edge_b.is_some(), "missing root-b edge");
         assert_eq!(edge_b.unwrap().from.name, "mainB");
         assert_eq!(edge_b.unwrap().to.name, "helperB");
