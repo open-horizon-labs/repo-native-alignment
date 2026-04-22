@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use tokio::sync::Mutex;
 
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
@@ -107,6 +108,18 @@ impl LspEnricher {
                 )
             })
             .filter(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "diagnostic"))
+            // For Python, only enrich functions (via callHierarchy).
+            // pyright's textDocument/references hangs on class/enum/const
+            // definitions (30s timeout per node), triggering the error-rate
+            // abort and killing the entire enrichment before any functions
+            // get processed.
+            .filter(|n| {
+                if language == "python" {
+                    return n.id.kind == NodeKind::Function
+                        || n.id.kind == NodeKind::Trait;
+                }
+                true
+            })
             .filter(|n| {
                 // Skip test functions (have #[test] or #[tokio::test] decorator)
                 if n.id.kind == NodeKind::Function {
@@ -163,6 +176,10 @@ impl LspEnricher {
         let completed = Arc::new(AtomicI64::new(0));
         let error_count = Arc::new(AtomicI64::new(0));
         let ramped_up = Arc::new(AtomicBool::new(false));
+        // Track files we've sent didOpen for — pyright only resolves
+        // callHierarchy for files it has analyzed.
+        let opened_files: Arc<Mutex<std::collections::HashSet<PathBuf>>> =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
 
         for node in &enrichable_nodes {
             let node = (*node).clone();
@@ -175,6 +192,7 @@ impl LspEnricher {
             let completed = Arc::clone(&completed);
             let error_count = Arc::clone(&error_count);
             let ramped_up = Arc::clone(&ramped_up);
+            let opened = Arc::clone(&opened_files);
 
             join_set.spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
@@ -187,6 +205,37 @@ impl LspEnricher {
                         return (Vec::new(), Vec::new(), false);
                     }
                 };
+
+                // Send didOpen for this file if not already opened.
+                // pyright only resolves callHierarchy for analyzed files.
+                {
+                    let needs_open = {
+                        let mut set = opened.lock().await;
+                        set.insert(node.id.file.clone())
+                    };
+                    if needs_open {
+                        let lang_id = match language.as_str() {
+                            "python" => "python",
+                            "typescript" => if abs_path.extension().map(|e| e == "tsx").unwrap_or(false) { "typescriptreact" } else { "typescript" },
+                            "rust" => "rust",
+                            "go" => "go",
+                            _ => "plaintext",
+                        };
+                        if let Ok(content) = std::fs::read_to_string(&abs_path) {
+                            let _ = transport.notify(
+                                "textDocument/didOpen",
+                                serde_json::json!({
+                                    "textDocument": {
+                                        "uri": file_uri.to_string(),
+                                        "languageId": lang_id,
+                                        "version": 1,
+                                        "text": content
+                                    }
+                                }),
+                            ).await;
+                        }
+                    }
+                }
 
                 let (line, col) = Self::node_lsp_position(&node);
                 let mut edges = Vec::new();
