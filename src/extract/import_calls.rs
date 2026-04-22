@@ -139,9 +139,10 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         // each against the imports set. This is O(body_size + imports) instead
         // of O(imports × body_size) when iterating imports first.
         let called_names = extract_call_sites(&node.body);
-        if called_names.is_empty() {
-            continue;
-        }
+        // Also check for bare name references (not calls) — e.g.,
+        // `handler=some_function` or `callback_list.append(some_function)`.
+        // This captures functions passed as first-class values.
+        let body_bytes = node.body.as_bytes();
 
         // For each imported name that appears as a call in this function body
         for imported_name in imported_names {
@@ -153,8 +154,12 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             if node.id.name == imported_name.as_str() {
                 continue;
             }
-            // Check if the extracted call sites include this imported name.
-            if !called_names.contains(imported_name.as_str()) {
+            // Check if the imported name appears in this function body —
+            // either as a call site (`name(`) or as a bare identifier reference
+            // (`handler=name`, `list.append(name)`, etc.).
+            let is_called = called_names.contains(imported_name.as_str());
+            let is_referenced = !is_called && body_contains_word(body_bytes, imported_name.as_bytes());
+            if !is_called && !is_referenced {
                 continue;
             }
 
@@ -203,7 +208,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
                 edges.push(Edge {
                     from: node.id.clone(),
                     to: callee.id.clone(),
-                    kind: EdgeKind::Calls,
+                    kind: if is_called { EdgeKind::Calls } else { EdgeKind::ReferencedBy },
                     source: ExtractionSource::TreeSitter,
                     confidence: confidence.clone(),
                 });
@@ -531,6 +536,36 @@ fn parse_es6_import_names(text: &str) -> Vec<String> {
     }
 
     names
+}
+
+/// Check if `name` appears as a whole-word identifier in `body`.
+/// Uses ASCII word-boundary checks (prev/next byte is not alphanumeric or `_`).
+/// This catches bare name references like `handler=some_function` or
+/// `[some_function, other]` that `extract_call_sites` misses (it requires `name(`).
+fn body_contains_word(body: &[u8], name: &[u8]) -> bool {
+    if name.is_empty() || body.len() < name.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + name.len() <= body.len() {
+        if &body[i..i + name.len()] == name {
+            // Check word boundary before
+            let before_ok = i == 0 || {
+                let b = body[i - 1];
+                !b.is_ascii_alphanumeric() && b != b'_'
+            };
+            // Check word boundary after
+            let after_ok = i + name.len() == body.len() || {
+                let b = body[i + name.len()];
+                !b.is_ascii_alphanumeric() && b != b'_'
+            };
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
