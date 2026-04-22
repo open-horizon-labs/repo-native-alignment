@@ -70,6 +70,19 @@ Remove from consideration:
 - **Entry points** — `main`, `run`, `setup`, `__init__`, `__main__`
 - **Framework callbacks** — functions with decorators like `#[tokio::main]`, `@app.route`, `@pytest.fixture`, `#[test]`, `@click.command`, `#[handler]`, `#[endpoint]`, `@celery.task`
 - **Trait/interface implementations** — if the function is inside an `impl Trait for` block or implements an interface method
+- **Method overrides on library base classes** — if a method is defined on a class
+  that inherits from an external library class (e.g., SQLAlchemy `TypeDecorator`,
+  OTEL `SpanProcessor`, Django `Model`, Pydantic `BaseModel`), the library calls
+  the method internally. Check the class definition's parent list — if the parent
+  is imported from an external package, any method override is a framework hook
+  candidate. Common patterns:
+  - SQLAlchemy: `process_bind_param`, `process_result_value`, `column_expression`
+  - OTEL: `on_start`, `on_end`, `shutdown`, `force_flush`
+  - Django: `save`, `delete`, `clean`, `get_queryset`
+  - Pydantic: `model_post_init`, validators
+  - Python ABCs: any method matching a name defined on the abstract parent
+- **CLI script functions** — functions in `scripts/` directories are typically
+  called from `if __name__ == "__main__"` blocks or CLI tools, not imported
 - **Functions with high in-edge count** — if `In: 5+ edge(s)`, it's clearly used; skip
 
 Focus on functions where `In: 0-2 edge(s)` — these are the candidates worth checking.
