@@ -552,7 +552,9 @@ fn body_contains_word(body: &[u8], name: &[u8]) -> bool {
             // Check word boundary before
             let before_ok = i == 0 || {
                 let b = body[i - 1];
-                !b.is_ascii_alphanumeric() && b != b'_'
+                // Not preceded by identifier char, '.', or ':'
+                // This avoids matching `obj.helper` as bare `helper`
+                !b.is_ascii_alphanumeric() && b != b'_' && b != b'.' && b != b':'
             };
             // Check word boundary after
             let after_ok = i + name.len() == body.len() || {
