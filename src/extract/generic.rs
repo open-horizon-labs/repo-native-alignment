@@ -19,7 +19,7 @@
 //! the individual extractor files, but as small focused functions rather than
 //! full 300-line traversal reimplementations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -226,7 +226,7 @@ fn collect_attribute_names<'a>(
     source: &'a [u8],
     attr_kind: &str,
     attr_field: &str,
-    stop_kinds: &[&str],
+    stop_kinds: &HashSet<&str>,
     out: &mut Vec<&'a str>,
 ) {
     if node.kind() == attr_kind
@@ -234,13 +234,13 @@ fn collect_attribute_names<'a>(
         && let Ok(text) = child.utf8_text(source)
     {
         let text = text.trim();
-        if text.len() >= 4 {
+        if !text.is_empty() {
             out.push(text);
         }
     }
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            if stop_kinds.contains(&child.kind()) {
+            if stop_kinds.contains(child.kind()) {
                 continue;
             }
             collect_attribute_names(child, source, attr_kind, attr_field, stop_kinds, out);
@@ -595,7 +595,7 @@ fn collect_nodes(
                 // into this outer function's attr_refs. Stop recursion at any node
                 // kind configured to map to NodeKind::Function, plus common closure
                 // syntaxes across supported languages.
-                let mut fn_stop_kinds: Vec<&str> = config
+                let mut fn_stop_kinds: HashSet<&str> = config
                     .node_kinds
                     .iter()
                     .filter(|(_, k)| *k == NodeKind::Function)
@@ -607,9 +607,7 @@ fn collect_nodes(
                     "lambda",
                     "closure_expression",
                 ] {
-                    if !fn_stop_kinds.contains(&extra) {
-                        fn_stop_kinds.push(extra);
-                    }
+                    fn_stop_kinds.insert(extra);
                 }
                 // Walk this function's own children, but stop at any nested
                 // function/closure so attribute accesses inside inner defs

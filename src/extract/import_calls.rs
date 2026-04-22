@@ -258,15 +258,19 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             if compatible.is_empty() {
                 continue;
             }
-            let resolved: Vec<&&Node> = if compatible.len() == 1 {
-                compatible
-            } else if let Some(ref module) = module_path {
+            let resolved: Vec<&&Node> = if let Some(ref module) = module_path {
+                // An explicit module path was written; require a compatible
+                // candidate whose file matches that path before accepting it.
+                // Falling back to `candidates.len() == 1` here would wrongly
+                // accept a local `init` for `import { init } from 'some-library'`.
                 let narrowed: Vec<&&Node> = compatible
                     .iter()
                     .copied()
                     .filter(|c| import_path_matches_file(module, &c.id.file))
                     .collect();
                 if narrowed.len() == 1 { narrowed } else { continue; }
+            } else if compatible.len() == 1 {
+                compatible
             } else {
                 continue;
             };
@@ -313,27 +317,42 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             let Some(candidates) = fn_by_name.get(attr_name) else {
                 continue;
             };
-            for callee in candidates {
-                // Cross-file, same language family
-                if (callee.id.root == node.id.root && callee.id.file == node.id.file)
-                    || !languages_compatible(caller_lang, callee.language.as_str())
-                {
-                    continue;
-                }
-                let key = (node.id.to_stable_id(), callee.id.to_stable_id());
-                if seen.contains(&key) {
-                    continue;
-                }
-                seen.insert(key);
-                edges.push(Edge {
-                    from: node.id.clone(),
-                    to: callee.id.clone(),
-                    kind: EdgeKind::ReferencedBy,
-                    source: ExtractionSource::TreeSitter,
-                    confidence: Confidence::Detected,
-                });
-                attr_ref_count += 1;
+            // Restrict to cross-file, same-language-family, top-level functions.
+            // Nested/local function defs carry `parent_scope_kind = function` in
+            // metadata and would otherwise fan out `obj.helper()` to every
+            // same-named inner helper in the codebase.
+            let eligible: Vec<&&Node> = candidates
+                .iter()
+                .filter(|c| {
+                    if callee_is_nested_local(c) {
+                        return false;
+                    }
+                    if c.id.root == node.id.root && c.id.file == node.id.file {
+                        return false;
+                    }
+                    languages_compatible(caller_lang, c.language.as_str())
+                })
+                .collect();
+            // Only emit when the attribute name resolves unambiguously. Any
+            // fan-out at this stage turns common method names (`save`,
+            // `render`) into large false-live clusters during dead-code runs.
+            if eligible.len() != 1 {
+                continue;
             }
+            let callee = eligible[0];
+            let key = (node.id.to_stable_id(), callee.id.to_stable_id());
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.insert(key);
+            edges.push(Edge {
+                from: node.id.clone(),
+                to: callee.id.clone(),
+                kind: EdgeKind::ReferencedBy,
+                source: ExtractionSource::TreeSitter,
+                confidence: Confidence::Detected,
+            });
+            attr_ref_count += 1;
         }
     }
 
@@ -377,6 +396,15 @@ fn languages_compatible(caller_lang: &str, callee_lang: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Returns `true` when `callee` is a function defined inside another function
+/// or closure, as recorded by the generic extractor in
+/// `metadata["parent_scope_kind"]`. Such nested/local helpers are not valid
+/// cross-file `ReferencedBy` targets for a bare `obj.method_name()` attribute
+/// access in another file.
+fn callee_is_nested_local(callee: &Node) -> bool {
+    callee.metadata.get("parent_scope_kind").map(|s| s.as_str()) == Some("function")
 }
 
 // ---------------------------------------------------------------------------
@@ -541,9 +569,11 @@ fn parse_import_module(text: &str) -> Option<String> {
 /// to the given callee file.
 ///
 /// Splits the module on common separators (`/`, `.`, `::`) into non-trivial
-/// segments and requires the last informative segment to equal the file stem,
-/// a parent directory name, or the file's basename. Leading `.` segments are
-/// ignored so `./b` and `../api` work.
+/// segments and requires the last informative segment to equal the file stem
+/// or basename. When the last segment instead matches an ancestor *directory*
+/// name, only accept the file when it is an index-like re-export module
+/// (`index.*`, `__init__.py`, `mod.rs`). Leading `.` / `crate` / `self` /
+/// `super` segments are ignored so `./b` and `../api` still work.
 fn import_path_matches_file(module: &str, file: &std::path::Path) -> bool {
     let segments: Vec<&str> = module
         .split(|c: char| c == '/' || c == '.' || c == ':' || c == '\\')
@@ -564,8 +594,14 @@ fn import_path_matches_file(module: &str, file: &std::path::Path) -> bool {
     if *last == file_stem || *last == file_name {
         return true;
     }
-    // Fall back to matching against any ancestor directory name when the module
-    // path points to a folder (e.g. `../api` importing a re-export index).
+    // Folder imports (e.g. `../api`, `from pkg import ...`): only accept when
+    // the callee lives in an index-like re-export module inside that directory.
+    // Matching any descendant file here would let `../api` resolve to an
+    // arbitrary `api/*.ts` file even when the import clearly points at `api/index.ts`.
+    let is_index_module = matches!(file_name, "index.ts" | "index.tsx" | "index.js" | "index.jsx" | "index.mjs" | "index.cjs" | "__init__.py" | "mod.rs");
+    if !is_index_module {
+        return false;
+    }
     file.ancestors().any(|a| {
         a.file_name()
             .and_then(|s| s.to_str())
