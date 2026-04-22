@@ -603,7 +603,9 @@ impl LspEnricher {
         // Send didOpen for a representative source file to create a project
         // context. tsserver requires at least one open file before it creates
         // a project; pyright uses it to trigger import-graph indexing.
-        if let Some(warmup_path) = Self::find_warmup_file(startup_root, &self.language) {
+        // Save the URI for use as a documentSymbol validation fallback.
+        let warmup_uri: Option<String> = if let Some(warmup_path) = Self::find_warmup_file(startup_root, &self.language) {
+            let uri_str = path_to_uri(&warmup_path).ok().map(|u| u.to_string());
             match Self::send_did_open(transport, &warmup_path).await {
                 Ok(()) => tracing::info!(
                     "{} sent didOpen for '{}'",
@@ -616,7 +618,10 @@ impl LspEnricher {
                     e
                 ),
             }
-        }
+            uri_str
+        } else {
+            None
+        };
 
         tracing::info!(
             "{} initialized, waiting for indexing...",
@@ -986,6 +991,33 @@ impl LspEnricher {
                             server_ready = true;
                             saw_quiescent = true;
                             break;
+                        }
+                        // workspace/symbol returned 0 — try documentSymbol on the
+                        // warmup file as a fallback. pyright's workspace/symbol
+                        // is unreliable (returns 0 even when fully indexed), but
+                        // documentSymbol works.
+                        if let Some(ref uri) = warmup_uri {
+                            let doc_result = tokio::time::timeout(
+                                tokio::time::Duration::from_secs(10),
+                                transport.request("textDocument/documentSymbol", serde_json::json!({
+                                    "textDocument": { "uri": uri }
+                                })),
+                            )
+                            .await;
+                            if let Ok(Ok(ref resp)) = doc_result {
+                                let doc_count = resp.as_array().map(|a| a.len()).unwrap_or(0);
+                                if doc_count > 0 {
+                                    tracing::info!(
+                                        "{} indexing validated via documentSymbol fallback: {} symbols in warmup file ({}s elapsed)",
+                                        self.server_command,
+                                        doc_count,
+                                        elapsed
+                                    );
+                                    server_ready = true;
+                                    saw_quiescent = true;
+                                    break;
+                                }
+                            }
                         }
                         consecutive_empty += 1;
                         tracing::info!(
