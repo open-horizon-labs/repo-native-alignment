@@ -112,6 +112,57 @@ If AGENTS.md exists but lacks the marker, append this block:
 
 If AGENTS.md does not exist, create it with the tool guidance block as the initial content.
 
+## Step 5b: Check for framework boundary patterns
+
+Check if the project uses messaging frameworks, event buses, or libraries with hook patterns that RNA should know about. Look at the project's imports:
+
+```bash
+repo-native-alignment search --repo . "" --kind import --compact 2>&1 | grep -iE 'pubsub|kafka|celery|pika|redis|rabbitmq|sqlalchemy|django|flask|opentelemetry|otel'
+```
+
+If any match, check if `.oh/extractors/` already has coverage:
+
+```bash
+ls .oh/extractors/ 2>/dev/null
+```
+
+If the project uses a messaging framework without coverage, create a config file. Example for Google Pub/Sub:
+
+```toml
+# .oh/extractors/google-pubsub.toml
+[meta]
+name = "google-pubsub"
+applies_when = { language = "python", imports_contain = "google.cloud.pubsub" }
+
+[[boundaries]]
+function_pattern = "publisher.publish"
+arg_position = 0
+edge_kind = "Produces"
+
+[[boundaries]]
+function_pattern = "subscribe"
+arg_position = 0
+edge_kind = "Consumes"
+```
+
+If the project uses frameworks with method-override hooks (SQLAlchemy, Django, OTEL), create a hooks config:
+
+```toml
+# .oh/extractors/sqlalchemy-hooks.toml
+[meta]
+name = "sqlalchemy-hooks"
+applies_when = { language = "python", imports_contain = "sqlalchemy" }
+
+[[hooks]]
+class_contains = "TypeDecorator"
+method_names = ["process_bind_param", "process_result_value"]
+```
+
+The `[[boundaries]]` section detects Produces/Consumes edges for message brokers.
+The `[[hooks]]` section marks method overrides on library base classes as framework hooks (so dead-code analysis skips them).
+
+For more details, see `docs/extractors.md` in the RNA repo, or use `/gen-extractor` to generate configs from a natural-language description.
+
 ## Step 6: Inform the user
 
 Tell the user:
