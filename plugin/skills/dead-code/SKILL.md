@@ -25,23 +25,20 @@ Examples:
 
 ### Step 0: Check LSP enrichment health
 
-Before analyzing, verify the graph has call edges from LSP enrichment:
+Before analyzing, verify the repo has completed a full scan with LSP enrichment. Use scan logs — not symbol output — because normal `search` output does not expose edge provenance (`source: Lsp`).
 
 ```text
-search(query="Calls", kind="function", file="<scope>", limit=5)
+repo-native-alignment scan --repo <path> --full
 ```
 
-Look for functions with `Calls` edges that have `source: Lsp`. If **no** function
-shows LSP-sourced edges, the LSP enrichment didn't run successfully for this repo.
+Confirm the logs report LSP completion with non-zero LSP call edges, for example:
 
-> ⚠️ **Warning:** Without LSP enrichment, the graph only has structural edges
-> (Defines, Contains) and import-resolution edges. Method calls (`obj.method()`),
-> property access, JSX component usage (`<Component />`), and callback patterns
-> are invisible. Results will have a **high false-positive rate** for Python and
-> TypeScript repos. Rust and Go repos are less affected (static dispatch).
->
-> To fix: run `repo-native-alignment scan --repo <path> --full` and check the
-> LSP enrichment logs for errors.
+```text
+LSP enrichment complete for python: 1234 edges ...
+[background-lsp] LSP enrichment complete: 2870 LSP call edges, 173056 total LSP edges
+```
+
+If the scan logs show 0 LSP call edges, aborted LSP passes, or missing language servers, expect higher false-positive rates — especially for Python and TypeScript repos where method calls, JSX usage, and framework wiring rely on LSP enrichment.
 
 ### Step 1: Gather functions
 

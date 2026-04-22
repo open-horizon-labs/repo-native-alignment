@@ -120,10 +120,10 @@ Check if the project uses messaging frameworks, event buses, or libraries with h
 repo-native-alignment search --repo . "" --kind import --compact 2>&1 | grep -iE 'pubsub|kafka|celery|pika|redis|rabbitmq|sqlalchemy|django|flask|opentelemetry|otel'
 ```
 
-If any match, check if `.oh/extractors/` already has coverage:
+If any match, check whether `.oh/extractors/` already has coverage for the detected frameworks by searching extractor contents (listing filenames alone is not sufficient):
 
 ```bash
-ls .oh/extractors/ 2>/dev/null
+grep -RniE 'pubsub|kafka|celery|pika|redis|rabbitmq|sqlalchemy|django|flask|opentelemetry|otel' .oh/extractors/ 2>/dev/null
 ```
 
 If the project uses a messaging framework without coverage, create a config file. Example for Google Pub/Sub:

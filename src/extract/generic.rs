@@ -218,29 +218,24 @@ pub struct LangConfig {
 /// Walk a tree-sitter subtree and collect attribute/member access names.
 /// Finds all nodes of kind `attr_kind` and extracts the child field `attr_field`.
 fn collect_attribute_names<'a>(
-    cursor: &mut tree_sitter::TreeCursor<'a>,
+    node: tree_sitter::Node<'a>,
     source: &'a [u8],
     attr_kind: &str,
     attr_field: &str,
     out: &mut Vec<&'a str>,
 ) {
-    loop {
-        let node = cursor.node();
-        if node.kind() == attr_kind
-            && let Some(child) = node.child_by_field_name(attr_field)
-            && let Ok(text) = child.utf8_text(source)
-        {
-            let text = text.trim();
-            if text.len() >= 4 {
-                out.push(text);
-            }
+    if node.kind() == attr_kind
+        && let Some(child) = node.child_by_field_name(attr_field)
+        && let Ok(text) = child.utf8_text(source)
+    {
+        let text = text.trim();
+        if text.len() >= 4 {
+            out.push(text);
         }
-        if cursor.goto_first_child() {
-            collect_attribute_names(cursor, source, attr_kind, attr_field, out);
-            cursor.goto_parent();
-        }
-        if !cursor.goto_next_sibling() {
-            break;
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            collect_attribute_names(child, source, attr_kind, attr_field, out);
         }
     }
 }
@@ -589,8 +584,7 @@ fn collect_nodes(
                 && let Some((attr_kind, attr_field)) = config.attribute_access_node
             {
                 let mut attr_names: Vec<&str> = Vec::new();
-                let mut cursor = node.walk();
-                collect_attribute_names(&mut cursor, source, attr_kind, attr_field, &mut attr_names);
+                collect_attribute_names(node, source, attr_kind, attr_field, &mut attr_names);
                 if !attr_names.is_empty() {
                     attr_names.sort_unstable();
                     attr_names.dedup();

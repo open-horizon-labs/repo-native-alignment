@@ -258,20 +258,20 @@ impl LspEnricher {
     }
 
     /// Find a representative source file in `root` to open via didOpen.
-    /// Picks a short, non-test, non-generated file — we just need one file
-    /// to trigger project detection (tsserver) and import-graph indexing (pyright).
-    fn find_warmup_file(root: &Path, language: &str) -> Option<PathBuf> {
-        let extensions: &[&str] = match language {
-            "python" => &["py"],
-            "typescript" => &["ts", "tsx"],
-            "rust" => &["rs"],
-            "go" => &["go"],
-            _ => return None,
-        };
+    /// Picks a short, non-test, non-generated file from the enricher's configured
+    /// extensions — we just need one file to trigger project detection and indexing.
+    fn find_warmup_file(&self, root: &Path) -> Option<PathBuf> {
+        let extensions: std::collections::HashSet<&str> =
+            self.extensions.iter().map(String::as_str).collect();
+        if extensions.is_empty() {
+            return None;
+        }
 
-        // Shallow recursive search (max 4 levels) using std::fs.
-        // We only need one file — stop as soon as we find a small source file.
-        fn walk(dir: &Path, extensions: &[&str], depth: u8) -> Option<PathBuf> {
+        fn walk(
+            dir: &Path,
+            extensions: &std::collections::HashSet<&str>,
+            depth: u8,
+        ) -> Option<PathBuf> {
             if depth > 4 {
                 return None;
             }
@@ -299,10 +299,9 @@ impl LspEnricher {
                 }
                 let path = entry.path();
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if !extensions.contains(&ext) {
+                if !extensions.contains(ext) {
                     continue;
                 }
-                // Skip test, generated, and declaration files
                 if name_str.starts_with("test_")
                     || name_str.contains(".test.")
                     || name_str.contains(".spec.")
@@ -313,13 +312,15 @@ impl LspEnricher {
                 {
                     continue;
                 }
-                // Skip files inside test directories
                 let entry_path = entry.path();
-                let path_str = entry_path.to_string_lossy();
-                if path_str.contains("/tests/")
-                    || path_str.contains("/test/")
-                    || path_str.contains("/__tests__/")
-                {
+                let in_test_dir = entry_path.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::Normal(seg)
+                            if seg == "tests" || seg == "test" || seg == "__tests__"
+                    )
+                });
+                if in_test_dir {
                     continue;
                 }
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
@@ -327,7 +328,6 @@ impl LspEnricher {
                     return Some(path);
                 }
             }
-            // Recurse into subdirectories
             for subdir in subdirs {
                 if let Some(found) = walk(&subdir, extensions, depth + 1) {
                     return Some(found);
@@ -336,25 +336,35 @@ impl LspEnricher {
             None
         }
 
-        walk(root, extensions, 0)
+        walk(root, &extensions, 0)
     }
 
-    /// Send textDocument/didOpen for the given file.
-    async fn send_did_open(
-        transport: &mut LspTransport,
-        path: &Path,
-    ) -> Result<()> {
-        let uri = path_to_uri(path)?;
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("reading warmup file {}", path.display()))?;
-        let language_id = match path.extension().and_then(|e| e.to_str()) {
+
+    fn lsp_language_id_for_path(&self, path: &Path) -> &'static str {
+        match path.extension().and_then(|e| e.to_str()) {
             Some("py") => "python",
             Some("ts") => "typescript",
             Some("tsx") => "typescriptreact",
+            Some("js") => "javascript",
+            Some("jsx") => "javascriptreact",
             Some("rs") => "rust",
             Some("go") => "go",
-            _ => "plaintext",
-        };
+            _ => match self.language.as_str() {
+                "python" => "python",
+                "typescript" | "deno" => "typescript",
+                "rust" => "rust",
+                "go" => "go",
+                _ => "plaintext",
+            },
+        }
+    }
+
+    /// Send textDocument/didOpen for the given file.
+    async fn send_did_open(&self, transport: &mut LspTransport, path: &Path) -> Result<()> {
+        let uri = path_to_uri(path)?;
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("reading warmup file {}", path.display()))?;
+        let language_id = self.lsp_language_id_for_path(path);
         transport
             .notify(
                 "textDocument/didOpen",
@@ -368,7 +378,6 @@ impl LspEnricher {
                 }),
             )
             .await?;
-        // Give the server a moment to process the file
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         Ok(())
     }
@@ -613,9 +622,9 @@ impl LspEnricher {
         // context. tsserver requires at least one open file before it creates
         // a project; pyright uses it to trigger import-graph indexing.
         // Save the URI for use as a documentSymbol validation fallback.
-        let warmup_uri: Option<String> = if let Some(warmup_path) = Self::find_warmup_file(startup_root, &self.language) {
+        let warmup_uri: Option<String> = if let Some(warmup_path) = Self::find_warmup_file(self, startup_root) {
             let uri_str = path_to_uri(&warmup_path).ok().map(|u| u.to_string());
-            match Self::send_did_open(transport, &warmup_path).await {
+            match self.send_did_open(transport, &warmup_path).await {
                 Ok(()) => tracing::info!(
                     "{} sent didOpen for '{}'",
                     self.server_command,

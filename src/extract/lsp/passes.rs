@@ -205,22 +205,26 @@ impl LspEnricher {
                 };
 
                 // Send didOpen for this file if not already opened.
-                // pyright only resolves callHierarchy for analyzed files.
+                // Only mark the file as opened after the file read and notify succeed,
+                // so a transient failure doesn't permanently suppress future attempts.
                 {
-                    let needs_open = {
-                        let mut set = opened.lock().await;
-                        set.insert(node.id.file.clone())
+                    let already_open = {
+                        let set = opened.lock().await;
+                        set.contains(&node.id.file)
                     };
-                    if needs_open {
-                        let lang_id = match language.as_str() {
-                            "python" => "python",
-                            "typescript" => if abs_path.extension().map(|e| e == "tsx").unwrap_or(false) { "typescriptreact" } else { "typescript" },
-                            "rust" => "rust",
-                            "go" => "go",
+                    if !already_open {
+                        let lang_id = match abs_path.extension().and_then(|e| e.to_str()) {
+                            Some("py") => "python",
+                            Some("ts") => "typescript",
+                            Some("tsx") => "typescriptreact",
+                            Some("js") => "javascript",
+                            Some("jsx") => "javascriptreact",
+                            Some("rs") => "rust",
+                            Some("go") => "go",
                             _ => "plaintext",
                         };
-                        if let Ok(content) = std::fs::read_to_string(&abs_path) {
-                            let _ = transport.notify(
+                        if let Ok(content) = std::fs::read_to_string(&abs_path)
+                            && transport.notify(
                                 "textDocument/didOpen",
                                 serde_json::json!({
                                     "textDocument": {
@@ -230,7 +234,10 @@ impl LspEnricher {
                                         "text": content
                                     }
                                 }),
-                            ).await;
+                            ).await.is_ok()
+                        {
+                            let mut set = opened.lock().await;
+                            set.insert(node.id.file.clone());
                         }
                     }
                 }

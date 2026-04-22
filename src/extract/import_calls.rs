@@ -216,8 +216,10 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         }
     }
 
-    let calls_count = edges.len();
-
+    let calls_count = edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Calls)
+        .count();
     // ------------------------------------------------------------------
     // 5. Emit ReferencedBy edges for imports that resolve to functions.
     //    This catches references that aren't bare call sites (keyword args,
