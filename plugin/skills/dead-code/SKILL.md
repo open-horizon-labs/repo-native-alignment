@@ -81,6 +81,9 @@ Remove from consideration:
   - Django: `save`, `delete`, `clean`, `get_queryset`
   - Pydantic: `model_post_init`, validators
   - Python ABCs: any method matching a name defined on the abstract parent
+- **Nested/local functions** — if the result shows `Parent: <outer-name> (function)`,
+  this is a function defined inside another function/closure. Skip it for dead-code
+  analysis — it is a local helper, not a top-level candidate. The outer function owns it.
 - **CLI script functions** — functions in `scripts/` directories are typically
   called from `if __name__ == "__main__"` blocks or CLI tools, not imported
 - **Functions with high in-edge count** — if `In: 5+ edge(s)`, it's clearly used; skip

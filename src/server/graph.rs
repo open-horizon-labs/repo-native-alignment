@@ -23,6 +23,64 @@ use super::store::{
     load_graph_from_lance, persist_graph_incremental, persist_graph_to_lance,
 };
 
+fn merge_duplicate_node(into: &mut Node, from: Node) {
+    // Later duplicate nodes are newer data; let them win for scalar fields while
+    // still preserving any earlier non-empty values if the newer node omits them.
+    if !from.signature.is_empty() {
+        into.signature = from.signature;
+    }
+    if !from.body.is_empty() {
+        into.body = from.body;
+    }
+    if from.line_start != 0 {
+        into.line_start = from.line_start;
+    }
+    if from.line_end != 0 {
+        into.line_end = from.line_end;
+    }
+    for (k, v) in from.metadata {
+        into.metadata.insert(k, v);
+    }
+}
+
+fn dedup_nodes_merge_metadata(nodes: &mut Vec<Node>) {
+    let mut merged: std::collections::HashMap<String, Node> = std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for node in nodes.drain(..) {
+        let sid = node.stable_id();
+        use std::collections::hash_map::Entry;
+        match merged.entry(sid.clone()) {
+            Entry::Vacant(v) => {
+                order.push(sid);
+                v.insert(node);
+            }
+            Entry::Occupied(mut o) => {
+                merge_duplicate_node(o.get_mut(), node);
+            }
+        }
+    }
+    *nodes = order
+        .into_iter()
+        .filter_map(|sid| merged.remove(&sid))
+        .collect();
+}
+fn collect_post_pass_node_upserts(
+    nodes: &[Node],
+    node_ids_before: &std::collections::HashSet<String>,
+    upsert_node_ids: &mut std::collections::HashSet<String>,
+) {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for n in nodes {
+        *counts.entry(n.stable_id()).or_insert(0) += 1;
+    }
+    for (sid, count) in counts {
+        if count > 1 || !node_ids_before.contains(&sid) {
+            upsert_node_ids.insert(sid);
+        }
+    }
+}
+
+
 impl RnaHandler {
     /// Maximum time to wait for pre-warm to finish before falling back to
     /// building the graph ourselves.
@@ -325,13 +383,13 @@ impl RnaHandler {
                         }
                     }
 
-                    // Auto-collect delta from passes
-                    for n in &full_state.nodes {
-                        let sid = n.stable_id();
-                        if !node_ids_before_passes.contains(&sid) {
-                            upsert_node_ids.insert(sid);
-                        }
-                    }
+                    // Auto-collect delta from passes. Include duplicate stable IDs too
+                    // so metadata-only post-pass updates are persisted.
+                    collect_post_pass_node_upserts(
+                        &full_state.nodes,
+                        &node_ids_before_passes,
+                        &mut upsert_node_ids,
+                    );
                     for e in &full_state.edges {
                         let sid = e.stable_id();
                         if !edge_ids_before_passes.contains(&sid) {
@@ -339,14 +397,9 @@ impl RnaHandler {
                         }
                     }
 
-                    // Dedup
+                    // Dedup nodes, merging metadata from duplicate stable_ids.
                     {
-                        let mut seen_nodes = std::collections::HashSet::new();
-                        full_state.nodes.reverse();
-                        full_state
-                            .nodes
-                            .retain(|n| seen_nodes.insert(n.stable_id()));
-                        full_state.nodes.reverse();
+                        dedup_nodes_merge_metadata(&mut full_state.nodes);
                         let mut seen_edges = std::collections::HashSet::new();
                         full_state
                             .edges
@@ -444,12 +497,11 @@ impl RnaHandler {
                             full_state.nodes.extend(sub_added_nodes);
                             full_state.edges.extend(sub_added_edges);
                         }
-                        for n in &full_state.nodes {
-                            let sid = n.stable_id();
-                            if !node_ids_before_group2.contains(&sid) {
-                                upsert_node_ids.insert(sid);
-                            }
-                        }
+                        collect_post_pass_node_upserts(
+                            &full_state.nodes,
+                            &node_ids_before_group2,
+                            &mut upsert_node_ids,
+                        );
                         for e in &full_state.edges {
                             let sid = e.stable_id();
                             if !edge_ids_before_group2.contains(&sid) {
@@ -1284,10 +1336,7 @@ impl RnaHandler {
         // same entries, producing duplicates. Dedup here avoids skewed PageRank
         // weights and inflated community sizes.
         {
-            let mut seen_nodes = std::collections::HashSet::new();
-            all_nodes.reverse();
-            all_nodes.retain(|n| seen_nodes.insert(n.stable_id()));
-            all_nodes.reverse();
+            dedup_nodes_merge_metadata(&mut all_nodes);
 
             let before_edges = all_edges.len();
             let mut seen_edges = std::collections::HashSet::new();
@@ -1798,13 +1847,13 @@ impl RnaHandler {
         }
 
         // Auto-collect delta: everything added by post-extraction passes since
-        // the snapshot above. No pass needs to manually report its own output.
-        for n in &graph.nodes {
-            let sid = n.stable_id();
-            if !node_ids_before_passes.contains(&sid) {
-                upsert_node_ids.insert(sid);
-            }
-        }
+        // the snapshot above. Include duplicate stable IDs so metadata-only
+        // updates are persisted on incremental scans.
+        collect_post_pass_node_upserts(
+            &graph.nodes,
+            &node_ids_before_passes,
+            &mut upsert_node_ids,
+        );
         for e in &graph.edges {
             let sid = e.stable_id();
             if !edge_ids_before_passes.contains(&sid) {
@@ -1821,15 +1870,12 @@ impl RnaHandler {
         //     stale data exposed to search/query tools)
         //   - graph.edges: N-multiplied edges → inflated PageRank weights
         //
-        // Node dedup: keep the LAST occurrence (newest data). Reverse, retain first
-        // seen (which is now the newest), then reverse back to restore order.
+        // Node dedup: merge duplicate stable_ids, letting later metadata/scalar
+        // fields win so post-extraction annotations survive.
         // Edge dedup: keep the FIRST occurrence (stable_id is topology-only; all
         // duplicates are structurally identical).
         {
-            let mut seen_nodes = std::collections::HashSet::new();
-            graph.nodes.reverse();
-            graph.nodes.retain(|n| seen_nodes.insert(n.stable_id()));
-            graph.nodes.reverse();
+            dedup_nodes_merge_metadata(&mut graph.nodes);
 
             let mut seen_edges = std::collections::HashSet::new();
             graph.edges.retain(|e| seen_edges.insert(e.stable_id()));
@@ -1957,13 +2003,13 @@ impl RnaHandler {
             }
 
             // Auto-collect post-community delta: everything added by subsystem_node and
-            // fw aggregation since the snapshot above.
-            for n in &graph.nodes {
-                let sid = n.stable_id();
-                if !node_ids_before_group2.contains(&sid) {
-                    upsert_node_ids.insert(sid);
-                }
-            }
+            // fw aggregation since the snapshot above. Include duplicate stable IDs so
+            // metadata-only updates are persisted.
+            collect_post_pass_node_upserts(
+                &graph.nodes,
+                &node_ids_before_group2,
+                &mut upsert_node_ids,
+            );
             for e in &graph.edges {
                 let sid = e.stable_id();
                 if !edge_ids_before_group2.contains(&sid) {

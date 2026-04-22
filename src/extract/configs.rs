@@ -228,7 +228,7 @@ pub static PYTHON_CONFIG: LangConfig = LangConfig {
         ("import_from_statement", NodeKind::Import),
         // Python has no keyword for fields; ALL_CAPS consts handled in python.rs
     ],
-    scope_parent_kinds: &["class_definition"],
+    scope_parent_kinds: &["class_definition", "function_definition"],
     const_value_field: None,
     full_text_name_kinds: &["import_statement", "import_from_statement"],
     string_literal_kinds: &[("string", None)],

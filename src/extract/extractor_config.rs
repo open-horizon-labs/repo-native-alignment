@@ -464,7 +464,24 @@ pub fn extractor_config_pass_with_configs(
 
     // ---------------------------------------------------------------
     // Process [[hooks]] — mark framework hook methods with metadata.
+    // For each function with a parent_scope, find the class node (Struct) in
+    // the same file and check if its SIGNATURE contains the hook's class_contains
+    // substring. The signature has the full inheritance chain, e.g.,
+    // "class StrEnum(TypeDecorator):" which matches class_contains="TypeDecorator".
     // ---------------------------------------------------------------
+
+    // Pre-index: class signatures by (file, class_name) for O(1) lookup.
+    let mut class_sigs: std::collections::HashMap<(&std::path::Path, &str), &str> =
+        std::collections::HashMap::new();
+    for node in all_nodes {
+        if node.id.kind == NodeKind::Struct {
+            class_sigs.insert(
+                (node.id.file.as_path(), node.id.name.as_str()),
+                node.signature.as_str(),
+            );
+        }
+    }
+
     let mut hook_count = 0usize;
     for config in configs {
         if config.hooks.is_empty() {
@@ -481,18 +498,20 @@ pub fn extractor_config_pass_with_configs(
         };
         for (node, _body_lower) in candidates {
             let parent_scope = match node.metadata.get("parent_scope") {
-                Some(s) => s,
+                Some(s) => s.as_str(),
+                None => continue,
+            };
+            // Look up the class node's signature to check inheritance
+            let class_sig = match class_sigs.get(&(node.id.file.as_path(), parent_scope)) {
+                Some(sig) => *sig,
                 None => continue,
             };
             for hook in &config.hooks {
-                if !parent_scope.contains(&hook.class_contains) {
+                if !class_sig.contains(&hook.class_contains) {
                     continue;
                 }
                 if hook.method_names.iter().any(|m| m == &node.id.name) {
                     hook_count += 1;
-                    // We can't mutate the node directly (it's borrowed from all_nodes),
-                    // so emit a synthetic node with the framework_hook metadata set.
-                    // The graph merge will update the existing node's metadata.
                     let mut metadata = node.metadata.clone();
                     metadata.insert("framework_hook".to_string(), config.meta.name.clone());
                     result_nodes.push(Node {
@@ -501,7 +520,7 @@ pub fn extractor_config_pass_with_configs(
                         line_start: node.line_start,
                         line_end: node.line_end,
                         signature: node.signature.clone(),
-                        body: String::new(), // don't duplicate body
+                        body: String::new(),
                         metadata,
                         source: ExtractionSource::TreeSitter,
                     });

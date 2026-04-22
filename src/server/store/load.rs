@@ -152,6 +152,15 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
             let decorators_col = batch
                 .column_by_name("decorators")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let parent_scope_col = batch
+                .column_by_name("parent_scope")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let parent_scope_kind_col = batch
+                .column_by_name("parent_scope_kind")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let framework_hook_col = batch
+                .column_by_name("framework_hook")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             let type_params_col = batch
                 .column_by_name("type_params")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
@@ -271,6 +280,30 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                     let val = col.value(i);
                     if !val.is_empty() {
                         metadata.insert("decorators".to_string(), val.to_string());
+                    }
+                }
+                if let Some(col) = parent_scope_col
+                    && !col.is_null(i)
+                {
+                    let val = col.value(i);
+                    if !val.is_empty() {
+                        metadata.insert("parent_scope".to_string(), val.to_string());
+                    }
+                }
+                if let Some(col) = parent_scope_kind_col
+                    && !col.is_null(i)
+                {
+                    let val = col.value(i);
+                    if !val.is_empty() {
+                        metadata.insert("parent_scope_kind".to_string(), val.to_string());
+                    }
+                }
+                if let Some(col) = framework_hook_col
+                    && !col.is_null(i)
+                {
+                    let val = col.value(i);
+                    if !val.is_empty() {
+                        metadata.insert("framework_hook".to_string(), val.to_string());
                     }
                 }
                 if let Some(col) = type_params_col

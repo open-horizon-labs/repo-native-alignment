@@ -428,8 +428,12 @@ fn collect_nodes(
             let mut metadata = BTreeMap::new();
 
             // Parent scope.
-            if let Some((scope_name, _)) = parent_scope {
+            if let Some((scope_name, scope_kind)) = parent_scope {
                 metadata.insert("parent_scope".to_string(), scope_name.clone());
+                metadata.insert(
+                    "parent_scope_kind".to_string(),
+                    scope_kind.to_string(),
+                );
             }
 
             // Name column for LSP cursor positioning.

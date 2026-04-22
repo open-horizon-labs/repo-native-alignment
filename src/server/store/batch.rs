@@ -97,6 +97,18 @@ pub(super) fn build_symbols_batch(
         .iter()
         .map(|n| n.metadata.get("decorators").cloned())
         .collect();
+    let parent_scope_col: Vec<Option<String>> = nodes
+        .iter()
+        .map(|n| n.metadata.get("parent_scope").cloned())
+        .collect();
+    let parent_scope_kind_col: Vec<Option<String>> = nodes
+        .iter()
+        .map(|n| n.metadata.get("parent_scope_kind").cloned())
+        .collect();
+    let framework_hook_col: Vec<Option<String>> = nodes
+        .iter()
+        .map(|n| n.metadata.get("framework_hook").cloned())
+        .collect();
     let type_params_col: Vec<Option<String>> = nodes
         .iter()
         .map(|n| n.metadata.get("type_params").cloned())
@@ -210,6 +222,9 @@ pub(super) fn build_symbols_batch(
             Arc::new(StringArray::from(storages)),
             Arc::new(mutable_builder.finish()),
             Arc::new(StringArray::from(decorators_col)),
+            Arc::new(StringArray::from(parent_scope_col)),
+            Arc::new(StringArray::from(parent_scope_kind_col)),
+            Arc::new(StringArray::from(framework_hook_col)),
             Arc::new(StringArray::from(type_params_col)),
             Arc::new(StringArray::from(pattern_hints)),
             Arc::new(is_static_builder.finish()),

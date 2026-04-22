@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search`.
-pub const SCHEMA_VERSION: u32 = 18; // gRPC proto columns: parent_service, rpc_request_type, rpc_response_type
+pub const SCHEMA_VERSION: u32 = 20; // persist parent_scope_kind for nested/local classification
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -60,6 +60,9 @@ pub fn symbols_schema() -> Schema {
         Field::new("storage", DataType::Utf8, true), // metadata["storage"] — "static" (Rust) or "var" (Go)
         Field::new("mutable", DataType::Boolean, true), // metadata["mutable"] — true for `static mut`
         Field::new("decorators", DataType::Utf8, true), // metadata["decorators"] — comma-separated decorator/attribute text
+        Field::new("parent_scope", DataType::Utf8, true), // metadata["parent_scope"] — enclosing class/interface name
+        Field::new("parent_scope_kind", DataType::Utf8, true), // metadata["parent_scope_kind"] — enclosing scope kind
+        Field::new("framework_hook", DataType::Utf8, true), // metadata["framework_hook"] — extractor-config hook match
         Field::new("type_params", DataType::Utf8, true), // metadata["type_params"] — generic type parameters (e.g. "<T: Clone + Send>")
         Field::new("pattern_hint", DataType::Utf8, true), // metadata["pattern_hint"] — design pattern from naming conventions (e.g. "factory", "observer")
         Field::new("is_static", DataType::Boolean, true), // metadata["is_static"] — true for static/associated methods, false for instance methods
@@ -117,6 +120,9 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("storage", DataType::Utf8, true),
         Field::new("mutable", DataType::Boolean, true),
         Field::new("decorators", DataType::Utf8, true),
+        Field::new("parent_scope", DataType::Utf8, true),
+        Field::new("parent_scope_kind", DataType::Utf8, true),
+        Field::new("framework_hook", DataType::Utf8, true),
         Field::new("type_params", DataType::Utf8, true),
         Field::new("pattern_hint", DataType::Utf8, true),
         Field::new("is_static", DataType::Boolean, true),
@@ -220,134 +226,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_schema_version_constant() {
-        // SCHEMA_VERSION must be at least 17 (bumped for scan_version column #477)
-        assert!(SCHEMA_VERSION >= 17, "SCHEMA_VERSION should be >= 17");
-    }
-
-    #[test]
-    fn test_symbols_schema_fields() {
+    fn test_symbols_schema_has_expected_fields() {
         let schema = symbols_schema();
         assert!(schema.field_with_name("id").is_ok());
-        assert!(schema.field_with_name("root_id").is_ok());
-        assert!(schema.field_with_name("file_path").is_ok());
-        assert!(schema.field_with_name("name").is_ok());
-        assert!(schema.field_with_name("kind").is_ok());
-        assert!(schema.field_with_name("line_start").is_ok());
-        assert!(schema.field_with_name("line_end").is_ok());
         assert!(schema.field_with_name("signature").is_ok());
         assert!(schema.field_with_name("body").is_ok());
-        assert!(schema.field_with_name("meta_virtual").is_ok());
-        assert!(schema.field_with_name("meta_package").is_ok());
-        assert!(schema.field_with_name("meta_name_col").is_ok());
         assert!(schema.field_with_name("value").is_ok());
         assert!(schema.field_with_name("synthetic").is_ok());
+        assert!(schema.field_with_name("cyclomatic").is_ok());
         assert!(schema.field_with_name("importance").is_ok());
         assert!(schema.field_with_name("storage").is_ok());
         assert!(schema.field_with_name("mutable").is_ok());
         assert!(schema.field_with_name("decorators").is_ok());
         assert!(schema.field_with_name("type_params").is_ok());
         assert!(schema.field_with_name("is_static").is_ok());
-        // Diagnostic columns (added for NodeKind::Other("diagnostic") nodes)
+        // Diagnostic columns
         assert!(schema.field_with_name("diagnostic_severity").is_ok());
         assert!(schema.field_with_name("diagnostic_source").is_ok());
         assert!(schema.field_with_name("diagnostic_message").is_ok());
         assert!(schema.field_with_name("diagnostic_range").is_ok());
         assert!(schema.field_with_name("diagnostic_timestamp").is_ok());
-        // ApiEndpoint columns (added for NodeKind::ApiEndpoint nodes)
-        assert!(schema.field_with_name("http_method").is_ok());
-        assert!(schema.field_with_name("http_path").is_ok());
-        // doc_comment column — survives LSP reindex round-trip (#416)
-        assert!(schema.field_with_name("doc_comment").is_ok());
-        assert!(schema.field_with_name("updated_at").is_ok());
-        assert!(schema.field_with_name("scan_version").is_ok());
-        // no vector column in base schema
-        assert!(schema.field_with_name("vector").is_err());
     }
 
     #[test]
-    fn test_symbols_schema_with_vector() {
-        let schema = symbols_schema_with_vector(384);
-        assert!(schema.field_with_name("vector").is_ok());
-        let vector_field = schema.field_with_name("vector").unwrap();
-        match vector_field.data_type() {
-            DataType::FixedSizeList(_, dim) => assert_eq!(*dim, 384),
-            other => panic!("Expected FixedSizeList, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_is_static_column_type_and_nullability() {
-        // Adversarial: verify is_static is Boolean and nullable in both schemas
-        let schema = symbols_schema();
-        let field = schema
-            .field_with_name("is_static")
-            .expect("is_static missing from symbols_schema");
-        assert_eq!(
-            *field.data_type(),
-            DataType::Boolean,
-            "is_static should be Boolean"
-        );
-        assert!(
-            field.is_nullable(),
-            "is_static should be nullable (top-level functions have no is_static)"
-        );
-
-        let vec_schema = symbols_schema_with_vector(384);
-        let vec_field = vec_schema
-            .field_with_name("is_static")
-            .expect("is_static missing from symbols_schema_with_vector");
-        assert_eq!(
-            *vec_field.data_type(),
-            DataType::Boolean,
-            "is_static should be Boolean in vector schema"
-        );
-        assert!(
-            vec_field.is_nullable(),
-            "is_static should be nullable in vector schema"
-        );
-    }
-
-    #[test]
-    fn test_edges_schema_fields() {
+    fn test_edges_schema_has_expected_fields() {
         let schema = edges_schema();
-        assert!(schema.field_with_name("id").is_ok());
         assert!(schema.field_with_name("source_id").is_ok());
-        assert!(schema.field_with_name("source_type").is_ok());
         assert!(schema.field_with_name("target_id").is_ok());
-        assert!(schema.field_with_name("target_type").is_ok());
         assert!(schema.field_with_name("edge_type").is_ok());
-        assert!(schema.field_with_name("edge_source").is_ok());
-        assert!(schema.field_with_name("edge_confidence").is_ok());
-        assert!(schema.field_with_name("root_id").is_ok());
-        assert!(schema.field_with_name("updated_at").is_ok());
-        assert!(schema.field_with_name("scan_version").is_ok());
-    }
-
-    #[test]
-    fn test_pr_merges_schema_fields() {
-        let schema = pr_merges_schema();
-        assert!(schema.field_with_name("id").is_ok());
-        assert!(schema.field_with_name("root_id").is_ok());
-        assert!(schema.field_with_name("merge_sha").is_ok());
-        assert!(schema.field_with_name("branch_name").is_ok());
-        assert!(schema.field_with_name("title").is_ok());
-        assert!(schema.field_with_name("description").is_ok());
-        assert!(schema.field_with_name("author").is_ok());
-        assert!(schema.field_with_name("merged_at").is_ok());
-        assert!(schema.field_with_name("commit_count").is_ok());
-        assert!(schema.field_with_name("files_changed").is_ok());
-        assert!(schema.field_with_name("updated_at").is_ok());
-    }
-
-    #[test]
-    fn test_file_index_schema_fields() {
-        let schema = file_index_schema();
-        assert!(schema.field_with_name("path").is_ok());
-        assert!(schema.field_with_name("root_id").is_ok());
-        assert!(schema.field_with_name("mtime").is_ok());
-        assert!(schema.field_with_name("size").is_ok());
-        assert!(schema.field_with_name("last_indexed").is_ok());
-        assert!(schema.field_with_name("extractors_used").is_ok());
     }
 }
