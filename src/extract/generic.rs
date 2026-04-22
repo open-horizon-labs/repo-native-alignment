@@ -198,6 +198,52 @@ pub struct LangConfig {
     /// Whether this language's LSP server supports a custom `parentModule`
     /// request for more accurate module hierarchy (e.g., rust-analyzer).
     pub has_parent_module_request: bool,
+    /// Tree-sitter node kind and child field name for attribute/member access.
+    /// Used to extract attribute names from function bodies at parse time.
+    /// The attribute name is the identifier accessed via `.` (e.g., `obj.method` → "method").
+    ///
+    /// Stored as `metadata["attr_refs"]` on function nodes — a comma-separated
+    /// list of attribute names used in the body. Consumed by `import_calls_pass`
+    /// for dead-code detection (any function whose name appears as an attr_ref
+    /// somewhere in the codebase is not dead).
+    ///
+    /// Examples:
+    /// - Python: `Some(("attribute", "attribute"))` — `obj.method` is an `attribute` node
+    /// - TypeScript: `Some(("member_expression", "property"))` — `obj.method` is a `member_expression`
+    /// - Rust: `Some(("field_expression", "field"))`
+    /// - Go: `Some(("selector_expression", "field"))`
+    pub attribute_access_node: Option<(&'static str, &'static str)>,
+}
+
+/// Walk a tree-sitter subtree and collect attribute/member access names.
+/// Finds all nodes of kind `attr_kind` and extracts the child field `attr_field`.
+fn collect_attribute_names<'a>(
+    cursor: &mut tree_sitter::TreeCursor<'a>,
+    source: &'a [u8],
+    attr_kind: &str,
+    attr_field: &str,
+    out: &mut Vec<&'a str>,
+) {
+    loop {
+        let node = cursor.node();
+        if node.kind() == attr_kind {
+            if let Some(child) = node.child_by_field_name(attr_field) {
+                if let Ok(text) = child.utf8_text(source) {
+                    let text = text.trim();
+                    if text.len() >= 4 {
+                        out.push(text);
+                    }
+                }
+            }
+        }
+        if cursor.goto_first_child() {
+            collect_attribute_names(cursor, source, attr_kind, attr_field, out);
+            cursor.goto_parent();
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +259,7 @@ impl GenericExtractor {
     pub fn new(config: &'static LangConfig) -> Self {
         Self { config }
     }
+
 
     /// Run extraction and return the result. Used directly or as a base by
     /// per-language extractors that need custom post-processing.
@@ -530,6 +577,22 @@ fn collect_nodes(
                     }
                 }
                 metadata.insert("synthetic".to_string(), "false".to_string());
+            }
+
+            // Attribute access extraction — capture method/property names
+            // used via dot access in function bodies. Stored as metadata
+            // for import_calls_pass to match against defined function names.
+            if node_kind == NodeKind::Function {
+                if let Some((attr_kind, attr_field)) = config.attribute_access_node {
+                    let mut attr_names: Vec<&str> = Vec::new();
+                    let mut cursor = node.walk();
+                    collect_attribute_names(&mut cursor, source, attr_kind, attr_field, &mut attr_names);
+                    if !attr_names.is_empty() {
+                        attr_names.sort_unstable();
+                        attr_names.dedup();
+                        metadata.insert("attr_refs".to_string(), attr_names.join(","));
+                    }
+                }
             }
 
             // Public API surface detection (#409).

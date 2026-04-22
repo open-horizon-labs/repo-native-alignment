@@ -95,6 +95,7 @@ pub static RUST_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: true,
+    attribute_access_node: Some(("field_expression", "field")),
 };
 
 /// Rust tree-sitter extractor with topology pattern detection.

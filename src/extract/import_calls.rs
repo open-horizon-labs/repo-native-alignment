@@ -259,11 +259,61 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         }
     }
 
-    if calls_count > 0 || ref_count > 0 {
+    // ------------------------------------------------------------------
+    // 6. Emit ReferencedBy edges from attribute access in function bodies.
+    //    When a function body contains `obj.method_name()`, the attr_refs
+    //    metadata (extracted at parse time by GenericExtractor) includes
+    //    "method_name". Match against fn_by_name to create cross-file edges.
+    //    This is the vulture-style flat name matching approach — low precision
+    //    (same-named methods on different classes match) but high recall.
+    // ------------------------------------------------------------------
+    let mut attr_ref_count = 0usize;
+    for node in all_nodes {
+        if node.id.kind != NodeKind::Function {
+            continue;
+        }
+        let Some(attr_refs_str) = node.metadata.get("attr_refs") else {
+            continue;
+        };
+        let caller_lang = node.language.as_str();
+        for attr_name in attr_refs_str.split(',') {
+            let attr_name = attr_name.trim();
+            if attr_name.len() < 4 {
+                continue;
+            }
+            let Some(candidates) = fn_by_name.get(attr_name) else {
+                continue;
+            };
+            for callee in candidates {
+                // Cross-file, same language family
+                if (callee.id.root == node.id.root && callee.id.file == node.id.file)
+                    || !languages_compatible(caller_lang, callee.language.as_str())
+                {
+                    continue;
+                }
+                let key = (node.id.to_stable_id(), callee.id.to_stable_id());
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.insert(key);
+                edges.push(Edge {
+                    from: node.id.clone(),
+                    to: callee.id.clone(),
+                    kind: EdgeKind::ReferencedBy,
+                    source: ExtractionSource::TreeSitter,
+                    confidence: Confidence::Detected,
+                });
+                attr_ref_count += 1;
+            }
+        }
+    }
+
+    if calls_count > 0 || ref_count > 0 || attr_ref_count > 0 {
         tracing::info!(
-            "import_calls pass: {} cross-file Calls edge(s), {} import ReferencedBy edge(s)",
+            "import_calls pass: {} Calls, {} import ReferencedBy, {} attribute ReferencedBy edge(s)",
             calls_count,
-            ref_count
+            ref_count,
+            attr_ref_count
         );
     }
 

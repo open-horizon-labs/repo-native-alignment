@@ -259,6 +259,7 @@ pub static PYTHON_CONFIG: LangConfig = LangConfig {
     test_name_prefix: true,
     lsp_enrichable_kinds: Some(&[NodeKind::Function, NodeKind::Trait]),
     venv_candidates: Some(&[".venv", "venv", "env"]),
+    attribute_access_node: Some(("attribute", "attribute")),
     has_parent_module_request: false,
 };
 
@@ -324,6 +325,7 @@ pub static TYPESCRIPT_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: false,
+    attribute_access_node: Some(("member_expression", "property")),
 };
 
 // ---------------------------------------------------------------------------
@@ -377,6 +379,7 @@ pub static JAVASCRIPT_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: false,
+    attribute_access_node: Some(("selector_expression", "field")),
 };
 
 // ---------------------------------------------------------------------------
@@ -428,6 +431,7 @@ pub static GO_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: false,
+    attribute_access_node: Some(("member_expression", "property")),
 };
 
 // ---------------------------------------------------------------------------
@@ -493,6 +497,7 @@ pub static JAVA_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -549,6 +554,7 @@ pub static KOTLIN_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -614,6 +620,7 @@ pub static CSHARP_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -674,6 +681,7 @@ pub static SWIFT_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -724,6 +732,7 @@ pub static ZIG_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -786,6 +795,7 @@ pub static CPP_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -830,6 +840,7 @@ pub static LUA_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -884,6 +895,7 @@ pub static RUBY_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -930,6 +942,7 @@ pub static BASH_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -983,6 +996,7 @@ pub static C_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -1048,6 +1062,7 @@ pub static PHP_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -1108,6 +1123,7 @@ pub static SCALA_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -1166,6 +1182,7 @@ pub static DART_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ── GDScript ─────────────────────────────────────────────────────────────────
@@ -1213,6 +1230,7 @@ pub static GDSCRIPT_CONFIG: LangConfig = LangConfig {
     lsp_enrichable_kinds: None,
     venv_candidates: None,
     has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 
