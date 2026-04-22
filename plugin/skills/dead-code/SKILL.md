@@ -70,12 +70,12 @@ Remove from consideration:
 - **Entry points** — `main`, `run`, `setup`, `__init__`, `__main__`
 - **Framework callbacks** — functions with decorators like `#[tokio::main]`, `@app.route`, `@pytest.fixture`, `#[test]`, `@click.command`, `#[handler]`, `#[endpoint]`, `@celery.task`
 - **Trait/interface implementations** — if the function is inside an `impl Trait for` block or implements an interface method
-- **Method overrides on library base classes** — if a method is defined on a class
-  that inherits from an external library class (e.g., SQLAlchemy `TypeDecorator`,
-  OTEL `SpanProcessor`, Django `Model`, Pydantic `BaseModel`), the library calls
-  the method internally. Check the class definition's parent list — if the parent
-  is imported from an external package, any method override is a framework hook
-  candidate. Common patterns:
+- **Method overrides on library base classes** — if a function has
+  `metadata["framework_hook"]` set, it was identified by an `.oh/extractors/`
+  config as a library hook method. Skip it. If the metadata is NOT set but the
+  method is on a class inheriting from an external library (SQLAlchemy
+  `TypeDecorator`, OTEL `SpanProcessor`, Django `Model`, etc.), it may need an
+  `.oh/extractors/` config with a `[[hooks]]` section. Common framework hooks:
   - SQLAlchemy: `process_bind_param`, `process_result_value`, `column_expression`
   - OTEL: `on_start`, `on_end`, `shutdown`, `force_flush`
   - Django: `save`, `delete`, `clean`, `get_queryset`
