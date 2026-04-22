@@ -217,11 +217,16 @@ pub struct LangConfig {
 
 /// Walk a tree-sitter subtree and collect attribute/member access names.
 /// Finds all nodes of kind `attr_kind` and extracts the child field `attr_field`.
+///
+/// Recursion stops at nested function/closure boundaries so that attribute
+/// accesses inside inner defs/closures do not leak into the outer function's
+/// `attr_refs`. Callers pass `stop_kinds` listing nested-scope node kinds.
 fn collect_attribute_names<'a>(
     node: tree_sitter::Node<'a>,
     source: &'a [u8],
     attr_kind: &str,
     attr_field: &str,
+    stop_kinds: &[&str],
     out: &mut Vec<&'a str>,
 ) {
     if node.kind() == attr_kind
@@ -235,7 +240,10 @@ fn collect_attribute_names<'a>(
     }
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            collect_attribute_names(child, source, attr_kind, attr_field, out);
+            if stop_kinds.contains(&child.kind()) {
+                continue;
+            }
+            collect_attribute_names(child, source, attr_kind, attr_field, stop_kinds, out);
         }
     }
 }
@@ -583,8 +591,42 @@ fn collect_nodes(
             if node_kind == NodeKind::Function
                 && let Some((attr_kind, attr_field)) = config.attribute_access_node
             {
+                // Avoid leaking member accesses from nested function/closure bodies
+                // into this outer function's attr_refs. Stop recursion at any node
+                // kind configured to map to NodeKind::Function, plus common closure
+                // syntaxes across supported languages.
+                let mut fn_stop_kinds: Vec<&str> = config
+                    .node_kinds
+                    .iter()
+                    .filter(|(_, k)| *k == NodeKind::Function)
+                    .map(|(ts_kind, _)| *ts_kind)
+                    .collect();
+                for extra in [
+                    "arrow_function",
+                    "function_expression",
+                    "lambda",
+                    "closure_expression",
+                ] {
+                    if !fn_stop_kinds.contains(&extra) {
+                        fn_stop_kinds.push(extra);
+                    }
+                }
+                // Walk this function's own children, but stop at any nested
+                // function/closure so attribute accesses inside inner defs
+                // don't contaminate the outer function's attr_refs.
                 let mut attr_names: Vec<&str> = Vec::new();
-                collect_attribute_names(node, source, attr_kind, attr_field, &mut attr_names);
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i as u32) {
+                        collect_attribute_names(
+                            child,
+                            source,
+                            attr_kind,
+                            attr_field,
+                            &fn_stop_kinds,
+                            &mut attr_names,
+                        );
+                    }
+                }
                 if !attr_names.is_empty() {
                     attr_names.sort_unstable();
                     attr_names.dedup();

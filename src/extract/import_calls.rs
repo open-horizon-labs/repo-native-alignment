@@ -139,10 +139,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         // each against the imports set. This is O(body_size + imports) instead
         // of O(imports × body_size) when iterating imports first.
         let called_names = extract_call_sites(&node.body);
-        // Also check for bare name references (not calls) — e.g.,
-        // `handler=some_function` or `callback_list.append(some_function)`.
-        // This captures functions passed as first-class values.
-        let body_bytes = node.body.as_bytes();
+
 
         // For each imported name that appears as a call in this function body
         for imported_name in imported_names {
@@ -154,12 +151,13 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             if node.id.name == imported_name.as_str() {
                 continue;
             }
-            // Check if the imported name appears in this function body —
-            // either as a call site (`name(`) or as a bare identifier reference
-            // (`handler=name`, `list.append(name)`, etc.).
+            // Check if the imported name appears as a call site (`name(`).
+            // We intentionally do NOT look for bare-name occurrences in body
+            // text here: a byte-level whole-word match would also fire inside
+            // comments, string literals, or shadowing declarations, which would
+            // incorrectly keep callees alive for dead-code analysis.
             let is_called = called_names.contains(imported_name.as_str());
-            let is_referenced = !is_called && body_contains_word(body_bytes, imported_name.as_bytes());
-            if !is_called && !is_referenced {
+            if !is_called {
                 continue;
             }
 
@@ -208,7 +206,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
                 edges.push(Edge {
                     from: node.id.clone(),
                     to: callee.id.clone(),
-                    kind: if is_called { EdgeKind::Calls } else { EdgeKind::ReferencedBy },
+                    kind: EdgeKind::Calls,
                     source: ExtractionSource::TreeSitter,
                     confidence: confidence.clone(),
                 });
@@ -234,6 +232,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         let text = &import_node.id.name;
         let names = parse_imported_names(text);
         let importer_lang = import_node.language.as_str();
+        let module_path = parse_import_module(text);
         for name in &names {
             if name.len() < 4 {
                 continue;
@@ -241,14 +240,37 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             let Some(candidates) = fn_by_name.get(name.as_str()) else {
                 continue;
             };
-            for callee in candidates {
-                // Must be in a different file, same language family
-                if (callee.id.root == import_node.id.root
-                    && callee.id.file == import_node.id.file)
-                    || !languages_compatible(importer_lang, callee.language.as_str())
-                {
-                    continue;
-                }
+
+            // Only emit a ReferencedBy edge when the import's target is
+            // unambiguous. Name-only resolution over an entire monorepo links
+            // e.g. `import { init }` to every `init` function, which falsely
+            // keeps unrelated callees alive. Either the name has exactly one
+            // compatible candidate, or the module path parsed from the import
+            // statement uniquely identifies the callee file.
+            let compatible: Vec<&&Node> = candidates
+                .iter()
+                .filter(|c| {
+                    (c.id.root != import_node.id.root
+                        || c.id.file != import_node.id.file)
+                        && languages_compatible(importer_lang, c.language.as_str())
+                })
+                .collect();
+            if compatible.is_empty() {
+                continue;
+            }
+            let resolved: Vec<&&Node> = if compatible.len() == 1 {
+                compatible
+            } else if let Some(ref module) = module_path {
+                let narrowed: Vec<&&Node> = compatible
+                    .iter()
+                    .copied()
+                    .filter(|c| import_path_matches_file(module, &c.id.file))
+                    .collect();
+                if narrowed.len() == 1 { narrowed } else { continue; }
+            } else {
+                continue;
+            };
+            for callee in resolved {
                 let key = (import_node.id.to_stable_id(), callee.id.to_stable_id());
                 if seen.contains(&key) {
                     continue;
@@ -470,6 +492,88 @@ pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// Extract the module/path string from an import statement.
+///
+/// Returns a path-like string representing the source module when parseable,
+/// without quotes. Returns `None` for bare `import foo` or `import foo, bar`
+/// where there is no source spec (those bind module objects, not specific names).
+fn parse_import_module(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    // ES6: `import ... from '…'` or `import ... from "…"`
+    if let Some(idx) = trimmed.find(" from ") {
+        let after = trimmed[idx + " from ".len()..].trim();
+        let stripped = after
+            .trim_end_matches(';')
+            .trim()
+            .trim_matches(|c: char| c == '\'' || c == '"' || c == '`');
+        if !stripped.is_empty() {
+            return Some(stripped.to_string());
+        }
+    }
+    // Python: `from module.path import ...`
+    if let Some(rest) = trimmed.strip_prefix("from ")
+        && let Some(idx) = rest.find(" import ")
+    {
+        let module = rest[..idx].trim();
+        if !module.is_empty() {
+            return Some(module.to_string());
+        }
+    }
+    // Rust: `use crate::foo::Bar` or `use crate::foo::{A, B}`
+    if let Some(rest) = trimmed.strip_prefix("use ") {
+        let stripped = rest.trim().trim_end_matches(';').trim();
+        // Drop a trailing brace group for path purposes.
+        let module = if let Some(brace_idx) = stripped.find('{') {
+            stripped[..brace_idx].trim_end_matches("::").trim()
+        } else if let Some(last_sep) = stripped.rfind("::") {
+            stripped[..last_sep].trim()
+        } else {
+            stripped
+        };
+        if !module.is_empty() {
+            return Some(module.to_string());
+        }
+    }
+    None
+}
+
+/// Best-effort check that a module path from an import statement likely refers
+/// to the given callee file.
+///
+/// Splits the module on common separators (`/`, `.`, `::`) into non-trivial
+/// segments and requires the last informative segment to equal the file stem,
+/// a parent directory name, or the file's basename. Leading `.` segments are
+/// ignored so `./b` and `../api` work.
+fn import_path_matches_file(module: &str, file: &std::path::Path) -> bool {
+    let segments: Vec<&str> = module
+        .split(|c: char| c == '/' || c == '.' || c == ':' || c == '\\')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && *s != "crate" && *s != "self" && *s != "super")
+        .collect();
+    let Some(last) = segments.last() else {
+        return false;
+    };
+    let file_stem = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let file_name = file
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if *last == file_stem || *last == file_name {
+        return true;
+    }
+    // Fall back to matching against any ancestor directory name when the module
+    // path points to a folder (e.g. `../api` importing a re-export index).
+    file.ancestors().any(|a| {
+        a.file_name()
+            .and_then(|s| s.to_str())
+            .map(|n| n == *last)
+            .unwrap_or(false)
+    })
+}
+
 /// Parse ES6 import names from a TypeScript/JavaScript import statement.
 ///
 /// Handles:
@@ -540,37 +644,6 @@ fn parse_es6_import_names(text: &str) -> Vec<String> {
     names
 }
 
-/// Check if `name` appears as a whole-word identifier in `body`.
-/// Uses ASCII word-boundary checks (prev/next byte is not alphanumeric or `_`).
-/// This catches bare name references like `handler=some_function` or
-/// `[some_function, other]` that `extract_call_sites` misses (it requires `name(`).
-fn body_contains_word(body: &[u8], name: &[u8]) -> bool {
-    if name.is_empty() || body.len() < name.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i + name.len() <= body.len() {
-        if &body[i..i + name.len()] == name {
-            // Check word boundary before
-            let before_ok = i == 0 || {
-                let b = body[i - 1];
-                // Not preceded by identifier char, '.', or ':'
-                // This avoids matching `obj.helper` as bare `helper`
-                !b.is_ascii_alphanumeric() && b != b'_' && b != b'.' && b != b':'
-            };
-            // Check word boundary after
-            let after_ok = i + name.len() == body.len() || {
-                let b = body[i + name.len()];
-                !b.is_ascii_alphanumeric() && b != b'_'
-            };
-            if before_ok && after_ok {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
-}
 
 // ---------------------------------------------------------------------------
 // Helper: check if a function body contains a bare call to a name

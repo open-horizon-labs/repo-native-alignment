@@ -70,14 +70,19 @@ Remove from consideration:
 - **Method overrides on library base classes** — if a function has
   `metadata["framework_hook"]` set, it was identified by an `.oh/extractors/`
   config as a library hook method. Skip it. If the metadata is NOT set but the
-  method is on a class inheriting from an external library (SQLAlchemy
-  `TypeDecorator`, OTEL `SpanProcessor`, Django `Model`, etc.), it may need an
-  `.oh/extractors/` config with a `[[hooks]]` section. Common framework hooks:
+  method looks like it is called by an external framework (SQLAlchemy
+  `TypeDecorator`, OTEL `SpanProcessor`, Django `Model`, Pydantic, etc.), it
+  may need an `.oh/extractors/` config with a `[[hooks]]` section.
+
+  Hook matching is **name-based on the enclosing class**, not inheritance-based:
+  the matcher checks only that the function's immediate `parent_scope` contains
+  `class_contains` and that the function's own name is listed in `method_names`.
+  It does not traverse inherited base classes. Examples of common frameworks you
+  can configure hooks for:
   - SQLAlchemy: `process_bind_param`, `process_result_value`, `column_expression`
   - OTEL: `on_start`, `on_end`, `shutdown`, `force_flush`
   - Django: `save`, `delete`, `clean`, `get_queryset`
   - Pydantic: `model_post_init`, validators
-  - Python ABCs: any method matching a name defined on the abstract parent
 - **Nested/local functions** — if the result shows `Parent: <outer-name> (function)`,
   this is a function defined inside another function/closure. Skip it for dead-code
   analysis — it is a local helper, not a top-level candidate. The outer function owns it.

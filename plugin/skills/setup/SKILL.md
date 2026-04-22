@@ -117,13 +117,14 @@ If AGENTS.md does not exist, create it with the tool guidance block as the initi
 Check if the project uses messaging frameworks, event buses, or libraries with hook patterns that RNA should know about. Look at the project's imports:
 
 ```bash
-repo-native-alignment search --repo . "" --kind import --compact 2>&1 | grep -iE 'pubsub|kafka|celery|pika|redis|rabbitmq|sqlalchemy|django|flask|opentelemetry|otel'
+repo-native-alignment search --repo . "" --kind import --compact 2>&1 \
+  | grep -iE 'pubsub|kafka|celery|pika|redis|rabbitmq|sqlalchemy|django|flask|opentelemetry|otel' || true
 ```
 
 If any match, check whether `.oh/extractors/` already has coverage for the detected frameworks by searching extractor contents (listing filenames alone is not sufficient):
 
 ```bash
-grep -RniE 'pubsub|kafka|celery|pika|redis|rabbitmq|sqlalchemy|django|flask|opentelemetry|otel' .oh/extractors/ 2>/dev/null
+grep -RniE 'pubsub|kafka|celery|pika|redis|rabbitmq|sqlalchemy|django|flask|opentelemetry|otel' .oh/extractors/ 2>/dev/null || true
 ```
 
 If the project uses a messaging framework without coverage, create a config file. Example for Google Pub/Sub:
