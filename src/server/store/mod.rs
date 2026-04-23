@@ -9,6 +9,7 @@
 
 mod batch;
 pub(crate) mod load;
+pub(crate) mod metadata_keys;
 pub(crate) mod migrate;
 pub(crate) mod persist;
 
