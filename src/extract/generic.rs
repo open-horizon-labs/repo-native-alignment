@@ -594,7 +594,7 @@ fn collect_nodes(
                 // Avoid leaking member accesses from nested function/closure bodies
                 // into this outer function's attr_refs. Stop recursion at any node
                 // kind configured to map to NodeKind::Function, plus common closure
-                // syntaxes across supported languages.
+                // and inner-function syntaxes across supported languages.
                 let mut fn_stop_kinds: HashSet<&str> = config
                     .node_kinds
                     .iter()
@@ -602,28 +602,49 @@ fn collect_nodes(
                     .map(|(ts_kind, _)| *ts_kind)
                     .collect();
                 for extra in [
+                    // JS / TS
                     "arrow_function",
                     "function_expression",
-                    "lambda",
+                    "function_declaration",
+                    "generator_function",
+                    "generator_function_declaration",
+                    "method_definition",
+                    "method",
+                    // Rust
                     "closure_expression",
+                    "async_block",
+                    // Python
+                    "lambda",
+                    "async_function_definition",
+                    // Go
+                    "func_literal",
                 ] {
                     fn_stop_kinds.insert(extra);
                 }
-                // Walk this function's own children, but stop at any nested
-                // function/closure so attribute accesses inside inner defs
-                // don't contaminate the outer function's attr_refs.
+                // Walk only this function's body subtree so attribute accesses in
+                // parameter defaults, decorators, or return-type annotations do
+                // not contaminate attr_refs. Fall back to the whole node when no
+                // body field is exposed by the grammar.
                 let mut attr_names: Vec<&str> = Vec::new();
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32) {
-                        collect_attribute_names(
-                            child,
-                            source,
-                            attr_kind,
-                            attr_field,
-                            &fn_stop_kinds,
-                            &mut attr_names,
-                        );
-                    }
+                let body_node = node.child_by_field_name("body");
+                let walk_roots: Vec<tree_sitter::Node> = if let Some(body) = body_node {
+                    (0..body.child_count())
+                        .filter_map(|i| body.child(i as u32))
+                        .collect()
+                } else {
+                    (0..node.child_count())
+                        .filter_map(|i| node.child(i as u32))
+                        .collect()
+                };
+                for child in walk_roots {
+                    collect_attribute_names(
+                        child,
+                        source,
+                        attr_kind,
+                        attr_field,
+                        &fn_stop_kinds,
+                        &mut attr_names,
+                    );
                 }
                 if !attr_names.is_empty() {
                     attr_names.sort_unstable();

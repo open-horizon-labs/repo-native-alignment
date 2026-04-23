@@ -382,20 +382,26 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
 ///
 /// Returns `false` for unknown language pairs to avoid cross-language noise.
 fn languages_compatible(caller_lang: &str, callee_lang: &str) -> bool {
-    // Normalize to lowercase for comparison.
-    let c1 = caller_lang.to_lowercase();
-    let c2 = callee_lang.to_lowercase();
-    if c1 == c2 {
+    // Fast path: same language (case-insensitive, no allocation).
+    if caller_lang.eq_ignore_ascii_case(callee_lang) {
         return true;
     }
     // TypeScript / JavaScript share the same import system.
-    let ts_family = ["typescript", "javascript", "tsx", "jsx"];
-    let c1_is_ts = ts_family.iter().any(|l| c1.contains(l));
-    let c2_is_ts = ts_family.iter().any(|l| c2.contains(l));
-    if c1_is_ts && c2_is_ts {
-        return true;
+    const TS_FAMILY: [&str; 4] = ["typescript", "javascript", "tsx", "jsx"];
+    fn in_ts_family(lang: &str) -> bool {
+        // Case-insensitive substring match without allocation.
+        let lang_bytes = lang.as_bytes();
+        TS_FAMILY.iter().any(|needle| {
+            let n = needle.as_bytes();
+            if lang_bytes.len() < n.len() {
+                return false;
+            }
+            lang_bytes
+                .windows(n.len())
+                .any(|w| w.eq_ignore_ascii_case(n))
+        })
     }
-    false
+    in_ts_family(caller_lang) && in_ts_family(callee_lang)
 }
 
 /// Returns `true` when `callee` is a function defined inside another function
@@ -576,7 +582,7 @@ fn parse_import_module(text: &str) -> Option<String> {
 /// `super` segments are ignored so `./b` and `../api` still work.
 fn import_path_matches_file(module: &str, file: &std::path::Path) -> bool {
     let segments: Vec<&str> = module
-        .split(|c: char| c == '/' || c == '.' || c == ':' || c == '\\')
+        .split(['/', '.', ':', '\\'])
         .map(|s| s.trim())
         .filter(|s| !s.is_empty() && *s != "crate" && *s != "self" && *s != "super")
         .collect();
