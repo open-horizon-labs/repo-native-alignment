@@ -139,9 +139,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         // each against the imports set. This is O(body_size + imports) instead
         // of O(imports × body_size) when iterating imports first.
         let called_names = extract_call_sites(&node.body);
-        if called_names.is_empty() {
-            continue;
-        }
+
 
         // For each imported name that appears as a call in this function body
         for imported_name in imported_names {
@@ -153,8 +151,13 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
             if node.id.name == imported_name.as_str() {
                 continue;
             }
-            // Check if the extracted call sites include this imported name.
-            if !called_names.contains(imported_name.as_str()) {
+            // Check if the imported name appears as a call site (`name(`).
+            // We intentionally do NOT look for bare-name occurrences in body
+            // text here: a byte-level whole-word match would also fire inside
+            // comments, string literals, or shadowing declarations, which would
+            // incorrectly keep callees alive for dead-code analysis.
+            let is_called = called_names.contains(imported_name.as_str());
+            if !is_called {
                 continue;
             }
 
@@ -211,10 +214,154 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         }
     }
 
-    if !edges.is_empty() {
+    let calls_count = edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Calls)
+        .count();
+    // ------------------------------------------------------------------
+    // 5. Emit ReferencedBy edges for imports that resolve to functions.
+    //    This catches references that aren't bare call sites (keyword args,
+    //    dict dispatch, decorator registration, re-exports). A function
+    //    imported by another file is referenced even if not called directly.
+    // ------------------------------------------------------------------
+    let mut ref_count = 0usize;
+    for import_node in all_nodes {
+        if import_node.id.kind != NodeKind::Import {
+            continue;
+        }
+        let text = &import_node.id.name;
+        let names = parse_imported_names(text);
+        let importer_lang = import_node.language.as_str();
+        let module_path = parse_import_module(text);
+        for name in &names {
+            if name.len() < 4 {
+                continue;
+            }
+            let Some(candidates) = fn_by_name.get(name.as_str()) else {
+                continue;
+            };
+
+            // Only emit a ReferencedBy edge when the import's target is
+            // unambiguous. Name-only resolution over an entire monorepo links
+            // e.g. `import { init }` to every `init` function, which falsely
+            // keeps unrelated callees alive. Either the name has exactly one
+            // compatible candidate, or the module path parsed from the import
+            // statement uniquely identifies the callee file.
+            let compatible: Vec<&&Node> = candidates
+                .iter()
+                .filter(|c| {
+                    (c.id.root != import_node.id.root
+                        || c.id.file != import_node.id.file)
+                        && languages_compatible(importer_lang, c.language.as_str())
+                })
+                .collect();
+            if compatible.is_empty() {
+                continue;
+            }
+            let resolved: Vec<&&Node> = if let Some(ref module) = module_path {
+                // An explicit module path was written; require a compatible
+                // candidate whose file matches that path before accepting it.
+                // Falling back to `candidates.len() == 1` here would wrongly
+                // accept a local `init` for `import { init } from 'some-library'`.
+                let narrowed: Vec<&&Node> = compatible
+                    .iter()
+                    .copied()
+                    .filter(|c| import_path_matches_file(module, &c.id.file))
+                    .collect();
+                if narrowed.len() == 1 { narrowed } else { continue; }
+            } else if compatible.len() == 1 {
+                compatible
+            } else {
+                continue;
+            };
+            for callee in resolved {
+                let key = (import_node.id.to_stable_id(), callee.id.to_stable_id());
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.insert(key);
+                edges.push(Edge {
+                    from: import_node.id.clone(),
+                    to: callee.id.clone(),
+                    kind: EdgeKind::ReferencedBy,
+                    source: ExtractionSource::TreeSitter,
+                    confidence: Confidence::Detected,
+                });
+                ref_count += 1;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 6. Emit ReferencedBy edges from attribute access in function bodies.
+    //    When a function body contains `obj.method_name()`, the attr_refs
+    //    metadata (extracted at parse time by GenericExtractor) includes
+    //    "method_name". Match against fn_by_name to create cross-file edges.
+    //    This is the vulture-style flat name matching approach — low precision
+    //    (same-named methods on different classes match) but high recall.
+    // ------------------------------------------------------------------
+    let mut attr_ref_count = 0usize;
+    for node in all_nodes {
+        if node.id.kind != NodeKind::Function {
+            continue;
+        }
+        let Some(attr_refs_str) = node.metadata.get("attr_refs") else {
+            continue;
+        };
+        let caller_lang = node.language.as_str();
+        for attr_name in attr_refs_str.split(',') {
+            let attr_name = attr_name.trim();
+            if attr_name.len() < 4 {
+                continue;
+            }
+            let Some(candidates) = fn_by_name.get(attr_name) else {
+                continue;
+            };
+            // Restrict to cross-file, same-language-family, top-level functions.
+            // Nested/local function defs carry `parent_scope_kind = function` in
+            // metadata and would otherwise fan out `obj.helper()` to every
+            // same-named inner helper in the codebase.
+            let eligible: Vec<&&Node> = candidates
+                .iter()
+                .filter(|c| {
+                    if callee_is_nested_local(c) {
+                        return false;
+                    }
+                    if c.id.root == node.id.root && c.id.file == node.id.file {
+                        return false;
+                    }
+                    languages_compatible(caller_lang, c.language.as_str())
+                })
+                .collect();
+            // Only emit when the attribute name resolves unambiguously. Any
+            // fan-out at this stage turns common method names (`save`,
+            // `render`) into large false-live clusters during dead-code runs.
+            if eligible.len() != 1 {
+                continue;
+            }
+            let callee = eligible[0];
+            let key = (node.id.to_stable_id(), callee.id.to_stable_id());
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.insert(key);
+            edges.push(Edge {
+                from: node.id.clone(),
+                to: callee.id.clone(),
+                kind: EdgeKind::ReferencedBy,
+                source: ExtractionSource::TreeSitter,
+                confidence: Confidence::Detected,
+            });
+            attr_ref_count += 1;
+        }
+    }
+
+    if calls_count > 0 || ref_count > 0 || attr_ref_count > 0 {
         tracing::info!(
-            "import_calls pass: {} cross-file Calls edge(s) via import resolution",
-            edges.len()
+            "import_calls pass: {} Calls, {} import ReferencedBy, {} attribute ReferencedBy edge(s)",
+            calls_count,
+            ref_count,
+            attr_ref_count
         );
     }
 
@@ -235,20 +382,35 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
 ///
 /// Returns `false` for unknown language pairs to avoid cross-language noise.
 fn languages_compatible(caller_lang: &str, callee_lang: &str) -> bool {
-    // Normalize to lowercase for comparison.
-    let c1 = caller_lang.to_lowercase();
-    let c2 = callee_lang.to_lowercase();
-    if c1 == c2 {
+    // Fast path: same language (case-insensitive, no allocation).
+    if caller_lang.eq_ignore_ascii_case(callee_lang) {
         return true;
     }
     // TypeScript / JavaScript share the same import system.
-    let ts_family = ["typescript", "javascript", "tsx", "jsx"];
-    let c1_is_ts = ts_family.iter().any(|l| c1.contains(l));
-    let c2_is_ts = ts_family.iter().any(|l| c2.contains(l));
-    if c1_is_ts && c2_is_ts {
-        return true;
+    const TS_FAMILY: [&str; 4] = ["typescript", "javascript", "tsx", "jsx"];
+    fn in_ts_family(lang: &str) -> bool {
+        // Case-insensitive substring match without allocation.
+        let lang_bytes = lang.as_bytes();
+        TS_FAMILY.iter().any(|needle| {
+            let n = needle.as_bytes();
+            if lang_bytes.len() < n.len() {
+                return false;
+            }
+            lang_bytes
+                .windows(n.len())
+                .any(|w| w.eq_ignore_ascii_case(n))
+        })
     }
-    false
+    in_ts_family(caller_lang) && in_ts_family(callee_lang)
+}
+
+/// Returns `true` when `callee` is a function defined inside another function
+/// or closure, as recorded by the generic extractor in
+/// `metadata["parent_scope_kind"]`. Such nested/local helpers are not valid
+/// cross-file `ReferencedBy` targets for a bare `obj.method_name()` attribute
+/// access in another file.
+fn callee_is_nested_local(callee: &Node) -> bool {
+    callee.metadata.get("parent_scope_kind").map(|s| s.as_str()) == Some("function")
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +526,96 @@ pub(crate) fn parse_imported_names(import_text: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// Extract the module/path string from an import statement.
+///
+/// Returns a path-like string representing the source module when parseable,
+/// without quotes. Returns `None` for bare `import foo` or `import foo, bar`
+/// where there is no source spec (those bind module objects, not specific names).
+fn parse_import_module(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    // ES6: `import ... from '…'` or `import ... from "…"`
+    if let Some(idx) = trimmed.find(" from ") {
+        let after = trimmed[idx + " from ".len()..].trim();
+        let stripped = after
+            .trim_end_matches(';')
+            .trim()
+            .trim_matches(|c: char| c == '\'' || c == '"' || c == '`');
+        if !stripped.is_empty() {
+            return Some(stripped.to_string());
+        }
+    }
+    // Python: `from module.path import ...`
+    if let Some(rest) = trimmed.strip_prefix("from ")
+        && let Some(idx) = rest.find(" import ")
+    {
+        let module = rest[..idx].trim();
+        if !module.is_empty() {
+            return Some(module.to_string());
+        }
+    }
+    // Rust: `use crate::foo::Bar` or `use crate::foo::{A, B}`
+    if let Some(rest) = trimmed.strip_prefix("use ") {
+        let stripped = rest.trim().trim_end_matches(';').trim();
+        // Drop a trailing brace group for path purposes.
+        let module = if let Some(brace_idx) = stripped.find('{') {
+            stripped[..brace_idx].trim_end_matches("::").trim()
+        } else if let Some(last_sep) = stripped.rfind("::") {
+            stripped[..last_sep].trim()
+        } else {
+            stripped
+        };
+        if !module.is_empty() {
+            return Some(module.to_string());
+        }
+    }
+    None
+}
+
+/// Best-effort check that a module path from an import statement likely refers
+/// to the given callee file.
+///
+/// Splits the module on common separators (`/`, `.`, `::`) into non-trivial
+/// segments and requires the last informative segment to equal the file stem
+/// or basename. When the last segment instead matches an ancestor *directory*
+/// name, only accept the file when it is an index-like re-export module
+/// (`index.*`, `__init__.py`, `mod.rs`). Leading `.` / `crate` / `self` /
+/// `super` segments are ignored so `./b` and `../api` still work.
+fn import_path_matches_file(module: &str, file: &std::path::Path) -> bool {
+    let segments: Vec<&str> = module
+        .split(['/', '.', ':', '\\'])
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && *s != "crate" && *s != "self" && *s != "super")
+        .collect();
+    let Some(last) = segments.last() else {
+        return false;
+    };
+    let file_stem = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let file_name = file
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if *last == file_stem || *last == file_name {
+        return true;
+    }
+    // Folder imports (e.g. `../api`, `from pkg import ...`): only accept when
+    // the callee lives in an index-like re-export module inside that directory.
+    // Matching any descendant file here would let `../api` resolve to an
+    // arbitrary `api/*.ts` file even when the import clearly points at `api/index.ts`.
+    let is_index_module = matches!(file_name, "index.ts" | "index.tsx" | "index.js" | "index.jsx" | "index.mjs" | "index.cjs" | "__init__.py" | "mod.rs");
+    if !is_index_module {
+        return false;
+    }
+    file.ancestors().any(|a| {
+        a.file_name()
+            .and_then(|s| s.to_str())
+            .map(|n| n == *last)
+            .unwrap_or(false)
+    })
+}
+
 /// Parse ES6 import names from a TypeScript/JavaScript import statement.
 ///
 /// Handles:
@@ -433,6 +685,7 @@ fn parse_es6_import_names(text: &str) -> Vec<String> {
 
     names
 }
+
 
 // ---------------------------------------------------------------------------
 // Helper: check if a function body contains a bare call to a name
@@ -790,10 +1043,14 @@ mod tests {
         let nodes = vec![caller.clone(), callee.clone(), import];
         let edges = import_calls_pass(&nodes);
 
-        assert_eq!(edges.len(), 1, "expected 1 Calls edge, got {:?}", edges);
-        assert_eq!(edges[0].from.name, "main");
-        assert_eq!(edges[0].to.name, "helper");
-        assert_eq!(edges[0].kind, EdgeKind::Calls);
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
+        assert_eq!(calls.len(), 1, "expected 1 Calls edge, got {:?}", edges);
+        assert_eq!(calls[0].from.name, "main");
+        assert_eq!(calls[0].to.name, "helper");
+        assert_eq!(calls[0].kind, EdgeKind::Calls);
+        // Also expect a ReferencedBy edge from the import
+        let refs: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::ReferencedBy).collect();
+        assert_eq!(refs.len(), 1, "expected 1 import ReferencedBy edge");
     }
 
     #[test]
@@ -836,12 +1093,11 @@ mod tests {
 
         let nodes = vec![caller, callee, import];
         let edges = import_calls_pass(&nodes);
-
-        assert!(
-            edges.is_empty(),
-            "no call in body → no edge, got {:?}",
-            edges
-        );
+        // No Calls edge (helper not called in body), but import creates a ReferencedBy edge
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
+        assert!(calls.is_empty(), "no call in body → no Calls edge, got {:?}", calls);
+        let refs: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::ReferencedBy).collect();
+        assert_eq!(refs.len(), 1, "import creates ReferencedBy even without body call");
     }
 
     #[test]
@@ -895,15 +1151,10 @@ mod tests {
         let nodes = vec![caller, callee, import_node];
         let edges = import_calls_pass(&nodes);
 
-        assert_eq!(
-            edges.len(),
-            1,
-            "expected 1 Python Calls edge, got {:?}",
-            edges
-        );
-        assert_eq!(edges[0].from.name, "get_workspace");
-        assert_eq!(edges[0].to.name, "fetch_data");
-        assert_eq!(edges[0].kind, EdgeKind::Calls);
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
+        assert_eq!(calls.len(), 1, "expected 1 Python Calls edge, got {:?}", edges);
+        assert_eq!(calls[0].from.name, "get_workspace");
+        assert_eq!(calls[0].to.name, "fetch_data");
     }
 
     #[test]
@@ -952,11 +1203,12 @@ mod tests {
         let nodes = vec![caller, callee, import];
         let edges = import_calls_pass(&nodes);
 
-        assert!(
-            edges.is_empty(),
-            "method call `obj.helper()` must not emit Calls edge, got {:?}",
-            edges
-        );
+        // No Calls edge (method call, not bare call), but import ReferencedBy still emitted
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
+        assert!(calls.is_empty(), "method call `obj.helper()` must not emit Calls edge, got {:?}", calls);
+        // Import ReferencedBy is still emitted since helper is imported
+        let refs: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::ReferencedBy).collect();
+        assert_eq!(refs.len(), 1, "import ReferencedBy still emitted");
     }
 
     #[test]
@@ -968,12 +1220,9 @@ mod tests {
         let nodes = vec![caller, callee, import];
         let edges = import_calls_pass(&nodes);
 
-        assert_eq!(edges.len(), 1);
-        assert_eq!(
-            edges[0].confidence,
-            Confidence::Detected,
-            "relative import should produce Detected confidence"
-        );
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].confidence, Confidence::Detected, "relative import should produce Detected confidence");
     }
 
     #[test]
@@ -986,19 +1235,11 @@ mod tests {
         let nodes = vec![caller, callee, import];
         let edges = import_calls_pass(&nodes);
 
-        // Edge is emitted when a local function with matching name exists.
-        assert_eq!(
-            edges.len(),
-            1,
-            "expected 1 Calls edge for the non-relative import"
-        );
-        // All edges use Detected confidence.
+        // Calls edge + import ReferencedBy edge
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
+        assert_eq!(calls.len(), 1, "expected 1 Calls edge for the non-relative import");
         for e in &edges {
-            assert_eq!(
-                e.confidence,
-                Confidence::Detected,
-                "all import-calls edges use Detected confidence"
-            );
+            assert_eq!(e.confidence, Confidence::Detected, "all import-calls edges use Detected confidence");
         }
     }
 
@@ -1194,25 +1435,22 @@ mod tests {
         ];
         let edges = import_calls_pass(&nodes);
 
-        // Expected: 2 edges — mainA→helperA (root-a) and mainB→helperB (root-b).
-        // Without (root, file) keying: root-b's `helperB` import could leak into
-        // root-a, and vice versa, causing different counts.
+        // Expected: 2 Calls edges — mainA→helperA (root-a) and mainB→helperB (root-b).
+        // Plus 2 import ReferencedBy edges.
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
         assert_eq!(
-            edges.len(),
+            calls.len(),
             2,
-            "expected 2 isolated cross-file edges, got {:?}",
-            edges
-                .iter()
-                .map(|e| format!("{}->{}", e.from.name, e.to.name))
-                .collect::<Vec<_>>()
+            "expected 2 isolated cross-file Calls edges, got {:?}",
+            calls.iter().map(|e| format!("{}->{}", e.from.name, e.to.name)).collect::<Vec<_>>()
         );
 
-        let edge_a = edges.iter().find(|e| e.from.root == "root-a");
+        let edge_a = calls.iter().find(|e| e.from.root == "root-a");
         assert!(edge_a.is_some(), "missing root-a edge");
         assert_eq!(edge_a.unwrap().from.name, "mainA");
         assert_eq!(edge_a.unwrap().to.name, "helperA");
 
-        let edge_b = edges.iter().find(|e| e.from.root == "root-b");
+        let edge_b = calls.iter().find(|e| e.from.root == "root-b");
         assert!(edge_b.is_some(), "missing root-b edge");
         assert_eq!(edge_b.unwrap().from.name, "mainB");
         assert_eq!(edge_b.unwrap().to.name, "helperB");

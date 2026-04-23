@@ -10,6 +10,7 @@ use arrow_array::{
 
 use crate::graph::index::GraphIndex;
 use crate::graph::{Confidence, Edge, ExtractionSource, Node, NodeId};
+use crate::server::store::metadata_keys as mk;
 
 use super::super::state::GraphState;
 use super::migrate::read_committed_scan_version;
@@ -152,6 +153,15 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
             let decorators_col = batch
                 .column_by_name("decorators")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let parent_scope_col = batch
+                .column_by_name("parent_scope")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let parent_scope_kind_col = batch
+                .column_by_name("parent_scope_kind")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let framework_hook_col = batch
+                .column_by_name("framework_hook")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             let type_params_col = batch
                 .column_by_name("type_params")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
@@ -200,6 +210,10 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
             let doc_comment_col = batch
                 .column_by_name("doc_comment")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            // attr_refs column -- survives round-trip for import_calls_pass Step 6
+            let attr_refs_col = batch
+                .column_by_name("attr_refs")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             // gRPC / proto columns -- survives round-trip for GrpcClientCallsPass on incremental scans (#466)
             let parent_service_col = batch
                 .column_by_name("parent_service")
@@ -219,58 +233,82 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                     && !col.is_null(i)
                     && col.value(i)
                 {
-                    metadata.insert("virtual".to_string(), "true".to_string());
+                    metadata.insert(mk::VIRTUAL.to_owned(), "true".to_string());
                 }
                 if let Some(col) = meta_package_col
                     && !col.is_null(i)
                 {
-                    metadata.insert("package".to_string(), col.value(i).to_string());
+                    metadata.insert(mk::PACKAGE.to_owned(), col.value(i).to_string());
                 }
                 if let Some(col) = meta_name_col_col
                     && !col.is_null(i)
                 {
-                    metadata.insert("name_col".to_string(), col.value(i).to_string());
+                    metadata.insert(mk::NAME_COL.to_owned(), col.value(i).to_string());
                 }
                 if let Some(col) = value_col
                     && !col.is_null(i)
                 {
-                    metadata.insert("value".to_string(), col.value(i).to_string());
+                    metadata.insert(mk::VALUE.to_owned(), col.value(i).to_string());
                 }
                 if let Some(col) = synthetic_col
                     && !col.is_null(i)
                 {
                     metadata.insert(
-                        "synthetic".to_string(),
+                        mk::SYNTHETIC.to_owned(),
                         if col.value(i) { "true" } else { "false" }.to_string(),
                     );
                 }
                 if let Some(col) = cyclomatic_col
                     && !col.is_null(i)
                 {
-                    metadata.insert("cyclomatic".to_string(), col.value(i).to_string());
+                    metadata.insert(mk::CYCLOMATIC.to_owned(), col.value(i).to_string());
                 }
                 if let Some(col) = importance_col
                     && !col.is_null(i)
                 {
-                    metadata.insert("importance".to_string(), format!("{:.6}", col.value(i)));
+                    metadata.insert(mk::IMPORTANCE.to_owned(), format!("{:.6}", col.value(i)));
                 }
                 if let Some(col) = storage_col
                     && !col.is_null(i)
                 {
-                    metadata.insert("storage".to_string(), col.value(i).to_string());
+                    metadata.insert(mk::STORAGE.to_owned(), col.value(i).to_string());
                 }
                 if let Some(col) = mutable_col
                     && !col.is_null(i)
                     && col.value(i)
                 {
-                    metadata.insert("mutable".to_string(), "true".to_string());
+                    metadata.insert(mk::MUTABLE.to_owned(), "true".to_string());
                 }
                 if let Some(col) = decorators_col
                     && !col.is_null(i)
                 {
                     let val = col.value(i);
                     if !val.is_empty() {
-                        metadata.insert("decorators".to_string(), val.to_string());
+                        metadata.insert(mk::DECORATORS.to_owned(), val.to_string());
+                    }
+                }
+                if let Some(col) = parent_scope_col
+                    && !col.is_null(i)
+                {
+                    let val = col.value(i);
+                    if !val.is_empty() {
+                        metadata.insert(mk::PARENT_SCOPE.to_owned(), val.to_string());
+                    }
+                }
+                if let Some(col) = parent_scope_kind_col
+                    && !col.is_null(i)
+                {
+                    let val = col.value(i);
+                    if !val.is_empty() {
+                        metadata.insert(mk::PARENT_SCOPE_KIND.to_owned(), val.to_string());
+                    }
+                }
+                if let Some(col) = framework_hook_col
+                    && !col.is_null(i)
+                {
+                    let val = col.value(i);
+                    if !val.is_empty() {
+                        metadata.insert(mk::FRAMEWORK_HOOK.to_owned(), val.to_string());
                     }
                 }
                 if let Some(col) = type_params_col
@@ -278,7 +316,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 {
                     let val = col.value(i);
                     if !val.is_empty() {
-                        metadata.insert("type_params".to_string(), val.to_string());
+                        metadata.insert(mk::TYPE_PARAMS.to_owned(), val.to_string());
                     }
                 }
                 if let Some(col) = pattern_hint_col
@@ -286,14 +324,14 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 {
                     let val = col.value(i);
                     if !val.is_empty() {
-                        metadata.insert("pattern_hint".to_string(), val.to_string());
+                        metadata.insert(mk::PATTERN_HINT.to_owned(), val.to_string());
                     }
                 }
                 if let Some(col) = is_static_col
                     && !col.is_null(i)
                 {
                     metadata.insert(
-                        "is_static".to_string(),
+                        mk::IS_STATIC.to_owned(),
                         if col.value(i) { "true" } else { "false" }.to_string(),
                     );
                 }
@@ -301,34 +339,34 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                     && !col.is_null(i)
                     && col.value(i)
                 {
-                    metadata.insert("is_async".to_string(), "true".to_string());
+                    metadata.insert(mk::IS_ASYNC.to_owned(), "true".to_string());
                 }
                 if let Some(col) = is_test_col
                     && !col.is_null(i)
                     && col.value(i)
                 {
-                    metadata.insert("is_test".to_string(), "true".to_string());
+                    metadata.insert(mk::IS_TEST.to_owned(), "true".to_string());
                 }
                 if let Some(col) = visibility_col
                     && !col.is_null(i)
                 {
                     let val = col.value(i);
                     if !val.is_empty() {
-                        metadata.insert("visibility".to_string(), val.to_string());
+                        metadata.insert(mk::VISIBILITY.to_owned(), val.to_string());
                     }
                 }
                 if let Some(col) = exported_col
                     && !col.is_null(i)
                     && col.value(i)
                 {
-                    metadata.insert("exported".to_string(), "true".to_string());
+                    metadata.insert(mk::EXPORTED.to_owned(), "true".to_string());
                 }
                 if let Some(col) = diag_severity_col
                     && !col.is_null(i)
                 {
                     let val = col.value(i);
                     if !val.is_empty() {
-                        metadata.insert("diagnostic_severity".to_string(), val.to_string());
+                        metadata.insert(mk::DIAG_SEVERITY.to_owned(), val.to_string());
                     }
                 }
                 if let Some(col) = diag_source_col
@@ -336,7 +374,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 {
                     let val = col.value(i);
                     if !val.is_empty() {
-                        metadata.insert("diagnostic_source".to_string(), val.to_string());
+                        metadata.insert(mk::DIAG_SOURCE.to_owned(), val.to_string());
                     }
                 }
                 if let Some(col) = diag_message_col
@@ -344,7 +382,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 {
                     let val = col.value(i);
                     if !val.is_empty() {
-                        metadata.insert("diagnostic_message".to_string(), val.to_string());
+                        metadata.insert(mk::DIAG_MESSAGE.to_owned(), val.to_string());
                     }
                 }
                 if let Some(col) = diag_range_col
@@ -352,7 +390,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 {
                     let val = col.value(i);
                     if !val.is_empty() {
-                        metadata.insert("diagnostic_range".to_string(), val.to_string());
+                        metadata.insert(mk::DIAG_RANGE.to_owned(), val.to_string());
                     }
                 }
                 if let Some(col) = diag_timestamp_col
@@ -360,7 +398,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 {
                     let val = col.value(i);
                     if !val.is_empty() {
-                        metadata.insert("diagnostic_timestamp".to_string(), val.to_string());
+                        metadata.insert(mk::DIAG_TIMESTAMP.to_owned(), val.to_string());
                     }
                 }
                 if let Some(col) = http_method_col
@@ -368,7 +406,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 {
                     let val = col.value(i);
                     if !val.is_empty() {
-                        metadata.insert("http_method".to_string(), val.to_string());
+                        metadata.insert(mk::HTTP_METHOD.to_owned(), val.to_string());
                     }
                 }
                 if let Some(col) = http_path_col
@@ -376,7 +414,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 {
                     let val = col.value(i);
                     if !val.is_empty() {
-                        metadata.insert("http_path".to_string(), val.to_string());
+                        metadata.insert(mk::HTTP_PATH.to_owned(), val.to_string());
                     }
                 }
                 if let Some(col) = doc_comment_col
@@ -384,7 +422,15 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 {
                     let val = col.value(i);
                     if !val.is_empty() {
-                        metadata.insert("doc_comment".to_string(), val.to_string());
+                        metadata.insert(mk::DOC_COMMENT.to_owned(), val.to_string());
+                    }
+                }
+                if let Some(col) = attr_refs_col
+                    && !col.is_null(i)
+                {
+                    let val = col.value(i);
+                    if !val.is_empty() {
+                        metadata.insert(mk::ATTR_REFS.to_owned(), val.to_string());
                     }
                 }
                 // gRPC / proto columns -- restore metadata for GrpcClientCallsPass (#466)
@@ -393,7 +439,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 {
                     let val = col.value(i);
                     if !val.is_empty() {
-                        metadata.insert("parent_service".to_string(), val.to_string());
+                        metadata.insert(mk::PARENT_SERVICE.to_owned(), val.to_string());
                     }
                 }
                 if let Some(col) = rpc_request_type_col
@@ -401,7 +447,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 {
                     let val = col.value(i);
                     if !val.is_empty() {
-                        metadata.insert("request_type".to_string(), val.to_string());
+                        metadata.insert(mk::REQUEST_TYPE.to_owned(), val.to_string());
                     }
                 }
                 if let Some(col) = rpc_response_type_col
@@ -409,7 +455,7 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                 {
                     let val = col.value(i);
                     if !val.is_empty() {
-                        metadata.insert("response_type".to_string(), val.to_string());
+                        metadata.insert(mk::RESPONSE_TYPE.to_owned(), val.to_string());
                     }
                 }
                 nodes.push(Node {

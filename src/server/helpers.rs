@@ -366,6 +366,16 @@ pub(crate) fn format_node_entry_with_root(
         if let Some(decorators) = n.metadata.get("decorators") {
             entry.push_str(&format!("\n  Decorators: {}", decorators));
         }
+        if let Some(parent) = n.metadata.get("parent_scope") {
+            if let Some(parent_kind) = n.metadata.get("parent_scope_kind") {
+                entry.push_str(&format!("\n  Parent: {} ({})", parent, parent_kind));
+            } else {
+                entry.push_str(&format!("\n  Parent: {}", parent));
+            }
+        }
+        if let Some(hook) = n.metadata.get("framework_hook") {
+            entry.push_str(&format!("\n  Framework hook: {}", hook));
+        }
         if let Some(val) = n.metadata.get("value") {
             entry.push_str(&format!("\n  Value: `{}`", val));
         }

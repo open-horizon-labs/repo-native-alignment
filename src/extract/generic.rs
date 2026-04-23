@@ -19,9 +19,9 @@
 //! the individual extractor files, but as small focused functions rather than
 //! full 300-line traversal reimplementations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
 
@@ -182,6 +182,143 @@ pub struct LangConfig {
     /// Rust, Java, TypeScript use decorator/attribute patterns — their `test_helper()`
     /// functions are NOT tests by naming alone.
     pub test_name_prefix: bool,
+    /// Which node kinds to send to the LSP enricher for reference/callHierarchy lookups.
+    /// Defaults to `None` = all enrichable kinds (Function, Trait, Struct, Enum, TypeAlias, Const).
+    /// When `Some(&[...])`, only the listed kinds are enriched via LSP.
+    ///
+    /// Python sets this to `&[Function, Trait]` because pyright's textDocument/references
+    /// hangs on class/enum/const lookups (30s timeout per node), triggering the error-rate
+    /// abort and killing the entire enrichment pass before any functions get processed.
+    pub lsp_enrichable_kinds: Option<&'static [NodeKind]>,
+    /// Virtual environment directory names to look for in the startup root.
+    /// When found, these are passed to the LSP server as venvPath/venv in
+    /// initializationOptions so it can resolve installed packages.
+    /// `None` = no venv detection for this language.
+    pub venv_candidates: Option<&'static [&'static str]>,
+    /// Whether this language's LSP server supports a custom `parentModule`
+    /// request for more accurate module hierarchy (e.g., rust-analyzer).
+    pub has_parent_module_request: bool,
+    /// Tree-sitter node kind and child field name for attribute/member access.
+    /// Used to extract method call names from function bodies at parse time.
+    /// The attribute name is the identifier accessed via `.` (e.g., `obj.method()` → "method").
+    ///
+    /// Only call-position accesses are collected: the attribute node must be the
+    /// callee (`call_expr_kinds.1` field) of a `call_expr_kinds.0` parent. Bare
+    /// property reads (`obj.attr`) are excluded to keep graph edges accurate —
+    /// a property read is not a use-relationship to a function.
+    ///
+    /// Stored as `metadata["attr_refs"]` on function nodes — a comma-separated
+    /// list of method names called via dot notation in the body. Consumed by
+    /// `import_calls_pass` to emit `ReferencedBy` edges for cross-file method calls.
+    ///
+    /// Examples:
+    /// - Python: `Some(("attribute", "attribute"))` — `obj.method` node in `obj.method()`
+    /// - TypeScript: `Some(("member_expression", "property"))` — `obj.method` node in `obj.method()`
+    /// - Go: `Some(("selector_expression", "field"))` — `obj.Method` node in `obj.Method()`
+    pub attribute_access_node: Option<(&'static str, &'static str)>,
+}
+
+/// Return the cached attr_refs recursion stop-kind set for `config`.
+///
+/// Built once per language from the canonical [`CLOSURE_NODE_KINDS`] list plus
+/// any ts_kinds this [`LangConfig`] maps to [`NodeKind::Function`] (named inner
+/// defs, methods). Per-call rebuilds caused the inline list in `collect_nodes`
+/// to diverge from the canonical closure list used by `count_branches`, which
+/// is exactly what the `no-language-conditionals-in-generic` guardrail is
+/// meant to prevent.
+fn fn_stop_kinds_for(config: &LangConfig) -> &'static HashSet<&'static str> {
+    static CACHE: OnceLock<Mutex<HashMap<&'static str, &'static HashSet<&'static str>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // Fast-path: return already-built set for this language.
+    {
+        let guard = cache.lock().expect("fn_stop_kinds cache poisoned");
+        if let Some(&set) = guard.get(config.language_name) {
+            return set;
+        }
+    }
+    // Build the merged set. Named Function-mapped kinds come from LangConfig;
+    // anonymous closure forms come from the shared constant. Leak into static
+    // memory once per language (count bounded by the number of registered
+    // languages) so the borrow outlives any extraction call.
+    let mut set: HashSet<&'static str> = config
+        .node_kinds
+        .iter()
+        .filter(|(_, k)| *k == NodeKind::Function)
+        .map(|(ts_kind, _)| *ts_kind)
+        .collect();
+    for &k in CLOSURE_NODE_KINDS {
+        set.insert(k);
+    }
+    let leaked: &'static HashSet<&'static str> = Box::leak(Box::new(set));
+    let mut guard = cache.lock().expect("fn_stop_kinds cache poisoned");
+    // Race-safe: another thread may have inserted concurrently; keep the first
+    // winner and drop our leaked copy for that language.
+    guard.entry(config.language_name).or_insert(leaked)
+}
+
+/// Walk a tree-sitter subtree and collect attribute/member access names.
+/// Finds all nodes of kind `attr_kind` and extracts the child field `attr_field`.
+///
+/// When `call_filter` is `Some((call_kind, callee_field))`, only names whose
+/// attribute node is the `callee_field` child of a `call_kind` parent are
+/// collected — i.e., only actual method calls (`obj.method()`), not bare
+/// property reads (`obj.attr`). This keeps `attr_refs` edges in the graph
+/// accurate: a property read is not a use-relationship to a function.
+///
+/// Recursion stops at nested function/closure boundaries so that attribute
+/// accesses inside inner defs/closures do not leak into the outer function's
+/// `attr_refs`. Callers pass `stop_kinds` listing nested-scope node kinds.
+fn collect_attribute_names<'a>(
+    node: tree_sitter::Node<'a>,
+    source: &'a [u8],
+    attr_kind: &str,
+    attr_field: &str,
+    call_filter: Option<(&'static str, &'static str)>,
+    stop_kinds: &HashSet<&str>,
+    out: &mut Vec<&'a str>,
+) {
+    if node.kind() == attr_kind {
+        // Only emit when the attribute access is the callee of a call expression.
+        // When call_filter is None (language has no call_expr_kinds configured),
+        // fall back to including all accesses rather than silently dropping them.
+        let in_call_position = call_filter.map_or(true, |(call_kind, callee_field)| {
+            node.parent()
+                .map(|parent| {
+                    parent.kind() == call_kind
+                        && parent
+                            .child_by_field_name(callee_field)
+                            .map(|callee| callee.id() == node.id())
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+        if in_call_position
+            && let Some(child) = node.child_by_field_name(attr_field)
+            && let Ok(text) = child.utf8_text(source)
+        {
+            let text = text.trim();
+            if !text.is_empty() {
+                out.push(text);
+            }
+        }
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            if stop_kinds.contains(child.kind()) {
+                continue;
+            }
+            collect_attribute_names(
+                child,
+                source,
+                attr_kind,
+                attr_field,
+                call_filter,
+                stop_kinds,
+                out,
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +334,7 @@ impl GenericExtractor {
     pub fn new(config: &'static LangConfig) -> Self {
         Self { config }
     }
+
 
     /// Run extraction and return the result. Used directly or as a base by
     /// per-language extractors that need custom post-processing.
@@ -366,8 +504,12 @@ fn collect_nodes(
             let mut metadata = BTreeMap::new();
 
             // Parent scope.
-            if let Some((scope_name, _)) = parent_scope {
+            if let Some((scope_name, scope_kind)) = parent_scope {
                 metadata.insert("parent_scope".to_string(), scope_name.clone());
+                metadata.insert(
+                    "parent_scope_kind".to_string(),
+                    scope_kind.to_string(),
+                );
             }
 
             // Name column for LSP cursor positioning.
@@ -514,6 +656,51 @@ fn collect_nodes(
                     }
                 }
                 metadata.insert("synthetic".to_string(), "false".to_string());
+            }
+
+            // Attribute access extraction — capture method/property names
+            // used via dot access in function bodies. Stored as metadata
+            // for import_calls_pass to match against defined function names.
+            if node_kind == NodeKind::Function
+                && let Some((attr_kind, attr_field)) = config.attribute_access_node
+            {
+                // Walk only this function's body subtree so attribute accesses in
+                // parameter defaults, decorators, or return-type annotations do
+                // not contaminate attr_refs. Fall back to the whole node when no
+                // body field is exposed by the grammar.
+                //
+                // Nested-scope stops come from the canonical `CLOSURE_NODE_KINDS`
+                // constant plus any ts_kinds this LangConfig maps to
+                // NodeKind::Function (named inner defs / methods). The combined
+                // set is built once per language via `fn_stop_kinds_for`.
+                let fn_stop_kinds = fn_stop_kinds_for(config);
+                let mut attr_names: Vec<&str> = Vec::new();
+                let body_node = node.child_by_field_name("body");
+                let walk_roots: Vec<tree_sitter::Node> = if let Some(body) = body_node {
+                    (0..body.child_count())
+                        .filter_map(|i| body.child(i as u32))
+                        .collect()
+                } else {
+                    (0..node.child_count())
+                        .filter_map(|i| node.child(i as u32))
+                        .collect()
+                };
+                for child in walk_roots {
+                    collect_attribute_names(
+                        child,
+                        source,
+                        attr_kind,
+                        attr_field,
+                        config.call_expr_kinds,
+                        fn_stop_kinds,
+                        &mut attr_names,
+                    );
+                }
+                if !attr_names.is_empty() {
+                    attr_names.sort_unstable();
+                    attr_names.dedup();
+                    metadata.insert("attr_refs".to_string(), attr_names.join(","));
+                }
             }
 
             // Public API surface detection (#409).
@@ -788,6 +975,7 @@ const LOGICAL_OPERATORS: &[&str] = &["&&", "||", "and", "or"];
 /// but branches inside them belong to the closure, not the enclosing function.
 const CLOSURE_NODE_KINDS: &[&str] = &[
     "closure_expression",  // Rust
+    "async_block",         // Rust — anonymous `async { ... }` block
     "lambda",              // Python
     "arrow_function",      // TypeScript, JavaScript
     "function_expression", // JavaScript
@@ -6578,6 +6766,76 @@ fn spawn_task() {
             fn_node.metadata.get("is_async").is_none(),
             "sync fn with async body should NOT have is_async, got: {:?}",
             fn_node.metadata.get("is_async")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // attr_refs: call-position filter
+    // ------------------------------------------------------------------
+
+    /// Bare property reads must NOT appear in attr_refs; only method calls should.
+    #[test]
+    fn test_attr_refs_excludes_bare_property_reads_python() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = r#"
+def process(self):
+    # method call — should appear in attr_refs
+    result = self.transform(data)
+    # bare property read — must NOT appear
+    t = self.timeout
+    return result
+"#;
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(Path::new("processor.py"), code)
+            .unwrap();
+        let fn_node = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "process")
+            .unwrap();
+        let attr_refs = fn_node.metadata.get("attr_refs").map(String::as_str).unwrap_or("");
+        assert!(
+            attr_refs.split(',').any(|s| s.trim() == "transform"),
+            "transform() call should appear in attr_refs, got: {:?}",
+            attr_refs
+        );
+        assert!(
+            !attr_refs.split(',').any(|s| s.trim() == "timeout"),
+            "bare property read 'timeout' must NOT appear in attr_refs, got: {:?}",
+            attr_refs
+        );
+    }
+
+    /// TypeScript: same contract — method calls in, bare property reads out.
+    #[test]
+    fn test_attr_refs_excludes_bare_property_reads_typescript() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let code = r#"
+function process(handler: Handler): void {
+    // method call — should appear in attr_refs
+    const result = handler.transform(data);
+    // bare property read — must NOT appear
+    const t = handler.timeout;
+}
+"#;
+        let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
+            .run(Path::new("processor.ts"), code)
+            .unwrap();
+        let fn_node = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "process")
+            .unwrap();
+        let attr_refs = fn_node.metadata.get("attr_refs").map(String::as_str).unwrap_or("");
+        assert!(
+            attr_refs.split(',').any(|s| s.trim() == "transform"),
+            "transform() call should appear in attr_refs, got: {:?}",
+            attr_refs
+        );
+        assert!(
+            !attr_refs.split(',').any(|s| s.trim() == "timeout"),
+            "bare property read 'timeout' must NOT appear in attr_refs, got: {:?}",
+            attr_refs
         );
     }
 }

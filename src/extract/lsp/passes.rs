@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use tokio::sync::Mutex;
 
 use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, NodeKind};
 
@@ -107,6 +108,16 @@ impl LspEnricher {
                 )
             })
             .filter(|n| !matches!(&n.id.kind, NodeKind::Other(s) if s == "diagnostic"))
+            // When lsp_enrichable_kinds is set, restrict to those kinds only.
+            // This is configured per-language via LangConfig (e.g., Python restricts
+            // to Function+Trait because pyright's textDocument/references hangs on
+            // class/enum/const lookups).
+            .filter(|n| {
+                if let Some(ref kinds) = self.lsp_enrichable_kinds {
+                    return kinds.contains(&n.id.kind);
+                }
+                true
+            })
             .filter(|n| {
                 // Skip test functions (have #[test] or #[tokio::test] decorator)
                 if n.id.kind == NodeKind::Function {
@@ -163,6 +174,10 @@ impl LspEnricher {
         let completed = Arc::new(AtomicI64::new(0));
         let error_count = Arc::new(AtomicI64::new(0));
         let ramped_up = Arc::new(AtomicBool::new(false));
+        // Track files we've sent didOpen for — pyright only resolves
+        // callHierarchy for files it has analyzed.
+        let opened_files: Arc<Mutex<std::collections::HashSet<PathBuf>>> =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
 
         for node in &enrichable_nodes {
             let node = (*node).clone();
@@ -175,6 +190,7 @@ impl LspEnricher {
             let completed = Arc::clone(&completed);
             let error_count = Arc::clone(&error_count);
             let ramped_up = Arc::clone(&ramped_up);
+            let opened = Arc::clone(&opened_files);
 
             join_set.spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
@@ -187,6 +203,44 @@ impl LspEnricher {
                         return (Vec::new(), Vec::new(), false);
                     }
                 };
+
+                // Send didOpen for this file if not already opened.
+                // Only mark the file as opened after the file read and notify succeed,
+                // so a transient failure doesn't permanently suppress future attempts.
+                {
+                    let already_open = {
+                        let set = opened.lock().await;
+                        set.contains(&node.id.file)
+                    };
+                    if !already_open {
+                        let lang_id = match abs_path.extension().and_then(|e| e.to_str()) {
+                            Some("py") => "python",
+                            Some("ts") => "typescript",
+                            Some("tsx") => "typescriptreact",
+                            Some("js") => "javascript",
+                            Some("jsx") => "javascriptreact",
+                            Some("rs") => "rust",
+                            Some("go") => "go",
+                            _ => "plaintext",
+                        };
+                        if let Ok(content) = std::fs::read_to_string(&abs_path)
+                            && transport.notify(
+                                "textDocument/didOpen",
+                                serde_json::json!({
+                                    "textDocument": {
+                                        "uri": file_uri.to_string(),
+                                        "languageId": lang_id,
+                                        "version": 1,
+                                        "text": content
+                                    }
+                                }),
+                            ).await.is_ok()
+                        {
+                            let mut set = opened.lock().await;
+                            set.insert(node.id.file.clone());
+                        }
+                    }
+                }
 
                 let (line, col) = Self::node_lsp_position(&node);
                 let mut edges = Vec::new();
@@ -899,10 +953,12 @@ impl LspEnricher {
             nodes_by_file.entry(n.id.file.clone()).or_default().push(n);
         }
 
-        let is_rust = self.language == "rust";
+        let has_parent_module = crate::extract::configs::config_for_language(&self.language)
+            .map(|c| c.has_parent_module_request)
+            .unwrap_or(false);
 
         for (rel_file, file_nodes) in &nodes_by_file {
-            Self::emit_belongs_to_edges(transport, file_nodes, rel_file, root, is_rust, result)
+            Self::emit_belongs_to_edges(transport, file_nodes, rel_file, root, has_parent_module, result)
                 .await;
         }
 

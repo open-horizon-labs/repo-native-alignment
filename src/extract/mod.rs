@@ -736,6 +736,16 @@ impl EnricherRegistry {
                 "kotlin" => enricher.with_config_file("build.gradle.kts"),
                 _ => enricher,
             };
+            // Apply per-language LSP enrichable kind restrictions from LangConfig.
+            let enricher = if let Some(config) = configs::config_for_language(lang) {
+                if let Some(kinds) = config.lsp_enrichable_kinds {
+                    enricher.with_enrichable_kinds(kinds)
+                } else {
+                    enricher
+                }
+            } else {
+                enricher
+            };
             registry.register(Box::new(enricher));
         }
 

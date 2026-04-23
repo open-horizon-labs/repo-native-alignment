@@ -82,6 +82,9 @@ pub struct LspEnricher {
     /// always uses `repo_root` (passed to `enrich()`), which ensures file URIs point to
     /// the correct absolute paths.
     startup_root_override: std::sync::OnceLock<PathBuf>,
+    /// Which node kinds to enrich via LSP. None = all enrichable kinds.
+    /// Configured per-language via LangConfig::lsp_enrichable_kinds.
+    lsp_enrichable_kinds: Option<Vec<NodeKind>>,
 }
 
 struct LspState {
@@ -183,6 +186,7 @@ impl LspEnricher {
                 diagnostics_sink: Arc::new(std::sync::Mutex::new(HashMap::new())),
             }),
             startup_root_override: std::sync::OnceLock::new(),
+            lsp_enrichable_kinds: None,
         }
     }
 
@@ -218,6 +222,13 @@ impl LspEnricher {
         self
     }
 
+    /// Restrict which node kinds are enriched via LSP.
+    /// When set, only nodes matching these kinds are sent for enrichment.
+    pub fn with_enrichable_kinds(mut self, kinds: &'static [NodeKind]) -> Self {
+        self.lsp_enrichable_kinds = Some(kinds.to_vec());
+        self
+    }
+
     /// Check if an `experimental/serverStatus` notification indicates readiness.
     ///
     /// rust-analyzer sends `quiescent: true` when it has finished all background
@@ -244,6 +255,131 @@ impl LspEnricher {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    /// Find a representative source file in `root` to open via didOpen.
+    /// Picks a short, non-test, non-generated file from the enricher's configured
+    /// extensions — we just need one file to trigger project detection and indexing.
+    fn find_warmup_file(&self, root: &Path) -> Option<PathBuf> {
+        let extensions: std::collections::HashSet<&str> =
+            self.extensions.iter().map(String::as_str).collect();
+        if extensions.is_empty() {
+            return None;
+        }
+
+        fn walk(
+            dir: &Path,
+            extensions: &std::collections::HashSet<&str>,
+            depth: u8,
+        ) -> Option<PathBuf> {
+            if depth > 4 {
+                return None;
+            }
+            let entries = std::fs::read_dir(dir).ok()?;
+            let mut subdirs = Vec::new();
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with('.') || matches!(
+                    name_str.as_ref(),
+                    "node_modules" | "__pycache__" | "target" | ".venv" | "venv" | "env"
+                ) {
+                    continue;
+                }
+                let ft = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                if ft.is_dir() {
+                    subdirs.push(entry.path());
+                    continue;
+                }
+                if !ft.is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if !extensions.contains(ext) {
+                    continue;
+                }
+                if name_str.starts_with("test_")
+                    || name_str.contains(".test.")
+                    || name_str.contains(".spec.")
+                    || name_str.contains(".gen.")
+                    || name_str.contains("_pb2")
+                    || name_str.starts_with("conftest")
+                    || name_str.ends_with(".d.ts")
+                {
+                    continue;
+                }
+                let entry_path = entry.path();
+                let in_test_dir = entry_path.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::Normal(seg)
+                            if seg == "tests" || seg == "test" || seg == "__tests__"
+                    )
+                });
+                if in_test_dir {
+                    continue;
+                }
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+                if size > 0 && size < 50_000 {
+                    return Some(path);
+                }
+            }
+            for subdir in subdirs {
+                if let Some(found) = walk(&subdir, extensions, depth + 1) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        walk(root, &extensions, 0)
+    }
+
+
+    fn lsp_language_id_for_path(&self, path: &Path) -> &'static str {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("py") => "python",
+            Some("ts") => "typescript",
+            Some("tsx") => "typescriptreact",
+            Some("js") => "javascript",
+            Some("jsx") => "javascriptreact",
+            Some("rs") => "rust",
+            Some("go") => "go",
+            _ => match self.language.as_str() {
+                "python" => "python",
+                "typescript" | "deno" => "typescript",
+                "rust" => "rust",
+                "go" => "go",
+                _ => "plaintext",
+            },
+        }
+    }
+
+    /// Send textDocument/didOpen for the given file.
+    async fn send_did_open(&self, transport: &mut LspTransport, path: &Path) -> Result<()> {
+        let uri = path_to_uri(path)?;
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("reading warmup file {}", path.display()))?;
+        let language_id = self.lsp_language_id_for_path(path);
+        transport
+            .notify(
+                "textDocument/didOpen",
+                serde_json::json!({
+                    "textDocument": {
+                        "uri": uri.to_string(),
+                        "languageId": language_id,
+                        "version": 1,
+                        "text": content
+                    }
+                }),
+            )
+            .await?;
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        Ok(())
     }
 
     /// Initialize the language server if not already running.
@@ -359,19 +495,16 @@ impl LspEnricher {
         //
         // Checks common venv directory names in priority order: .venv, venv, env.
         // Build effective initialization settings.
-        // For pyright, detect a virtual environment at startup_root and inject
-        // venvPath + venv so pyright can resolve installed packages.
-        // We materialize the full python.analysis structure even if init_settings
-        // doesn't have it, so venv config is always delivered when a venv exists.
-        let effective_settings = if self.language == "python" {
-            let venv_candidates = [".venv", "venv", "env"];
-            if let Some(venv_name) = venv_candidates
+        // If the LangConfig declares venv_candidates, detect a virtual environment
+        // at startup_root and inject venvPath + venv so the LSP server can resolve
+        // installed packages.
+        let lang_config = crate::extract::configs::config_for_language(&self.language);
+        let effective_settings = if let Some(venv_dirs) = lang_config.and_then(|c| c.venv_candidates) {
+            let found_venv = venv_dirs
                 .iter()
-                .find(|&&name| startup_root.join(name).is_dir())
-            {
+                .find(|&&name| startup_root.join(name).is_dir());
+            if let Some(venv_name) = found_venv {
                 let venv_path_str = startup_root.to_string_lossy().to_string();
-                // Start from existing settings or an empty object, then
-                // unconditionally materialize python.analysis.{venvPath,venv}.
                 let mut merged = self
                     .init_settings
                     .as_ref()
@@ -401,7 +534,8 @@ impl LspEnricher {
                     }
                 }
                 tracing::info!(
-                    "pyright: found {} at '{}', adding venvPath/venv to initializationOptions",
+                    "{}: found {} at '{}', adding venvPath/venv to initializationOptions",
+                    self.server_command,
                     venv_name,
                     startup_root.display()
                 );
@@ -483,6 +617,29 @@ impl LspEnricher {
         transport
             .notify("initialized", serde_json::json!({}))
             .await?;
+
+        // Send didOpen for a representative source file to create a project
+        // context. tsserver requires at least one open file before it creates
+        // a project; pyright uses it to trigger import-graph indexing.
+        // Save the URI for use as a documentSymbol validation fallback.
+        let warmup_uri: Option<String> = if let Some(warmup_path) = Self::find_warmup_file(self, startup_root) {
+            let uri_str = path_to_uri(&warmup_path).ok().map(|u| u.to_string());
+            match self.send_did_open(transport, &warmup_path).await {
+                Ok(()) => tracing::info!(
+                    "{} sent didOpen for '{}'",
+                    self.server_command,
+                    warmup_path.display()
+                ),
+                Err(e) => tracing::debug!(
+                    "{} didOpen warmup failed (non-fatal): {}",
+                    self.server_command,
+                    e
+                ),
+            }
+            uri_str
+        } else {
+            None
+        };
 
         tracing::info!(
             "{} initialized, waiting for indexing...",
@@ -853,6 +1010,33 @@ impl LspEnricher {
                             saw_quiescent = true;
                             break;
                         }
+                        // workspace/symbol returned 0 — try documentSymbol on the
+                        // warmup file as a fallback. pyright's workspace/symbol
+                        // is unreliable (returns 0 even when fully indexed), but
+                        // documentSymbol works.
+                        if let Some(ref uri) = warmup_uri {
+                            let doc_result = tokio::time::timeout(
+                                tokio::time::Duration::from_secs(10),
+                                transport.request("textDocument/documentSymbol", serde_json::json!({
+                                    "textDocument": { "uri": uri }
+                                })),
+                            )
+                            .await;
+                            if let Ok(Ok(ref resp)) = doc_result {
+                                let doc_count = resp.as_array().map(|a| a.len()).unwrap_or(0);
+                                if doc_count > 0 {
+                                    tracing::info!(
+                                        "{} indexing validated via documentSymbol fallback: {} symbols in warmup file ({}s elapsed)",
+                                        self.server_command,
+                                        doc_count,
+                                        elapsed
+                                    );
+                                    server_ready = true;
+                                    saw_quiescent = true;
+                                    break;
+                                }
+                            }
+                        }
                         consecutive_empty += 1;
                         tracing::info!(
                             "{} indexing validation {}/{}: workspace/symbol(\"{}\") returned 0 symbols ({}s elapsed, waiting {}s)",
@@ -894,13 +1078,11 @@ impl LspEnricher {
                     }
                 }
 
-                // After 3 consecutive empty responses on different queries,
-                // the server is almost certainly not going to index this project.
-                // Mark it as "responsive but not indexed" early.
-                if consecutive_empty >= 3 && attempt >= 3 {
-                    // Check if ALL queries returned empty — not just a streak.
-                    // If every query we tried returned 0 symbols, the server
-                    // is responsive but not indexing this workspace.
+                // After consecutive empty responses on different queries,
+                // the server may not have finished indexing yet. Only bail
+                // early if we've waited at least 60s — large Python/TS projects
+                // (27k+ nodes) genuinely need this long for pyright to index.
+                if consecutive_empty >= 3 && attempt >= 3 && elapsed >= 60 {
                     tracing::warn!(
                         "{} indexing validation failed: {} consecutive empty responses across different queries — \
                          server is responsive but has not indexed the workspace ({}s elapsed)",
@@ -908,10 +1090,6 @@ impl LspEnricher {
                         consecutive_empty,
                         elapsed
                     );
-                    // server_ready stays false, saw_quiescent stays false.
-                    // This means Pass 1 and Pass 3 will be skipped, which is
-                    // correct — sending requests to an unindexed server produces
-                    // 0 edges and wastes time.
                     break;
                 }
 
@@ -1826,7 +2004,7 @@ impl LspEnricher {
         file_nodes: &[&Node],
         rel_file: &Path,
         root: &Path,
-        is_rust: bool,
+        has_parent_module: bool,
         result: &mut EnrichmentResult,
     ) {
         if file_nodes.is_empty() {
@@ -1834,8 +2012,8 @@ impl LspEnricher {
         }
 
         // Derive a module name for this file.
-        // Priority: (1) rust-analyzer/parentModule for Rust, (2) directory-based fallback.
-        let module_name: Option<String> = if is_rust {
+        // Priority: (1) LSP parentModule request if supported, (2) directory-based fallback.
+        let module_name: Option<String> = if has_parent_module {
             let abs_path = root.join(rel_file);
             if let Ok(file_uri) = path_to_uri(&abs_path) {
                 Self::ra_parent_module(transport, &file_uri)

@@ -23,6 +23,23 @@ Examples:
 
 ## Procedure
 
+### Step 0: Check LSP enrichment health
+
+Before analyzing, verify the repo has completed a full scan with LSP enrichment. Use scan logs — not symbol output — because normal `search` output does not expose edge provenance (`source: Lsp`).
+
+```text
+repo-native-alignment scan --repo <path> --full
+```
+
+Confirm the logs report LSP completion with non-zero LSP call edges, for example:
+
+```text
+LSP enrichment complete for python: 1234 edges ...
+[background-lsp] LSP enrichment complete: 2870 LSP call edges, 173056 total LSP edges
+```
+
+If the scan logs show 0 LSP call edges, aborted LSP passes, or missing language servers, expect higher false-positive rates — especially for Python and TypeScript repos where method calls, JSX usage, and framework wiring rely on LSP enrichment.
+
 ### Step 1: Gather functions
 
 List all functions in scope. Use non-compact mode to see `In:` and `Out:` edge counts separately.
@@ -50,6 +67,27 @@ Remove from consideration:
 - **Entry points** — `main`, `run`, `setup`, `__init__`, `__main__`
 - **Framework callbacks** — functions with decorators like `#[tokio::main]`, `@app.route`, `@pytest.fixture`, `#[test]`, `@click.command`, `#[handler]`, `#[endpoint]`, `@celery.task`
 - **Trait/interface implementations** — if the function is inside an `impl Trait for` block or implements an interface method
+- **Method overrides on library base classes** — if a function has
+  `metadata["framework_hook"]` set, it was identified by an `.oh/extractors/`
+  config as a library hook method. Skip it. If the metadata is NOT set but the
+  method looks like it is called by an external framework (SQLAlchemy
+  `TypeDecorator`, OTEL `SpanProcessor`, Django `Model`, Pydantic, etc.), it
+  may need an `.oh/extractors/` config with a `[[hooks]]` section.
+
+  Hook matching is **name-based on the enclosing class**, not inheritance-based:
+  the matcher checks only that the function's immediate `parent_scope` contains
+  `class_contains` and that the function's own name is listed in `method_names`.
+  It does not traverse inherited base classes. Examples of common frameworks you
+  can configure hooks for:
+  - SQLAlchemy: `process_bind_param`, `process_result_value`, `column_expression`
+  - OTEL: `on_start`, `on_end`, `shutdown`, `force_flush`
+  - Django: `save`, `delete`, `clean`, `get_queryset`
+  - Pydantic: `model_post_init`, validators
+- **Nested/local functions** — if the result shows `Parent: <outer-name> (function)`,
+  this is a function defined inside another function/closure. Skip it for dead-code
+  analysis — it is a local helper, not a top-level candidate. The outer function owns it.
+- **CLI script functions** — functions in `scripts/` directories are typically
+  called from `if __name__ == "__main__"` blocks or CLI tools, not imported
 - **Functions with high in-edge count** — if `In: 5+ edge(s)`, it's clearly used; skip
 
 Focus on functions where `In: 0-2 edge(s)` — these are the candidates worth checking.

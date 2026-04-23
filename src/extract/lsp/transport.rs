@@ -577,4 +577,24 @@ impl PipelinedTransport {
             }
         }
     }
+
+    /// Send a JSON-RPC notification (no response expected).
+    pub(super) async fn notify<P: serde::Serialize>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> Result<()> {
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        let body = serde_json::to_string(&notification)?;
+        let header = format!("Content-Length: {}\r\n\r\n", body.len());
+        let mut writer = self.writer.lock().await;
+        writer.write_all(header.as_bytes()).await?;
+        writer.write_all(body.as_bytes()).await?;
+        writer.flush().await?;
+        Ok(())
+    }
 }

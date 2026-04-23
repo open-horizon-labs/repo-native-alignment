@@ -63,6 +63,10 @@ pub struct ExtractorConfig {
     pub meta: Meta,
     #[serde(default)]
     pub boundaries: Vec<Boundary>,
+    /// Framework hook declarations. Methods matching these patterns are marked
+    /// with `metadata["framework_hook"]` so dead-code analysis skips them.
+    #[serde(default)]
+    pub hooks: Vec<Hook>,
 }
 
 /// Metadata section of an extractor config.
@@ -112,6 +116,26 @@ impl Boundary {
             _ => None,
         }
     }
+}
+
+/// A framework hook declaration.
+///
+/// When a Function node's `parent_scope` metadata contains `class_contains`,
+/// and the function name is in `method_names`, the function is marked with
+/// `metadata["framework_hook"] = config_name`.
+///
+/// Example:
+/// ```toml
+/// [[hooks]]
+/// class_contains = "TypeDecorator"
+/// method_names = ["process_bind_param", "process_result_value"]
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct Hook {
+    /// Substring that must appear in the class name or parent scope.
+    pub class_contains: String,
+    /// Method names that are framework hooks when defined on a matching class.
+    pub method_names: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -436,19 +460,86 @@ pub fn extractor_config_pass_with_configs(
         }
     }
 
-    let nodes: Vec<Node> = channel_nodes.into_values().collect();
+    let mut result_nodes: Vec<Node> = channel_nodes.into_values().collect();
 
-    if !result_edges.is_empty() {
+    // ---------------------------------------------------------------
+    // Process [[hooks]] — mark framework hook methods with metadata.
+    // For each function with a parent_scope, find the class node (Struct) in
+    // the same file and check if its SIGNATURE contains the hook's class_contains
+    // substring. The signature has the full inheritance chain, e.g.,
+    // "class StrEnum(TypeDecorator):" which matches class_contains="TypeDecorator".
+    // ---------------------------------------------------------------
+
+    // Pre-index: class signatures by (file, class_name) for O(1) lookup.
+    let mut class_sigs: std::collections::HashMap<(&std::path::Path, &str), &str> =
+        std::collections::HashMap::new();
+    for node in all_nodes {
+        if node.id.kind == NodeKind::Struct {
+            class_sigs.insert(
+                (node.id.file.as_path(), node.id.name.as_str()),
+                node.signature.as_str(),
+            );
+        }
+    }
+
+    let mut hook_count = 0usize;
+    for config in configs {
+        if config.hooks.is_empty() {
+            continue;
+        }
+        let target = config.meta.applies_when.imports_contain.as_str();
+        let import_match = import_texts.iter().any(|text| text.contains(target));
+        if !import_match {
+            continue;
+        }
+        let lang = config.meta.applies_when.language.as_str();
+        let Some(candidates) = by_language.get(lang) else {
+            continue;
+        };
+        for (node, _body_lower) in candidates {
+            let parent_scope = match node.metadata.get("parent_scope") {
+                Some(s) => s.as_str(),
+                None => continue,
+            };
+            // Look up the class node's signature to check inheritance
+            let class_sig = match class_sigs.get(&(node.id.file.as_path(), parent_scope)) {
+                Some(sig) => *sig,
+                None => continue,
+            };
+            for hook in &config.hooks {
+                if !class_sig.contains(&hook.class_contains) {
+                    continue;
+                }
+                if hook.method_names.iter().any(|m| m == &node.id.name) {
+                    hook_count += 1;
+                    let mut metadata = node.metadata.clone();
+                    metadata.insert("framework_hook".to_string(), config.meta.name.clone());
+                    result_nodes.push(Node {
+                        id: node.id.clone(),
+                        language: node.language.clone(),
+                        line_start: node.line_start,
+                        line_end: node.line_end,
+                        signature: node.signature.clone(),
+                        body: String::new(),
+                        metadata,
+                        source: ExtractionSource::TreeSitter,
+                    });
+                }
+            }
+        }
+    }
+
+    if !result_edges.is_empty() || hook_count > 0 {
         tracing::info!(
-            "Extractor config pass: {} channel node(s), {} Produces/Consumes edge(s) from {} config(s)",
-            nodes.len(),
+            "Extractor config pass: {} channel node(s), {} boundary edge(s), {} framework hook(s)",
+            result_nodes.len().saturating_sub(hook_count),
             result_edges.len(),
-            configs.len(),
+            hook_count,
         );
     }
 
     ExtractionResult {
-        nodes,
+        nodes: result_nodes,
         edges: result_edges,
     }
 }

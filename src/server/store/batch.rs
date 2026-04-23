@@ -8,6 +8,7 @@ use arrow_array::{
 
 use crate::graph::store::{edges_schema, symbols_schema};
 use crate::graph::{Edge, Node};
+use crate::server::store::metadata_keys as mk;
 
 /// Build a symbols `RecordBatch` for `nodes` tagged with `scan_version`.
 pub(super) fn build_symbols_batch(
@@ -36,7 +37,7 @@ pub(super) fn build_symbols_batch(
     let meta_virtuals: Vec<Option<bool>> = nodes
         .iter()
         .map(|n| {
-            if n.metadata.get("virtual").map(|v| v.as_str()) == Some("true") {
+            if n.metadata.get(mk::VIRTUAL).map(|v| v.as_str()) == Some("true") {
                 Some(true)
             } else {
                 None
@@ -45,7 +46,7 @@ pub(super) fn build_symbols_batch(
         .collect();
     let meta_packages: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("package").cloned())
+        .map(|n| n.metadata.get(mk::PACKAGE).cloned())
         .collect();
     let meta_name_cols: Vec<Option<i32>> = nodes
         .iter()
@@ -57,11 +58,11 @@ pub(super) fn build_symbols_batch(
         .collect();
     let values: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("value").cloned())
+        .map(|n| n.metadata.get(mk::VALUE).cloned())
         .collect();
     let mut synthetic_builder = BooleanBuilder::new();
     for n in nodes.iter() {
-        match n.metadata.get("synthetic") {
+        match n.metadata.get(mk::SYNTHETIC) {
             Some(v) => synthetic_builder.append_value(v == "true"),
             None => synthetic_builder.append_null(),
         }
@@ -84,55 +85,67 @@ pub(super) fn build_symbols_batch(
         .collect();
     let storages: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("storage").cloned())
+        .map(|n| n.metadata.get(mk::STORAGE).cloned())
         .collect();
     let mut mutable_builder = BooleanBuilder::new();
     for n in nodes.iter() {
-        match n.metadata.get("mutable") {
+        match n.metadata.get(mk::MUTABLE) {
             Some(v) => mutable_builder.append_value(v == "true"),
             None => mutable_builder.append_null(),
         }
     }
     let decorators_col: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("decorators").cloned())
+        .map(|n| n.metadata.get(mk::DECORATORS).cloned())
+        .collect();
+    let parent_scope_col: Vec<Option<String>> = nodes
+        .iter()
+        .map(|n| n.metadata.get(mk::PARENT_SCOPE).cloned())
+        .collect();
+    let parent_scope_kind_col: Vec<Option<String>> = nodes
+        .iter()
+        .map(|n| n.metadata.get(mk::PARENT_SCOPE_KIND).cloned())
+        .collect();
+    let framework_hook_col: Vec<Option<String>> = nodes
+        .iter()
+        .map(|n| n.metadata.get(mk::FRAMEWORK_HOOK).cloned())
         .collect();
     let type_params_col: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("type_params").cloned())
+        .map(|n| n.metadata.get(mk::TYPE_PARAMS).cloned())
         .collect();
     let pattern_hints: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("pattern_hint").cloned())
+        .map(|n| n.metadata.get(mk::PATTERN_HINT).cloned())
         .collect();
     let mut is_static_builder = BooleanBuilder::new();
     for n in nodes.iter() {
-        match n.metadata.get("is_static") {
+        match n.metadata.get(mk::IS_STATIC) {
             Some(v) => is_static_builder.append_value(v == "true"),
             None => is_static_builder.append_null(),
         }
     }
     let mut is_async_builder = BooleanBuilder::new();
     for n in nodes.iter() {
-        match n.metadata.get("is_async") {
+        match n.metadata.get(mk::IS_ASYNC) {
             Some(v) => is_async_builder.append_value(v == "true"),
             None => is_async_builder.append_null(),
         }
     }
     let mut is_test_builder = BooleanBuilder::new();
     for n in nodes.iter() {
-        match n.metadata.get("is_test") {
+        match n.metadata.get(mk::IS_TEST) {
             Some(v) => is_test_builder.append_value(v == "true"),
             None => is_test_builder.append_null(),
         }
     }
     let visibilities: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("visibility").cloned())
+        .map(|n| n.metadata.get(mk::VISIBILITY).cloned())
         .collect();
     let mut exported_builder = BooleanBuilder::new();
     for n in nodes.iter() {
-        match n.metadata.get("exported") {
+        match n.metadata.get(mk::EXPORTED) {
             Some(v) => exported_builder.append_value(v == "true"),
             None => exported_builder.append_null(),
         }
@@ -140,50 +153,56 @@ pub(super) fn build_symbols_batch(
     // Diagnostic metadata columns
     let diag_severities: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("diagnostic_severity").cloned())
+        .map(|n| n.metadata.get(mk::DIAG_SEVERITY).cloned())
         .collect();
     let diag_sources: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("diagnostic_source").cloned())
+        .map(|n| n.metadata.get(mk::DIAG_SOURCE).cloned())
         .collect();
     let diag_messages: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("diagnostic_message").cloned())
+        .map(|n| n.metadata.get(mk::DIAG_MESSAGE).cloned())
         .collect();
     let diag_ranges: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("diagnostic_range").cloned())
+        .map(|n| n.metadata.get(mk::DIAG_RANGE).cloned())
         .collect();
     let diag_timestamps: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("diagnostic_timestamp").cloned())
+        .map(|n| n.metadata.get(mk::DIAG_TIMESTAMP).cloned())
         .collect();
     // ApiEndpoint metadata columns
     let http_methods: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("http_method").cloned())
+        .map(|n| n.metadata.get(mk::HTTP_METHOD).cloned())
         .collect();
     let http_paths: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("http_path").cloned())
+        .map(|n| n.metadata.get(mk::HTTP_PATH).cloned())
         .collect();
     // doc_comment column -- persisted for LSP reindex round-trip (#416)
     let doc_comments: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("doc_comment").cloned())
+        .map(|n| n.metadata.get(mk::DOC_COMMENT).cloned())
+        .collect();
+    // attr_refs column -- persisted so import_calls_pass Step 6 (attr-access
+    // ReferencedBy) still fires on incremental scans after a LanceDB round-trip.
+    let attr_refs_col: Vec<Option<String>> = nodes
+        .iter()
+        .map(|n| n.metadata.get(mk::ATTR_REFS).cloned())
         .collect();
     // gRPC / proto columns -- populated for proto RPC Function nodes (#466)
     let parent_services: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("parent_service").cloned())
+        .map(|n| n.metadata.get(mk::PARENT_SERVICE).cloned())
         .collect();
     let rpc_request_types: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("request_type").cloned())
+        .map(|n| n.metadata.get(mk::REQUEST_TYPE).cloned())
         .collect();
     let rpc_response_types: Vec<Option<String>> = nodes
         .iter()
-        .map(|n| n.metadata.get("response_type").cloned())
+        .map(|n| n.metadata.get(mk::RESPONSE_TYPE).cloned())
         .collect();
     let updated_ats: Vec<i64> = vec![now; nodes.len()];
     let scan_versions: Vec<u64> = vec![scan_version; nodes.len()];
@@ -210,6 +229,9 @@ pub(super) fn build_symbols_batch(
             Arc::new(StringArray::from(storages)),
             Arc::new(mutable_builder.finish()),
             Arc::new(StringArray::from(decorators_col)),
+            Arc::new(StringArray::from(parent_scope_col)),
+            Arc::new(StringArray::from(parent_scope_kind_col)),
+            Arc::new(StringArray::from(framework_hook_col)),
             Arc::new(StringArray::from(type_params_col)),
             Arc::new(StringArray::from(pattern_hints)),
             Arc::new(is_static_builder.finish()),
@@ -225,6 +247,7 @@ pub(super) fn build_symbols_batch(
             Arc::new(StringArray::from(http_methods)),
             Arc::new(StringArray::from(http_paths)),
             Arc::new(StringArray::from(doc_comments)),
+            Arc::new(StringArray::from(attr_refs_col)),
             Arc::new(StringArray::from(parent_services)),
             Arc::new(StringArray::from(rpc_request_types)),
             Arc::new(StringArray::from(rpc_response_types)),

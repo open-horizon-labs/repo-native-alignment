@@ -228,7 +228,7 @@ pub static PYTHON_CONFIG: LangConfig = LangConfig {
         ("import_from_statement", NodeKind::Import),
         // Python has no keyword for fields; ALL_CAPS consts handled in python.rs
     ],
-    scope_parent_kinds: &["class_definition"],
+    scope_parent_kinds: &["class_definition", "function_definition"],
     const_value_field: None,
     full_text_name_kinds: &["import_statement", "import_from_statement"],
     string_literal_kinds: &[("string", None)],
@@ -257,6 +257,10 @@ pub static PYTHON_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None,
     has_all_export: true,
     test_name_prefix: true,
+    lsp_enrichable_kinds: Some(&[NodeKind::Function, NodeKind::Trait]),
+    venv_candidates: Some(&[".venv", "venv", "env"]),
+    attribute_access_node: Some(("attribute", "attribute")),
+    has_parent_module_request: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -318,6 +322,10 @@ pub static TYPESCRIPT_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None,
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: false,
+    attribute_access_node: Some(("member_expression", "property")),
 };
 
 // ---------------------------------------------------------------------------
@@ -368,6 +376,10 @@ pub static JAVASCRIPT_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None,
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: false,
+    attribute_access_node: Some(("selector_expression", "field")),
 };
 
 // ---------------------------------------------------------------------------
@@ -416,6 +428,10 @@ pub static GO_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None,
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: false,
+    attribute_access_node: Some(("member_expression", "property")),
 };
 
 // ---------------------------------------------------------------------------
@@ -478,6 +494,10 @@ pub static JAVA_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None,
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -531,6 +551,10 @@ pub static KOTLIN_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None,
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -593,6 +617,10 @@ pub static CSHARP_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None,
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -650,6 +678,10 @@ pub static SWIFT_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None,
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -697,6 +729,10 @@ pub static ZIG_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None,
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -756,6 +792,10 @@ pub static CPP_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None,
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -797,6 +837,10 @@ pub static LUA_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None,
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -848,6 +892,10 @@ pub static RUBY_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None,
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -891,6 +939,10 @@ pub static BASH_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None,
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -941,6 +993,10 @@ pub static C_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None,
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -1003,6 +1059,10 @@ pub static PHP_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None, // PHP has no re-export semantics like Rust's `pub use`
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -1060,6 +1120,10 @@ pub static SCALA_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None,
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ---------------------------------------------------------------------------
@@ -1115,6 +1179,10 @@ pub static DART_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None,
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
 // ── GDScript ─────────────────────────────────────────────────────────────────
@@ -1159,5 +1227,36 @@ pub static GDSCRIPT_CONFIG: LangConfig = LangConfig {
     pub_visibility_modifier: None,
     has_all_export: false,
     test_name_prefix: false,
+    lsp_enrichable_kinds: None,
+    venv_candidates: None,
+    has_parent_module_request: false,
+    attribute_access_node: None,
 };
 
+
+/// Look up the LangConfig for a language name. Returns None for languages
+/// not supported by the generic extractor (JSON, Markdown, TOML, etc.).
+pub fn config_for_language(language: &str) -> Option<&'static LangConfig> {
+    match language {
+        "rust" => Some(&super::rust::RUST_CONFIG),
+        "python" => Some(&PYTHON_CONFIG),
+        "typescript" => Some(&TYPESCRIPT_CONFIG),
+        "javascript" => Some(&JAVASCRIPT_CONFIG),
+        "go" => Some(&GO_CONFIG),
+        "java" => Some(&JAVA_CONFIG),
+        "kotlin" => Some(&KOTLIN_CONFIG),
+        "csharp" => Some(&CSHARP_CONFIG),
+        "swift" => Some(&SWIFT_CONFIG),
+        "zig" => Some(&ZIG_CONFIG),
+        "cpp" => Some(&CPP_CONFIG),
+        "lua" => Some(&LUA_CONFIG),
+        "ruby" => Some(&RUBY_CONFIG),
+        "bash" => Some(&BASH_CONFIG),
+        "c" => Some(&C_CONFIG),
+        "php" => Some(&PHP_CONFIG),
+        "scala" => Some(&SCALA_CONFIG),
+        "dart" => Some(&DART_CONFIG),
+        "gdscript" => Some(&GDSCRIPT_CONFIG),
+        _ => None,
+    }
+}
