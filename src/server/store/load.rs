@@ -209,6 +209,10 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
             let doc_comment_col = batch
                 .column_by_name("doc_comment")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            // attr_refs column -- survives round-trip for import_calls_pass Step 6
+            let attr_refs_col = batch
+                .column_by_name("attr_refs")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             // gRPC / proto columns -- survives round-trip for GrpcClientCallsPass on incremental scans (#466)
             let parent_service_col = batch
                 .column_by_name("parent_service")
@@ -418,6 +422,14 @@ pub async fn load_graph_from_lance(repo_root: &Path) -> anyhow::Result<GraphStat
                     let val = col.value(i);
                     if !val.is_empty() {
                         metadata.insert("doc_comment".to_string(), val.to_string());
+                    }
+                }
+                if let Some(col) = attr_refs_col
+                    && !col.is_null(i)
+                {
+                    let val = col.value(i);
+                    if !val.is_empty() {
+                        metadata.insert("attr_refs".to_string(), val.to_string());
                     }
                 }
                 // gRPC / proto columns -- restore metadata for GrpcClientCallsPass (#466)

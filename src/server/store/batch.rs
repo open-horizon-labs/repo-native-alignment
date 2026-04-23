@@ -184,6 +184,12 @@ pub(super) fn build_symbols_batch(
         .iter()
         .map(|n| n.metadata.get("doc_comment").cloned())
         .collect();
+    // attr_refs column -- persisted so import_calls_pass Step 6 (attr-access
+    // ReferencedBy) still fires on incremental scans after a LanceDB round-trip.
+    let attr_refs_col: Vec<Option<String>> = nodes
+        .iter()
+        .map(|n| n.metadata.get("attr_refs").cloned())
+        .collect();
     // gRPC / proto columns -- populated for proto RPC Function nodes (#466)
     let parent_services: Vec<Option<String>> = nodes
         .iter()
@@ -240,6 +246,7 @@ pub(super) fn build_symbols_batch(
             Arc::new(StringArray::from(http_methods)),
             Arc::new(StringArray::from(http_paths)),
             Arc::new(StringArray::from(doc_comments)),
+            Arc::new(StringArray::from(attr_refs_col)),
             Arc::new(StringArray::from(parent_services)),
             Arc::new(StringArray::from(rpc_request_types)),
             Arc::new(StringArray::from(rpc_response_types)),

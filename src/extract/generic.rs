@@ -19,9 +19,9 @@
 //! the individual extractor files, but as small focused functions rather than
 //! full 300-line traversal reimplementations.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
 
@@ -213,6 +213,45 @@ pub struct LangConfig {
     /// - Rust: `Some(("field_expression", "field"))`
     /// - Go: `Some(("selector_expression", "field"))`
     pub attribute_access_node: Option<(&'static str, &'static str)>,
+}
+
+/// Return the cached attr_refs recursion stop-kind set for `config`.
+///
+/// Built once per language from the canonical [`CLOSURE_NODE_KINDS`] list plus
+/// any ts_kinds this [`LangConfig`] maps to [`NodeKind::Function`] (named inner
+/// defs, methods). Per-call rebuilds caused the inline list in `collect_nodes`
+/// to diverge from the canonical closure list used by `count_branches`, which
+/// is exactly what the `no-language-conditionals-in-generic` guardrail is
+/// meant to prevent.
+fn fn_stop_kinds_for(config: &LangConfig) -> &'static HashSet<&'static str> {
+    static CACHE: OnceLock<Mutex<HashMap<&'static str, &'static HashSet<&'static str>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // Fast-path: return already-built set for this language.
+    {
+        let guard = cache.lock().expect("fn_stop_kinds cache poisoned");
+        if let Some(&set) = guard.get(config.language_name) {
+            return set;
+        }
+    }
+    // Build the merged set. Named Function-mapped kinds come from LangConfig;
+    // anonymous closure forms come from the shared constant. Leak into static
+    // memory once per language (count bounded by the number of registered
+    // languages) so the borrow outlives any extraction call.
+    let mut set: HashSet<&'static str> = config
+        .node_kinds
+        .iter()
+        .filter(|(_, k)| *k == NodeKind::Function)
+        .map(|(ts_kind, _)| *ts_kind)
+        .collect();
+    for &k in CLOSURE_NODE_KINDS {
+        set.insert(k);
+    }
+    let leaked: &'static HashSet<&'static str> = Box::leak(Box::new(set));
+    let mut guard = cache.lock().expect("fn_stop_kinds cache poisoned");
+    // Race-safe: another thread may have inserted concurrently; keep the first
+    // winner and drop our leaked copy for that language.
+    guard.entry(config.language_name).or_insert(leaked)
 }
 
 /// Walk a tree-sitter subtree and collect attribute/member access names.
@@ -591,40 +630,16 @@ fn collect_nodes(
             if node_kind == NodeKind::Function
                 && let Some((attr_kind, attr_field)) = config.attribute_access_node
             {
-                // Avoid leaking member accesses from nested function/closure bodies
-                // into this outer function's attr_refs. Stop recursion at any node
-                // kind configured to map to NodeKind::Function, plus common closure
-                // and inner-function syntaxes across supported languages.
-                let mut fn_stop_kinds: HashSet<&str> = config
-                    .node_kinds
-                    .iter()
-                    .filter(|(_, k)| *k == NodeKind::Function)
-                    .map(|(ts_kind, _)| *ts_kind)
-                    .collect();
-                for extra in [
-                    // JS / TS
-                    "arrow_function",
-                    "function_expression",
-                    "function_declaration",
-                    "generator_function",
-                    "generator_function_declaration",
-                    "method_definition",
-                    "method",
-                    // Rust
-                    "closure_expression",
-                    "async_block",
-                    // Python
-                    "lambda",
-                    "async_function_definition",
-                    // Go
-                    "func_literal",
-                ] {
-                    fn_stop_kinds.insert(extra);
-                }
                 // Walk only this function's body subtree so attribute accesses in
                 // parameter defaults, decorators, or return-type annotations do
                 // not contaminate attr_refs. Fall back to the whole node when no
                 // body field is exposed by the grammar.
+                //
+                // Nested-scope stops come from the canonical `CLOSURE_NODE_KINDS`
+                // constant plus any ts_kinds this LangConfig maps to
+                // NodeKind::Function (named inner defs / methods). The combined
+                // set is built once per language via `fn_stop_kinds_for`.
+                let fn_stop_kinds = fn_stop_kinds_for(config);
                 let mut attr_names: Vec<&str> = Vec::new();
                 let body_node = node.child_by_field_name("body");
                 let walk_roots: Vec<tree_sitter::Node> = if let Some(body) = body_node {
@@ -642,7 +657,7 @@ fn collect_nodes(
                         source,
                         attr_kind,
                         attr_field,
-                        &fn_stop_kinds,
+                        fn_stop_kinds,
                         &mut attr_names,
                     );
                 }
@@ -925,6 +940,7 @@ const LOGICAL_OPERATORS: &[&str] = &["&&", "||", "and", "or"];
 /// but branches inside them belong to the closure, not the enclosing function.
 const CLOSURE_NODE_KINDS: &[&str] = &[
     "closure_expression",  // Rust
+    "async_block",         // Rust — anonymous `async { ... }` block
     "lambda",              // Python
     "arrow_function",      // TypeScript, JavaScript
     "function_expression", // JavaScript

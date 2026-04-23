@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 /// The server auto-drops and rebuilds all LanceDB tables when this mismatches
 /// the stored version. No manual cache deletion needed.
 /// Also surfaced in the index freshness footer on `search`.
-pub const SCHEMA_VERSION: u32 = 20; // persist parent_scope_kind for nested/local classification
+pub const SCHEMA_VERSION: u32 = 21; // persist attr_refs for import_calls_pass Step 6 on incremental scans
 
 /// Arrow schema for the `symbols` table.
 ///
@@ -81,6 +81,10 @@ pub fn symbols_schema() -> Schema {
         Field::new("http_path", DataType::Utf8, true),   // "/users" | "/items/{id}" | etc.
         // Doc comment column — survives LSP reindex round-trip (#416)
         Field::new("doc_comment", DataType::Utf8, true), // metadata["doc_comment"] — documentation comment
+        // attr_refs column — survives round-trip so import_calls_pass Step 6
+        // (attr-access ReferencedBy) works on incremental scans; otherwise
+        // previously-extracted functions lose attr_refs after a LanceDB load.
+        Field::new("attr_refs", DataType::Utf8, true), // metadata["attr_refs"] — comma-separated dot-access identifiers in function bodies
         // gRPC / proto columns — populated for proto RPC Function nodes (#466)
         // These must survive LanceDB round-trip so GrpcClientCallsPass works on incremental scans.
         Field::new("parent_service", DataType::Utf8, true), // metadata["parent_service"] — owning service name
@@ -141,6 +145,8 @@ pub fn symbols_schema_with_vector(dim: i32) -> Schema {
         Field::new("http_path", DataType::Utf8, true),
         // Doc comment column — survives LSP reindex round-trip (#416)
         Field::new("doc_comment", DataType::Utf8, true),
+        // attr_refs column — survives round-trip (#644 follow-up)
+        Field::new("attr_refs", DataType::Utf8, true),
         // gRPC / proto columns — populated for proto RPC Function nodes (#466)
         Field::new("parent_service", DataType::Utf8, true),
         Field::new("rpc_request_type", DataType::Utf8, true),
