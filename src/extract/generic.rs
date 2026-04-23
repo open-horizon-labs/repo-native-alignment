@@ -199,19 +199,22 @@ pub struct LangConfig {
     /// request for more accurate module hierarchy (e.g., rust-analyzer).
     pub has_parent_module_request: bool,
     /// Tree-sitter node kind and child field name for attribute/member access.
-    /// Used to extract attribute names from function bodies at parse time.
-    /// The attribute name is the identifier accessed via `.` (e.g., `obj.method` → "method").
+    /// Used to extract method call names from function bodies at parse time.
+    /// The attribute name is the identifier accessed via `.` (e.g., `obj.method()` → "method").
+    ///
+    /// Only call-position accesses are collected: the attribute node must be the
+    /// callee (`call_expr_kinds.1` field) of a `call_expr_kinds.0` parent. Bare
+    /// property reads (`obj.attr`) are excluded to keep graph edges accurate —
+    /// a property read is not a use-relationship to a function.
     ///
     /// Stored as `metadata["attr_refs"]` on function nodes — a comma-separated
-    /// list of attribute names used in the body. Consumed by `import_calls_pass`
-    /// for dead-code detection (any function whose name appears as an attr_ref
-    /// somewhere in the codebase is not dead).
+    /// list of method names called via dot notation in the body. Consumed by
+    /// `import_calls_pass` to emit `ReferencedBy` edges for cross-file method calls.
     ///
     /// Examples:
-    /// - Python: `Some(("attribute", "attribute"))` — `obj.method` is an `attribute` node
-    /// - TypeScript: `Some(("member_expression", "property"))` — `obj.method` is a `member_expression`
-    /// - Rust: `Some(("field_expression", "field"))`
-    /// - Go: `Some(("selector_expression", "field"))`
+    /// - Python: `Some(("attribute", "attribute"))` — `obj.method` node in `obj.method()`
+    /// - TypeScript: `Some(("member_expression", "property"))` — `obj.method` node in `obj.method()`
+    /// - Go: `Some(("selector_expression", "field"))` — `obj.Method` node in `obj.Method()`
     pub attribute_access_node: Option<(&'static str, &'static str)>,
 }
 
@@ -257,6 +260,12 @@ fn fn_stop_kinds_for(config: &LangConfig) -> &'static HashSet<&'static str> {
 /// Walk a tree-sitter subtree and collect attribute/member access names.
 /// Finds all nodes of kind `attr_kind` and extracts the child field `attr_field`.
 ///
+/// When `call_filter` is `Some((call_kind, callee_field))`, only names whose
+/// attribute node is the `callee_field` child of a `call_kind` parent are
+/// collected — i.e., only actual method calls (`obj.method()`), not bare
+/// property reads (`obj.attr`). This keeps `attr_refs` edges in the graph
+/// accurate: a property read is not a use-relationship to a function.
+///
 /// Recursion stops at nested function/closure boundaries so that attribute
 /// accesses inside inner defs/closures do not leak into the outer function's
 /// `attr_refs`. Callers pass `stop_kinds` listing nested-scope node kinds.
@@ -265,16 +274,33 @@ fn collect_attribute_names<'a>(
     source: &'a [u8],
     attr_kind: &str,
     attr_field: &str,
+    call_filter: Option<(&'static str, &'static str)>,
     stop_kinds: &HashSet<&str>,
     out: &mut Vec<&'a str>,
 ) {
-    if node.kind() == attr_kind
-        && let Some(child) = node.child_by_field_name(attr_field)
-        && let Ok(text) = child.utf8_text(source)
-    {
-        let text = text.trim();
-        if !text.is_empty() {
-            out.push(text);
+    if node.kind() == attr_kind {
+        // Only emit when the attribute access is the callee of a call expression.
+        // When call_filter is None (language has no call_expr_kinds configured),
+        // fall back to including all accesses rather than silently dropping them.
+        let in_call_position = call_filter.map_or(true, |(call_kind, callee_field)| {
+            node.parent()
+                .map(|parent| {
+                    parent.kind() == call_kind
+                        && parent
+                            .child_by_field_name(callee_field)
+                            .map(|callee| callee.id() == node.id())
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+        if in_call_position
+            && let Some(child) = node.child_by_field_name(attr_field)
+            && let Ok(text) = child.utf8_text(source)
+        {
+            let text = text.trim();
+            if !text.is_empty() {
+                out.push(text);
+            }
         }
     }
     for i in 0..node.child_count() {
@@ -282,7 +308,15 @@ fn collect_attribute_names<'a>(
             if stop_kinds.contains(child.kind()) {
                 continue;
             }
-            collect_attribute_names(child, source, attr_kind, attr_field, stop_kinds, out);
+            collect_attribute_names(
+                child,
+                source,
+                attr_kind,
+                attr_field,
+                call_filter,
+                stop_kinds,
+                out,
+            );
         }
     }
 }
@@ -657,6 +691,7 @@ fn collect_nodes(
                         source,
                         attr_kind,
                         attr_field,
+                        config.call_expr_kinds,
                         fn_stop_kinds,
                         &mut attr_names,
                     );
@@ -6731,6 +6766,76 @@ fn spawn_task() {
             fn_node.metadata.get("is_async").is_none(),
             "sync fn with async body should NOT have is_async, got: {:?}",
             fn_node.metadata.get("is_async")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // attr_refs: call-position filter
+    // ------------------------------------------------------------------
+
+    /// Bare property reads must NOT appear in attr_refs; only method calls should.
+    #[test]
+    fn test_attr_refs_excludes_bare_property_reads_python() {
+        use crate::extract::configs::PYTHON_CONFIG;
+        let code = r#"
+def process(self):
+    # method call — should appear in attr_refs
+    result = self.transform(data)
+    # bare property read — must NOT appear
+    t = self.timeout
+    return result
+"#;
+        let result = GenericExtractor::new(&PYTHON_CONFIG)
+            .run(Path::new("processor.py"), code)
+            .unwrap();
+        let fn_node = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "process")
+            .unwrap();
+        let attr_refs = fn_node.metadata.get("attr_refs").map(String::as_str).unwrap_or("");
+        assert!(
+            attr_refs.split(',').any(|s| s.trim() == "transform"),
+            "transform() call should appear in attr_refs, got: {:?}",
+            attr_refs
+        );
+        assert!(
+            !attr_refs.split(',').any(|s| s.trim() == "timeout"),
+            "bare property read 'timeout' must NOT appear in attr_refs, got: {:?}",
+            attr_refs
+        );
+    }
+
+    /// TypeScript: same contract — method calls in, bare property reads out.
+    #[test]
+    fn test_attr_refs_excludes_bare_property_reads_typescript() {
+        use crate::extract::configs::TYPESCRIPT_CONFIG;
+        let code = r#"
+function process(handler: Handler): void {
+    // method call — should appear in attr_refs
+    const result = handler.transform(data);
+    // bare property read — must NOT appear
+    const t = handler.timeout;
+}
+"#;
+        let result = GenericExtractor::new(&TYPESCRIPT_CONFIG)
+            .run(Path::new("processor.ts"), code)
+            .unwrap();
+        let fn_node = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "process")
+            .unwrap();
+        let attr_refs = fn_node.metadata.get("attr_refs").map(String::as_str).unwrap_or("");
+        assert!(
+            attr_refs.split(',').any(|s| s.trim() == "transform"),
+            "transform() call should appear in attr_refs, got: {:?}",
+            attr_refs
+        );
+        assert!(
+            !attr_refs.split(',').any(|s| s.trim() == "timeout"),
+            "bare property read 'timeout' must NOT appear in attr_refs, got: {:?}",
+            attr_refs
         );
     }
 }
