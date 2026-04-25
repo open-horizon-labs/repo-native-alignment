@@ -649,4 +649,210 @@ message Event {
         let result = extractor.extract(Path::new("test.proto"), content).unwrap();
         assert_eq!(result.nodes[0].language, "protobuf");
     }
+
+    // -----------------------------------------------------------------------
+    // Iceberg / regression suite (issue #647 + siblings)
+    //
+    // These tests document the line-scanner extractor's failure modes so the
+    // tree-sitter port has a regression target. Markers explain current state:
+    //   - #[should_panic]: line scanner panics today; tree-sitter port must succeed
+    //   - #[ignore]:       line scanner returns wrong output today (no panic);
+    //                      tree-sitter port must produce the correct shape
+    // After the port lands, both markers should be removed and assertions pass as-is.
+    // -----------------------------------------------------------------------
+
+    /// Drazen's repro from issue #647: single-line empty message panics in
+    /// `extract_message_fields` because `find_block_end` returns `start_line`
+    /// and the helper forms `lines[start+1..start]`.
+    #[test]
+    #[should_panic(expected = "slice index starts at")]
+    fn iceberg_single_line_empty_message_panics_today() {
+        let extractor = ProtoExtractor::new();
+        let content = "message Empty {}\n";
+        let _ = extractor.extract(Path::new("empty.proto"), content);
+    }
+
+    /// Asserts the *correct* shape: empty message yields a ProtoMessage node
+    /// with zero field children. Will pass once the extractor stops panicking.
+    #[test]
+    #[ignore = "FIXME(D): tree-sitter port should make this pass without panic"]
+    fn iceberg_single_line_empty_message_extracts_message_no_fields() {
+        let extractor = ProtoExtractor::new();
+        let content = "message Empty {}\n";
+        let result = extractor.extract(Path::new("empty.proto"), content).unwrap();
+        let messages: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ProtoMessage)
+            .collect();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id.name, "Empty");
+        let fields: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Other("proto_field".to_string()))
+            .collect();
+        assert!(fields.is_empty());
+    }
+
+    /// Single-line empty enum: inline slice `lines[(start+1)..end]` panics.
+    #[test]
+    #[should_panic(expected = "slice index starts at")]
+    fn iceberg_single_line_empty_enum_panics_today() {
+        let extractor = ProtoExtractor::new();
+        let content = "enum E {}\n";
+        let _ = extractor.extract(Path::new("e.proto"), content);
+    }
+
+    /// Single-line empty service: `extract_rpc_methods` slice panics.
+    #[test]
+    #[should_panic(expected = "slice index starts at")]
+    fn iceberg_single_line_empty_service_panics_today() {
+        let extractor = ProtoExtractor::new();
+        let content = "service S {}\n";
+        let _ = extractor.extract(Path::new("s.proto"), content);
+    }
+
+    /// Single-line non-empty service: same panic — `find_block_end` returns
+    /// the same line because depth resolves on a single iteration.
+    #[test]
+    #[should_panic(expected = "slice index starts at")]
+    fn iceberg_single_line_service_with_rpc_panics_today() {
+        let extractor = ProtoExtractor::new();
+        let content = "service S { rpc Foo (Bar) returns (Baz); }\n";
+        let _ = extractor.extract(Path::new("s.proto"), content);
+    }
+
+    /// `oneof` block: `extract_message_fields` skips lines starting with
+    /// `oneof `, dropping all fields inside the oneof.
+    #[test]
+    #[ignore = "FIXME(D): line scanner skips oneof contents; tree-sitter port should extract inner fields"]
+    fn iceberg_oneof_inner_fields_extracted() {
+        let extractor = ProtoExtractor::new();
+        let content = r#"message M {
+  oneof choice {
+    string a = 1;
+    int32 b = 2;
+  }
+}
+"#;
+        let result = extractor.extract(Path::new("m.proto"), content).unwrap();
+        let fields: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Other("proto_field".to_string()))
+            .collect();
+        let names: Vec<&str> = fields.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"a"), "oneof field `a` must be extracted; got {:?}", names);
+        assert!(names.contains(&"b"), "oneof field `b` must be extracted; got {:?}", names);
+    }
+
+    /// Nested message: outer scanner advances past the block, helper skips
+    /// `message ` lines — inner type and its fields are silently dropped.
+    #[test]
+    #[ignore = "FIXME(D): nested messages dropped; tree-sitter port must surface inner types"]
+    fn iceberg_nested_message_extracted() {
+        let extractor = ProtoExtractor::new();
+        let content = r#"message Outer {
+  string outer_field = 1;
+  message Inner {
+    string inner_field = 1;
+  }
+}
+"#;
+        let result = extractor.extract(Path::new("nested.proto"), content).unwrap();
+        let messages: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ProtoMessage)
+            .collect();
+        let names: Vec<&str> = messages.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"Outer"));
+        assert!(
+            names.contains(&"Inner"),
+            "nested message `Inner` must be extracted; got {:?}",
+            names
+        );
+    }
+
+    /// Comment containing `{`: depth tracker counts the brace inside the
+    /// comment, so `find_block_end` walks past the real closing `}` and
+    /// returns the file-end fallback, producing a wrong body slice.
+    #[test]
+    #[ignore = "FIXME(D): brace-in-comment miscounts depth; tree-sitter port respects comment scopes"]
+    fn iceberg_brace_in_comment_does_not_break_depth() {
+        let extractor = ProtoExtractor::new();
+        let content = r#"message M {
+  // a comment with { brace
+  string x = 1;
+}
+message N {
+  string y = 1;
+}
+"#;
+        let result = extractor.extract(Path::new("c.proto"), content).unwrap();
+        let messages: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ProtoMessage)
+            .collect();
+        let names: Vec<&str> = messages.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"M"));
+        assert!(
+            names.contains(&"N"),
+            "second message must be detected even when first message contains `{{` in a comment; got {:?}",
+            names
+        );
+    }
+
+    // --- Regression: working cases that must keep working through the port ---
+
+    #[test]
+    fn regression_empty_file() {
+        let extractor = ProtoExtractor::new();
+        let result = extractor.extract(Path::new("empty.proto"), "").unwrap();
+        assert!(result.nodes.is_empty());
+        assert!(result.edges.is_empty());
+    }
+
+    #[test]
+    fn regression_imports_only() {
+        let extractor = ProtoExtractor::new();
+        let content = "syntax = \"proto3\";\nimport \"a/b.proto\";\nimport \"c.proto\";\n";
+        let result = extractor.extract(Path::new("i.proto"), content).unwrap();
+        let imports: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Import)
+            .collect();
+        assert_eq!(imports.len(), 2);
+    }
+
+    #[test]
+    fn regression_options_only() {
+        let extractor = ProtoExtractor::new();
+        let content = "syntax = \"proto3\";\noption go_package = \"example.com/foo\";\n";
+        let result = extractor.extract(Path::new("o.proto"), content).unwrap();
+        let consts: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Const)
+            .collect();
+        assert_eq!(consts.len(), 1);
+        assert_eq!(consts[0].id.name, "go_package");
+    }
+
+    #[test]
+    fn regression_multi_line_message_header() {
+        // Brace on its own line — should not panic, message body extracted.
+        let extractor = ProtoExtractor::new();
+        let content = "message M\n{\n  string x = 1;\n}\n";
+        let result = extractor.extract(Path::new("m.proto"), content).unwrap();
+        let messages: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ProtoMessage)
+            .collect();
+        assert_eq!(messages.len(), 1, "expected M; got {:?}", messages);
+    }
 }
