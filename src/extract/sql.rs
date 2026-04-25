@@ -601,7 +601,14 @@ CREATE TABLE posts (id INT);
         let extractor = SqlExtractor::new();
         let content = "CREATE TABLE Foo (id SERIAL PRIMARY KEY);\n";
         let result = extractor.extract(Path::new("pg.sql"), content).unwrap();
-        // No assertion on count — just verifying graceful behavior.
-        let _ = result.nodes.len();
+        let table_count = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::SqlTable)
+            .count();
+        assert!(
+            table_count <= 1,
+            "SERIAL handling should stay graceful: at most one table node, got {table_count}"
+        );
     }
 }

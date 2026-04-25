@@ -719,6 +719,10 @@ components:
   "properties": { "id": { "type": "integer" } }
 }
 "#;
+        assert!(
+            extractor.can_handle(Path::new("u.json"), content),
+            "JSON Schema marker should pass can_handle gate"
+        );
         let result = extractor.extract(Path::new("u.json"), content).unwrap();
         let endpoints: Vec<_> = result
             .nodes
@@ -734,6 +738,10 @@ components:
         // the body isn't valid YAML. extract() must return Err, not panic.
         let extractor = OpenApiExtractor::new();
         let content = "openapi: 3.0.0\nthis: is: not: valid: yaml: at: all\n";
+        assert!(
+            extractor.can_handle(Path::new("bad.yaml"), content),
+            "openapi marker should pass can_handle gate even when YAML body is invalid"
+        );
         let outcome = extractor.extract(Path::new("bad.yaml"), content);
         assert!(
             outcome.is_err(),
