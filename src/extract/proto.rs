@@ -1,11 +1,20 @@
-//! Protobuf schema extractor.
+//! Protobuf schema extractor (tree-sitter-driven).
 //!
-//! Parses `.proto` files using line-based parsing to extract:
-//! - `message` definitions -> `NodeKind::ProtoMessage` nodes
-//! - Fields within messages -> `NodeKind::Other("proto_field")` nodes + `EdgeKind::HasField` edges
-//! - `service` definitions -> `NodeKind::Other("proto_service")` nodes
-//! - RPC methods -> `NodeKind::Function` nodes + edges to request/response message types
-//! - `import` statements -> `EdgeKind::DependsOn` edges
+//! Parses `.proto` files using `tree-sitter-proto` to extract:
+//! - `message` definitions (including nested) -> `NodeKind::ProtoMessage`
+//! - Fields within messages (including `oneof` inner fields) ->
+//!   `NodeKind::Other("proto_field")` + `EdgeKind::HasField`
+//! - `service` definitions -> `NodeKind::Other("proto_service")`
+//! - RPC methods -> `NodeKind::Function` + `EdgeKind::Defines` from the service
+//!   and `EdgeKind::DependsOn` edges to the request/response message types
+//! - `import` statements -> `NodeKind::Import` + `EdgeKind::DependsOn` to a `Module`
+//! - Top-level `option` statements and `enum` values -> `NodeKind::Const`
+//!
+//! Uses tree-sitter for scope/comment/brace awareness — the previous line scanner
+//! lost data on `oneof`, nested messages, single-line `{}` blocks, and braces
+//! inside comments (issue #647 and siblings).
+//!
+//! See `iceberg_*` and `regression_*` tests for the behavioral contract.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -16,7 +25,7 @@ use crate::graph::{Confidence, Edge, EdgeKind, ExtractionSource, Node, NodeId, N
 
 use super::{ExtractionResult, Extractor};
 
-/// Protobuf schema extractor using line-based parsing.
+/// Protobuf schema extractor using tree-sitter.
 pub struct ProtoExtractor;
 
 impl Default for ProtoExtractor {
@@ -41,459 +50,559 @@ impl Extractor for ProtoExtractor {
     }
 
     fn extract(&self, path: &Path, content: &str) -> Result<ExtractionResult> {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_proto::LANGUAGE.into())?;
+
+        let tree = match parser.parse(content, None) {
+            Some(t) => t,
+            None => return Ok(ExtractionResult::default()),
+        };
+
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
+        let source = content.as_bytes();
+        let root = tree.root_node();
 
-        let lines: Vec<&str> = content.lines().collect();
-        let mut i = 0;
-
-        while i < lines.len() {
-            let line = lines[i].trim();
-
-            // import statements
-            if line.starts_with("import ") {
-                let import_path = line
-                    .trim_start_matches("import ")
-                    .trim_end_matches(';')
-                    .trim()
-                    .trim_matches('"')
-                    .to_string();
-
-                if !import_path.is_empty() {
-                    let import_node_id = NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: format!("import \"{}\"", import_path),
-                        kind: NodeKind::Import,
-                    };
-                    nodes.push(Node {
-                        id: import_node_id.clone(),
-                        language: "protobuf".to_string(),
-                        line_start: i + 1,
-                        line_end: i + 1,
-                        signature: line.to_string(),
-                        body: line.to_string(),
-                        metadata: BTreeMap::new(),
-                        source: ExtractionSource::Schema,
-                    });
-                    let target_id = NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: import_path,
-                        kind: NodeKind::Module,
-                    };
-                    edges.push(Edge {
-                        from: import_node_id,
-                        to: target_id,
-                        kind: EdgeKind::DependsOn,
-                        source: ExtractionSource::Schema,
-                        confidence: Confidence::Detected,
-                    });
-                }
-                i += 1;
-                continue;
-            }
-
-            // message definitions
-            if line.starts_with("message ") {
-                let msg_name = line
-                    .trim_start_matches("message ")
-                    .trim_end_matches('{')
-                    .trim()
-                    .to_string();
-
-                if !msg_name.is_empty() {
-                    let block_start = i;
-                    let block_end = find_block_end(&lines, i);
-                    let body = lines[block_start..=block_end.min(lines.len() - 1)].join("\n");
-
-                    let msg_node_id = NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: msg_name.clone(),
-                        kind: NodeKind::ProtoMessage,
-                    };
-                    nodes.push(Node {
-                        id: msg_node_id.clone(),
-                        language: "protobuf".to_string(),
-                        line_start: block_start + 1,
-                        line_end: block_end + 1,
-                        signature: format!("message {}", msg_name),
-                        body: body.clone(),
-                        metadata: BTreeMap::new(),
-                        source: ExtractionSource::Schema,
-                    });
-
-                    // Extract fields within the message
-                    extract_message_fields(
-                        &lines,
-                        block_start + 1,
-                        block_end,
-                        path,
-                        &msg_node_id,
-                        &mut nodes,
-                        &mut edges,
-                    );
-
-                    i = block_end + 1;
-                    continue;
-                }
-            }
-
-            // enum definitions — emit enum values as Const nodes
-            if line.starts_with("enum ") {
-                let enum_name = line
-                    .trim_start_matches("enum ")
-                    .trim_end_matches('{')
-                    .trim()
-                    .to_string();
-                if !enum_name.is_empty() {
-                    let block_start = i;
-                    let block_end = find_block_end(&lines, i);
-                    // Emit each enum value as a Const
-                    for (offset, ev_line_raw) in
-                        lines[(block_start + 1)..block_end].iter().enumerate()
-                    {
-                        let j = block_start + 1 + offset;
-                        let ev_line = ev_line_raw.trim();
-                        if ev_line.is_empty()
-                            || ev_line.starts_with("//")
-                            || ev_line.starts_with("option ")
-                        {
-                            continue;
-                        }
-                        // Enum values: `FIELD_NAME = number;`
-                        if let Some(eq_pos) = ev_line.find('=') {
-                            let ev_name = ev_line[..eq_pos].trim().to_string();
-                            let ev_val = ev_line[eq_pos + 1..]
-                                .trim()
-                                .trim_end_matches(';')
-                                .trim()
-                                .to_string();
-                            if !ev_name.is_empty() && !ev_name.contains(' ') {
-                                let mut metadata = BTreeMap::new();
-                                if !ev_val.is_empty() {
-                                    metadata.insert("value".to_string(), ev_val);
-                                }
-                                metadata.insert("synthetic".to_string(), "false".to_string());
-                                nodes.push(Node {
-                                    id: NodeId {
-                                        root: String::new(),
-                                        file: path.to_path_buf(),
-                                        name: format!("{}.{}", enum_name, ev_name),
-                                        kind: NodeKind::Const,
-                                    },
-                                    language: "protobuf".to_string(),
-                                    line_start: j + 1,
-                                    line_end: j + 1,
-                                    signature: ev_line.to_string(),
-                                    body: ev_line.to_string(),
-                                    metadata,
-                                    source: ExtractionSource::Schema,
-                                });
-                            }
-                        }
-                    }
-                    i = block_end + 1;
-                    continue;
-                }
-            }
-
-            // top-level option statements: `option java_package = "com.example";`
-            if line.starts_with("option ") {
-                let opt_line = line.trim_end_matches(';').trim();
-                if let Some(eq_pos) = opt_line.find('=') {
-                    let opt_name = opt_line[7..eq_pos].trim().to_string(); // strip "option "
-                    let opt_val = opt_line[eq_pos + 1..].trim().trim_matches('"').to_string();
-                    if !opt_name.is_empty() {
-                        let mut metadata = BTreeMap::new();
-                        if !opt_val.is_empty() {
-                            metadata.insert("value".to_string(), opt_val);
-                        }
-                        metadata.insert("synthetic".to_string(), "false".to_string());
-                        nodes.push(Node {
-                            id: NodeId {
-                                root: String::new(),
-                                file: path.to_path_buf(),
-                                name: opt_name.clone(),
-                                kind: NodeKind::Const,
-                            },
-                            language: "protobuf".to_string(),
-                            line_start: i + 1,
-                            line_end: i + 1,
-                            signature: line.to_string(),
-                            body: line.to_string(),
-                            metadata,
-                            source: ExtractionSource::Schema,
-                        });
-                    }
-                }
-                i += 1;
-                continue;
-            }
-
-            // service definitions
-            if line.starts_with("service ") {
-                let svc_name = line
-                    .trim_start_matches("service ")
-                    .trim_end_matches('{')
-                    .trim()
-                    .to_string();
-
-                if !svc_name.is_empty() {
-                    let block_start = i;
-                    let block_end = find_block_end(&lines, i);
-                    let body = lines[block_start..=block_end.min(lines.len() - 1)].join("\n");
-
-                    let svc_node_id = NodeId {
-                        root: String::new(),
-                        file: path.to_path_buf(),
-                        name: svc_name.clone(),
-                        kind: NodeKind::Other("proto_service".to_string()),
-                    };
-                    nodes.push(Node {
-                        id: svc_node_id.clone(),
-                        language: "protobuf".to_string(),
-                        line_start: block_start + 1,
-                        line_end: block_end + 1,
-                        signature: format!("service {}", svc_name),
-                        body: body.clone(),
-                        metadata: BTreeMap::new(),
-                        source: ExtractionSource::Schema,
-                    });
-
-                    // Extract RPC methods
-                    extract_rpc_methods(
-                        &lines,
-                        block_start + 1,
-                        block_end,
-                        path,
-                        &svc_node_id,
-                        &mut nodes,
-                        &mut edges,
-                    );
-
-                    i = block_end + 1;
-                    continue;
-                }
-            }
-
-            i += 1;
+        let mut cursor = root.walk();
+        for child in root.named_children(&mut cursor) {
+            walk_top_level(child, path, source, &mut nodes, &mut edges);
         }
 
         Ok(ExtractionResult { nodes, edges })
     }
 }
 
-/// Find the closing brace for a block starting at `start_line`.
-fn find_block_end(lines: &[&str], start_line: usize) -> usize {
-    let mut depth = 0i32;
-    for (j, line) in lines.iter().enumerate().skip(start_line) {
-        for ch in line.chars() {
-            if ch == '{' {
-                depth += 1;
-            } else if ch == '}' {
-                depth -= 1;
-                if depth == 0 {
-                    return j;
+fn walk_top_level(
+    node: tree_sitter::Node<'_>,
+    path: &Path,
+    source: &[u8],
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+) {
+    match node.kind() {
+        "import" => extract_import(node, path, source, nodes, edges),
+        "message" => extract_message(node, path, source, nodes, edges),
+        "service" => extract_service(node, path, source, nodes, edges),
+        "enum" => extract_enum(node, path, source, nodes),
+        "option" => {
+            if let Some(c) = extract_option_const(node, path, source, /*top_level=*/ true) {
+                nodes.push(c);
+            }
+        }
+        _ => {} // syntax, package, edition, empty_statement, extend, etc.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// import
+// ---------------------------------------------------------------------------
+
+fn extract_import(
+    node: tree_sitter::Node<'_>,
+    path: &Path,
+    source: &[u8],
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+) {
+    let path_node = match node.child_by_field_name("path") {
+        Some(p) => p,
+        None => return,
+    };
+    let import_path = strip_quotes(text_of(path_node, source));
+    if import_path.is_empty() {
+        return;
+    }
+
+    let line_start = node.start_position().row + 1;
+    let line_end = node.end_position().row + 1;
+    let body = text_of(node, source).to_string();
+
+    let import_node_id = NodeId {
+        root: String::new(),
+        file: path.to_path_buf(),
+        name: format!("import \"{}\"", import_path),
+        kind: NodeKind::Import,
+    };
+    nodes.push(Node {
+        id: import_node_id.clone(),
+        language: "protobuf".to_string(),
+        line_start,
+        line_end,
+        signature: body.clone(),
+        body: body.clone(),
+        metadata: BTreeMap::new(),
+        source: ExtractionSource::Schema,
+    });
+
+    let target_id = NodeId {
+        root: String::new(),
+        file: path.to_path_buf(),
+        name: import_path,
+        kind: NodeKind::Module,
+    };
+    edges.push(Edge {
+        from: import_node_id,
+        to: target_id,
+        kind: EdgeKind::DependsOn,
+        source: ExtractionSource::Schema,
+        confidence: Confidence::Detected,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// message (recursive: nested messages + nested enums + oneof)
+// ---------------------------------------------------------------------------
+
+fn extract_message(
+    node: tree_sitter::Node<'_>,
+    path: &Path,
+    source: &[u8],
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+) {
+    let name = match find_named_child(node, "message_name")
+        .and_then(|n| find_named_child(n, "identifier"))
+    {
+        Some(n) => text_of(n, source).to_string(),
+        None => return,
+    };
+    if name.is_empty() {
+        return;
+    }
+
+    let line_start = node.start_position().row + 1;
+    let line_end = node.end_position().row + 1;
+    let body = text_of(node, source).to_string();
+
+    let msg_node_id = NodeId {
+        root: String::new(),
+        file: path.to_path_buf(),
+        name: name.clone(),
+        kind: NodeKind::ProtoMessage,
+    };
+    nodes.push(Node {
+        id: msg_node_id.clone(),
+        language: "protobuf".to_string(),
+        line_start,
+        line_end,
+        signature: format!("message {}", name),
+        body,
+        metadata: BTreeMap::new(),
+        source: ExtractionSource::Schema,
+    });
+
+    if let Some(message_body) = find_named_child(node, "message_body") {
+        let mut cursor = message_body.walk();
+        for child in message_body.named_children(&mut cursor) {
+            match child.kind() {
+                "field" => emit_field(child, path, source, &msg_node_id, nodes, edges),
+                "oneof" => {
+                    let mut oc = child.walk();
+                    for inner in child.named_children(&mut oc) {
+                        if inner.kind() == "oneof_field" {
+                            emit_field(inner, path, source, &msg_node_id, nodes, edges);
+                        }
+                    }
                 }
+                "message" => extract_message(child, path, source, nodes, edges),
+                "enum" => extract_enum(child, path, source, nodes),
+                // map_field, group, extend, extensions, reserved, option,
+                // empty_statement: not part of the existing extractor's contract.
+                _ => {}
             }
         }
     }
-    lines.len().saturating_sub(1)
 }
 
-/// Extract fields from within a message block.
-fn extract_message_fields(
-    lines: &[&str],
-    start: usize,
-    end: usize,
+/// Emit a `proto_field` node + `HasField` edge for either a `field` or
+/// `oneof_field` tree-sitter node. Both share the same shape: `type`,
+/// `identifier` (field name), `field_number`, optional `field_options`, and
+/// (for `field` only) optional `repeated` / `optional` / `required` keyword
+/// tokens that appear as anonymous children before the type.
+fn emit_field(
+    node: tree_sitter::Node<'_>,
     path: &Path,
+    source: &[u8],
     parent_id: &NodeId,
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
 ) {
-    for (offset, field_line_raw) in lines[start..end].iter().enumerate() {
-        let j = start + offset;
-        let field_line = field_line_raw.trim();
-        // Skip empty lines, comments, closing braces, nested messages, options
-        if field_line.is_empty()
-            || field_line.starts_with("//")
-            || field_line.starts_with('}')
-            || field_line.starts_with("message ")
-            || field_line.starts_with("enum ")
-            || field_line.starts_with("oneof ")
-            || field_line.starts_with("option ")
-            || field_line.starts_with("reserved ")
-            || field_line.starts_with("map<")
-        {
-            continue;
-        }
-
-        // Parse field: [repeated|optional] type name = number;
-        if let Some((field_type, field_name)) = parse_proto_field(field_line) {
-            let field_node_id = NodeId {
-                root: String::new(),
-                file: path.to_path_buf(),
-                name: field_name.clone(),
-                kind: NodeKind::Other("proto_field".to_string()),
-            };
-
-            let mut metadata = BTreeMap::new();
-            metadata.insert("field_type".to_string(), field_type);
-            metadata.insert("parent_message".to_string(), parent_id.name.clone());
-
-            nodes.push(Node {
-                id: field_node_id.clone(),
-                language: "protobuf".to_string(),
-                line_start: j + 1,
-                line_end: j + 1,
-                signature: field_line.to_string(),
-                body: field_line.to_string(),
-                metadata,
-                source: ExtractionSource::Schema,
-            });
-
-            edges.push(Edge {
-                from: parent_id.clone(),
-                to: field_node_id,
-                kind: EdgeKind::HasField,
-                source: ExtractionSource::Schema,
-                confidence: Confidence::Detected,
-            });
-        }
+    let type_text = match find_named_child(node, "type") {
+        Some(t) => text_of(t, source).trim().to_string(),
+        None => return,
+    };
+    let field_name = match find_named_child(node, "identifier") {
+        Some(n) => text_of(n, source).to_string(),
+        None => return,
+    };
+    if field_name.is_empty() || type_text.is_empty() {
+        return;
     }
-}
 
-/// Parse a protobuf field line into (type, name).
-/// Handles: `string query = 1;`, `repeated int32 ids = 2;`, `optional Foo bar = 3;`
-fn parse_proto_field(line: &str) -> Option<(String, String)> {
-    let line = line.trim().trim_end_matches(';').trim();
-    // Remove field number: everything after the last `=`
-    let line = if let Some(eq_pos) = line.rfind('=') {
-        line[..eq_pos].trim()
-    } else {
-        line
+    // Detect label keyword (anonymous tokens) that precedes the type child.
+    // For `oneof_field`, no label is permitted by the grammar.
+    let label = field_label(node);
+    let field_type = match label {
+        Some(lbl) => format!("{} {}", lbl, type_text),
+        None => type_text,
     };
 
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    match parts.len() {
-        2 => Some((parts[0].to_string(), parts[1].to_string())),
-        3 if parts[0] == "repeated" || parts[0] == "optional" || parts[0] == "required" => {
-            Some((format!("{} {}", parts[0], parts[1]), parts[2].to_string()))
+    let line_start = node.start_position().row + 1;
+    let line_end = node.end_position().row + 1;
+    let body = text_of(node, source).to_string();
+
+    let field_node_id = NodeId {
+        root: String::new(),
+        file: path.to_path_buf(),
+        name: field_name,
+        kind: NodeKind::Other("proto_field".to_string()),
+    };
+
+    let mut metadata = BTreeMap::new();
+    metadata.insert("field_type".to_string(), field_type);
+    metadata.insert("parent_message".to_string(), parent_id.name.clone());
+
+    nodes.push(Node {
+        id: field_node_id.clone(),
+        language: "protobuf".to_string(),
+        line_start,
+        line_end,
+        signature: body.clone(),
+        body,
+        metadata,
+        source: ExtractionSource::Schema,
+    });
+
+    edges.push(Edge {
+        from: parent_id.clone(),
+        to: field_node_id,
+        kind: EdgeKind::HasField,
+        source: ExtractionSource::Schema,
+        confidence: Confidence::Detected,
+    });
+}
+
+/// Returns "repeated", "optional", or "required" if one appears as an anonymous
+/// keyword child on the field, else `None`. Looks at *all* children (named and
+/// anonymous) since these labels are unnamed string tokens in the grammar.
+fn field_label(node: tree_sitter::Node<'_>) -> Option<&'static str> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "repeated" => return Some("repeated"),
+            "optional" => return Some("optional"),
+            "required" => return Some("required"),
+            _ => {}
         }
-        _ => None,
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// service / rpc
+// ---------------------------------------------------------------------------
+
+fn extract_service(
+    node: tree_sitter::Node<'_>,
+    path: &Path,
+    source: &[u8],
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+) {
+    let svc_name = match find_named_child(node, "service_name")
+        .and_then(|n| find_named_child(n, "identifier"))
+    {
+        Some(n) => text_of(n, source).to_string(),
+        None => return,
+    };
+    if svc_name.is_empty() {
+        return;
+    }
+
+    let line_start = node.start_position().row + 1;
+    let line_end = node.end_position().row + 1;
+    let body = text_of(node, source).to_string();
+
+    let svc_node_id = NodeId {
+        root: String::new(),
+        file: path.to_path_buf(),
+        name: svc_name.clone(),
+        kind: NodeKind::Other("proto_service".to_string()),
+    };
+    nodes.push(Node {
+        id: svc_node_id.clone(),
+        language: "protobuf".to_string(),
+        line_start,
+        line_end,
+        signature: format!("service {}", svc_name),
+        body,
+        metadata: BTreeMap::new(),
+        source: ExtractionSource::Schema,
+    });
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "rpc" {
+            extract_rpc(child, path, source, &svc_node_id, nodes, edges);
+        }
     }
 }
 
-/// Extract RPC methods from within a service block.
-fn extract_rpc_methods(
-    lines: &[&str],
-    start: usize,
-    end: usize,
+fn extract_rpc(
+    node: tree_sitter::Node<'_>,
     path: &Path,
+    source: &[u8],
     service_id: &NodeId,
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
 ) {
-    for (offset, rpc_line_raw) in lines[start..end].iter().enumerate() {
-        let j = start + offset;
-        let rpc_line = rpc_line_raw.trim();
-        if !rpc_line.starts_with("rpc ") {
+    let method_name = match find_named_child(node, "rpc_name")
+        .and_then(|n| find_named_child(n, "identifier"))
+    {
+        Some(n) => text_of(n, source).to_string(),
+        None => return,
+    };
+
+    // The two `message_or_enum_type` children are request and response, in
+    // source order. Each contains identifier child(ren); we take the full
+    // dotted path text as the type name to preserve qualifications.
+    let mut types = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "message_or_enum_type" {
+            types.push(text_of(child, source).trim().to_string());
+        }
+    }
+    if types.len() < 2 || method_name.is_empty() {
+        return;
+    }
+    let request_type = types[0].clone();
+    let response_type = types[1].clone();
+
+    let line_start = node.start_position().row + 1;
+    let line_end = node.end_position().row + 1;
+    let body = text_of(node, source).to_string();
+
+    let method_node_id = NodeId {
+        root: String::new(),
+        file: path.to_path_buf(),
+        name: method_name,
+        kind: NodeKind::Function,
+    };
+
+    let mut metadata = BTreeMap::new();
+    metadata.insert("request_type".to_string(), request_type.clone());
+    metadata.insert("response_type".to_string(), response_type.clone());
+    metadata.insert("parent_service".to_string(), service_id.name.clone());
+
+    nodes.push(Node {
+        id: method_node_id.clone(),
+        language: "protobuf".to_string(),
+        line_start,
+        line_end,
+        signature: body.clone(),
+        body,
+        metadata,
+        source: ExtractionSource::Schema,
+    });
+
+    edges.push(Edge {
+        from: service_id.clone(),
+        to: method_node_id.clone(),
+        kind: EdgeKind::Defines,
+        source: ExtractionSource::Schema,
+        confidence: Confidence::Detected,
+    });
+
+    edges.push(Edge {
+        from: method_node_id.clone(),
+        to: NodeId {
+            root: String::new(),
+            file: path.to_path_buf(),
+            name: request_type,
+            kind: NodeKind::ProtoMessage,
+        },
+        kind: EdgeKind::DependsOn,
+        source: ExtractionSource::Schema,
+        confidence: Confidence::Detected,
+    });
+
+    edges.push(Edge {
+        from: method_node_id,
+        to: NodeId {
+            root: String::new(),
+            file: path.to_path_buf(),
+            name: response_type,
+            kind: NodeKind::ProtoMessage,
+        },
+        kind: EdgeKind::DependsOn,
+        source: ExtractionSource::Schema,
+        confidence: Confidence::Detected,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// enum (values emitted as Const; enum itself has no node — preserves the
+// pre-existing extractor's contract)
+// ---------------------------------------------------------------------------
+
+fn extract_enum(
+    node: tree_sitter::Node<'_>,
+    path: &Path,
+    source: &[u8],
+    nodes: &mut Vec<Node>,
+) {
+    let enum_name = match find_named_child(node, "enum_name")
+        .and_then(|n| find_named_child(n, "identifier"))
+    {
+        Some(n) => text_of(n, source).to_string(),
+        None => return,
+    };
+    if enum_name.is_empty() {
+        return;
+    }
+
+    let body_node = match find_named_child(node, "enum_body") {
+        Some(b) => b,
+        None => return,
+    };
+
+    let mut cursor = body_node.walk();
+    for child in body_node.named_children(&mut cursor) {
+        if child.kind() != "enum_field" {
+            continue;
+        }
+        let ev_name = match find_named_child(child, "identifier") {
+            Some(n) => text_of(n, source).to_string(),
+            None => continue,
+        };
+        let ev_val = find_named_child(child, "int_lit")
+            .map(|n| text_of(n, source).to_string())
+            .unwrap_or_default();
+        if ev_name.is_empty() {
             continue;
         }
 
-        if let Some((method_name, request_type, response_type)) = parse_rpc_line(rpc_line) {
-            let method_node_id = NodeId {
+        let mut metadata = BTreeMap::new();
+        if !ev_val.is_empty() {
+            metadata.insert("value".to_string(), ev_val);
+        }
+        metadata.insert("synthetic".to_string(), "false".to_string());
+
+        let line = child.start_position().row + 1;
+        let body_text = text_of(child, source).to_string();
+
+        nodes.push(Node {
+            id: NodeId {
                 root: String::new(),
                 file: path.to_path_buf(),
-                name: method_name.clone(),
-                kind: NodeKind::Function,
-            };
-
-            let mut metadata = BTreeMap::new();
-            metadata.insert("request_type".to_string(), request_type.clone());
-            metadata.insert("response_type".to_string(), response_type.clone());
-            metadata.insert("parent_service".to_string(), service_id.name.clone());
-
-            nodes.push(Node {
-                id: method_node_id.clone(),
-                language: "protobuf".to_string(),
-                line_start: j + 1,
-                line_end: j + 1,
-                signature: rpc_line.to_string(),
-                body: rpc_line.to_string(),
-                metadata,
-                source: ExtractionSource::Schema,
-            });
-
-            // Edge from service to method
-            edges.push(Edge {
-                from: service_id.clone(),
-                to: method_node_id.clone(),
-                kind: EdgeKind::Defines,
-                source: ExtractionSource::Schema,
-                confidence: Confidence::Detected,
-            });
-
-            // Edge from method to request message type
-            edges.push(Edge {
-                from: method_node_id.clone(),
-                to: NodeId {
-                    root: String::new(),
-                    file: path.to_path_buf(),
-                    name: request_type,
-                    kind: NodeKind::ProtoMessage,
-                },
-                kind: EdgeKind::DependsOn,
-                source: ExtractionSource::Schema,
-                confidence: Confidence::Detected,
-            });
-
-            // Edge from method to response message type
-            edges.push(Edge {
-                from: method_node_id,
-                to: NodeId {
-                    root: String::new(),
-                    file: path.to_path_buf(),
-                    name: response_type,
-                    kind: NodeKind::ProtoMessage,
-                },
-                kind: EdgeKind::DependsOn,
-                source: ExtractionSource::Schema,
-                confidence: Confidence::Detected,
-            });
-        }
+                name: format!("{}.{}", enum_name, ev_name),
+                kind: NodeKind::Const,
+            },
+            language: "protobuf".to_string(),
+            line_start: line,
+            line_end: line,
+            signature: body_text.clone(),
+            body: body_text,
+            metadata,
+            source: ExtractionSource::Schema,
+        });
     }
 }
 
-/// Parse an RPC line into (method_name, request_type, response_type).
-/// Example: `rpc Search (SearchRequest) returns (SearchResponse);`
-fn parse_rpc_line(line: &str) -> Option<(String, String, String)> {
-    let line = line.trim_start_matches("rpc ").trim();
+// ---------------------------------------------------------------------------
+// option (top-level only; option statements inside messages/enums/etc. are
+// not part of the pre-existing extractor's contract)
+// ---------------------------------------------------------------------------
 
-    // Extract method name (before first paren)
-    let paren_pos = line.find('(')?;
-    let method_name = line[..paren_pos].trim().to_string();
-
-    // Extract request type: between first ( and first )
-    let after_open = &line[paren_pos + 1..];
-    let close_pos = after_open.find(')')?;
-    let request_type = after_open[..close_pos].trim().to_string();
-
-    // Extract response type: after "returns", between ( and )
-    let returns_pos = line.find("returns")?;
-    let after_returns = &line[returns_pos + 7..];
-    let resp_open = after_returns.find('(')?;
-    let resp_after = &after_returns[resp_open + 1..];
-    let resp_close = resp_after.find(')')?;
-    let response_type = resp_after[..resp_close].trim().to_string();
-
-    if method_name.is_empty() || request_type.is_empty() || response_type.is_empty() {
+fn extract_option_const(
+    node: tree_sitter::Node<'_>,
+    path: &Path,
+    source: &[u8],
+    top_level: bool,
+) -> Option<Node> {
+    if !top_level {
         return None;
     }
 
-    Some((method_name, request_type, response_type))
+    // Option name comes from the private `_option_name` rule which projects
+    // its content (an identifier or full_ident) up as a named child of the
+    // option node. The constant value follows.
+    let mut name: Option<String> = None;
+    let mut value: Option<String> = None;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "identifier" | "full_ident" if name.is_none() => {
+                name = Some(text_of(child, source).to_string());
+            }
+            "constant" if value.is_none() => {
+                value = Some(strip_quotes(text_of(child, source)));
+            }
+            _ => {}
+        }
+    }
+    let name = name?;
+    if name.is_empty() {
+        return None;
+    }
+
+    let line_start = node.start_position().row + 1;
+    let line_end = node.end_position().row + 1;
+    let body = text_of(node, source).to_string();
+
+    let mut metadata = BTreeMap::new();
+    if let Some(v) = value
+        && !v.is_empty()
+    {
+        metadata.insert("value".to_string(), v);
+    }
+    metadata.insert("synthetic".to_string(), "false".to_string());
+
+    Some(Node {
+        id: NodeId {
+            root: String::new(),
+            file: path.to_path_buf(),
+            name,
+            kind: NodeKind::Const,
+        },
+        language: "protobuf".to_string(),
+        line_start,
+        line_end,
+        signature: body.clone(),
+        body,
+        metadata,
+        source: ExtractionSource::Schema,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+fn find_named_child<'a>(
+    node: tree_sitter::Node<'a>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find(|c| c.kind() == kind)
+}
+
+fn text_of<'a>(node: tree_sitter::Node<'_>, source: &'a [u8]) -> &'a str {
+    node.utf8_text(source).unwrap_or("")
+}
+
+fn strip_quotes(s: &str) -> String {
+    let s = s.trim();
+    if s.len() >= 2 {
+        let bytes = s.as_bytes();
+        let first = bytes[0];
+        let last = bytes[s.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return s[1..s.len() - 1].to_string();
+        }
+    }
+    s.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -653,29 +762,38 @@ message Event {
     // -----------------------------------------------------------------------
     // Iceberg / regression suite (issue #647 + siblings)
     //
-    // These tests document the line-scanner extractor's failure modes so the
-    // tree-sitter port has a regression target. Markers explain current state:
-    //   - #[should_panic]: line scanner panics today; tree-sitter port must succeed
-    //   - #[ignore]:       line scanner returns wrong output today (no panic);
-    //                      tree-sitter port must produce the correct shape
-    // After the port lands, both markers should be removed and assertions pass as-is.
+    // The tree-sitter port turns these from documentation-of-bugs into
+    // positive correctness tests. Names retain the `iceberg_*` prefix to
+    // preserve traceability to the original failure modes; `_panics_today`
+    // suffixes are kept as historical markers (the panics no longer happen).
     // -----------------------------------------------------------------------
 
-    /// Drazen's repro from issue #647: single-line empty message panics in
-    /// `extract_message_fields` because `find_block_end` returns `start_line`
-    /// and the helper forms `lines[start+1..start]`.
+    /// Originally panicked in `extract_message_fields` because the line scanner's
+    /// `find_block_end` returned `start_line` for `message Empty {}`. Tree-sitter
+    /// parses single-line bodies natively.
     #[test]
-    #[should_panic(expected = "slice index starts at")]
     fn iceberg_single_line_empty_message_panics_today() {
         let extractor = ProtoExtractor::new();
         let content = "message Empty {}\n";
-        let _ = extractor.extract(Path::new("empty.proto"), content);
+        let result = extractor.extract(Path::new("empty.proto"), content).unwrap();
+        let messages: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ProtoMessage)
+            .collect();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id.name, "Empty");
+        let fields: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Other("proto_field".to_string()))
+            .collect();
+        assert!(fields.is_empty());
     }
 
-    /// Asserts the *correct* shape: empty message yields a ProtoMessage node
-    /// with zero field children. Will pass once the extractor stops panicking.
+    /// Same shape, different test name — kept for parallelism with the iceberg
+    /// suite's "extracts" assertions and to match the contract's 17-test count.
     #[test]
-    #[ignore = "FIXME(D): tree-sitter port should make this pass without panic"]
     fn iceberg_single_line_empty_message_extracts_message_no_fields() {
         let extractor = ProtoExtractor::new();
         let content = "message Empty {}\n";
@@ -695,38 +813,82 @@ message Event {
         assert!(fields.is_empty());
     }
 
-    /// Single-line empty enum: inline slice `lines[(start+1)..end]` panics.
+    /// Single-line empty enum: line scanner panicked on inline slice. The
+    /// pre-existing extractor model doesn't emit a node for the enum itself,
+    /// only for its values — an empty enum therefore yields no `Const` nodes.
     #[test]
-    #[should_panic(expected = "slice index starts at")]
     fn iceberg_single_line_empty_enum_panics_today() {
         let extractor = ProtoExtractor::new();
         let content = "enum E {}\n";
-        let _ = extractor.extract(Path::new("e.proto"), content);
+        let result = extractor.extract(Path::new("e.proto"), content).unwrap();
+        let consts: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Const)
+            .collect();
+        assert!(consts.is_empty(), "empty enum has no values; got {:?}", consts);
     }
 
-    /// Single-line empty service: `extract_rpc_methods` slice panics.
+    /// Single-line empty service: line scanner panicked. Service node still
+    /// emitted; RPC list is empty.
     #[test]
-    #[should_panic(expected = "slice index starts at")]
     fn iceberg_single_line_empty_service_panics_today() {
         let extractor = ProtoExtractor::new();
         let content = "service S {}\n";
-        let _ = extractor.extract(Path::new("s.proto"), content);
+        let result = extractor.extract(Path::new("s.proto"), content).unwrap();
+        let services: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Other("proto_service".to_string()))
+            .collect();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].id.name, "S");
+        let rpcs: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Function)
+            .collect();
+        assert!(rpcs.is_empty());
     }
 
-    /// Single-line non-empty service: same panic — `find_block_end` returns
-    /// the same line because depth resolves on a single iteration.
+    /// Single-line non-empty service: same panic family. RPC must be extracted
+    /// with correct request/response types in metadata.
     #[test]
-    #[should_panic(expected = "slice index starts at")]
     fn iceberg_single_line_service_with_rpc_panics_today() {
         let extractor = ProtoExtractor::new();
         let content = "service S { rpc Foo (Bar) returns (Baz); }\n";
-        let _ = extractor.extract(Path::new("s.proto"), content);
+        let result = extractor.extract(Path::new("s.proto"), content).unwrap();
+        let services: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Other("proto_service".to_string()))
+            .collect();
+        assert_eq!(services.len(), 1);
+        let rpcs: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Function)
+            .collect();
+        assert_eq!(rpcs.len(), 1);
+        assert_eq!(rpcs[0].id.name, "Foo");
+        assert_eq!(
+            rpcs[0].metadata.get("request_type").map(|s| s.as_str()),
+            Some("Bar"),
+        );
+        assert_eq!(
+            rpcs[0].metadata.get("response_type").map(|s| s.as_str()),
+            Some("Baz"),
+        );
+        assert_eq!(
+            rpcs[0].metadata.get("parent_service").map(|s| s.as_str()),
+            Some("S"),
+        );
     }
 
-    /// `oneof` block: `extract_message_fields` skips lines starting with
-    /// `oneof `, dropping all fields inside the oneof.
+    /// `oneof` block inner fields: the line scanner skipped any line starting
+    /// with `oneof `, dropping inner fields. Tree-sitter port surfaces them as
+    /// regular `proto_field` nodes attached to the enclosing message.
     #[test]
-    #[ignore = "FIXME(D): line scanner skips oneof contents; tree-sitter port should extract inner fields"]
     fn iceberg_oneof_inner_fields_extracted() {
         let extractor = ProtoExtractor::new();
         let content = r#"message M {
@@ -747,10 +909,10 @@ message Event {
         assert!(names.contains(&"b"), "oneof field `b` must be extracted; got {:?}", names);
     }
 
-    /// Nested message: outer scanner advances past the block, helper skips
-    /// `message ` lines — inner type and its fields are silently dropped.
+    /// Nested message: the line scanner advanced past the outer block and the
+    /// helper skipped lines starting with `message `, dropping the inner type.
+    /// Tree-sitter port recurses into `message_body` and emits both.
     #[test]
-    #[ignore = "FIXME(D): nested messages dropped; tree-sitter port must surface inner types"]
     fn iceberg_nested_message_extracted() {
         let extractor = ProtoExtractor::new();
         let content = r#"message Outer {
@@ -775,11 +937,10 @@ message Event {
         );
     }
 
-    /// Comment containing `{`: depth tracker counts the brace inside the
-    /// comment, so `find_block_end` walks past the real closing `}` and
-    /// returns the file-end fallback, producing a wrong body slice.
+    /// Comment containing `{`: the line scanner's depth tracker counted the
+    /// brace inside the comment, miscounted block end, and lost downstream
+    /// top-level messages. Tree-sitter ignores comments at the lexer level.
     #[test]
-    #[ignore = "FIXME(D): brace-in-comment miscounts depth; tree-sitter port respects comment scopes"]
     fn iceberg_brace_in_comment_does_not_break_depth() {
         let extractor = ProtoExtractor::new();
         let content = r#"message M {
