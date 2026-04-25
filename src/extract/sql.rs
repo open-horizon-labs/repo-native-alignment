@@ -427,4 +427,188 @@ CREATE TABLE posts (
         // Should return empty result, not error
         assert!(result.nodes.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Regression / iceberg suite for SQL extractor.
+    //
+    // Sibling exercise to the proto extractor's iceberg suite (#647 / #648).
+    // sql.rs delegates to sqlparser-rs (a real AST parser), so we don't expect
+    // proto-style panics. These tests verify edge-case behavior on weird-but-valid
+    // (and weird-and-invalid) inputs.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn regression_empty_file() {
+        let extractor = SqlExtractor::new();
+        let result = extractor.extract(Path::new("empty.sql"), "").unwrap();
+        assert!(result.nodes.is_empty());
+        assert!(result.edges.is_empty());
+    }
+
+    #[test]
+    fn regression_comment_only_line() {
+        let extractor = SqlExtractor::new();
+        let content = "-- just a comment\n";
+        let result = extractor.extract(Path::new("c.sql"), content).unwrap();
+        assert!(result.nodes.is_empty());
+    }
+
+    #[test]
+    fn regression_block_comment_only() {
+        let extractor = SqlExtractor::new();
+        let content = "/* block\n   comment */\n";
+        let result = extractor.extract(Path::new("c.sql"), content).unwrap();
+        assert!(result.nodes.is_empty());
+    }
+
+    #[test]
+    fn regression_single_line_empty_table() {
+        let extractor = SqlExtractor::new();
+        let content = "CREATE TABLE Foo();\n";
+        let result = extractor.extract(Path::new("e.sql"), content).unwrap();
+        let tables: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::SqlTable)
+            .collect();
+        assert_eq!(tables.len(), 1, "single-line empty table should be extracted");
+        assert_eq!(tables[0].id.name, "Foo");
+        let cols: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Other("sql_column".to_string()))
+            .collect();
+        assert!(cols.is_empty(), "empty table has zero columns");
+    }
+
+    #[test]
+    fn regression_single_line_table_with_column() {
+        let extractor = SqlExtractor::new();
+        let content = "CREATE TABLE Foo (id INT);\n";
+        let result = extractor.extract(Path::new("f.sql"), content).unwrap();
+        let tables: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::SqlTable)
+            .collect();
+        let cols: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Other("sql_column".to_string()))
+            .collect();
+        assert_eq!(tables.len(), 1);
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].id.name, "Foo.id");
+    }
+
+    #[test]
+    fn regression_create_if_not_exists() {
+        let extractor = SqlExtractor::new();
+        let content = "CREATE TABLE IF NOT EXISTS Foo (id INT);\n";
+        let result = extractor.extract(Path::new("f.sql"), content).unwrap();
+        let tables: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::SqlTable)
+            .collect();
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].id.name, "Foo");
+    }
+
+    #[test]
+    fn regression_drop_table_unhandled() {
+        // sqlparser-rs parses DROP fine; the extractor doesn't model drops.
+        // Test pins the behavior so a future feature is intentional, not accidental.
+        let extractor = SqlExtractor::new();
+        let content = "DROP TABLE Foo;\n";
+        let result = extractor.extract(Path::new("d.sql"), content).unwrap();
+        assert!(
+            result.nodes.is_empty(),
+            "DROP currently produces no nodes (documented; revisit if schema-history tracking is added)"
+        );
+    }
+
+    #[test]
+    fn regression_inline_foreign_key() {
+        let extractor = SqlExtractor::new();
+        let content = r#"
+CREATE TABLE users (id INT PRIMARY KEY);
+CREATE TABLE orders (
+    id INT PRIMARY KEY,
+    user_id INT REFERENCES users(id)
+);
+"#;
+        let result = extractor.extract(Path::new("fk.sql"), content).unwrap();
+        let deps: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::DependsOn)
+            .collect();
+        assert_eq!(deps.len(), 1, "inline REFERENCES should produce one DependsOn edge");
+        assert_eq!(deps[0].from.name, "orders");
+        assert_eq!(deps[0].to.name, "users");
+    }
+
+    #[test]
+    fn regression_self_referential_foreign_key() {
+        let extractor = SqlExtractor::new();
+        let content = r#"
+CREATE TABLE nodes (
+    id INT PRIMARY KEY,
+    parent_id INT,
+    FOREIGN KEY (parent_id) REFERENCES nodes(id)
+);
+"#;
+        let result = extractor.extract(Path::new("self.sql"), content).unwrap();
+        let deps: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::DependsOn)
+            .collect();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].from.name, "nodes");
+        assert_eq!(deps[0].to.name, "nodes", "self-FK target should be the same table");
+    }
+
+    #[test]
+    fn regression_create_alter_create_in_one_file() {
+        let extractor = SqlExtractor::new();
+        let content = r#"
+CREATE TABLE users (id INT);
+ALTER TABLE users ADD COLUMN name VARCHAR(255);
+CREATE TABLE posts (id INT);
+"#;
+        let result = extractor.extract(Path::new("multi.sql"), content).unwrap();
+        let tables: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::SqlTable)
+            .collect();
+        let alters: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::Other("sql_alter".to_string()))
+            .collect();
+        assert_eq!(tables.len(), 2, "both CREATEs produce table nodes");
+        assert_eq!(alters.len(), 1, "the ALTER produces an alter node");
+    }
+
+    #[test]
+    fn regression_postgres_serial_under_generic_dialect_is_graceful() {
+        // Postgres `SERIAL` may or may not parse under GenericDialect across
+        // sqlparser versions. Either way the extractor must not panic; if the
+        // statement parses, we get a table node; if it fails, we get empty.
+        let extractor = SqlExtractor::new();
+        let content = "CREATE TABLE Foo (id SERIAL PRIMARY KEY);\n";
+        let result = extractor.extract(Path::new("pg.sql"), content).unwrap();
+        let table_count = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::SqlTable)
+            .count();
+        assert!(
+            table_count <= 1,
+            "SERIAL handling should stay graceful: at most one table node, got {table_count}"
+        );
+    }
 }

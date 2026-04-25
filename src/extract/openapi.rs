@@ -562,4 +562,200 @@ definitions:
         assert!(!endpoints.is_empty());
         assert_eq!(endpoints[0].language, "openapi");
     }
+
+    // -----------------------------------------------------------------------
+    // Regression / iceberg suite for OpenAPI extractor.
+    //
+    // Sibling exercise to the proto extractor's iceberg suite (#647 / #648).
+    // openapi.rs uses serde_yaml / serde_json (real parsers), so panics from
+    // hand-rolled scanning aren't expected. These tests verify edge-case
+    // behavior on weird-but-valid (and weird-and-invalid) inputs.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn regression_empty_paths_object() {
+        let extractor = OpenApiExtractor::new();
+        let content = "openapi: 3.0.0\ninfo:\n  title: T\n  version: 1\npaths: {}\n";
+        let result = extractor.extract(Path::new("e.yaml"), content).unwrap();
+        let endpoints: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert!(endpoints.is_empty(), "empty paths block produces no endpoints");
+    }
+
+    #[test]
+    fn regression_same_path_multiple_methods() {
+        let extractor = OpenApiExtractor::new();
+        let content = r#"openapi: 3.0.0
+info:
+  title: T
+  version: 1
+paths:
+  /users:
+    get:
+      summary: list
+    post:
+      summary: create
+    delete:
+      summary: drop_all
+"#;
+        let result = extractor.extract(Path::new("x.yaml"), content).unwrap();
+        let endpoints: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(endpoints.len(), 3, "three methods on same path = three endpoints");
+        let names: Vec<&str> = endpoints.iter().map(|n| n.id.name.as_str()).collect();
+        assert!(names.contains(&"GET /users"));
+        assert!(names.contains(&"POST /users"));
+        assert!(names.contains(&"DELETE /users"));
+    }
+
+    #[test]
+    fn regression_path_with_curly_braces() {
+        let extractor = OpenApiExtractor::new();
+        let content = r#"openapi: 3.0.0
+info:
+  title: T
+  version: 1
+paths:
+  /users/{id}:
+    get:
+      summary: by_id
+"#;
+        let result = extractor.extract(Path::new("x.yaml"), content).unwrap();
+        let endpoints: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].id.name, "GET /users/{id}");
+    }
+
+    #[test]
+    fn regression_path_with_parameters_block_only() {
+        // Per OpenAPI spec, a path may have a `parameters` key alongside HTTP
+        // methods (shared params for all methods on that path). This must NOT
+        // produce a phantom "PARAMETERS /x" endpoint.
+        let extractor = OpenApiExtractor::new();
+        let content = r#"openapi: 3.0.0
+info:
+  title: T
+  version: 1
+paths:
+  /users:
+    parameters:
+      - name: trace_id
+        in: header
+    get:
+      summary: list
+"#;
+        let result = extractor.extract(Path::new("x.yaml"), content).unwrap();
+        let endpoints: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert_eq!(endpoints.len(), 1, "only GET counts as an endpoint, not the path-level parameters block");
+        assert_eq!(endpoints[0].id.name, "GET /users");
+    }
+
+    #[test]
+    fn regression_local_ref_emits_dependson_edge() {
+        let extractor = OpenApiExtractor::new();
+        let content = r#"openapi: 3.0.0
+info:
+  title: T
+  version: 1
+paths:
+  /users:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/User'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+components:
+  schemas:
+    User:
+      type: object
+      properties:
+        id:
+          type: integer
+"#;
+        let result = extractor.extract(Path::new("x.yaml"), content).unwrap();
+        let deps: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::DependsOn)
+            .collect();
+        assert!(
+            !deps.is_empty(),
+            "endpoint that $refs a schema should produce at least one DependsOn edge"
+        );
+        assert!(deps.iter().all(|e| e.to.name == "User"));
+    }
+
+    #[test]
+    fn regression_pure_json_schema_no_paths() {
+        // A bare JSON Schema document triggers `can_handle` (via $schema) but
+        // has no `paths`. Should extract no endpoints; schemas under `definitions`
+        // (Swagger-style) get picked up if present, otherwise nothing.
+        let extractor = OpenApiExtractor::new();
+        let content = r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "User",
+  "type": "object",
+  "properties": { "id": { "type": "integer" } }
+}
+"#;
+        assert!(
+            extractor.can_handle(Path::new("u.json"), content),
+            "JSON Schema marker should pass can_handle gate"
+        );
+        let result = extractor.extract(Path::new("u.json"), content).unwrap();
+        let endpoints: Vec<_> = result
+            .nodes
+            .iter()
+            .filter(|n| n.id.kind == NodeKind::ApiEndpoint)
+            .collect();
+        assert!(endpoints.is_empty(), "bare JSON Schema has no API endpoints");
+    }
+
+    #[test]
+    fn regression_invalid_yaml_with_openapi_marker_returns_error() {
+        // can_handle() returns true (matches "openapi:" in first 50 lines) but
+        // the body isn't valid YAML. extract() must return Err, not panic.
+        let extractor = OpenApiExtractor::new();
+        let content = "openapi: 3.0.0\nthis: is: not: valid: yaml: at: all\n";
+        assert!(
+            extractor.can_handle(Path::new("bad.yaml"), content),
+            "openapi marker should pass can_handle gate even when YAML body is invalid"
+        );
+        let outcome = extractor.extract(Path::new("bad.yaml"), content);
+        assert!(
+            outcome.is_err(),
+            "invalid YAML must surface as Err, not silently succeed; got {:?}",
+            outcome.map(|r| r.nodes.len())
+        );
+    }
+
+    #[test]
+    fn regression_empty_file() {
+        // Empty file: can_handle() is false (no marker). Even if extract() were
+        // called directly, serde_yaml treats empty input as Null.
+        let extractor = OpenApiExtractor::new();
+        // can_handle should be false for genuinely empty content
+        assert!(!extractor.can_handle(Path::new("e.yaml"), ""));
+    }
 }
