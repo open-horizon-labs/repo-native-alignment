@@ -8,7 +8,31 @@ use anyhow::{Context, Result, bail};
 use gray_matter::{Matter, ParsedEntity, engine::YAML};
 use serde::{Deserialize, Serialize};
 
-const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Default timeout for child processes spawned by ADR validation (cargo test,
+/// scripts, smoke fixtures, `cargo test -- --list`).
+///
+/// Override with `RNA_ADR_CHILD_TIMEOUT_MS` (parsed once on first use). On parse
+/// failure the default is used and a warning is written to stderr. Setting `0`
+/// disables the override and reverts to the default.
+const DEFAULT_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn command_timeout() -> std::time::Duration {
+    static CACHED: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("RNA_ADR_CHILD_TIMEOUT_MS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => DEFAULT_COMMAND_TIMEOUT,
+            Ok(ms) => std::time::Duration::from_millis(ms),
+            Err(err) => {
+                eprintln!(
+                    "warning: invalid RNA_ADR_CHILD_TIMEOUT_MS={raw:?} ({err}); using default {}s",
+                    DEFAULT_COMMAND_TIMEOUT.as_secs()
+                );
+                DEFAULT_COMMAND_TIMEOUT
+            }
+        },
+        Err(_) => DEFAULT_COMMAND_TIMEOUT,
+    })
+}
 const GENERATED_DIR: &str = ".oh/adr-validation";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,7 +383,7 @@ pub fn validate(
                 .arg("--")
                 .arg("--exact")
                 .current_dir(repo_root);
-            let output = run_command_with_timeout(&mut command, COMMAND_TIMEOUT)
+            let output = run_command_with_timeout(&mut command, command_timeout())
                 .with_context(|| format!("running cargo test {}", test_name))?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -373,7 +397,7 @@ pub fn validate(
                 details: if ok {
                     "passed".to_string()
                 } else if output.timed_out {
-                    format!("timed out after {}s", COMMAND_TIMEOUT.as_secs())
+                    format!("timed out after {}s", command_timeout().as_secs())
                 } else if output.success {
                     "command succeeded but did not run exactly one test".to_string()
                 } else {
@@ -409,7 +433,7 @@ pub fn validate(
                 Command::new(&script_path)
             };
             command.current_dir(repo_root);
-            let output = run_command_with_timeout(&mut command, COMMAND_TIMEOUT)
+            let output = run_command_with_timeout(&mut command, command_timeout())
                 .with_context(|| format!("running script {}", script))?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -421,7 +445,7 @@ pub fn validate(
                 details: if ok {
                     "passed".to_string()
                 } else if output.timed_out {
-                    format!("timed out after {}s", COMMAND_TIMEOUT.as_secs())
+                    format!("timed out after {}s", command_timeout().as_secs())
                 } else {
                     summarize_command_output(&stdout, &stderr)
                 },
@@ -440,7 +464,7 @@ pub fn validate(
                 .arg("--repo")
                 .arg(repo_root.join(fixture))
                 .current_dir(repo_root);
-            let output = run_command_with_timeout(&mut command, COMMAND_TIMEOUT)
+            let output = run_command_with_timeout(&mut command, command_timeout())
                 .with_context(|| format!("running smoke fixture {}", fixture))?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -452,7 +476,7 @@ pub fn validate(
                 details: if ok {
                     "passed".to_string()
                 } else if output.timed_out {
-                    format!("timed out after {}s", COMMAND_TIMEOUT.as_secs())
+                    format!("timed out after {}s", command_timeout().as_secs())
                 } else {
                     summarize_command_output(&stdout, &stderr)
                 },
@@ -692,16 +716,23 @@ fn render_readme(adrs: &[ParsedAdr]) -> String {
 }
 
 fn list_cargo_tests(repo_root: &Path, cargo_args: &[String]) -> Result<BTreeSet<String>> {
-    let output = Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .arg("test")
         .args(cargo_args)
         .arg("--")
         .arg("--list")
-        .current_dir(repo_root)
-        .output()
+        .current_dir(repo_root);
+    let output = run_command_with_timeout(&mut command, command_timeout())
         .context("listing cargo tests for ADR validation")?;
 
-    if !output.status.success() {
+    if output.timed_out {
+        bail!(
+            "`cargo test -- --list` timed out after {}s",
+            command_timeout().as_secs()
+        );
+    }
+    if !output.success {
         bail!(
             "`cargo test -- --list` failed: {}",
             summarize_command_output(
