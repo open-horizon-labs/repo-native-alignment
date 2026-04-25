@@ -282,7 +282,7 @@ fn collect_attribute_names<'a>(
         // Only emit when the attribute access is the callee of a call expression.
         // When call_filter is None (language has no call_expr_kinds configured),
         // fall back to including all accesses rather than silently dropping them.
-        let in_call_position = call_filter.map_or(true, |(call_kind, callee_field)| {
+        let in_call_position = call_filter.is_none_or(|(call_kind, callee_field)| {
             node.parent()
                 .map(|parent| {
                     parent.kind() == call_kind
