@@ -397,7 +397,7 @@ pub fn validate(
                 details: if ok {
                     "passed".to_string()
                 } else if output.timed_out {
-                    format!("timed out after {}s", command_timeout().as_secs())
+                    format!("timed out after {:?}", command_timeout())
                 } else if output.success {
                     "command succeeded but did not run exactly one test".to_string()
                 } else {
@@ -549,7 +549,7 @@ fn run_command_with_timeout(
                 stderr.push(b'\n');
             }
             stderr.extend_from_slice(
-                format!("command timed out after {}s", timeout.as_secs()).as_bytes(),
+                format!("command timed out after {timeout:?}").as_bytes(),
             );
             return Ok(TimedCommandOutput {
                 stdout: output.stdout,
@@ -728,8 +728,8 @@ fn list_cargo_tests(repo_root: &Path, cargo_args: &[String]) -> Result<BTreeSet<
 
     if output.timed_out {
         bail!(
-            "`cargo test -- --list` timed out after {}s",
-            command_timeout().as_secs()
+            "`cargo test -- --list` timed out after {:?}",
+            command_timeout()
         );
     }
     if !output.success {
