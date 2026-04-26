@@ -3865,4 +3865,202 @@ mod tests {
             "Non-FastAPI repo must not have 'fastapi' in detected_frameworks"
         );
     }
+    /// Functional + diagnostic regression coverage for the post-extraction ADR
+    /// validation passes added in PR #641. Per repo policy, a new post-extraction
+    /// pass on the hot path must demonstrate it does not unexpectedly slow down
+    /// scans on a 100k+ node repo.
+    ///
+    /// Pass/fail is deterministic and based on edge identity, not wall-clock:
+    /// the forward pass must produce exactly one `References` edge from the
+    /// seeded ADR section to the seeded test function, and the backward pass
+    /// must produce zero edges (no `adr_refs` metadata in the fixture). Any
+    /// functional regression — including edge-kind/source/target drift or an
+    /// O(N^2) slowdown that breaks the seeded match — fails the test.
+    ///
+    /// Wall-clock timing for `tested_by_pass` (the largest existing post-
+    /// extraction consumer) and the ADR passes is captured as a `println!`
+    /// diagnostic so reviewers and CI logs can spot a hot-path regression at a
+    /// glance, but is not asserted on (host-load dependent).
+    #[test]
+    fn test_adr_passes_scan_time_regression() {
+        use crate::extract::markdown::{adr_backreference_pass, adr_validation_pass};
+        use crate::extract::naming_convention::tested_by_pass;
+        use crate::graph::{ExtractionSource, Node, NodeId, NodeKind};
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+        use std::time::Instant;
+
+        // Build a 100k-node fixture: production functions plus test functions
+        // with `is_test` and `test_path` metadata, plus a single ADR markdown
+        // pair (frontmatter + section).
+        //
+        // The test functions deliberately omit `adr_refs` metadata so the
+        // backward pass exercises the no-match path on every test node — the
+        // O(N) traversal we want to time, not a tiny match-and-emit hot loop.
+        // The forward pass exercises the match path via the seeded frontmatter
+        // entry that points at `module_0::tests::test_process_event_0`.
+        const N: usize = 100_000;
+        let mut nodes: Vec<Node> = Vec::with_capacity(N + 4);
+
+        // Half production fns, half test fns.
+        for i in 0..N / 2 {
+            nodes.push(Node {
+                id: NodeId {
+                    root: "app".to_string(),
+                    file: PathBuf::from(format!("src/module_{i}.rs")),
+                    name: format!("process_event_{i}"),
+                    kind: NodeKind::Function,
+                },
+                language: "rust".to_string(),
+                line_start: 1,
+                line_end: 1,
+                signature: String::new(),
+                body: String::new(),
+                metadata: BTreeMap::new(),
+                source: ExtractionSource::TreeSitter,
+            });
+            nodes.push(Node {
+                id: NodeId {
+                    root: "app".to_string(),
+                    file: PathBuf::from(format!("src/module_{i}.rs")),
+                    name: format!("test_process_event_{i}"),
+                    kind: NodeKind::Function,
+                },
+                language: "rust".to_string(),
+                line_start: 2,
+                line_end: 2,
+                signature: String::new(),
+                body: String::new(),
+                metadata: BTreeMap::from([
+                    ("is_test".to_string(), "true".to_string()),
+                    (
+                        "test_path".to_string(),
+                        format!("module_{i}::tests::test_process_event_{i}"),
+                    ),
+                ]),
+                source: ExtractionSource::TreeSitter,
+            });
+        }
+
+        // Seed one ADR pair so the passes have at least one match to discover.
+        let adr_path = PathBuf::from("docs/ADRs/001-perf.md");
+        nodes.push(Node {
+            id: NodeId {
+                root: "app".to_string(),
+                file: adr_path.clone(),
+                name: "frontmatter".to_string(),
+                kind: NodeKind::MarkdownSection,
+            },
+            language: "markdown".to_string(),
+            line_start: 1,
+            line_end: 4,
+            signature: "[frontmatter]".to_string(),
+            body: "validate:\n  cargo_tests:\n    - module_0::tests::test_process_event_0\n".to_string(),
+            metadata: BTreeMap::from([("is_frontmatter".to_string(), "true".to_string())]),
+            source: ExtractionSource::Markdown,
+        });
+        nodes.push(Node {
+            id: NodeId {
+                root: "app".to_string(),
+                file: adr_path,
+                name: "Performance ADR".to_string(),
+                kind: NodeKind::MarkdownSection,
+            },
+            language: "markdown".to_string(),
+            line_start: 6,
+            line_end: 12,
+            signature: "# Performance ADR".to_string(),
+            body: String::new(),
+            metadata: BTreeMap::new(),
+            source: ExtractionSource::Markdown,
+        });
+
+        // Warm up: each pass once, results discarded.
+        let _ = tested_by_pass(&nodes);
+        let _ = adr_validation_pass(&nodes);
+        let _ = adr_backreference_pass(&nodes);
+
+        // Median of 3 runs each to dampen noise.
+        let median = |mut v: Vec<u128>| {
+            v.sort_unstable();
+            v[1]
+        };
+        let baseline_ns = median(
+            (0..3)
+                .map(|_| {
+                    let t = Instant::now();
+                    let _ = tested_by_pass(&nodes);
+                    t.elapsed().as_nanos()
+                })
+                .collect(),
+        );
+        let forward_ns = median(
+            (0..3)
+                .map(|_| {
+                    let t = Instant::now();
+                    let _ = adr_validation_pass(&nodes);
+                    t.elapsed().as_nanos()
+                })
+                .collect(),
+        );
+        let backward_ns = median(
+            (0..3)
+                .map(|_| {
+                    let t = Instant::now();
+                    let _ = adr_backreference_pass(&nodes);
+                    t.elapsed().as_nanos()
+                })
+                .collect(),
+        );
+        let adr_ns = forward_ns + backward_ns;
+
+        // Functional assertions: tight identity checks on the seeded edge.
+        // Drifting kind/from/to (e.g. wrong NodeKind, swapped src/dst, broken
+        // root scoping) all surface here, not just count regressions.
+        use crate::graph::EdgeKind;
+        let edges_forward = adr_validation_pass(&nodes);
+        let edges_backward = adr_backreference_pass(&nodes);
+        assert_eq!(
+            edges_forward.len(),
+            1,
+            "forward pass should match the seeded cargo_test entry"
+        );
+        let edge = &edges_forward[0];
+        assert_eq!(edge.kind, EdgeKind::References, "edge kind must be References");
+        assert_eq!(edge.from.root, "app", "edge must originate in seeded root");
+        assert_eq!(
+            edge.from.file,
+            PathBuf::from("docs/ADRs/001-perf.md"),
+            "edge must originate from the seeded ADR file"
+        );
+        assert_eq!(
+            edge.to.root, "app",
+            "edge target must be in seeded root (no cross-root link)"
+        );
+        assert_eq!(
+            edge.to.name, "test_process_event_0",
+            "edge must target the test function named by the seeded cargo_tests entry"
+        );
+        assert_eq!(
+            edges_backward.len(),
+            0,
+            "backward pass: no adr_refs metadata seeded, expected 0 edges"
+        );
+
+        // Timing diagnostics: print baseline/ADR/ratio for the 100k-node fixture
+        // so reviewers and CI logs can spot a regression at a glance, but do not
+        // gate the test on wall-clock measurements (host-load dependent, flaky).
+        // The pass/fail conditions above are deterministic: edge counts on the
+        // seeded fixture must be exactly correct. An accidental O(N^2) regression
+        // would surface either as a timeout in CI's overall test-run budget or
+        // as an out-of-bounds ratio in the diagnostic line below; the human
+        // reviewer or a downstream perf job can act on it.
+        let baseline_ms = baseline_ns as f64 / 1_000_000.0;
+        let adr_ms = adr_ns as f64 / 1_000_000.0;
+        let ratio = adr_ns as f64 / baseline_ns.max(1) as f64;
+        println!(
+            "adr_passes_scan_time: tested_by={baseline_ms:.2}ms, adr={adr_ms:.2}ms, ratio={ratio:.2}x ({N} nodes)"
+        );
+    }
+
 }

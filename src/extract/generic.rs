@@ -1497,7 +1497,11 @@ fn normalize_adr_ref(raw: &str, is_id: bool) -> Option<PathBuf> {
     }
 
     if is_id {
-        return Some(PathBuf::from("docs/ADRs").join(format!("{}.md", trimmed)));
+        // Tolerate authors who already include the `.md` suffix in `ADR-ID:`
+        // values; without this strip, `ADR-ID: 001-foo.md` would resolve to
+        // `docs/ADRs/001-foo.md.md` and silently fail lookup.
+        let id = trimmed.strip_suffix(".md").unwrap_or(trimmed);
+        return Some(PathBuf::from("docs/ADRs").join(format!("{id}.md")));
     }
 
     if !trimmed.ends_with(".md") {
@@ -6083,6 +6087,16 @@ async fn my_async_test() {}
         );
     }
 
+    /// The non-test metadata gate must keep `adr_refs` off non-test functions.
+    /// `parse_adr_refs` would otherwise pull ADR paths out of any function's doc
+    /// comment, allowing the backref pass to draw spurious `References` edges
+    /// from helpers that merely *mention* an ADR in their narrative.
+    ///
+    /// The original assertion only checked that no `EdgeKind::References` edge
+    /// was emitted from `helper`, but `GenericExtractor` never emits References
+    /// edges directly (those come from the markdown post-extraction pass), so
+    /// it would pass even if `adr_refs` were attached to non-test fns. Both
+    /// invariants are now asserted explicitly.
     #[test]
     fn test_non_test_function_doc_comment_does_not_emit_adr_reference() {
         use crate::extract::rust::RUST_CONFIG;
@@ -6094,14 +6108,38 @@ fn helper() {}
             .run(Path::new("lib.rs"), code)
             .unwrap();
 
+        let helper = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "helper")
+            .expect("helper node should be extracted");
+        assert!(
+            helper.metadata.get("adr_refs").is_none(),
+            "non-test functions must not carry adr_refs metadata; got: {:?}",
+            helper.metadata.get("adr_refs")
+        );
         assert!(
             !result
                 .edges
                 .iter()
-                .any(|e| e.kind == EdgeKind::References && e.from.name == "helper")
+                .any(|e| e.kind == EdgeKind::References && e.from.name == "helper"),
+            "non-test fn must not produce References edges directly"
         );
     }
 
+    #[test]
+    fn test_normalize_adr_id_strips_redundant_md_suffix() {
+        // ADR-ID: 001-foo and ADR-ID: 001-foo.md must resolve to the same path.
+        // Without the strip, the second form silently produced .md.md and missed
+        // every lookup against real markdown nodes.
+        let plain = normalize_adr_ref("001-foo", true).unwrap();
+        let with_md = normalize_adr_ref("001-foo.md", true).unwrap();
+        assert_eq!(plain, PathBuf::from("docs/ADRs/001-foo.md"));
+        assert_eq!(with_md, PathBuf::from("docs/ADRs/001-foo.md"));
+        assert_eq!(plain, with_md);
+    }
+
+    
     #[test]
     fn test_parse_adr_refs_supports_path_and_id() {
         let refs = parse_adr_refs(
