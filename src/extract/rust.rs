@@ -128,12 +128,8 @@ impl Extractor for RustExtractor {
         // Generic pass: function/struct/field/const/import/etc. + string literals.
         let mut result = GenericExtractor::new(&RUST_CONFIG).run(path, content)?;
 
-        // Rust-specific: enrich extracted test functions with exact `cargo test -- --list`
-        // style paths so ADR frontmatter can reference real tests unambiguously.
-        enrich_test_paths(path, &mut result.nodes);
-
-        // Rust-specific: topology pattern detection (subprocess, network, async)
-        // and static item metadata enrichment.
+        // Rust-specific: topology pattern detection (subprocess, network, async),
+        // static item metadata enrichment, and test_path resolution.
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
         if let Some(tree) = parser.parse(content, None) {
@@ -144,39 +140,171 @@ impl Extractor for RustExtractor {
                 &mut result.edges,
             );
             enrich_static_metadata(tree.root_node(), content.as_bytes(), &mut result.nodes);
+            // Compute exact `cargo test -- --list` style paths from the AST.
+            // Walks enclosing `mod_item` ancestors so tests inside
+            // `#[cfg(test)] mod tests { ... }` get the correct `tests::` segment.
+            enrich_test_paths(path, tree.root_node(), content.as_bytes(), &mut result.nodes);
         }
 
         Ok(result)
     }
 }
 
-fn enrich_test_paths(path: &Path, nodes: &mut [crate::graph::Node]) {
+/// Metadata key for the resolved `cargo test -- --list` style path.
+/// Hoisted out of the per-node loop in `enrich_test_paths` to avoid an
+/// allocation on every iteration over potentially thousands of test nodes.
+const TEST_PATH_KEY: &str = "test_path";
+
+/// Walk the AST to assign each test function a `cargo test -- --list` style path.
+///
+/// The path is `<module-segments-from-file-path>::<enclosing-mod-names>::<scope>::<name>`,
+/// where:
+/// - module segments come from `rust_module_segments(path)`
+/// - enclosing `mod_item` names accumulate as we descend the AST
+/// - `scope` (impl/struct/enum/trait) is read from existing `parent_scope`
+///   metadata (set by the generic extractor for those node kinds)
+///
+/// Walking the AST is required because the generic extractor only sets
+/// `parent_scope` for impl/struct/enum/trait blocks; tests inside
+/// `#[cfg(test)] mod tests { ... }` would otherwise miss the `tests::` segment
+/// that libtest reports.
+fn enrich_test_paths(
+    path: &Path,
+    root: tree_sitter::Node,
+    source: &[u8],
+    nodes: &mut [crate::graph::Node],
+) {
     let base_segments = rust_module_segments(path);
 
-    for node in nodes.iter_mut() {
-        if node.id.kind != NodeKind::Function
-            || node.language != "rust"
-            || node.metadata.get("is_test").map(|value| value.as_str()) != Some("true")
+    // Build a (name, line_start) -> nodes-index map for O(1) lookup.
+    // Multiple test fns can share a name across mods, so values are Vec<usize>.
+    let mut by_name_line: std::collections::HashMap<(String, usize), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, n) in nodes.iter().enumerate() {
+        if n.id.kind == NodeKind::Function
+            && n.language == "rust"
+            && n.metadata.get("is_test").map(|v| v.as_str()) == Some("true")
         {
-            continue;
+            by_name_line
+                .entry((n.id.name.clone(), n.line_start))
+                .or_default()
+                .push(i);
         }
+    }
 
-        let mut segments = base_segments.clone();
-        if let Some(scope) = node.metadata.get("parent_scope") {
-            let scope = scope.trim();
-            if !scope.is_empty()
-                && !scope.contains(" for ")
-                && segments.last().is_none_or(|last| last != scope)
-            {
-                segments.push(scope.to_string());
+    enrich_test_paths_walk(
+        root,
+        source,
+        &base_segments,
+        &mut Vec::new(),
+        nodes,
+        &by_name_line,
+    );
+}
+
+fn enrich_test_paths_walk(
+    node: tree_sitter::Node,
+    source: &[u8],
+    base_segments: &[String],
+    mod_stack: &mut Vec<String>,
+    nodes: &mut [crate::graph::Node],
+    by_name_line: &std::collections::HashMap<(String, usize), Vec<usize>>,
+) {
+    let kind = node.kind();
+
+    if kind == "mod_item" {
+        let name = node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+            .unwrap_or("");
+        if name.is_empty() {
+            // Anonymous mods are unusual; descend without pushing.
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    enrich_test_paths_walk(
+                        child,
+                        source,
+                        base_segments,
+                        mod_stack,
+                        nodes,
+                        by_name_line,
+                    );
+                }
+            }
+            return;
+        }
+        mod_stack.push(name.to_string());
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i as u32) {
+                enrich_test_paths_walk(
+                    child,
+                    source,
+                    base_segments,
+                    mod_stack,
+                    nodes,
+                    by_name_line,
+                );
             }
         }
-        segments.push(node.id.name.clone());
-        node.metadata
-            .insert("test_path".to_string(), segments.join("::"));
+        mod_stack.pop();
+        return;
+    }
+
+    if kind == "function_item" {
+        let name = node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+            .unwrap_or("");
+        let line = node.start_position().row + 1;
+        if !name.is_empty()
+            && let Some(indices) = by_name_line.get(&(name.to_string(), line))
+        {
+            for &idx in indices {
+                let mut segments: Vec<String> = base_segments.to_vec();
+                segments.extend(mod_stack.iter().cloned());
+                if let Some(scope) = nodes[idx].metadata.get("parent_scope") {
+                    let scope = scope.trim();
+                    if !scope.is_empty()
+                        && !scope.contains(" for ")
+                        && segments.last().is_none_or(|last| last != scope)
+                    {
+                        segments.push(scope.to_string());
+                    }
+                }
+                segments.push(nodes[idx].id.name.clone());
+                nodes[idx]
+                    .metadata
+                    .insert(TEST_PATH_KEY.to_string(), segments.join("::"));
+            }
+        }
+        // Don't recurse into function bodies (no nested mod_items expected
+        // and a stray local fn shouldn't pollute mod_stack).
+        return;
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            enrich_test_paths_walk(
+                child,
+                source,
+                base_segments,
+                mod_stack,
+                nodes,
+                by_name_line,
+            );
+        }
     }
 }
 
+/// Compute the Rust module-path prefix for `path`, matching what `cargo test`
+/// uses when listing tests with `-- --list`.
+///
+/// Examples:
+/// - `src/extract/event_bus.rs` -> `["extract", "event_bus"]`
+/// - `src/extract/mod.rs`        -> `["extract"]`
+/// - `tests/integration.rs`     -> `["integration"]`
+/// - `src/lib.rs` / `src/main.rs` -> `[]` (libtest emits these as `tests::name`,
+///   not `lib::tests::name` / `main::tests::name`)
 fn rust_module_segments(path: &Path) -> Vec<String> {
     let mut parts: Vec<String> = path
         .iter()
@@ -196,6 +324,13 @@ fn rust_module_segments(path: &Path) -> Vec<String> {
     }
 
     if parts.last().is_some_and(|last| last == "mod") {
+        parts.pop();
+    }
+
+    // Crate-root files (lib.rs, main.rs) contribute no module segment in
+    // libtest's listing: tests in `src/lib.rs` are reported as `tests::name`,
+    // not `lib::tests::name`. Same for `src/main.rs`.
+    if parts.len() == 1 && (parts[0] == "lib" || parts[0] == "main") {
         parts.pop();
     }
 
@@ -1439,4 +1574,89 @@ impl Display for Foo {
             );
         }
     }
+    // -----------------------------------------------------------------------
+    // rust_module_segments / enrich_test_paths boundary handling
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rust_module_segments_typical_paths() {
+        assert_eq!(
+            rust_module_segments(Path::new("src/extract/event_bus.rs")),
+            vec!["extract".to_string(), "event_bus".to_string()]
+        );
+        assert_eq!(
+            rust_module_segments(Path::new("src/extract/mod.rs")),
+            vec!["extract".to_string()]
+        );
+        assert_eq!(
+            rust_module_segments(Path::new("tests/integration.rs")),
+            vec!["integration".to_string()]
+        );
+    }
+
+    /// `cargo test -- --list` reports tests in `src/lib.rs` and `src/main.rs`
+    /// without a `lib::` / `main::` prefix (e.g. `tests::it_works`, not
+    /// `lib::tests::it_works`). The module segments must therefore be empty for
+    /// these crate-root files so the resolved `test_path` matches the listing.
+    #[test]
+    fn test_rust_module_segments_lib_main_boundary() {
+        assert_eq!(
+            rust_module_segments(Path::new("src/lib.rs")),
+            Vec::<String>::new(),
+            "src/lib.rs must produce no module segments"
+        );
+        assert_eq!(
+            rust_module_segments(Path::new("src/main.rs")),
+            Vec::<String>::new(),
+            "src/main.rs must produce no module segments"
+        );
+    }
+
+    #[test]
+    fn test_enrich_test_paths_lib_root() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn it_works() {}
+}
+"#;
+        let result = extractor.extract(Path::new("src/lib.rs"), code).unwrap();
+        let it_works = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "it_works")
+            .expect("it_works should be extracted");
+        assert_eq!(
+            it_works.metadata.get("test_path").map(|s| s.as_str()),
+            Some("tests::it_works"),
+            "src/lib.rs test must resolve to `tests::it_works` (cargo's --list format)"
+        );
+    }
+
+    #[test]
+    fn test_enrich_test_paths_nested_module() {
+        let extractor = RustExtractor::new();
+        let code = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_depth_first_ordering() {}
+}
+"#;
+        let result = extractor
+            .extract(Path::new("src/extract/event_bus.rs"), code)
+            .unwrap();
+        let test = result
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "test_depth_first_ordering")
+            .expect("test should be extracted");
+        assert_eq!(
+            test.metadata.get("test_path").map(|s| s.as_str()),
+            Some("extract::event_bus::tests::test_depth_first_ordering")
+        );
+    }
+
 }
