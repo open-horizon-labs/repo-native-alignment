@@ -3885,14 +3885,19 @@ mod tests {
         use std::path::PathBuf;
         use std::time::Instant;
 
-        // Build a 100k-node fixture: production functions, test functions with
-        // adr_refs metadata and test_path metadata, plus a single ADR markdown
+        // Build a 100k-node fixture: production functions plus test functions
+        // with `is_test` and `test_path` metadata, plus a single ADR markdown
         // pair (frontmatter + section).
+        //
+        // The test functions deliberately omit `adr_refs` metadata so the
+        // backward pass exercises the no-match path on every test node — the
+        // O(N) traversal we want to time, not a tiny match-and-emit hot loop.
+        // The forward pass exercises the match path via the seeded frontmatter
+        // entry that points at `module_0::tests::test_process_event_0`.
         const N: usize = 100_000;
         let mut nodes: Vec<Node> = Vec::with_capacity(N + 4);
 
-        // Half production fns, half test fns. Test fns reference the ADR via
-        // adr_refs metadata so the backref pass has work to do.
+        // Half production fns, half test fns.
         for i in 0..N / 2 {
             nodes.push(Node {
                 id: NodeId {
