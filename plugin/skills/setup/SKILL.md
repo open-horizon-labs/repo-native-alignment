@@ -131,9 +131,15 @@ fi
 If frameworks were detected, assert real coverage in `.oh/extractors/` by searching extractor file **contents** (not just listing filenames). The check below sets `EXTRACTOR_COVERAGE` to the list of frameworks already covered, then computes the gap; both branches exit zero so chained pipelines do not abort.
 
 ```bash
-if [ -n "$DETECTED_FRAMEWORKS" ] && [ -d .oh/extractors ]; then
-  EXTRACTOR_COVERAGE=$(grep -RhoiE "$FRAMEWORK_PATTERN" .oh/extractors/ 2>/dev/null \
-    | sort -u || true)
+if [ -n "$DETECTED_FRAMEWORKS" ]; then
+  if [ -d .oh/extractors ]; then
+    EXTRACTOR_COVERAGE=$(grep -RhoiE "$FRAMEWORK_PATTERN" .oh/extractors/ 2>/dev/null \
+      | sort -u || true)
+  else
+    # Treat missing dir as zero coverage so the gap output names every detected
+    # framework. Do not exit non-zero — chained automated setup must continue.
+    EXTRACTOR_COVERAGE=""
+  fi
   GAP=$(comm -23 <(echo "$DETECTED_FRAMEWORKS") <(echo "$EXTRACTOR_COVERAGE"))
   if [ -z "$GAP" ]; then
     echo "All detected frameworks have extractor coverage."

@@ -32,7 +32,7 @@ Putting it in `plugin/skills/` keeps the heuristic visible to the agent that run
 The skill's accuracy is bounded by the graph it queries. If LSP enrichment did not run (or aborted), the graph has only structural edges (`Defines`, `Contains`, `BelongsTo`) — no `Calls`, no `ReferencedBy`. Every function then looks dead. The skill's Step 0 verifies LSP enrichment completed before any candidate analysis; if call-edge counts are zero in the scan output, the skill aborts with a clear message rather than producing a false-positive avalanche.
 
 Run order for trustworthy results:
-```
+```bash
 repo-native-alignment scan --repo <path> --full
 # Confirm scan output reports non-zero LSP call edges before invoking /dead-code.
 ```
