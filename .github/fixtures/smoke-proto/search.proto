@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+// Smoke fixture for the proto extractor (#648). Asserts that messages and
+// fields surface as graph nodes after a scan.
+
+message SearchRequest {
+  string query = 1;
+  int32 page_number = 2;
+  int32 result_per_page = 3;
+}
+
+message SearchResponse {
+  repeated string results = 1;
+}

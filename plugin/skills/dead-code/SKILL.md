@@ -23,22 +23,31 @@ Examples:
 
 ## Procedure
 
-### Step 0: Check LSP enrichment health
+### Step 0: Verify LSP enrichment completed (precondition)
 
-Before analyzing, verify the repo has completed a full scan with LSP enrichment. Use scan logs — not symbol output — because normal `search` output does not expose edge provenance (`source: Lsp`).
+This skill assumes the repo has been scanned with `--full` and that LSP enrichment produced `Calls` / `ReferencedBy` edges. Without those edges every function looks dead and every result is a false positive. Verify before doing anything else.
 
-```text
-repo-native-alignment scan --repo <path> --full
+**Self-check (run this first):**
+
+```bash
+repo-native-alignment scan --repo <path> --full 2>&1 | tee /tmp/rna-deadcode-scan.log
+grep -E 'LSP enrichment complete: ([1-9][0-9]*) LSP call edges' /tmp/rna-deadcode-scan.log
 ```
 
-Confirm the logs report LSP completion with non-zero LSP call edges, for example:
+If the `grep` matches a non-zero call-edge count, proceed. Examples of acceptable output:
 
 ```text
-LSP enrichment complete for python: 1234 edges ...
+LSP enrichment complete for python: 1234 edges
 [background-lsp] LSP enrichment complete: 2870 LSP call edges, 173056 total LSP edges
 ```
 
-If the scan logs show 0 LSP call edges, aborted LSP passes, or missing language servers, expect higher false-positive rates — especially for Python and TypeScript repos where method calls, JSX usage, and framework wiring rely on LSP enrichment.
+If the `grep` returns nothing, or the matched count is `0`, **abort and report the precondition failure** rather than emitting candidates. Common causes:
+
+- The repo's language server is not on `PATH` (e.g., `pyright`, `tsserver`, `gopls`, `rust-analyzer`).
+- The scan was run without `--full` (incremental scans skip LSP).
+- LSP enrichment aborted mid-run; check the scan log for `LspConsumer(...) enrichment failed`.
+
+Tell the user the dead-code analysis cannot run reliably without LSP enrichment and stop. Do not fall back to a structural-edges-only scan.
 
 ### Step 1: Gather functions
 
@@ -77,12 +86,23 @@ Remove from consideration:
   Hook matching is **name-based on the enclosing class**, not inheritance-based:
   the matcher checks only that the function's immediate `parent_scope` contains
   `class_contains` and that the function's own name is listed in `method_names`.
-  It does not traverse inherited base classes. Examples of common frameworks you
-  can configure hooks for:
-  - SQLAlchemy: `process_bind_param`, `process_result_value`, `column_expression`
-  - OTEL: `on_start`, `on_end`, `shutdown`, `force_flush`
-  - Django: `save`, `delete`, `clean`, `get_queryset`
-  - Pydantic: `model_post_init`, validators
+  It does not traverse inherited base classes.
+
+  Concretely: a `[[hooks]]` entry with `class_contains = "TypeDecorator"` only
+  fires on methods whose enclosing class name contains the substring
+  `TypeDecorator` (e.g., `class JsonTypeDecorator(TypeDecorator):`). It does
+  **not** fire on `class Money(TypeDecorator):` because `Money` lacks the
+  substring. To cover concrete subclasses with arbitrary names, add a separate
+  `[[hooks]]` section per known class, or rename the class to include the
+  framework name when feasible.
+
+  Example configs that work with the current matcher (assume the user's class
+  name contains the framework substring — add per-class entries otherwise):
+
+  - SQLAlchemy: `class_contains = "TypeDecorator"`, `method_names = ["process_bind_param", "process_result_value", "column_expression"]`
+  - OTEL: `class_contains = "SpanProcessor"`, `method_names = ["on_start", "on_end", "shutdown", "force_flush"]`
+  - Django: `class_contains = "Model"`, `method_names = ["save", "delete", "clean", "get_queryset"]`
+  - Pydantic: `class_contains = "BaseModel"`, `method_names = ["model_post_init"]`
 - **Nested/local functions** — if the result shows `Parent: <outer-name> (function)`,
   this is a function defined inside another function/closure. Skip it for dead-code
   analysis — it is a local helper, not a top-level candidate. The outer function owns it.

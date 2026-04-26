@@ -216,6 +216,7 @@ repo-native-alignment adr validate --repo . --cargo-arg --no-default-features
 | Skill | What it does |
 |-------|-------------|
 | `/rna-mcp:setup` | Download binary, configure MCP, update AGENTS.md |
+| `/rna-mcp:dead-code` | Find public functions with zero non-test callers using RNA's graph (no code changes). Heuristic — false positives exist for framework callbacks, trait impls, and FFI exports. Accuracy depends on a `scan --full` having completed with LSP enrichment; without LSP-derived `Calls`/`ReferencedBy` edges every function looks dead. See [`plugin/skills/dead-code/SKILL.md`](plugin/skills/dead-code/SKILL.md). |
 | `/rna-mcp:record` | Record business artifacts (metis, signals, guardrails, outcome updates) with frontmatter templates |
 
 ## The `.oh/` Directory
