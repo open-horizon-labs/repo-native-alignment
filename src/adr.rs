@@ -1240,6 +1240,33 @@ mod tests {
         assert!(tests.contains("extract::event_bus::tests::test_depth_first_ordering"));
     }
 
+    /// `cargo test -- --list` mixes ": test" lines with ": benchmark" lines and a
+    /// trailing summary ("N tests, M benchmarks") plus blank separators. Only
+    /// the `: test` rows belong in the lookup set used by ADR validation.
+    #[test]
+    fn test_parse_cargo_test_list_skips_non_test_lines() {
+        let stdout = concat!(
+            "\n",
+            "server::tests::test_basic: test\n",
+            "my_benchmark: benchmark\n",
+            "another::tests::test_other: test\n",
+            "\n",
+            "3 tests, 1 benchmark\n",
+        );
+        let tests = parse_cargo_test_list(stdout);
+        assert_eq!(tests.len(), 2, "expected exactly 2 test names; got: {tests:?}");
+        assert!(tests.contains("server::tests::test_basic"));
+        assert!(tests.contains("another::tests::test_other"));
+        assert!(
+            !tests.contains("my_benchmark"),
+            "benchmark rows must not enter the test set"
+        );
+        assert!(
+            !tests.iter().any(|t| t.contains("tests, 1 benchmark")),
+            "summary line must not enter the test set"
+        );
+    }
+
     #[test]
     fn test_audit_static_registration_only_detects_dynamic_registration() {
         let tmp = TempDir::new().unwrap();
