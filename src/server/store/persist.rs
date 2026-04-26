@@ -803,4 +803,84 @@ mod tests {
             "fn_any should be visible with no version filter"
         );
     }
+
+    /// Regression: PR #644 added `attr_refs` metadata on functions and
+    /// `ReferencedBy` edges from import_calls_pass step 6. Both must survive
+    /// `persist_graph_to_lance` -> `load_graph_from_lance` so incremental
+    /// scans can keep emitting these edges from the cached graph.
+    ///
+    /// See `.oh/guardrails/computed-but-not-delivered.md`: every new metadata
+    /// field must wire through extraction, the Arrow schema, and the read
+    /// path. Skipping any layer drops the value silently on the next load.
+    #[tokio::test]
+    async fn test_attr_refs_and_referenced_by_round_trip() {
+        use crate::graph::{Confidence, Edge, EdgeKind};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+
+        let mut caller_meta = BTreeMap::new();
+        caller_meta.insert(
+            super::super::metadata_keys::ATTR_REFS.to_string(),
+            "persist,load,render".to_string(),
+        );
+        let caller = Node {
+            id: NodeId {
+                root: "local".to_string(),
+                file: PathBuf::from("src/caller.rs"),
+                name: "caller_fn".to_string(),
+                kind: NodeKind::Function,
+            },
+            language: "rust".to_string(),
+            signature: "fn caller_fn()".to_string(),
+            line_start: 1,
+            line_end: 5,
+            body: "fn caller_fn() { obj.persist(); }".to_string(),
+            metadata: caller_meta,
+            source: ExtractionSource::TreeSitter,
+        };
+        let callee = make_test_node("persist");
+
+        let edge = Edge {
+            from: caller.id.clone(),
+            to: callee.id.clone(),
+            kind: EdgeKind::ReferencedBy,
+            source: ExtractionSource::TreeSitter,
+            confidence: Confidence::Detected,
+        };
+
+        persist_graph_to_lance(repo_root, &[caller.clone(), callee.clone()], &[edge.clone()])
+            .await
+            .expect("persist failed");
+
+        let state = load_graph_from_lance(repo_root)
+            .await
+            .expect("load failed");
+
+        let reloaded_caller = state
+            .nodes
+            .iter()
+            .find(|n| n.id.name == "caller_fn")
+            .expect("caller node missing after reload");
+        assert_eq!(
+            reloaded_caller
+                .metadata
+                .get(super::super::metadata_keys::ATTR_REFS)
+                .map(String::as_str),
+            Some("persist,load,render"),
+            "attr_refs metadata dropped on round-trip; import_calls_pass step 6 \
+             would silently stop emitting edges on cached loads",
+        );
+
+        let referenced_by_count = state
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::ReferencedBy)
+            .count();
+        assert_eq!(
+            referenced_by_count, 1,
+            "ReferencedBy edge dropped on round-trip; got edges {:?}",
+            state.edges.iter().map(|e| e.kind.to_string()).collect::<Vec<_>>(),
+        );
+    }
 }
