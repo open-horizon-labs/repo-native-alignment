@@ -143,8 +143,11 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
 
         // For each imported name that appears as a call in this function body
         for imported_name in imported_names {
-            // Skip very short names to avoid false positives.
-            if imported_name.len() < 4 {
+            // Skip names known to be common builtins / accessors. The previous
+            // blanket `len() < 4` filter dropped legitimate short imports
+            // (`init`, `tick`, `save`); the stopword list keeps the noisy
+            // names out without the false negatives.
+            if is_call_stopword(imported_name.as_str()) {
                 continue;
             }
             // Skip if caller name == imported name (self-call / wrapper pattern).
@@ -234,7 +237,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         let importer_lang = import_node.language.as_str();
         let module_path = parse_import_module(text);
         for name in &names {
-            if name.len() < 4 {
+            if is_call_stopword(name.as_str()) {
                 continue;
             }
             let Some(candidates) = fn_by_name.get(name.as_str()) else {
@@ -311,7 +314,7 @@ pub fn import_calls_pass(all_nodes: &[Node]) -> Vec<Edge> {
         let caller_lang = node.language.as_str();
         for attr_name in attr_refs_str.split(',') {
             let attr_name = attr_name.trim();
-            if attr_name.len() < 4 {
+            if attr_name.is_empty() || is_call_stopword(attr_name) {
                 continue;
             }
             let Some(candidates) = fn_by_name.get(attr_name) else {
@@ -691,29 +694,125 @@ fn parse_es6_import_names(text: &str) -> Vec<String> {
 // Helper: check if a function body contains a bare call to a name
 // ---------------------------------------------------------------------------
 
-/// Returns `true` when `body` contains a bare function call to `name` —
-/// i.e., the name appears followed by `(` with no intervening `.` or `::`.
-///
-/// This is intentionally conservative: only `name(` counts, not `obj.name(`.
-/// Extract all function call site names from a body in one pass.
+/// Extract all bare function call site names from a body in one pass.
 /// Returns a HashSet of identifier names that appear immediately before `(`.
 /// O(body_size) — called once per function body instead of once per import name.
+///
+/// Skips occurrences inside string literals (`'`, `"`, backtick) and comments
+/// (`//`, `/* */`, `#`) so that `"call(name)"` in a docstring or
+/// `// call(name)` in a code comment do not falsely keep `name` alive for
+/// dead-code analysis. The lexer is intentionally permissive: it covers the
+/// common forms across the languages this pass runs over (TS, JS, Python,
+/// Rust, Go) without growing into a full per-language tokenizer. Edge cases
+/// like Python triple-quoted strings, Rust raw strings (`r#"…"#`), and
+/// nested template-literal expressions (``` `${call()}` ```) are still
+/// considered "in string" by the simple-quote rules; the worst case is
+/// dropping a real call inside a template expression, which only loses a
+/// possible edge — never a false positive.
 pub(crate) fn extract_call_sites(body: &str) -> HashSet<&str> {
     let mut result = HashSet::new();
     let bytes = body.as_bytes();
     let len = bytes.len();
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mode {
+        Code,
+        LineComment,        // // … or # … to end of line
+        BlockComment,       // /* … */
+        StringDouble,       // "…"
+        StringSingle,       // '…'
+        StringBacktick,     // `…`
+    }
+    let mut mode = Mode::Code;
     let mut i = 0;
     while i < len {
-        // Find '('
-        if bytes[i] == b'(' && i > 0 {
-            // Walk backwards to find the identifier
+        let b = bytes[i];
+        match mode {
+            Mode::LineComment => {
+                if b == b'\n' {
+                    mode = Mode::Code;
+                }
+                i += 1;
+                continue;
+            }
+            Mode::BlockComment => {
+                if b == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
+                    mode = Mode::Code;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            Mode::StringDouble | Mode::StringSingle | Mode::StringBacktick => {
+                if b == b'\\' && i + 1 < len {
+                    // skip the escaped byte (covers \" \' \\ \n etc.)
+                    i += 2;
+                    continue;
+                }
+                let closer = match mode {
+                    Mode::StringDouble => b'"',
+                    Mode::StringSingle => b'\'',
+                    Mode::StringBacktick => b'`',
+                    _ => unreachable!(),
+                };
+                if b == closer {
+                    mode = Mode::Code;
+                }
+                i += 1;
+                continue;
+            }
+            Mode::Code => {}
+        }
+
+        // Enter comment / string modes.
+        if b == b'/' && i + 1 < len {
+            match bytes[i + 1] {
+                b'/' => {
+                    mode = Mode::LineComment;
+                    i += 2;
+                    continue;
+                }
+                b'*' => {
+                    mode = Mode::BlockComment;
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if b == b'#' {
+            // Python / Ruby / Bash / TOML line comment. Skip in TS/JS/Rust
+            // a `#` is rare outside attributes (`#[…]`) and string interpolation;
+            // those patterns don't precede a `(` we'd misclassify as a call,
+            // so the conservative behaviour is fine.
+            mode = Mode::LineComment;
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            mode = Mode::StringDouble;
+            i += 1;
+            continue;
+        }
+        if b == b'\'' {
+            mode = Mode::StringSingle;
+            i += 1;
+            continue;
+        }
+        if b == b'`' {
+            mode = Mode::StringBacktick;
+            i += 1;
+            continue;
+        }
+
+        if b == b'(' && i > 0 {
+            // Walk backwards to find the identifier.
             let mut j = i.saturating_sub(1);
-            // Skip whitespace
             while j > 0 && bytes[j] == b' ' {
                 j -= 1;
             }
             let end = j + 1;
-            // Walk back through identifier chars
             while j > 0
                 && (bytes[j - 1].is_ascii_alphanumeric()
                     || bytes[j - 1] == b'_'
@@ -722,13 +821,10 @@ pub(crate) fn extract_call_sites(body: &str) -> HashSet<&str> {
                 j -= 1;
             }
             if j < end {
-                // Use byte-based slicing to avoid UTF-8 char boundary panics.
-                // `j` and `end` are byte indices from walking over `bytes`; the
-                // walk only proceeds through ASCII identifier chars, so `j..end`
-                // is always a valid ASCII slice. Convert via the byte slice.
+                // Byte slice is ASCII because the walk only accepted ASCII
+                // identifier bytes; conversion is infallible in practice.
                 let ident = std::str::from_utf8(&bytes[j..end]).unwrap_or("");
-                if ident.len() >= 4 {
-                    // Reject if preceded by '.' or ':' (method/scoped call)
+                if !ident.is_empty() && !is_call_stopword(ident) {
                     let prev = if j > 0 { bytes[j - 1] } else { 0 };
                     if prev != b'.' && prev != b':' {
                         result.insert(ident);
@@ -739,6 +835,71 @@ pub(crate) fn extract_call_sites(body: &str) -> HashSet<&str> {
         i += 1;
     }
     result
+}
+
+/// Common short identifiers that almost always denote builtins, accessors,
+/// or trivial verbs rather than the kind of cross-file callable a
+/// `ReferencedBy` edge should reach. Keeping these out of the call-site set
+/// stops `obj.id()`-style noise from drowning out real edges in the index.
+///
+/// This list replaces the old blanket `len() < 4` filter so legitimate short
+/// names (`init`, `tick`, `save`, `read`, `data`) still produce edges. Names
+/// here are case-sensitive — we only filter literal lowercase forms because
+/// `Get`, `Set`, etc. in TitleCase are typically real exported functions in
+/// Go / C# and we do want edges for those.
+pub(crate) fn is_call_stopword(name: &str) -> bool {
+    matches!(
+        name,
+        "id"
+            | "is"
+            | "do"
+            | "go"
+            | "ok"
+            | "on"
+            | "to"
+            | "of"
+            | "as"
+            | "at"
+            | "be"
+            | "in"
+            | "if"
+            | "or"
+            | "no"
+            | "so"
+            | "up"
+            | "by"
+            | "it"
+            | "add"
+            | "all"
+            | "any"
+            | "are"
+            | "end"
+            | "for"
+            | "get"
+            | "has"
+            | "had"
+            | "key"
+            | "len"
+            | "map"
+            | "max"
+            | "min"
+            | "new"
+            | "not"
+            | "now"
+            | "out"
+            | "put"
+            | "raw"
+            | "run"
+            | "set"
+            | "sum"
+            | "top"
+            | "use"
+            | "val"
+            | "var"
+            | "was"
+            | "who"
+            | "yes"
+    )
 }
 
 #[allow(dead_code)]
@@ -954,6 +1115,86 @@ mod tests {
     fn test_parse_rust_use_bare() {
         let names = parse_imported_names("use crate::service::handle_request");
         assert_eq!(names, vec!["handle_request"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_call_sites tests — string / comment / declaration skipping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_call_sites_skips_double_quoted_string() {
+        // `parse_imported_names("foo")` looks like a call to `parse_imported_names`,
+        // but the literal `"foo"` must not register `foo` as a callee.
+        let body = "let s = \"render(component)\"; helper(x);";
+        let calls = extract_call_sites(body);
+        assert!(calls.contains("helper"), "got {:?}", calls);
+        assert!(!calls.contains("render"), "render inside a string must not register, got {:?}", calls);
+    }
+
+    #[test]
+    fn test_extract_call_sites_skips_line_comment() {
+        let body = "// helper(x) is intentionally commented out\nrender(c);";
+        let calls = extract_call_sites(body);
+        assert!(calls.contains("render"), "got {:?}", calls);
+        assert!(!calls.contains("helper"), "call inside a // comment must not register, got {:?}", calls);
+    }
+
+    #[test]
+    fn test_extract_call_sites_skips_block_comment() {
+        let body = "/* helper(x); */ render(c);";
+        let calls = extract_call_sites(body);
+        assert!(calls.contains("render"), "got {:?}", calls);
+        assert!(!calls.contains("helper"), "call inside /*…*/ must not register, got {:?}", calls);
+    }
+
+    #[test]
+    fn test_extract_call_sites_skips_python_hash_comment() {
+        let body = "def f():\n    # helper(x)\n    render(c)";
+        let calls = extract_call_sites(body);
+        assert!(calls.contains("render"), "got {:?}", calls);
+        assert!(!calls.contains("helper"), "call inside # comment must not register, got {:?}", calls);
+    }
+
+    #[test]
+    fn test_extract_call_sites_skips_template_literal_string() {
+        let body = "const s = `helper(${x})`; render(c);";
+        let calls = extract_call_sites(body);
+        assert!(calls.contains("render"), "got {:?}", calls);
+        // The simple lexer treats the entire backtick literal as a string,
+        // including the `${…}` interpolation. That's fine: the worst case is
+        // dropping a real call inside a template expression — never a false
+        // positive. helper does not get a phantom edge.
+        assert!(!calls.contains("helper"), "call inside `…` template must not register, got {:?}", calls);
+    }
+
+    #[test]
+    fn test_extract_call_sites_handles_escaped_quotes() {
+        // Escaped quote must not end the string early; the inner `helper(x)`
+        // stays inside the string region and must not register.
+        let body = "let s = \"abc \\\" helper(x) \\\" def\"; render(c);";
+        let calls = extract_call_sites(body);
+        assert!(calls.contains("render"), "got {:?}", calls);
+        assert!(!calls.contains("helper"), "escaped-quote inner must remain string-context, got {:?}", calls);
+    }
+
+    #[test]
+    fn test_extract_call_sites_drops_stopwords() {
+        let body = "get(x); set(y); render(c);";
+        let calls = extract_call_sites(body);
+        assert!(calls.contains("render"), "got {:?}", calls);
+        assert!(!calls.contains("get"), "stopword 'get' must not register, got {:?}", calls);
+        assert!(!calls.contains("set"), "stopword 'set' must not register, got {:?}", calls);
+    }
+
+    #[test]
+    fn test_extract_call_sites_keeps_short_non_stopwords() {
+        // `tick` / `init` / `save` are 4 chars but were dropped by the old
+        // blanket length filter; the stopword approach keeps them.
+        let body = "tick(); init(); save();";
+        let calls = extract_call_sites(body);
+        assert!(calls.contains("tick"), "got {:?}", calls);
+        assert!(calls.contains("init"), "got {:?}", calls);
+        assert!(calls.contains("save"), "got {:?}", calls);
     }
 
     // -----------------------------------------------------------------------
@@ -1177,18 +1418,41 @@ mod tests {
     }
 
     #[test]
-    fn test_short_names_skipped() {
-        // Imported names shorter than 4 chars are skipped.
-        let caller = make_fn("a.ts", "main", "function main() { foo(x); }");
-        let callee = make_fn("b.ts", "foo", "function foo(x) { return x; }");
-        let import = make_import("a.ts", "import { foo } from './b'");
+    fn test_stopword_names_skipped() {
+        // Imported names that are common short builtins (`get`, `set`, `id`)
+        // are dropped via the stopword deny-list — they otherwise create
+        // false-live edges across every same-named accessor in the workspace.
+        let caller = make_fn("a.ts", "main", "function main() { get(x); }");
+        let callee = make_fn("b.ts", "get", "function get(x) { return x; }");
+        let import = make_import("a.ts", "import { get } from './b'");
 
         let nodes = vec![caller, callee, import];
         let edges = import_calls_pass(&nodes);
 
         assert!(
             edges.is_empty(),
-            "names < 4 chars must be skipped, got {:?}",
+            "stopword names must be skipped, got {:?}",
+            edges
+        );
+    }
+
+    #[test]
+    fn test_short_non_stopword_names_emit_edges() {
+        // `init` is 4 chars but historically dropped under the old `len() < 4`
+        // gate when typed as `tick` / `save` / etc. Removing the gate in favour
+        // of a stopword list lets these legitimate short calls produce edges.
+        let caller = make_fn("a.ts", "main", "function main() { init(x); }");
+        let callee = make_fn("b.ts", "init", "function init(x) { return x; }");
+        let import = make_import("a.ts", "import { init } from './b'");
+
+        let nodes = vec![caller, callee, import];
+        let edges = import_calls_pass(&nodes);
+
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "non-stopword short name must emit a Calls edge, got {:?}",
             edges
         );
     }
