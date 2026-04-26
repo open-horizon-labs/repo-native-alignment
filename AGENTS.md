@@ -154,3 +154,8 @@ Solo developer. PRs go through the full /ship pipeline (12 steps). "Done" = all 
 - PR merge extraction: git merge history → graph nodes + outcome_progress integration
 - Graph persistence: LanceDB cache at `.oh/.cache/lance/`, loads in <1s on restart
 - Context injection: business context auto-delivered on first tool call
+
+## Plugin Skills (this repo)
+- `/rna-mcp:setup` — install/configure RNA MCP, pre-warm the index, update AGENTS.md.
+- `/rna-mcp:dead-code` — find public functions with zero non-test callers via the RNA graph. **No code changes**; pure graph query. **Accuracy requires LSP enrichment**: run `scan --full` first so `Calls`/`ReferencedBy` edges are populated. Without LSP-derived edges every function looks dead. Common dogfood gotcha: `In: 1` means *zero* callers — the single incoming edge is the parent module's `Defines`. Skill file: `plugin/skills/dead-code/SKILL.md`. Rationale: `.oh/metis/dead-code-skill-rationale.md`.
+- `/rna-mcp:record` — record `.oh/` business artifacts (metis, signals, guardrails, outcome updates) with frontmatter templates.

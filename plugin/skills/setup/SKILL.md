@@ -114,17 +114,40 @@ If AGENTS.md does not exist, create it with the tool guidance block as the initi
 
 ## Step 5b: Check for framework boundary patterns
 
-Check if the project uses messaging frameworks, event buses, or libraries with hook patterns that RNA should know about. Look at the project's imports:
+Check whether the project uses messaging frameworks, event buses, or libraries with hook patterns that RNA should know about. Capture the result so the setup pipeline can branch on it explicitly — do not rely on `grep` exit codes, which return non-zero on no-match and would halt chained automated setup.
 
 ```bash
-repo-native-alignment search --repo . "" --kind import --compact 2>&1 \
-  | grep -iE 'pubsub|kafka|celery|pika|redis|rabbitmq|sqlalchemy|django|flask|opentelemetry|otel' || true
+FRAMEWORK_PATTERN='pubsub|kafka|celery|pika|redis|rabbitmq|sqlalchemy|django|flask|opentelemetry|otel'
+DETECTED_FRAMEWORKS=$(repo-native-alignment search --repo . "" --kind import --compact 2>/dev/null \
+  | grep -iEo "$FRAMEWORK_PATTERN" | sort -u || true)
+
+if [ -z "$DETECTED_FRAMEWORKS" ]; then
+  echo "No framework boundaries detected; skipping extractor coverage check."
+else
+  echo "Detected frameworks: $DETECTED_FRAMEWORKS"
+fi
 ```
 
-If any match, check whether `.oh/extractors/` already has coverage for the detected frameworks by searching extractor contents (listing filenames alone is not sufficient):
+If frameworks were detected, assert real coverage in `.oh/extractors/` by searching extractor file **contents** (not just listing filenames). The check below sets `EXTRACTOR_COVERAGE` to the list of frameworks already covered, then computes the gap; both branches exit zero so chained pipelines do not abort.
 
 ```bash
-grep -RniE 'pubsub|kafka|celery|pika|redis|rabbitmq|sqlalchemy|django|flask|opentelemetry|otel' .oh/extractors/ 2>/dev/null || true
+if [ -n "$DETECTED_FRAMEWORKS" ]; then
+  if [ -d .oh/extractors ]; then
+    EXTRACTOR_COVERAGE=$(grep -RhoiE "$FRAMEWORK_PATTERN" .oh/extractors/ 2>/dev/null \
+      | sort -u || true)
+  else
+    # Treat missing dir as zero coverage so the gap output names every detected
+    # framework. Do not exit non-zero — chained automated setup must continue.
+    EXTRACTOR_COVERAGE=""
+  fi
+  GAP=$(comm -23 <(echo "$DETECTED_FRAMEWORKS") <(echo "$EXTRACTOR_COVERAGE"))
+  if [ -z "$GAP" ]; then
+    echo "All detected frameworks have extractor coverage."
+  else
+    echo "Detected frameworks missing extractor coverage:"
+    echo "$GAP"
+  fi
+fi
 ```
 
 If the project uses a messaging framework without coverage, create a config file. Example for Google Pub/Sub:
