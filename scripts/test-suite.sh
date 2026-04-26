@@ -145,9 +145,11 @@ check "EventBus::register exists" \
   "grep -c 'pub fn register' $RNA_REPO/src/extract/event_bus.rs" "[1-9]"
 check "consumers.rs built-in consumers present" \
   "grep -c 'ExtractionConsumer for' $RNA_REPO/src/extract/consumers.rs" "[1-9]"
-# ADR constraint: no direct pass calls in server/ (bus must coordinate)
+# ADR constraint: no direct pass calls in src/server/ (bus must coordinate).
+# Match the call form `name(` only; mentions in comments, docstrings, error
+# messages, and test assertions are not architectural violations.
 check "ADR constraint: no direct pass calls in server/" \
-  "grep -r 'api_link_pass\|tested_by_pass\|import_calls_pass' $RNA_REPO/src/server/ 2>/dev/null | grep -v '//\|test' | wc -l | tr -d ' '" "^0$"
+  "grep -rE 'api_link_pass\\(|tested_by_pass\\(|import_calls_pass\\(' $RNA_REPO/src/server/ 2>/dev/null | grep -v '//\|test' | wc -l | tr -d ' '" "^0$"
 
 # ── Custom Extractor Config (#468 / #494) ─────────────────────────────────────
 # The extractor_config_pass_with_configs function must be callable and produce
