@@ -445,7 +445,7 @@ pub fn validate(
                 details: if ok {
                     "passed".to_string()
                 } else if output.timed_out {
-                    format!("timed out after {}s", command_timeout().as_secs())
+                    format!("timed out after {:?}", command_timeout())
                 } else {
                     summarize_command_output(&stdout, &stderr)
                 },
@@ -476,7 +476,7 @@ pub fn validate(
                 details: if ok {
                     "passed".to_string()
                 } else if output.timed_out {
-                    format!("timed out after {}s", command_timeout().as_secs())
+                    format!("timed out after {:?}", command_timeout())
                 } else {
                     summarize_command_output(&stdout, &stderr)
                 },
