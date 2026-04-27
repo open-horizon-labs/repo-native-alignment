@@ -294,25 +294,35 @@ fn init_tracing(default_filter: &str, log_path: Option<&std::path::Path>) {
 }
 
 /// Load graph from LanceDB cache or exit with instructions to scan first.
-async fn load_cached_graph(repo_root: &std::path::Path) -> server::state::GraphState {
+async fn try_load_cached_graph(
+    repo_root: &std::path::Path,
+ ) -> anyhow::Result<Option<server::state::GraphState>> {
     let lance_path = repo_root.join(".oh").join(".cache").join("lance");
-    if lance_path.exists() {
-        match server::load_graph_from_lance(repo_root).await {
-            Ok(state) => {
-                eprintln!("Loaded {} symbols from cache.", state.nodes.len());
-                state
-            }
-            Err(e) => {
-                eprintln!(
-                    "Failed to load cached index: {}. Run `repo-native-alignment scan --path .` first.",
-                    e
-                );
-                std::process::exit(1);
-            }
+    if !lance_path.exists() {
+        return Ok(None);
+    }
+
+    match server::load_graph_from_lance(repo_root).await {
+        Ok(state) => {
+            eprintln!("Loaded {} symbols from cache.", state.nodes.len());
+            Ok(Some(state))
         }
-    } else {
-        eprintln!("No index found. Run `repo-native-alignment scan --path .` first.");
-        std::process::exit(1);
+        Err(e) => Err(e.context("Failed to load cached index")),
+    }
+}
+
+/// Load graph from LanceDB cache or exit with instructions to scan first.
+async fn load_cached_graph(repo_root: &std::path::Path) -> server::state::GraphState {
+    match try_load_cached_graph(repo_root).await {
+        Ok(Some(state)) => state,
+        Ok(None) => {
+            eprintln!("No index found. Run `repo-native-alignment scan --path .` first.");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("{:#}. Run `repo-native-alignment scan --path .` first.", e);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -393,27 +403,44 @@ async fn async_main() -> anyhow::Result<()> {
                 lsp_only_roots: Arc::new(lsp_only_roots_scan),
                 ..Default::default()
             };
-            let graph = handler.build_full_graph().await?;
-            // Await the background embedding task so it completes before the
-            // Tokio runtime shuts down. Without this, the runtime drop cancels
-            // in-flight LanceDB I/O tasks, causing JoinError::Cancelled (#560).
-            eprintln!(
-                "  Embedding {} symbols...",
-                graph
-                    .nodes
-                    .iter()
-                    .filter(|n| n.id.root != "external")
-                    .count()
-            );
-            handler.await_background_embed().await;
-            let embeddings_available = handler.embed_index.load().is_some();
+
+            let mut scanner = repo_native_alignment::scanner::Scanner::new(repo_root.clone())?;
+            let scan = scanner.scan()?;
+            if scan.changed_files.is_empty() && scan.new_files.is_empty() && scan.deleted_files.is_empty() {
+                scanner.commit_state()?;
+                let graph = match try_load_cached_graph(&repo_root).await? {
+                    Some(graph) => graph,
+                    None => handler.build_full_graph_inner(false).await?,
+                };
+                let elapsed = t0.elapsed();
+                eprintln!();
+                eprintln!(
+                    "  Symbols: {} | Edges: {} | Embeddings: {} | Time: {:.2}s",
+                    graph.nodes.len(),
+                    graph.edges.len(),
+                    if handler.embed_index.load().is_some() { "yes" } else { "no" },
+                    elapsed.as_secs_f64()
+                );
+                return Ok(());
+            }
+
+            let mut graph = match try_load_cached_graph(&repo_root).await? {
+                Some(graph) => graph,
+                None => {
+                    eprintln!("No cached index found; building initial graph.");
+                    handler.build_full_graph_inner(false).await?
+                }
+            };
+            handler
+                .update_graph_with_scan(&mut graph, Some(scan), false)
+                .await?;
             let elapsed = t0.elapsed();
             eprintln!();
             eprintln!(
                 "  Symbols: {} | Edges: {} | Embeddings: {} | Time: {:.2}s",
                 graph.nodes.len(),
                 graph.edges.len(),
-                if embeddings_available { "yes" } else { "no" },
+                if handler.embed_index.load().is_some() { "yes" } else { "no" },
                 elapsed.as_secs_f64()
             );
             return Ok(());

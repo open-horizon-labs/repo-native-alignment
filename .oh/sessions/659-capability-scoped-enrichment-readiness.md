@@ -283,3 +283,21 @@ The resolver is package-manager agnostic at the config level: key = package/libr
 - `git diff --check`
 
 Targeted `cargo test --lib --no-default-features manifest::tests` still cannot run on this workstation because the linker cannot find `clang_rt.osx`; test compilation succeeds with `cargo check --tests`.
+
+## Execute Follow-up: Incremental CLI Scan
+**Updated:** 2026-04-27
+**Status:** implemented in PR #661
+
+The HiPhi verification exposed that plain `repo-native-alignment scan --repo ...` was not actually incremental at the graph/embed layer: scanner detected `0 new, 1 changed, 0 deleted`, but the CLI called `build_full_graph()` and awaited the whole-graph embedding task. This made non-`--full` scans behave like full rebuild/re-embed operations.
+
+### Implemented
+- Non-`--full` CLI scan runs `Scanner` first.
+- If no files changed, it commits scanner state and loads the cached graph without spawning graph rebuild, LSP, or embedding.
+- If cached graph exists and files changed, it calls `update_graph_with_scan` with the pending `ScanResult` so existing targeted changed-file re-embedding is used.
+- If no cache exists, it falls back to the foreground initial graph build.
+
+### Verification
+- `cargo check --lib --bins --no-default-features`
+- `git diff --check`
+
+Local binary execution is blocked by the same workstation linker issue (`clang_rt.osx`) when building a fresh debug binary. The installed CI artifact still has the old behavior, so end-to-end behavior for this fix should be verified from the next CI fast artifact.

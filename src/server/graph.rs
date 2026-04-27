@@ -718,7 +718,7 @@ impl RnaHandler {
         self.build_full_graph_inner(true).await
     }
 
-    pub(crate) async fn build_full_graph_inner(
+    pub async fn build_full_graph_inner(
         &self,
         spawn_background: bool,
     ) -> anyhow::Result<GraphState> {
@@ -1650,7 +1650,7 @@ impl RnaHandler {
     ///
     /// LSP enrichment runs synchronously inside `emit_enrichment_pipeline` via `LspConsumer`.
     /// The `_spawn_lsp` parameter is kept for API compatibility but is no longer acted on.
-    pub(crate) async fn update_graph_with_scan(
+    pub async fn update_graph_with_scan(
         &self,
         graph: &mut GraphState,
         pending_scan: Option<ScanResult>,
