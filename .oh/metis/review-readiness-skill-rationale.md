@@ -6,27 +6,26 @@ title: 'Review Readiness Starts With Cheap Diff Graph Context, Not Full Enrichme
 
 ## Pattern
 
-PR review is a workflow-specific context job. It does not need full-repo LSP or embeddings before it can start. A useful first pass can come from cheap sources: git diff hunks, current extracted symbol ranges, and existing RNA graph metadata.
+PR review is a workflow-specific context job. It does not need full-repo LSP or embeddings before it can start, but it also does not need a rigid generated report for every diff. A useful skill starts from the review decision, then pulls cheap context only where it changes what the reviewer should inspect.
 
-The `/rna-mcp:review-readiness` skill is a walking skeleton for capability-scoped readiness. It reports what is ready for the review job and what is explicitly missing:
+The `/rna-mcp:review-readiness` skill is a walking skeleton for capability-scoped readiness as an agent process. It helps an agent decide:
 
-- changed files/hunks from git diff
-- changed-symbol overlap from extracted graph ranges
-- existing graph context such as stable node IDs and edge counts
-- file/hunk-level representation for unmapped or deleted changes
-- readiness gaps for exact semantic refs, deleted symbol identity, and embeddings
+- whether raw `git diff` is already sufficient
+- which changed symbols/files/outcomes/guardrails deserve review attention
+- which existing RNA graph or business context changes the review decision
+- which specific metadata is missing, stale, or intentionally not needed
 
 ## Why this matters
 
-This avoids treating LSP enrichment as the product. LSP is a possible follow-up provider for exact callers/references, not a prerequisite for all review context.
+This avoids treating LSP enrichment as the product, and avoids treating a helper script as the skill. LSP is a possible follow-up provider for exact callers/references, not a prerequisite for all review context. The skill should say when RNA adds no material value for a diff rather than forcing graph-shaped output.
 
-This directly supports #659: enrichment readiness should be workflow-specific. For PR review, the first useful answer is often cheap and available now; for global dead-code, the required coverage is much stricter.
+This directly supports #659: enrichment readiness should be workflow-specific. For PR review, the first useful answer is often a human-readable review map: what changed, what context matters, what is missing, and whether to continue reviewing.
 
 ## When to use
 
 - Before reviewing a PR or dirty working tree.
-- Before deciding whether targeted LSP impact lookup is worth running.
-- When an agent needs to know whether existing graph context beats raw `git diff` for a change.
+- Before deciding whether RNA context, targeted LSP impact lookup, or plain diff review is the right next step.
+- When an agent needs to explain what context would improve review confidence.
 
 ## When not to use
 

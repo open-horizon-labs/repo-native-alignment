@@ -217,7 +217,7 @@ repo-native-alignment adr validate --repo . --cargo-arg --no-default-features
 |-------|-------------|
 | `/rna-mcp:setup` | Download binary, configure MCP, update AGENTS.md |
 | `/rna-mcp:dead-code` | Find public functions with zero non-test callers using RNA's graph (no code changes). Heuristic — false positives exist for framework callbacks, trait impls, and FFI exports. Accuracy depends on a `scan --full` having completed with LSP enrichment; without LSP-derived `Calls`/`ReferencedBy` edges every function looks dead. See [`plugin/skills/dead-code/SKILL.md`](plugin/skills/dead-code/SKILL.md). |
-| `/rna-mcp:review-readiness` | Map a PR or working-tree diff to RNA graph context using cheap metadata first: git diff + extracted symbol ranges + existing graph metadata. Reports readiness gaps without requiring full-repo LSP or embeddings. See [`plugin/skills/review-readiness/SKILL.md`](plugin/skills/review-readiness/SKILL.md). |
+| `/rna-mcp:review-readiness` | Agent-led PR/working-tree review triage. Starts from the diff, adds RNA graph/business context only where it changes review decisions, and states when raw diff review is enough. See [`plugin/skills/review-readiness/SKILL.md`](plugin/skills/review-readiness/SKILL.md). |
 | `/rna-mcp:record` | Record business artifacts (metis, signals, guardrails, outcome updates) with frontmatter templates |
 
 ## The `.oh/` Directory

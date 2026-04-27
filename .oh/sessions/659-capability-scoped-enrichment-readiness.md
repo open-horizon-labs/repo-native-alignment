@@ -191,17 +191,17 @@ This child issue is intentionally not a generic readiness API issue. It is the c
 
 ## Execute
 **Updated:** 2026-04-27
-**Status:** implementation-complete
+**Status:** implementation-revised
 
-Implemented #660 walking skeleton in PR #661.
+Implemented #660 walking skeleton in PR #661, then revised it after review showed the helper-script framing failed the user-value test: for docs/skill changes it produced a worse artifact than `git diff`, and it made the skill feel like a fixed report generator rather than an agent process.
 
 ### Changes
 - Added `plugin/skills/review-readiness/SKILL.md` for `/rna-mcp:review-readiness`.
-- Added `plugin/skills/review-readiness/review_readiness.py`, a skill-local helper that maps git/PR diffs to current RNA extracted symbol ranges and reports review readiness without LSP or embeddings.
-- Added README and AGENTS discoverability entries.
-- Added `.oh/metis/review-readiness-skill-rationale.md` tying the skill to `context-assembly` and #659.
+- Removed the skill-local Python helper; the walking skeleton is now the agent-led review triage process.
+- Updated README and AGENTS discoverability entries to describe agent-led triage rather than generated reports.
+- Updated `.oh/metis/review-readiness-skill-rationale.md` tying the skill to `context-assembly` and #659.
 
 ### Verification
-- `python3 -m py_compile plugin/skills/review-readiness/review_readiness.py`
-- `python3 plugin/skills/review-readiness/review_readiness.py --base 310ff6ae55a120f1328e17ada063d1b201d58d28^ --head 310ff6ae55a120f1328e17ada063d1b201d58d28`
-- `python3 plugin/skills/review-readiness/review_readiness.py` on current working tree, confirming untracked file-level changes are represented honestly.
+- Confirmed `plugin/skills/review-readiness/review_readiness.py` is no longer present.
+- Checked changed-file diff shape with `git diff --stat origin/main...HEAD`.
+- Re-read the skill/rationale/docs after edit for coherence.
