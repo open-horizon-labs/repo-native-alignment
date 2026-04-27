@@ -11,7 +11,7 @@ use crate::embed::EmbeddingIndex;
 use crate::extract::ExtractorRegistry;
 use crate::graph::index::GraphIndex;
 use crate::graph::store::SCHEMA_VERSION;
-use crate::graph::{Edge, Node, NodeKind};
+use crate::graph::{Edge, EdgeKind, Node, NodeKind};
 use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
 use crate::scanner::{ScanResult, Scanner};
 
@@ -79,7 +79,6 @@ fn collect_post_pass_node_upserts(
         }
     }
 }
-
 
 impl RnaHandler {
     /// Maximum time to wait for pre-warm to finish before falling back to
@@ -1640,6 +1639,86 @@ impl RnaHandler {
         ))
     }
 
+    /// Refresh cheap manifest-derived package nodes and dependency edges without
+    /// running extraction, embeddings, or LSP. This catches `.oh/config.toml`
+    /// package host changes and manifest dependency metadata on otherwise idle scans.
+    pub async fn refresh_manifest_graph(&self, graph: &mut GraphState) -> anyhow::Result<bool> {
+        fn is_manifest_package_node(node: &Node) -> bool {
+            node.source == crate::graph::ExtractionSource::Schema
+                && matches!(&node.id.kind, NodeKind::Other(kind) if kind == "package")
+        }
+
+        fn is_manifest_package_edge(edge: &Edge) -> bool {
+            edge.source == crate::graph::ExtractionSource::Schema
+                && (edge.kind == EdgeKind::DependsOn
+                    || matches!(&edge.from.kind, NodeKind::Other(kind) if kind == "package")
+                    || matches!(&edge.to.kind, NodeKind::Other(kind) if kind == "package"))
+        }
+
+        fn manifest_fingerprint(nodes: &[Node], edges: &[Edge]) -> Vec<String> {
+            let mut entries = Vec::new();
+            for node in nodes.iter().filter(|node| is_manifest_package_node(node)) {
+                entries.push(format!(
+                    "node:{}:{:?}:{}:{}",
+                    node.stable_id(),
+                    node.metadata,
+                    node.signature,
+                    node.body
+                ));
+            }
+            for edge in edges.iter().filter(|edge| is_manifest_package_edge(edge)) {
+                entries.push(format!(
+                    "edge:{}:{:?}:{:?}",
+                    edge.stable_id(),
+                    edge.source,
+                    edge.confidence
+                ));
+            }
+            entries.sort();
+            entries
+        }
+
+        let root_pairs: Vec<(String, std::path::PathBuf)> = WorkspaceConfig::load()
+            .with_primary_root(self.repo_root.clone())
+            .with_worktrees(&self.repo_root)
+            .with_declared_roots(&self.repo_root)
+            .resolved_roots()
+            .iter()
+            .map(|root| (root.slug.clone(), root.path.clone()))
+            .collect();
+
+        let before = manifest_fingerprint(&graph.nodes, &graph.edges);
+        let manifest = crate::extract::manifest::manifest_pass(&root_pairs);
+
+        graph.nodes.retain(|node| !is_manifest_package_node(node));
+        graph.edges.retain(|edge| !is_manifest_package_edge(edge));
+        graph.nodes.extend(manifest.nodes);
+        graph.edges.extend(manifest.edges);
+
+        dedup_nodes_merge_metadata(&mut graph.nodes);
+        let mut seen_edges = std::collections::HashSet::new();
+        graph
+            .edges
+            .retain(|edge| seen_edges.insert(edge.stable_id()));
+
+        graph.index = GraphIndex::new();
+        graph.index.rebuild_from_edges(&graph.edges);
+        for node in &graph.nodes {
+            graph
+                .index
+                .ensure_node(&node.stable_id(), &node.id.kind.to_string());
+        }
+
+        let after = manifest_fingerprint(&graph.nodes, &graph.edges);
+        if before == after {
+            return Ok(false);
+        }
+
+        let _lance_guard = self.lance_write_lock.lock().await;
+        persist_graph_to_lance(&self.repo_root, &graph.nodes, &graph.edges).await?;
+        Ok(true)
+    }
+
     /// Incrementally update the graph, accepting an optional pre-computed scan.
     ///
     /// When `pending_scan` is `Some`, the caller already ran the scanner and
@@ -1849,11 +1928,7 @@ impl RnaHandler {
         // Auto-collect delta: everything added by post-extraction passes since
         // the snapshot above. Include duplicate stable IDs so metadata-only
         // updates are persisted on incremental scans.
-        collect_post_pass_node_upserts(
-            &graph.nodes,
-            &node_ids_before_passes,
-            &mut upsert_node_ids,
-        );
+        collect_post_pass_node_upserts(&graph.nodes, &node_ids_before_passes, &mut upsert_node_ids);
         for e in &graph.edges {
             let sid = e.stable_id();
             if !edge_ids_before_passes.contains(&sid) {

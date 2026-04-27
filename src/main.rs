@@ -431,7 +431,12 @@ async fn async_main() -> anyhow::Result<()> {
             {
                 scanner.commit_state()?;
                 let graph = match try_load_cached_graph(&repo_root).await? {
-                    Some(graph) => graph,
+                    Some(mut graph) => {
+                        if handler.refresh_manifest_graph(&mut graph).await? {
+                            eprintln!("Refreshed manifest dependency graph.");
+                        }
+                        graph
+                    }
                     None => handler.build_full_graph_inner(false).await?,
                 };
                 let elapsed = t0.elapsed();

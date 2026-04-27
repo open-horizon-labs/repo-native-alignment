@@ -301,42 +301,57 @@ fn find_explicit_provider<'a>(
     host: &str,
     dependency_node: &NodeId,
 ) -> Option<&'a Node> {
-    let matches: Vec<&Node> = nodes
+    let mut matches: Vec<(usize, &Node)> = nodes
         .iter()
         .filter(|node| node.id.kind == NodeKind::Other("package".to_string()))
         .filter(|node| node.id.name == package_name)
         .filter(|node| node.id != *dependency_node)
-        .filter(|node| package_node_matches_host(node, host))
+        .filter_map(|node| package_node_host_rank(node, host).map(|rank| (rank, node)))
         .collect();
 
-    if matches.len() == 1 {
-        Some(matches[0])
+    matches.sort_by_key(|(rank, node)| (*rank, node.id.to_stable_id()));
+    let best_rank = matches.first().map(|(rank, _)| *rank)?;
+    let best_matches: Vec<&Node> = matches
+        .into_iter()
+        .filter(|(rank, _)| *rank == best_rank)
+        .map(|(_, node)| node)
+        .collect();
+
+    if best_matches.len() == 1 {
+        Some(best_matches[0])
     } else {
         None
     }
 }
 
-fn package_node_matches_host(node: &Node, host: &str) -> bool {
+fn package_node_host_rank(node: &Node, host: &str) -> Option<usize> {
     let normalized_host = host.trim().trim_matches('/');
     if normalized_host.is_empty() {
-        return false;
+        return None;
     }
 
-    node.id.root == normalized_host
-        || node
-            .id
-            .file
-            .components()
-            .next()
-            .is_some_and(|component| component.as_os_str().to_string_lossy() == normalized_host)
-        || node
-            .metadata
-            .get("repository")
-            .and_then(|url| repository_slug(url))
-            .is_some_and(|slug| {
-                slug == repository_slug(normalized_host)
-                    .unwrap_or_else(|| normalized_host.to_ascii_lowercase())
-            })
+    if node.id.root == normalized_host {
+        return Some(0);
+    }
+
+    if node
+        .id
+        .file
+        .components()
+        .next()
+        .is_some_and(|component| component.as_os_str().to_string_lossy() == normalized_host)
+    {
+        return Some(1);
+    }
+
+    node.metadata
+        .get("repository")
+        .and_then(|url| repository_slug(url))
+        .and_then(|slug| {
+            let host_slug = repository_slug(normalized_host)
+                .unwrap_or_else(|| normalized_host.to_ascii_lowercase());
+            (slug == host_slug).then_some(2)
+        })
 }
 
 fn repository_slug(url: &str) -> Option<String> {
@@ -1106,6 +1121,53 @@ repository = "https://github.com/open-horizon-labs/rust-roon-api"
                 .any(|edge| edge.from.name == "unified-hifi-control"
                     && edge.to.name == "roon-api"
                     && edge.to.file == manifest("rust-roon-api/Cargo.toml")
+                    && edge.confidence == Confidence::Confirmed)
+        );
+    }
+
+    #[test]
+    fn test_explicit_package_host_prefers_declared_root_over_primary_directory_copy() {
+        let mut hosts = PackageHosts::new();
+        hosts.insert("roon-api".to_string(), "rust-roon-api".to_string());
+
+        let (mut nodes, mut edges) = parse_cargo_toml(
+            r#"
+[package]
+name = "unified-hifi-control"
+
+[dependencies]
+roon-api = { git = "https://github.com/open-horizon-labs/rust-roon-api.git" }
+#",
+            &manifest("unified-hifi-control/Cargo.toml"),
+            "hiphi-repos",
+        );
+        let (primary_provider_nodes, _) = parse_cargo_toml(
+            r#"
+[package]
+name = "roon-api"
+#",
+            &manifest("rust-roon-api/Cargo.toml"),
+            "hiphi-repos",
+        );
+        let (declared_provider_nodes, _) = parse_cargo_toml(
+            r#"
+[package]
+name = "roon-api"
+#",
+            &manifest("Cargo.toml"),
+            "rust-roon-api",
+        );
+        nodes.extend(primary_provider_nodes);
+        nodes.extend(declared_provider_nodes);
+
+        add_explicit_package_host_edges(&nodes, &mut edges, &hosts);
+
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.from.name == "unified-hifi-control"
+                    && edge.to.root == "rust-roon-api"
+                    && edge.to.name == "roon-api"
                     && edge.confidence == Confidence::Confirmed)
         );
     }
