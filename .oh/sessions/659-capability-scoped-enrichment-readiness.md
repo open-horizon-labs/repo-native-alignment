@@ -188,3 +188,20 @@ Title: **Spike /review-readiness skill for diff-scoped graph context**
 Purpose: validate the job-shaped skill path before core API work. The issue keeps the scope at skill-level first: use git diff + extracted graph + existing RNA context to report PR/diff review readiness and identify missing capabilities. Core code should follow only if the skill proves useful and exposes hard affordance gaps.
 
 This child issue is intentionally not a generic readiness API issue. It is the concrete PR/diff review use case that should force any later model/API design.
+
+## Execute
+**Updated:** 2026-04-27
+**Status:** implementation-complete
+
+Implemented #660 walking skeleton in PR #661.
+
+### Changes
+- Added `plugin/skills/review-readiness/SKILL.md` for `/rna-mcp:review-readiness`.
+- Added `plugin/skills/review-readiness/review_readiness.py`, a skill-local helper that maps git/PR diffs to current RNA extracted symbol ranges and reports review readiness without LSP or embeddings.
+- Added README and AGENTS discoverability entries.
+- Added `.oh/metis/review-readiness-skill-rationale.md` tying the skill to `context-assembly` and #659.
+
+### Verification
+- `python3 -m py_compile plugin/skills/review-readiness/review_readiness.py`
+- `python3 plugin/skills/review-readiness/review_readiness.py --base 310ff6ae55a120f1328e17ada063d1b201d58d28^ --head 310ff6ae55a120f1328e17ada063d1b201d58d28`
+- `python3 plugin/skills/review-readiness/review_readiness.py` on current working tree, confirming untracked file-level changes are represented honestly.
