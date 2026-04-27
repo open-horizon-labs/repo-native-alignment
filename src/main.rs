@@ -296,9 +296,13 @@ fn init_tracing(default_filter: &str, log_path: Option<&std::path::Path>) {
 /// Load graph from LanceDB cache or exit with instructions to scan first.
 async fn try_load_cached_graph(
     repo_root: &std::path::Path,
- ) -> anyhow::Result<Option<server::state::GraphState>> {
+) -> anyhow::Result<Option<server::state::GraphState>> {
     let lance_path = repo_root.join(".oh").join(".cache").join("lance");
     if !lance_path.exists() {
+        return Ok(None);
+    }
+
+    if !lance_path.join("symbols.lance").exists() || !lance_path.join("edges.lance").exists() {
         return Ok(None);
     }
 
@@ -309,6 +313,21 @@ async fn try_load_cached_graph(
         }
         Err(e) => Err(e.context("Failed to load cached index")),
     }
+}
+
+fn print_scan_summary(
+    graph: &server::state::GraphState,
+    embeddings_loaded: bool,
+    elapsed: std::time::Duration,
+) {
+    eprintln!();
+    eprintln!(
+        "  Symbols: {} | Edges: {} | Embeddings: {} | Time: {:.2}s",
+        graph.nodes.len(),
+        graph.edges.len(),
+        if embeddings_loaded { "yes" } else { "no" },
+        elapsed.as_secs_f64()
+    );
 }
 
 /// Load graph from LanceDB cache or exit with instructions to scan first.
@@ -406,21 +425,17 @@ async fn async_main() -> anyhow::Result<()> {
 
             let mut scanner = repo_native_alignment::scanner::Scanner::new(repo_root.clone())?;
             let scan = scanner.scan()?;
-            if scan.changed_files.is_empty() && scan.new_files.is_empty() && scan.deleted_files.is_empty() {
+            if scan.changed_files.is_empty()
+                && scan.new_files.is_empty()
+                && scan.deleted_files.is_empty()
+            {
                 scanner.commit_state()?;
                 let graph = match try_load_cached_graph(&repo_root).await? {
                     Some(graph) => graph,
                     None => handler.build_full_graph_inner(false).await?,
                 };
                 let elapsed = t0.elapsed();
-                eprintln!();
-                eprintln!(
-                    "  Symbols: {} | Edges: {} | Embeddings: {} | Time: {:.2}s",
-                    graph.nodes.len(),
-                    graph.edges.len(),
-                    if handler.embed_index.load().is_some() { "yes" } else { "no" },
-                    elapsed.as_secs_f64()
-                );
+                print_scan_summary(&graph, handler.embed_index.load().is_some(), elapsed);
                 return Ok(());
             }
 
@@ -428,21 +443,17 @@ async fn async_main() -> anyhow::Result<()> {
                 Some(graph) => graph,
                 None => {
                     eprintln!("No cached index found; building initial graph.");
-                    handler.build_full_graph_inner(false).await?
+                    let graph = handler.build_full_graph_inner(false).await?;
+                    let elapsed = t0.elapsed();
+                    print_scan_summary(&graph, handler.embed_index.load().is_some(), elapsed);
+                    return Ok(());
                 }
             };
             handler
                 .update_graph_with_scan(&mut graph, Some(scan), false)
                 .await?;
             let elapsed = t0.elapsed();
-            eprintln!();
-            eprintln!(
-                "  Symbols: {} | Edges: {} | Embeddings: {} | Time: {:.2}s",
-                graph.nodes.len(),
-                graph.edges.len(),
-                if handler.embed_index.load().is_some() { "yes" } else { "no" },
-                elapsed.as_secs_f64()
-            );
+            print_scan_summary(&graph, handler.embed_index.load().is_some(), elapsed);
             return Ok(());
         }
         Some(Commands::Search(args)) => {
