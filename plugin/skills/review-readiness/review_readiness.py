@@ -103,9 +103,44 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def has_commit(repo: Path, rev: str) -> bool:
+    result = subprocess.run(
+        ["git", "cat-file", "-e", f"{rev}^{{commit}}"],
+        cwd=repo,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def pr_diff_refs(pr_number: int, repo: Path) -> tuple[str, str]:
+    refs = run(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(pr_number),
+            "--json",
+            "baseRefOid,headRefOid",
+            "--jq",
+            '.baseRefOid + " " + .headRefOid',
+        ],
+        repo,
+    ).strip().split()
+    if len(refs) != 2:
+        raise SystemExit(f"could not resolve base/head refs for PR {pr_number}")
+    base, head = refs
+    for rev in (base, head):
+        if not has_commit(repo, rev):
+            run(["git", "fetch", "--quiet", "origin", rev], repo)
+    return base, head
+
+
 def diff_text(args: argparse.Namespace, repo: Path) -> str:
     if args.pr is not None:
-        return run(["gh", "pr", "diff", str(args.pr), "--", "--unified=0"], repo)
+        base, head = pr_diff_refs(args.pr, repo)
+        return run(["git", "diff", "--unified=0", base, head], repo)
     if args.base and args.head:
         return run(["git", "diff", "--unified=0", args.base, args.head], repo)
     if args.base:
