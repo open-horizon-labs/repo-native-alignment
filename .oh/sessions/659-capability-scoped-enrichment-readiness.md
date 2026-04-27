@@ -205,3 +205,54 @@ Implemented #660 walking skeleton in PR #661, then revised it after review showe
 - Confirmed `plugin/skills/review-readiness/review_readiness.py` is no longer present.
 - Checked changed-file diff shape with `git diff --stat origin/main...HEAD`.
 - Re-read the skill/rationale/docs after edit for coherence.
+
+## HipHi Repo-Family Spike
+**Updated:** 2026-04-27
+**Status:** evidence gathered
+
+### Testbed
+Used `/Users/muness1/src/hiphi-repos` as a repo-family workspace: `roon-knob`, `unified-hifi-control`, `rust-roon-api`, and `hiphi`. Added local testbed config at `/Users/muness1/src/hiphi-repos/.oh/config.toml`:
+
+```toml
+[workspace.roots]
+unified_hifi_control = "unified-hifi-control"
+rust_roon_api = "rust-roon-api"
+roon_knob = "roon-knob"
+hiphi_site = "hiphi"
+```
+
+The scanner requires `[scanner]` for excludes, not `[scan]`, and directory exclude patterns need trailing `/` because the matcher treats slash-suffixed patterns as directory components.
+
+### Scan Result
+`repo-native-alignment scan --repo /Users/muness1/src/hiphi-repos` completed with the installed optimized CLI after excludes were fixed:
+
+- Symbols: 9893
+- Edges: 28680
+- Embeddings: yes
+- Time: ~68s
+
+The first attempt exposed a real RNA bug: `json_extractor` sliced `value_text[..500]` and panicked when byte 500 fell inside a multi-byte character. Fixed in PR #661 by truncating on UTF-8 char boundaries.
+
+### Cross-Root Findings
+RNA can index the repo family as one workspace and find symbols across repos:
+
+- `unified-hifi-control/src/adapters/roon.rs` imports `roon_api::{ ... transport::{..., Transport, ...} ... }`.
+- `rust-roon-api/src/transport.rs` exposes `Transport` and `control`.
+- `roon-knob/common/bridge_client.c` and docs show bridge/control surfaces.
+
+But the graph does **not** currently connect the unified import/calls to the sibling `rust-roon-api` provider symbols:
+
+- The unified import has `DependsOn` only to synthetic `roon_api`.
+- `rust-roon-api/src/transport.rs:control:function` has no incoming edge from unified-hifi-control.
+- `manifest_pass` currently supports package.json, pyproject.toml, requirements.txt, and go.mod, but not Cargo.toml.
+
+### Required Capability
+Support a directory hosting a specified library/package:
+
+1. Parse Cargo manifests into package nodes and dependency edges.
+2. Record dependency metadata such as package name, git URL, branch/tag, path, and optional alias/rename.
+3. In a multi-root workspace, match dependency declarations to local provider roots/packages by package name and repository URL/path.
+4. Emit package/root-level `DependsOn` edges across roots before attempting symbol-level call resolution.
+5. Use those package edges to resolve imports like `roon_api::transport::Transport` from `unified-hifi-control` to `rust-roon-api` symbols when names line up.
+
+This is the concrete monorepo/repo-family JTBD: diff joins become compelling when a change crosses firmware -> bridge -> local library -> external system boundaries.
