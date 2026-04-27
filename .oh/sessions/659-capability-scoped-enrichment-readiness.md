@@ -256,3 +256,30 @@ Support a directory hosting a specified library/package:
 5. Use those package edges to resolve imports like `roon_api::transport::Transport` from `unified-hifi-control` to `rust-roon-api` symbols when names line up.
 
 This is the concrete monorepo/repo-family JTBD: diff joins become compelling when a change crosses firmware -> bridge -> local library -> external system boundaries.
+
+## Execute Follow-up: Explicit Package Hosts
+**Updated:** 2026-04-27
+**Status:** implemented in PR #661
+
+The package-provider relationship should be explicit, not guessed from unique names, repository basenames, or path similarity. Implemented a generic workspace config hook:
+
+```toml
+[workspace.package_hosts]
+"roon-api" = "rust-roon-api"
+```
+
+The resolver is package-manager agnostic at the config level: key = package/library name, value = hosting root or directory. The first parser feeding it is Cargo because the observed HiPhi gap is `unified-hifi-control` depending on `roon-api` hosted by sibling `rust-roon-api`.
+
+### Implemented
+- `Cargo.toml` manifest parsing into package nodes and dependency edges.
+- Cargo dependency metadata: alias, actual package name, git/path/branch/tag/rev/version.
+- Explicit package host resolution from `.oh/config.toml` `[workspace.package_hosts]`.
+- Confirmed cross-root `DependsOn` edge only when the package host designation exists.
+- Tests that reject implicit unique-name guessing.
+
+### Verification
+- `cargo check --lib --no-default-features`
+- `cargo check --lib --tests --no-default-features`
+- `git diff --check`
+
+Targeted `cargo test --lib --no-default-features manifest::tests` still cannot run on this workstation because the linker cannot find `clang_rt.osx`; test compilation succeeds with `cargo check --tests`.
