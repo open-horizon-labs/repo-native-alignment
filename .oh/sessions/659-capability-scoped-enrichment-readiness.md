@@ -301,3 +301,27 @@ The HiPhi verification exposed that plain `repo-native-alignment scan --repo ...
 - `git diff --check`
 
 Local binary execution is blocked by the same workstation linker issue (`clang_rt.osx`) when building a fresh debug binary. The installed CI artifact still has the old behavior, so end-to-end behavior for this fix should be verified from the next CI fast artifact.
+
+## Execute Follow-up: Explicit Package Host Refresh
+**Updated:** 2026-04-27
+**Status:** implemented and verified in PR #661
+
+HiPhi verification showed the explicit package host implementation was computed but not delivered into the cached graph on idle scans: package nodes existed, but the cross-root dependency edge from `unified-hifi-control` to the `rust-roon-api` provider was missing until a manifest refresh ran.
+
+### Implemented
+- Added a cheap manifest graph refresh on non-`--full` idle CLI scans.
+- Refresh removes/re-emits manifest package nodes and schema `DependsOn` edges without extraction, embeddings, or LSP.
+- Explicit package host resolution now prefers declared root matches over primary-root directory copies, then repository slug matches.
+- Added a regression test for duplicate primary/subroot provider nodes so explicit hosts choose the declared root.
+
+### Verification
+- `cargo check --lib --bins --no-default-features`
+- `git diff --check`
+- CI run `25022987045`: `build-release-fast`, `lint`, and `test` passed; `smoke` still fails at the existing CLI search smoke step.
+- Installed CI fast artifact `6672359692` locally and ran against `/Users/muness1/src/hiphi-repos`.
+- First idle scan refreshed manifest graph in 0.23s, persisted `10023` symbols and `29064` edges, with `Embeddings: no`.
+- Second idle scan completed in 0.13s with no refresh and no embeddings.
+- `repo-native-alignment graph --node 'rust-roon-api:Cargo.toml:roon-api:package' --mode neighbors --direction incoming --repo /Users/muness1/src/hiphi-repos` now shows incoming package dependencies from `unified-hifi-control`.
+
+### Remaining Gap
+The repo-family graph now exposes the package/root-level join. It does not yet resolve `roon_api::...` import/call edges down to sibling provider symbols. That is a follow-up capability, not required to prove the explicit package-host walking skeleton.
