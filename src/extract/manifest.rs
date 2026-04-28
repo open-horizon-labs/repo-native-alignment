@@ -1130,7 +1130,7 @@ repository = "https://github.com/open-horizon-labs/rust-roon-api"
         let mut hosts = PackageHosts::new();
         hosts.insert("roon-api".to_string(), "rust-roon-api".to_string());
 
-        let (mut nodes, mut edges) = parse_cargo_toml(
+        let (_app_nodes, mut edges) = parse_cargo_toml(
             r#"
 [package]
 name = "unified-hifi-control"
@@ -1157,6 +1157,7 @@ name = "roon-api"
             &manifest("Cargo.toml"),
             "rust-roon-api",
         );
+        let mut nodes = _app_nodes;
         nodes.extend(primary_provider_nodes);
         nodes.extend(declared_provider_nodes);
 
