@@ -11,7 +11,7 @@ use crate::embed::EmbeddingIndex;
 use crate::extract::ExtractorRegistry;
 use crate::graph::index::GraphIndex;
 use crate::graph::store::SCHEMA_VERSION;
-use crate::graph::{Edge, EdgeKind, Node, NodeKind};
+use crate::graph::{Edge, Node, NodeKind};
 use crate::roots::{RootConfig, WorkspaceConfig, cache_state_path};
 use crate::scanner::{ScanResult, Scanner};
 
@@ -64,6 +64,72 @@ fn dedup_nodes_merge_metadata(nodes: &mut Vec<Node>) {
         .filter_map(|sid| merged.remove(&sid))
         .collect();
 }
+fn is_manifest_package_node(node: &Node) -> bool {
+    node.source == crate::graph::ExtractionSource::Schema
+        && matches!(&node.id.kind, NodeKind::Other(kind) if kind == "package")
+}
+
+fn is_manifest_package_edge(edge: &Edge) -> bool {
+    edge.source == crate::graph::ExtractionSource::Schema
+        && (matches!(&edge.from.kind, NodeKind::Other(kind) if kind == "package")
+            || matches!(&edge.to.kind, NodeKind::Other(kind) if kind == "package"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(kind: NodeKind, name: &str) -> Node {
+        Node {
+            id: crate::graph::NodeId {
+                root: String::new(),
+                file: PathBuf::from("x.yaml"),
+                name: name.to_string(),
+                kind,
+            },
+            language: "yaml".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: name.to_string(),
+            body: String::new(),
+            metadata: std::collections::BTreeMap::new(),
+            source: crate::graph::ExtractionSource::Schema,
+        }
+    }
+
+    #[test]
+    fn manifest_refresh_filter_preserves_non_package_schema_depends_on_edges() {
+        let openapi_dep = Edge {
+            from: crate::graph::NodeId {
+                root: String::new(),
+                file: PathBuf::from("openapi.yaml"),
+                name: "POST /users".to_string(),
+                kind: NodeKind::ApiEndpoint,
+            },
+            to: crate::graph::NodeId {
+                root: String::new(),
+                file: PathBuf::from("openapi.yaml"),
+                name: "User".to_string(),
+                kind: NodeKind::Struct,
+            },
+            kind: crate::graph::EdgeKind::DependsOn,
+            source: crate::graph::ExtractionSource::Schema,
+            confidence: crate::graph::Confidence::Detected,
+        };
+
+        let package_dep = Edge {
+            from: node(NodeKind::Other("package".to_string()), "app").id,
+            to: node(NodeKind::Other("package".to_string()), "lib").id,
+            kind: crate::graph::EdgeKind::DependsOn,
+            source: crate::graph::ExtractionSource::Schema,
+            confidence: crate::graph::Confidence::Detected,
+        };
+
+        assert!(!is_manifest_package_edge(&openapi_dep));
+        assert!(is_manifest_package_edge(&package_dep));
+    }
+}
+
 fn collect_post_pass_node_upserts(
     nodes: &[Node],
     node_ids_before: &std::collections::HashSet<String>,
@@ -1643,18 +1709,6 @@ impl RnaHandler {
     /// running extraction, embeddings, or LSP. This catches `.oh/config.toml`
     /// package host changes and manifest dependency metadata on otherwise idle scans.
     pub async fn refresh_manifest_graph(&self, graph: &mut GraphState) -> anyhow::Result<bool> {
-        fn is_manifest_package_node(node: &Node) -> bool {
-            node.source == crate::graph::ExtractionSource::Schema
-                && matches!(&node.id.kind, NodeKind::Other(kind) if kind == "package")
-        }
-
-        fn is_manifest_package_edge(edge: &Edge) -> bool {
-            edge.source == crate::graph::ExtractionSource::Schema
-                && (edge.kind == EdgeKind::DependsOn
-                    || matches!(&edge.from.kind, NodeKind::Other(kind) if kind == "package")
-                    || matches!(&edge.to.kind, NodeKind::Other(kind) if kind == "package"))
-        }
-
         fn manifest_fingerprint(nodes: &[Node], edges: &[Edge]) -> Vec<String> {
             let mut entries = Vec::new();
             for node in nodes.iter().filter(|node| is_manifest_package_node(node)) {
