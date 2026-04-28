@@ -327,3 +327,21 @@ HiPhi verification showed the explicit package host implementation was computed 
 
 ### Remaining Gap
 The repo-family graph now exposes the package/root-level join. It does not yet resolve `roon_api::...` import/call edges down to sibling provider symbols. That is a follow-up capability, not required to prove the explicit package-host walking skeleton.
+
+
+## Execute Follow-up: Local Darwin Build Cache
+**Updated:** 2026-04-28
+**Status:** fixed locally and verified
+
+Local test/binary linking was failing with `ld: library 'clang_rt.osx' not found`. The active toolchain is Command Line Tools (`xcode-select -p` = `/Library/Developer/CommandLineTools`), and the runtime exists at `/Library/Developer/CommandLineTools/usr/lib/clang/21/lib/darwin/libclang_rt.osx.a`. The stale path came from cached `ort-sys` build-script output, which injected `/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/lib/darwin`.
+
+### Fix
+- Ran `cargo clean -p ort-sys` to invalidate only the stale `ort-sys` build-script output instead of deleting the whole target directory.
+- A later `cargo clean -p repo-native-alignment` was used to refresh local crate test warnings after the linker fix; the shared dependency cache remained usable.
+
+### Verification
+- `cargo test --lib --no-default-features manifest::tests` links and passes locally: 27 passed.
+- `cargo build --no-default-features` links a local debug binary.
+- Warm `cargo check --lib --bins --no-default-features` completes in ~1.2s, then ~0.4s.
+- Warm `cargo test --lib --no-default-features manifest::tests` completes in ~0.8s.
+- `target/` remains present (~43G), and sccache is configured at `/Users/muness1/Library/Caches/Mozilla.sccache`. With a hot target tree, sccache is not exercised because Cargo does not invoke rustc for unchanged crates.
