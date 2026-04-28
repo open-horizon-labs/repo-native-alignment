@@ -294,13 +294,15 @@ The HiPhi verification exposed that plain `repo-native-alignment scan --repo ...
 - Non-`--full` CLI scan runs `Scanner` first.
 - If no files changed, it commits scanner state and loads the cached graph without spawning graph rebuild, LSP, or embedding.
 - If cached graph exists and files changed, it calls `update_graph_with_scan` with the pending `ScanResult` so existing targeted changed-file re-embedding is used.
-- If no cache exists, it falls back to the foreground initial graph build.
+- If no cache exists, it falls back to an initial extracted-graph build with background enrichment deferred; it does not run LSP inline before making the graph queryable.
 
 ### Verification
 - `cargo check --lib --bins --no-default-features`
 - `git diff --check`
 
 Local binary execution is blocked by the same workstation linker issue (`clang_rt.osx`) when building a fresh debug binary. The installed CI artifact still has the old behavior, so end-to-end behavior for this fix should be verified from the next CI fast artifact.
+
+Follow-up fix: local smoke reproduction showed the no-cache non-`--full` CLI scan still used the foreground/full path and could hang in rust-analyzer before persisting the fixture graph. Updated the no-cache fallback to `build_full_graph_inner(true)` so first scan persists the extracted graph immediately and defers LSP/embedding instead of blocking search readiness.
 
 ## Execute Follow-up: Explicit Package Host Refresh
 **Updated:** 2026-04-27

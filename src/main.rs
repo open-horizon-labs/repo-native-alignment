@@ -437,7 +437,7 @@ async fn async_main() -> anyhow::Result<()> {
                         }
                         graph
                     }
-                    None => handler.build_full_graph_inner(false).await?,
+                    None => handler.build_full_graph_inner(true).await?,
                 };
                 let elapsed = t0.elapsed();
                 print_scan_summary(&graph, handler.embed_index.load().is_some(), elapsed);
@@ -447,8 +447,8 @@ async fn async_main() -> anyhow::Result<()> {
             let mut graph = match try_load_cached_graph(&repo_root).await? {
                 Some(graph) => graph,
                 None => {
-                    eprintln!("No cached index found; building initial graph.");
-                    let graph = handler.build_full_graph_inner(false).await?;
+                    eprintln!("No cached index found; building initial extracted graph.");
+                    let graph = handler.build_full_graph_inner(true).await?;
                     let elapsed = t0.elapsed();
                     print_scan_summary(&graph, handler.embed_index.load().is_some(), elapsed);
                     return Ok(());
