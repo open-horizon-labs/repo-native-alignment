@@ -1,6 +1,8 @@
 //! Formatting utilities, argument parsing, and display helpers.
 
-use super::state::{EmbeddingStatus, LspEnrichmentStatus};
+use super::state::{
+    CapabilityReadiness, CapabilityReadinessState, EmbeddingStatus, LspEnrichmentStatus,
+};
 use crate::graph;
 use crate::graph::index::GraphIndex;
 use petgraph::Direction;
@@ -77,6 +79,82 @@ pub fn format_freshness_full(
         crate::graph::store::SCHEMA_VERSION,
         embed_part,
         lsp_part,
+    )
+}
+
+/// Format workflow capability readiness for MCP-visible tool output.
+///
+/// This is deliberately distinct from the compact freshness footer: freshness says
+/// when the index last changed; readiness says which workflow metadata an agent can
+/// trust right now.
+pub fn format_capability_readiness(
+    node_count: usize,
+    lsp_status: Option<&LspEnrichmentStatus>,
+    embed_status: Option<&EmbeddingStatus>,
+    semantic_index_available: bool,
+) -> String {
+    let extracted = if node_count > 0 {
+        CapabilityReadiness::new(
+            "extracted graph / exact search",
+            CapabilityReadinessState::Ready,
+            format!("{} symbols available without LSP or embeddings", node_count),
+        )
+    } else {
+        CapabilityReadiness::new(
+            "extracted graph / exact search",
+            CapabilityReadinessState::Running,
+            "no symbols are loaded yet",
+        )
+    };
+
+    let embeddings = embed_status.map_or_else(
+        || {
+            if semantic_index_available {
+                CapabilityReadiness::new(
+                    "embeddings / semantic search",
+                    CapabilityReadinessState::Ready,
+                    "semantic index is loaded",
+                )
+            } else {
+                CapabilityReadiness::new(
+                    "embeddings / semantic search",
+                    CapabilityReadinessState::NotNeeded,
+                    "not required for exact symbol, graph, or file queries",
+                )
+            }
+        },
+        |status| status.capability_readiness(semantic_index_available),
+    );
+
+    let (lsp, dead_code) = lsp_status.map_or_else(
+        || {
+            (
+                CapabilityReadiness::new(
+                    "LSP call/reference coverage",
+                    CapabilityReadinessState::Unavailable,
+                    "not attached for this repo context",
+                ),
+                CapabilityReadiness::new(
+                    "global dead-code prerequisites",
+                    CapabilityReadinessState::Unavailable,
+                    "blocked: requires complete, persisted, non-zero LSP call/reference coverage",
+                ),
+            )
+        },
+        |status| {
+            (
+                status.call_reference_readiness(),
+                status.dead_code_readiness(),
+            )
+        },
+    );
+
+    format!(
+        "\n\n### Capability readiness\n\n{}\n{}\n{}\n{}",
+        extracted.markdown_line(),
+        embeddings.markdown_line(),
+        lsp.markdown_line(),
+        dead_code.markdown_line(),
     )
 }
 
@@ -1060,5 +1138,31 @@ mod tests {
         let result = format_freshness_full(100, None, None, None);
         assert!(!result.contains("embedding"), "got: {}", result);
         assert!(!result.contains("embedded"), "got: {}", result);
+    }
+    #[test]
+    fn test_format_capability_readiness_reports_dead_code_blocker() {
+        let lsp_status = super::super::state::LspEnrichmentStatus::default();
+        lsp_status.set_unavailable();
+        let result = format_capability_readiness(42, Some(&lsp_status), None, false);
+        assert!(
+            result.contains("### Capability readiness"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("extracted graph / exact search"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("global dead-code prerequisites"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("blocked: requires complete"),
+            "got: {}",
+            result
+        );
     }
 }

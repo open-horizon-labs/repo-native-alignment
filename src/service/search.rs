@@ -11,8 +11,8 @@ use crate::graph::{Node, NodeKind};
 use crate::ranking;
 use crate::server::handlers::parse_search_mode;
 use crate::server::helpers::{
-    format_freshness_full, format_neighbors_grouped_with_root, format_node_entry_with_root,
-    strip_root_prefix,
+    format_capability_readiness, format_freshness_full, format_neighbors_grouped_with_root,
+    format_node_entry_with_root, strip_root_prefix,
 };
 use crate::server::state::GraphState;
 use crate::server::store::parse_edge_kind;
@@ -30,6 +30,24 @@ const IMPACT_SUMMARY_NODE_THRESHOLD: usize = 30;
 /// This catches cases where a small number of nodes with verbose bodies (non-
 /// compact mode) still produce huge responses (e.g., 157K chars for ~80 nodes).
 const IMPACT_SUMMARY_CHAR_THRESHOLD: usize = 40_000;
+
+fn format_verbose_readiness(gs: &GraphState, ctx: &SearchContext<'_>) -> String {
+    format!(
+        "{}{}",
+        format_freshness_full(
+            gs.nodes.len(),
+            gs.last_scan_completed_at,
+            ctx.lsp_status,
+            ctx.embed_status,
+        ),
+        format_capability_readiness(
+            gs.nodes.len(),
+            ctx.lsp_status,
+            ctx.embed_status,
+            ctx.embed_index.is_some(),
+        ),
+    )
+}
 
 /// Unified search entry point. Returns formatted markdown.
 pub async fn search(params: &SearchParams, ctx: &SearchContext<'_>) -> String {
@@ -217,12 +235,7 @@ async fn search_flat(
     }
 
     let freshness = if params.verbose {
-        format_freshness_full(
-            graph_state.nodes.len(),
-            graph_state.last_scan_completed_at,
-            ctx.lsp_status,
-            ctx.embed_status,
-        )
+        format_verbose_readiness(graph_state, ctx)
     } else {
         String::new()
     };
@@ -622,12 +635,7 @@ async fn search_traversal(
         });
         let edge_filter_slice = edge_filter.as_deref();
         let freshness = if params.verbose {
-            format_freshness_full(
-                gs.nodes.len(),
-                gs.last_scan_completed_at,
-                ctx.lsp_status,
-                ctx.embed_status,
-            )
+            format_verbose_readiness(gs, ctx)
         } else {
             String::new()
         };
@@ -716,12 +724,7 @@ async fn search_traversal(
         });
         let edge_filter_slice = edge_filter.as_deref();
         let freshness = if params.verbose {
-            format_freshness_full(
-                gs.nodes.len(),
-                gs.last_scan_completed_at,
-                ctx.lsp_status,
-                ctx.embed_status,
-            )
+            format_verbose_readiness(gs, ctx)
         } else {
             String::new()
         };
@@ -1048,12 +1051,7 @@ async fn search_traversal(
     };
     let direction = params.direction.as_deref().unwrap_or("outgoing");
     let freshness = if params.verbose {
-        format_freshness_full(
-            gs.nodes.len(),
-            gs.last_scan_completed_at,
-            ctx.lsp_status,
-            ctx.embed_status,
-        )
+        format_verbose_readiness(gs, ctx)
     } else {
         String::new()
     };
@@ -1280,12 +1278,7 @@ fn search_batch(node_ids: &[&str], params: &SearchParams, ctx: &SearchContext<'_
     use crate::server::handlers::run_traversal_grouped;
     let gs = ctx.graph_state;
     let freshness = if params.verbose {
-        format_freshness_full(
-            gs.nodes.len(),
-            gs.last_scan_completed_at,
-            ctx.lsp_status,
-            ctx.embed_status,
-        )
+        format_verbose_readiness(gs, ctx)
     } else {
         String::new()
     };

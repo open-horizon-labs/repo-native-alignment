@@ -364,3 +364,21 @@ Additional self-review found idle manifest refresh was too broad: it removed eve
 - `cargo test --lib --no-default-features manifest::tests` — 28 passed
 - `cargo test --lib --no-default-features manifest_refresh_filter_preserves_non_package_schema_depends_on_edges` — passed
 - Fresh smoke fixture changed scan: initial scan, append to `lib.rs`, second scan saw `0 new, 1 changed`, third scan saw `0 new, 0 changed, 0 deleted`.
+
+## Execute Follow-up: Capability Readiness Walking Skeleton
+**Updated:** 2026-04-29
+**Status:** in progress on #662
+
+Created #662 — https://github.com/open-horizon-labs/repo-native-alignment/issues/662 — as the next child issue under #659. This slice keeps the work focused on MCP-visible capability readiness rather than another global enrichment state patch.
+
+### Implemented so far
+- Added agent-facing capability readiness states: ready, partial/degraded, running, failed, unavailable, stale, and not needed.
+- Added readiness mapping for extracted graph/search, embeddings/semantic search, LSP call/reference coverage, and global dead-code prerequisites.
+- Surfaced capability readiness in verbose `search` output so MCP clients can see whether answers are safe, degraded, or blocked.
+- Updated `/dead-code` to fail closed from MCP-visible readiness instead of scraping scan logs.
+
+### Verification so far
+- `cargo check --lib --bins --no-default-features`
+- `cargo test --lib --no-default-features readiness` — 4 passed
+- `cargo build --no-default-features`
+- Local CLI smoke: `./target/debug/repo-native-alignment search --verbose --limit 1 readiness` showed `### Capability readiness` with extracted graph ready, embeddings ready, and dead-code prerequisites blocked when LSP status is not attached in CLI context.
